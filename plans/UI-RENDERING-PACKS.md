@@ -191,8 +191,20 @@ bring-up fails. Verified end-to-end here (renders + reads back correctly) — bu
 this host GL is software (Mesa llvmpipe), so it is a correctness proof of the path,
 not a speedup. Default builds stay raster.
 
-Later: bundling a `.ttf` for fontless hosts, macOS (Cocoa) / windows (Win32) window
-backends, and verifying the macos/windows shim recipes on those hosts.
+**macOS / Windows window backends — WRITTEN (unverified here).** The shim's
+windowing section now has one backend per OS behind the same C ABI (open / surface
+/ present / poll / close): X11 (`-DKLIO_X11`, verified), Win32 (`_WIN32` —
+`StretchDIBits` blit of the N32 surface, window-proc event queue) and Cocoa
+(`-DKLIO_COCOA`, opt-in `-Dcocoa` — compiles the shim as Objective-C++, presents by
+setting the content view's `CALayer.contents` to a `CGImage`, `NSApp` event pump).
+Both the Win32 and Cocoa backends are written against their platform APIs but are
+**not compiled or run-verified in this environment** — this host has no macOS/
+Windows toolchain (zig's Windows cross target also fails here), so they need
+building + checking on real hosts. The Linux/X11 path is unchanged and green.
+
+Later: bundling a `.ttf` for fontless hosts; building + verifying the Win32/Cocoa
+backends on real macOS/Windows hosts; a GPU window surface (today's GPU path is
+offscreen).
 
 ### Vendor the real compose.ui / foundation / material
 

@@ -371,11 +371,14 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 }  // extern "C"
 
 // ---------------------------------------------------------------------------
-// Windowing — a live on-screen surface + input event loop. X11 only for now
-// (enabled by -DKLIO_X11 when build.zig finds the X11 headers + lib); the raster
-// surface (N32 premul == X TrueColor BGRX) is blitted with XPutImage. macOS
-// (Cocoa) / Windows (Win32) get their own backends later; without a backend the
-// window functions return failure so the pack falls back to headless rendering.
+// Windowing — a live on-screen surface + input event loop, one backend per OS
+// behind the same C ABI (open / surface / present / poll / close):
+//   X11    (-DKLIO_X11)   — verified; raster (N32 premul == X BGRX) via XPutImage.
+//   Win32  (_WIN32)       — StretchDIBits blit; written, not run-verified here.
+//   Cocoa  (-DKLIO_COCOA) — CALayer contents from a CGImage; written as
+//                           Objective-C++, not compiled/run-verified here.
+// Without a backend the window functions return failure and the pack falls back to
+// headless rendering.
 // ---------------------------------------------------------------------------
 
 #if defined(KLIO_X11)
@@ -522,7 +525,291 @@ void klio_win_close(KlioWindow* kw) {
 
 }  // extern "C"
 
-#else  // no windowing backend (non-X11 build)
+#elif defined(_WIN32)
+
+// Win32 backend. The N32-premul surface (BGRA) matches a 32bpp top-down BI_RGB
+// DIB, so present is a StretchDIBits blit. Events arrive through the window proc;
+// each poll pumps the queue and returns the first translated event. Compile-checked
+// via a Windows cross target; not run-verified.
+#include <windows.h>
+
+struct KlioWindow {
+    HWND hwnd;
+    int w;
+    int h;
+    KlioSurface* surface;
+    int evType;
+    int evA;
+    int evB;
+    bool hasEv;
+};
+
+static LRESULT CALLBACK klioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* kw = reinterpret_cast<KlioWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    if (kw) {
+        switch (msg) {
+            case WM_LBUTTONDOWN:
+                kw->evType = 1;
+                kw->evA = LOWORD(lParam);
+                kw->evB = HIWORD(lParam);
+                kw->hasEv = true;
+                return 0;
+            case WM_CLOSE:
+                kw->evType = 2;
+                kw->hasEv = true;
+                return 0;
+            case WM_CHAR:
+                kw->evType = 3;
+                kw->evA = static_cast<int>(wParam);
+                kw->evB = static_cast<int>(wParam);
+                kw->hasEv = true;
+                return 0;
+            case WM_MOUSEMOVE:
+                kw->evType = 4;
+                kw->evA = LOWORD(lParam);
+                kw->evB = HIWORD(lParam);
+                kw->hasEv = true;
+                return 0;
+            case WM_SIZE: {
+                const int nw = LOWORD(lParam);
+                const int nh = HIWORD(lParam);
+                if ((nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
+                    if (kw->surface) klio_skia_free(kw->surface);
+                    kw->surface = klio_skia_new(nw, nh);
+                    kw->w = nw;
+                    kw->h = nh;
+                    kw->evType = 5;
+                    kw->evA = nw;
+                    kw->evB = nh;
+                    kw->hasEv = true;
+                }
+                return 0;
+            }
+        }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+extern "C" {
+
+KlioWindow* klio_win_open(int w, int h, const char* title) {
+    if (w <= 0 || h <= 0) return nullptr;
+    HINSTANCE inst = GetModuleHandle(nullptr);
+    static const char* kClass = "KlioWindowClass";
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = klioWndProc;
+        wc.hInstance = inst;
+        wc.lpszClassName = kClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    RECT r = {0, 0, w, h};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);  // client area == w x h
+    HWND hwnd = CreateWindowA(kClass, title ? title : "klio", WS_OVERLAPPEDWINDOW,
+                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
+                              r.bottom - r.top, nullptr, nullptr, inst, nullptr);
+    if (!hwnd) return nullptr;
+    auto* kw = new KlioWindow{hwnd, w, h, nullptr, 0, 0, 0, false};
+    kw->surface = klio_skia_new(w, h);
+    if (!kw->surface) {
+        DestroyWindow(hwnd);
+        delete kw;
+        return nullptr;
+    }
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(kw));
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    return kw;
+}
+
+KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
+
+void klio_win_present(KlioWindow* kw) {
+    if (!kw || !kw->surface) return;
+    SkPixmap pm;
+    if (!kw->surface->surface->peekPixels(&pm)) return;
+    HDC hdc = GetDC(kw->hwnd);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = kw->w;
+    bmi.bmiHeader.biHeight = -kw->h;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    StretchDIBits(hdc, 0, 0, kw->w, kw->h, 0, 0, kw->w, kw->h, pm.addr(), &bmi,
+                  DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(kw->hwnd, hdc);
+}
+
+int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
+    if (!kw) return 2;
+    kw->hasEv = false;
+    MSG msg;
+    if (!PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(timeoutMs), QS_ALLINPUT);
+    }
+    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+        if (kw->hasEv) {
+            if (outA) *outA = kw->evA;
+            if (outB) *outB = kw->evB;
+            return kw->evType;
+        }
+    }
+    return 0;
+}
+
+void klio_win_close(KlioWindow* kw) {
+    if (!kw) return;
+    if (kw->surface) klio_skia_free(kw->surface);
+    DestroyWindow(kw->hwnd);
+    delete kw;
+}
+
+}  // extern "C"
+
+#elif defined(__APPLE__) && defined(KLIO_COCOA)
+
+// Cocoa backend (compiled as Objective-C++ — build.zig adds -x objective-c++ on
+// macOS with -DKLIO_COCOA). Presents by setting the content view's layer contents
+// to a CGImage of the surface. Best-effort: written against the Cocoa API but NOT
+// compiled or run-verified in this environment (no macOS SDK/host here).
+#import <Cocoa/Cocoa.h>
+
+struct KlioWindow {
+    NSWindow* window;
+    NSView* view;
+    int w;
+    int h;
+    KlioSurface* surface;
+};
+
+extern "C" {
+
+KlioWindow* klio_win_open(int w, int h, const char* title) {
+    if (w <= 0 || h <= 0) return nullptr;
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        NSRect frame = NSMakeRect(0, 0, w, h);
+        NSWindow* window = [[NSWindow alloc]
+            initWithContentRect:frame
+                      styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                 NSWindowStyleMaskResizable)
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        if (!window) return nullptr;
+        [window setReleasedWhenClosed:NO];  // we own its lifetime (non-ARC)
+        if (title) [window setTitle:[NSString stringWithUTF8String:title]];
+        NSView* view = [window contentView];
+        [view setWantsLayer:YES];
+        [window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        auto* kw = new KlioWindow{window, view, w, h, nullptr};
+        kw->surface = klio_skia_new(w, h);
+        if (!kw->surface) {
+            [window close];
+            delete kw;
+            return nullptr;
+        }
+        return kw;
+    }
+}
+
+KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
+
+void klio_win_present(KlioWindow* kw) {
+    if (!kw || !kw->surface) return;
+    SkPixmap pm;
+    if (!kw->surface->surface->peekPixels(&pm)) return;
+    @autoreleasepool {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        // N32 premul is BGRA little-endian → 32BE | premul | byteorder32Little.
+        CGBitmapInfo info = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
+        CGContextRef ctx = CGBitmapContextCreate(const_cast<void*>(pm.addr()), kw->w, kw->h, 8,
+                                                 pm.rowBytes(), cs, info);
+        CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : nullptr;
+        if (img) {
+            kw->view.layer.contents = (id)img;  // non-ARC: CGImageRef -> id
+            CGImageRelease(img);
+        }
+        if (ctx) CGContextRelease(ctx);
+        CGColorSpaceRelease(cs);
+    }
+}
+
+int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
+    if (!kw) return 2;
+    @autoreleasepool {
+        NSDate* until = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+        NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                         untilDate:until
+                                            inMode:NSDefaultRunLoopMode
+                                           dequeue:YES];
+        if (!ev) return 0;
+        // Content-view coordinates, top-left origin (flip y).
+        NSPoint p = [kw->view convertPoint:[ev locationInWindow] fromView:nil];
+        const int px = static_cast<int>(p.x);
+        const int py = static_cast<int>(kw->h - p.y);
+        int type = 0;
+        switch ([ev type]) {
+            case NSEventTypeLeftMouseDown:
+                if (outA) *outA = px;
+                if (outB) *outB = py;
+                type = 1;
+                break;
+            case NSEventTypeMouseMoved:
+            case NSEventTypeLeftMouseDragged:
+                if (outA) *outA = px;
+                if (outB) *outB = py;
+                type = 4;
+                break;
+            case NSEventTypeKeyDown: {
+                NSString* chars = [ev characters];
+                const int c = [chars length] > 0 ? [chars characterAtIndex:0] : 0;
+                if (outA) *outA = c;
+                if (outB) *outB = [ev keyCode];
+                type = 3;
+                break;
+            }
+            default:
+                break;
+        }
+        [NSApp sendEvent:ev];
+        // A closed window is no longer visible.
+        if (![kw->window isVisible]) return 2;
+        // A resized content view: recreate the surface to match.
+        const int nw = static_cast<int>([kw->view bounds].size.width);
+        const int nh = static_cast<int>([kw->view bounds].size.height);
+        if (type == 0 && (nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
+            if (kw->surface) klio_skia_free(kw->surface);
+            kw->surface = klio_skia_new(nw, nh);
+            kw->w = nw;
+            kw->h = nh;
+            if (outA) *outA = nw;
+            if (outB) *outB = nh;
+            return 5;
+        }
+        return type;
+    }
+}
+
+void klio_win_close(KlioWindow* kw) {
+    if (!kw) return;
+    if (kw->surface) klio_skia_free(kw->surface);
+    @autoreleasepool {
+        [kw->window close];
+    }
+    delete kw;
+}
+
+}  // extern "C"
+
+#else  // no windowing backend
 
 extern "C" {
 void* klio_win_open(int, int, const char*) { return nullptr; }
