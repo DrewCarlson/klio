@@ -422,11 +422,48 @@ fn eqBoxed(x: *const Value, y: *const Value) bool {
     return Value.structuralEqBoxed(x, y);
 }
 
+/// Value equality that honours a user `equals` override: when either side is a
+/// class Instance, dispatch `x.equals(y)` through the VM (as Kotlin's
+/// membership/dedup do); otherwise structural equality. A non-data class with a
+/// custom `equals` (e.g. klio's `LocalDate`) compares by value, not identity.
+fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
+    if (x.* == .Instance or y.* == .Instance) {
+        if (try host.invokeMethod(x, "equals", &.{y.*}, out)) |m| {
+            if (m == .ok and m.ok == .Bool) return m.ok.Bool;
+        }
+    }
+    return eqBoxed(x, y);
+}
+
 fn containsBoxed(items: []const Value, needle: *const Value) bool {
     for (items) |*v| {
         if (eqBoxed(v, needle)) return true;
     }
     return false;
+}
+
+fn containsBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle: *const Value) Error!bool {
+    for (items) |*v| {
+        if (try eqBoxedH(host, out, v, needle)) return true;
+    }
+    return false;
+}
+
+/// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
+fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
+    var deduped: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        if (!try containsBoxedH(host, out, deduped.items, &v)) {
+            if (runtime.reclaimEnabled()) v.retain();
+            try deduped.append(a, v);
+        }
+    }
+    return .{ .Set = .{
+        .items = try ValueList.init(a, deduped),
+        .mutable = mutable,
+        .backing = null,
+        .mod_count = try modCountFor(a, mutable),
+    } };
 }
 
 /// Reinterpret a numeric `needle` into the element kind of a primitive
@@ -2326,10 +2363,10 @@ pub fn coll_empty_list(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_set_of(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(try sharedEmptySet(ctx.allocator));
-    return ok(try makeSet(ctx.allocator, ctx.args, false));
+    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, false));
 }
 pub fn coll_mutable_set_of(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeSet(ctx.allocator, ctx.args, true));
+    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, true));
 }
 pub fn coll_empty_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try sharedEmptySet(ctx.allocator));
@@ -2673,9 +2710,11 @@ pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+    // Snapshot before dispatching a user `equals` (re-entering the VM under the
+    // list borrow is unsafe).
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.indexOf")) {
@@ -4604,11 +4643,11 @@ pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     var out: std.ArrayList(Value) = .empty;
-    for (g.get().items) |v| {
-        if (!containsBoxed(out.items, &v)) try out.append(a, v);
+    for (items) |v| {
+        if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
     }
     return ok(try makeListBorrowed(a, out, false));
 }
@@ -5216,9 +5255,9 @@ pub fn coll_set_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 
 pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
@@ -6190,7 +6229,9 @@ pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSetVL(a, it, false));
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
+    return ok(try makeSetH(ctx.host, ctx.out, a, items, false));
 }
 pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
