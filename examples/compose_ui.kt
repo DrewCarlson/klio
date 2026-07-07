@@ -31,9 +31,9 @@ fun main() {
     }
 
     println("--- frame 0 (count=0) ---")
-    println(ui.render())
+    println(ui.displayList())
     count.value = 3
     println("--- frame 1 (count=3) ---")
-    println(ui.recomposeRender())
+    println(ui.recomposeDisplayList())
     ui.dispose()
 }

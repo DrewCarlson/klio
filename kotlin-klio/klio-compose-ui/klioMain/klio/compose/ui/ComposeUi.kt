@@ -1,11 +1,10 @@
-// A minimal Compose UI core on a headless software canvas — the first increment
-// of the Compose-UI stack. A @Composable tree emits LayoutNodes through the
-// compose runtime's node path (ComposeNode -> LayoutNodeApplier); a measure pass
-// sizes and places them under Constraints, and a draw pass paints backgrounds
-// into a software pixel buffer that dumps deterministically as ASCII. This proves
-// the LayoutNode + measure/layout/draw + software-canvas architecture runs on
-// klio end-to-end; native Skia, windowing, text/font rendering, and the full
-// foundation/material surface are deferred.
+// A minimal Compose UI core rendered by Skia. A @Composable tree emits LayoutNodes
+// through the compose runtime's node path (ComposeNode -> LayoutNodeApplier); a
+// measure pass sizes and places them under Constraints, and a draw pass records a
+// display list of draw ops (fills, stroked/rounded rects, text). The list is
+// replayed onto a real Skia raster surface by the native backend (src/compose_ui
+// + libklio_skia) to produce a PNG. The display list is itself a deterministic,
+// human-readable render artifact, so tests assert on it without needing Skia.
 
 package klio.compose.ui
 
@@ -20,74 +19,73 @@ import androidx.compose.runtime.key
 
 // ----- color -----
 
-/** An ARGB color. The pixel dump maps each to a distinct character. */
+/** A packed ARGB color (0xAARRGGBB), the value Skia paints with. */
 class Color(val argb: Int) {
     companion object {
-        val Transparent = Color(0)
-        val Black = Color(1)
-        val White = Color(2)
-        val Red = Color(3)
-        val Green = Color(4)
-        val Blue = Color(5)
-        val Yellow = Color(6)
-        val Cyan = Color(7)
-        val Magenta = Color(8)
-        val Gray = Color(9)
+        val Transparent = Color(0x00000000)
+        val Black = Color(0xFF000000.toInt())
+        val White = Color(0xFFFFFFFF.toInt())
+        val Red = Color(0xFFF44336.toInt())
+        val Green = Color(0xFF4CAF50.toInt())
+        val Blue = Color(0xFF2196F3.toInt())
+        val Yellow = Color(0xFFFFEB3B.toInt())
+        val Cyan = Color(0xFF00BCD4.toInt())
+        val Magenta = Color(0xFFE91E63.toInt())
+        val Gray = Color(0xFF9E9E9E.toInt())
     }
 }
 
-private fun charFor(argb: Int): Char {
-    return when (argb) {
-        0 -> '.'
-        1 -> 'K'
-        2 -> 'W'
-        3 -> 'R'
-        4 -> 'G'
-        5 -> 'B'
-        6 -> 'Y'
-        7 -> 'C'
-        8 -> 'M'
-        9 -> 'g'
-        else -> '?'
+// ----- display list -----
+
+/** A recorded list of draw ops in the text format the native Skia backend replays
+ * (see src/compose_ui skiaRender). Colors are 8-hex-digit ARGB; coordinates are
+ * pixels. It doubles as the deterministic render artifact tests assert on. */
+class DisplayList {
+    private val sb = StringBuilder()
+
+    private fun hex(argb: Int): String {
+        val h = (argb.toLong() and 0xFFFFFFFFL).toString(16).uppercase()
+        val pad = 8 - h.length
+        return if (pad > 0) "0".repeat(pad) + h else h
     }
-}
 
-// ----- bitmap font (3x5 glyphs) -----
-
-// Each glyph is 5 rows of 3 columns, packed as 3 low bits per row (bit 2 = left).
-private fun glyph(c: Char): IntArray {
-    return when (c) {
-        '0' -> intArrayOf(7, 5, 5, 5, 7)
-        '1' -> intArrayOf(2, 6, 2, 2, 7)
-        '2' -> intArrayOf(7, 1, 7, 4, 7)
-        '3' -> intArrayOf(7, 1, 7, 1, 7)
-        '4' -> intArrayOf(5, 5, 7, 1, 1)
-        '5' -> intArrayOf(7, 4, 7, 1, 7)
-        '6' -> intArrayOf(7, 4, 7, 5, 7)
-        '7' -> intArrayOf(7, 1, 2, 2, 2)
-        '8' -> intArrayOf(7, 5, 7, 5, 7)
-        '9' -> intArrayOf(7, 5, 7, 1, 7)
-        'A' -> intArrayOf(2, 5, 7, 5, 5)
-        'C' -> intArrayOf(7, 4, 4, 4, 7)
-        'E' -> intArrayOf(7, 4, 7, 4, 7)
-        'H' -> intArrayOf(5, 5, 7, 5, 5)
-        'I' -> intArrayOf(7, 2, 2, 2, 7)
-        'K' -> intArrayOf(5, 5, 6, 5, 5)
-        'L' -> intArrayOf(4, 4, 4, 4, 7)
-        'N' -> intArrayOf(5, 7, 7, 7, 5)
-        'O' -> intArrayOf(7, 5, 5, 5, 7)
-        'R' -> intArrayOf(7, 5, 7, 6, 5)
-        'T' -> intArrayOf(7, 2, 2, 2, 2)
-        'U' -> intArrayOf(5, 5, 5, 5, 7)
-        'Y' -> intArrayOf(5, 5, 2, 2, 2)
-        ' ' -> intArrayOf(0, 0, 0, 0, 0)
-        else -> intArrayOf(7, 5, 5, 5, 7) // unknown → filled box outline
+    fun clear(argb: Int) {
+        sb.append("clear ").append(hex(argb)).append('\n')
     }
-}
 
-private const val GLYPH_W = 3
-private const val GLYPH_H = 5
-private const val GLYPH_ADVANCE = 4 // 3px glyph + 1px gap
+    fun fillRect(x: Int, y: Int, w: Int, h: Int, argb: Int) {
+        sb.append("rect ").append(x).append(' ').append(y).append(' ').append(w).append(' ')
+            .append(h).append(' ').append(hex(argb)).append('\n')
+    }
+
+    fun strokeRect(x: Int, y: Int, w: Int, h: Int, stroke: Int, argb: Int) {
+        sb.append("srect ").append(x).append(' ').append(y).append(' ').append(w).append(' ')
+            .append(h).append(' ').append(stroke).append(' ').append(hex(argb)).append('\n')
+    }
+
+    fun roundRect(x: Int, y: Int, w: Int, h: Int, radius: Int, argb: Int) {
+        sb.append("rrect ").append(x).append(' ').append(y).append(' ').append(w).append(' ')
+            .append(h).append(' ').append(radius).append(' ').append(radius).append(' ')
+            .append(hex(argb)).append('\n')
+    }
+
+    fun circle(cx: Int, cy: Int, r: Int, argb: Int) {
+        sb.append("circle ").append(cx).append(' ').append(cy).append(' ').append(r).append(' ')
+            .append(hex(argb)).append('\n')
+    }
+
+    fun line(x0: Int, y0: Int, x1: Int, y1: Int, stroke: Int, argb: Int) {
+        sb.append("line ").append(x0).append(' ').append(y0).append(' ').append(x1).append(' ')
+            .append(y1).append(' ').append(stroke).append(' ').append(hex(argb)).append('\n')
+    }
+
+    fun drawText(x: Int, y: Int, size: Int, argb: Int, s: String) {
+        sb.append("text ").append(x).append(' ').append(y).append(' ').append(size).append(' ')
+            .append(hex(argb)).append(' ').append(s).append('\n')
+    }
+
+    fun encoded(): String = sb.toString()
+}
 
 // ----- geometry -----
 
@@ -100,64 +98,11 @@ private fun clamp(value: Int, lo: Int, hi: Int): Int {
     return value
 }
 
-// ----- software canvas -----
-
-/** A software pixel buffer; the draw pass fills rectangles into it. */
-class PixelCanvas(val width: Int, val height: Int) {
-    val pixels = IntArray(width * height)
-
-    fun fillRect(x: Int, y: Int, w: Int, h: Int, argb: Int) {
-        var yy = y
-        val yEnd = y + h
-        while (yy < yEnd && yy < height) {
-            if (yy >= 0) {
-                var xx = x
-                val xEnd = x + w
-                while (xx < xEnd && xx < width) {
-                    if (xx >= 0) pixels[yy * width + xx] = argb
-                    xx += 1
-                }
-            }
-            yy += 1
-        }
-    }
-
-    /** Stroke a 1px outline around the rect (top/bottom rows + left/right cols). */
-    fun strokeRect(x: Int, y: Int, w: Int, h: Int, argb: Int) {
-        if (w <= 0 || h <= 0) return
-        fillRect(x, y, w, 1, argb)
-        fillRect(x, y + h - 1, w, 1, argb)
-        fillRect(x, y, 1, h, argb)
-        fillRect(x + w - 1, y, 1, h, argb)
-    }
-
-    fun toAscii(): String {
-        val sb = StringBuilder()
-        var row = 0
-        while (row < height) {
-            var col = 0
-            while (col < width) {
-                sb.append(charFor(pixels[row * width + col]))
-                col += 1
-            }
-            if (row < height - 1) sb.append('\n')
-            row += 1
-        }
-        return sb.toString()
-    }
-
-    /** One hex digit per pixel (the colour index), row-major — the compact
-     * encoding the native PPM writer consumes. */
-    fun toHex(): String {
-        val sb = StringBuilder()
-        var i = 0
-        while (i < pixels.size) {
-            sb.append(('0'.code + pixels[i]).toChar())
-            i += 1
-        }
-        return sb.toString()
-    }
-}
+// Nominal text metrics (layout units) — the measure pass sizes text boxes with
+// these; the Skia render uses the same nominal glyph height so layout and paint
+// agree without a font-metric round trip through the backend.
+private const val GLYPH_H = 5
+private const val GLYPH_ADVANCE = 4 // per-character width incl. gap
 
 // ----- modifier -----
 
@@ -174,6 +119,7 @@ class Modifier private constructor(
     val fillMaxHeight: Boolean,
     val onClick: (() -> Unit)?,
     val border: Color?,
+    val cornerRadius: Int,
 ) {
     private fun copy(
         width: Int = this.width,
@@ -184,7 +130,8 @@ class Modifier private constructor(
         fillMaxHeight: Boolean = this.fillMaxHeight,
         onClick: (() -> Unit)? = this.onClick,
         border: Color? = this.border,
-    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick, border)
+        cornerRadius: Int = this.cornerRadius,
+    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick, border, cornerRadius)
 
     fun size(w: Int, h: Int): Modifier = copy(width = w, height = h)
     fun width(w: Int): Modifier = copy(width = w)
@@ -196,16 +143,17 @@ class Modifier private constructor(
     fun fillMaxSize(): Modifier = copy(fillMaxWidth = true, fillMaxHeight = true)
     fun clickable(onClick: () -> Unit): Modifier = copy(onClick = onClick)
     fun border(c: Color): Modifier = copy(border = c)
+    fun cornerRadius(r: Int): Modifier = copy(cornerRadius = r)
 
     companion object {
-        val None = Modifier(-1, -1, 0, null, false, false, null, null)
+        val None = Modifier(-1, -1, 0, null, false, false, null, null, 0)
     }
 }
 
 // ----- layout node + applier -----
 
 /** The layout node — the applier's node type. Measures + places its children
- * per its [arrangement], then draws its background and children. */
+ * per its [arrangement], then records draw ops for its background and children. */
 class LayoutNode {
     var modifier: Modifier = Modifier.None
     var arrangement: String = "Box" // Box (stack), Row (horizontal), Column (vertical)
@@ -271,11 +219,27 @@ class LayoutNode {
         measuredHeight = clamp(wantH, constraints.minHeight, constraints.maxHeight)
     }
 
-    fun draw(canvas: PixelCanvas, originX: Int, originY: Int, hits: MutableList<HitRegion>) {
+    /** Record draw ops for this node (background/border/text) + children into
+     * [list], scaling layout units by [scale], and collect clickable regions
+     * (in unscaled layout units). */
+    fun draw(list: DisplayList, originX: Int, originY: Int, scale: Int, hits: MutableList<HitRegion>) {
+        val stroke = if (scale < 1) 1 else scale
         val bg = modifier.background
-        if (bg != null) canvas.fillRect(originX, originY, measuredWidth, measuredHeight, bg.argb)
+        if (bg != null) {
+            val x = originX * scale
+            val y = originY * scale
+            val w = measuredWidth * scale
+            val h = measuredHeight * scale
+            if (modifier.cornerRadius > 0) {
+                list.roundRect(x, y, w, h, modifier.cornerRadius * scale, bg.argb)
+            } else {
+                list.fillRect(x, y, w, h, bg.argb)
+            }
+        }
         val brd = modifier.border
-        if (brd != null) canvas.strokeRect(originX, originY, measuredWidth, measuredHeight, brd.argb)
+        if (brd != null) {
+            list.strokeRect(originX * scale, originY * scale, measuredWidth * scale, measuredHeight * scale, stroke, brd.argb)
+        }
         val onClick = modifier.onClick
         if (onClick != null) {
             hits.add(HitRegion(originX, originY, measuredWidth, measuredHeight, onClick))
@@ -283,32 +247,20 @@ class LayoutNode {
         val pad = modifier.padding
         if (text.isNotEmpty()) {
             val fg = textColor ?: Color.White
-            var penX = originX + pad
-            var i = 0
-            while (i < text.length) {
-                val rows = glyph(text[i])
-                var gy = 0
-                while (gy < GLYPH_H) {
-                    val bits = rows[gy]
-                    var gx = 0
-                    while (gx < GLYPH_W) {
-                        val on = (bits shr (GLYPH_W - 1 - gx)) and 1
-                        if (on != 0) canvas.fillRect(penX + gx, originY + pad + gy, 1, 1, fg.argb)
-                        gx += 1
-                    }
-                    gy += 1
-                }
-                penX += GLYPH_ADVANCE
-                i += 1
-            }
+            val size = GLYPH_H * scale
+            // Skia text origin is the baseline; place it a glyph-height below the
+            // padded top-left so it sits inside the box.
+            val tx = (originX + pad) * scale
+            val baseline = (originY + pad) * scale + size
+            list.drawText(tx, baseline, size, fg.argb, text)
         }
         for (child in children) {
-            child.draw(canvas, originX + child.offsetX, originY + child.offsetY, hits)
+            child.draw(list, originX + child.offsetX, originY + child.offsetY, scale, hits)
         }
     }
 }
 
-/** A clickable region collected during the draw pass (absolute bounds + handler). */
+/** A clickable region collected during the draw pass (absolute layout bounds + handler). */
 class HitRegion(val x: Int, val y: Int, val w: Int, val h: Int, val onClick: () -> Unit) {
     fun contains(px: Int, py: Int): Boolean = px >= x && px < x + w && py >= y && py < y + h
 }
@@ -492,7 +444,7 @@ fun PrimaryButton(label: String, onClick: () -> Unit) {
 // ----- driver -----
 
 /** Drives one composition into a LayoutNode tree, measures + lays it out under a
- * fixed [width] x [height], draws it into a software canvas, and returns it. */
+ * fixed [width] x [height], records a display list, and renders it via Skia. */
 class UiRenderer internal constructor(
     private val root: LayoutNode,
     private val width: Int,
@@ -502,50 +454,57 @@ class UiRenderer internal constructor(
 ) {
     private val hits = ArrayList<HitRegion>()
 
-    /** Measure/layout + draw the current tree into a fresh pixel canvas. */
-    private fun renderCanvas(): PixelCanvas {
+    /** Measure/layout + record a display list, collecting hit regions. */
+    private fun build(scale: Int): DisplayList {
         root.measure(Constraints(width, width, height, height))
-        val canvas = PixelCanvas(width, height)
+        val list = DisplayList()
         hits.clear()
-        root.draw(canvas, 0, 0, hits)
-        return canvas
+        root.draw(list, 0, 0, scale, hits)
+        return list
     }
 
-    /** Measure/layout + draw the current tree, returning an ASCII pixel dump. */
-    fun render(): String = renderCanvas().toAscii()
+    /** The current frame's display list text (the deterministic render artifact). */
+    fun displayList(scale: Int): String = build(scale).encoded()
+
+    fun displayList(): String = displayList(1)
 
     /**
-     * Render to a real P6 PPM image at [path] (scaled [scale]x per pixel) via the
-     * native rendering sink, returning a checksum of the encoded bytes — the
-     * headless offscreen-surface dump.
+     * Render the current frame to a PNG at [path] (layout units scaled [scale]x)
+     * through the Skia backend, returning an FNV-1a checksum of the encoded bytes
+     * (0 if the Skia library is unavailable).
      */
-    fun savePpm(path: String, scale: Int): Long {
-        val canvas = renderCanvas()
-        return __composeui_writePpm(path, canvas.width, canvas.height, canvas.toHex(), scale)
+    fun savePng(path: String, scale: Int): Long {
+        val list = build(scale)
+        return renderDisplayListToPng(path, width * scale, height * scale, list.encoded())
     }
 
-    /** Recompose after a state write, then render the next frame. */
-    fun recomposeRender(): String {
+    /** Recompose after a state write, then return the next frame's display list. */
+    fun recomposeDisplayList(scale: Int): String {
         recomposer.recompose()
-        return render()
+        return displayList(scale)
     }
 
+    fun recomposeDisplayList(): String = recomposeDisplayList(1)
+
+    fun click(px: Int, py: Int): String = click(px, py, 1)
+
     /**
-     * Dispatch a pointer click at ([px], [py]) to the topmost clickable region
-     * hit (regions are collected front-to-back during draw, so the last match is
-     * on top), then recompose + re-render. Returns the new frame, or the current
-     * one if nothing was hit.
+     * Dispatch a pointer click at ([px], [py], in layout units) to the topmost
+     * clickable region hit (regions are collected front-to-back, so the last match
+     * is on top), then recompose. Returns the new frame's display list, or the
+     * current one if nothing was hit. Requires a prior [displayList]/[savePng] to
+     * have populated the hit regions.
      */
-    fun click(px: Int, py: Int): String {
+    fun click(px: Int, py: Int, scale: Int): String {
         var handler: (() -> Unit)? = null
         for (region in hits) {
             if (region.contains(px, py)) handler = region.onClick
         }
         if (handler != null) {
             handler()
-            return recomposeRender()
+            return recomposeDisplayList(scale)
         }
-        return render()
+        return displayList(scale)
     }
 
     fun dispose() {

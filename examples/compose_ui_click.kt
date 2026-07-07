@@ -25,7 +25,7 @@ fun main() {
     }
 
     println("--- initial (count=0) ---")
-    println(ui.render())
+    println(ui.displayList())
 
     // The ADD button sits at the top-left of the Gray column (inset by padding);
     // click inside it. Each click increments the counter and re-renders.

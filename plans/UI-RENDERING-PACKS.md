@@ -120,22 +120,24 @@ hashes. CI runs `scripts/fetch-skia.sh` once (like the kotlin checkout).
    exposes `renderDisplayListToPng`. Verified: a Kotlin program renders a correct AA
    PNG through the full stack. `loadSkia` returns null gracefully when absent.
 
-**TODO:**
-
-5. **Display list + Skia draw in `klio.compose.ui`** — the draw pass records draw ops
-   (rect/rrect/circle/line/text with float coords + ARGB) instead of writing pixels;
-   `UiRenderer.savePng(path)` hands the list to the host binding. Delete `PixelCanvas`,
-   the bitmap font, `toAscii`/`toHex`, and `src/compose_ui` PPM code. Measure/layout
+5. **Display list + Skia draw in `klio.compose.ui`** — DONE. The draw pass records a
+   `DisplayList` of ops (rect/srect/rrect/circle/line/text, ARGB, real colors);
+   `UiRenderer` exposes `displayList(scale)` (the deterministic artifact) and
+   `savePng(path, scale)`. `PixelCanvas`, the 3×5 bitmap font, `toAscii`/`toHex`, and
+   the `src/compose_ui` PPM sink (`writePpm` + palette) are deleted. Measure/layout
    unchanged.
-6. **Bundle a font** — the empty `SkFontMgr` has no faces, so `_draw_text` currently
-   no-ops. Embed a small permissive `.ttf` (e.g. a DejaVu/Inter subset) loaded via
-   `SkTypeface` `makeFromData`, or wire `skparagraph` for real layout.
-7. **Tests + examples** — assert on the display-list text dump (readable,
-   deterministic, no Skia needed) + a PNG-bytes hash; migrate `compose_ui*` examples
-   to PNG output.
+6. **Font** — DONE. The shim loads a typeface from `$KLIO_SKIA_FONT` or the first
+   available system font (Noto/DejaVu/Liberation/macOS/windows paths); `replay()`
+   handles the `text` op. Verified: `savePng` produces a PNG with real anti-aliased
+   text. (Bundling a `.ttf` for a fontless host, or `skparagraph` for wrapping, later.)
+7. **Tests + examples** — DONE. `compose_ui{,_click,_lazy,_material}.kt` print the
+   display list (asserted by the corpus, Skia-independent); `compose_ui_png.kt`
+   (renamed from `_ppm`) prints the list + calls `savePng`. The corpus was
+   regenerated; check_examples/differential/e2e green.
 
 Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), a platform window + live input
-event loop, and macos/windows shims (same C ABI, per-OS lib variant).
+event loop, bundling a `.ttf` + `skparagraph` text layout, and verifying the macos/
+windows shim recipes on those hosts.
 
 ### Vendor the real compose.ui / foundation / material
 
