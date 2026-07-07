@@ -84,6 +84,32 @@ points:
   eager resolution OFF and ON and reports any divergence between the
   two modes.
 
+## 4a. Library commonTest suites (project mode)
+
+Each kotlinx/ktor library is a *project* (`kotlin-klio/klio-*`) whose
+`klio.toml` declares `[[test]]` source sets pointing at the upstream
+`commonTest` tree. `klio test <library-dir>` builds+installs the pack
+and composes those test sources into ONE module — the accurate way to
+run a library's own suite (running files individually breaks
+cross-file resolution and mis-counts). Native runner options replace
+the external sweep's ad-hoc flags:
+
+- `--filter <substring>` — one class/method/file (retires the sweep's
+  `--filter`).
+- `--format json` — machine-readable counts + per-test status for a CI
+  ratchet (`klio test <library> --format=json` + a floor assertion).
+- `--list` — enumerate `@Test` names without running.
+- `--isolate [--timeout <s>]` — opt-in debug: one sub-process per test
+  with a per-test timeout, to pinpoint a hanging (`TIMEOUT`) or crashing
+  (`CRASH`) test. The default single in-process run is faster and is
+  the norm; a genuine hang is an interpreter/test bug to fix, not to
+  paper over. See [Testing with KLIO](../testing.md#runner-options).
+
+The `src/itests/*_commontest.zig` suites drive these per library and
+ratchet the pass count. The migration from the per-file driver + the
+Python sweep to a single `klio test <project> --format=json` is
+tracked in `plans/project-manifest.md`.
+
 ## 5. Pack smoke tests
 
 Every pack ships a smoke flow:

@@ -48,9 +48,11 @@ The full common assertion surface is available: `assertEquals`,
 ## Running tests
 
 ```
+klio test                          # the project in the current directory
 klio test path/to/MyTest.kt        # a single file
 klio test src/test                 # every .kt under a directory (recursive)
 klio test a.kt b.kt                 # several files as one module
+klio test kotlin-klio/klio-kotlinx-io   # a project (its klio.toml [[test]] sets)
 ```
 
 Each test prints `PASSED`, `FAILED` (with the failure message), or `SKIPPED`
@@ -65,8 +67,40 @@ topLevelTestsWorkToo PASSED
 3 tests, 3 passed, 0 failed, 0 skipped
 ```
 
-`klio test` accepts the same `--feature <pack>/<feature>` and `--virtual-time`
-options as `klio run`.
+### Project mode
+
+Given a directory that carries a `klio.toml` manifest with `[[test]]` source
+sets, `klio test <dir>` (or `klio test` with the manifest in the current
+directory) builds+installs the project's pack, then composes its active test
+sources into **one module** and runs them. Whole-module composition resolves
+cross-file references correctly — running the same files individually breaks
+cross-file resolution and mis-counts. `[[test]]` sets can be feature-scoped;
+`--all` (default) runs core + every feature module, `--feature <name>` narrows
+to core + the named feature(s). See [Authoring a pack](packs/authoring.md) for
+the `[[test]]` manifest schema.
+
+### Runner options
+
+- `--filter <substring>` — run only tests whose `Class`, `Class.method`, or
+  file name contains the substring.
+- `--format <plain|json>` — `plain` (default) is the human-facing per-test list
+  plus summary; `json` emits a machine-readable object
+  (`{"total":N,"passed":P,"failed":F,"skipped":S,"tests":[{"name","outcome","detail"}]}`)
+  for CI ratchets.
+- `--list` — print the discovered `@Test` names without running any.
+- `--isolate [--timeout <s>]` — an opt-in debugging mode that runs **each test in
+  its own sub-process** with a per-test wall-clock timeout (default 60s), so a
+  test that hangs is pinpointed as `TIMEOUT` and one that crashes as `CRASH`,
+  instead of taking the whole suite down. The default single in-process run is
+  faster; reach for `--isolate` only to locate a bad test.
+- `--all` / `--feature <pack>/<feature>` — select which feature modules'
+  sources and tests are active.
+- `--virtual-time` — deterministic virtual time for coroutines (as in `klio run`).
+
+```
+klio test kotlin-klio/klio-kotlinx-io --filter ByteStringTest --format json
+klio test kotlin-klio/klio-kotlinx-datetime --isolate --timeout 5   # find the hang
+```
 
 ## The `kotlin.test` pack
 

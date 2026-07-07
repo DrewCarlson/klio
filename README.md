@@ -38,7 +38,7 @@ fun main() {
 | Command                    | What it does                                            |
 | -------------------------- | ------------------------------------------------------- |
 | `klio run <file...>`       | Execute a `.kt` file, or a set of files as one module   |
-| `klio test <file\|dir...>` | Run `kotlin.test` `@Test` functions                     |
+| `klio test [path]`         | Run `@Test` functions — a file, dir, or project (`klio.toml` `[[test]]` sets); `--filter`, `--format=json`, `--list`, `--isolate` |
 | `klio check <file...>`     | Resolve + type-check, emit diagnostics (plain/json/sarif) |
 | `klio lex <file>`          | Print the token stream                                  |
 | `klio parse <file>`        | Print the AST                                           |

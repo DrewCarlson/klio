@@ -125,10 +125,13 @@ not hiding them, is the point.)
   as pre-installed).
 - [x] Test-runner correctness — collect a class's tests from its own decl (not
   a same-named class in another package); "no tests found" for empty runs.
-- [~] Phase 2 — runner ergonomics: `--filter` DONE (class + method name
-  substring, retires the sweep's filter); feature selection DONE (`--all` /
-  `--feature X`, default = all feature modules). Remaining: `--isolate`
-  (opt-in debug), `--format=json`.
+- [x] Phase 2 — runner ergonomics, complete: `--filter` (class + method name
+  substring, retires the sweep's filter); feature selection (`--all` /
+  `--feature X`, default = all feature modules); `--format=json` (machine-
+  readable counts + per-test status/detail for CI ratchets); `--list` (discover
+  `@Test` names without running); `--isolate [--timeout <s>]` (opt-in debug:
+  one sub-process per test with a parent-enforced per-test timeout, so a hang
+  is pinpointed as TIMEOUT / a crash as CRASH instead of taking down the suite).
 - [ ] Phase 3 — migrate harness + packs; retire the sweep.
 - [~] Phase 4 — grind each pack's commonTest to 100%. Interpreter bugs found +
   fixed (not worked around):
