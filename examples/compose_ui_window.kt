@@ -5,8 +5,10 @@
 // with no windowing backend runApp returns immediately (headless-safe), so this
 // example has no baked corpus output.
 
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import klio.compose.ui.Button
 import klio.compose.ui.Color
 import klio.compose.ui.Column
@@ -18,15 +20,13 @@ import klio.compose.ui.runApp
 fun main() {
     // 64x40 layout units at 8x scale = a 512x320 window.
     runApp(64, 40, 8, "klio compose", 600) {
-        val count = remember { mutableStateOf(0) }
+        var count by remember { mutableStateOf(0) }
         Column(Modifier.None.background(Color(0xFF10141A.toInt())).padding(2)) {
             Text("KLIO COMPOSE", Color.Cyan, Modifier.None)
             Spacer(1, 2)
-            Button("ADD", Modifier.None.background(Color.Blue).cornerRadius(1)) {
-                count.value = count.value + 1
-            }
+            Button("ADD", Modifier.None.background(Color.Blue).cornerRadius(1)) { count++ }
             Spacer(1, 2)
-            Text("COUNT " + count.value, Color.White, Modifier.None)
+            Text("COUNT " + count, Color.White, Modifier.None)
         }
     }
 }

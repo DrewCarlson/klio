@@ -111,6 +111,17 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // delegate would need a true read-through dispatch
         // and is tracked separately).
         const delegate = try lowerExpr(b, de);
+        // A `var x by D` needs write-through: keep the delegate under a hidden
+        // binding (`x$klio_delegate`) so `x = v` can dispatch
+        // `D.setValue(null, ::x, v)` — see storeCombinedToTarget, which detects it
+        // by name (in scope directly, or captured as an outer inside a closure).
+        // Bound as an immutable val — the delegate reference itself does not
+        // change — so a nested lambda captures it by value. Reads of `x` still use
+        // the eager-once getValue cache below.
+        if (p.mutable) {
+            const dname = try std.fmt.allocPrint(b.allocator, "{s}$klio_delegate", .{p.name.name});
+            try b.bind(dname, delegate);
+        }
         const null_arg = try b.emitConst(.Null);
         const prop_ref = b.allocReg();
         const pname = try b.module.internConst(b.allocator, .{ .String = p.name.name });
@@ -725,6 +736,34 @@ fn lowerAssign(
     return null;
 }
 
+/// Emit `delegate.setValue(null, ::prop, value)` for a `var x by D` write-through
+/// (the delegate is bound under `dname`). Capture-aware resolve so the write works
+/// inside a closure that captured the delegate.
+fn emitDelegateSetValue(b: *FuncBuilder, dname: []const u8, prop: []const u8, value: Reg) Allocator.Error!void {
+    const delegate = try lambda_body.resolveCapture(b, dname);
+    const null_arg = try b.emitConst(.Null);
+    const prop_ref = b.allocReg();
+    const pname = try b.module.internConst(b.allocator, .{ .String = prop });
+    try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
+    // Contiguous args: null (thisRef), ::prop, value.
+    const args_start = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
+    const a1 = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = a1, .src = prop_ref } });
+    const a2 = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = a2, .src = value } });
+    const dst = b.allocReg();
+    const name_c = try b.module.internConst(b.allocator, .{ .String = "setValue" });
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = delegate,
+        .name = name_c,
+        .args = args_start,
+        .n_args = 3,
+        .arg_names = &.{},
+    } });
+}
+
 // Route the already-combined value to the assignment target: a single
 // Path name (local / cell / capture / member / global), a Member field,
 // or an Index `set` call. Shared by compound-assign, prefix ++/--, and
@@ -799,6 +838,20 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 const n = try b.module.internConst(b.allocator, .{ .String = target_name });
                 try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
             }
+            // Write-through for a `var x by D` delegate: if the hidden delegate
+            // binding (bound at the decl) is in scope here — directly or as a
+            // captured outer inside a closure — dispatch setValue so a MutableState
+            // (or any writable delegate) receives the write and it survives
+            // recomposition, not just the eager-once local cache above. A stack
+            // buffer avoids allocating for the common (non-delegated) case; only a
+            // real match heap-dupes a stable name for resolveCapture.
+            var namebuf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{seg})) |dname_stack| {
+                if (b.resolve(dname_stack) != null or b.knowsOuter(dname_stack)) {
+                    const dname = try b.allocator.dupe(u8, dname_stack);
+                    try emitDelegateSetValue(b, dname, seg, combined);
+                }
+            } else |_| {}
         },
         .Member => |m| {
             if (m.safe) return;
