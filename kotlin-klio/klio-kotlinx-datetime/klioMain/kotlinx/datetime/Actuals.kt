@@ -466,6 +466,10 @@ fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
     return Instant.fromEpochSeconds(r[0], r[1])
 }
 
+/** The instant at the start of this day (midnight) in [timeZone]. */
+fun LocalDate.atStartOfDayIn(timeZone: TimeZone): Instant =
+    LocalDateTime(this, LocalTime(0, 0, 0, 0)).toInstant(timeZone)
+
 // Calendar-aware period add. klio's overload resolver picks
 // `Instant.plus(Duration)` (kotlin.time member) vs this by signature
 // now, but the upstream `Instant.plus(DateTimePeriod, TimeZone)`
