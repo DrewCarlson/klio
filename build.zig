@@ -1040,17 +1040,26 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.
     const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
     const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
-    const want_gpu = b.option(bool, "gpu", "Build the optional Ganesh+EGL GPU surface for the Skia shim (linux; opt-in, falls back to raster)") orelse false;
-    const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; opt-in, unverified)") orelse false;
+    const want_gpu = b.option(bool, "gpu", "Build the optional GPU surface for the Skia shim (linux Ganesh+EGL, or macOS Metal with -Dcocoa; opt-in, falls back to raster)") orelse false;
+    const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; opt-in)") orelse false;
 
     const run = b.addSystemCommand(&.{cxx});
     run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
     // The Cocoa backend needs the shim compiled as Objective-C++; -x applies to the
     // source that follows, so it must precede the source file.
-    if (os == .macos and want_cocoa) run.addArgs(&.{ "-DKLIO_COCOA", "-x", "objective-c++" });
+    if (os == .macos and want_cocoa) {
+        run.addArgs(&.{ "-DKLIO_COCOA", "-x", "objective-c++" });
+        // Metal GPU surface for the Cocoa window (opt-in via -Dgpu). The ganesh
+        // Metal backend is already in the linked archives; this enables the code
+        // path. Falls back to raster if Metal bring-up fails at runtime.
+        if (want_gpu) run.addArg("-DKLIO_METAL");
+    }
     run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
     // The bundled fallback font, baked into a byte array (scripts/gen-font-data.py).
     run.addFileArg(b.path("src/compose_ui/font_data.cpp"));
+    // Reset the input language so the .a archives that follow are linked, not
+    // compiled as Objective-C++ source (the -x above applies to everything after).
+    if (os == .macos and want_cocoa) run.addArgs(&.{ "-x", "none" });
     run.addArg("-o");
     const so = run.addOutputFileArg(skiaLibName(os));
 

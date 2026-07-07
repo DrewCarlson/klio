@@ -7,6 +7,7 @@
 //! interp_ir run, with stdlib + kotlinx + ktor intrinsics registered.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const span = @import("span");
 const SourceMap = span.SourceMap;
@@ -938,6 +939,13 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
+    // macOS: keep the interpreter on the process main thread (with a large stack
+    // via an in-thread stack switch) so a program that opens a Compose UI window
+    // can drive AppKit and the single-threaded Skia Metal context, both of which
+    // must run on the main thread. Elsewhere, a large-stack worker thread is fine.
+    if (builtin.os.tag == .macos) {
+        return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+    }
     return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 

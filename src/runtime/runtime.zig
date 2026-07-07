@@ -193,6 +193,7 @@ pub const startRunDeadline = safety_mod.startRunDeadline;
 pub const runCapped = safety_mod.runCapped;
 pub const CapResult = safety_mod.CapResult;
 pub const runOnBigStack = safety_mod.runOnBigStack;
+pub const runOnBigStackMainThread = safety_mod.runOnBigStackMainThread;
 pub const INTERPRET_STACK_SIZE = safety_mod.INTERPRET_STACK_SIZE;
 
 test {

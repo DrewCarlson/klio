@@ -30,7 +30,13 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkTypeface.h"
 #include "include/encode/SkPngEncoder.h"
+// Font manager factory: the macOS Skia pack ships CoreText, not the custom-empty
+// port (that symbol is absent), so select per platform.
+#if defined(__APPLE__)
+#include "include/ports/SkFontMgr_mac_ct.h"
+#else
 #include "include/ports/SkFontMgr_empty.h"
+#endif
 
 // Optional GPU (Ganesh + EGL) backend — off by default. When built with -DKLIO_GPU
 // (and linked against libskia_ganesh_ext + libEGL), klio_skia_new_gpu returns a
@@ -115,7 +121,11 @@ bool g_fonts_tried = false;
 void ensureFonts() {
     if (g_fonts_tried) return;
     g_fonts_tried = true;
+#if defined(__APPLE__)
+    g_fontMgr = SkFontMgr_New_CoreText(nullptr);
+#else
     g_fontMgr = SkFontMgr_New_Custom_Empty();
+#endif
     if (g_fontMgr) {
         if (const char* env = std::getenv("KLIO_SKIA_FONT")) {
             g_typeface = g_fontMgr->makeFromFile(env, 0);
@@ -688,10 +698,26 @@ void klio_win_close(KlioWindow* kw) {
 #elif defined(__APPLE__) && defined(KLIO_COCOA)
 
 // Cocoa backend (compiled as Objective-C++ — build.zig adds -x objective-c++ on
-// macOS with -DKLIO_COCOA). Presents by setting the content view's layer contents
-// to a CGImage of the surface. Best-effort: written against the Cocoa API but NOT
-// compiled or run-verified in this environment (no macOS SDK/host here).
+// macOS with -DKLIO_COCOA). Two present paths behind one C ABI:
+//   raster — an N32 surface blitted to the view's layer as a CGImage.
+//   Metal  — (-DKLIO_METAL, via -Dgpu) a CAMetalLayer whose per-frame drawable is
+//            wrapped as a Ganesh GPU surface; Skia renders on the GPU and the
+//            drawable is presented through the Metal command queue.
 #import <Cocoa/Cocoa.h>
+#include <cstdio>
+
+#if defined(KLIO_METAL)
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include "include/core/SkColorSpace.h"
+#include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
+#include "include/gpu/ganesh/mtl/SkSurfaceMetal.h"
+#include "include/ports/SkCFObject.h"
+#endif
 
 struct KlioWindow {
     NSWindow* window;
@@ -699,7 +725,55 @@ struct KlioWindow {
     int w;
     int h;
     KlioSurface* surface;
+#if defined(KLIO_METAL)
+    CAMetalLayer* metalLayer;  // nil when the raster path is in use
+    id<MTLDevice> device;
+    id<MTLCommandQueue> queue;
+    sk_sp<GrDirectContext> grContext;
+    GrMTLHandle drawable;  // this frame's CAMetalDrawable (retained until present)
+#endif
 };
+
+#if defined(KLIO_METAL)
+// Bring up a Metal device + Ganesh context and attach a CAMetalLayer to the view.
+// Returns true when the GPU path is live; false leaves the window on raster.
+static bool klioMetalInit(KlioWindow* kw, int w, int h) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();  // +1 (non-ARC)
+    if (!device) return false;
+    id<MTLCommandQueue> queue = [device newCommandQueue];  // +1
+    if (!queue) {
+        [device release];
+        return false;
+    }
+    CAMetalLayer* layer = [[CAMetalLayer layer] retain];  // own our ref
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = NO;  // Skia renders into the drawable's texture
+    layer.contentsScale = 1.0;
+    layer.drawableSize = CGSizeMake(w, h);
+    [kw->view setLayer:layer];
+    [kw->view setWantsLayer:YES];
+
+    GrMtlBackendContext backend = {};
+    backend.fDevice.retain((GrMTLHandle)device);
+    backend.fQueue.retain((GrMTLHandle)queue);
+    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend);
+    if (!ctx) {
+        [layer release];
+        [queue release];
+        [device release];
+        return false;
+    }
+    kw->device = device;
+    kw->queue = queue;
+    kw->metalLayer = layer;
+    kw->grContext = ctx;
+    kw->drawable = nullptr;
+    if (std::getenv("KLIO_SKIA_VERBOSE"))
+        fprintf(stderr, "[klio-skia] window backend: Metal (GPU)\n");
+    return true;
+}
+#endif  // KLIO_METAL
 
 extern "C" {
 
@@ -719,24 +793,83 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         [window setReleasedWhenClosed:NO];  // we own its lifetime (non-ARC)
         if (title) [window setTitle:[NSString stringWithUTF8String:title]];
         NSView* view = [window contentView];
-        [view setWantsLayer:YES];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
-        auto* kw = new KlioWindow{window, view, w, h, nullptr};
+        auto* kw = new KlioWindow();
+        kw->window = window;
+        kw->view = view;
+        kw->w = w;
+        kw->h = h;
+        kw->surface = nullptr;
+#if defined(KLIO_METAL)
+        kw->metalLayer = nil;
+        kw->device = nil;
+        kw->queue = nil;
+        kw->drawable = nullptr;
+        if (klioMetalInit(kw, w, h)) return kw;  // GPU path; surface is per-frame
+#endif
+        // Raster fallback: a layer-backed view presented from a CGImage.
+        [view setWantsLayer:YES];
         kw->surface = klio_skia_new(w, h);
         if (!kw->surface) {
             [window close];
             delete kw;
             return nullptr;
         }
+        if (std::getenv("KLIO_SKIA_VERBOSE"))
+            fprintf(stderr, "[klio-skia] window backend: raster (CPU)\n");
         return kw;
     }
 }
 
-KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
+KlioSurface* klio_win_surface(KlioWindow* kw) {
+    if (!kw) return nullptr;
+#if defined(KLIO_METAL)
+    if (kw->grContext && kw->metalLayer) {
+        // Wrap the layer's next drawable as a fresh GPU surface. Drop the previous
+        // frame's surface/drawable if they were never presented.
+        if (kw->surface) {
+            klio_skia_free(kw->surface);
+            kw->surface = nullptr;
+        }
+        if (kw->drawable) {
+            CFRelease(kw->drawable);
+            kw->drawable = nullptr;
+        }
+        GrMTLHandle drawable = nullptr;
+        sk_sp<SkSurface> surf = SkSurfaces::WrapCAMetalLayer(
+            kw->grContext.get(), (GrMTLHandle)kw->metalLayer, kTopLeft_GrSurfaceOrigin,
+            1, kBGRA_8888_SkColorType, nullptr, nullptr, &drawable);
+        if (!surf || !drawable) return nullptr;
+        kw->drawable = (GrMTLHandle)CFRetain(drawable);  // keep it alive to present
+        kw->surface = new KlioSurface();
+        kw->surface->surface = surf;
+        return kw->surface;
+    }
+#endif
+    return kw->surface;
+}
 
 void klio_win_present(KlioWindow* kw) {
-    if (!kw || !kw->surface) return;
+    if (!kw) return;
+#if defined(KLIO_METAL)
+    if (kw->grContext && kw->metalLayer) {
+        if (!kw->surface || !kw->drawable) return;
+        kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+        @autoreleasepool {
+            id<CAMetalDrawable> d = (id<CAMetalDrawable>)kw->drawable;
+            id<MTLCommandBuffer> cmd = [kw->queue commandBuffer];
+            [cmd presentDrawable:d];
+            [cmd commit];
+        }
+        klio_skia_free(kw->surface);
+        kw->surface = nullptr;
+        CFRelease(kw->drawable);
+        kw->drawable = nullptr;
+        return;
+    }
+#endif
+    if (!kw->surface) return;
     SkPixmap pm;
     if (!kw->surface->surface->peekPixels(&pm)) return;
     @autoreleasepool {
@@ -795,12 +928,19 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
         [NSApp sendEvent:ev];
         // A closed window is no longer visible.
         if (![kw->window isVisible]) return 2;
-        // A resized content view: recreate the surface to match.
+        // A resized content view: resize the drawable (Metal) or the raster surface.
         const int nw = static_cast<int>([kw->view bounds].size.width);
         const int nh = static_cast<int>([kw->view bounds].size.height);
         if (type == 0 && (nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
-            if (kw->surface) klio_skia_free(kw->surface);
-            kw->surface = klio_skia_new(nw, nh);
+#if defined(KLIO_METAL)
+            if (kw->grContext && kw->metalLayer) {
+                kw->metalLayer.drawableSize = CGSizeMake(nw, nh);
+            } else
+#endif
+            {
+                if (kw->surface) klio_skia_free(kw->surface);
+                kw->surface = klio_skia_new(nw, nh);
+            }
             kw->w = nw;
             kw->h = nh;
             if (outA) *outA = nw;
@@ -814,6 +954,25 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     if (kw->surface) klio_skia_free(kw->surface);
+#if defined(KLIO_METAL)
+    if (kw->drawable) {
+        CFRelease(kw->drawable);
+        kw->drawable = nullptr;
+    }
+    kw->grContext.reset();
+    if (kw->metalLayer) {
+        [kw->metalLayer release];
+        kw->metalLayer = nil;
+    }
+    if (kw->queue) {
+        [kw->queue release];
+        kw->queue = nil;
+    }
+    if (kw->device) {
+        [kw->device release];
+        kw->device = nil;
+    }
+#endif
     @autoreleasepool {
         [kw->window close];
     }
