@@ -336,6 +336,17 @@ pub fn build(b: *std.Build) void {
         "Optimize mode for the program-running test harnesses (default ReleaseSafe)",
     ) orelse .ReleaseSafe;
 
+    // The Compose-UI Skia backend: libklio_skia.so (the compose_ui module
+    // dlopens it) is built by the system C++ toolchain because the prebuilt
+    // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
+    // see plans/UI-RENDERING-PACKS.md. Defaults ON when the vendored libs are
+    // present (`scripts/fetch-skia.sh`); a checkout without them stays green.
+    const skia_libs_present = blk: {
+        b.build_root.handle.access(b.graph.io, "third_party/skia/out/Release-linux-x64/libskia.a", .{}) catch break :blk false;
+        break :blk true;
+    };
+    const want_skia = b.option(bool, "skia", "Build the Compose-UI Skia rendering backend (default: on when third_party/skia is present)") orelse skia_libs_present;
+
     // Memoized configure-phase directory walks for declareDataDirs.
     var data_memo = std.StringHashMap([]const []const u8).init(b.allocator);
 
@@ -485,6 +496,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+
+    // Build + install the Compose-UI Skia backend as a shared library the
+    // compose_ui module dlopens at runtime. Built with system g++ (libstdc++
+    // ABI); the resulting .so is self-contained (static Skia + deps linked in).
+    const skia_lib_step = b.step("skia-lib", "Build + install the Compose-UI Skia backend (libklio_skia.so)");
+    if (want_skia) {
+        if (buildSkiaShim(b)) |so| {
+            const inst = b.addInstallFileWithDir(so, .lib, "libklio_skia.so");
+            skia_lib_step.dependOn(&inst.step);
+            b.getInstallStep().dependOn(&inst.step);
+        } else {
+            std.log.warn("-Dskia set but third_party/skia not found; run scripts/fetch-skia.sh", .{});
+        }
+    }
 
     // Harness-optimized `klio` for the child-spawning itests: each spawned
     // program pays the embedded-stdlib assembly, so those tests point at
@@ -883,4 +908,37 @@ fn buildZstd(
     lib.installHeader(dep.path("lib/zstd.h"), "zstd.h");
 
     return lib;
+}
+
+/// Build libklio_skia.so (the Compose-UI Skia backend) with the system C++
+/// toolchain. The prebuilt Skia archives (fetch-skia.sh) are compiled against
+/// GNU libstdc++ with the old string ABI, so the shim + Skia must be linked by
+/// g++ (not zig cc/libc++). The archives are -fPIC, so they link into a
+/// self-contained shared object the compose_ui module dlopens at runtime.
+/// Returns null when the vendored libs are absent.
+fn buildSkiaShim(b: *std.Build) ?std.Build.LazyPath {
+    const io = b.graph.io;
+    const skia_root = "third_party/skia";
+    const lib_dir = skia_root ++ "/out/Release-linux-x64";
+    b.build_root.handle.access(io, lib_dir ++ "/libskia.a", .{}) catch return null;
+
+    const run = b.addSystemCommand(&.{ "g++", "-std=c++17", "-fPIC", "-shared", "-I" ++ skia_root });
+    run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    run.addArg("-o");
+    const so = run.addOutputFileArg("libklio_skia.so");
+
+    // Whole Skia archive set as a link group (circular inter-archive deps).
+    run.addArg("-Wl,--start-group");
+    var dir = b.build_root.handle.openDir(io, lib_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch return null;
+    defer walker.deinit();
+    while (walker.next(io) catch return null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".a")) {
+            run.addArg(b.fmt("{s}/{s}", .{ lib_dir, entry.path }));
+        }
+    }
+    run.addArg("-Wl,--end-group");
+    run.addArgs(&.{ "-lstdc++", "-lpthread", "-ldl", "-lm" });
+    return so;
 }

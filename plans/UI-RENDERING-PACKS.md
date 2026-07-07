@@ -74,56 +74,52 @@ Because freetype/harfbuzz/icu/png are bundled, CPU raster + PNG encode + real te
 shaping all work offline with essentially no system deps (pthread/dl). No GPU
 context needed for a headless deterministic backend.
 
-**Proven (spike done).** A minimal shim — `SkSurfaces::Raster(SkImageInfo::MakeN32Premul)`
-→ `SkCanvas` `clear`/`drawRect`/`drawRRect`/`drawCircle` (anti-aliased `SkPaint`) →
-`surface->peekPixels` → `SkPngEncoder::Encode(SkWStream*, SkPixmap, Options)` —
-compiles and renders a correct anti-aliased PNG on this box. **Critical constraint:
-Skia was built against GNU libstdc++ with the OLD string ABI** (undefined symbols
-`std::string::_Rep::_S_empty_rep_storage`, `std::__throw_length_error`), so it links
-with **system g++ (`/usr/bin/g++` 13.3, libstdc++)**, NOT `zig c++` (which pulls
-LLVM libc++ → ABI mismatch, unresolved symbols). Link line that works:
-`g++ -std=c++17 -Ithird_party/skia shim.cpp -Wl,--start-group
-third_party/skia/out/Release-linux-x64/*.a -Wl,--end-group -lpthread -ldl`.
+**Decision (2026-07): Skia-only.** The optional software rasterizer (PixelCanvas +
+3×5 bitmap font + PPM sink, ~250 lines) is being dropped rather than maintained as a
+second draw backend. Skia is the single renderer; deterministic tests come from a
+draw-op **display list** (text-dumpable, Skia-independent to assert) plus PNG-bytes
+hashes. CI runs `scripts/fetch-skia.sh` once (like the kotlin checkout).
 
-**Plan:**
+**DONE (build backend wired + proven):**
 
-1. **Vendor the libs.** A `scripts/fetch-skia.sh` downloads + extracts the pinned
-   release into `third_party/skia/{include,modules,out}` (gitignored; fetched on
-   demand like the kotlin stdlib checkout). Pin the tag `m150-1f14f1166a`.
-2. **C++ shim** `src/compose_ui/skia_shim.cpp` — Skia's public API is C++, so expose
-   the `DrawScope` primitives klio needs as `extern "C"` functions: create a raster
-   `SkSurface` (`SkSurfaces::Raster(SkImageInfo)`), `clear`, `drawRect`/`drawRRect`/
-   `drawCircle`/`drawPath`/`drawLine`/`drawOval`, `SkPaint` (color/style/stroke-width/
-   antialias/shader-gradient), text via `SkFont`+`SkTextBlob` (simple) then
-   `skparagraph::Paragraph` (real layout/wrapping), `readPixels`, and
-   `SkPngEncoder::Encode` → bytes. Opaque handle types (surface/paint/path/font) over
-   the FFI boundary. Zig calls these via `extern "C"` decls — no C++ in Zig.
-3. **build.zig** — because of the libstdc++ ABI constraint, the shim CANNOT be built
-   with `zig cc` (libc++). Build it + link Skia with **system g++** invoked from
-   build.zig (`b.addSystemCommand("g++", …)`): compile `skia_shim.cpp` (`-std=c++17`,
-   `-Ithird_party/skia`) and archive it with the Skia `*.a` into a single
-   `libklio_skia.a` (or a `.so`). Then the `klio` binary links that archive +
-   `-lstdc++ -lpthread -ldl` (`exe.linkSystemLibrary("stdc++")`, `exe.addObjectFile`/
-   `addLibraryPath`). Alternatively produce `libklio_skia.so` and `dlopen` it from the
-   `src/compose_ui` module (keeps libstdc++ fully out of the zig link). Gate behind a
-   `-Dskia` build option **ON by default**: Skia is the primary backend once the libs
-   are fetched (`scripts/fetch-skia.sh`); the software PPM path is the explicit
-   `-Dskia=false` fallback for a checkout without the download.
-4. **Wire into `src/compose_ui/`** — the existing module is already the seam
-   (`mergedHostBindings`, kept out of the interpreter). Add Skia-backed host
-   intrinsics beside the PPM sink; `UiRenderer` gets a `savePng(path, scale)` that
-   routes the `PixelCanvas`/`DrawScope` ops to the shim instead of the palette
-   rasterizer. Keep the software PPM path as the no-Skia fallback.
-5. **Richer `DrawScope` in `klio.compose.ui`** — with Skia behind it, the draw pass
-   can do real anti-aliased fills, stroked/rounded rects, gradients, clips, and real
-   font glyphs (SkFont/skparagraph) instead of the 3×5 bitmap font. The measure/
-   layout pass is unchanged; only the draw backend swaps.
-6. **Deterministic tests** — headless raster → PNG; hash the encoded bytes (as the
-   PPM sink already returns a checksum) for corpus assertions. GPU/windowing later.
+1. **`scripts/fetch-skia.sh`** — downloads + extracts the pinned `m150-1f14f1166a`
+   release into `third_party/skia/{include,modules,out}` (gitignored) for the host
+   os/arch. The archive is self-contained (`libskia.a` + all deps).
+2. **`src/compose_ui/skia_shim.cpp`** — the `extern "C"` DrawScope: `klio_skia_new`/
+   `_free`/`_clear`/`_fill_rect`/`_stroke_rect`/`_fill_rrect`/`_fill_circle`/
+   `_draw_line`/`_draw_text` (SkFont, needs a bundled font — see below) /`_save_png`/
+   `_encode_png`. Anti-aliased `SkPaint`, N32-premul raster `SkSurface`. Zig calls
+   these via `extern` — no C++ in Zig.
+3. **build.zig** — `buildSkiaShim` runs system **g++** (the libstdc++ ABI constraint:
+   Skia uses the OLD GNU string ABI, `std::string::_Rep::_S_empty_rep_storage`; `zig
+   cc`/libc++ cannot link it) to build a self-contained **`libklio_skia.so`** (Skia
+   `.a` are `-fPIC`, so a shared object links cleanly). `-Dskia` build option, ON by
+   default when `third_party/skia` is present; `-Dskia=false` skips it. `zig build`
+   (and `zig build skia-lib`) install the `.so` to `zig-out/lib`. **dlopen chosen**
+   over static-link so libstdc++ stays entirely out of the zig link. Verified: `zig
+   build` produces `klio` + `libklio_skia.so`; the `.so` dlopens + renders a correct
+   anti-aliased PNG.
 
-Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), a platform window + live
-input event loop (or a headless synthetic-input driver), and macos/windows shims
-(same C ABI, per-OS lib variant).
+**TODO:**
+
+4. **Zig dlopen binding** in `src/compose_ui/compose_ui.zig` — `std.DynLib` opens the
+   `.so` (path: `KLIO_SKIA_LIB` env → `libklio_skia.so` via loader path → relative to
+   the exe), lazily + cached, resolves the `klio_skia_*` symbols, and a host
+   intrinsic replays a display list → PNG. Replaces the PPM sink registration.
+5. **Display list + Skia draw in `klio.compose.ui`** — the draw pass records draw ops
+   (rect/rrect/circle/line/text with float coords + ARGB) instead of writing pixels;
+   `UiRenderer.savePng(path)` hands the list to the host binding. Delete `PixelCanvas`,
+   the bitmap font, `toAscii`/`toHex`, and `src/compose_ui` PPM code. Measure/layout
+   unchanged.
+6. **Bundle a font** — the empty `SkFontMgr` has no faces, so `_draw_text` currently
+   no-ops. Embed a small permissive `.ttf` (e.g. a DejaVu/Inter subset) loaded via
+   `SkTypeface` `makeFromData`, or wire `skparagraph` for real layout.
+7. **Tests + examples** — assert on the display-list text dump (readable,
+   deterministic, no Skia needed) + a PNG-bytes hash; migrate `compose_ui*` examples
+   to PNG output.
+
+Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), a platform window + live input
+event loop, and macos/windows shims (same C ABI, per-OS lib variant).
 
 ### Vendor the real compose.ui / foundation / material
 
