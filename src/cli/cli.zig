@@ -65,6 +65,9 @@ const USAGE =
     \\  --filter <substring>         Run only tests whose Class/method/file matches.
     \\  --format <plain|json>        plain (default) or a machine-readable JSON summary.
     \\  --all / --feature <name>     Select which feature modules' tests to run.
+    \\  --list                       List discovered @Test names without running them.
+    \\  --isolate [--timeout <s>]    Debug: run each test in its own sub-process with a
+    \\                               per-test timeout (default 60s) to pinpoint a hang/crash.
     \\
     \\Check options:
     \\  --format <plain|json|sarif>  Output format for diagnostics.
@@ -114,7 +117,7 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
-        return runTestCmd(gpa, rest);
+        return runTestCmd(gpa, rest, argv[0]);
     } else if (std.mem.eql(u8, cmd, "check")) {
         return runCheckCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "repl")) {
@@ -232,7 +235,7 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     return commands.runModuleFiles(gpa, files.items, &requested);
 }
 
-fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []const u8) u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;
@@ -247,6 +250,11 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var virtual_time = false;
     var filter: ?[]const u8 = null;
     var test_format: commands.TestFormat = .plain;
+    var list_only = false;
+    var isolate = false;
+    var jobs: usize = 1;
+    var timeout_s: u64 = 60;
+    _ = &jobs;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -270,6 +278,38 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
                 printErr(gpa, "error: unknown --format `{s}` (use plain|json)\n", .{v});
                 return 2;
             }
+        } else if (std.mem.eql(u8, a, "--list")) {
+            list_only = true;
+        } else if (std.mem.eql(u8, a, "--isolate")) {
+            isolate = true;
+        } else if (std.mem.eql(u8, a, "--jobs") or optionValue(a, "--jobs=") != null) {
+            const v = if (optionValue(a, "--jobs=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --jobs requires a number\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            jobs = std.fmt.parseInt(usize, v, 10) catch {
+                printErr(gpa, "error: --jobs must be a positive integer\n", .{});
+                return 2;
+            };
+            if (jobs == 0) jobs = 1;
+        } else if (std.mem.eql(u8, a, "--timeout") or optionValue(a, "--timeout=") != null) {
+            const v = if (optionValue(a, "--timeout=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --timeout requires a number of seconds\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            timeout_s = std.fmt.parseInt(u64, v, 10) catch {
+                printErr(gpa, "error: --timeout must be a positive integer (seconds)\n", .{});
+                return 2;
+            };
+            if (timeout_s == 0) timeout_s = 1;
         } else if (std.mem.eql(u8, a, "--all")) {
             all_features = true;
         } else if (std.mem.eql(u8, a, "--filter")) {
@@ -322,6 +362,26 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     // No path → the project in the current directory.
     if (paths.items.len == 0) paths.append(gpa, ".") catch return 2;
 
+    // `--isolate` (opt-in debug): re-invoke `klio test` once per discovered
+    // test in its own sub-process with a per-test wall-clock timeout, to
+    // pinpoint which test hangs or crashes. The child re-parses the same base
+    // args (paths + feature/only-file selection) plus `--filter`.
+    if (isolate) {
+        var base: std.ArrayList([]const u8) = .empty;
+        defer base.deinit(gpa);
+        for (paths.items) |p| base.append(gpa, p) catch return 2;
+        if (all_features) base.append(gpa, "--all") catch return 2;
+        for (project_features.items) |fs| {
+            base.append(gpa, "--feature") catch return 2;
+            base.append(gpa, fs) catch return 2;
+        }
+        for (only_files.items) |of| {
+            base.append(gpa, "--only-file") catch return 2;
+            base.append(gpa, of) catch return 2;
+        }
+        return commands.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
+    }
+
     // Project mode: a single directory carrying `klio.toml` (with `[[test]]`
     // sets) runs that project's composed test sources against its
     // built+installed pack — no hand-listed files. `planTest` returns null for
@@ -340,10 +400,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
             }
-            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter, test_format);
+            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter, test_format, list_only);
         }
     }
-    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format);
+    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format, list_only);
 }
 
 /// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a

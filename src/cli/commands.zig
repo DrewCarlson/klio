@@ -356,6 +356,104 @@ fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
 /// `klio test` — discover and run `kotlin.test` `@Test` functions in the
 /// given files/directories. Returns 1 if any test fails (or the module
 /// fails to build), 0 otherwise.
+/// `--isolate`: an opt-in debugging driver that runs each discovered `@Test` in
+/// its OWN sub-process with a per-test wall-clock timeout, so a test that hangs
+/// or crashes is pinpointed (the parent kills the child and records it) rather
+/// than taking down the whole suite. `base_args` is the original `test`
+/// argument vector minus `--isolate`/`--jobs`; the driver re-invokes
+/// `klio test <base_args> --list` to enumerate, then `... --filter=<name>` per
+/// test with the timeout enforced by the parent (`std.process.run`).
+pub fn runTestsIsolated(
+    gpa: std.mem.Allocator,
+    self: []const u8,
+    base_args: []const []const u8,
+    timeout_s: u64,
+) u8 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const rio = threaded.io();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    runtime.procEnvPutAllInto(gpa, &env);
+
+    // 1. Enumerate the test names (compile once; no execution).
+    var list_argv: std.ArrayList([]const u8) = .empty;
+    defer list_argv.deinit(gpa);
+    list_argv.append(gpa, self) catch return 2;
+    list_argv.append(gpa, "test") catch return 2;
+    list_argv.appendSlice(gpa, base_args) catch return 2;
+    list_argv.append(gpa, "--list") catch return 2;
+    const listed = std.process.run(gpa, rio, .{ .argv = list_argv.items, .environ_map = &env }) catch {
+        io.writeStderr("error: --isolate: failed to enumerate tests\n");
+        return 2;
+    };
+    defer gpa.free(listed.stdout);
+    defer gpa.free(listed.stderr);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    var it = std.mem.tokenizeScalar(u8, listed.stdout, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len != 0) names.append(gpa, t) catch return 2;
+    }
+    if (names.items.len == 0) {
+        io.printStdout(gpa, "no tests found\n", .{});
+        return 0;
+    }
+
+    const timeout_ms: i64 = @intCast(timeout_s * 1000);
+    var passed: usize = 0;
+    var failed: usize = 0;
+    var timed_out: usize = 0;
+    for (names.items) |name| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        const filt = std.fmt.allocPrint(gpa, "--filter={s}", .{name}) catch return 2;
+        defer gpa.free(filt);
+        argv.append(gpa, self) catch return 2;
+        argv.append(gpa, "test") catch return 2;
+        argv.appendSlice(gpa, base_args) catch return 2;
+        argv.append(gpa, filt) catch return 2;
+        const res = std.process.run(gpa, rio, .{
+            .argv = argv.items,
+            .environ_map = &env,
+            .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } },
+        }) catch |e| {
+            if (e == error.Timeout) {
+                io.printStdout(gpa, "{s} TIMEOUT ({d}s)\n", .{ name, timeout_s });
+                timed_out += 1;
+            } else {
+                io.printStdout(gpa, "{s} ERROR (spawn failed)\n", .{name});
+                failed += 1;
+            }
+            continue;
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        // A clean exit-0 → the isolated test passed; exit-1 → it failed; any
+        // abnormal termination (signal/crash) → CRASH.
+        switch (res.term) {
+            .exited => |c| if (c == 0) {
+                io.printStdout(gpa, "{s} PASSED\n", .{name});
+                passed += 1;
+            } else {
+                io.printStdout(gpa, "{s} FAILED\n", .{name});
+                failed += 1;
+            },
+            else => {
+                io.printStdout(gpa, "{s} CRASH\n", .{name});
+                timed_out += 1;
+            },
+        }
+    }
+    io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} timeout/crash\n", .{
+        names.items.len, passed, failed, timed_out,
+    });
+    return if (failed + timed_out > 0) 1 else 0;
+}
+
 pub fn runTestFiles(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
@@ -363,6 +461,7 @@ pub fn runTestFiles(
     only_files: []const []const u8,
     filter: ?[]const u8,
     format: TestFormat,
+    list_only: bool,
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
@@ -404,7 +503,7 @@ pub fn runTestFiles(
                     }
                 }
             }
-            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items, filter, format);
+            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items, filter, format, list_only);
         }
     }
 
@@ -451,7 +550,7 @@ pub fn runTestFiles(
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
-    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format);
+    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
 
 /// Tail shared by the legacy and image test paths: surface lowering-time
@@ -485,6 +584,7 @@ fn runTestsOnBuilt(
     only_fids: []const u32,
     filter: ?[]const u8,
     format: TestFormat,
+    list_only: bool,
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
@@ -512,6 +612,18 @@ fn runTestsOnBuilt(
 
     span.active_map = map;
     defer span.active_map = null;
+
+    // `--list`: discover the `@Test` names and print them, one per line, without
+    // running any (the `--isolate` driver spawns a sub-process per name).
+    if (list_only) {
+        const names = test_runner.listTests(gpa, &vm, user_asts, only_fids, filter) catch return 1;
+        defer {
+            for (names) |n| gpa.free(n);
+            gpa.free(names);
+        }
+        for (names) |n| io.printStdout(gpa, "{s}\n", .{n});
+        return 0;
+    }
 
     var stdout = io.StdoutSink{};
     // Run on the large interpreter stack: a test exercises arbitrary

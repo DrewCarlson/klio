@@ -450,6 +450,32 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
 /// Discover and run every `@Test` in `user_asts` against the prepared `vm`,
 /// writing test-program output to `out`. The returned `Report` is owned by
 /// the caller (`Report.deinit`).
+/// Discover the `@Test` display names WITHOUT running them (the `--isolate`
+/// driver spawns one sub-process per name). Caller owns each returned string
+/// and the slice.
+pub fn listTests(
+    gpa: Allocator,
+    vm: *Vm,
+    user_asts: []const ast.KotlinFile,
+    only_fids: []const u32,
+    filter: ?[]const u8,
+) Allocator.Error![][]const u8 {
+    var plan: Plan = blk: {
+        const mg = vm.module.borrow();
+        defer mg.deinit();
+        break :blk try discover(gpa, mg.get(), user_asts, only_fids, filter);
+    };
+    defer freePlan(gpa, &plan);
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    for (plan.top) |t| try names.append(gpa, try gpa.dupe(u8, t.display));
+    for (plan.classes) |c| for (c.methods) |m| try names.append(gpa, try gpa.dupe(u8, m.display));
+    return names.toOwnedSlice(gpa);
+}
+
 pub fn runTests(
     gpa: Allocator,
     vm: *Vm,
