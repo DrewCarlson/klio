@@ -157,9 +157,21 @@ mis-binds the delegate in the composition. `compose_ui_window.kt` uses the worki
 `remember { mutableStateOf }` + `.value` form; the `by` form needs the interpreter
 fix.
 
-Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), keyboard/pointer-move/resize
-input, bundling a `.ttf` + `skparagraph` text layout, macOS/windows window backends,
-and verifying the macos/windows shim recipes on those hosts.
+**Richer input — DONE (X11).** The shim poll now returns key (char + keysym via
+XLookupString), pointer-motion, and resize (ConfigureNotify, recreating the surface)
+events. The pack adds `Modifier.onKey`/`.onHover`; `HitRegion` carries click/key/
+hover handlers; `UiRenderer` gains focus (click a node with `onKey` to focus it;
+focus re-resolves from a click anchor after each recompose so it tracks the fresh
+handler), `key()`, `hover()` (fires each hoverable's handler with the current
+inside-ness → state-driven highlight), and `resize()`; `runApp` dispatches all event
+types. A `TextField` composable (click to focus, type, Backspace). Demo:
+`examples/compose_ui_input.kt` — verified live (screenshots): typing into the field
+updates it + a greeting, the button highlights on hover, and the window resizes +
+relayouts.
+
+Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), bundling a `.ttf` +
+`skparagraph` text layout (wrapping/alignment), macOS (Cocoa) / windows (Win32)
+window backends, and verifying the macos/windows shim recipes on those hosts.
 
 ### Vendor the real compose.ui / foundation / material
 

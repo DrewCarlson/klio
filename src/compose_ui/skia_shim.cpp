@@ -196,6 +196,7 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 #include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 struct KlioWindow {
     Display* dpy;
@@ -219,7 +220,9 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
                                      static_cast<unsigned>(h), 0,
                                      BlackPixel(dpy, screen), BlackPixel(dpy, screen));
     if (title) XStoreName(dpy, win, title);
-    XSelectInput(dpy, win, ExposureMask | ButtonPressMask | KeyPressMask | StructureNotifyMask);
+    XSelectInput(dpy, win,
+                 ExposureMask | ButtonPressMask | PointerMotionMask | KeyPressMask |
+                     StructureNotifyMask);
     Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wmDelete, 1);
     XMapWindow(dpy, win);
@@ -257,9 +260,15 @@ void klio_win_present(KlioWindow* kw) {
     XFlush(kw->dpy);
 }
 
-// Wait up to timeoutMs for one event. Returns: 0 none/redraw, 1 click (writes
-// *outX/*outY), 2 close requested.
-int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outX, int* outY) {
+// Wait up to timeoutMs for one event. Returns an event type and writes two
+// type-dependent values into *outA/*outB:
+//   0 none/redraw
+//   1 click     — outA=x, outB=y
+//   2 close
+//   3 key       — outA=char (ASCII, 0 if non-printable), outB=keysym
+//   4 move      — outA=x, outB=y (pointer position)
+//   5 resize    — outA=width, outB=height (the surface is recreated to match)
+int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     if (!kw) return 2;
     if (!XPending(kw->dpy)) {
         int fd = ConnectionNumber(kw->dpy);
@@ -274,16 +283,45 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outX, int* outY) {
     }
     XEvent ev;
     XNextEvent(kw->dpy, &ev);
-    if (ev.type == ButtonPress) {
-        if (outX) *outX = ev.xbutton.x;
-        if (outY) *outY = ev.xbutton.y;
-        return 1;
+    switch (ev.type) {
+        case ButtonPress:
+            if (outA) *outA = ev.xbutton.x;
+            if (outB) *outB = ev.xbutton.y;
+            return 1;
+        case ClientMessage:
+            if (static_cast<Atom>(ev.xclient.data.l[0]) == kw->wmDelete) return 2;
+            return 0;
+        case KeyPress: {
+            char buf[8];
+            KeySym ks = 0;
+            int n = XLookupString(&ev.xkey, buf, sizeof(buf), &ks, nullptr);
+            if (outA) *outA = (n > 0) ? static_cast<unsigned char>(buf[0]) : 0;
+            if (outB) *outB = static_cast<int>(ks);
+            return 3;
+        }
+        case MotionNotify:
+            if (outA) *outA = ev.xmotion.x;
+            if (outB) *outB = ev.xmotion.y;
+            return 4;
+        case ConfigureNotify: {
+            const int nw = ev.xconfigure.width;
+            const int nh = ev.xconfigure.height;
+            if ((nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
+                // The surface is sized to the window; recreate it to match so the
+                // next present blits at the new size.
+                if (kw->surface) klio_skia_free(kw->surface);
+                kw->surface = klio_skia_new(nw, nh);
+                kw->w = nw;
+                kw->h = nh;
+                if (outA) *outA = nw;
+                if (outB) *outB = nh;
+                return 5;
+            }
+            return 0;
+        }
+        default:
+            return 0;  // Expose etc. — the caller re-presents each loop.
     }
-    if (ev.type == ClientMessage &&
-        static_cast<Atom>(ev.xclient.data.l[0]) == kw->wmDelete) {
-        return 2;
-    }
-    return 0;  // Expose / configure / key — the caller re-presents each loop.
 }
 
 void klio_win_close(KlioWindow* kw) {

@@ -120,6 +120,11 @@ class Modifier private constructor(
     val onClick: (() -> Unit)?,
     val border: Color?,
     val cornerRadius: Int,
+    // A key handler; a node carrying one is focusable (clicking it takes focus,
+    // and subsequent key input is delivered to it as (charCode, keysym)).
+    val onKey: ((Int, Int) -> Unit)?,
+    // Fires with true when the pointer enters this node's bounds, false on exit.
+    val onHover: ((Boolean) -> Unit)?,
 ) {
     private fun copy(
         width: Int = this.width,
@@ -131,7 +136,9 @@ class Modifier private constructor(
         onClick: (() -> Unit)? = this.onClick,
         border: Color? = this.border,
         cornerRadius: Int = this.cornerRadius,
-    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick, border, cornerRadius)
+        onKey: ((Int, Int) -> Unit)? = this.onKey,
+        onHover: ((Boolean) -> Unit)? = this.onHover,
+    ): Modifier = Modifier(width, height, padding, background, fillMaxWidth, fillMaxHeight, onClick, border, cornerRadius, onKey, onHover)
 
     fun size(w: Int, h: Int): Modifier = copy(width = w, height = h)
     fun width(w: Int): Modifier = copy(width = w)
@@ -144,9 +151,11 @@ class Modifier private constructor(
     fun clickable(onClick: () -> Unit): Modifier = copy(onClick = onClick)
     fun border(c: Color): Modifier = copy(border = c)
     fun cornerRadius(r: Int): Modifier = copy(cornerRadius = r)
+    fun onKey(handler: (Int, Int) -> Unit): Modifier = copy(onKey = handler)
+    fun onHover(handler: (Boolean) -> Unit): Modifier = copy(onHover = handler)
 
     companion object {
-        val None = Modifier(-1, -1, 0, null, false, false, null, null, 0)
+        val None = Modifier(-1, -1, 0, null, false, false, null, null, 0, null, null)
     }
 }
 
@@ -240,9 +249,9 @@ class LayoutNode {
         if (brd != null) {
             list.strokeRect(originX * scale, originY * scale, measuredWidth * scale, measuredHeight * scale, stroke, brd.argb)
         }
-        val onClick = modifier.onClick
-        if (onClick != null) {
-            hits.add(HitRegion(originX, originY, measuredWidth, measuredHeight, onClick))
+        val m = modifier
+        if (m.onClick != null || m.onKey != null || m.onHover != null) {
+            hits.add(HitRegion(originX, originY, measuredWidth, measuredHeight, m.onClick, m.onKey, m.onHover))
         }
         val pad = modifier.padding
         if (text.isNotEmpty()) {
@@ -260,8 +269,17 @@ class LayoutNode {
     }
 }
 
-/** A clickable region collected during the draw pass (absolute layout bounds + handler). */
-class HitRegion(val x: Int, val y: Int, val w: Int, val h: Int, val onClick: () -> Unit) {
+/** An interactive region collected during the draw pass (absolute layout bounds +
+ * click / key / hover handlers). */
+class HitRegion(
+    val x: Int,
+    val y: Int,
+    val w: Int,
+    val h: Int,
+    val onClick: (() -> Unit)?,
+    val onKey: ((Int, Int) -> Unit)?,
+    val onHover: ((Boolean) -> Unit)?,
+) {
     fun contains(px: Int, py: Int): Boolean = px >= x && px < x + w && py >= y && py < y + h
 }
 
@@ -404,6 +422,32 @@ fun Button(label: String, modifier: Modifier, onClick: () -> Unit) {
     }
 }
 
+// X11 keysyms the TextField handles.
+private const val KEYSYM_BACKSPACE = 0xff08
+private const val KEYSYM_DELETE = 0xffff
+
+/**
+ * An editable single-line text field. Clicking it takes keyboard focus (via the
+ * `onKey` modifier); typing appends printable characters and Backspace deletes the
+ * last one. A `_` caret is drawn after the text.
+ */
+@Composable
+fun TextField(value: String, onValueChange: (String) -> Unit, modifier: Modifier) {
+    Box(
+        modifier
+            .onKey { char, keysym ->
+                when {
+                    keysym == KEYSYM_BACKSPACE || keysym == KEYSYM_DELETE ->
+                        if (value.isNotEmpty()) onValueChange(value.substring(0, value.length - 1))
+                    char in 32..126 -> onValueChange(value + char.toChar())
+                }
+            }
+            .padding(1),
+    ) {
+        Text(value + "_", Color.White, Modifier.None)
+    }
+}
+
 // ----- material (a themed layer on the foundation, via CompositionLocal) -----
 
 /** A material-style colour scheme, provided to a subtree by [MaterialTheme]. */
@@ -447,12 +491,36 @@ fun PrimaryButton(label: String, onClick: () -> Unit) {
  * fixed [width] x [height], records a display list, and renders it via Skia. */
 class UiRenderer internal constructor(
     private val root: LayoutNode,
-    private val width: Int,
-    private val height: Int,
+    private var width: Int,
+    private var height: Int,
     private val recomposer: Recomposer,
     private val composition: Composition,
 ) {
     private val hits = ArrayList<HitRegion>()
+
+    /** The key handler of the focused node (set by clicking a node with an
+     * `onKey` modifier); key input is delivered here. Re-resolved after every
+     * recomposition from [focusAnchorX]/[focusAnchorY] so it always points at the
+     * freshly-composed handler (which captures the current field value), not a
+     * stale closure. */
+    private var focusedOnKey: ((Int, Int) -> Unit)? = null
+    private var focusAnchorX = -1
+    private var focusAnchorY = -1
+
+    /** Point [focusedOnKey] at the topmost focusable region under the focus anchor
+     * in the current (freshly built) hit list. */
+    private fun resolveFocus() {
+        focusedOnKey = null
+        if (focusAnchorX < 0) return
+        for (region in hits) {
+            if (region.onKey != null && region.contains(focusAnchorX, focusAnchorY)) {
+                focusedOnKey = region.onKey
+            }
+        }
+    }
+
+    val layoutWidth: Int get() = width
+    val layoutHeight: Int get() = height
 
     /** Measure/layout + record a display list, collecting hit regions. */
     private fun build(scale: Int): DisplayList {
@@ -497,13 +565,59 @@ class UiRenderer internal constructor(
      */
     fun click(px: Int, py: Int, scale: Int): String {
         var handler: (() -> Unit)? = null
+        var focusHit = false
         for (region in hits) {
-            if (region.contains(px, py)) handler = region.onClick
+            if (region.contains(px, py)) {
+                if (region.onClick != null) handler = region.onClick
+                if (region.onKey != null) focusHit = true
+            }
+        }
+        // Clicking a focusable node anchors focus there; clicking elsewhere clears it.
+        if (focusHit) {
+            focusAnchorX = px
+            focusAnchorY = py
+        } else if (handler != null) {
+            focusAnchorX = -1
+            focusAnchorY = -1
         }
         if (handler != null) {
             handler()
-            return recomposeDisplayList(scale)
+            val r = recomposeDisplayList(scale)
+            resolveFocus()
+            return r
         }
+        val s = displayList(scale)
+        resolveFocus()
+        return s
+    }
+
+    /** Deliver a key event ([charCode] ASCII, [keysym] X11 keysym) to the focused
+     * node, then recompose. No-op if nothing is focused. */
+    fun key(charCode: Int, keysym: Int, scale: Int): String {
+        val f = focusedOnKey ?: return displayList(scale)
+        f(charCode, keysym)
+        val r = recomposeDisplayList(scale)
+        resolveFocus()
+        return r
+    }
+
+    /** Update hover state: fire each hoverable region's `onHover` with whether the
+     * pointer ([px], [py], layout units) is inside it, then recompose. A handler
+     * that sets an unchanged state does not trigger a real recomposition. */
+    fun hover(px: Int, py: Int, scale: Int): String {
+        var any = false
+        for (region in hits) {
+            val h = region.onHover ?: continue
+            h(region.contains(px, py))
+            any = true
+        }
+        return if (any) recomposeDisplayList(scale) else displayList(scale)
+    }
+
+    /** Resize the canvas to [newWidth] x [newHeight] layout units and re-render. */
+    fun resize(newWidth: Int, newHeight: Int, scale: Int): String {
+        width = if (newWidth > 0) newWidth else width
+        height = if (newHeight > 0) newHeight else height
         return displayList(scale)
     }
 
@@ -540,12 +654,14 @@ fun runApp(
         __composeui_winRender(handle, ui.displayList(scale))
         val ev = __composeui_winPoll(handle, 100)
         val type = (ev shr 32).toInt()
-        if (type == 2) {
-            running = false
-        } else if (type == 1) {
-            val x = ((ev shr 16) and 0xFFFF).toInt() / scale
-            val y = (ev and 0xFFFF).toInt() / scale
-            ui.click(x, y, scale)
+        val a = ((ev shr 16) and 0xFFFF).toInt()
+        val b = (ev and 0xFFFF).toInt()
+        when (type) {
+            2 -> running = false                             // close
+            1 -> ui.click(a / scale, b / scale, scale)       // click: a=x, b=y
+            3 -> ui.key(a, b, scale)                          // key: a=char, b=keysym
+            4 -> ui.hover(a / scale, b / scale, scale)        // move: a=x, b=y
+            5 -> ui.resize(a / scale, b / scale, scale)       // resize: a=w, b=h (px)
         }
         frame += 1
     }
