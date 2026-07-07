@@ -362,6 +362,7 @@ pub fn runTestFiles(
     features: *const RequestedFeatures,
     only_files: []const []const u8,
     filter: ?[]const u8,
+    format: TestFormat,
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
@@ -403,7 +404,7 @@ pub fn runTestFiles(
                     }
                 }
             }
-            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items, filter);
+            return runTestsOnBuilt(gpa, prep.built, prep.bindings, prep.map, prep.user_asts, image_fids.items, filter, format);
         }
     }
 
@@ -450,12 +451,31 @@ pub fn runTestFiles(
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
-    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter);
+    return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format);
 }
 
 /// Tail shared by the legacy and image test paths: surface lowering-time
 /// resolution diagnostics, materialize a Vm, install bindings, then
 /// discover and run the `@Test` functions in `user_asts`.
+/// Test-runner output format. `plain` is the human-facing per-test list +
+/// summary; `json` is a machine-readable object (counts + per-test status +
+/// failure reason) for CI ratchets.
+pub const TestFormat = enum { plain, json };
+
+/// Emit a JSON string literal with the minimal escapes JSON requires.
+fn writeJsonString(gpa: std.mem.Allocator, s: []const u8) void {
+    io.printStdout(gpa, "\"", .{});
+    for (s) |c| switch (c) {
+        '"' => io.printStdout(gpa, "\\\"", .{}),
+        '\\' => io.printStdout(gpa, "\\\\", .{}),
+        '\n' => io.printStdout(gpa, "\\n", .{}),
+        '\r' => io.printStdout(gpa, "\\r", .{}),
+        '\t' => io.printStdout(gpa, "\\t", .{}),
+        else => if (c < 0x20) io.printStdout(gpa, "\\u{x:0>4}", .{c}) else io.printStdout(gpa, "{c}", .{c}),
+    };
+    io.printStdout(gpa, "\"", .{});
+}
+
 fn runTestsOnBuilt(
     gpa: std.mem.Allocator,
     built_in: interp_ir.build.BuiltModule,
@@ -464,6 +484,7 @@ fn runTestsOnBuilt(
     user_asts: []const KotlinFile,
     only_fids: []const u32,
     filter: ?[]const u8,
+    format: TestFormat,
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
@@ -506,6 +527,25 @@ fn runTestsOnBuilt(
         .filter = filter,
     });
     defer report.deinit(gpa);
+
+    if (format == .json) {
+        io.printStdout(gpa, "{{\"total\":{d},\"passed\":{d},\"failed\":{d},\"skipped\":{d},\"tests\":[", .{
+            report.results.len, report.passed, report.failed, report.skipped,
+        });
+        for (report.results, 0..) |r, idx| {
+            if (idx != 0) io.printStdout(gpa, ",", .{});
+            io.printStdout(gpa, "{{\"name\":", .{});
+            writeJsonString(gpa, r.display);
+            io.printStdout(gpa, ",\"outcome\":\"{s}\"", .{@tagName(r.outcome)});
+            if (r.detail) |d| {
+                io.printStdout(gpa, ",\"detail\":", .{});
+                writeJsonString(gpa, d);
+            }
+            io.printStdout(gpa, "}}", .{});
+        }
+        io.printStdout(gpa, "]}}\n", .{});
+        return if (report.failed > 0) 1 else 0;
+    }
 
     for (report.results) |r| {
         const tag = switch (r.outcome) {

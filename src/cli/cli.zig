@@ -61,6 +61,11 @@ const USAGE =
     \\  --virtual-time             Use deterministic virtual time for coroutines.
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
     \\
+    \\Test options:
+    \\  --filter <substring>         Run only tests whose Class/method/file matches.
+    \\  --format <plain|json>        plain (default) or a machine-readable JSON summary.
+    \\  --all / --feature <name>     Select which feature modules' tests to run.
+    \\
     \\Check options:
     \\  --format <plain|json|sarif>  Output format for diagnostics.
     \\  --feature <pack>/<feature>   Enable a pack feature (repeatable).
@@ -241,12 +246,30 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var all_features = false;
     var virtual_time = false;
     var filter: ?[]const u8 = null;
+    var test_format: commands.TestFormat = .plain;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
+        } else if (std.mem.eql(u8, a, "--format") or optionValue(a, "--format=") != null) {
+            const v = if (optionValue(a, "--format=")) |vv| vv else blk: {
+                i += 1;
+                if (i >= args.len) {
+                    printErr(gpa, "error: --format requires a value (plain|json)\n", .{});
+                    return 2;
+                }
+                break :blk args[i];
+            };
+            if (std.mem.eql(u8, v, "json")) {
+                test_format = .json;
+            } else if (std.mem.eql(u8, v, "plain")) {
+                test_format = .plain;
+            } else {
+                printErr(gpa, "error: unknown --format `{s}` (use plain|json)\n", .{v});
+                return 2;
+            }
         } else if (std.mem.eql(u8, a, "--all")) {
             all_features = true;
         } else if (std.mem.eql(u8, a, "--filter")) {
@@ -317,10 +340,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
             }
-            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter);
+            return commands.runTestFiles(gpa, plan.roots, &requested, only_files.items, filter, test_format);
         }
     }
-    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter);
+    return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format);
 }
 
 /// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a
