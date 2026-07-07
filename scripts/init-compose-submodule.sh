@@ -16,7 +16,26 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 path="kotlin-klio/klio-compose-runtime/upstream"
+# The compose runtime commonMain, plus every upstream module the klio compose
+# packs consume verbatim: the pure-Kotlin ui foundation (geometry / unit / util
+# / graphics), the runtime saveable Saver surface, the ui engine (ui/ui), the
+# text and animation modules, and foundation.
 sparse="compose/runtime/runtime/src/commonMain"
+sparse_ui=(
+  "compose/ui/ui-util/src/commonMain"
+  "compose/ui/ui-geometry/src/commonMain"
+  "compose/ui/ui-unit/src/commonMain"
+  "compose/ui/ui-graphics/src/commonMain"
+  "compose/runtime/runtime-saveable/src/commonMain"
+  "compose/ui/ui/src/commonMain"
+  "compose/ui/ui-text/src/commonMain"
+  "compose/ui/ui-text/src/skikoMain"
+  "compose/animation/animation-core/src/commonMain"
+  "compose/foundation/foundation-layout/src/commonMain"
+  "compose/foundation/foundation/src/commonMain"
+  "compose/material3/material3/src/commonMain"
+  "graphics/graphics-shapes/src/commonMain"
+)
 
 url=$(git config -f .gitmodules submodule."$path".url)
 ref=$(git config -f .gitmodules submodule."$path".branch)
@@ -36,7 +55,7 @@ rm -rf "$path"
 # trees + blobs are fetched.
 git clone --filter=tree:0 --no-checkout --depth 1 --branch "$ref" "$url" "$path"
 git -C "$path" sparse-checkout init --cone
-git -C "$path" sparse-checkout set "$sparse"
+git -C "$path" sparse-checkout set "$sparse" "${sparse_ui[@]}"
 git -C "$path" checkout "$ref"
 
 # Move the submodule's .git under .git/modules so it is a proper submodule.

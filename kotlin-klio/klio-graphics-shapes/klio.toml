@@ -1,0 +1,35 @@
+# androidx.graphics.shapes — the graphics-shapes morphing library (RoundedPolygon,
+# CornerRounding, Morph, Cubic), a pure-Kotlin geometry lib material3 uses for its
+# shape system. Vendored verbatim.
+[library]
+id = "androidx.graphics.shapes"
+version = "1.0.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/graphics/graphics-shapes/src/commonMain/kotlin"
+include = [
+    "androidx/graphics/shapes/CornerRounding.kt",
+    "androidx/graphics/shapes/Cubic.kt",
+    "androidx/graphics/shapes/FeatureDetector.kt",
+    "androidx/graphics/shapes/FeatureMapping.kt",
+    "androidx/graphics/shapes/FeatureSerializer.kt",
+    "androidx/graphics/shapes/Features.kt",
+    "androidx/graphics/shapes/FloatMapping.kt",
+    "androidx/graphics/shapes/Format.kt",
+    "androidx/graphics/shapes/Morph.kt",
+    "androidx/graphics/shapes/Point.kt",
+    "androidx/graphics/shapes/PolygonMeasure.kt",
+    "androidx/graphics/shapes/PolygonValidation.kt",
+    "androidx/graphics/shapes/RoundedPolygon.kt",
+    "androidx/graphics/shapes/Shapes.kt",
+    "androidx/graphics/shapes/SvgPathParser.kt",
+    "androidx/graphics/shapes/Utils.kt",
+]
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.collection"

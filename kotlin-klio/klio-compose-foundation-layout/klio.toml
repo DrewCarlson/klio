@@ -1,0 +1,63 @@
+# androidx.compose.foundation.layout — the Compose layout primitives (Box, Row,
+# Column, Arrangement, Padding, Size, Spacer, flow/grid layouts, window insets),
+# vendored verbatim. Depends on the ui engine, unit, graphics, and runtime packs.
+[library]
+id = "androidx.compose.foundation.layout"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/foundation/foundation-layout/src/commonMain/kotlin"
+include = [
+    "androidx/compose/foundation/layout/AlignmentLine.kt",
+    "androidx/compose/foundation/layout/Arrangement.kt",
+    "androidx/compose/foundation/layout/AspectRatio.kt",
+    "androidx/compose/foundation/layout/Box.kt",
+    "androidx/compose/foundation/layout/BoxWithConstraints.kt",
+    "androidx/compose/foundation/layout/Column.kt",
+    "androidx/compose/foundation/layout/ComposeFoundationLayoutFlags.kt",
+    "androidx/compose/foundation/layout/ContextualFlowLayout.kt",
+    "androidx/compose/foundation/layout/ExperimentalFlexBoxApi.kt",
+    "androidx/compose/foundation/layout/ExperimentalGridApi.kt",
+    "androidx/compose/foundation/layout/ExperimentalLayoutApi.kt",
+    "androidx/compose/foundation/layout/FlexBox.kt",
+    "androidx/compose/foundation/layout/FlowLayout.kt",
+    "androidx/compose/foundation/layout/FlowLayoutBuildingBlocks.kt",
+    "androidx/compose/foundation/layout/FlowLayoutOverflow.kt",
+    "androidx/compose/foundation/layout/Grid.kt",
+    "androidx/compose/foundation/layout/Intrinsic.kt",
+    "androidx/compose/foundation/layout/LayoutScopeMarker.kt",
+    "androidx/compose/foundation/layout/Offset.kt",
+    "androidx/compose/foundation/layout/Padding.kt",
+    "androidx/compose/foundation/layout/Row.kt",
+    "androidx/compose/foundation/layout/RowColumnImpl.kt",
+    "androidx/compose/foundation/layout/RowColumnMeasurePolicy.kt",
+    "androidx/compose/foundation/layout/RulerAlignment.kt",
+    "androidx/compose/foundation/layout/Size.kt",
+    "androidx/compose/foundation/layout/Spacer.kt",
+    "androidx/compose/foundation/layout/Visible.kt",
+    "androidx/compose/foundation/layout/WindowInsets.kt",
+    "androidx/compose/foundation/layout/WindowInsetsPadding.kt",
+    "androidx/compose/foundation/layout/WindowInsetsSize.kt",
+    "androidx/compose/foundation/layout/internal/InlineClassHelper.kt",
+    "androidx/compose/foundation/layout/internal/JvmDefaultWithCompatibility.kt",
+]
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.ui"
+[[deps]]
+id = "androidx.compose.ui.unit"
+[[deps]]
+id = "androidx.compose.ui.geometry"
+[[deps]]
+id = "androidx.compose.ui.graphics"
+[[deps]]
+id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.collection"

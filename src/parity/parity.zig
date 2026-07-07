@@ -1151,7 +1151,7 @@ const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
 /// Number of in-repo packs the parity pipeline can load from source.
-pub const N_PACK_DIRS = 7;
+pub const N_PACK_DIRS = 11;
 
 fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
@@ -1163,6 +1163,10 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-mosaic" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-util" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-geometry" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-unit" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-graphics" }),
     };
 }
 
@@ -1184,7 +1188,7 @@ fn collectKotlinxPackSources(
     // diverge from the base identity.
     const mask = try packMaskFor(io, import_prefixes, imports_coroutines, arena);
     for (pack_dirs, 0..) |pack_dir, idx| {
-        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+        if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
 
         const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
             .err => |e| return .{ .err = e },
@@ -1405,9 +1409,28 @@ const BaseEntry = struct {
 
 var base_lock: runtime.SpinMutex = .{};
 var base_arena_state: ?*std.heap.ArenaAllocator = null;
-/// key (mode|mask|gate byte) -> entry, or null when the base for that key
-/// could not be snapshotted (callers then always take the fallback).
-var base_entries: ?std.AutoHashMap(u16, ?*const BaseEntry) = null;
+
+/// A cached dependency base plus the arena that owns its memory, so an
+/// evicted base's ~stdlib-sized footprint returns to the OS. `entry` is null
+/// when the base for this key is not snapshot-safe (cached so callers stop
+/// retrying); such placeholders own no arena and are never evicted.
+const CachedBase = struct {
+    entry: ?*const BaseEntry,
+    arena: ?*std.heap.ArenaAllocator,
+    tick: u64,
+};
+/// key (mode|mask|gate byte) -> cached base.
+var base_entries: ?std.AutoHashMap(u32, CachedBase) = null;
+var base_tick: u64 = 0;
+
+/// Max number of real (arena-owning) bases to retain; 0 means unbounded (the
+/// default, so `klio run` and the reuse-heavy harnesses are unaffected). A
+/// batch harness that runs many programs across many pack masks — the e2e
+/// corpus — sets a small bound so the process does not accumulate one full
+/// stdlib clone per mask. Safe to evict: a base is only referenced inside
+/// `getOrBuildBase`/`prepareWithBase` (the run clones what it needs), and the
+/// batch harnesses drive it from a single thread.
+pub var base_cache_max: usize = 0;
 var stdlib_meta_cache: ?StdlibMeta = null;
 var pack_meta_cache: [N_PACK_DIRS]?PackMeta = @splat(null);
 
@@ -1427,8 +1450,11 @@ const PackMeta = struct {
     deps: []const []const u8,
 };
 
-fn baseKey(mode: LoadMode, mask: u8, full: bool) u16 {
-    return (@as(u16, @intFromEnum(mode)) << 8) | (@as(u16, mask) << 1) | @intFromBool(full);
+fn baseKey(mode: LoadMode, mask: u16, full: bool) u32 {
+    // `mask` occupies a full u16 (one bit per in-repo pack, up to N_PACK_DIRS),
+    // so it lands in bits 1..16 and `mode` sits above it (bit 24+) — no overlap
+    // even when the top mask bit is set.
+    return (@as(u32, @intFromEnum(mode)) << 24) | (@as(u32, mask) << 1) | @intFromBool(full);
 }
 
 /// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
@@ -1576,8 +1602,8 @@ fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.
 /// Which in-repo packs `import_prefixes` pulls in, as a bitmask over
 /// `kotlinxPackDirs` order. Mirrors `collectKotlinxPackSources`' selection
 /// (including coroutines forcing atomicfu).
-fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u8 {
-    var mask: u8 = 0;
+fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u16 {
+    var mask: u16 = 0;
     var idx: usize = 0;
     while (idx < N_PACK_DIRS) : (idx += 1) {
         const meta = try packMeta(io, idx);
@@ -1594,7 +1620,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
             }
         }
         if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
-        if (wanted) mask |= @as(u8, 1) << @intCast(idx);
+        if (wanted) mask |= @as(u16, 1) << @intCast(idx);
     }
     // Manifest-dependency closure: a selected pack pulls the packs its
     // klio.toml declares, transitively (compose -> kotlinx.coroutines +
@@ -1604,15 +1630,15 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
         changed = false;
         var i: usize = 0;
         while (i < N_PACK_DIRS) : (i += 1) {
-            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            if (mask & (@as(u16, 1) << @intCast(i)) == 0) continue;
             const m = try packMeta(io, i);
             for (m.deps) |dep| {
                 var j: usize = 0;
                 while (j < N_PACK_DIRS) : (j += 1) {
-                    if (mask & (@as(u8, 1) << @intCast(j)) != 0) continue;
+                    if (mask & (@as(u16, 1) << @intCast(j)) != 0) continue;
                     const jm = try packMeta(io, j);
                     if (std.mem.eql(u8, jm.lib_id, dep)) {
-                        mask |= @as(u8, 1) << @intCast(j);
+                        mask |= @as(u16, 1) << @intCast(j);
                         changed = true;
                     }
                 }
@@ -1624,7 +1650,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
 
 /// Whether the stdlib load gate opens fully for this prefix set (mirrors
 /// `embeddedStdlibSources`' `load_gated`).
-fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: u8, scratch: Allocator) Allocator.Error!bool {
+fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: u16, scratch: Allocator) Allocator.Error!bool {
     const meta = try stdlibMeta(io);
     if (!meta.any_non_implicit) return true;
     var it = import_prefixes.keyIterator();
@@ -1635,7 +1661,7 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
     }
     var idx: usize = 0;
     while (idx < N_PACK_DIRS) : (idx += 1) {
-        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+        if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
         const pmeta = try packMeta(io, idx);
         for (pmeta.import_prefixes) |imp| {
             for (meta.pkgs) |pkg| {
@@ -1648,21 +1674,66 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
 
 /// Get or build the dependency snapshot for (mode, pack mask, gate).
 /// Returns null when that base is not snapshot-safe.
-fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     base_lock.lock();
     defer base_lock.unlock();
 
-    const a = baseArenaAllocator();
-    if (base_entries == null) base_entries = std.AutoHashMap(u16, ?*const BaseEntry).init(std.heap.page_allocator);
+    if (base_entries == null) base_entries = std.AutoHashMap(u32, CachedBase).init(std.heap.page_allocator);
     const key = baseKey(mode, mask, full);
-    if (base_entries.?.get(key)) |hit| return hit;
+    if (base_entries.?.getPtr(key)) |hit| {
+        base_tick += 1;
+        hit.tick = base_tick;
+        return hit.entry;
+    }
 
-    const entry = try buildBaseEntry(a, io, mode, mask, full);
-    try base_entries.?.put(key, entry);
+    // Build each base in its own arena so eviction can hand its pages back.
+    const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+    holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const entry = buildBaseEntry(holder.allocator(), io, mode, mask, full) catch |e| {
+        holder.deinit();
+        std.heap.page_allocator.destroy(holder);
+        return e;
+    };
+    base_tick += 1;
+    if (entry == null) {
+        // Not snapshot-safe: keep no arena, just remember the miss.
+        holder.deinit();
+        std.heap.page_allocator.destroy(holder);
+        try base_entries.?.put(key, .{ .entry = null, .arena = null, .tick = base_tick });
+        return null;
+    }
+    try base_entries.?.put(key, .{ .entry = entry, .arena = holder, .tick = base_tick });
+    evictBasesBeyondCap();
     return entry;
 }
 
-fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+/// Drop least-recently-used real bases until at most `base_cache_max` remain
+/// (no-op when the cap is 0). Only arena-owning entries count and are evicted;
+/// null placeholders are free and kept.
+fn evictBasesBeyondCap() void {
+    if (base_cache_max == 0) return;
+    while (true) {
+        var owning: usize = 0;
+        var lru_key: u32 = 0;
+        var lru_tick: u64 = std.math.maxInt(u64);
+        var it = base_entries.?.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.arena == null) continue;
+            owning += 1;
+            if (kv.value_ptr.tick < lru_tick) {
+                lru_tick = kv.value_ptr.tick;
+                lru_key = kv.key_ptr.*;
+            }
+        }
+        if (owning <= base_cache_max) return;
+        const removed = base_entries.?.fetchRemove(lru_key).?;
+        const arena = removed.value.arena.?;
+        arena.deinit();
+        std.heap.page_allocator.destroy(arena);
+    }
+}
+
+fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     if (try loadBakedBase(a, io, mode, mask, full)) |entry| return entry;
     return buildBaseEntryFromSource(a, io, mode, mask, full);
 }
@@ -1672,7 +1743,7 @@ fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Al
 /// interpreter modules change, and each test run step's cache manifest
 /// covers the image bytes. Only the EmbeddedOnly bases are baked; other
 /// keys — and any read/decode failure — take the source build below.
-fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     if (mode != .EmbeddedOnly or mask != 0) return null;
     const dir = (runtime.procEnvGetVar(a, "KLIO_PARITY_BASE_IMAGES") catch null) orelse return null;
     const path = try std.fmt.allocPrint(a, "{s}/embedded-gate{d}.klio-image", .{ dir, @intFromBool(full) });
@@ -1693,7 +1764,7 @@ pub fn bakeEmbeddedBase(allocator: Allocator, io: Io, full: bool) Allocator.Erro
     return try interp_ir.image.bake(allocator, entry.base, entry.map, .{});
 }
 
-fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
 
@@ -1705,7 +1776,7 @@ fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u8, full
         var sources: std.ArrayList(PackSource) = .empty;
         defer sources.deinit(a);
         for (pack_dirs, 0..) |dir, idx| {
-            if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+            if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
             const manifest_sources = switch (try collectManifestSources(a, io, dir)) {
                 .err => return null,
                 .ok => |s| s,
@@ -1812,7 +1883,7 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
     }
 
     base_lock.lock();
-    const mask: u8 = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
+    const mask: u16 = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
         base_lock.unlock();
         return e;
     };

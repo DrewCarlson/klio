@@ -17,6 +17,12 @@ fn runCorpus(jit_on: bool) !void {
     jit.setEnabledForTest(jit_on);
     defer jit.setEnabledForTest(false);
 
+    // The corpus runs 161 programs spanning ~8 distinct pack masks, each of
+    // which otherwise retains its own full stdlib clone. Bound the dependency-
+    // base cache so the process holds a handful at a time instead of all of
+    // them (each is rebuilt on demand if evicted).
+    parity.base_cache_max = 4;
+
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer list_arena.deinit();
     const la = list_arena.allocator();
@@ -157,6 +163,7 @@ test "function-JIT recursion matches the interpreter" {
     jit.setFuncEnabledForTest(true);
     defer jit.setEnabledForTest(false);
     defer jit.setFuncEnabledForTest(false);
+    parity.base_cache_max = 4;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();

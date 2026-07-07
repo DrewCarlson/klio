@@ -1,0 +1,10 @@
+Offset sum = (11.0, 22.0)
+distance(3, 4) = 5.0
+Size = 120.0 x 80.0
+Rect right=130.0 bottom=90.0
+contains(50, 40) = true
+contains(200, 40) = false
+IntOffset sum = (7, 10)
+IntSize area = 3072
+16.dp + 8.dp = 24.0
+16.dp > 8.dp = true

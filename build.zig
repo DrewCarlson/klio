@@ -272,6 +272,7 @@ const kotlinx_pack_dirs = [_][]const u8{
     "kotlin-klio/klio-compose-runtime",
     "kotlin-klio/klio-mosaic",
     "kotlin-klio/klio-compose-ui",
+    "kotlin-klio/klio-compose-ui-graphics",
 };
 
 /// Environment variables the interpreter and runtime read per-process (via
@@ -335,6 +336,14 @@ pub fn build(b: *std.Build) void {
         "Optimize mode for the program-running test harnesses (default ReleaseSafe)",
     ) orelse .ReleaseSafe;
 
+    // The Compose-UI Skia backend: libklio_skia.so (the compose_ui module
+    // dlopens it) is built by the system C++ toolchain because the prebuilt
+    // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
+    // see plans/UI-RENDERING-PACKS.md. Defaults ON when the vendored libs are
+    // present (`scripts/fetch-skia.sh`); a checkout without them stays green.
+    const skia_libs_present = skiaLibsPresent(b, target);
+    const want_skia = b.option(bool, "skia", "Build the Compose-UI Skia rendering backend (default: on when third_party/skia is present for the target)") orelse skia_libs_present;
+
     // Memoized configure-phase directory walks for declareDataDirs.
     var data_memo = std.StringHashMap([]const []const u8).init(b.allocator);
 
@@ -363,6 +372,14 @@ pub fn build(b: *std.Build) void {
     const pack_mod = mods.get("pack").?;
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
+
+    // The compose_ui module dlopens the Skia backend (std.DynLib), which needs
+    // libc; flow it into every artifact that imports compose_ui.
+    mods.get("compose_ui").?.link_libc = true;
+
+    // ir (eval/jit_loop) selects std.heap.c_allocator on the GC-off path, so its
+    // test build needs libc too.
+    mods.get("ir").?.link_libc = true;
 
     // The AArch64 JIT backend uses Darwin's per-thread MAP_JIT write toggle and
     // instruction-cache invalidate from libSystem. Link libc into every artifact
@@ -396,6 +413,8 @@ pub fn build(b: *std.Build) void {
         const pack_harness = harness_mods.get("pack").?;
         pack_harness.link_libc = true;
         pack_harness.linkLibrary(zstd_harness);
+        harness_mods.get("compose_ui").?.link_libc = true;
+        harness_mods.get("ir").?.link_libc = true;
         if (target.result.os.tag.isDarwin()) harness_mods.get("jit").?.link_libc = true;
     }
 
@@ -484,6 +503,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+
+    // Build + install the Compose-UI Skia backend as a shared library the
+    // compose_ui module dlopens at runtime. Built with system g++ (libstdc++
+    // ABI); the resulting .so is self-contained (static Skia + deps linked in).
+    const skia_lib_step = b.step("skia-lib", "Build + install the Compose-UI Skia backend shared library");
+    if (want_skia) {
+        if (buildSkiaShim(b, target)) |so| {
+            const inst = b.addInstallFileWithDir(so, .lib, skiaLibName(target.result.os.tag));
+            skia_lib_step.dependOn(&inst.step);
+            b.getInstallStep().dependOn(&inst.step);
+        } else {
+            std.log.warn("-Dskia set but Skia libs for the target are missing; run scripts/fetch-skia.sh", .{});
+        }
+    }
 
     // Harness-optimized `klio` for the child-spawning itests: each spawned
     // program pays the embedded-stdlib assembly, so those tests point at
@@ -578,6 +611,11 @@ pub fn build(b: *std.Build) void {
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
+                    // The parity harness caches one base snapshot per (load-mode,
+                    // pack-mask) combination and never evicts, so the ceiling
+                    // rises as the in-repo pack set grows. Give the parity suites
+                    // headroom over the 6 GB default watchdog cap.
+                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
                     run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
                     run_t.step.dependOn(&base_images_install.step);
                     run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
@@ -625,6 +663,10 @@ pub fn build(b: *std.Build) void {
         // e2e and bench run programs through the in-process parity pipeline:
         // point them at the baked dependency bases like the parity itests.
         if (runs_programs) {
+            // The parity harness caches one base snapshot per (load-mode,
+            // pack-mask) combo without eviction, so give the corpus runners
+            // headroom over the 6 GB default RSS watchdog cap.
+            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
             run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
             run_t.step.dependOn(&base_images_install.step);
             run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
@@ -873,4 +915,116 @@ fn buildZstd(
     lib.installHeader(dep.path("lib/zstd.h"), "zstd.h");
 
     return lib;
+}
+
+/// Skia prebuilt-lib layout for a target: the vendored base dir, the archive dir,
+/// and the archive extension (`.a` on linux/macOS, `.lib` on windows). Null when
+/// the OS/arch is not one of the six supported desktop targets.
+fn skiaLibInfo(b: *std.Build, target: std.Build.ResolvedTarget) ?struct {
+    base: []const u8,
+    lib_dir: []const u8,
+    ext: []const u8,
+} {
+    const os = target.result.os.tag;
+    const os_name: []const u8 = switch (os) {
+        .linux => "linux",
+        .macos => "macos",
+        .windows => "windows",
+        else => return null,
+    };
+    const arch_name: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "x64",
+        .aarch64 => "arm64",
+        else => return null,
+    };
+    const base = b.fmt("third_party/skia/{s}-{s}", .{ os_name, arch_name });
+    return .{
+        .base = base,
+        .lib_dir = b.fmt("{s}/out/Release-{s}-{s}", .{ base, os_name, arch_name }),
+        .ext = if (os == .windows) "lib" else "a",
+    };
+}
+
+/// Whether the target's prebuilt Skia libs are vendored (fetch-skia.sh).
+fn skiaLibsPresent(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const info = skiaLibInfo(b, target) orelse return false;
+    b.build_root.handle.access(b.graph.io, b.fmt("{s}/libskia.{s}", .{ info.lib_dir, info.ext }), .{}) catch return false;
+    return true;
+}
+
+/// The dynamic-library file name of the Skia backend for a target OS (the name
+/// the compose_ui module dlopens).
+fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
+    return switch (os) {
+        .macos => "libklio_skia.dylib",
+        .windows => "klio_skia.dll",
+        else => "libklio_skia.so",
+    };
+}
+
+/// Build the Compose-UI Skia backend shared library for `target` with the system
+/// C++ toolchain, from `src/compose_ui/skia_shim.cpp` + the prebuilt Skia libs in
+/// `third_party/skia/<os>-<arch>/` (fetch-skia.sh). The compiler and C++ runtime
+/// must match the prebuilt libs' ABI, which differs per OS — linux GNU libstdc++,
+/// macOS LLVM libc++, windows MSVC — so this is NOT `zig cc` (libc++ everywhere)
+/// but the platform C++ driver. `-Dskia-cxx` (or `$CXX`) overrides the compiler,
+/// which is how a cross toolchain (osxcross clang++, etc.) is supplied for a cross
+/// build. The libs are -fPIC, so each links into a self-contained dynamic library
+/// the module dlopens at runtime. Returns null when the target's libs are absent
+/// or the OS/arch is unsupported.
+///
+/// Verified on linux-x64. macOS/windows use the standard per-platform link recipe
+/// (clang++ + frameworks / clang-cl + system libs) but are unverified here.
+fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    const io = b.graph.io;
+    const os = target.result.os.tag;
+    const info = skiaLibInfo(b, target) orelse return null;
+    const base = info.base;
+    const lib_dir = info.lib_dir;
+    const ext = info.ext;
+    b.build_root.handle.access(io, b.fmt("{s}/libskia.{s}", .{ lib_dir, ext }), .{}) catch return null;
+
+    // Compiler: -Dskia-cxx → per-OS default. The override lets a cross toolchain
+    // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.
+    const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
+    const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
+
+    const run = b.addSystemCommand(&.{cxx});
+    run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    run.addArg("-o");
+    const so = run.addOutputFileArg(skiaLibName(os));
+
+    // The prebuilt Skia archives have circular inter-archive references; on GNU
+    // ld that needs a link group. ld64 (macOS) and lld resolve archives without.
+    const group = os == .linux;
+    if (group) run.addArg("-Wl,--start-group");
+    var dir = b.build_root.handle.openDir(io, lib_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch return null;
+    defer walker.deinit();
+    const dot_ext = b.fmt(".{s}", .{ext});
+    while (walker.next(io) catch return null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, dot_ext)) {
+            run.addArg(b.fmt("{s}/{s}", .{ lib_dir, entry.path }));
+        }
+    }
+    if (group) run.addArg("-Wl,--end-group");
+
+    // Per-OS C++ runtime + system frameworks/libs Skia needs.
+    switch (os) {
+        .linux => run.addArgs(&.{ "-lstdc++", "-lpthread", "-ldl", "-lm" }),
+        .macos => run.addArgs(&.{
+            "-lc++",
+            "-framework", "CoreFoundation", "-framework", "CoreGraphics",
+            "-framework", "CoreText",       "-framework", "CoreServices",
+            "-framework", "Foundation",     "-framework", "Metal",
+            "-framework", "QuartzCore",     "-framework", "IOKit",
+        }),
+        .windows => run.addArgs(&.{
+            "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32",
+        }),
+        else => return null,
+    }
+    return so;
 }
