@@ -129,8 +129,12 @@ actual class LocalDate(
         if (monthNumber != other.monthNumber) return monthNumber.compareTo(other.monthNumber)
         return day.compareTo(other.day)
     }
-    override fun toString(): String =
-        "${year.toString().padStart(4, '0')}-${monthNumber.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}"
+    override fun toString(): String {
+        // A negative proleptic year formats as `-0001`, not `00-1`: pad the
+        // magnitude, then re-attach the sign.
+        val y = if (year < 0) "-" + (-year).toString().padStart(4, '0') else year.toString().padStart(4, '0')
+        return "$y-${monthNumber.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}"
+    }
 
     override fun equals(other: Any?): Boolean {
         if (other !is LocalDate) return false
@@ -165,7 +169,12 @@ actual class LocalDate(
             // via the leading `-`; a leading `+` or padded width is rejected),
             // 2-digit month and day, all digits.
             val yStr = parts[0]; val mStr = parts[1]; val dStr = parts[2]
-            if (yStr.length < 4 || mStr.length != 2 || dStr.length != 2 ||
+            // An unsigned year is EXACTLY 4 digits (0000..9999); a wider year is
+            // only valid with the leading `-` (this parser's supported sign),
+            // where it is 4+ digits. `102017-10-01` (6 unsigned digits) is
+            // rejected, matching kotlinx-datetime.
+            val yearDigitsValid = if (neg) yStr.length >= 4 else yStr.length == 4
+            if (!yearDigitsValid || mStr.length != 2 || dStr.length != 2 ||
                 !yStr.all { it in '0'..'9' } || !mStr.all { it in '0'..'9' } || !dStr.all { it in '0'..'9' })
                 throw DateTimeFormatException("Invalid ISO-8601 date: $input")
             val yMag = yStr.toIntOrNull() ?: throw DateTimeFormatException("Invalid ISO-8601 date: $input")
