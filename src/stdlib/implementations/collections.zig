@@ -2534,7 +2534,7 @@ pub fn coll_set_of_not_null(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_sorted_set_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const items = try a.dupe(Value, ctx.args);
-    if (try sortValuesNatural(a, items)) |e| return e;
+    if (try sortListHostAware(ctx, items)) |e| return e;
     return ok(try makeSet(a, items, true));
 }
 
@@ -5315,7 +5315,7 @@ pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
     };
     const copy = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortValuesNatural(a, copy)) |e| return e;
+    if (try sortListHostAware(ctx, copy)) |e| return e;
     return ok(try makeList(a, copy, false));
 }
 pub fn coll_set_sorted_descending(ctx: *CallCtx) Error!EvalResult {
