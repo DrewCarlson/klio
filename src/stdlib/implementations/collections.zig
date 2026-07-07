@@ -456,6 +456,34 @@ fn indexOfBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle:
     return null;
 }
 
+fn findKeyIndexBoxedH(host: IntrinsicHost, out: Output, entries: []const MapPair, key: *const Value) Error!?usize {
+    for (entries, 0..) |*kv, i| {
+        if (try eqBoxedH(host, out, &kv.key, key)) return i;
+    }
+    return null;
+}
+
+/// `makeMap` honouring a user `equals` for key dedup (last write wins).
+fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
+    var o: std.ArrayList(MapPair) = .empty;
+    for (entries) |kv| {
+        if (try findKeyIndexBoxedH(host, out, o.items, &kv.key)) |i| {
+            if (runtime.reclaimEnabled()) {
+                o.items[i].value.release(a);
+                kv.value.retain();
+            }
+            o.items[i].value = kv.value;
+        } else {
+            if (runtime.reclaimEnabled()) {
+                kv.key.retain();
+                kv.value.retain();
+            }
+            try o.append(a, kv);
+        }
+    }
+    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
+}
+
 /// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
 fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
@@ -1355,7 +1383,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        const pos = findKeyIndexBoxed(acc.items, &k);
+        const pos = try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k);
         const cur = if (pos) |p| acc.items[p].value else blk: {
             if (isCallable(initial)) {
                 break :blk switch (try invoke(ctx, &initial, &.{ k, v })) {
@@ -1396,7 +1424,7 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (findKeyIndexBoxed(acc.items, &k)) |p| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k)) |p| {
             const cur = acc.items[p].value;
             const next = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
                 .value => |val| val,
@@ -1441,7 +1469,7 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             key.retain();
             val.retain();
         }
-        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 key.release(a); // existing key kept; drop the duplicate's retain
@@ -1484,7 +1512,7 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             };
             value_owned = true;
         }
-        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 if (!value_owned) value.retain();
@@ -1515,7 +1543,7 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
         };
         // val is owned (invoke result); v is a borrowed receiver element used as
         // the key, so the map owns its own ref to it.
-        if (findKeyIndexBoxed(entries.items, &v)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &v)) |i| {
             if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
         } else {
@@ -2505,7 +2533,7 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
         try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
     if (try sortMapByKey(a, entries.items, false)) |e| return e;
-    return ok(try makeMap(a, entries.items, true));
+    return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, true));
 }
 
 /// Insertion sort a map's entries by key (natural order, optional reverse).
@@ -4585,7 +4613,7 @@ fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) {
                 };
             },
         }
-        if (findKeyIndexBoxed(out.items, &key)) |i| {
+        if (try findKeyIndexBoxedH(ctx.host, ctx.out, out.items, &key)) |i| {
             out.items[i].value = val;
         } else {
             try out.append(a, .{ .key = key, .value = val });
@@ -4640,7 +4668,7 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
         }
         return ok(dest);
     }
-    return ok(try makeMap(a, entries.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, false));
 }
 
 pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
@@ -5573,7 +5601,7 @@ pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
         },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
     }
-    return ok(try makeMap(a, out.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
 }
 
 pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
@@ -5603,7 +5631,7 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     for (src) |kv| {
         if (!containsBoxed(keys.items, &kv.key)) try out.append(a, kv);
     }
-    return ok(try makeMap(a, out.items, false));
+    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
 }
 
 pub fn coll_map_size(ctx: *CallCtx) Error!EvalResult {
