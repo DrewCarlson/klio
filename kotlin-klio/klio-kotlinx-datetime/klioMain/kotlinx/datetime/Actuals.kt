@@ -428,7 +428,10 @@ actual class LocalDateTime(
 // UtcOffset / FixedOffsetTimeZone / the format DSL, out of scope).
 // Conversion is chrono-backed in the host.
 
-class TimeZone internal constructor(val id: String) {
+// `offsetSeconds` is non-null for a FIXED-OFFSET zone (`+03:00`, `UTC+3`, `Z`),
+// whose instant<->local conversion is pure arithmetic and needs no IANA host
+// binding; null for a named region zone (chrono-host-backed).
+class TimeZone internal constructor(val id: String, internal val offsetSeconds: Int? = null) {
     override fun toString(): String = id
     override fun equals(other: Any?): Boolean = (other is TimeZone) && other.id == id
     override fun hashCode(): Int = id.hashCode()
@@ -441,6 +444,9 @@ class TimeZone internal constructor(val id: String) {
         val UTC: TimeZone = TimeZone("UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
         fun of(zoneId: String): TimeZone {
+            parseFixedOffsetSeconds(zoneId)?.let { off ->
+                return TimeZone(if (off == 0) "Z" else UtcOffset(off).toString(), off)
+            }
             if (!__kxdt_validateTimeZone(zoneId)) {
                 throw IllegalTimeZoneException("Unknown time-zone id: $zoneId")
             }
@@ -455,13 +461,52 @@ class TimeZone internal constructor(val id: String) {
 // in TimeZone.kt (not consumed); klio supplies them directly over
 // the chrono host binding.
 
+// Parse a fixed-offset zone id (`Z`, `UTC`, `GMT`, `+3`, `-06:30`, `UTC+3`,
+// `+03:00:00`) to total seconds, or null when it is a named region zone.
+internal fun parseFixedOffsetSeconds(id: String): Int? {
+    if (id == "Z" || id == "z" || id == "UTC" || id == "GMT" || id == "UT") return 0
+    var s = id
+    for (prefix in listOf("UTC", "GMT", "UT")) {
+        if (s.startsWith(prefix)) { s = s.substring(prefix.length); break }
+    }
+    if (s.isEmpty()) return null
+    val sign = when (s[0]) { '+' -> 1; '-' -> -1; else -> return null }
+    val body = s.substring(1)
+    if (body.isEmpty()) return null
+    val parts = body.split(":")
+    if (parts.size > 3) return null
+    val h = parts[0].toIntOrNull() ?: return null
+    val m = if (parts.size > 1) (parts[1].toIntOrNull() ?: return null) else 0
+    val sec = if (parts.size > 2) (parts[2].toIntOrNull() ?: return null) else 0
+    if (m !in 0..59 || sec !in 0..59) return null
+    return sign * (h * 3600 + m * 60 + sec)
+}
+
+// Split epoch seconds into (floor days, seconds-of-day) with a non-negative
+// remainder, for a fixed-offset local calendar.
+private fun epochSecondsToLocalDateTime(sec: Long, nanos: Int): LocalDateTime {
+    val days = if (sec >= 0) sec / 86400L else -((-sec + 86399L) / 86400L)
+    val secOfDay = sec - days * 86400L
+    return LocalDateTime(
+        dateFromEpochDays(days),
+        LocalTime((secOfDay / 3600L).toInt(), ((secOfDay % 3600L) / 60L).toInt(), (secOfDay % 60L).toInt(), nanos),
+    )
+}
+
 fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime {
+    timeZone.offsetSeconds?.let { off ->
+        return epochSecondsToLocalDateTime(epochSeconds + off, nanosecondsOfSecond)
+    }
     val parts = __kxdt_instantToLocalParts(epochSeconds, nanosecondsOfSecond, timeZone.id)
     return LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
         parts[3].toInt(), parts[4].toInt(), parts[5].toInt(), parts[6].toInt())
 }
 
 fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
+    timeZone.offsetSeconds?.let { off ->
+        val localSec = date.toEpochDays() * 86400L + hour.toLong() * 3600L + minute.toLong() * 60L + second.toLong()
+        return Instant.fromEpochSeconds(localSec - off, nanosecond.toLong())
+    }
     val r = __kxdt_localToInstant(year, monthNumber, dayOfMonth, hour, minute, second, nanosecond, timeZone.id)
     return Instant.fromEpochSeconds(r[0], r[1])
 }
