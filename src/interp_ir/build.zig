@@ -2147,11 +2147,19 @@ fn buildModuleWithOverrides(
             });
             try entries.append(a, .{ .name = entry.name.name, .value = .{ .Instance = inst } });
 
-            if (entry.args.len != 0) {
-                var fids = try a.alloc(FuncId, entry.args.len);
-                for (entry.args, 0..) |*arg, idx| {
+            // Lower an init thunk per constructor slot: the entry's explicit
+            // args, then default values for any trailing primary-ctor params
+            // the entry omits (`enum E(val n:Int, val f:Boolean=false){A(1)}`
+            // must still initialize `f`). Kotlin requires the provided args to
+            // be a prefix, so defaults fill the suffix and stay index-aligned.
+            var slot_count: usize = entry.args.len;
+            while (slot_count < c.primary_params.len and c.primary_params[slot_count].default != null) : (slot_count += 1) {}
+            if (slot_count != 0) {
+                var fids = try a.alloc(FuncId, slot_count);
+                for (0..slot_count) |idx| {
                     const nm = try std.fmt.allocPrint(a, "__enum_arg_{s}_{s}_{d}", .{ c.name.name, entry.name.name, idx });
-                    fids[idx] = try ir.lower.lowerExprAsThunk(module, arg, nm);
+                    const arg_expr = if (idx < entry.args.len) &entry.args[idx] else &c.primary_params[idx].default.?;
+                    fids[idx] = try ir.lower.lowerExprAsThunk(module, arg_expr, nm);
                 }
                 try enum_entry_arg_inits.append(a, .{ .class_name = c.name.name, .entry_name = entry.name.name, .funcs = fids });
             }
