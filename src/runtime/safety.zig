@@ -129,7 +129,7 @@ fn memoryWatchdogLoop(cap_kb: u64) void {
 /// Current resident-set size in KiB. Read from `/proc/self/statm` on Linux
 /// (field 2 = resident pages) and from the mach task basic info on macOS.
 /// Returns `null` on any other platform or on a read error.
-fn currentRssKb() ?u64 {
+pub fn currentRssKb() ?u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
@@ -272,6 +272,83 @@ pub fn runOnBigStack(
         .{&runner},
     ) catch return func(ctx);
     t.join();
+    return runner.result;
+}
+
+/// Switch the stack pointer to `sp_top`, call `func(arg)`, then restore it —
+/// running `func` on a caller-supplied stack without leaving the current OS
+/// thread. `sp_top` must point just past a writable region and be 16-byte
+/// aligned. Used to give the interpreter a large stack while keeping it on the
+/// process main thread (macOS AppKit + a single-threaded Skia GPU context both
+/// require the main thread).
+noinline fn callOnStack(
+    sp_top: usize,
+    func: *const fn (*anyopaque) callconv(.c) void,
+    arg: *anyopaque,
+) void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile (
+            \\ mov x20, sp
+            \\ mov sp, %[sp]
+            \\ mov x0, %[arg]
+            \\ blr %[func]
+            \\ mov sp, x20
+            :
+            : [sp] "r" (sp_top),
+              [func] "r" (func),
+              [arg] "r" (arg),
+            : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x20 = true, .x30 = true, .memory = true, .nzcv = true }),
+        .x86_64 => asm volatile (
+            \\ movq %%rsp, %%r15
+            \\ movq %[sp], %%rsp
+            \\ movq %[arg], %%rdi
+            \\ callq *%[func]
+            \\ movq %%r15, %%rsp
+            :
+            : [sp] "r" (sp_top),
+              [func] "r" (func),
+              [arg] "r" (arg),
+            : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r15 = true, .memory = true, .cc = true }),
+        else => func(arg),
+    }
+}
+
+/// Run `func(ctx)` on the current OS thread but on a freshly mmap'd large stack
+/// (via `callOnStack`), returning its result. Unlike `runOnBigStack` this does
+/// not spawn a worker thread, so the interpreter keeps running on the process
+/// main thread — required on macOS, where AppKit windowing and the single-thread
+/// Skia GPU (Metal) context must both live on the main thread. Falls back to an
+/// inline call on the current stack if the mapping fails or the arch is
+/// unsupported (same behavior, just the smaller default stack).
+pub fn runOnBigStackMainThread(
+    comptime Ctx: type,
+    comptime Ret: type,
+    comptime func: fn (Ctx) Ret,
+    ctx: Ctx,
+) Ret {
+    if (comptime builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64) {
+        return func(ctx);
+    }
+    const Runner = struct {
+        ctx: Ctx,
+        result: Ret = undefined,
+        fn entry(arg: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(arg));
+            self.result = func(self.ctx);
+        }
+    };
+    var runner = Runner{ .ctx = ctx };
+    const stack = std.posix.mmap(
+        null,
+        INTERPRET_STACK_SIZE,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    ) catch return func(ctx);
+    defer std.posix.munmap(stack);
+    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
+    callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
 }
 

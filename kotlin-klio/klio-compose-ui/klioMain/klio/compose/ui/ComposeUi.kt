@@ -13,9 +13,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.ComposeNode
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.ControlledComposition
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshots.ObserverHandle
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlin.coroutines.EmptyCoroutineContext
 
 // ----- color -----
 
@@ -84,6 +88,14 @@ class DisplayList {
             .append(hex(argb)).append(' ').append(s).append('\n')
     }
 
+    // Word-wrapped, aligned text (align: 0 left, 1 center, 2 right) with its
+    // top-left at (x, y), wrapped within w px.
+    fun paragraph(x: Int, y: Int, w: Int, size: Int, align: Int, argb: Int, s: String) {
+        sb.append("para ").append(x).append(' ').append(y).append(' ').append(w).append(' ')
+            .append(size).append(' ').append(align).append(' ').append(hex(argb)).append(' ')
+            .append(s).append('\n')
+    }
+
     fun encoded(): String = sb.toString()
 }
 
@@ -103,6 +115,17 @@ private fun clamp(value: Int, lo: Int, hi: Int): Int {
 // agree without a font-metric round trip through the backend.
 private const val GLYPH_H = 5
 private const val GLYPH_ADVANCE = 4 // per-character width incl. gap
+
+// The wrapped height (layout units) of [s] word-wrapped to [width]. Uses the Skia
+// backend's real font metrics when available; otherwise estimates from the nominal
+// mono advance so headless layout (no backend) still sizes paragraphs.
+private fun paragraphHeight(s: String, width: Int): Int {
+    val measured = __composeui_measureText(s, width, GLYPH_H).toInt()
+    if (measured > 0) return measured
+    val perLine = if (width / GLYPH_ADVANCE > 0) width / GLYPH_ADVANCE else 1
+    val lines = (s.length + perLine - 1) / perLine
+    return (if (lines < 1) 1 else lines) * ((GLYPH_H * 13 + 9) / 10)
+}
 
 // ----- modifier -----
 
@@ -173,6 +196,8 @@ class LayoutNode {
     var offsetY = 0
     var text: String = ""
     var textColor: Color? = null
+    var wrapWidth = 0 // >0: paragraph mode, word-wrapped to this width (layout units)
+    var textAlign = 0 // 0 left, 1 center, 2 right
 
     fun measure(constraints: Constraints) {
         val pad = modifier.padding
@@ -187,8 +212,13 @@ class LayoutNode {
         var contentW = 0
         var contentH = 0
         if (text.isNotEmpty()) {
-            contentW = text.length * GLYPH_ADVANCE - 1
-            contentH = GLYPH_H
+            if (wrapWidth > 0) {
+                contentW = wrapWidth
+                contentH = paragraphHeight(text, wrapWidth)
+            } else {
+                contentW = text.length * GLYPH_ADVANCE - 1
+                contentH = GLYPH_H
+            }
         }
         if (arrangement == "Row") {
             var cursor = 0
@@ -257,11 +287,17 @@ class LayoutNode {
         if (text.isNotEmpty()) {
             val fg = textColor ?: Color.White
             val size = GLYPH_H * scale
-            // Skia text origin is the baseline; place it a glyph-height below the
-            // padded top-left so it sits inside the box.
-            val tx = (originX + pad) * scale
-            val baseline = (originY + pad) * scale + size
-            list.drawText(tx, baseline, size, fg.argb, text)
+            if (wrapWidth > 0) {
+                // Paragraph: the backend wraps within w px and offsets the baseline
+                // itself, so pass the padded top-left as the origin.
+                list.paragraph((originX + pad) * scale, (originY + pad) * scale, wrapWidth * scale, size, textAlign, fg.argb, text)
+            } else {
+                // Skia text origin is the baseline; place it a glyph-height below
+                // the padded top-left so it sits inside the box.
+                val tx = (originX + pad) * scale
+                val baseline = (originY + pad) * scale + size
+                list.drawText(tx, baseline, size, fg.argb, text)
+            }
         }
         for (child in children) {
             child.draw(list, originX + child.offsetX, originY + child.offsetY, scale, hits)
@@ -387,6 +423,40 @@ fun Text(text: String, color: Color) {
     Text(text, color, Modifier.None)
 }
 
+// Text alignment for [Paragraph].
+const val ALIGN_LEFT = 0
+const val ALIGN_CENTER = 1
+const val ALIGN_RIGHT = 2
+
+/**
+ * Word-wrapped, multi-line text laid out within [width] layout units and aligned
+ * ([ALIGN_LEFT]/[ALIGN_CENTER]/[ALIGN_RIGHT]). The Skia backend wraps on real font
+ * metrics; headless layout estimates the line count. Unlike [Text] (single line),
+ * this grows in height to fit.
+ */
+@Composable
+fun Paragraph(text: String, color: Color, width: Int, align: Int, modifier: Modifier) {
+    ComposeNode<LayoutNode, LayoutNodeApplier>(
+        factory = {
+            val n = LayoutNode()
+            n.arrangement = "Box"
+            n
+        },
+        update = {
+            set(text) { this.text = it }
+            set(color) { this.textColor = it }
+            set(width) { this.wrapWidth = it }
+            set(align) { this.textAlign = it }
+            set(modifier) { this.modifier = it }
+        },
+    )
+}
+
+@Composable
+fun Paragraph(text: String, color: Color, width: Int) {
+    Paragraph(text, color, width, ALIGN_LEFT, Modifier.None)
+}
+
 /**
  * A lazy vertical list: only the items in the scrolled-into-view window are
  * composed (the item content for off-screen indices never runs), so a list of
@@ -498,6 +568,15 @@ class UiRenderer internal constructor(
 ) {
     private val hits = ArrayList<HitRegion>()
 
+    /** State objects modified since the last recomposition. A snapshot apply
+     * observer records the committed writes here so [recomposeDisplayList] can
+     * hand them to the composition (the recomposer's own apply observer only runs
+     * while its coroutine loop is active, which this synchronous harness never
+     * starts). */
+    private val pendingModifications = HashSet<Any>()
+    private val applyObserver: ObserverHandle =
+        Snapshot.registerApplyObserver { changed, _ -> pendingModifications.addAll(changed) }
+
     /** The key handler of the focused node (set by clicking a node with an
      * `onKey` modifier); key input is delivered here. Re-resolved after every
      * recomposition from [focusAnchorX]/[focusAnchorY] so it always points at the
@@ -546,9 +625,32 @@ class UiRenderer internal constructor(
         return renderDisplayListToPng(path, width * scale, height * scale, list.encoded())
     }
 
-    /** Recompose after a state write, then return the next frame's display list. */
+    /** Recompose after a state write, then return the next frame's display list.
+     * Drives the composition synchronously through the real upstream
+     * `ControlledComposition` API: publish the pending writes, invalidate the
+     * scopes that read them, recompose, and apply the resulting node changes. */
     fun recomposeDisplayList(scale: Int): String {
-        recomposer.recompose()
+        Snapshot.sendApplyNotifications()
+        if (pendingModifications.isNotEmpty()) {
+            val controlled = composition as ControlledComposition
+            controlled.recordModificationsOf(pendingModifications.toSet())
+            pendingModifications.clear()
+            // Recompose inside a read-observing snapshot (mirrors the recomposer's
+            // own `composing`): the read observer re-records the state each scope
+            // reads, so a later write reinvalidates it. Without it a recomposed
+            // scope loses its subscription and only the first write ever takes.
+            val snapshot = Snapshot.takeMutableSnapshot(
+                { value -> controlled.recordReadOf(value) },
+                { value -> controlled.recordWriteOf(value) },
+            )
+            val changed = try {
+                snapshot.enter { controlled.recompose() }
+            } finally {
+                snapshot.apply().check()
+                snapshot.dispose()
+            }
+            if (changed) controlled.applyChanges()
+        }
         return displayList(scale)
     }
 
@@ -622,6 +724,7 @@ class UiRenderer internal constructor(
     }
 
     fun dispose() {
+        applyObserver.dispose()
         composition.dispose()
     }
 }
@@ -650,18 +753,38 @@ fun runApp(
     }
     var frame = 0
     var running = true
-    while (running && (maxFrames < 0 || frame < maxFrames)) {
+    var dirty = true
+    // Invoked by the windowing backend during a live resize (while the modal drag
+    // blocks this loop) so the UI relayouts and redraws in realtime; w/h in points.
+    val onResize: (Int, Int) -> Unit = { w, h ->
+        ui.resize(w / scale, h / scale, scale)
         __composeui_winRender(handle, ui.displayList(scale))
-        val ev = __composeui_winPoll(handle, 100)
-        val type = (ev shr 32).toInt()
-        val a = ((ev shr 16) and 0xFFFF).toInt()
-        val b = (ev and 0xFFFF).toInt()
-        when (type) {
-            2 -> running = false                             // close
-            1 -> ui.click(a / scale, b / scale, scale)       // click: a=x, b=y
-            3 -> ui.key(a, b, scale)                          // key: a=char, b=keysym
-            4 -> ui.hover(a / scale, b / scale, scale)        // move: a=x, b=y
-            5 -> ui.resize(a / scale, b / scale, scale)       // resize: a=w, b=h (px)
+    }
+    while (running && (maxFrames < 0 || frame < maxFrames)) {
+        // Present only when the frame changed. Rendering every iteration paces the
+        // whole loop to vsync (nextDrawable blocks), which would gate event
+        // processing behind the render throttle and delay input after a burst.
+        if (dirty) {
+            __composeui_winRender(handle, ui.displayList(scale))
+            dirty = false
+        }
+        // Block for one event, then drain any others without rendering between them,
+        // so a backlog (e.g. moves accumulated during a resize) processes at once and
+        // the resulting state is drawn in a single frame.
+        var ev = __composeui_winPoll(handle, 100, onResize)
+        while (true) {
+            val type = (ev shr 32).toInt()
+            val a = ((ev shr 16) and 0xFFFF).toInt()
+            val b = (ev and 0xFFFF).toInt()
+            when (type) {
+                2 -> running = false                             // close
+                1 -> { ui.click(a / scale, b / scale, scale); dirty = true }   // a=x, b=y
+                3 -> { ui.key(a, b, scale); dirty = true }                      // a=char, b=keysym
+                4 -> { ui.hover(a / scale, b / scale, scale); dirty = true }    // a=x, b=y
+                5 -> { ui.resize(a / scale, b / scale, scale); dirty = true }   // a=w, b=h
+            }
+            if (type == 0 || !running) break
+            ev = __composeui_winPoll(handle, 0, onResize)  // drain remaining, non-blocking
         }
         frame += 1
     }
@@ -674,7 +797,7 @@ fun uiRenderer(width: Int, height: Int, content: @Composable () -> Unit): UiRend
     val root = LayoutNode()
     root.arrangement = "Box"
     root.modifier = Modifier.None.fillMaxSize()
-    val recomposer = Recomposer()
+    val recomposer = Recomposer(EmptyCoroutineContext)
     val composition = Composition(LayoutNodeApplier(root), recomposer)
     composition.setContent(content)
     return UiRenderer(root, width, height, recomposer, composition)
