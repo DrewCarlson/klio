@@ -46,6 +46,8 @@ include = [
     "-Platform.kt",
     "ByteString.kt",
     "ByteStringBuilder.kt",
+    "Base64.kt",
+    "Hex.kt",
     "unsafe/Annotations.kt",
     "unsafe/UnsafeByteStringOperations.kt",
 ]
