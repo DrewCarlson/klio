@@ -2955,7 +2955,47 @@ fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     if (try sublistComodGuard(a, &ctx.args[0])) |e| return e;
-    const buf = try display(a, ctx.args[0]);
+    const recv = ctx.args[0];
+    // A List/Set element that is a user Instance must render via its own
+    // `toString()` (dispatched through the VM), not the Zig-level `display`
+    // formatter, which prints `ClassName@id` for a non-data class. Primitives
+    // and data classes fall back to `display` (already correct).
+    const items: ?[]Value = switch (recv) {
+        .List => |l| try snapshotItems(a, l.items),
+        .Set => |s| try snapshotItems(a, s.items),
+        else => null,
+    };
+    if (items) |elems| {
+        defer a.free(elems);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try out.append(a, '[');
+        for (elems, 0..) |v, i| {
+            if (i > 0) try out.appendSlice(a, ", ");
+            // A collection that contains itself renders the self-slot as
+            // `(this Collection)` rather than recursing (matches Kotlin).
+            if (Value.referenceEq(&v, &recv)) {
+                try out.appendSlice(a, "(this Collection)");
+                continue;
+            }
+            const piece: []const u8 = if (v == .Instance) blk: {
+                if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
+                    if (mr == .ok and mr.ok == .String) {
+                        const g = mr.ok.String.borrow();
+                        defer g.deinit();
+                        break :blk try a.dupe(u8, g.get().bytes);
+                    }
+                }
+                break :blk try display(a, v);
+            } else try display(a, v);
+            try out.appendSlice(a, piece);
+            if (runtime.freeScratch()) a.free(piece);
+        }
+        try out.append(a, ']');
+        const buf = try out.toOwnedSlice(a);
+        return ok(try makeStringOwned(a, buf));
+    }
+    const buf = try display(a, recv);
     const s = try makeStringOwned(a, buf);
     if (runtime.freeScratch()) a.free(buf);
     return ok(s);
