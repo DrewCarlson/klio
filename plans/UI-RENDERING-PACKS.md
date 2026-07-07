@@ -113,12 +113,15 @@ hashes. CI runs `scripts/fetch-skia.sh` once (like the kotlin checkout).
    dlopens + renders a correct anti-aliased PNG); macOS/windows use the standard
    per-platform recipe but are unverified on this host.
 
+4. **Zig dlopen binding** — DONE. `src/compose_ui/compose_ui.zig` lazily dlopens the
+   Skia lib (`KLIO_SKIA_LIB` env → platform lib name via the loader path), resolves
+   the `klio_skia_*` symbols, and the `__composeui_skiaRender(path, w, h, list)` host
+   intrinsic replays a display list → PNG (returns an FNV-1a checksum). The pack
+   exposes `renderDisplayListToPng`. Verified: a Kotlin program renders a correct AA
+   PNG through the full stack. `loadSkia` returns null gracefully when absent.
+
 **TODO:**
 
-4. **Zig dlopen binding** in `src/compose_ui/compose_ui.zig` — `std.DynLib` opens the
-   `.so` (path: `KLIO_SKIA_LIB` env → `libklio_skia.so` via loader path → relative to
-   the exe), lazily + cached, resolves the `klio_skia_*` symbols, and a host
-   intrinsic replays a display list → PNG. Replaces the PPM sink registration.
 5. **Display list + Skia draw in `klio.compose.ui`** — the draw pass records draw ops
    (rect/rrect/circle/line/text with float coords + ARGB) instead of writing pixels;
    `UiRenderer.savePng(path)` hands the list to the host binding. Delete `PixelCanvas`,
