@@ -83,22 +83,35 @@ hashes. CI runs `scripts/fetch-skia.sh` once (like the kotlin checkout).
 **DONE (build backend wired + proven):**
 
 1. **`scripts/fetch-skia.sh`** — downloads + extracts the pinned `m150-1f14f1166a`
-   release into `third_party/skia/{include,modules,out}` (gitignored) for the host
-   os/arch. The archive is self-contained (`libskia.a` + all deps).
+   release for a target os/arch into `third_party/skia/<os>-<arch>/{include,modules,
+   out}` (gitignored, per-target so several coexist for cross builds). All 6 desktop
+   targets: `{linux,macos,windows}` × `{x64,arm64}`. Defaults to host; override with
+   `fetch-skia.sh <os> <arch>` or `KLIO_SKIA_OS`/`KLIO_SKIA_ARCH`. Archives are
+   self-contained (`libskia.{a,lib}` + all deps + headers).
 2. **`src/compose_ui/skia_shim.cpp`** — the `extern "C"` DrawScope: `klio_skia_new`/
    `_free`/`_clear`/`_fill_rect`/`_stroke_rect`/`_fill_rrect`/`_fill_circle`/
    `_draw_line`/`_draw_text` (SkFont, needs a bundled font — see below) /`_save_png`/
    `_encode_png`. Anti-aliased `SkPaint`, N32-premul raster `SkSurface`. Zig calls
-   these via `extern` — no C++ in Zig.
-3. **build.zig** — `buildSkiaShim` runs system **g++** (the libstdc++ ABI constraint:
-   Skia uses the OLD GNU string ABI, `std::string::_Rep::_S_empty_rep_storage`; `zig
-   cc`/libc++ cannot link it) to build a self-contained **`libklio_skia.so`** (Skia
-   `.a` are `-fPIC`, so a shared object links cleanly). `-Dskia` build option, ON by
-   default when `third_party/skia` is present; `-Dskia=false` skips it. `zig build`
-   (and `zig build skia-lib`) install the `.so` to `zig-out/lib`. **dlopen chosen**
-   over static-link so libstdc++ stays entirely out of the zig link. Verified: `zig
-   build` produces `klio` + `libklio_skia.so`; the `.so` dlopens + renders a correct
-   anti-aliased PNG.
+   these via `extern` — no C++ in Zig. Platform-agnostic source (one shim, all OSes).
+3. **build.zig** — `buildSkiaShim(target)` builds a self-contained Skia dynamic
+   library the compose_ui module dlopens (Skia `.a`/`.lib` are `-fPIC`; dlopen keeps
+   the platform C++ runtime out of the zig link). It is **target-aware** — per OS it
+   picks the lib dir (`third_party/skia/<os>-<arch>/…`), the C++ driver + ABI, the
+   output name, and the link deps:
+   - **linux** → `g++` (GNU libstdc++ — the prebuilt Skia uses the OLD string ABI,
+     `std::string::_Rep::_S_empty_rep_storage`, which `zig cc`/libc++ cannot link),
+     `-Wl,--start-group *.a`, `-lstdc++ -lpthread -ldl -lm`, `libklio_skia.so`.
+   - **macOS** → `clang++` (LLVM libc++), `*.a` + `-lc++` + CoreFoundation/CoreGraphics/
+     CoreText/Metal/… frameworks, `libklio_skia.dylib`.
+   - **windows** → clang++/clang-cl (MSVC ABI), `*.lib` + user32/gdi32/opengl32/…,
+     `klio_skia.dll`.
+   `-Dskia` ON by default when the target's libs are present; `-Dskia=false` skips.
+   `-Dskia-cxx=<compiler>` overrides the C++ driver — the hook for a **cross build**
+   (osxcross clang++, a mingw/clang-cl wrapper): fetch the target's libs, pass
+   `-Dtarget=<...>` + `-Dskia-cxx=<cross-compiler>`. `zig build` (and `zig build
+   skia-lib`) install the lib to `zig-out/lib`. **Verified on linux-x64** (builds +
+   dlopens + renders a correct anti-aliased PNG); macOS/windows use the standard
+   per-platform recipe but are unverified on this host.
 
 **TODO:**
 

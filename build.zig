@@ -341,11 +341,8 @@ pub fn build(b: *std.Build) void {
     // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
     // see plans/UI-RENDERING-PACKS.md. Defaults ON when the vendored libs are
     // present (`scripts/fetch-skia.sh`); a checkout without them stays green.
-    const skia_libs_present = blk: {
-        b.build_root.handle.access(b.graph.io, "third_party/skia/out/Release-linux-x64/libskia.a", .{}) catch break :blk false;
-        break :blk true;
-    };
-    const want_skia = b.option(bool, "skia", "Build the Compose-UI Skia rendering backend (default: on when third_party/skia is present)") orelse skia_libs_present;
+    const skia_libs_present = skiaLibsPresent(b, target);
+    const want_skia = b.option(bool, "skia", "Build the Compose-UI Skia rendering backend (default: on when third_party/skia is present for the target)") orelse skia_libs_present;
 
     // Memoized configure-phase directory walks for declareDataDirs.
     var data_memo = std.StringHashMap([]const []const u8).init(b.allocator);
@@ -500,14 +497,14 @@ pub fn build(b: *std.Build) void {
     // Build + install the Compose-UI Skia backend as a shared library the
     // compose_ui module dlopens at runtime. Built with system g++ (libstdc++
     // ABI); the resulting .so is self-contained (static Skia + deps linked in).
-    const skia_lib_step = b.step("skia-lib", "Build + install the Compose-UI Skia backend (libklio_skia.so)");
+    const skia_lib_step = b.step("skia-lib", "Build + install the Compose-UI Skia backend shared library");
     if (want_skia) {
-        if (buildSkiaShim(b)) |so| {
-            const inst = b.addInstallFileWithDir(so, .lib, "libklio_skia.so");
+        if (buildSkiaShim(b, target)) |so| {
+            const inst = b.addInstallFileWithDir(so, .lib, skiaLibName(target.result.os.tag));
             skia_lib_step.dependOn(&inst.step);
             b.getInstallStep().dependOn(&inst.step);
         } else {
-            std.log.warn("-Dskia set but third_party/skia not found; run scripts/fetch-skia.sh", .{});
+            std.log.warn("-Dskia set but Skia libs for the target are missing; run scripts/fetch-skia.sh", .{});
         }
     }
 
@@ -910,35 +907,114 @@ fn buildZstd(
     return lib;
 }
 
-/// Build libklio_skia.so (the Compose-UI Skia backend) with the system C++
-/// toolchain. The prebuilt Skia archives (fetch-skia.sh) are compiled against
-/// GNU libstdc++ with the old string ABI, so the shim + Skia must be linked by
-/// g++ (not zig cc/libc++). The archives are -fPIC, so they link into a
-/// self-contained shared object the compose_ui module dlopens at runtime.
-/// Returns null when the vendored libs are absent.
-fn buildSkiaShim(b: *std.Build) ?std.Build.LazyPath {
-    const io = b.graph.io;
-    const skia_root = "third_party/skia";
-    const lib_dir = skia_root ++ "/out/Release-linux-x64";
-    b.build_root.handle.access(io, lib_dir ++ "/libskia.a", .{}) catch return null;
+/// Skia prebuilt-lib layout for a target: the vendored base dir, the archive dir,
+/// and the archive extension (`.a` on linux/macOS, `.lib` on windows). Null when
+/// the OS/arch is not one of the six supported desktop targets.
+fn skiaLibInfo(b: *std.Build, target: std.Build.ResolvedTarget) ?struct {
+    base: []const u8,
+    lib_dir: []const u8,
+    ext: []const u8,
+} {
+    const os = target.result.os.tag;
+    const os_name: []const u8 = switch (os) {
+        .linux => "linux",
+        .macos => "macos",
+        .windows => "windows",
+        else => return null,
+    };
+    const arch_name: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "x64",
+        .aarch64 => "arm64",
+        else => return null,
+    };
+    const base = b.fmt("third_party/skia/{s}-{s}", .{ os_name, arch_name });
+    return .{
+        .base = base,
+        .lib_dir = b.fmt("{s}/out/Release-{s}-{s}", .{ base, os_name, arch_name }),
+        .ext = if (os == .windows) "lib" else "a",
+    };
+}
 
-    const run = b.addSystemCommand(&.{ "g++", "-std=c++17", "-fPIC", "-shared", "-I" ++ skia_root });
+/// Whether the target's prebuilt Skia libs are vendored (fetch-skia.sh).
+fn skiaLibsPresent(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const info = skiaLibInfo(b, target) orelse return false;
+    b.build_root.handle.access(b.graph.io, b.fmt("{s}/libskia.{s}", .{ info.lib_dir, info.ext }), .{}) catch return false;
+    return true;
+}
+
+/// The dynamic-library file name of the Skia backend for a target OS (the name
+/// the compose_ui module dlopens).
+fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
+    return switch (os) {
+        .macos => "libklio_skia.dylib",
+        .windows => "klio_skia.dll",
+        else => "libklio_skia.so",
+    };
+}
+
+/// Build the Compose-UI Skia backend shared library for `target` with the system
+/// C++ toolchain, from `src/compose_ui/skia_shim.cpp` + the prebuilt Skia libs in
+/// `third_party/skia/<os>-<arch>/` (fetch-skia.sh). The compiler and C++ runtime
+/// must match the prebuilt libs' ABI, which differs per OS — linux GNU libstdc++,
+/// macOS LLVM libc++, windows MSVC — so this is NOT `zig cc` (libc++ everywhere)
+/// but the platform C++ driver. `-Dskia-cxx` (or `$CXX`) overrides the compiler,
+/// which is how a cross toolchain (osxcross clang++, etc.) is supplied for a cross
+/// build. The libs are -fPIC, so each links into a self-contained dynamic library
+/// the module dlopens at runtime. Returns null when the target's libs are absent
+/// or the OS/arch is unsupported.
+///
+/// Verified on linux-x64. macOS/windows use the standard per-platform link recipe
+/// (clang++ + frameworks / clang-cl + system libs) but are unverified here.
+fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    const io = b.graph.io;
+    const os = target.result.os.tag;
+    const info = skiaLibInfo(b, target) orelse return null;
+    const base = info.base;
+    const lib_dir = info.lib_dir;
+    const ext = info.ext;
+    b.build_root.handle.access(io, b.fmt("{s}/libskia.{s}", .{ lib_dir, ext }), .{}) catch return null;
+
+    // Compiler: -Dskia-cxx → per-OS default. The override lets a cross toolchain
+    // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.
+    const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
+    const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
+
+    const run = b.addSystemCommand(&.{cxx});
+    run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
     run.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
     run.addArg("-o");
-    const so = run.addOutputFileArg("libklio_skia.so");
+    const so = run.addOutputFileArg(skiaLibName(os));
 
-    // Whole Skia archive set as a link group (circular inter-archive deps).
-    run.addArg("-Wl,--start-group");
+    // The prebuilt Skia archives have circular inter-archive references; on GNU
+    // ld that needs a link group. ld64 (macOS) and lld resolve archives without.
+    const group = os == .linux;
+    if (group) run.addArg("-Wl,--start-group");
     var dir = b.build_root.handle.openDir(io, lib_dir, .{ .iterate = true }) catch return null;
     defer dir.close(io);
     var walker = dir.walk(b.allocator) catch return null;
     defer walker.deinit();
+    const dot_ext = b.fmt(".{s}", .{ext});
     while (walker.next(io) catch return null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".a")) {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, dot_ext)) {
             run.addArg(b.fmt("{s}/{s}", .{ lib_dir, entry.path }));
         }
     }
-    run.addArg("-Wl,--end-group");
-    run.addArgs(&.{ "-lstdc++", "-lpthread", "-ldl", "-lm" });
+    if (group) run.addArg("-Wl,--end-group");
+
+    // Per-OS C++ runtime + system frameworks/libs Skia needs.
+    switch (os) {
+        .linux => run.addArgs(&.{ "-lstdc++", "-lpthread", "-ldl", "-lm" }),
+        .macos => run.addArgs(&.{
+            "-lc++",
+            "-framework", "CoreFoundation", "-framework", "CoreGraphics",
+            "-framework", "CoreText",       "-framework", "CoreServices",
+            "-framework", "Foundation",     "-framework", "Metal",
+            "-framework", "QuartzCore",     "-framework", "IOKit",
+        }),
+        .windows => run.addArgs(&.{
+            "-luser32", "-lgdi32", "-lopengl32", "-lole32", "-loleaut32",
+        }),
+        else => return null,
+    }
     return so;
 }
