@@ -1213,7 +1213,7 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (!containsBoxed(keys.items, &key)) {
+        if (!try containsBoxedH(ctx.host, ctx.out, keys.items, &key)) {
             try keys.append(a, key);
             try result.append(a, v);
         }
@@ -1353,7 +1353,7 @@ pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
         };
         var found = false;
         for (counts.items) |*c| {
-            if (eqBoxed(&c.key, &k)) {
+            if (try eqBoxedH(ctx.host, ctx.out, &c.key, &k)) {
                 c.n += 1;
                 found = true;
                 break;
@@ -4185,7 +4185,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
             var seen: std.ArrayList(Value) = .empty;
             var nx: std.ArrayList(Value) = .empty;
             for (items) |v| {
-                if (!containsBoxed(seen.items, &v)) {
+                if (!try containsBoxedH(host, out, seen.items, &v)) {
                     try seen.append(a, v);
                     try nx.append(a, v);
                 }
@@ -4200,7 +4200,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
                 };
-                if (!containsBoxed(seen.items, &key)) {
+                if (!try containsBoxedH(host, out, seen.items, &key)) {
                     try seen.append(a, key);
                     try nx.append(a, v);
                 }
@@ -6898,7 +6898,7 @@ pub fn array_content_equals(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(xb);
     if (xa.len != xb.len) return ok(.{ .Bool = false });
     for (xa, xb) |*x, *y| {
-        if (!eqBoxed(x, y)) return ok(.{ .Bool = false });
+        if (!try eqBoxedH(ctx.host, ctx.out, x, y)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
