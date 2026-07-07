@@ -561,6 +561,32 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .MemberRef => |mr| {
+            // `TypeName::class` on a bare type name: load the receiver with
+            // constructor-reference semantics so a class that declares a
+            // `companion object` yields the CLASS value, not its companion
+            // singleton. Without `ctor_ref` a class-name read resolves to the
+            // published companion (Kotlin's `C` ⇒ `C.Companion` value rule),
+            // and `.class` then takes the companion's class — so once the
+            // companion is constructed, `C::class` degrades to
+            // `C$Companion$Companion` and `isInstance` / the name diverge.
+            // `.class` is the identity on the resulting class value (and the
+            // object's class for an `object` singleton), so it is kept.
+            if (std.mem.eql(u8, mr.name.name, "class") and
+                mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
+            {
+                const rn = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn) == null and !b.knowsOuter(rn)) {
+                    if (b.module.classId(rn)) |cid| {
+                        const recv = b.allocReg();
+                        const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
+                        try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = rnm, .class = cid, .ctor_ref = true } });
+                        const dst = b.allocReg();
+                        const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
+                        try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = cnm } });
+                        return dst;
+                    }
+                }
+            }
             // `String::countVowels` where the member names an in-scope
             // LOCAL extension function: kotlinc resolves the reference to
             // that local, not to a member of the type. The local lowered
