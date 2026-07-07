@@ -4150,6 +4150,15 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         }
         cg.deinit();
     }
+    // Companion-extension receiver: `fun LocalDate.Companion.Format(...)` called
+    // as `LocalDate.Format { }`. Its declared receiver is `<Class>.Companion`,
+    // so add that probe name; `extensionTargetsAny` then matches it (by the
+    // "Companion" simple name), the companion singleton is constructed, and the
+    // extension dispatches on it. A false match against another class's
+    // companion extension simply misses on this companion and falls through.
+    var comp_probe_buf: [160]u8 = undefined;
+    const comp_probe = std.fmt.bufPrint(&comp_probe_buf, "{s}.Companion", .{cls_name}) catch cls_name;
+    try probe_classes.append(allocator, comp_probe);
     var comp_name: ?[]const u8 = null;
     {
         const mg = self.module.borrow();
