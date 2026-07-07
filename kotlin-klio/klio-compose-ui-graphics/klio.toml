@@ -1,0 +1,61 @@
+# androidx.compose.ui — the real Compose UI foundation math layer, vendored
+# verbatim from the compose-multiplatform-core submodule (shared with the compose
+# runtime pack). This is genuine androidx.compose.ui code: the geometry
+# (Offset/Size/Rect/RoundRect), unit (Dp/IntOffset/IntSize/Constraints), and util
+# (packFloats/lerp) packages — pure Kotlin over inline value classes, no Skia. The
+# klioMain layer supplies the handful of platform `expect` actuals (float-bit
+# helpers, fastRoundToInt, no-op tracing). The heavier ui-unit files that pull in
+# Density/FontScaling/TextUnit are excluded for this first cut.
+[library]
+id = "androidx.compose.ui"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+# ui-util: the math + inline-class helpers geometry/unit build on.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-util/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/util/MathHelpers.kt",
+    "androidx/compose/ui/util/ListUtils.kt",
+    "androidx/compose/ui/util/InlineClassHelper.kt",
+]
+
+# ui-geometry: Offset / Size / Rect / RoundRect / CornerRadius (all pure).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-geometry/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/geometry/GeometryUtils.kt",
+    "androidx/compose/ui/geometry/InlineClassHelper.kt",
+    "androidx/compose/ui/geometry/Offset.kt",
+    "androidx/compose/ui/geometry/Size.kt",
+    "androidx/compose/ui/geometry/CornerRadius.kt",
+    "androidx/compose/ui/geometry/Rect.kt",
+    "androidx/compose/ui/geometry/RoundRect.kt",
+    "androidx/compose/ui/geometry/MutableRect.kt",
+]
+
+# ui-unit: the self-contained units (Dp/IntOffset/IntSize/IntRect/Constraints/…).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-unit/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/unit/ComposeUiUnitFlags.kt",
+    "androidx/compose/ui/unit/InlineClassHelper.kt",
+    "androidx/compose/ui/unit/LayoutDirection.kt",
+    "androidx/compose/ui/unit/Dp.kt",
+    "androidx/compose/ui/unit/IntOffset.kt",
+    "androidx/compose/ui/unit/IntSize.kt",
+    "androidx/compose/ui/unit/IntRect.kt",
+    "androidx/compose/ui/unit/Constraints.kt",
+    "androidx/compose/ui/unit/Velocity.kt",
+]
+
+# klioMain: the platform `expect` actuals (float bits, fastRoundToInt, tracing).
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"

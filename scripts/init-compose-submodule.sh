@@ -16,7 +16,15 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 path="kotlin-klio/klio-compose-runtime/upstream"
+# The compose runtime commonMain, plus the self-contained ui foundation
+# submodules (geometry / unit / util — pure Kotlin, no Skia) that the
+# klio-compose-ui-graphics pack consumes verbatim.
 sparse="compose/runtime/runtime/src/commonMain"
+sparse_ui=(
+  "compose/ui/ui-util/src/commonMain"
+  "compose/ui/ui-geometry/src/commonMain"
+  "compose/ui/ui-unit/src/commonMain"
+)
 
 url=$(git config -f .gitmodules submodule."$path".url)
 ref=$(git config -f .gitmodules submodule."$path".branch)
@@ -36,7 +44,7 @@ rm -rf "$path"
 # trees + blobs are fetched.
 git clone --filter=tree:0 --no-checkout --depth 1 --branch "$ref" "$url" "$path"
 git -C "$path" sparse-checkout init --cone
-git -C "$path" sparse-checkout set "$sparse"
+git -C "$path" sparse-checkout set "$sparse" "${sparse_ui[@]}"
 git -C "$path" checkout "$ref"
 
 # Move the submodule's .git under .git/modules so it is a proper submodule.

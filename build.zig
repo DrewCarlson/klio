@@ -272,6 +272,7 @@ const kotlinx_pack_dirs = [_][]const u8{
     "kotlin-klio/klio-compose-runtime",
     "kotlin-klio/klio-mosaic",
     "kotlin-klio/klio-compose-ui",
+    "kotlin-klio/klio-compose-ui-graphics",
 };
 
 /// Environment variables the interpreter and runtime read per-process (via
@@ -578,6 +579,11 @@ pub fn build(b: *std.Build) void {
                 if (spec.parity_data) {
                     declareDataDirs(b, run_t, &data_memo, &stdlib_data_dirs);
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
+                    // The parity harness caches one base snapshot per (load-mode,
+                    // pack-mask) combination and never evicts, so the ceiling
+                    // rises as the in-repo pack set grows. Give the parity suites
+                    // headroom over the 6 GB default watchdog cap.
+                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
                     run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
                     run_t.step.dependOn(&base_images_install.step);
                     run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
@@ -625,6 +631,10 @@ pub fn build(b: *std.Build) void {
         // e2e and bench run programs through the in-process parity pipeline:
         // point them at the baked dependency bases like the parity itests.
         if (runs_programs) {
+            // The parity harness caches one base snapshot per (load-mode,
+            // pack-mask) combo without eviction, so give the corpus runners
+            // headroom over the 6 GB default RSS watchdog cap.
+            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
             run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
             run_t.step.dependOn(&base_images_install.step);
             run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));

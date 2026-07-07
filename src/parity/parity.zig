@@ -1151,7 +1151,7 @@ const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
 /// Number of in-repo packs the parity pipeline can load from source.
-pub const N_PACK_DIRS = 7;
+pub const N_PACK_DIRS = 8;
 
 fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
@@ -1163,6 +1163,7 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-mosaic" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-graphics" }),
     };
 }
 
@@ -1407,7 +1408,7 @@ var base_lock: runtime.SpinMutex = .{};
 var base_arena_state: ?*std.heap.ArenaAllocator = null;
 /// key (mode|mask|gate byte) -> entry, or null when the base for that key
 /// could not be snapshotted (callers then always take the fallback).
-var base_entries: ?std.AutoHashMap(u16, ?*const BaseEntry) = null;
+var base_entries: ?std.AutoHashMap(u32, ?*const BaseEntry) = null;
 var stdlib_meta_cache: ?StdlibMeta = null;
 var pack_meta_cache: [N_PACK_DIRS]?PackMeta = @splat(null);
 
@@ -1427,8 +1428,11 @@ const PackMeta = struct {
     deps: []const []const u8,
 };
 
-fn baseKey(mode: LoadMode, mask: u8, full: bool) u16 {
-    return (@as(u16, @intFromEnum(mode)) << 8) | (@as(u16, mask) << 1) | @intFromBool(full);
+fn baseKey(mode: LoadMode, mask: u8, full: bool) u32 {
+    // `mask` occupies a full u8 (one bit per in-repo pack, up to N_PACK_DIRS),
+    // so it lands in bits 1..8 and `mode` sits above it — no overlap even when
+    // the top mask bit is set.
+    return (@as(u32, @intFromEnum(mode)) << 16) | (@as(u32, mask) << 1) | @intFromBool(full);
 }
 
 /// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
@@ -1653,7 +1657,7 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!
     defer base_lock.unlock();
 
     const a = baseArenaAllocator();
-    if (base_entries == null) base_entries = std.AutoHashMap(u16, ?*const BaseEntry).init(std.heap.page_allocator);
+    if (base_entries == null) base_entries = std.AutoHashMap(u32, ?*const BaseEntry).init(std.heap.page_allocator);
     const key = baseKey(mode, mask, full);
     if (base_entries.?.get(key)) |hit| return hit;
 
