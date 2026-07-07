@@ -37,7 +37,62 @@ multi-thread / coroutine / closure / host-temporary close-out):
   slab pages so RSS tracks the live set.
 
 Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
-marking), both below.
+marking), both below. One pending-hardening item (external-bytes accounting) sits
+between the shipped collector and Stage 2 — described directly below.
+
+
+## Pending: external-bytes Appel accounting + keepalive-hole close-out
+
+The Appel trigger (`threshold = max(floor, live*2)`) only counts bytes on the
+sweep registry — refcounted cells. But two large allocation classes live in libc
+storage OUTSIDE the registry: frame register buffers (`acquireRegs`) and
+suspension snapshots (the `dupe`d regs/params/captures a park captures). They are
+traced through the frame chain (never swept directly), so they are sound, but
+their growth never advances the trigger. Consequence: a program that builds a
+deep suspended chain (DeepRecursive, a long generator) keeps the trigger pinned
+at the floor and re-marks the whole growing chain on every collection — the
+observed quadratic in `runFrameInner` self-time.
+
+The fix is written and lives behind `KLIO_GC_EXT=1` (`external_accounting` in
+`gc.zig`): `noteExternalBytes` / `noteExternalFreed` add/subtract these buffers
+at their acquire/release/pool-transition sites (`acquireRegs`, `releaseRegs`
+pool return, the snapshot `dupe`, `freeSnapshotBuffers`), and `external_live`
+feeds the threshold as `max(floor, (live + external_live)*2)`. With it on,
+DeepRecursive at 150k levels drops 33s → 17s.
+
+It ships **gated off** because turning it on collects more often, and the added
+pressure exposed a class of LATENT keepalive holes — host paths that hold a
+Value only in a Zig local across a re-entrant eval, invisible to the mark. This
+is exactly Residual risk #1 made acute. Two real holes were found and fixed via
+`KLIO_GC_POISON` (a swept cell traps on next touch):
+- `SeqIterState.gcTrace`/`deinit` skipped `iter_obj` — the Iterator an
+  `IteratorFn` source produced. Any collection between pulls swept the live
+  iterator; the next pull read freed memory (an eternal borrow spin or a
+  `0xdddddddd…` segfault). Now traced and released.
+- A fresh builder cursor (`freshBuilderState`) driven by a host loop
+  (`streamSequence`, the `sequence.zig` drive sites) was reachable only through
+  a Zig local. `pinBuilderState` now roots it through the keepalive stack for
+  the drive window.
+
+**Remaining work to close this out and flip the default:**
+1. Run the full corpus + parity sweep under `KLIO_GC_EXT=1 KLIO_GC_POISON=1`
+   (and `KLIO_GC_STRESS=1`); every trap is another host path holding a Value in
+   a local across an invoke without a keepalive scope. Fix each by opening a
+   `keepaliveMark`/`keepaliveRestore` window (or routing the value onto a rooted
+   structure) — same mechanism as `pinBuilderState`.
+2. Extend the Debug keepalive lint (Residual risk #1's structural backstop) so a
+   host fn that binds a Value local AND calls invoke/eval between binding it and
+   its last use requires an open keepalive scope — the two holes above would
+   have been caught statically.
+3. Once a clean sweep under `KLIO_GC_EXT=1 KLIO_GC_POISON=1` passes, remove the
+   gate: make `external_accounting` unconditional (delete the flag and the
+   `and external_accounting` guards), so the Appel trigger is correct by
+   default and DeepRecursive's win is on for every run.
+
+**Validation:** the accounting change is byte-identical in output to the gated-off
+path (it only changes collection *timing*), so the acceptance test is the dual
+sweep staying at zero failures with the flag forced on, plus the DeepRecursive
+timing win, plus a clean `KLIO_GC_POISON` run.
 
 
 ## Chosen approach

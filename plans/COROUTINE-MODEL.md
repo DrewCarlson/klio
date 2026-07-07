@@ -179,6 +179,26 @@ are the implementation notes behind these verdicts.
   channel park must register cancellation interest so a cancel resumes its slot with the
   exception.
 
+- **`DeepRecursiveFunction` works under `klio test` but crashes under `klio run`.**
+  `runCallLoop` calls `function.startCoroutineUninterceptedOrReturn(this, value, cont)`,
+  an extension on a `suspend R.(P) -> T` function value. Under `klio test` the call
+  resolves as a top-level function (`path=call_func`,
+  `decl=kotlin.coroutines.intrinsics.startCoroutineUninterceptedOrReturn`) and runs. Under
+  `klio run` (the embedded-image path) the same call is left to runtime extension
+  resolution on the function-typed receiver, which misses and errors:
+  `Vm::call_member 'startCoroutineUninterceptedOrReturn' on 'kotlin.Function'`. So this is
+  an embedded-image-vs-test **extension-resolution divergence** on a function-typed
+  receiver, not a coroutine-machinery bug — the machinery is proven correct by the passing
+  `test` path. Repro:
+  `scratchpad/b6/deeprec2.kt` (`val depth: DeepRecursiveFunction<Int, Int> =
+  DeepRecursiveFunction { n -> if (n == 0) 0 else callRecursive(n - 1) + 1 };
+  println(depth(100_000))`) — fails under `klio run`, passes as a `@Test`. Root-cause the
+  divergence: why the embedded image does not resolve the `startCoroutineUninterceptedOrReturn`
+  extension on a `kotlin.Function` receiver the way the test-compiled program does (likely
+  a missing intrinsic/extension registration or a receiver-head match that only the test
+  path's symbol index carries). Fix ships a deterministic probe promoted into the e2e
+  corpus so `klio run` and `klio test` stay in lockstep.
+
 **Suggested fix order:** the #4 `onTimeout` remnant + the cancel-on-channel-park defect
 (closes out the select work); then #1 + #2 (shared `KlioRuntime` root, one segfault);
 then the flow/dispatch cluster #5–#8 (largest, with #7 Unconfined the shared root the #4
