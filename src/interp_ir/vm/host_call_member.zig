@@ -2600,6 +2600,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 // A cached miss falls through to the probe ladder (stdlib /
                 // extension / field), but `irMethodWalk` will skip the walk.
             }
+            // Member-miss that resolved to a top-level extension: dispatch it
+            // here, before the whole builtin probe ladder, exactly as the
+            // member fast path above does. Same owner-independence guards the
+            // cache was populated under.
+            if (!strict_ext and !no_ext and static_recv == null and declared_recv == null) {
+                if (extMethodCacheGet(self, k)) |fid| {
+                    // A top-level extension's `param[0]` is its receiver, so the
+                    // member invoker binds `[receiver] ++ args` correctly — and
+                    // it builds the frame args in one allocation (no prepend
+                    // scratch slice), matching the member fast path's speed.
+                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+                }
+            }
         }
     }
 
@@ -6620,17 +6633,34 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 fn methodArgSig(args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
-    var sig: u64 = @as(u64, args.len) << 56;
-    for (args, 0..) |*a, i| {
-        const tag: u64 = switch (a.*) {
-            .Int => 1,    .Long => 2,   .Double => 3, .Float => 4,
-            .Short => 5,  .Byte => 6,   .Char => 7,   .Bool => 8,
-            .UInt => 9,   .ULong => 10, .UShort => 11, .UByte => 12,
+    // Hash a per-arg type discriminator. Primitives contribute their tag;
+    // an `Instance` also folds in its class identity, so an overload picked
+    // by the argument's class (`LocalDate.plus(DatePeriod)` vs
+    // `LocalDate.plus(DateTimeUnit)`) gets a distinct, cacheable key rather
+    // than the pre-hash scheme's "non-primitive → no key" bail. Any other
+    // value shape yields no key (that call re-resolves) so the cache never
+    // conflates argument types the overload dispatch would distinguish.
+    var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15 +% args.len);
+    for (args) |*a| {
+        const tag: u8 = switch (a.*) {
+            .Int => 1,   .Long => 2,   .Double => 3,  .Float => 4,
+            .Short => 5, .Byte => 6,   .Char => 7,    .Bool => 8,
+            .UInt => 9,  .ULong => 10, .UShort => 11, .UByte => 12,
+            .Instance => 13,
             else => return null,
         };
-        sig |= tag << @intCast(i * 4);
+        h.update((&tag)[0..1]);
+        if (a.* == .Instance) {
+            const g = a.Instance.borrow();
+            const id = g.get().class.identity();
+            g.deinit();
+            h.update(std.mem.asBytes(&id));
+        }
     }
-    return sig;
+    const v = h.final();
+    // 0 is reserved for the empty-arg case; the key also carries `n_args`,
+    // so a non-empty sig colliding to 0 stays distinct from `args.len == 0`.
+    return if (v == 0) 1 else v;
 }
 
 fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
@@ -6663,6 +6693,18 @@ fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
+}
+
+fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().ext_method_cache.get(key);
+}
+
+fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().ext_method_cache.put(key, fid) catch {};
 }
 
 fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
@@ -7425,8 +7467,32 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
 
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
+
+    // Inline-cache fast path. A prior *owner-independent* resolution of this
+    // (receiver class, name, arg types) to a top-level extension dispatches
+    // straight through `callFuncRec`, skipping the candidate collection, the
+    // enclosing-owner set allocation, and the filter/score passes below —
+    // the dominant cost of extension-heavy hot loops. Only keyed when no
+    // receiver override is in play (a static/declared receiver, or the strict
+    // bare-name probe, can resolve the same names differently).
+    const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
+        if (!strict_ext and static_recv == null and declared_recv == null)
+            instanceMethodKey(receiver, name, args)
+        else
+            null;
+    if (cache_key) |k| {
+        if (extMethodCacheGet(self, k)) |fid| {
+            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+        }
+    }
+
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
+
+    // Whether any candidate for this name is a member-extension (its
+    // visibility/selection depends on the enclosing-`this` chain). When one
+    // exists the resolution is context-dependent and must not be cached.
+    var saw_member_ext = false;
 
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(allocator);
@@ -7437,6 +7503,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            if (isMemberExt(mod, fid)) saw_member_ext = true;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             // An unsettled bodyless header is not executable — selecting
             // it would re-enter `callFunc`'s bodyless ladder and cycle,
@@ -7708,6 +7775,13 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 ir.eval.pushEnclosing(&inst);
                 pushed_owner = true;
             }
+        }
+        // Memoize an owner-independent pick: no member-extension competes for
+        // this name and the winner is itself top-level, so the (receiver
+        // class, name, arg types) key fully determines the target. A future
+        // call hits the fast path above and skips this whole resolution.
+        if (!pushed_owner and !saw_member_ext) {
+            if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
         if (pushed_owner) ir.eval.popEnclosing();

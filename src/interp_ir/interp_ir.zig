@@ -177,6 +177,14 @@ pub const ProgramImage = struct {
     /// the method body. Keyed by identity: the class cell pointer and interned
     /// method-name pointer are stable for the program's lifetime.
     instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
+    /// Inline cache for a member-miss that resolves to a top-level *extension*
+    /// function. Same key as `instance_method_cache`; the value is the resolved
+    /// extension `FuncId`. Only owner-independent picks (no member-extension
+    /// candidate competes, no static/declared receiver override, non-strict)
+    /// are stored, so a hit is a pure function of (receiver class, name, arg
+    /// types) and dispatches straight through `callFuncRec` instead of the
+    /// per-call candidate collection + filtering + scoring.
+    ext_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
     /// Inline cache for the pack-binding / stdlib-intrinsic resolution on an
     /// `Instance` receiver (the `instanceBindingProbe` path). Without it every
     /// intrinsic instance-method call rebuilds candidate FQN strings, walks the
@@ -292,6 +300,7 @@ pub const ProgramImage = struct {
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
+            .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
@@ -330,6 +339,7 @@ pub const ProgramImage = struct {
         }
         self.member_resolve_cache.deinit();
         self.instance_method_cache.deinit();
+        self.ext_method_cache.deinit();
         {
             var it = self.instance_intrinsic_cache.valueIterator();
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
