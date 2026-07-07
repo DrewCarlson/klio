@@ -79,11 +79,6 @@ actual class LocalDate(
     val monthNumber: Int,
     val day: Int,
 ) : Comparable<LocalDate> {
-    init {
-        require(year in -999_999..999_999) { "Invalid year: $year" }
-        require(monthNumber in 1..12) { "Invalid month: $monthNumber" }
-        require(day in 1..daysInMonth(year, monthNumber)) { "Invalid day of month: $day" }
-    }
     constructor(year: Int, month: Month, day: Int) : this(year, month.number, day)
 
     val month: Month get() = Month(monthNumber)
@@ -292,12 +287,6 @@ actual class LocalTime(
     val second: Int = 0,
     val nanosecond: Int = 0,
 ) : Comparable<LocalTime> {
-    init {
-        require(hour in 0..23) { "Invalid hour: $hour" }
-        require(minute in 0..59) { "Invalid minute: $minute" }
-        require(second in 0..59) { "Invalid second: $second" }
-        require(nanosecond in 0..999_999_999) { "Invalid nanosecond: $nanosecond" }
-    }
     fun toSecondOfDay(): Int = (hour * 60 + minute) * 60 + second
     fun toMillisecondOfDay(): Int = toSecondOfDay() * 1_000 + nanosecond / 1_000_000
     fun toNanosecondOfDay(): Long =
