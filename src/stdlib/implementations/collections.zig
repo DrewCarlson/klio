@@ -449,6 +449,13 @@ fn containsBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle
     return false;
 }
 
+fn indexOfBoxedH(host: IntrinsicHost, out: Output, items: []const Value, needle: *const Value) Error!?usize {
+    for (items, 0..) |*v, i| {
+        if (try eqBoxedH(host, out, v, needle)) return i;
+    }
+    return null;
+}
+
 /// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
 fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var deduped: std.ArrayList(Value) = .empty;
@@ -2723,9 +2730,9 @@ pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("indexOf requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    const pos = indexOfBoxed(g.get().items, &needle);
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
+    const pos = try indexOfBoxedH(ctx.host, ctx.out, items, &needle);
     return ok(Value.newInt(if (pos) |p| @intCast(p) else -1));
 }
 pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
@@ -2877,13 +2884,12 @@ pub fn coll_list_last_index_of(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("lastIndexOf requires an argument");
     const needle = ctx.args[1];
-    const g = it.borrow();
-    defer g.deinit();
-    const items = g.get().items;
+    const items = try snapshotItems(ctx.allocator, it);
+    defer if (runtime.freeScratch()) ctx.allocator.free(items);
     var i = items.len;
     while (i > 0) {
         i -= 1;
-        if (eqBoxed(&items[i], &needle)) return ok(Value.newInt(@intCast(i)));
+        if (try eqBoxedH(ctx.host, ctx.out, &items[i], &needle)) return ok(Value.newInt(@intCast(i)));
     }
     return ok(Value.newInt(-1));
 }
@@ -4943,7 +4949,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
         if (is_collection) {
-            if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+            if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
         } else if (indexOfBoxed(removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
@@ -5189,7 +5195,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+        if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
@@ -6199,10 +6205,10 @@ pub fn coll_list_contains_all(ctx: *CallCtx) Error!EvalResult {
     };
     const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
         return typeErr("containsAll requires a collection");
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
-        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+        if (!try containsBoxedH(ctx.host, ctx.out, items, &o)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
@@ -6422,10 +6428,10 @@ pub fn coll_set_contains_all(ctx: *CallCtx) Error!EvalResult {
     };
     const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
         return typeErr("containsAll requires a collection");
-    const g = it.borrow();
-    defer g.deinit();
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
-        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+        if (!try containsBoxedH(ctx.host, ctx.out, items, &o)) return ok(.{ .Bool = false });
     }
     return ok(.{ .Bool = true });
 }
@@ -7064,7 +7070,7 @@ pub fn array_contains(ctx: *CallCtx) Error!EvalResult {
     };
     defer if (runtime.freeScratch()) a.free(items);
     const needle = coerceNeedleToArrayKind(ctx.args[1], arrayPrimOf(ctx.args[0]));
-    return ok(.{ .Bool = containsBoxed(items, &needle) });
+    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
 }
 
 pub fn array_contains_all(ctx: *CallCtx) Error!EvalResult {
