@@ -50,7 +50,12 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const pair = pairIntArgs(ctx, "until") orelse return typeErr("until requires two Int operands");
+    // `until` is the integral range builtin, but the name is shared by user
+    // extensions (e.g. `LocalDate.until(other, unit)`). Non-integral operands
+    // are not ours: yield `Unimplemented` so dispatch falls back to the user
+    // extension rather than hard-failing with a type error.
+    const pair = pairIntArgs(ctx, "until") orelse
+        return .{ .err = .{ .Unimplemented = "Vm::until non-integral operands" } };
     const kind = rangeKindForArgs(ctx.args[0], ctx.args[1]);
     // `a until MIN_VALUE` is empty: Kotlin returns the type's EMPTY range rather
     // than wrapping `to - 1` below MIN.
