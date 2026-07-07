@@ -74,6 +74,17 @@ Because freetype/harfbuzz/icu/png are bundled, CPU raster + PNG encode + real te
 shaping all work offline with essentially no system deps (pthread/dl). No GPU
 context needed for a headless deterministic backend.
 
+**Proven (spike done).** A minimal shim — `SkSurfaces::Raster(SkImageInfo::MakeN32Premul)`
+→ `SkCanvas` `clear`/`drawRect`/`drawRRect`/`drawCircle` (anti-aliased `SkPaint`) →
+`surface->peekPixels` → `SkPngEncoder::Encode(SkWStream*, SkPixmap, Options)` —
+compiles and renders a correct anti-aliased PNG on this box. **Critical constraint:
+Skia was built against GNU libstdc++ with the OLD string ABI** (undefined symbols
+`std::string::_Rep::_S_empty_rep_storage`, `std::__throw_length_error`), so it links
+with **system g++ (`/usr/bin/g++` 13.3, libstdc++)**, NOT `zig c++` (which pulls
+LLVM libc++ → ABI mismatch, unresolved symbols). Link line that works:
+`g++ -std=c++17 -Ithird_party/skia shim.cpp -Wl,--start-group
+third_party/skia/out/Release-linux-x64/*.a -Wl,--end-group -lpthread -ldl`.
+
 **Plan:**
 
 1. **Vendor the libs.** A `scripts/fetch-skia.sh` downloads + extracts the pinned
@@ -86,12 +97,18 @@ context needed for a headless deterministic backend.
    antialias/shader-gradient), text via `SkFont`+`SkTextBlob` (simple) then
    `skparagraph::Paragraph` (real layout/wrapping), `readPixels`, and
    `SkPngEncoder::Encode` → bytes. Opaque handle types (surface/paint/path/font) over
-   the FFI boundary.
-3. **build.zig** — a `compose_ui_skia` artifact: compile the shim with `zig cc`
-   (C++, `-std=c++17`), `addIncludePath` the Skia `include` + `modules`, link every
-   `out/Release-linux-x64/*.a` (order-independent via `--start-group` or list all),
-   `-lpthread -ldl`. Gate behind a `-Dskia` build option (off by default until the
-   libs are fetched, so CI without the download still builds the software path).
+   the FFI boundary. Zig calls these via `extern "C"` decls — no C++ in Zig.
+3. **build.zig** — because of the libstdc++ ABI constraint, the shim CANNOT be built
+   with `zig cc` (libc++). Build it + link Skia with **system g++** invoked from
+   build.zig (`b.addSystemCommand("g++", …)`): compile `skia_shim.cpp` (`-std=c++17`,
+   `-Ithird_party/skia`) and archive it with the Skia `*.a` into a single
+   `libklio_skia.a` (or a `.so`). Then the `klio` binary links that archive +
+   `-lstdc++ -lpthread -ldl` (`exe.linkSystemLibrary("stdc++")`, `exe.addObjectFile`/
+   `addLibraryPath`). Alternatively produce `libklio_skia.so` and `dlopen` it from the
+   `src/compose_ui` module (keeps libstdc++ fully out of the zig link). Gate behind a
+   `-Dskia` build option **ON by default**: Skia is the primary backend once the libs
+   are fetched (`scripts/fetch-skia.sh`); the software PPM path is the explicit
+   `-Dskia=false` fallback for a checkout without the download.
 4. **Wire into `src/compose_ui/`** — the existing module is already the seam
    (`mergedHostBindings`, kept out of the interpreter). Add Skia-backed host
    intrinsics beside the PPM sink; `UiRenderer` gets a `savePng(path, scale)` that

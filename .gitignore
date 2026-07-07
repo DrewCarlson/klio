@@ -9,3 +9,4 @@ scripts/__pycache__/
 .claude/
 .pi-lens/
 /CLAUDE.md
+/third_party/skia/
