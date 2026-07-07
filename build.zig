@@ -373,6 +373,14 @@ pub fn build(b: *std.Build) void {
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
 
+    // The compose_ui module dlopens the Skia backend (std.DynLib), which needs
+    // libc; flow it into every artifact that imports compose_ui.
+    mods.get("compose_ui").?.link_libc = true;
+
+    // ir (eval/jit_loop) selects std.heap.c_allocator on the GC-off path, so its
+    // test build needs libc too.
+    mods.get("ir").?.link_libc = true;
+
     // The AArch64 JIT backend uses Darwin's per-thread MAP_JIT write toggle and
     // instruction-cache invalidate from libSystem. Link libc into every artifact
     // that pulls in the jit module so those externs resolve on Apple targets.
@@ -405,6 +413,8 @@ pub fn build(b: *std.Build) void {
         const pack_harness = harness_mods.get("pack").?;
         pack_harness.link_libc = true;
         pack_harness.linkLibrary(zstd_harness);
+        harness_mods.get("compose_ui").?.link_libc = true;
+        harness_mods.get("ir").?.link_libc = true;
         if (target.result.os.tag.isDarwin()) harness_mods.get("jit").?.link_libc = true;
     }
 
