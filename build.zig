@@ -952,6 +952,37 @@ fn skiaLibsPresent(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     return true;
 }
 
+/// Locate the X11 headers + shared library for the Skia shim's windowing backend.
+/// Checks the standard system location, then a linuxbrew prefix. Returns the
+/// include dir + a full path to libX11 (linked directly, so no dev `.so` symlink
+/// is required), or null when X11 is unavailable (then windowing is disabled).
+fn detectX11(b: *std.Build) ?struct { inc: []const u8, lib: []const u8 } {
+    const io = b.graph.io;
+    const inc_candidates = [_][]const u8{ "/usr/include", "/home/linuxbrew/.linuxbrew/include" };
+    const lib_candidates = [_][]const u8{
+        "/usr/lib/x86_64-linux-gnu/libX11.so.6",
+        "/usr/lib/aarch64-linux-gnu/libX11.so.6",
+        "/home/linuxbrew/.linuxbrew/lib/libX11.so.6",
+        "/usr/lib/libX11.so.6",
+    };
+    var inc: ?[]const u8 = null;
+    for (inc_candidates) |c| {
+        if (b.build_root.handle.access(io, b.fmt("{s}/X11/Xlib.h", .{c}), .{})) |_| {
+            inc = c;
+            break;
+        } else |_| {}
+    }
+    var lib: ?[]const u8 = null;
+    for (lib_candidates) |c| {
+        if (b.build_root.handle.access(io, c, .{})) |_| {
+            lib = c;
+            break;
+        } else |_| {}
+    }
+    if (inc != null and lib != null) return .{ .inc = inc.?, .lib = lib.? };
+    return null;
+}
+
 /// The dynamic-library file name of the Skia backend for a target OS (the name
 /// the compose_ui module dlopens).
 fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
@@ -1010,6 +1041,15 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
         }
     }
     if (group) run.addArg("-Wl,--end-group");
+
+    // X11 windowing backend (the shim's on-screen surface). Compiled in only when
+    // the X11 headers + lib are found; otherwise the window functions are stubs
+    // and the pack falls back to headless rendering.
+    if (os == .linux) {
+        if (detectX11(b)) |x| {
+            run.addArgs(&.{ "-DKLIO_X11", b.fmt("-I{s}", .{x.inc}), x.lib });
+        }
+    }
 
     // Per-OS C++ runtime + system frameworks/libs Skia needs.
     switch (os) {
