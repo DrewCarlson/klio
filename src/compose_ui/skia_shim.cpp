@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "include/core/SkBitmap.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColor.h"
 #include "include/core/SkData.h"
@@ -30,6 +31,53 @@
 #include "include/core/SkTypeface.h"
 #include "include/encode/SkPngEncoder.h"
 #include "include/ports/SkFontMgr_empty.h"
+
+// Optional GPU (Ganesh + EGL) backend — off by default. When built with -DKLIO_GPU
+// (and linked against libskia_ganesh_ext + libEGL), klio_skia_new_gpu returns a
+// GPU-backed surface; otherwise it returns null and callers fall back to raster.
+#if defined(KLIO_GPU)
+#include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrContextOptions.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/gl/GrGLAssembleInterface.h"
+#include "include/gpu/ganesh/gl/GrGLDirectContext.h"
+#include "include/gpu/ganesh/gl/GrGLInterface.h"
+#include "include/gpu/ganesh/gl/GrGLTypes.h"
+
+// Minimal EGL surface-less context bring-up. Declared here (rather than via the
+// EGL headers, which are not reliably present) since only these entry points +
+// constants are needed; values are fixed by the EGL 1.5 spec.
+extern "C" {
+typedef void* EGLDisplay;
+typedef void* EGLConfig;
+typedef void* EGLContext;
+typedef void* EGLSurface;
+typedef int EGLint;
+typedef unsigned int EGLBoolean;
+typedef unsigned int EGLenum;
+EGLDisplay eglGetDisplay(void*);
+EGLBoolean eglInitialize(EGLDisplay, EGLint*, EGLint*);
+EGLBoolean eglChooseConfig(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
+EGLBoolean eglBindAPI(EGLenum);
+EGLContext eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
+EGLSurface eglCreatePbufferSurface(EGLDisplay, EGLConfig, const EGLint*);
+EGLBoolean eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+void (*eglGetProcAddress(const char*))(void);
+EGLint eglGetError(void);
+}
+#define KLIO_EGL_DEFAULT_DISPLAY ((void*)0)
+#define KLIO_EGL_NO_CONTEXT ((void*)0)
+#define KLIO_EGL_NO_SURFACE ((void*)0)
+#define KLIO_EGL_NONE 0x3038
+#define KLIO_EGL_SURFACE_TYPE 0x3033
+#define KLIO_EGL_PBUFFER_BIT 0x0001
+#define KLIO_EGL_RENDERABLE_TYPE 0x3040
+#define KLIO_EGL_OPENGL_BIT 0x0008
+#define KLIO_EGL_OPENGL_API 0x30A2
+#define KLIO_EGL_WIDTH 0x3057
+#define KLIO_EGL_HEIGHT 0x3056
+#endif  // KLIO_GPU
 
 namespace {
 
@@ -115,9 +163,81 @@ inline void strokePaint(SkPaint& p, uint32_t argb, float width) {
     p.setColor(toColor(argb));
 }
 
+// Snapshot a surface's pixels: the fast peekPixels path for raster surfaces, or a
+// GPU→CPU readback for Ganesh surfaces. `backing` owns the pixels when read back.
+bool surfaceToPixmap(KlioSurface* s, SkPixmap& pm, SkBitmap& backing) {
+    if (s->surface->peekPixels(&pm)) return true;
+    if (!backing.tryAllocPixels(s->surface->imageInfo())) return false;
+    if (!s->surface->readPixels(backing.pixmap(), 0, 0)) return false;
+    pm = backing.pixmap();
+    return true;
+}
+
+#if defined(KLIO_GPU)
+sk_sp<GrDirectContext> g_grContext;
+bool g_gpu_tried = false;
+
+// Bring up a surface-less EGL desktop-GL context + a Skia GrDirectContext once.
+// Leaves g_grContext null (callers fall back to raster) if any step fails.
+void ensureGpu() {
+    if (g_gpu_tried) return;
+    g_gpu_tried = true;
+    EGLDisplay dpy = eglGetDisplay(KLIO_EGL_DEFAULT_DISPLAY);
+    if (!dpy) return;
+    EGLint major = 0, minor = 0;
+    if (!eglInitialize(dpy, &major, &minor)) return;
+    const EGLint cfgAttrs[] = {
+        KLIO_EGL_SURFACE_TYPE,    KLIO_EGL_PBUFFER_BIT,
+        KLIO_EGL_RENDERABLE_TYPE, KLIO_EGL_OPENGL_BIT,
+        KLIO_EGL_NONE};
+    EGLConfig cfg = nullptr;
+    EGLint n = 0;
+    if (!eglChooseConfig(dpy, cfgAttrs, &cfg, 1, &n) || n < 1) return;
+    if (!eglBindAPI(KLIO_EGL_OPENGL_API)) return;
+    EGLContext ctx = eglCreateContext(dpy, cfg, KLIO_EGL_NO_CONTEXT, nullptr);
+    if (ctx == KLIO_EGL_NO_CONTEXT) return;
+    const EGLint pbAttrs[] = {KLIO_EGL_WIDTH, 1, KLIO_EGL_HEIGHT, 1, KLIO_EGL_NONE};
+    EGLSurface surf = eglCreatePbufferSurface(dpy, cfg, pbAttrs);
+    if (!eglMakeCurrent(dpy, surf, surf, ctx)) return;
+    // Assemble the GL interface from eglGetProcAddress (the prebuilt ganesh's
+    // native interface is GLX-bound; this keeps us on EGL). Desktop GL context, so
+    // the GL — not GLES — assembler.
+    auto iface = GrGLMakeAssembledGLInterface(
+        nullptr, [](void*, const char name[]) -> GrGLFuncPtr {
+            return reinterpret_cast<GrGLFuncPtr>(eglGetProcAddress(name));
+        });
+    if (!iface) return;
+    g_grContext = GrDirectContexts::MakeGL(iface);
+}
+#endif  // KLIO_GPU
+
 }  // namespace
 
 extern "C" {
+
+// Create a GPU (Ganesh) surface, or null if the GPU backend is unavailable (not
+// built with -DKLIO_GPU, or EGL/GL bring-up failed) so the caller uses raster.
+KlioSurface* klio_skia_new_gpu(int width, int height) {
+#if defined(KLIO_GPU)
+    if (width <= 0 || height <= 0) return nullptr;
+    ensureGpu();
+    if (!g_grContext) return nullptr;
+    auto* s = new KlioSurface();
+    s->surface = SkSurfaces::RenderTarget(
+        g_grContext.get(), skgpu::Budgeted::kYes,
+        SkImageInfo::MakeN32Premul(width, height), 0, nullptr);
+    if (!s->surface) {
+        delete s;
+        return nullptr;
+    }
+    ensureFonts();
+    return s;
+#else
+    (void)width;
+    (void)height;
+    return nullptr;
+#endif
+}
 
 // Create a headless N32-premul raster surface, cleared transparent.
 KlioSurface* klio_skia_new(int width, int height) {
@@ -220,7 +340,8 @@ float klio_skia_measure_paragraph(const char* utf8, float width, float size) {
 int klio_skia_save_png(KlioSurface* s, const char* path) {
     if (!s || !path) return 1;
     SkPixmap pm;
-    if (!s->surface->peekPixels(&pm)) return 2;
+    SkBitmap backing;
+    if (!surfaceToPixmap(s, pm, backing)) return 2;
     SkFILEWStream out(path);
     if (!out.isValid()) return 3;
     SkPngEncoder::Options opts;
@@ -232,7 +353,8 @@ int klio_skia_save_png(KlioSurface* s, const char* path) {
 uint8_t* klio_skia_encode_png(KlioSurface* s, size_t* out_len) {
     if (!s || !out_len) return nullptr;
     SkPixmap pm;
-    if (!s->surface->peekPixels(&pm)) return nullptr;
+    SkBitmap backing;
+    if (!surfaceToPixmap(s, pm, backing)) return nullptr;
     SkDynamicMemoryWStream out;
     SkPngEncoder::Options opts;
     if (!SkPngEncoder::Encode(&out, pm, opts)) return nullptr;

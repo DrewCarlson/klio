@@ -983,6 +983,27 @@ fn detectX11(b: *std.Build) ?struct { inc: []const u8, lib: []const u8 } {
     return null;
 }
 
+/// A versioned system shared object (e.g. `libEGL.so.1`) for the optional GPU
+/// backend, by base name. No dev symlink (`libEGL.so`) is required — the `.so.1`
+/// is enough to link against directly by path.
+fn findVersionedLib(b: *std.Build, name: []const u8) ?[]const u8 {
+    const io = b.graph.io;
+    const dirs = [_][]const u8{
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+    };
+    const sonames = [_][]const u8{ "so.1", "so" };
+    for (dirs) |d| {
+        for (sonames) |sfx| {
+            const p = b.fmt("{s}/{s}.{s}", .{ d, name, sfx });
+            if (b.build_root.handle.access(io, p, .{})) |_| return p else |_| {}
+        }
+    }
+    return null;
+}
+
 /// The dynamic-library file name of the Skia backend for a target OS (the name
 /// the compose_ui module dlopens).
 fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
@@ -1019,6 +1040,7 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.
     const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
     const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
+    const want_gpu = b.option(bool, "gpu", "Build the optional Ganesh+EGL GPU surface for the Skia shim (linux; opt-in, falls back to raster)") orelse false;
 
     const run = b.addSystemCommand(&.{cxx});
     run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
@@ -1048,6 +1070,18 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     if (os == .linux) {
         if (detectX11(b)) |x| {
             run.addArgs(&.{ "-DKLIO_X11", b.fmt("-I{s}", .{x.inc}), x.lib });
+        }
+        // Optional Ganesh+EGL GPU surface. The ganesh archive is already in the
+        // link group above; this just enables the code path + links the GL/EGL
+        // runtime (the ganesh objects also reference glX, so libGL is needed too).
+        // On a software GL stack it renders correctly with no speedup (opt-in).
+        // Skipped (raster fallback) if the GL/EGL libs are not found.
+        if (want_gpu) {
+            if (findVersionedLib(b, "libEGL")) |egl| {
+                if (findVersionedLib(b, "libGL")) |gl| {
+                    run.addArgs(&.{ "-DKLIO_GPU", egl, gl });
+                }
+            }
         }
     }
 

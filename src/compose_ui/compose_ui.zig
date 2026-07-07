@@ -54,6 +54,7 @@ const SkWindow = anyopaque;
 const Skia = struct {
     lib: std.DynLib,
     new: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
+    newGpu: *const fn (c_int, c_int) callconv(.c) ?*SkSurface,
     free: *const fn (?*SkSurface) callconv(.c) void,
     clear: *const fn (?*SkSurface, u32) callconv(.c) void,
     fillRect: *const fn (?*SkSurface, f32, f32, f32, f32, u32) callconv(.c) void,
@@ -101,6 +102,7 @@ fn loadSkia() ?*Skia {
     const s = Skia{
         .lib = lib,
         .new = F.get(&lib, "new", "klio_skia_new") orelse return skiaLoadFail(&lib),
+        .newGpu = F.get(&lib, "newGpu", "klio_skia_new_gpu") orelse return skiaLoadFail(&lib),
         .free = F.get(&lib, "free", "klio_skia_free") orelse return skiaLoadFail(&lib),
         .clear = F.get(&lib, "clear", "klio_skia_clear") orelse return skiaLoadFail(&lib),
         .fillRect = F.get(&lib, "fillRect", "klio_skia_fill_rect") orelse return skiaLoadFail(&lib),
@@ -166,7 +168,11 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
 
     const width: c_int = @intCast(@max(1, argInt(ctx.args[1])));
     const height: c_int = @intCast(@max(1, argInt(ctx.args[2])));
-    const surface = skia.new(width, height) orelse return ok(Value.newLong(0));
+    // Opt-in GPU (Ganesh+EGL) surface when KLIO_SKIA_GPU is set and the backend was
+    // built with it; otherwise (or on GPU init failure) fall back to raster.
+    const gpu = runtime.getenvSlice("KLIO_SKIA_GPU") != null;
+    const surface = (if (gpu) skia.newGpu(width, height) else null) orelse
+        skia.new(width, height) orelse return ok(Value.newLong(0));
     defer skia.free(surface);
 
     const dg = ctx.args[3].String.borrow();

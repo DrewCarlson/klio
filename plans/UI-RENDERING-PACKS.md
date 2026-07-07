@@ -180,9 +180,19 @@ the prebuilt libs' bundled ICU data ships under a skiko-renamed symbol
 `icudt_skiko74_dat` that ICU's loader does not pick up, so full shaping/BiDi is
 deferred; SkFont wrapping covers Latin UI text.)
 
-Later: a GPU surface (`libskia_ganesh_ext` + GL/EGL), bundling a `.ttf` for
-fontless hosts, macOS (Cocoa) / windows (Win32) window backends, and verifying the
-macos/windows shim recipes on those hosts.
+**GPU surface — DONE (opt-in, Ganesh+EGL).** `zig build -Dgpu` compiles the shim
+with `-DKLIO_GPU` and links libGL/libEGL; `klio_skia_new_gpu` brings up a
+surface-less EGL desktop-GL context, assembles a `GrGLInterface` from
+`eglGetProcAddress` (the prebuilt ganesh's native interface is GLX-bound, so we
+assemble rather than use `MakeEGL`, which these libs don't ship), and makes a
+Ganesh `SkSurfaces::RenderTarget`. PNG save/encode read back GPU→CPU. At runtime
+`KLIO_SKIA_GPU=1` selects it; it falls back to raster if unbuilt or if EGL/GL
+bring-up fails. Verified end-to-end here (renders + reads back correctly) — but on
+this host GL is software (Mesa llvmpipe), so it is a correctness proof of the path,
+not a speedup. Default builds stay raster.
+
+Later: bundling a `.ttf` for fontless hosts, macOS (Cocoa) / windows (Win32) window
+backends, and verifying the macos/windows shim recipes on those hosts.
 
 ### Vendor the real compose.ui / foundation / material
 
