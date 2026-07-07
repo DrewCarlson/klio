@@ -582,6 +582,11 @@ fun Instant.minus(value: Int, unit: DateTimeUnit, timeZone: TimeZone): Instant =
 
 /** The offset from UTC, in whole seconds, at a specific moment in a time zone. */
 class UtcOffset internal constructor(val totalSeconds: Int) {
+    // Component factory: `UtcOffset(hours = 3)`, `UtcOffset(seconds = -30)`. A
+    // single positional Int still binds the internal `totalSeconds` primary.
+    constructor(hours: Int? = null, minutes: Int? = null, seconds: Int? = null) :
+        this(utcOffsetTotalSeconds(hours, minutes, seconds))
+
     override fun toString(): String {
         if (totalSeconds == 0) return "Z"
         val sign = if (totalSeconds < 0) "-" else "+"
@@ -596,8 +601,57 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
 
     companion object {
         val ZERO: UtcOffset = UtcOffset(0)
+
+        fun parse(input: CharSequence): UtcOffset {
+            val s = input.toString()
+            if (s == "Z" || s == "z") return ZERO
+            val secs = parseFixedOffsetSeconds(s)
+                ?: throw DateTimeFormatException("Invalid ISO-8601 UTC offset: $input")
+            if (secs < -18 * 3600 || secs > 18 * 3600)
+                throw DateTimeFormatException("UTC offset out of range: $input")
+            return UtcOffset(secs)
+        }
+        fun parseOrNull(input: CharSequence): UtcOffset? = try { parse(input) } catch (e: Exception) { null }
+        fun orNull(hours: Int? = null, minutes: Int? = null, seconds: Int? = null): UtcOffset? =
+            try { UtcOffset(hours, minutes, seconds) } catch (e: Exception) { null }
     }
 }
+
+private fun utcOffsetTotalSeconds(hours: Int?, minutes: Int?, seconds: Int?): Int = when {
+    hours != null -> utcOffsetHms(hours, minutes ?: 0, seconds ?: 0)
+    minutes != null -> utcOffsetHms(minutes / 60, minutes % 60, seconds ?: 0)
+    else -> utcOffsetCheckTotal(seconds ?: 0)
+}
+
+private fun utcOffsetCheckTotal(total: Int): Int {
+    if (total < -18 * 3600 || total > 18 * 3600)
+        throw IllegalArgumentException("Total seconds value is out of range: $total")
+    return total
+}
+
+private fun utcOffsetHms(hours: Int, minutes: Int, seconds: Int): Int {
+    if (hours < -18 || hours > 18)
+        throw IllegalArgumentException("Zone offset hours not in valid range: value $hours is not in the range -18 to 18")
+    if (hours > 0) {
+        if (minutes < 0 || seconds < 0)
+            throw IllegalArgumentException("Zone offset minutes and seconds must be positive because hours is positive")
+    } else if (hours < 0) {
+        if (minutes > 0 || seconds > 0)
+            throw IllegalArgumentException("Zone offset minutes and seconds must be negative because hours is negative")
+    } else if (minutes > 0 && seconds < 0 || minutes < 0 && seconds > 0) {
+        throw IllegalArgumentException("Zone offset minutes and seconds must have the same sign")
+    }
+    val am = if (minutes < 0) -minutes else minutes
+    val asec = if (seconds < 0) -seconds else seconds
+    if (am > 59)
+        throw IllegalArgumentException("Zone offset minutes not in valid range: value $am is not in the range 0 to 59")
+    if (asec > 59)
+        throw IllegalArgumentException("Zone offset seconds not in valid range: value $asec is not in the range 0 to 59")
+    return utcOffsetCheckTotal(hours * 3600 + minutes * 60 + seconds)
+}
+
+/** The fixed-offset time zone with this offset. */
+fun UtcOffset.asTimeZone(): TimeZone = TimeZone(if (totalSeconds == 0) "Z" else toString(), totalSeconds)
 
 /** The wall-clock offset of [timeZone] from UTC at this instant. */
 fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
