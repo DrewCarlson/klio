@@ -1249,7 +1249,7 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
         }
         var found = false;
         for (groups.items) |*g| {
-            if (eqBoxed(&g.key, &key)) {
+            if (try eqBoxedH(ctx.host, ctx.out, &g.key, &key)) {
                 try g.vs.append(a, value);
                 found = true;
                 break;
@@ -5156,17 +5156,17 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const arg = ctx.args[1];
     switch (arg) {
         .List => |l| {
-            const g = l.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            const src = try snapshotItems(a, l.items);
+            defer if (runtime.freeScratch()) a.free(src);
+            for (src) |v| {
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         .Set => |s| {
-            const g = s.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            const src = try snapshotItems(a, s.items);
+            defer if (runtime.freeScratch()) a.free(src);
+            for (src) |v| {
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         .Array, .Range, .Sequence => {
@@ -5176,11 +5176,11 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
             };
             defer if (runtime.freeScratch()) a.free(xs);
             for (xs) |v| {
-                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
             }
         },
         else => {
-            if (!containsBoxed(out.items, &arg)) try out.append(a, arg);
+            if (!try containsBoxedH(ctx.host, ctx.out, out.items, &arg)) try out.append(a, arg);
         },
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
@@ -5253,7 +5253,7 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
     for (src) |v| {
-        if (containsBoxed(other.items, &v)) try out.append(a, v);
+        if (try containsBoxedH(ctx.host, ctx.out, other.items, &v)) try out.append(a, v);
     }
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
@@ -5329,9 +5329,13 @@ pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("add requires an argument");
     const arg = ctx.args[1];
+    // Snapshot for the membership check (dispatching `equals` re-enters the VM,
+    // which must not happen under the mutable borrow); then borrow to append.
+    const snap = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(snap);
+    if (try containsBoxedH(ctx.host, ctx.out, snap, &arg)) return ok(.{ .Bool = false });
     const g = it.borrowMut();
     defer g.deinit();
-    if (containsBoxed(g.get().items, &arg)) return ok(.{ .Bool = false });
     // The set owns one reference per element; retain the borrowed argument.
     if (runtime.reclaimEnabled()) arg.retain();
     try g.get().append(a, arg);
@@ -6524,18 +6528,30 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    const g = it.borrowMut();
-    defer g.deinit();
-    var changed = false;
+    // Collect the genuinely-new items under a snapshot (dispatching key
+    // `equals` re-enters the VM and must not run under the mutable borrow),
+    // checking against the growing `seen` set; then append them in one borrow.
+    const initial = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(initial);
+    var seen: std.ArrayList(Value) = .empty;
+    defer seen.deinit(a);
+    try seen.appendSlice(a, initial);
+    var new_items: std.ArrayList(Value) = .empty;
+    defer new_items.deinit(a);
     for (to_add) |v| {
-        if (!containsBoxed(g.get().items, &v)) {
-            // The set owns one ref per element; `to_add` is a borrowed snapshot.
-            if (runtime.reclaimEnabled()) v.retain();
-            try g.get().append(a, v);
-            changed = true;
+        if (!try containsBoxedH(ctx.host, ctx.out, seen.items, &v)) {
+            try seen.append(a, v);
+            try new_items.append(a, v);
         }
     }
-    return ok(.{ .Bool = changed });
+    if (new_items.items.len == 0) return ok(.{ .Bool = false });
+    const g = it.borrowMut();
+    defer g.deinit();
+    for (new_items.items) |v| {
+        if (runtime.reclaimEnabled()) v.retain();
+        try g.get().append(a, v);
+    }
+    return ok(.{ .Bool = true });
 }
 
 // =====================================================================
