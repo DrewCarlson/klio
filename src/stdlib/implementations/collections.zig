@@ -4978,7 +4978,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         if (is_collection) {
             if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
-        } else if (indexOfBoxed(removals.items, &v)) |pos| {
+        } else if (try indexOfBoxedH(ctx.host, ctx.out, removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
             try out.append(a, v);
@@ -5467,11 +5467,21 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
             },
         }
     };
+    // Decide keep/drop per element under a snapshot (membership dispatches a
+    // user `equals` that re-enters the VM, which must not run under the mutable
+    // borrow); then compact in place under one borrow. Single-threaded, so the
+    // snapshot's order matches the live list.
+    const snap = try snapshotItems(a, items);
+    defer if (runtime.freeScratch()) a.free(snap);
+    const keep_flags = try a.alloc(bool, snap.len);
+    defer if (runtime.freeScratch()) a.free(keep_flags);
+    for (snap, 0..) |v, i| {
+        const present = try containsBoxedH(ctx.host, ctx.out, other, &v);
+        keep_flags[i] = if (retain) present else !present;
+    }
     var changed = false;
     {
-        const g = it_mut: {
-            break :it_mut items.borrowMut();
-        };
+        const g = items.borrowMut();
         defer g.deinit();
         const list = g.get();
         const before = list.items.len;
@@ -5479,9 +5489,7 @@ fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []con
         var r: usize = 0;
         while (r < list.items.len) : (r += 1) {
             const v = list.items[r];
-            const present = containsBoxed(other, &v);
-            const keep = if (retain) present else !present;
-            if (keep) {
+            if (r < keep_flags.len and keep_flags[r]) {
                 list.items[w] = v;
                 w += 1;
             } else if (runtime.reclaimEnabled()) {
