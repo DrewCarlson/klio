@@ -5124,35 +5124,35 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
 
     // Secondary-ctor delegation / default-value thunk: a bare own-member call
     // with no `this` in scope is a companion access — the enclosing instance
-    // does not exist yet, so `decorate(x)` inside `: this(decorate(x))` binds
-    // the companion's `decorate`, never an instance method. Dispatch it as a
-    // member call on the owner class value, which the VM forwards to the
-    // companion singleton (the same forwarding a `this`-receiver bare call
-    // reaches at runtime). Mirrors the value-read handling of the same case (a
-    // bare own-member read in a param thunk). Guarded on the owner actually
-    // having a companion so a plain own-member name is left alone.
+    // does not exist yet, so `generateOetf(x)` inside `: this(generateOetf(x))`
+    // binds the companion's `generateOetf`, never an instance method. Dispatch
+    // it as a member call on the owner class value; the VM forwards a class
+    // receiver to its companion singleton, walking the superclass chain so an
+    // inherited companion member (declared on a superclass's companion) resolves
+    // too — `Sub.mk()` lowers to exactly this `LoadGlobal + CallMember` pair.
+    // Mirrors the value-read handling of the same case (a bare own-member read
+    // in a param thunk); `own_members` already includes own + inherited
+    // companion members, so a plain member name is filtered by `hasOwnMember`.
     if (b.isParamThunk() and b.resolve("this") == null and
         b.hasOwnMember(name0) and !classWithCompanion(b, name0))
     {
         if (b.ownerClass()) |owner| {
-            if (b.module.registry.companion_singletons.get(owner) != null) {
-                const cls = b.allocReg();
-                const on = try b.module.internConst(b.allocator, .{ .String = owner });
-                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
-                const run = try lowerArgRun(b, args);
-                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                const dst = b.allocReg();
-                const nmc = try b.module.internConst(b.allocator, .{ .String = name0 });
-                try b.push(.{ .CallMember = .{
-                    .dst = dst,
-                    .receiver = cls,
-                    .name = nmc,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                } });
-                return dst;
-            }
+            const cls = b.allocReg();
+            const on = try b.module.internConst(b.allocator, .{ .String = owner });
+            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nmc = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = cls,
+                .name = nmc,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
         }
     }
 
