@@ -13,6 +13,30 @@ added, common apps keep working unchanged and platform APIs slot in cleanly.
 Related: [PACK-ROADMAP.md](PACK-ROADMAP.md), [PACK-DISTRIBUTION.md](PACK-DISTRIBUTION.md),
 [UI-RENDERING-PACKS.md](UI-RENDERING-PACKS.md).
 
+## 0. Pack granularity — one pack per upstream module
+
+When vendoring a multi-module upstream library (compose, ktor, kotlinx.*),
+**maintain the upstream module boundaries: one klio pack per upstream Gradle
+module**, each pack's `id` being that module's real coordinate/package
+(`androidx.compose.ui.util`, `androidx.compose.ui.graphics`,
+`io.ktor.http`, `io.ktor.client.core`, …). Do NOT collapse several modules into
+one umbrella pack. Each pack declares only its real cross-module dependencies as
+`[[deps]]`; the fixpoint loader (`src/cli/pack_cache.zig`, `importPrefixMatches`)
+pulls dependency packs in transitively via source imports, so a program that
+imports one module's symbol loads exactly that module's pack and its dependency
+closure — nothing more.
+
+Why: it mirrors the upstream module graph (so klio is a faithful drop-in), keeps
+each pack independently buildable/testable, lets a consumer pull in a feature
+module without dragging in unrelated ones, and matches the per-target source-set
+axis below (a module's platform actuals live in that module's pack's klioMain).
+
+Status: **compose UI is split** — `androidx.compose.ui.{util,geometry,unit,graphics}`
+are separate packs (`kotlin-klio/klio-compose-ui-{util,geometry,unit,graphics}`).
+**ktor is still a monolithic `io.ktor` umbrella** (`kotlin-klio/klio-ktor` bundles
+ktor-io/utils/http/client-core/server-core/events) — a retrofit to split it into
+`io.ktor.{io,http,client.core,server.core,…}` packs is a follow-up.
+
 ## 1. Where we are (ground truth)
 
 There is currently **no platform/target axis anywhere** in the pack model,
