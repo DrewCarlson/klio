@@ -277,11 +277,13 @@ What the numbers mean:
   (`execInst` giant switch, `runFrameInner`, the by-value `Frame`).
 - **Debug vs Release ≈ 2x memory + large CPU gap.** Default `zig build` is Debug; perf
   work must use `-Doptimize=ReleaseFast`. Biggest zero-code lever today.
-- **Resize "leak" (RSS climbs, partial reclaim)** — consistent with the interpreter stack
-  high-water mark: deep recompose during a drag touches big-stack pages that the mmap never
-  decommits (malloc frees on reclaim, resident stack stays). Not an unbounded leak. Fixable
-  by trimming the stack (madvise `MADV_FREE` the unused region at `eval_depth==0`) or by
-  reducing per-call frame size.
+- **Resize "leak" — NOT a leak (resolved).** A 6217-frame drag traced with `KLIO_RSS_LOG`
+  showed RSS oscillating 152→182 MB, settling ~160 MB phys-footprint — bounded, GC-managed.
+  NOT the stack high-water mark (post-drag interpreter stack was ~432 KB resident; normal
+  compose recompose is shallow). The residual is transient malloc (display-list strings +
+  layout/drawable churn) the GC keeps bounded. A stack-trim was tried and reverted (idle-CPU
+  regression, didn't reclaim, unverifiable without a live-drag test). No fix needed. Diagnostic:
+  `KLIO_RSS_LOG` logs per-frame RSS.
 
 Prioritized optimization backlog (highest impact first): (E) slim Skia build — biggest
 compose-memory win, heavy; (D) lazy stdlib load — biggest baseline win, big change;
