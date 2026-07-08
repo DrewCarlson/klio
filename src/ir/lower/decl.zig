@@ -336,7 +336,7 @@ fn collectMemberArities(
 
 /// Add enum-entry, nested-class, and companion-member names that are
 /// visible under their bare names inside the class's method bodies.
-fn addVisibleMemberNames(
+pub fn addVisibleMemberNames(
     c: *const ast.Class,
     own_member_names: *StringSet,
 ) Allocator.Error!void {

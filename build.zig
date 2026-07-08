@@ -272,6 +272,9 @@ const kotlinx_pack_dirs = [_][]const u8{
     "kotlin-klio/klio-compose-runtime",
     "kotlin-klio/klio-mosaic",
     "kotlin-klio/klio-compose-ui",
+    "kotlin-klio/klio-compose-ui-util",
+    "kotlin-klio/klio-compose-ui-geometry",
+    "kotlin-klio/klio-compose-ui-unit",
     "kotlin-klio/klio-compose-ui-graphics",
 };
 

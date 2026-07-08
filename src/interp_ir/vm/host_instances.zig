@@ -165,13 +165,60 @@ fn headInSet(head: []const u8, set: []const []const u8) bool {
 const integral_heads = [_][]const u8{ "Int", "Long", "Short", "Byte", "UInt", "ULong", "UShort", "UByte", "Char" };
 const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "Iterable", "MutableIterable", "List", "MutableList", "Set", "MutableSet", "Sequence" };
 
-fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+/// Whether a constructor parameter declared `declared` can accept `arg`. A
+/// class-instance argument must be a subtype of a concrete class-typed
+/// parameter; otherwise a `this(...)` / constructor delegation whose named args
+/// map to a differently-typed constructor (e.g. a `color: Color`/`Int`
+/// secondary vs the primary's `textForegroundStyle: TextForegroundStyle`) would
+/// silently bind the wrong slot. Type parameters (`T`, `E`) and `Any` accept
+/// anything; non-instance values (primitives, null, lambdas) are left to the
+/// arity/family logic.
+fn paramAcceptsArg(self: *VmHost, declared: []const u8, arg: *const Value) bool {
+    if (std.mem.eql(u8, declared, "Any")) return true;
+    if (declared.len <= 2 and isAllUpper(declared)) return true;
+    if (arg.* == .Instance) {
+        if (instanceOfClassName(arg, declared)) return true;
+        // Only disqualify when `declared` is a class the argument is NOT: a
+        // typealias or otherwise-unresolved receiver name (a `Point` alias for
+        // `FloatFloatPair`) has no ClassDef, so the mismatch is unconfirmed and
+        // the candidate must not be rejected.
+        const kd = classDefByName(self, declared);
+        if (kd) |d| d.deinit();
+        return kd == null;
+    }
+    // A non-instance builtin value (String, a list, an Int, …) offered to a
+    // parameter of a definitely-different builtin kind cannot match — a
+    // `String` param must not swallow a `List` argument, which would let an
+    // overloaded `this(...)` delegation pick a same-arity ctor with swapped
+    // parameters and recurse. Unknown kinds (0, e.g. a class type or a
+    // supertype like `Any`/`Number`) accept anything.
+    const gk = builtinTypeKind(valueTypeHead(arg.*));
+    const dk = builtinTypeKind(declared);
+    if (gk != 0 and dk != 0 and gk != dk) return false;
+    return true;
+}
+
+/// Coarse bucket for a builtin type head, so a definite cross-kind argument
+/// mismatch (a list for a string param) disqualifies a constructor candidate.
+/// `0` means "not a recognised concrete builtin" (class, type parameter, or a
+/// supertype like `Number`/`CharSequence`) and matches anything.
+fn builtinTypeKind(head: []const u8) u8 {
+    if (headInSet(head, &integral_heads)) return 1;
+    if (std.mem.eql(u8, head, "Float") or std.mem.eql(u8, head, "Double")) return 2;
+    if (std.mem.eql(u8, head, "Boolean")) return 3;
+    if (std.mem.eql(u8, head, "String")) return 5;
+    if (headInSet(head, &collectionish_heads)) return 6;
+    if (std.mem.eql(u8, head, "Map") or std.mem.eql(u8, head, "MutableMap") or
+        std.mem.eql(u8, head, "HashMap") or std.mem.eql(u8, head, "LinkedHashMap")) return 7;
+    return 0;
+}
+
+fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
     var best_score: i32 = -1;
     outer: for (entries) |e| {
         if (e.param_count != args.len) continue;
-        if (first == null) first = e;
         var score: i32 = 0;
         var i: usize = 0;
         while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
@@ -200,7 +247,11 @@ fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []c
                 continue;
             }
             if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
+            if (!paramAcceptsArg(self, declared, &args[i])) continue :outer;
         }
+        // Reached only when no parameter disqualified this candidate: it is a
+        // genuine arity+type match, so it is eligible as the fallback too.
+        if (first == null) first = e;
         if (score > best_score) {
             best_score = score;
             best = e;
@@ -672,7 +723,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         return .{ .ok = {} };
     }
     const entries = secondaryCtors(self, class_fqn, class_name);
-    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
+    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     const entry = chosen orelse {
         // No secondary ctor takes this shape: the class delegates through
         // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
@@ -1176,7 +1227,49 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         }
         return newInstance(self, allocator, class, full.items, outer_hint);
     }
+    // A named-arg call to a same-named top-level FACTORY function (a class or
+    // interface with a factory, e.g. kotlinx `MutableSharedFlow(replay=…,
+    // extraBufferCapacity=…)`): reorder against the factory's own parameters.
+    // The positional `newInstance` below would bind the named args by position
+    // and mis-score the factory — or, for an interface, fail to instantiate.
+    if (findNamedFactory(self, class_name, arg_names)) |fid| {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        return self.callFuncNamed(allocator, mg.get(), fid, args, arg_names);
+    }
     return newInstance(self, allocator, class, args, outer_hint);
+}
+
+/// A same-named top-level factory function whose parameters include every
+/// supplied argument name, so a named-arg `Foo(name = v)` call can target the
+/// factory `fun Foo(name: T = …)` rather than a constructor. Excludes instance
+/// methods / extensions (a leading `this` receiver) and bodyless declarations.
+fn findNamedFactory(self: *VmHost, class_name: []const u8, arg_names: []const ?[]const u8) ?FuncId {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    for (m.funcsBySimpleName(class_name)) |fid| {
+        const f = m.funcById(fid) orelse continue;
+        if (!f.hasBody()) continue;
+        if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var all_match = true;
+        for (arg_names) |an| {
+            const nm = an orelse continue;
+            var found = false;
+            for (f.params) |p| {
+                if (std.mem.eql(u8, p.name, nm)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) return fid;
+    }
+    return null;
 }
 
 fn isIntrinsicClass(fqn: []const u8) bool {
@@ -1494,7 +1587,7 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
-    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
+    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     if (chosen == null) {
         for (entries) |e| {
             if (e.param_count > args.len) {
@@ -1506,10 +1599,22 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
                         break;
                     }
                 }
-                if (all_default) {
-                    chosen = e;
-                    break;
+                if (!all_default) continue;
+                // The provided args must type-match this larger candidate's
+                // params (same subtype guard as chooseSecondaryCtor), so the
+                // fallback does not bind a class value to a mismatched slot and
+                // re-select the wrong ctor a `this(...)` delegation should skip.
+                var typ_ok = true;
+                var j: usize = 0;
+                while (j < args.len and j < e.param_type_heads.len) : (j += 1) {
+                    if (!paramAcceptsArg(self, e.param_type_heads[j], &args[j])) {
+                        typ_ok = false;
+                        break;
+                    }
                 }
+                if (!typ_ok) continue;
+                chosen = e;
+                break;
             }
         }
     }
@@ -1924,10 +2029,18 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
         const f = m.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-        const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+        // Arity that honors default parameters: a call may omit trailing
+        // defaulted params (`CornerRadius(8f)` calls `fun CornerRadius(x, y = x)`),
+        // so require only `provided in [required, total]` — not an exact match.
+        const arity_ok = blk: {
+            if (m.decl_user_arity.get(fid.int())) |da| {
+                break :blk da.has_vararg or (provided >= da.required and provided <= da.total);
+            }
+            const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+            break :blk vararg or f.params.len == provided;
+        };
+        if (!arity_ok) continue;
         if (clean_only) {
-            const arity_ok = f.params.len == provided or vararg;
-            if (!arity_ok) continue;
             var score: i32 = 0;
             var clean = true;
             for (args, 0..) |a, i| {
@@ -1945,8 +2058,7 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
                 best_score = score;
             }
         } else {
-            const arity_ok = f.params.len == provided or vararg;
-            if (arity_ok) return fid;
+            return fid;
         }
     }
     return best_fid;

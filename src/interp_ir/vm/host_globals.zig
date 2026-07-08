@@ -848,7 +848,24 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     if (ctor_ref and !is_object) break :blk null;
                     const mg = self.module.borrow();
                     defer mg.deinit();
-                    if (mg.get().registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
+                    const m = mg.get();
+                    // `companion_singletons` is keyed by SIMPLE class name, so a
+                    // different class of the same simple name (e.g. a nested
+                    // value class in another pack sharing a top-level enum's
+                    // name) would otherwise hijack this resolution — routing the
+                    // enum to the other class's companion. Only forward to the
+                    // companion when it actually belongs to THIS class (cid):
+                    // either cid declares a nested `Companion`, or the recorded
+                    // singleton name is one of cid's own lifted members (a
+                    // lifted companion is renamed away from the literal
+                    // `Companion`, e.g. `LineHeightStyle$Alignment$Companion$…`).
+                    if (!is_object) {
+                        const cn_opt = m.registry.companion_singletons.get(cls_name);
+                        const own = m.classIdNestedIn(cid, "Companion") != null or
+                            (cn_opt != null and std.mem.startsWith(u8, cn_opt.?, cls_name));
+                        if (!own) break :blk null;
+                    }
+                    if (m.registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
                     if (is_object) break :blk cls_name;
                     break :blk null;
                 };
@@ -1339,6 +1356,31 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
         switch (try ensureObjectSingleton(self, name)) {
             .ok => |maybe| if (maybe) |v| return .{ .ok = v },
             .err => |e| return .{ .err = e },
+        }
+    }
+    // A package-qualified reference to an `object` (`demo.Singleton`,
+    // `androidx…drawscope.Fill`) is keyed by its FQN, not the by-simple-name
+    // object registry, so the read above misses and the raw global is the
+    // classifier. Map the FQN to the object's simple name and resolve through
+    // the SAME path the bare name takes, so both yield the one singleton — but
+    // only when the FQN names a genuine object (its simple name is a registered
+    // object), so a qualified reference to a regular class stays the class value.
+    if (raw == null or raw.? != .Instance) {
+        const obj_simple: ?[]const u8 = blk_obj: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            const cid = m.classIdByFqn(name) orelse break :blk_obj null;
+            if (cid.int() >= m.classes.items.len) break :blk_obj null;
+            const simple = m.classes.items[cid.int()].name;
+            if (!progHasObjectName(self, simple)) break :blk_obj null;
+            break :blk_obj simple;
+        };
+        if (obj_simple) |simple| {
+            switch (try ensureObjectSingleton(self, simple)) {
+                .ok => |maybe| if (maybe) |v| return .{ .ok = v },
+                .err => |e| return .{ .err = e },
+            }
         }
     }
     if (raw) |rv| {

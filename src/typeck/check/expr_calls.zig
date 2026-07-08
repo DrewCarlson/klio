@@ -219,10 +219,11 @@ pub fn checkCall(
                 return ty;
             }
         }
-        {
-            var recv_ty = try expr_mod.checkExpr(self, m.receiver, null);
-            recv_ty.deinit(self.allocator);
-        }
+        // Type the receiver ONCE and reuse it below. Re-typing a chained-call
+        // receiver at each member level makes a deep chain (e.g. a long
+        // `sb.append(..).append(..)...`) cost 2^depth to check.
+        var recv_ty = try expr_mod.checkExpr(self, m.receiver, null);
+        defer recv_ty.deinit(self.allocator);
         // A receiver that reads an explicit-backing-field property outside
         // its declaring scope has the property's PUBLIC type: the member
         // must resolve on that type, not on the field type.
@@ -297,8 +298,8 @@ pub fn checkCall(
         if (self.expr_class.get(m.receiver.span())) |cn| {
             class_from_ty = cn;
         } else {
-            var recv_ty = try expr_mod.checkExpr(self, m.receiver, null);
-            defer recv_ty.deinit(self.allocator);
+            // Reuse `recv_ty` typed once above (a second checkExpr here would
+            // re-recurse the receiver, making deep call chains 2^depth).
             class_from_ty = switch (recv_ty.nonNull().*) {
                 .Generic => |g| g.name,
                 .String => "String",

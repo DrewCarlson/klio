@@ -337,6 +337,18 @@ pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *co
 // ---- expression typing ----------------------------------------------
 
 pub fn checkExpr(self: *Checker, expr: *const Expr, expected: ?*const Type) Allocator.Error!Type {
+    // Reuse a call's already-recorded type instead of recomputing it. A call's
+    // type at a span is fixed (narrowing is span-determined) and every check of
+    // a given call carries the same expected type (a call is a receiver OR an
+    // argument, never both), so this is sound — and it turns the O(2^depth)
+    // re-typing of every receiver in a deep `a.f().g().h()...` chain into O(depth).
+    // Limited to `expected == null` (the receiver position) to leave
+    // expected-driven inference untouched.
+    if (expected == null and expr.* == .Call) {
+        if (self.types.getPtr(expr.span())) |cached| {
+            return try cached.clone(self.allocator);
+        }
+    }
     const ty = try computeExprTy(self, expr, expected);
     try recordType(self, expr.span(), &ty);
     return ty;

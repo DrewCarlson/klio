@@ -1,0 +1,6 @@
+default fill=true aa=true alpha=1.0
+default cap=Butt join=Miter miter=4.0
+default blend=SrcOver shader=true
+stroke width=6.0 cap=Round join=Bevel
+color r=1.0 g=0.0 b=0.0 alpha=0.5 blend=Multiply
+is stroke=true

@@ -22,6 +22,40 @@ include = [
     "androidx/compose/ui/graphics/Color.kt",
     "androidx/compose/ui/graphics/Float16.kt",
     "androidx/compose/ui/graphics/InlineClassHelper.kt",
+    # The pure-Kotlin Path surface (klioMain supplies the actual command buffer).
+    "androidx/compose/ui/graphics/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/ui/graphics/Path.kt",
+    "androidx/compose/ui/graphics/PathIterator.kt",
+    "androidx/compose/ui/graphics/Bezier.kt",
+    "androidx/compose/ui/graphics/PathSegment.kt",
+    "androidx/compose/ui/graphics/Matrix.kt",
+    # The Paint surface (klioMain supplies the actual value object) + the value
+    # types its properties reference (Shader / ColorFilter / PathEffect / etc.).
+    "androidx/compose/ui/graphics/Paint.kt",
+    "androidx/compose/ui/graphics/Shader.kt",
+    "androidx/compose/ui/graphics/ColorFilter.kt",
+    "androidx/compose/ui/graphics/ColorMatrix.kt",
+    "androidx/compose/ui/graphics/PathEffect.kt",
+    "androidx/compose/ui/graphics/ImageBitmap.kt",
+    "androidx/compose/ui/graphics/PixelMap.kt",
+    # The Canvas surface (klioMain supplies the actual over the Skia shim).
+    "androidx/compose/ui/graphics/Canvas.kt",
+    "androidx/compose/ui/graphics/Vertices.kt",
+    # The DrawScope layer — pure Kotlin over Canvas.
+    "androidx/compose/ui/graphics/drawscope/DrawScopeMarker.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawTransform.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawContext.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/CanvasDrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/ContentDrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/EmptyCanvas.kt",
+    # Shape + Outline — pure Kotlin over Path / geometry.
+    "androidx/compose/ui/graphics/Shape.kt",
+    "androidx/compose/ui/graphics/Outline.kt",
+    "androidx/compose/ui/graphics/RectangleShape.kt",
+    # Brush — SolidColor is a plain Paint colour; gradient brushes build but need
+    # the (deferred) shader actuals to paint.
+    "androidx/compose/ui/graphics/Brush.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
@@ -60,6 +94,10 @@ id = "stdlib"
 id = "androidx.compose.runtime"
 [[deps]]
 id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.compose.ui.geometry"
+[[deps]]
+id = "androidx.compose.ui.unit"
 # Connector.kt uses androidx.collection.mutableIntObjectMapOf for its
 # colorspace-connection cache.
 [[deps]]

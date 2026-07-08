@@ -63,3 +63,11 @@ test "check is clean on vararg arity and spread call sites" {
 test "check is clean on builder lambdas" {
     try expectCheckClean("examples/build_helpers.kt");
 }
+
+// Regression: a deep member-call chain must check in linear time. Before the
+// call-type memo, the checker re-typed a chained-call receiver at every level,
+// so this 40-deep chain took O(2^depth) and hung the checker (this test would
+// time out).
+test "check is clean on a deep method-call chain" {
+    try expectCheckClean("examples/deep_call_chain.kt");
+}
