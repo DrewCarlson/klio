@@ -26,6 +26,7 @@ include = [
     "androidx/compose/ui/graphics/internal/JvmDefaultWithCompatibility.kt",
     "androidx/compose/ui/graphics/Path.kt",
     "androidx/compose/ui/graphics/PathIterator.kt",
+    "androidx/compose/ui/graphics/Bezier.kt",
     "androidx/compose/ui/graphics/PathSegment.kt",
     "androidx/compose/ui/graphics/Matrix.kt",
     # The Paint surface (klioMain supplies the actual value object) + the value
