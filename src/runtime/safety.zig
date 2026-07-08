@@ -129,7 +129,7 @@ fn memoryWatchdogLoop(cap_kb: u64) void {
 /// Current resident-set size in KiB. Read from `/proc/self/statm` on Linux
 /// (field 2 = resident pages) and from the mach task basic info on macOS.
 /// Returns `null` on any other platform or on a read error.
-fn currentRssKb() ?u64 {
+pub fn currentRssKb() ?u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);

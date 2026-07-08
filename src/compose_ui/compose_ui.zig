@@ -23,6 +23,19 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
+/// Diagnostic: with `KLIO_RSS_LOG` set, print current RSS on each rendered frame.
+/// A manual window drag then traces whether memory climbs (and settles), showing
+/// whether the resize growth is heap churn or the stack high-water mark.
+var rss_log_gate: enum { unknown, on, off } = .unknown;
+fn rssLog() void {
+    if (rss_log_gate == .unknown) {
+        rss_log_gate = if (runtime.getenvSlice("KLIO_RSS_LOG") != null) .on else .off;
+    }
+    if (rss_log_gate != .on) return;
+    const kb = runtime.currentRssKb() orelse return;
+    std.debug.print("[rss] {} MB\n", .{kb / 1024});
+}
+
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
@@ -319,6 +332,7 @@ fn winRender(ctx: *CallCtx) Error!EvalResult {
     defer dg.deinit();
     replay(skia, surface, dg.get().bytes);
     skia.winPresent(win);
+    rssLog();
     return ok(Value.newLong(1));
 }
 
