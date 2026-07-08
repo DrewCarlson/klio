@@ -48,6 +48,10 @@ include = [
     "androidx/compose/ui/graphics/drawscope/CanvasDrawScope.kt",
     "androidx/compose/ui/graphics/drawscope/ContentDrawScope.kt",
     "androidx/compose/ui/graphics/drawscope/EmptyCanvas.kt",
+    # Shape + Outline — pure Kotlin over Path / geometry.
+    "androidx/compose/ui/graphics/Shape.kt",
+    "androidx/compose/ui/graphics/Outline.kt",
+    "androidx/compose/ui/graphics/RectangleShape.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
