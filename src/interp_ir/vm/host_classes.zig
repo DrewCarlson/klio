@@ -224,12 +224,17 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
 
     // Dotted nested-class names (`S.A`, `Outer.Inner`) — match by the
     // last segment, which corresponds to the lifted top-level class name
-    // in our module table.
-    if (std.mem.indexOfScalar(u8, ty.name, '.')) |_| {
-        if (std.mem.lastIndexOfScalar(u8, ty.name, '.')) |i| {
-            const last = ty.name[i + 1 ..];
-            const alt: TypeRef = .{ .name = last, .nullable = ty.nullable, .args = ty.args };
-            return instanceOf(self, value, alt);
+    // in our module table. A user-`Instance` value keeps the full dotted
+    // name so the identity-aware hierarchy walk below can reject a
+    // same-simple-name class from another package (`c is b.Shape` when the
+    // instance's supertype is `a.Shape`).
+    if (value.* != .Instance) {
+        if (std.mem.indexOfScalar(u8, ty.name, '.')) |_| {
+            if (std.mem.lastIndexOfScalar(u8, ty.name, '.')) |i| {
+                const last = ty.name[i + 1 ..];
+                const alt: TypeRef = .{ .name = last, .nullable = ty.nullable, .args = ty.args };
+                return instanceOf(self, value, alt);
+            }
         }
     }
 
@@ -296,6 +301,15 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 "ClassCastException",         "NumberFormatException",
                 "UnsupportedOperationException", "Any",
             };
+            // Resolve the target once: its simple name (for a same-name
+            // match) and, when it unambiguously denotes a registered class,
+            // its FQN (for an identity check that rejects a same-simple-name
+            // class in another package). The parent/interface chain is already
+            // linked package-aware (`build_module` resolves each supertype in
+            // its own package), so walking it and comparing by identity is
+            // collision-proof.
+            const target_simple = lastSegment(ty.name);
+            const target_fqn = resolveClassFqn(self, ty.name);
             var cur: ?ObjRef(ClassDef) = blk: {
                 const g = inst.borrow();
                 defer g.deinit();
@@ -307,22 +321,25 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 const cg = c.borrow();
                 defer cg.deinit();
                 const cdef = cg.get();
-                if (std.mem.eql(u8, cdef.name, ty.name) or std.mem.eql(u8, cdef.fqn, ty.name)) {
+                if (subtypeMatch(self, cdef.name, cdef.fqn, target_simple, target_fqn, ty.name)) {
                     return true;
                 }
                 // Direct + transitive interface supertypes.
-                if (interfaceChainMatches(self, cdef, ty.name)) return true;
-                // Walk supertype names — covers chains where the direct
-                // parent is a built-in exception class that isn't itself
-                // in the user class table.
+                if (interfaceChainMatches(self, cdef, target_simple, target_fqn, ty.name)) return true;
+                // Walk supertype names — covers chains where the direct parent
+                // is a built-in class not in the user class table. A target
+                // that names a definite registered class is matched by identity
+                // via the parent/interface walks above, so a supertype name is
+                // matched directly only for a builtin / ambiguous simple-name
+                // target (where identity resolution is unavailable).
                 for (cdef.supertype_names) |sup| {
-                    if (std.mem.eql(u8, sup, ty.name)) return true;
+                    if (target_fqn == null and std.mem.eql(u8, sup, target_simple)) return true;
                     if (containsStr(&builtin_exception_names, sup) and
-                        containsStr(&builtin_exception_names, ty.name)) return true;
+                        containsStr(&builtin_exception_names, target_simple)) return true;
                 }
                 if (cdef.is_anonymous) {
                     for (cdef.supertype_names) |n| {
-                        if (std.mem.eql(u8, n, ty.name)) return true;
+                        if (std.mem.eql(u8, n, target_simple)) return true;
                     }
                 }
                 if (cdef.parent) |parent| {
@@ -348,22 +365,32 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     return value.isRuntimeType(ty.name);
 }
 
-/// Walk a class's direct + transitive interface supertypes, matching
-/// `name` against each.
-fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8) bool {
+/// Walk a class's direct + transitive interface supertypes, matching the
+/// target against each by identity (`subtypeMatch`). The `interfaces` slices
+/// are linked package-aware, so the walk follows the real interface hierarchy;
+/// a same-simple-name interface in another package cannot be reached.
+fn interfaceChainMatches(
+    self: *VmHost,
+    cdef: *const ClassDef,
+    target_simple: []const u8,
+    target_fqn: ?[]const u8,
+    raw_target: []const u8,
+) bool {
     const a = self.allocator;
     var queue: std.ArrayList(ObjRef(ClassDef)) = .empty;
     defer {
         for (queue.items) |q| q.deinit();
         queue.deinit(a);
     }
+    // Dedup by FQN (identity): two same-simple-name interfaces from different
+    // packages must each be walked, never collapsed into one.
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(a);
 
     for (cdef.interfaces) |iface| {
         const fg = iface.borrow();
         defer fg.deinit();
-        if (std.mem.eql(u8, fg.get().name, name) or std.mem.eql(u8, fg.get().fqn, name)) {
+        if (subtypeMatch(self, fg.get().name, fg.get().fqn, target_simple, target_fqn, raw_target)) {
             return true;
         }
         queue.append(a, iface.clone()) catch return false;
@@ -376,17 +403,19 @@ fn interfaceChainMatches(self: *VmHost, cdef: *const ClassDef, name: []const u8)
         const fg = iface.borrow();
         defer fg.deinit();
         const idef = fg.get();
-        if (containsStr(seen.items, idef.name)) continue;
-        seen.append(a, idef.name) catch return false;
-        if (std.mem.eql(u8, idef.name, name) or std.mem.eql(u8, idef.fqn, name)) return true;
-        for (idef.supertype_names) |sup| {
-            if (std.mem.eql(u8, sup, name)) return true;
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get(sup)) |d| {
-                queue.append(a, d.clone()) catch return false;
+        if (containsStr(seen.items, idef.fqn)) continue;
+        seen.append(a, idef.fqn) catch return false;
+        if (subtypeMatch(self, idef.name, idef.fqn, target_simple, target_fqn, raw_target)) return true;
+        // Builtin / ambiguous interface supertypes (e.g. `Comparable`) are not
+        // resolved into `interfaces`; match them by simple name only when the
+        // target is not a definite registered class (identity unavailable).
+        if (target_fqn == null) {
+            for (idef.supertype_names) |sup| {
+                if (std.mem.eql(u8, sup, target_simple)) return true;
             }
         }
+        // Resolved interface supertypes, walked by identity (never re-resolved
+        // from a collidable simple name).
         for (idef.interfaces) |sup| {
             queue.append(a, sup.clone()) catch return false;
         }
@@ -666,6 +695,46 @@ fn matchesAny(name: []const u8, candidates: []const []const u8) bool {
         if (std.mem.eql(u8, name, c)) return true;
     }
     return false;
+}
+
+/// Resolve a type name from an `is`/`as` check to the FQN of the single
+/// registered user/pack class it denotes, or null when it is a bare simple
+/// name shared by several classes, a builtin, a generic parameter, or
+/// otherwise not a uniquely-registered class. `classIdByFqn` returns null on
+/// an ambiguous FQN, so a residual collision stays null and the caller keeps
+/// its collision-proof simple-name behaviour.
+fn resolveClassFqn(self: *VmHost, name: []const u8) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    const cid = m.classIdByFqn(name) orelse return null;
+    if (cid.int() >= m.classes.items.len) return null;
+    return m.classes.items[cid.int()].fqn;
+}
+
+/// Identity-aware subtype match for the `is`/`as` hierarchy walk. `ent_name`/
+/// `ent_fqn` describe a class reached in the walk; `target_simple`/`target_fqn`
+/// the type being tested against (`target_fqn` is non-null only when the
+/// target unambiguously denotes a registered class). A same-simple-name match
+/// is rejected only when the two names PROVABLY denote different registered
+/// classes (different FQNs); otherwise the collision-proof simple-name match is
+/// preserved (builtins, generics, anonymous / unregistered classes).
+fn subtypeMatch(
+    self: *VmHost,
+    ent_name: []const u8,
+    ent_fqn: []const u8,
+    target_simple: []const u8,
+    target_fqn: ?[]const u8,
+    raw_target: []const u8,
+) bool {
+    if (std.mem.eql(u8, ent_fqn, raw_target)) return true;
+    if (!std.mem.eql(u8, ent_name, target_simple)) return false;
+    const tf = target_fqn orelse return true;
+    if (std.mem.eql(u8, ent_fqn, tf)) return true;
+    // Simple names coincide but the target is a specific, different class.
+    // Reject only when the walked class is itself a registered class (so the
+    // two provably differ); otherwise keep the simple-name match.
+    return resolveClassFqn(self, ent_fqn) == null;
 }
 
 fn containsStr(haystack: []const []const u8, needle: []const u8) bool {

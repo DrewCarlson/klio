@@ -224,6 +224,13 @@ pub const ApplicabilityScope = struct {
     /// is not an instance or `target` is not reached.
     subtype: ?*const fn (*anyopaque, *const anyopaque, []const u8) ?i32 = null,
 
+    /// Whether a parameter written qualified (`x: a.Box`) and the argument's
+    /// runtime class provably denote DIFFERENT registered classes that share a
+    /// simple name (a cross-package collision). When true the exact-name tier
+    /// is skipped so the sibling overload with the matching class identity
+    /// wins. Null callback (lowering / eager) never conflicts.
+    identity_conflict: ?*const fn (*anyopaque, *const TypeRef, *const anyopaque) bool = null,
+
     /// `isFunctionTypeRefResolved`: function-typed param test with typealias
     /// indirection resolved, for the member trailing-lambda gate. Null falls
     /// back to the static `isFunctionTypeRef`.
@@ -384,6 +391,16 @@ fn subtypeDepth(scope: *const ApplicabilityScope, arg: *const ArgShape, target: 
     return cb(scope.ctx.?, v, target);
 }
 
+/// Whether a qualified parameter type and the argument's runtime class provably
+/// denote different registered classes sharing a simple name. False whenever
+/// the callback is absent (lowering / eager) or the argument carries no value.
+fn scopeIdentityConflict(scope: *const ApplicabilityScope, param_ty: *const TypeRef, arg: *const ArgShape) bool {
+    const cb = scope.identity_conflict orelse return false;
+    const ctx = scope.ctx orelse return false;
+    const v = arg.value orelse return false;
+    return cb(ctx, param_ty, v);
+}
+
 /// Value-independent fallback for a caller that could not prove a runtime head
 /// (lowering / eager). Never disqualifies (returns a base, never null).
 fn unknownArgScore(nm: []const u8) i32 {
@@ -509,8 +526,14 @@ fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const Applic
     };
 
     if (std.mem.eql(u8, nm, v_ty)) {
-        const d = refineDelta(scope, param_ty, arg) orelse return null;
-        return 100 + d;
+        // A same-simple-name exact match is rejected when the parameter is
+        // written qualified to a specific class and the argument's runtime
+        // class provably denotes a different class in another package — the
+        // sibling overload with the matching identity then wins on this tier.
+        if (!scopeIdentityConflict(scope, param_ty, arg)) {
+            const d = refineDelta(scope, param_ty, arg) orelse return null;
+            return 100 + d;
+        }
     }
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (arg.is_null and param_ty.nullable) return 50;

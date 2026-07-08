@@ -2040,6 +2040,14 @@ fn applicRefineCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyo
     return overload_match.refineByDeclaredArgs(self, param_ty, v);
 }
 
+/// `ApplicabilityScope.identity_conflict`: cross-package class-identity disproof
+/// for member overloads (same shared exact-name tier as the global scorer).
+fn applicIdentityConflictCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return overload_match.crossPackageIdentityConflict(self, param_ty, v);
+}
+
 /// `ApplicabilityScope.subtype`: the member instance-subtype BFS
 /// (`instanceSubtypeDistance`, simple-name matched — unlike the global BFS).
 fn applicSubtypeCbM(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
@@ -2461,6 +2469,7 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         .refine = applicRefineCbM,
         .subtype = applicSubtypeCbM,
         .func_type = applicFuncTypeCbM,
+        .identity_conflict = applicIdentityConflictCbM,
     };
 
     var best: ?Func = null;
@@ -7999,6 +8008,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         .ctx = @ptrCast(self),
         .refine = applicRefineCbM,
         .subtype = applicSubtypeCbM,
+        .identity_conflict = applicIdentityConflictCbM,
         .ext_recv_match = applicExtRecvMatchCb,
         .ext_is_subtype_name = applicExtSubtypeNameCb,
         .ext_owner_rank = applicExtOwnerRankCb,

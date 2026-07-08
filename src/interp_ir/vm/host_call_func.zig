@@ -730,6 +730,15 @@ fn applicRefineCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyop
     return overload_match.refineByDeclaredArgs(self, param_ty, v);
 }
 
+/// `applicability.ApplicabilityScope.identity_conflict`: wraps the cross-package
+/// class-identity disproof so the exact-name overload tier rejects a
+/// same-simple-name argument from a different package.
+fn applicIdentityConflictCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const v: *const Value = @ptrCast(@alignCast(value));
+    return overload_match.crossPackageIdentityConflict(self, param_ty, v);
+}
+
 /// `applicability.ApplicabilityScope.subtype`: the instance-supertype BFS from
 /// `overloadScoreArg`, returning the match depth (or null when the value is not
 /// an instance or `target` is never reached).
@@ -810,6 +819,7 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
         .ctx = @ptrCast(self),
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
+        .identity_conflict = applicIdentityConflictCb,
     };
 
     var best_func: ?FuncId = null;
@@ -1223,6 +1233,7 @@ pub fn pickNamedOverloadId(
         .ctx = @ptrCast(self),
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
+        .identity_conflict = applicIdentityConflictCb,
     };
 
     var best: ?FuncId = null;

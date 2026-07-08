@@ -17,6 +17,7 @@ const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
 const host_call_member = @import("host_call_member.zig");
+const overload_match = @import("overload_match.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -517,7 +518,10 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         v_ty_buf = lastSegment(fqn);
     }
     const v_ty = v_ty_buf;
-    if (std.mem.eql(u8, nm, v_ty)) return 100;
+    // A same-simple-name exact match is rejected when the parameter is written
+    // qualified to a specific class and the argument's runtime class provably
+    // denotes a different class in another package.
+    if (std.mem.eql(u8, nm, v_ty) and !overload_match.crossPackageIdentityConflict(self, param_ty, arg)) return 100;
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (arg.* == .Null and param_ty.nullable) return 50;
     // Numeric widening.
