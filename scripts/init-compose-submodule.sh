@@ -24,6 +24,7 @@ sparse_ui=(
   "compose/ui/ui-util/src/commonMain"
   "compose/ui/ui-geometry/src/commonMain"
   "compose/ui/ui-unit/src/commonMain"
+  "compose/ui/ui-graphics/src/commonMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
