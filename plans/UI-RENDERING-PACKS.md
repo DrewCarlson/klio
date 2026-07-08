@@ -148,6 +148,30 @@ companion-bearing value class in another pack and lost its identity. Now a class
 forwards to a companion only when it declares one. This unblocked the whole
 ui + animation-core + graphics + unit pack set coexisting.
 
+**ui-text status (`14b2d86c`, WIP):** the 81-file model+styling module is vendored
+and BUILDS, but unlike ui-core/animation-core its core types need their platform
+actuals to even initialize — `AnnotatedString.Companion` reads `AnnotatedStringSaver`
+at init, which builds on the expect Savers (`LineBreak`/`TextMotion`/
+`PlatformParagraphStyle`.Companion.Saver), so a program using `AnnotatedString`
+throws `FileFailedToInitializeException` until those land (diagnosed via
+`KLIO_INIT_DEBUG=1`). Remaining ui-text actual layer, in dependency order:
+1. **Style value classes** — `LineBreak` (value class over a packed `Int` mask;
+   Simple/Heading/Paragraph/Unspecified — use the real bit layout, not sentinels),
+   `TextMotion` (Static/Animated), the `PlatformTextStyle` family
+   (`PlatformParagraphStyle`/`PlatformSpanStyle` + `createPlatformTextStyle` + the
+   two `lerp`s + `.Default`/`merge`).
+2. **The three Savers** (`runtime.saveable.Saver<T, Any>` round-trips) — no-op-safe
+   for klio (no state restoration) but must construct.
+3. **Locale/text-break/string** — `Locale`/`PlatformLocale`, `PlatformString`,
+   `CharHelpers.find{Preceding,Following}Break`, `GapBuffer.toCharArray` (simple).
+4. **Font resolution** — `createFontFamilyResolver`, `FontSynthesis.synthesizeTypeface`,
+   `PlatformFontFamilyTypefaceAdapter` (stub to the bundled font initially).
+5. **Text shaping/measure/draw** — `ActualParagraph` (×3) + `MultiParagraph.
+   drawMultiParagraph` over the Skia Paragraph shim (`src/compose_ui`, which already
+   does SkFont wrap + Paragraph). This is the substantive part; the rest is plumbing.
+Then foundation → material3. ui-text is NOT yet in the parity/e2e list (its init
+failure would break e2e) — add it once the value-class + Saver actuals land.
+
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.
 Each module's pack builds with unimplemented actuals throwing at runtime (the
