@@ -131,12 +131,22 @@ subcomposition), then `compose.material3` (mostly verbatim on foundation).
 
 Dependency chain (surveyed from foundation's imports; sparse-checkout expanded to
 `compose/foundation/foundation/src/commonMain` — 342 files, 67 expects): foundation
-needs two modules NOT yet vendored — **`androidx.compose.ui.text`** (341 refs;
-needs the shim's text-shaping actuals) and **`androidx.compose.animation.core`**
-(120 refs; mostly pure-Kotlin animation math). So the vendoring order is
-**ui-text + animation-core → foundation → material3**. Its `androidx.compose.ui.*`
-needs (node/input/layout/platform/semantics) are satisfied by the vendored ui-core
-engine; unit/graphics/geometry/util by their packs.
+needs two modules on top of the ui engine. **`androidx.compose.animation.core`**
+(120 refs; pure-Kotlin animation math) is **DONE** — vendored as
+`klio-compose-animation-core` (36 files; Easing/CubicBezier/AnimationSpec/ArcSpline;
+klioMain actuals for atomics, current-thread, binarySearch, the cancellation base;
+needed `ui-graphics/Bezier.kt` added). Still needed: **`androidx.compose.ui.text`**
+(341 refs; needs the shim's text-shaping actuals). So the remaining order is
+**ui-text → foundation → material3**. foundation's `androidx.compose.ui.*` needs
+(node/input/layout/platform/semantics) are satisfied by the vendored ui-core
+engine; unit/graphics/geometry/util/animation-core by their packs.
+
+A general resolution bug this tier surfaced and fixed (`0acc0805`): a class
+resolved to a *same-simple-named* class's companion (`companion_singletons` is
+keyed by simple name), so a top-level enum shared its name with a nested
+companion-bearing value class in another pack and lost its identity. Now a class
+forwards to a companion only when it declares one. This unblocked the whole
+ui + animation-core + graphics + unit pack set coexisting.
 
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.

@@ -1,0 +1,6 @@
+t=0.0 linear=0.0 fastOutSlowIn=0.0 custom=0.0
+t=0.25 linear=0.25 fastOutSlowIn=0.23658738 custom=0.23658738
+t=0.5 linear=0.5 fastOutSlowIn=0.7755618 custom=0.7755618
+t=0.75 linear=0.75 fastOutSlowIn=0.9593679 custom=0.9593679
+t=1.0 linear=1.0 fastOutSlowIn=1.0 custom=1.0
+linearOutSlowIn(0.25)=0.5775731

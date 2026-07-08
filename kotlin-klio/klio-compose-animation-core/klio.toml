@@ -1,0 +1,72 @@
+# androidx.compose.animation.core — the pure-Kotlin animation engine (Easing,
+# AnimationSpec/VectorConverter, Animatable, TargetBasedAnimation, ArcSpline,
+# vector value types), vendored verbatim. klioMain supplies the platform-primitive
+# actuals (atomics, current-thread token, binary search, cancellation base).
+# A dependency of compose.foundation.
+[library]
+id = "androidx.compose.animation.core"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/animation/animation-core/src/commonMain/kotlin"
+include = [
+    "androidx/compose/animation/core/Animatable.kt",
+    "androidx/compose/animation/core/AnimateAsState.kt",
+    "androidx/compose/animation/core/AnimationEndReason.kt",
+    "androidx/compose/animation/core/Animation.kt",
+    "androidx/compose/animation/core/AnimationSpec.kt",
+    "androidx/compose/animation/core/AnimationState.kt",
+    "androidx/compose/animation/core/AnimationVectors.kt",
+    "androidx/compose/animation/core/ArcSpline.kt",
+    "androidx/compose/animation/core/DecayAnimationSpec.kt",
+    "androidx/compose/animation/core/DeferredTargetAnimation.kt",
+    "androidx/compose/animation/core/EasingFunctions.kt",
+    "androidx/compose/animation/core/Easing.kt",
+    "androidx/compose/animation/core/Expect.kt",
+    "androidx/compose/animation/core/ExperimentalAnimationSpecApi.kt",
+    "androidx/compose/animation/core/ExperimentalTransitionApi.kt",
+    "androidx/compose/animation/core/FloatAnimationSpec.kt",
+    "androidx/compose/animation/core/FloatDecayAnimationSpec.kt",
+    "androidx/compose/animation/core/InfiniteAnimationPolicy.kt",
+    "androidx/compose/animation/core/InfiniteTransition.kt",
+    "androidx/compose/animation/core/InternalAnimationApi.kt",
+    "androidx/compose/animation/core/internal/Arrays.kt",
+    "androidx/compose/animation/core/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/animation/core/InternalMutatorMutex.kt",
+    "androidx/compose/animation/core/internal/PlatformOptimizedCancellationException.kt",
+    "androidx/compose/animation/core/MonoSpline.kt",
+    "androidx/compose/animation/core/PathEasing.kt",
+    "androidx/compose/animation/core/Preconditions.kt",
+    "androidx/compose/animation/core/SpringEstimation.kt",
+    "androidx/compose/animation/core/SpringSimulation.kt",
+    "androidx/compose/animation/core/SuspendAnimation.kt",
+    "androidx/compose/animation/core/Transition.kt",
+    "androidx/compose/animation/core/VectorConverters.kt",
+    "androidx/compose/animation/core/VectorizedAnimationSpec.kt",
+    "androidx/compose/animation/core/VectorizedDecayAnimationSpec.kt",
+    "androidx/compose/animation/core/VectorizedMonoSplineKeyframesSpec.kt",
+    "androidx/compose/animation/core/VisibilityThresholds.kt",
+]
+
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.ui.unit"
+[[deps]]
+id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.compose.ui.geometry"
+[[deps]]
+id = "androidx.compose.ui.graphics"
+[[deps]]
+id = "kotlinx.atomicfu"
+[[deps]]
+id = "kotlinx.coroutines"
