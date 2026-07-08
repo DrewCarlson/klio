@@ -1,0 +1,47 @@
+# androidx.compose.ui:ui-unit — the compose UI unit module, vendored verbatim.
+# One klio pack per upstream Gradle module: the `androidx.compose.ui.unit` package
+# (Dp / IntOffset / IntSize / IntRect / Constraints / Velocity / TextUnit / Density /
+# LayoutDirection) — the density-independent units and pixel<->dp<->sp conversions
+# the layout system runs on. Pure Kotlin over inline value classes, no Skia.
+#
+# The klioMain layer supplies the platform actuals: `FontScaling` (upstream is an
+# `expect interface`; klio is a desktop runtime, so the actual is the linear
+# Sp<->Dp conversion — the non-Android default) and the no-op
+# `internal.JvmDefaultWithCompatibility` marker (an `@OptionalExpectation`
+# annotation upstream).
+[library]
+id = "androidx.compose.ui.unit"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-unit/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/unit/ComposeUiUnitFlags.kt",
+    "androidx/compose/ui/unit/InlineClassHelper.kt",
+    "androidx/compose/ui/unit/LayoutDirection.kt",
+    "androidx/compose/ui/unit/Dp.kt",
+    "androidx/compose/ui/unit/IntOffset.kt",
+    "androidx/compose/ui/unit/IntSize.kt",
+    "androidx/compose/ui/unit/IntRect.kt",
+    "androidx/compose/ui/unit/Constraints.kt",
+    "androidx/compose/ui/unit/Velocity.kt",
+    "androidx/compose/ui/unit/ExperimentalUnitApi.kt",
+    "androidx/compose/ui/unit/TextUnit.kt",
+    "androidx/compose/ui/unit/Density.kt",
+]
+
+# klioMain: the platform actuals (FontScaling linear conversion, JvmDefault marker).
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.compose.ui.geometry"
