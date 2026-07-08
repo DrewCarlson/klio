@@ -1409,9 +1409,28 @@ const BaseEntry = struct {
 
 var base_lock: runtime.SpinMutex = .{};
 var base_arena_state: ?*std.heap.ArenaAllocator = null;
-/// key (mode|mask|gate byte) -> entry, or null when the base for that key
-/// could not be snapshotted (callers then always take the fallback).
-var base_entries: ?std.AutoHashMap(u32, ?*const BaseEntry) = null;
+
+/// A cached dependency base plus the arena that owns its memory, so an
+/// evicted base's ~stdlib-sized footprint returns to the OS. `entry` is null
+/// when the base for this key is not snapshot-safe (cached so callers stop
+/// retrying); such placeholders own no arena and are never evicted.
+const CachedBase = struct {
+    entry: ?*const BaseEntry,
+    arena: ?*std.heap.ArenaAllocator,
+    tick: u64,
+};
+/// key (mode|mask|gate byte) -> cached base.
+var base_entries: ?std.AutoHashMap(u32, CachedBase) = null;
+var base_tick: u64 = 0;
+
+/// Max number of real (arena-owning) bases to retain; 0 means unbounded (the
+/// default, so `klio run` and the reuse-heavy harnesses are unaffected). A
+/// batch harness that runs many programs across many pack masks — the e2e
+/// corpus — sets a small bound so the process does not accumulate one full
+/// stdlib clone per mask. Safe to evict: a base is only referenced inside
+/// `getOrBuildBase`/`prepareWithBase` (the run clones what it needs), and the
+/// batch harnesses drive it from a single thread.
+pub var base_cache_max: usize = 0;
 var stdlib_meta_cache: ?StdlibMeta = null;
 var pack_meta_cache: [N_PACK_DIRS]?PackMeta = @splat(null);
 
@@ -1659,14 +1678,59 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error
     base_lock.lock();
     defer base_lock.unlock();
 
-    const a = baseArenaAllocator();
-    if (base_entries == null) base_entries = std.AutoHashMap(u32, ?*const BaseEntry).init(std.heap.page_allocator);
+    if (base_entries == null) base_entries = std.AutoHashMap(u32, CachedBase).init(std.heap.page_allocator);
     const key = baseKey(mode, mask, full);
-    if (base_entries.?.get(key)) |hit| return hit;
+    if (base_entries.?.getPtr(key)) |hit| {
+        base_tick += 1;
+        hit.tick = base_tick;
+        return hit.entry;
+    }
 
-    const entry = try buildBaseEntry(a, io, mode, mask, full);
-    try base_entries.?.put(key, entry);
+    // Build each base in its own arena so eviction can hand its pages back.
+    const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+    holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const entry = buildBaseEntry(holder.allocator(), io, mode, mask, full) catch |e| {
+        holder.deinit();
+        std.heap.page_allocator.destroy(holder);
+        return e;
+    };
+    base_tick += 1;
+    if (entry == null) {
+        // Not snapshot-safe: keep no arena, just remember the miss.
+        holder.deinit();
+        std.heap.page_allocator.destroy(holder);
+        try base_entries.?.put(key, .{ .entry = null, .arena = null, .tick = base_tick });
+        return null;
+    }
+    try base_entries.?.put(key, .{ .entry = entry, .arena = holder, .tick = base_tick });
+    evictBasesBeyondCap();
     return entry;
+}
+
+/// Drop least-recently-used real bases until at most `base_cache_max` remain
+/// (no-op when the cap is 0). Only arena-owning entries count and are evicted;
+/// null placeholders are free and kept.
+fn evictBasesBeyondCap() void {
+    if (base_cache_max == 0) return;
+    while (true) {
+        var owning: usize = 0;
+        var lru_key: u32 = 0;
+        var lru_tick: u64 = std.math.maxInt(u64);
+        var it = base_entries.?.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.arena == null) continue;
+            owning += 1;
+            if (kv.value_ptr.tick < lru_tick) {
+                lru_tick = kv.value_ptr.tick;
+                lru_key = kv.key_ptr.*;
+            }
+        }
+        if (owning <= base_cache_max) return;
+        const removed = base_entries.?.fetchRemove(lru_key).?;
+        const arena = removed.value.arena.?;
+        arena.deinit();
+        std.heap.page_allocator.destroy(arena);
+    }
 }
 
 fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {

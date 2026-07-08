@@ -1,0 +1,7 @@
+triangle bounds 0,0,40,30 empty=false convex=false
+triangle segments Move Line Line Close
+rect bounds 10,20,60,80 convex=true
+oval bounds 0,0,100,60 convex=true
+roundrect bounds 0,0,50,40 convex=true
+moved bounds 110,120,160,180
+mixed convex=false bounds 0,0,50,50
