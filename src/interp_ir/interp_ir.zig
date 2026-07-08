@@ -89,7 +89,7 @@ pub const EnumEntryArgInit = build.EnumEntryArgInit;
 /// One top-level property's on-demand init entry: the 0-arg initializer
 /// thunk plus the declared type's pre-init default category (`.none` when
 /// the declaration carries no usable annotation).
-pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault };
+pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault, file: u32 = 0 };
 
 /// Build-time-immutable program metadata. Produced once by
 /// `build.build_module` and shared by handle with every OS thread the
@@ -97,6 +97,10 @@ pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault 
 pub const ProgramImage = struct {
     /// Top-level property name → initializer thunk + typed default.
     top_level_prop_inits: std.StringHashMap(TopLevelPropInit),
+    /// The same top-level props in DECLARATION order (the map above is
+    /// unordered). Used to drive a file's `<clinit>` in order on demand.
+    /// Borrows the Vm's `top_level_props` slice (run-stable).
+    top_level_props_ordered: []const NameFunc = &.{},
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
     instance_prop_setters: PairFuncMap,

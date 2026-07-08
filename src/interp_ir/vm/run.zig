@@ -101,8 +101,11 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         const prog = pg.get();
         for (built.top_level_props.items) |nf| {
             try vm.top_level_props.append(allocator, nf);
-            try prog.top_level_prop_inits.put(nf.name, .{ .func = nf.func, .default = nf.default });
+            try prog.top_level_prop_inits.put(nf.name, .{ .func = nf.func, .default = nf.default, .file = nf.file });
         }
+        // The Vm owns the ordered list for the run; the program image borrows
+        // its slice so the on-demand driver can run a file's clinit in order.
+        prog.top_level_props_ordered = vm.top_level_props.items;
 
         // Move every dispatch-time side table into the program image. Each
         // map is swapped with a fresh empty so the `BuiltModule`'s own
@@ -507,6 +510,17 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 g.deinit();
                 if (exists) continue;
             }
+            // This prop's file `<clinit>` is running for its initializer, so a
+            // same-file forward read defaults while a cross-file read drives
+            // (per-file lazy static init, not one global clinit). Guard the
+            // prop itself too, so a re-entrant on-demand drive of this file
+            // (an object this initializer constructs reads a later sibling)
+            // skips the prop the startup pass is still evaluating instead of
+            // re-driving it into an unresolved cycle.
+            vmhost.host_impl.pushInitFile(nf.file);
+            defer vmhost.host_impl.popInitFile(nf.file);
+            vmhost.host_impl.pushInitProp(nf.name);
+            defer vmhost.host_impl.popInitProp(nf.name);
             var host = vmMakeHost(self, sink);
             const r = try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host);
             switch (r) {

@@ -109,6 +109,28 @@ pub fn filePrivateRename(name: []const u8, file: u32) ?[]const u8 {
     return inner.get(name);
 }
 
+/// Per-file rename table for file-private top-level FUNCTIONS: two files in one
+/// package each declaring `private fun debugLog(...)` are file-scoped in Kotlin,
+/// but klio's function namespace is flat, so identical signatures would look
+/// like conflicting overloads. Each is mangled per file and its declaring
+/// file's bare calls rewrite to it.
+threadlocal var lower_file_private_func_renames: ?*const FilePrivateRenames = null;
+
+/// Install the per-file function rename table for a lowering pass.
+pub fn setLowerFilePrivateFuncRenames(m: ?*const FilePrivateRenames) ?*const FilePrivateRenames {
+    const prev = lower_file_private_func_renames;
+    lower_file_private_func_renames = m;
+    return prev;
+}
+
+/// The renamed function name for a bare call to `name` from `file`, when that
+/// file resolves it to a mangled file-private top-level function.
+pub fn filePrivateFuncRename(name: []const u8, file: u32) ?[]const u8 {
+    const m = lower_file_private_func_renames orelse return null;
+    const inner = m.get(file) orelse return null;
+    return inner.get(name);
+}
+
 /// File-keyed type renames: span FileId -> (simple type name -> mangled
 /// lift name). Kotlin scopes a file-`private` top-level class or
 /// typealias to its declaring file; the build driver mangles one whose

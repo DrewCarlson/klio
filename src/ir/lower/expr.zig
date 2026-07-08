@@ -2967,6 +2967,48 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A bare call to a file-private top-level function mangled per file (two
+    // files in one package each declaring the same-signature `private fun`)
+    // resolves to the calling file's mangled name. Locals / outer captures /
+    // own members still shadow it (Kotlin scope order).
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const head = callee.Path.segments[0];
+        if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
+            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+                var new_segs = [_]ast.Ident{.{ .name = renamed, .span = head.span }};
+                var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
+                var rewritten = expr.*;
+                rewritten.Call.callee = &new_callee;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
+
+    // A bare call to a companion member imported by name
+    // (`import X.Companion.member` then `member(args)`) dispatches on X's
+    // companion: rewrite the callee to the qualified `X.member` the same way a
+    // bare companion-imported name expression is rewritten, so the call reaches
+    // the companion method instead of an unresolved global. A local / captured /
+    // own-member binding of the name shadows the import (Kotlin scope order).
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const head = callee.Path.segments[0];
+        if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+            if (importCompanionRewrite(b, head.span.file, head.name)) |rw| {
+                var recv_segs = [_]ast.Ident{.{ .name = rw.cls, .span = head.span }};
+                var recv = Expr{ .Path = .{ .segments = &recv_segs, .span = head.span } };
+                var new_callee = Expr{ .Member = .{
+                    .receiver = &recv,
+                    .name = .{ .name = rw.member, .span = head.span },
+                    .safe = false,
+                    .span = callee.Path.span,
+                } };
+                var rewritten = expr.*;
+                rewritten.Call.callee = &new_callee;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
+
     // Empty stdlib container creator (`emptyList()`, `setOf()`, `mapOf()`)
     // typed only by its binding annotation. With no explicit creation-site
     // type argument the runtime value cannot carry its element head, so a
@@ -5323,7 +5365,13 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the invisible candidate. Order-independent (decided from this file's imports)
     // and gated on the import actually naming in-scope funcs, so it never invents
     // a target.
+    // A member of the enclosing class (or an own member) shadows a top-level
+    // import for a bare call — Kotlin resolves `circle()` inside a class whose
+    // companion declares `fun circle()` to that member, never to an
+    // `import ....circle`. Leave the shadowed name for the member-dispatch
+    // paths below instead of qualifying it to the import's FQN.
     if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
+        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0) and
         b.module.funcsBySimpleName(name0).len >= 1)
     {
         const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
@@ -5342,7 +5390,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                     }
                 }
             }
-            if (import_resolves) {
+            // An imported EXTENSION function (`RoundedPolygon.Companion.circle`)
+            // called with no explicit receiver has no `this` to carry: the
+            // qualified FQN rewrite would load it as a receiverless global and
+            // miss. Only a plain top-level function (the `kotlin.math.max`
+            // shape this rewrite exists for) qualifies.
+            const imp_is_extension = blk: {
+                if (b.module.funcIdByFqn(alias_paths[0].fqn)) |ifid| {
+                    if (b.module.funcById(ifid)) |iff| {
+                        break :blk iff.params.len != 0 and std.mem.eql(u8, iff.params[0].name, "this");
+                    }
+                }
+                break :blk false;
+            };
+            if (import_resolves and !imp_is_extension) {
                 const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
                 for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
                 const new_callee = try b.allocator.create(Expr);

@@ -63,6 +63,12 @@ pub fn pendingTypedDefault(self: *VmHost, name: []const u8) ?Value {
     const pg = self.prog.borrow();
     defer pg.deinit();
     const entry = pg.get().top_level_prop_inits.get(name) orelse return null;
+    // Default only a SAME-file forward read: the prop's own file `<clinit>` is
+    // already running, so its field is still zero/null (JVM within-clinit
+    // semantics). A read of a prop in a file whose clinit has NOT started is a
+    // cross-file dependency that must be driven (Kotlin forces the other
+    // file's lazy static init) — returning null falls through to the drive.
+    if (!inProgressFileContains(entry.file)) return null;
     return typedDefaultValue(entry.default);
 }
 
@@ -95,12 +101,60 @@ fn typedDefaultValue(kind: build.TypedDefault) ?Value {
 /// like the sibling resolution guards, so it leaks nothing across runs.
 threadlocal var in_progress: std.ArrayListUnmanaged([]const u8) = .empty;
 
+/// FileIds whose top-level `<clinit>` is currently executing on this thread.
+/// Kotlin initializes top-level `val`s per FILE (one facade `<clinit>` each),
+/// lazily on first access. So a forward read of a prop whose file clinit is
+/// ALREADY running observes the declared-type default (JVM within-clinit field
+/// semantics), but a read of a prop in a file whose clinit has NOT started must
+/// DRIVE it (forcing that file's clinit) rather than defaulting — otherwise a
+/// cross-file `val a = b.f()` reads `b`'s zero/null default instead of its real
+/// value during a companion/object init cascade.
+threadlocal var in_progress_files: std.ArrayListUnmanaged(u32) = .empty;
+
+fn inProgressFileContains(file: u32) bool {
+    for (in_progress_files.items) |f| {
+        if (f == file) return true;
+    }
+    return false;
+}
+
+/// Mark a top-level prop as initializing (the in-order startup pass owns the
+/// prop it is currently evaluating): a re-entrant on-demand drive of the same
+/// file then SKIPS this prop rather than re-driving it while the startup pass
+/// still holds it mid-initialization.
+pub fn pushInitProp(name: []const u8) void {
+    in_progress.append(std.heap.page_allocator, name) catch {};
+}
+
+/// Release a startup-pass prop guard (mirrors `InitGuard.release`).
+pub fn popInitProp(name: []const u8) void {
+    (InitGuard{ .key = name }).release();
+}
+
+/// Mark a file's `<clinit>` as running for the duration of an initializer.
+pub fn pushInitFile(file: u32) void {
+    in_progress_files.append(std.heap.page_allocator, file) catch {};
+}
+
+/// Clear the innermost matching file after its initializer returns.
+pub fn popInitFile(file: u32) void {
+    var i: usize = in_progress_files.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (in_progress_files.items[i] == file) {
+            _ = in_progress_files.orderedRemove(i);
+            return;
+        }
+    }
+}
+
 /// Assert (Debug) the in-progress top-level-init set is empty at a run
 /// boundary and clear it capacity-retaining, so state leaked across runs is a
 /// loud failure rather than silently threaded into the next run.
 pub fn resetReceiverTls() void {
     std.debug.assert(in_progress.items.len == 0);
     in_progress.clearRetainingCapacity();
+    in_progress_files.clearRetainingCapacity();
 }
 
 /// True when `name` is already initializing on this thread's stack.
@@ -149,48 +203,63 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
     // property resolves to its declared type's default and its initializer
     // stays queued for the in-order pass (JVM <clinit> semantics).
     if (pendingTypedDefault(self, name)) |d| return .{ .ok = d };
-    const init = blk: {
+    const file: u32 = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        const inits = &pg.get().top_level_prop_inits;
-        const entry = inits.get(name) orelse return .{ .ok = null };
-        // The program-image key is run-stable (shared by the `prog` handle),
-        // so it outlives this guard frame without a per-key copy.
-        break :blk .{ .fid = entry.func, .key = inits.getKey(name) orelse name };
+        const entry = pg.get().top_level_prop_inits.get(name) orelse return .{ .ok = null };
+        break :blk entry.file;
     };
-    const fid = init.fid;
-    const init_key = init.key;
-    if (inProgressContains(init_key)) {
-        return .{ .ok = null };
-    }
-    in_progress.append(std.heap.page_allocator, init_key) catch {};
-    const guard = InitGuard{ .key = init_key };
-    defer guard.release();
-
-    const func = blk: {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        const m = mg.get();
-        break :blk m.funcById(fid) orelse {
-            const msg = try std.fmt.allocPrint(self.allocator, "top-level prop init FuncId {d} out of range", .{fid.int()});
-            return .{ .err = .{ .Type = msg } };
-        };
+    // Drive `name`'s file `<clinit>`: every top-level prop declared in that
+    // file, in declaration order, so a same-file EARLIER prop is assigned
+    // before a later one — or the cross-file dependency that forced us here —
+    // reads it. A file already mid-clinit was defaulted by
+    // `pendingTypedDefault` above, so reaching here means its clinit has not
+    // started. This matches Kotlin's per-file lazy static init: accessing any
+    // top-level member of a file runs that whole facade's `<clinit>`.
+    pushInitFile(file);
+    defer popInitFile(file);
+    const props = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().top_level_props_ordered;
     };
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const mg = module_ref.borrow();
     defer mg.deinit();
-    vmhost.emitPath(self.allocator, "top_level_init", func.fqn, fid, null, &.{});
-    const r = try ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, .empty, self);
-    switch (r) {
-        .ok => |v| {
-            const g = self.globals.borrowMut();
-            defer g.deinit();
-            g.get().define(name, v) catch {};
-            return .{ .ok = v };
-        },
-        .err => |e| return .{ .err = e },
+    const m = mg.get();
+    for (props) |nf| {
+        if (nf.file != file) continue;
+        {
+            const g = self.globals.borrow();
+            const done = g.get().lookup(nf.name) != null;
+            g.deinit();
+            if (done) continue;
+        }
+        // A prop initializer that re-reads its own name (a genuine cycle):
+        // leave it to resolve to null/default rather than recursing.
+        if (inProgressContains(nf.name)) continue;
+        in_progress.append(std.heap.page_allocator, nf.name) catch {};
+        const guard = InitGuard{ .key = nf.name };
+        defer guard.release();
+        const func = m.funcById(nf.func) orelse continue;
+        vmhost.emitPath(self.allocator, "top_level_init", func.fqn, nf.func, null, &.{});
+        const r = try ir.eval.evalWith(VmHost, self.allocator, m, func, .empty, self);
+        switch (r) {
+            .ok => |v| {
+                const g = self.globals.borrowMut();
+                defer g.deinit();
+                g.get().define(nf.name, v) catch {};
+            },
+            .err => |e| return .{ .err = e },
+        }
     }
+    {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        if (g.get().lookup(name)) |v| return .{ .ok = v };
+    }
+    return .{ .ok = null };
 }
 
 /// `Result<void, RuntimeError>` for the join helpers.

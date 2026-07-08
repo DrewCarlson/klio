@@ -1460,7 +1460,7 @@ pub fn isShadowingCapture(self: *VmHost, name: []const u8) bool {
 // Small accessors over the shared program/module tables.
 // -------------------------------------------------------------------------
 
-fn progHasObjectName(self: *VmHost, name: []const u8) bool {
+pub fn progHasObjectName(self: *VmHost, name: []const u8) bool {
     const pg = self.prog.borrow();
     defer pg.deinit();
     return pg.get().object_names.contains(name);

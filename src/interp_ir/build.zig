@@ -167,7 +167,7 @@ pub fn typedDefaultForInit(init: *const ast.Expr) TypedDefault {
 
 /// `(name, FuncId)` top-level property initializer entry, plus the
 /// declared type's pre-init default category.
-pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none };
+pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none, file: u32 = 0 };
 
 /// Per enum-entry constructor-arg thunks.
 pub const EnumEntryArgInit = struct {
@@ -431,6 +431,12 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         while (it.next()) |inner| inner.deinit();
         private_prop_renames.deinit();
     }
+    var private_func_renames = ir.build.FilePrivateRenames.init(allocator);
+    defer {
+        var it = private_func_renames.valueIterator();
+        while (it.next()) |inner| inner.deinit();
+        private_func_renames.deinit();
+    }
     {
         var name_files = std.StringHashMap(u32).init(allocator);
         defer name_files.deinit();
@@ -464,6 +470,44 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
             try gop.value_ptr.put(p.name.name, mangled);
             p.name = .{ .name = mangled, .span = p.name.span };
+        }
+        // File-private top-level FUNCTIONS: same story as private properties.
+        // Two files each declaring `private fun debugLog(...)` are file-scoped
+        // in Kotlin, but klio's function namespace is flat, so identical
+        // signatures read as conflicting overloads. Mangle each per file and
+        // record the rename so the declaring file's bare calls rewrite to it.
+        {
+            var fn_files = std.StringHashMap(u32).init(allocator);
+            defer fn_files.deinit();
+            var fn_counts = std.StringHashMap(u32).init(allocator);
+            defer fn_counts.deinit();
+            for (decls.items) |*d| {
+                if (d.* != .Function) continue;
+                const fdec = d.Function;
+                if (fdec.receiver_type != null) continue;
+                const fid = fdec.span.file.int();
+                const gop = try fn_counts.getOrPut(fdec.name.name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = 1;
+                    try fn_files.put(fdec.name.name, fid);
+                } else if (fn_files.get(fdec.name.name).? != fid) {
+                    gop.value_ptr.* += 1;
+                }
+            }
+            for (decls.items) |*d| {
+                if (d.* != .Function) continue;
+                const fdec = &d.Function;
+                if (fdec.receiver_type != null) continue;
+                if (fdec.visibility != .Private or fdec.is_expect or fdec.is_actual) continue;
+                const count = fn_counts.get(fdec.name.name) orelse 0;
+                if (count < 2) continue;
+                const fid = fdec.span.file.int();
+                const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ fdec.name.name, fid });
+                const gop = try private_func_renames.getOrPut(fid);
+                if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                try gop.value_ptr.put(fdec.name.name, mangled);
+                fdec.name = .{ .name = mangled, .span = fdec.name.span };
+            }
         }
         // Non-private decls of one simple name declared by two or more
         // packages: each gets its declaring-FQN slot.
@@ -563,6 +607,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     }
     const prev_renames = ir.build.setLowerFilePrivateRenames(&private_prop_renames);
     defer _ = ir.build.setLowerFilePrivateRenames(prev_renames);
+    const prev_fn_renames = ir.build.setLowerFilePrivateFuncRenames(&private_func_renames);
+    defer _ = ir.build.setLowerFilePrivateFuncRenames(prev_fn_renames);
 
     // Kotlin scopes a file-`private` top-level class or typealias to its
     // declaring file; the lowered type namespace is flat. Mangle a private
@@ -2487,7 +2533,7 @@ fn buildModuleWithOverrides(
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
     }
     for (decls) |*d| {
@@ -2522,12 +2568,12 @@ fn buildModuleWithOverrides(
             // driving the initializer out of order; non-literal unannotated
             // initializers keep the on-demand path (`.none`).
             const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
-            try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt });
+            try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt, .file = p.span.file.int() });
         } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
         if (p.delegate == null) {
             if (p.context_params.len != 0) module.has_context_decls = true;
@@ -2595,26 +2641,51 @@ fn buildModuleWithOverrides(
             else => {},
         }
     }
+    // Class-typed typealiases (`typealias Point = FloatFloatPair`). The shared
+    // `type_aliases` map records only function-typed aliases (for arity), so
+    // collect the class ones here to expand an extension receiver named by an
+    // alias to its underlying class — otherwise a `val Point.x` extension is
+    // keyed on `Point` and never dispatches on a `FloatFloatPair` value.
+    var class_aliases = std.StringHashMap([]const u8).init(a);
+    defer class_aliases.deinit();
+    for (decls) |*d| {
+        if (d.* != .TypeAlias) continue;
+        const ta = &d.TypeAlias;
+        if (ta.target.function != null) continue;
+        try class_aliases.put(ta.name.name, ta.target.name.name);
+    }
     for (ext_prop_decls.items) |epd| {
         const p = epd.p;
         const recv = p.receiver_type orelse continue;
+        // Expand a typealias receiver (`typealias Point = FloatFloatPair`; then
+        // `val Point.x`) to the underlying type so the extension keys and
+        // dispatches on the concrete class, not the alias name — a member
+        // access on a `FloatFloatPair` value otherwise never finds `.x`.
+        var recv_name = recv.name.name;
+        {
+            var hops: usize = 0;
+            while (class_aliases.get(recv_name)) |t| : (hops += 1) {
+                if (hops > 8 or std.mem.eql(u8, t, recv_name)) break;
+                recv_name = t;
+            }
+        }
         // A `val X.Companion.foo` records `qualified_path = "X.Companion"`; key
         // it under that path so it never collides with a plain `val X.foo` type
         // extension (which applies to instances of `X`, not its companion).
         const recv_key: []const u8 = if (recv.qualified_path) |qp|
-            (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv.name.name)
+            (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv_name)
         else
-            recv.name.name;
+            recv_name;
         const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
         if (p.getter) |getter| {
             var empty_members = StringSet.init(a);
             defer empty_members.deinit();
-            const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv.name.name, p.name.name });
+            const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
             const fid = switch (getter.body) {
-                .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv.name.name, &empty_members, &.{"this"}, &body, nm),
-                .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &empty_members, &.{"this"}, &blk, nm),
+                .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &empty_members, &.{"this"}, &body, nm),
+                .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
             };
             try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             // A member-extension property's accessor body has its
@@ -2628,7 +2699,7 @@ fn buildModuleWithOverrides(
             // `val R.x by expr`: no accessor bodies — the delegate object
             // (produced once by this thunk, cached per property) serves
             // reads and writes through its getValue/setValue.
-            const nm = try std.fmt.allocPrint(a, "__ext_prop_delegate_{s}_{s}", .{ recv.name.name, p.name.name });
+            const nm = try std.fmt.allocPrint(a, "__ext_prop_delegate_{s}_{s}", .{ recv_name, p.name.name });
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
             try extension_prop_delegates.put(.{ .a = recv_key, .b = p.name.name }, fid);
         }
@@ -2636,7 +2707,7 @@ fn buildModuleWithOverrides(
             const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
             var recv_members = StringSet.init(a);
             defer recv_members.deinit();
-            if (classes.get(recv.name.name)) |rdef| {
+            if (classes.get(recv_name)) |rdef| {
                 const rg = rdef.borrow();
                 for (rg.get().primary_params) |*pp| try recv_members.put(pp.name, {});
                 for (rg.get().body_properties) |*pp| try recv_members.put(pp.name, {});
@@ -2645,7 +2716,7 @@ fn buildModuleWithOverrides(
             // A `var X.Companion.x` setter's bare-name writes target the
             // companion's own members; fold them in so they lower as `this`
             // field writes rather than top-level bindings.
-            if (companion_singletons.get(recv.name.name)) |comp_name| {
+            if (companion_singletons.get(recv_name)) |comp_name| {
                 if (classes.get(comp_name)) |cdef| {
                     const cgm = cdef.borrow();
                     for (cgm.get().primary_params) |*pp| try recv_members.put(pp.name, {});
@@ -2653,10 +2724,10 @@ fn buildModuleWithOverrides(
                     cgm.deinit();
                 }
             }
-            const nm = try std.fmt.allocPrint(a, "__ext_set_{s}_{s}", .{ recv.name.name, p.name.name });
+            const nm = try std.fmt.allocPrint(a, "__ext_set_{s}_{s}", .{ recv_name, p.name.name });
             const fid = switch (setter.body) {
-                .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv.name.name, &recv_members, &.{ "this", setter_param_name }, &body, nm),
-                .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv.name.name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),
+                .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &body, nm),
+                .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),
             };
             try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             if (epd.owner) |owner| {
