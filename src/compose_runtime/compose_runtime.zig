@@ -43,6 +43,9 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.runtime.__compose_nextStateId", nextStateId);
     try b.register("androidx.compose.runtime.__compose_monotonicNanos", monotonicNanos);
     try b.register("androidx.compose.runtime.__compose_logError", logError);
+    // The real androidx.compose.ui engine needs the same identity hash for its
+    // node/coordinator caches; expose it under the ui package's own symbol.
+    try b.register("androidx.compose.ui.internal.__composeui_identityHashCode", identityHashCode);
     return b;
 }
 
@@ -113,7 +116,8 @@ test "hostBindings registers every compose symbol" {
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_nextStateId") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_monotonicNanos") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_logError") != null);
-    try testing.expectEqual(@as(usize, 4), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.internal.__composeui_identityHashCode") != null);
+    try testing.expectEqual(@as(usize, 5), b.len());
 }
 
 test "nextStateId is strictly increasing" {
