@@ -952,22 +952,29 @@ fn skiaLibsPresent(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     return true;
 }
 
-/// Locate the X11 headers + shared library for the Skia shim's windowing backend.
-/// Checks the standard system location, then a linuxbrew prefix. Returns the
-/// include dir + a full path to libX11 (linked directly, so no dev `.so` symlink
-/// is required), or null when X11 is unavailable (then windowing is disabled).
-fn detectX11(b: *std.Build) ?struct { inc: []const u8, lib: []const u8 } {
+/// Locate the SDL2 headers + shared library for the Skia shim's windowing backend.
+/// Checks the standard system locations, then a linuxbrew prefix. Returns the SDL2
+/// include dir (so the shim's `#include <SDL.h>` resolves) + a full path to libSDL2
+/// (linked directly, so no dev `.so` symlink is required), or null when SDL2 is
+/// unavailable (then windowing is disabled and the pack renders headless). SDL2
+/// picks X11 or Wayland at runtime, so this one backend covers the Linux matrix.
+fn detectSdl(b: *std.Build) ?struct { inc: []const u8, lib: []const u8 } {
     const io = b.graph.io;
-    const inc_candidates = [_][]const u8{ "/usr/include", "/home/linuxbrew/.linuxbrew/include" };
+    const inc_candidates = [_][]const u8{
+        "/usr/include/SDL2",
+        "/usr/local/include/SDL2",
+        "/home/linuxbrew/.linuxbrew/include/SDL2",
+    };
     const lib_candidates = [_][]const u8{
-        "/usr/lib/x86_64-linux-gnu/libX11.so.6",
-        "/usr/lib/aarch64-linux-gnu/libX11.so.6",
-        "/home/linuxbrew/.linuxbrew/lib/libX11.so.6",
-        "/usr/lib/libX11.so.6",
+        "/usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0",
+        "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0",
+        "/usr/local/lib/libSDL2-2.0.so.0",
+        "/home/linuxbrew/.linuxbrew/lib/libSDL2-2.0.so.0",
+        "/usr/lib/libSDL2-2.0.so.0",
     };
     var inc: ?[]const u8 = null;
     for (inc_candidates) |c| {
-        if (b.build_root.handle.access(io, b.fmt("{s}/X11/Xlib.h", .{c}), .{})) |_| {
+        if (b.build_root.handle.access(io, b.fmt("{s}/SDL.h", .{c}), .{})) |_| {
             inc = c;
             break;
         } else |_| {}
@@ -1079,17 +1086,19 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     }
     if (group) run.addArg("-Wl,--end-group");
 
-    // X11 windowing backend (the shim's on-screen surface). Compiled in only when
-    // the X11 headers + lib are found; otherwise the window functions are stubs
+    // SDL2 windowing backend (the shim's on-screen surface). Compiled in only when
+    // the SDL2 headers + lib are found; otherwise the window functions are stubs
     // and the pack falls back to headless rendering.
     if (os == .linux) {
-        if (detectX11(b)) |x| {
-            run.addArgs(&.{ "-DKLIO_X11", b.fmt("-I{s}", .{x.inc}), x.lib });
+        if (detectSdl(b)) |sdl| {
+            run.addArgs(&.{ "-DKLIO_SDL", b.fmt("-I{s}", .{sdl.inc}), sdl.lib });
+        } else {
+            std.log.warn("SDL2 not found; the Compose-UI window backend is disabled (headless render only). Install libsdl2-dev.", .{});
         }
-        // Optional Ganesh+EGL GPU surface. The ganesh archive is already in the
-        // link group above; this just enables the code path + links the GL/EGL
-        // runtime (the ganesh objects also reference glX, so libGL is needed too).
-        // On a software GL stack it renders correctly with no speedup (opt-in).
+        // Optional Ganesh+GL GPU surface. The ganesh archive is already in the link
+        // group above; this enables the code path + links the GL/EGL runtime (the
+        // ganesh objects also reference glX, so libGL is needed too). The on-screen
+        // GPU window renders through SDL's GL context; the offscreen path uses EGL.
         // Skipped (raster fallback) if the GL/EGL libs are not found.
         if (want_gpu) {
             if (findVersionedLib(b, "libEGL")) |egl| {

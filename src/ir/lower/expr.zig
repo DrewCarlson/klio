@@ -431,7 +431,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .InstanceOf = .{
                 .dst = dst,
                 .src = s,
-                .ty = .{ .name = loweredTypeName(b, &ck.ty), .nullable = ck.ty.nullable, .args = &.{} },
+                .ty = .{ .name = loweredCheckTypeName(b, &ck.ty), .nullable = ck.ty.nullable, .args = &.{} },
             } });
             if (ck.negated) {
                 const neg = b.allocReg();
@@ -446,7 +446,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .Cast = .{
                 .dst = dst,
                 .src = s,
-                .ty = .{ .name = loweredTypeName(b, &cast.ty), .nullable = cast.ty.nullable, .args = &.{} },
+                .ty = .{ .name = loweredCheckTypeName(b, &cast.ty), .nullable = cast.ty.nullable, .args = &.{} },
                 .safe = cast.safe,
             } });
             return dst;
@@ -1058,6 +1058,28 @@ pub fn loweredTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
         }
+    }
+    return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
+}
+
+/// Type name for an `is` / `as` check. Like `loweredTypeName`, but a
+/// package-qualified reference (`b.Shape`) keeps its dotted path (normalised
+/// to the class FQN when it resolves) instead of being stripped to the simple
+/// name, so the runtime hierarchy walk can compare class identity and reject a
+/// same-simple-name class from another package. A nested-class path
+/// (`Outer.Inner`) still maps to its lifted/mangled name.
+pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
+    if (ty.qualified_path) |qp| {
+        if (lastTwoSegments(qp)) |key| {
+            if (b.module.registry.mangled_nested.get(key)) |m| return m;
+        }
+        // Normalise to the canonical FQN when the dotted path resolves to a
+        // registered class; otherwise carry the dotted path through so the
+        // runtime resolves (or strips) it once every class is registered.
+        if (b.module.classIdByFqn(qp)) |cid| {
+            if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].fqn;
+        }
+        return qp;
     }
     return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
 }

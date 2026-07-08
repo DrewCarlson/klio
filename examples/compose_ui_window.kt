@@ -1,4 +1,4 @@
-// A live windowed Compose UI app, rendered by Skia into a real (X11) window. A
+// A live windowed Compose UI app, rendered by Skia into a real (SDL) window. A
 // clickable counter Button: clicking it writes state, recomposes, and redraws —
 // the full input -> state -> recompose -> draw loop, on screen. Run with the Skia
 // library available (LD_LIBRARY_PATH=zig-out/lib) on a machine with a display;

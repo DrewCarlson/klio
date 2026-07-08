@@ -8,6 +8,7 @@
 // Colors are 0xAARRGGBB (Compose's packed ARGB). Coordinates are pixels.
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -43,10 +44,12 @@
 // GPU-backed surface; otherwise it returns null and callers fall back to raster.
 #if defined(KLIO_GPU)
 #include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrContextOptions.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "include/gpu/ganesh/gl/GrGLAssembleInterface.h"
+#include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
 #include "include/gpu/ganesh/gl/GrGLDirectContext.h"
 #include "include/gpu/ganesh/gl/GrGLInterface.h"
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
@@ -396,7 +399,10 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 // ---------------------------------------------------------------------------
 // Windowing — a live on-screen surface + input event loop, one backend per OS
 // behind the same C ABI (open / surface / present / poll / close):
-//   X11    (-DKLIO_X11)   — verified; raster (N32 premul == X BGRX) via XPutImage.
+//   SDL    (-DKLIO_SDL)   — Linux (and any SDL2 platform); raster (N32 premul ==
+//                           SDL ARGB8888) uploaded to a streaming texture. SDL
+//                           picks X11 or Wayland at runtime, so one backend covers
+//                           the broad Linux desktop matrix.
 //   Win32  (_WIN32)       — StretchDIBits blit; written, not run-verified here.
 //   Cocoa  (-DKLIO_COCOA) — CALayer contents from a CGImage; written as
 //                           Objective-C++, not compiled/run-verified here.
@@ -404,145 +410,316 @@ void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
 // headless rendering.
 // ---------------------------------------------------------------------------
 
-#if defined(KLIO_X11)
+#if defined(KLIO_SDL)
 
-#include <sys/select.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
+// The shim is a shared library with no main(); tell SDL not to redefine main.
+#define SDL_MAIN_HANDLED
+#include <SDL.h>
 
 struct KlioWindow {
-    Display* dpy;
-    Window win;
-    GC gc;
-    Atom wmDelete;
-    int w;
-    int h;
-    KlioSurface* surface;
+    SDL_Window* win = nullptr;
+    SDL_Renderer* renderer = nullptr;  // raster present path (null in GPU mode)
+    SDL_Texture* tex = nullptr;        // raster present path
+    KlioSurface* surface = nullptr;
+    int w = 0;
+    int h = 0;
+#if defined(KLIO_GPU)
+    SDL_GLContext gl = nullptr;
+    sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
+    bool gpu = false;
+#endif
 };
+
+extern "C" void klio_win_close(KlioWindow* kw);  // used by the open error paths
+
+namespace {
+
+// (Re)create the raster surface + streaming texture at w x h. Called on open and
+// on every window resize so present always blits at the current window size.
+bool klioSdlSizeRaster(KlioWindow* kw, int w, int h) {
+    if (kw->surface) {
+        klio_skia_free(kw->surface);
+        kw->surface = nullptr;
+    }
+    if (kw->tex) {
+        SDL_DestroyTexture(kw->tex);
+        kw->tex = nullptr;
+    }
+    kw->surface = klio_skia_new(w, h);
+    if (!kw->surface) return false;
+    kw->tex = SDL_CreateTexture(kw->renderer, SDL_PIXELFORMAT_ARGB8888,
+                                SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (!kw->tex) return false;
+    SDL_SetTextureBlendMode(kw->tex, SDL_BLENDMODE_NONE);
+    kw->w = w;
+    kw->h = h;
+    return true;
+}
+
+#if defined(KLIO_GPU)
+constexpr unsigned kGlRgba8 = 0x8058;  // GL_RGBA8
+
+// (Re)wrap the window's default GL framebuffer (FBO 0) as a GPU-backed surface at
+// w x h. Called on open and on every resize (the default framebuffer resizes with
+// the window; this just re-wraps it at the new size).
+bool klioSdlSizeGpu(KlioWindow* kw, int w, int h) {
+    if (kw->surface) {
+        klio_skia_free(kw->surface);
+        kw->surface = nullptr;
+    }
+    if (!kw->grContext) return false;
+    GrGLFramebufferInfo fbInfo;
+    fbInfo.fFBOID = 0;
+    fbInfo.fFormat = kGlRgba8;
+    GrBackendRenderTarget rt = GrBackendRenderTargets::MakeGL(w, h, 0, 8, fbInfo);
+    SkSurfaceProps props;
+    auto* s = new KlioSurface();
+    s->surface = SkSurfaces::WrapBackendRenderTarget(
+        kw->grContext.get(), rt, kBottomLeft_GrSurfaceOrigin, kRGBA_8888_SkColorType,
+        nullptr, &props);
+    if (!s->surface) {
+        delete s;
+        return false;
+    }
+    kw->surface = s;
+    kw->w = w;
+    kw->h = h;
+    ensureFonts();
+    return true;
+}
+
+// Try to open an on-screen GPU window: SDL GL context + a Skia GrDirectContext
+// assembled from SDL's GL loader, wrapping the window framebuffer. Returns null on
+// any failure so the caller falls back to the raster renderer.
+KlioWindow* klioSdlOpenGpu(int w, int h, const char* title) {
+    const bool dbg = std::getenv("KLIO_COMPOSE_DEBUG") != nullptr;
+    // Compatibility profile keeps the legacy glGetString(GL_EXTENSIONS) query valid
+    // (a core profile returns null there), which Skia's extension setup can use.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_Window* win = SDL_CreateWindow(
+        title ? title : "klio", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+    if (!win) {
+        if (dbg) std::fprintf(stderr, "[klio-compose] GPU CreateWindow failed: %s\n", SDL_GetError());
+        return nullptr;
+    }
+    SDL_GLContext gl = SDL_GL_CreateContext(win);
+    if (!gl) {
+        if (dbg) std::fprintf(stderr, "[klio-compose] GPU CreateContext failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        return nullptr;
+    }
+    SDL_GL_MakeCurrent(win, gl);
+    SDL_GL_SetSwapInterval(1);
+    if (dbg) {
+        using GetStringFn = const unsigned char* (*)(unsigned);
+        auto glGetString = reinterpret_cast<GetStringFn>(SDL_GL_GetProcAddress("glGetString"));
+        const unsigned char* r = glGetString ? glGetString(0x1F01 /*GL_RENDERER*/) : nullptr;
+        const unsigned char* v = glGetString ? glGetString(0x1F02 /*GL_VERSION*/) : nullptr;
+        std::fprintf(stderr, "[klio-compose] GPU window: GL renderer = %s | version = %s\n",
+                     r ? reinterpret_cast<const char*>(r) : "(unknown)",
+                     v ? reinterpret_cast<const char*>(v) : "(unknown)");
+    }
+    // SDL uses GLX on X11, so the native (GLX) interface resolves the modern
+    // extension-enumeration path correctly. Fall back to assembling from SDL's
+    // loader if the native interface is unavailable.
+    sk_sp<const GrGLInterface> iface = GrGLMakeNativeInterface();
+    if (!iface) {
+        iface = GrGLMakeAssembledGLInterface(
+            nullptr, [](void*, const char name[]) -> GrGLFuncPtr {
+                return reinterpret_cast<GrGLFuncPtr>(SDL_GL_GetProcAddress(name));
+            });
+    }
+    sk_sp<GrDirectContext> ctx = iface ? GrDirectContexts::MakeGL(iface) : nullptr;
+    if (!ctx) {
+        if (dbg) std::fprintf(stderr, "[klio-compose] GPU GrContext failed (iface=%s)\n",
+                              iface ? "ok" : "null");
+        SDL_GL_DeleteContext(gl);
+        SDL_DestroyWindow(win);
+        return nullptr;
+    }
+    auto* kw = new KlioWindow();
+    kw->win = win;
+    kw->gl = gl;
+    kw->grContext = ctx;
+    kw->gpu = true;
+    int dw = w, dh = h;
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    if (!klioSdlSizeGpu(kw, dw, dh)) {
+        if (dbg) std::fprintf(stderr, "[klio-compose] GPU surface wrap failed (%dx%d)\n", dw, dh);
+        klio_win_close(kw);
+        return nullptr;
+    }
+    if (dbg) std::fprintf(stderr, "[klio-compose] GPU window ready (%dx%d)\n", dw, dh);
+    return kw;
+}
+#endif  // KLIO_GPU
+
+// (Re)size to w x h through whichever present path this window uses.
+bool klioSdlSizeTo(KlioWindow* kw, int w, int h) {
+#if defined(KLIO_GPU)
+    if (kw->gpu) return klioSdlSizeGpu(kw, w, h);
+#endif
+    return klioSdlSizeRaster(kw, w, h);
+}
+
+}  // namespace
 
 extern "C" {
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
-    Display* dpy = XOpenDisplay(nullptr);
-    if (!dpy) return nullptr;
-    int screen = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, screen);
-    Window win = XCreateSimpleWindow(dpy, root, 0, 0, static_cast<unsigned>(w),
-                                     static_cast<unsigned>(h), 0,
-                                     BlackPixel(dpy, screen), BlackPixel(dpy, screen));
-    if (title) XStoreName(dpy, win, title);
-    XSelectInput(dpy, win,
-                 ExposureMask | ButtonPressMask | PointerMotionMask | KeyPressMask |
-                     StructureNotifyMask);
-    Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wmDelete, 1);
-    XMapWindow(dpy, win);
-    GC gc = XCreateGC(dpy, win, 0, nullptr);
-    XFlush(dpy);
-
-    auto* kw = new KlioWindow{dpy, win, gc, wmDelete, w, h, nullptr};
-    kw->surface = klio_skia_new(w, h);
-    if (!kw->surface) {
-        XCloseDisplay(dpy);
-        delete kw;
+    SDL_SetMainReady();
+    if (SDL_WasInit(SDL_INIT_VIDEO) == 0 && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+        return nullptr;
+#if defined(KLIO_GPU)
+    // Try an on-screen GPU window (Ganesh over SDL's GL context) first; fall back to
+    // the raster renderer if any GL/Skia bring-up step fails.
+    if (KlioWindow* gpuWin = klioSdlOpenGpu(w, h, title)) {
+        SDL_StartTextInput();
+        return gpuWin;
+    }
+#endif
+    SDL_Window* win = SDL_CreateWindow(title ? title : "klio", SDL_WINDOWPOS_CENTERED,
+                                       SDL_WINDOWPOS_CENTERED, w, h,
+                                       SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    if (!win) return nullptr;
+    // Prefer an accelerated renderer; fall back to software if none is available.
+    SDL_Renderer* r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!r) r = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!r) {
+        SDL_DestroyWindow(win);
         return nullptr;
     }
+    auto* kw = new KlioWindow();
+    kw->win = win;
+    kw->renderer = r;
+    kw->w = w;
+    kw->h = h;
+    if (!klioSdlSizeRaster(kw, w, h)) {
+        klio_win_close(kw);
+        return nullptr;
+    }
+    SDL_StartTextInput();  // deliver typed characters as SDL_TEXTINPUT events
     return kw;
 }
 
 // The surface the caller replays the display list onto before presenting.
 KlioSurface* klio_win_surface(KlioWindow* kw) { return kw ? kw->surface : nullptr; }
 
-// Blit the surface to the window.
+// Upload the raster surface to the texture and present it. N32 premul (BGRA byte
+// order on little-endian) matches SDL_PIXELFORMAT_ARGB8888.
 void klio_win_present(KlioWindow* kw) {
     if (!kw || !kw->surface) return;
+#if defined(KLIO_GPU)
+    if (kw->gpu) {
+        if (kw->grContext) kw->grContext->flushAndSubmit(kw->surface->surface.get());
+        SDL_GL_SwapWindow(kw->win);
+        return;
+    }
+#endif
+    if (!kw->tex) return;
     SkPixmap pm;
     if (!kw->surface->surface->peekPixels(&pm)) return;
-    Visual* visual = DefaultVisual(kw->dpy, DefaultScreen(kw->dpy));
-    XImage* img = XCreateImage(kw->dpy, visual, 24, ZPixmap, 0,
-                               const_cast<char*>(static_cast<const char*>(pm.addr())),
-                               static_cast<unsigned>(kw->w), static_cast<unsigned>(kw->h),
-                               32, static_cast<int>(pm.rowBytes()));
-    if (!img) return;
-    XPutImage(kw->dpy, kw->win, kw->gc, img, 0, 0, 0, 0,
-              static_cast<unsigned>(kw->w), static_cast<unsigned>(kw->h));
-    img->data = nullptr;  // Skia owns the pixels; don't let XDestroyImage free them.
-    XDestroyImage(img);
-    XFlush(kw->dpy);
+    SDL_UpdateTexture(kw->tex, nullptr, pm.addr(), static_cast<int>(pm.rowBytes()));
+    SDL_RenderClear(kw->renderer);
+    SDL_RenderCopy(kw->renderer, kw->tex, nullptr, nullptr);
+    SDL_RenderPresent(kw->renderer);
 }
 
-// Wait up to timeoutMs for one event. Returns an event type and writes two
-// type-dependent values into *outA/*outB:
+// Wait up to timeoutMs for one event (poll when timeoutMs <= 0, so the caller can
+// drain a backlog non-blocking). Returns an event type and writes two type-
+// dependent values into *outA/*outB:
 //   0 none/redraw
 //   1 click     — outA=x, outB=y
 //   2 close
-//   3 key       — outA=char (ASCII, 0 if non-printable), outB=keysym
+//   3 key       — outA=char (ASCII, 0 if non-printable), outB=keysym (X11-style)
 //   4 move      — outA=x, outB=y (pointer position)
 //   5 resize    — outA=width, outB=height (the surface is recreated to match)
 int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     if (!kw) return 2;
-    if (!XPending(kw->dpy)) {
-        int fd = ConnectionNumber(kw->dpy);
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-        struct timeval tv;
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
-        select(fd + 1, &fds, nullptr, nullptr, &tv);
-        if (!XPending(kw->dpy)) return 0;
-    }
-    XEvent ev;
-    XNextEvent(kw->dpy, &ev);
+    SDL_Event ev;
+    const int got = (timeoutMs > 0) ? SDL_WaitEventTimeout(&ev, timeoutMs)
+                                    : SDL_PollEvent(&ev);
+    if (!got) return 0;
     switch (ev.type) {
-        case ButtonPress:
-            if (outA) *outA = ev.xbutton.x;
-            if (outB) *outB = ev.xbutton.y;
+        case SDL_QUIT:
+            return 2;
+        case SDL_WINDOWEVENT:
+            if (ev.window.event == SDL_WINDOWEVENT_CLOSE) return 2;
+            if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                const int nw = ev.window.data1;
+                const int nh = ev.window.data2;
+                if (nw > 0 && nh > 0 && (nw != kw->w || nh != kw->h)) {
+                    klioSdlSizeTo(kw, nw, nh);
+                    if (outA) *outA = nw;
+                    if (outB) *outB = nh;
+                    return 5;
+                }
+            }
+            return 0;  // Exposed / focus / etc. — the caller re-presents each loop.
+        case SDL_MOUSEBUTTONDOWN:
+            if (ev.button.button != SDL_BUTTON_LEFT) return 0;
+            if (outA) *outA = ev.button.x;
+            if (outB) *outB = ev.button.y;
             return 1;
-        case ClientMessage:
-            if (static_cast<Atom>(ev.xclient.data.l[0]) == kw->wmDelete) return 2;
-            return 0;
-        case KeyPress: {
-            char buf[8];
-            KeySym ks = 0;
-            int n = XLookupString(&ev.xkey, buf, sizeof(buf), &ks, nullptr);
-            if (outA) *outA = (n > 0) ? static_cast<unsigned char>(buf[0]) : 0;
-            if (outB) *outB = static_cast<int>(ks);
+        case SDL_MOUSEMOTION:
+            if (outA) *outA = ev.motion.x;
+            if (outB) *outB = ev.motion.y;
+            return 4;
+        case SDL_TEXTINPUT: {
+            // A typed printable character (honours shift/layout). Non-ASCII bytes
+            // are ignored for now (the interim ui-core is ASCII-only).
+            const unsigned char c = static_cast<unsigned char>(ev.text.text[0]);
+            if (c < 32 || c > 126) return 0;
+            if (outA) *outA = c;
+            if (outB) *outB = 0;
             return 3;
         }
-        case MotionNotify:
-            if (outA) *outA = ev.xmotion.x;
-            if (outB) *outB = ev.xmotion.y;
-            return 4;
-        case ConfigureNotify: {
-            const int nw = ev.xconfigure.width;
-            const int nh = ev.xconfigure.height;
-            if ((nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
-                // The surface is sized to the window; recreate it to match so the
-                // next present blits at the new size.
-                if (kw->surface) klio_skia_free(kw->surface);
-                kw->surface = klio_skia_new(nw, nh);
-                kw->w = nw;
-                kw->h = nh;
-                if (outA) *outA = nw;
-                if (outB) *outB = nh;
-                return 5;
+        case SDL_KEYDOWN: {
+            // Only the editing keys the ui-core handles; printable characters
+            // arrive via SDL_TEXTINPUT, so ignore their key-down to avoid doubling.
+            // Report X11-style keysyms so the pack's key handling stays unchanged.
+            int ch = 0;
+            int keysym = 0;
+            switch (ev.key.keysym.sym) {
+                case SDLK_BACKSPACE: ch = 8; keysym = 0xff08; break;
+                case SDLK_DELETE:    ch = 0; keysym = 0xffff; break;
+                default: return 0;
             }
-            return 0;
+            if (outA) *outA = ch;
+            if (outB) *outB = keysym;
+            return 3;
         }
         default:
-            return 0;  // Expose etc. — the caller re-presents each loop.
+            return 0;
     }
 }
 
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
     if (kw->surface) klio_skia_free(kw->surface);
-    XFreeGC(kw->dpy, kw->gc);
-    XDestroyWindow(kw->dpy, kw->win);
-    XCloseDisplay(kw->dpy);
+#if defined(KLIO_GPU)
+    if (kw->gpu) {
+        // Release GPU resources (surface freed above) before the GL context.
+        kw->grContext.reset();
+        if (kw->gl) SDL_GL_DeleteContext(kw->gl);
+        if (kw->win) SDL_DestroyWindow(kw->win);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        delete kw;
+        return;
+    }
+#endif
+    if (kw->tex) SDL_DestroyTexture(kw->tex);
+    if (kw->renderer) SDL_DestroyRenderer(kw->renderer);
+    if (kw->win) SDL_DestroyWindow(kw->win);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
     delete kw;
 }
 

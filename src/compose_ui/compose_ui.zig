@@ -88,8 +88,12 @@ const Skia = struct {
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
     winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
     winClose: *const fn (?*SkWindow) callconv(.c) void,
-    winSetResizeCb: *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void,
+    /// Optional: only the native live-resize backends (Cocoa) export this. A
+    /// backend that reports resizes purely through `winPoll` (SDL) leaves it null.
+    winSetResizeCb: ?ResizeCbFn,
 };
+
+const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -137,7 +141,8 @@ fn loadSkia() ?*Skia {
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
-        .winSetResizeCb = F.get(&lib, "winSetResizeCb", "klio_win_set_resize_cb") orelse return skiaLoadFail(&lib),
+        // Optional native-live-resize hook (Cocoa only); absent on SDL builds.
+        .winSetResizeCb = lib.lookup(ResizeCbFn, "klio_win_set_resize_cb"),
     };
     skia_state = s;
     return &skia_state.?;
@@ -330,6 +335,10 @@ fn winRender(ctx: *CallCtx) Error!EvalResult {
     const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
     const dg = ctx.args[1].String.borrow();
     defer dg.deinit();
+    // Clear to opaque black before replaying so frames don't accumulate on the
+    // persistent window surface (the display list draws the UI on top, and a
+    // double-buffered GPU swapchain would otherwise show a stale back buffer).
+    skia.clear(surface, 0xFF000000);
     replay(skia, surface, dg.get().bytes);
     skia.winPresent(win);
     rssLog();
@@ -367,15 +376,17 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
     // stays valid on the stack for the whole `skia.winPoll` call, and the callback
     // is a live argument so the VM keeps it rooted.
     var rc: ResizeCb = undefined;
-    const has_cb = ctx.args.len >= 3 and ctx.args[2] != .Null;
+    // The live-resize callback only fires on backends that export the hook
+    // (Cocoa). SDL reports resizes through winPoll's event code, so skip it there.
+    const has_cb = ctx.args.len >= 3 and ctx.args[2] != .Null and skia.winSetResizeCb != null;
     if (has_cb) {
         rc = .{ .host = ctx.host, .callback = ctx.args[2], .out = ctx.out };
-        skia.winSetResizeCb(win, resizeTrampoline, &rc);
+        skia.winSetResizeCb.?(win, resizeTrampoline, &rc);
     }
     var x: c_int = 0;
     var y: c_int = 0;
     const t = skia.winPoll(win, timeout, &x, &y);
-    if (has_cb) skia.winSetResizeCb(win, null, null);
+    if (has_cb) skia.winSetResizeCb.?(win, null, null);
     const packed_ev: i64 = (@as(i64, t) << 32) |
         (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
         @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));

@@ -261,6 +261,44 @@ pub fn runtimeHead(v: *const Value) []const u8 {
     };
 }
 
+/// The dotted path a parameter type carried when written qualified
+/// (`x: a.Box` lowers a `#qual:a.Box` marker arg), or null for an unqualified
+/// parameter type.
+fn qualifiedMarker(ty: *const TypeRef) ?[]const u8 {
+    for (ty.args) |*a| {
+        if (std.mem.startsWith(u8, a.name, "#qual:")) return a.name["#qual:".len..];
+    }
+    return null;
+}
+
+/// Whether a `param_ty` written qualified to a specific class and the runtime
+/// value `v` provably denote DIFFERENT registered classes that merely share a
+/// simple name — a cross-package collision. Lets the exact-name overload tier
+/// reject the wrong-package candidate so the identity-matching sibling wins.
+/// Definite-only: false unless the param's qualified target AND the arg's class
+/// both resolve to registered classes with different FQNs, so an unqualified
+/// param, a builtin, or an unregistered/anonymous arg never conflicts.
+pub fn crossPackageIdentityConflict(self: *VmHost, param_ty: *const TypeRef, v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const target_path = qualifiedMarker(param_ty) orelse return false;
+    const arg_fqn = blk: {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        // `fqn` is an immutable arena slice; it outlives the borrow lock.
+        break :blk cg.get().fqn;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    const target_cid = m.classIdByFqn(target_path) orelse return false;
+    if (target_cid.int() >= m.classes.items.len) return false;
+    const arg_cid = m.classIdByFqn(arg_fqn) orelse return false;
+    if (arg_cid.int() >= m.classes.items.len) return false;
+    return !std.mem.eql(u8, m.classes.items[target_cid.int()].fqn, m.classes.items[arg_cid.int()].fqn);
+}
+
 /// Does the declared head accept this runtime head through the builtin
 /// supertype table (`List` value for an `Iterable` parameter, `String`
 /// for `CharSequence`, …)?
