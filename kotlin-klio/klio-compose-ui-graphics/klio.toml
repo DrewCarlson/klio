@@ -22,6 +22,12 @@ include = [
     "androidx/compose/ui/graphics/Color.kt",
     "androidx/compose/ui/graphics/Float16.kt",
     "androidx/compose/ui/graphics/InlineClassHelper.kt",
+    # The pure-Kotlin Path surface (klioMain supplies the actual command buffer).
+    "androidx/compose/ui/graphics/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/ui/graphics/Path.kt",
+    "androidx/compose/ui/graphics/PathIterator.kt",
+    "androidx/compose/ui/graphics/PathSegment.kt",
+    "androidx/compose/ui/graphics/Matrix.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
