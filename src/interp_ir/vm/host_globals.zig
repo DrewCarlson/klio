@@ -848,7 +848,15 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     if (ctor_ref and !is_object) break :blk null;
                     const mg = self.module.borrow();
                     defer mg.deinit();
-                    if (mg.get().registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
+                    const m = mg.get();
+                    // `companion_singletons` is keyed by SIMPLE class name, so a
+                    // different class of the same simple name (e.g. a nested
+                    // value class in another pack sharing a top-level enum's
+                    // name) would otherwise hijack this resolution — routing the
+                    // enum to the other class's companion. Only forward to the
+                    // companion when THIS class (cid) actually declares one.
+                    if (!is_object and m.classIdNestedIn(cid, "Companion") == null) break :blk null;
+                    if (m.registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
                     if (is_object) break :blk cls_name;
                     break :blk null;
                 };
