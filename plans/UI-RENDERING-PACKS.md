@@ -250,11 +250,45 @@ Remaining:
 Minor/known: a little scale/hitch during a fast drag (nextDrawable blocks on vsync per
 resize step) — acceptable.
 
-**Perf/memory review (current focus, before the API surface).** Goals: (a) klio's
-baseline startup RSS with no compose/native resources, as low as possible; (b) compose
-UI + Skia memory footprint; (c) the resize leak (item 7); (d) CPU during idle and during
-activity, both the Skia/present side and the compose/Kotlin loop. Debug affordance:
-`KLIO_SKIA_DUMP=path` reads the first GPU frame back to a PNG.
+**Perf/memory review — FINDINGS (2026-07-08, macOS arm64, peak RSS via `/usr/bin/time -l`).**
+
+| Scenario | Debug | ReleaseFast |
+|---|---|---|
+| trivial `println` (klio baseline) | 44 MB | 38 MB |
+| recursion depth 1000 / 3000 / 6000 | — | 45 / 75 / 84 MB |
+| compose PNG (offscreen raster) | 156 MB | 150 MB |
+| Skia-only (3 draw ops, no compose) | — | 150 MB |
+| compose window (Metal) | 171 MB | 161 MB |
+
+What the numbers mean:
+- **Idle CPU ~0.3%** (dirty-frame loop) — already good; no action.
+- **Baseline ~38 MB** = eagerly-loaded stdlib image (~15 MB on disk) + interpreter
+  structures. Reducing needs lazy stdlib loading (big change).
+- **Compose +112 MB is entirely Skia** — Skia-only (no compose recompose) is also 150 MB.
+  It is NOT malloc (heap ~11 MB), NOT CoreText system-font enumeration (an empty
+  `CTFontCollection` moved it 0 MB), NOT compose recursion, NOT the JIT. It is Skia's
+  resident macOS framework working set (CoreGraphics/CoreText/ColorSync/ImageIO for
+  raster; + the Metal/AGX driver stack for the window). The `libklio_skia.dylib` itself is
+  only ~2.5 MB resident. Largely a fixed cost of the full prebuilt Skia; reducing it needs
+  a slimmer custom Skia build.
+- **Interpreter native stack ~15 KB/call (Release), ~42 KB/call (Debug)** — high for a
+  tree-walker; RSS scales with recursion depth. Not deep enough in compose to dominate its
+  memory, but a general CPU+memory cost. Reducing needs shrinking the hot frames
+  (`execInst` giant switch, `runFrameInner`, the by-value `Frame`).
+- **Debug vs Release ≈ 2x memory + large CPU gap.** Default `zig build` is Debug; perf
+  work must use `-Doptimize=ReleaseFast`. Biggest zero-code lever today.
+- **Resize "leak" (RSS climbs, partial reclaim)** — consistent with the interpreter stack
+  high-water mark: deep recompose during a drag touches big-stack pages that the mmap never
+  decommits (malloc frees on reclaim, resident stack stays). Not an unbounded leak. Fixable
+  by trimming the stack (madvise `MADV_FREE` the unused region at `eval_depth==0`) or by
+  reducing per-call frame size.
+
+Prioritized optimization backlog (highest impact first): (E) slim Skia build — biggest
+compose-memory win, heavy; (D) lazy stdlib load — biggest baseline win, big change;
+(C) shrink evaluator per-call frame — general CPU+memory, moderate/risky; (B) stack
+water-mark trim — targets the resize "leak", moderate; (F) drop the per-frame display-list
+string serialize+parse round-trip — compose activity CPU, moderate. Zero-code: ship
+ReleaseFast, not Debug. Debug affordance: `KLIO_SKIA_DUMP=path` dumps the first GPU frame.
 
 **Sequencing recommendation:** macOS hardening (items 1–3, done — the contract is locked)
 → this perf/memory pass → the Compose desktop API surface (real `compose.ui.graphics` on
