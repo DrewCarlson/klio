@@ -452,7 +452,8 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winRender") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winPoll") != null);
     try testing.expect(b.resolve("klio.compose.ui.__composeui_winClose") != null);
-    try testing.expectEqual(@as(usize, 6), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_path_op") != null);
+    try testing.expectEqual(@as(usize, 7), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {
