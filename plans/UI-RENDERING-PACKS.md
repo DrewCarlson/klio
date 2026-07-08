@@ -9,6 +9,12 @@ CompositionLocal, `derivedStateOf`, the async Recomposer + frame clock,
 `snapshotFlow`/`collectAsState`, `@Composable` content lambdas) is functional and
 green. This plan covers what renders UI on top of it.
 
+The common-vs-desktop-vs-mobile source-set layering these packs target — vendor
+upstream `androidx.compose.*` common verbatim, supply klio's Skia backend as the
+desktop actual, so klio is a drop-in for desktop Compose Multiplatform code — is
+specified in [MULTIPLATFORM.md](MULTIPLATFORM.md) §3. Desktop is the only live
+target today.
+
 ## Done (recap)
 
 - **N1 node emission** — `Applier<N>`/`AbstractApplier`, composer node ops
