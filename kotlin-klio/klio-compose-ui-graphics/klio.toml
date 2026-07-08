@@ -37,6 +37,9 @@ include = [
     "androidx/compose/ui/graphics/PathEffect.kt",
     "androidx/compose/ui/graphics/ImageBitmap.kt",
     "androidx/compose/ui/graphics/PixelMap.kt",
+    # The Canvas surface (klioMain supplies the actual over the Skia shim).
+    "androidx/compose/ui/graphics/Canvas.kt",
+    "androidx/compose/ui/graphics/Vertices.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
@@ -75,6 +78,10 @@ id = "stdlib"
 id = "androidx.compose.runtime"
 [[deps]]
 id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.compose.ui.geometry"
+[[deps]]
+id = "androidx.compose.ui.unit"
 # Connector.kt uses androidx.collection.mutableIntObjectMapOf for its
 # colorspace-connection cache.
 [[deps]]
