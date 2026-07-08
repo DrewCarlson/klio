@@ -26,11 +26,15 @@ fun main() {
             Size(70f, 60f),
             cornerRadius = CornerRadius(12f),
         )
-        val star = Path().apply {
-            moveTo(100f, 110f); lineTo(120f, 150f); lineTo(75f, 125f)
-            lineTo(125f, 125f); lineTo(80f, 150f); close()
+        // A transform block: rotate wraps the draw in withTransform (a
+        // two-lambda inline fn whose transform block runs on the DrawTransform).
+        rotate(degrees = 12f, pivot = Offset(100f, 130f)) {
+            val star = Path().apply {
+                moveTo(100f, 110f); lineTo(120f, 150f); lineTo(75f, 125f)
+                lineTo(125f, 125f); lineTo(80f, 150f); close()
+            }
+            drawPath(star, Color.Yellow)
         }
-        drawPath(star, Color.Yellow)
         drawLine(Color.White, Offset(10f, 150f), Offset(190f, 150f), strokeWidth = 3f)
     }
     println("drawscope drew=$drew")

@@ -55,16 +55,32 @@ with a minimal repro + green suites): identity-based inherited-method dispatch
 (name-collision), inherited companion `const`/`fun` resolution (qualified + in
 ctor-delegation), identity-aware `is`/subtype/overload across package name
 collisions, and interface-inherited member-extensions via a `with` receiver (the
-`Density.toPx()` unblocker). See the git history and the
-`compose-graphics-color-vendored` memory for specifics.
+`Density.toPx()` unblocker). The graphics/DrawScope layer drove more: a class ctor
+beating a same-named defaulted factory on one positional arg (`CornerRadius(8f)`);
+companion members in primary-ctor default values (`Stroke(width = …)`); named-call
+member-overload scoring (`drawRoundRect(Color, …, cornerRadius = X)` bound the
+brush overload); a package-qualified `object` reference resolving to the class not
+the singleton (`…drawscope.Fill`); and a receiver-lambda argument that is not the
+trailing arg of a multi-arg call losing its receiver context (`withTransform`'s
+transform block → `DrawScope.rotate`/`scale`/`clipRect` stack overflow), fixed by
+recording each lambda argument's expected arity by span at the call-lowering entry.
+See git history and the `klio-compose-graphics-stack` memory for specifics.
 
 ## Next work
 
-### 1. Skia-backed `compose.ui.graphics` (the current frontier)
+### 1. Skia-backed `compose.ui.graphics` — DONE
 
-The pure-Kotlin graphics is done, and the Skia-backed drawing API is landing as
-**klioMain actuals over the `src/compose_ui` shim** in the order `Path` → `Paint`
-→ `Canvas` → `DrawScope`:
+The full drawing API is vendored as klioMain actuals over the `src/compose_ui`
+shim: `Path` → `Paint` → `Canvas` → `DrawScope` → `Shape`/`Outline` → `Brush`.
+A real upstream `DrawScope` block rasterizes to a PNG through `KlioCanvas`
+(`klioRenderToPng`): rect/circle/roundRect/oval/path/line/arc, fill + stroke,
+`clipRect`/`clipPath`, the `rotate`/`scale`/`translate`/`clipRect`/`withTransform`
+transform helpers, `Shape.createOutline`, `SolidColor` + **linear/radial gradient
+brushes** (real `SkShaders` via the `__skia_c_set_shader` intrinsic). Deferred:
+sweep/image/composite shaders, `ImageBitmap`, colourspace conversion. Examples:
+`compose_{canvas,drawscope,shape,brush,gradient}.kt`.
+
+The earlier per-`Path`/`Paint` notes are folded into the above.
 
 - **`Path` — done.** A pure-Kotlin command buffer (`KlioPath`): build ops,
   `getBounds`, `isEmpty`/`isConvex`, `translate`, `addPath`, `PathIterator`; higher-
@@ -84,11 +100,26 @@ The pure-Kotlin graphics is done, and the Skia-backed drawing API is landing as
   the deferred shader/filter/bitmap actuals. `Shape`/`Outline` sit just above
   (`Outline.Generic` needs `Path`), unblocking `RoundedCornerShape` etc.
 
-### 2. Real `androidx.compose.ui` engine
+### 2. Real `androidx.compose.ui` engine — the current frontier
 
-The ~240-file engine: `LayoutNode`, the `Modifier.Node` chain, measure/layout/draw,
-`Constraints`/`Placeable`, pointer input, focus, semantics. Vendor incrementally
-on top of the graphics layer; the klio-authored ui-core documents the shapes the
+The ~240-file engine (sparse-checkout expanded: `compose/ui/ui/src/commonMain`):
+`LayoutNode`, the `Modifier.Node` chain, measure/layout/draw, `Constraints`
+(already in the unit pack) / `Placeable`, pointer input, focus, semantics. 81
+`expect` decls across 38 files need klio actuals — most are platform primitives
+(`Synchronization`, `AtomicReference`/`AtomicInt`, `IdentityHashCode`,
+`WeakReference`, `SortedSet` — trivial single-threaded actuals); the rest are
+integrations (pointer/key input → SDL, clipboard, text input, popup/dialog) that
+can start stubbed.
+
+**Render integration is settled and small**: `NodeCoordinator.draw(canvas:
+Canvas, …)` draws through the exact `androidx.compose.ui.graphics.Canvas` already
+vendored — `KlioCanvas` is its actual. So the path is `Owner.measureAndLayout →
+root LayoutNode → NodeCoordinator.draw(KlioCanvas)` onto a `KlioSurface`. The work
+is: vendor the node + layout packages, provide the platform-primitive actuals, and
+supply a klio `Owner` actual that hosts the root `LayoutNode`, runs the
+measure/layout passes, and draws via the Canvas. Deeply interconnected (even
+`Modifier` references `Modifier.Node` → the node package), so it lands as a
+coherent tier, not tiny slices. The klio-authored ui-core documents the shapes the
 real engine needs and is retired as the real API lands. Converge the public
 entrypoints on upstream (`androidx.compose.ui.window.Window`, `application { }`)
 so desktop Compose programs are source-compatible.
