@@ -8674,6 +8674,50 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
     return true;
 }
 
+/// Score an applicable named-call candidate by summing each argument's type
+/// match against the parameter it binds (positional or by name), mirroring
+/// `memberApplicableForWalkNamed`'s arg→param mapping. Higher is a better fit;
+/// an argument that only weakly matches (or is a wrong-but-not-disproven type
+/// like a `Color` against a `Brush` parameter) contributes less, so the closer
+/// overload wins. Used to break ties among same-named overloads of one class.
+fn scoreNamedMemberCandidate(self: *VmHost, f: *const Func, args: []const Value, arg_names: ?[]const ?[]const u8) i32 {
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    var bound = [_]bool{false} ** 64;
+    if (effective.len > bound.len) return 0;
+    var positional: usize = 0;
+    var total: i32 = 0;
+    for (args, 0..) |*a, i| {
+        const supplied_name: ?[]const u8 = if (arg_names) |ns| (if (i < ns.len) ns[i] else null) else null;
+        var param: ?*const ir.Param = null;
+        if (supplied_name) |nm| {
+            for (effective, 0..) |*p, k| {
+                if (!bound[k] and std.mem.eql(u8, p.name, nm)) {
+                    param = p;
+                    bound[k] = true;
+                    break;
+                }
+            }
+        } else {
+            while (positional < effective.len and bound[positional]) positional += 1;
+            if (positional < effective.len) {
+                param = &effective[positional];
+                bound[positional] = true;
+                positional += 1;
+            }
+        }
+        if (param) |p| {
+            if (p.is_vararg) continue;
+            if (overloadScoreArg(self, &p.ty, a)) |s| {
+                total += s;
+            } else {
+                total -= 1000;
+            }
+        }
+    }
+    return total;
+}
+
 /// Mirrors `memberApplicableForWalk`'s last-param shape test: a declared
 /// function type, a typealias expanding to one, or a bare type parameter.
 fn lastParamIsFunctionShaped(self: *VmHost, p: *const ir.Param) bool {
@@ -8735,6 +8779,14 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
             if (seen.contains(dedup_key)) continue;
             try seen.put(dedup_key, {});
             if (ir_class) |irc| {
+                // Among the applicable same-named overloads declared by THIS
+                // class, pick the best by argument-type score — not merely the
+                // first. Two overloads that differ only in one parameter's type
+                // (`drawRoundRect(color: Color, …)` vs `(brush: Brush, …)`) are
+                // both "applicable" when neither arg is provably wrong-typed, so
+                // taking the first would bind the wrong one and scramble the
+                // trailing defaulted parameters.
+                var best_score: i32 = std.math.minInt(i32);
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
@@ -8746,8 +8798,11 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                             // not definitely mismatch), or Kotlin
                             // resolution moves on to the next tier.
                             if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
-                                method_fid = fid;
-                                break;
+                                const sc = scoreNamedMemberCandidate(self, &f, args, arg_names);
+                                if (method_fid == null or sc > best_score) {
+                                    method_fid = fid;
+                                    best_score = sc;
+                                }
                             }
                         }
                     }

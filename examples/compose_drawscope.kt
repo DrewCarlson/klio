@@ -18,10 +18,12 @@ fun main() {
         drawCircle(Color.Cyan, radius = 40f, center = Offset(60f, 60f))
         // A stroked outline (Stroke's cap defaults to the companion's DefaultCap).
         drawCircle(Color.White, radius = 40f, center = Offset(60f, 60f), style = Stroke(width = 3f))
+        // Positional colour + a named `cornerRadius`: the overloaded
+        // drawRoundRect (color vs brush) must resolve to the colour variant.
         drawRoundRect(
-            color = Color(0xFF2196F3.toInt()),
-            topLeft = Offset(110f, 30f),
-            size = Size(70f, 60f),
+            Color(0xFF2196F3.toInt()),
+            Offset(110f, 30f),
+            Size(70f, 60f),
             cornerRadius = CornerRadius(12f),
         )
         val star = Path().apply {
