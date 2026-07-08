@@ -216,33 +216,52 @@ the Win32 API but not compiled/run-verified — a Windows host is needed, and it
 hit the same which-thread / message-pump question the macOS path did (the fix will
 likely reuse `runOnBigStackMainThread`). X11 (Linux) is verified and unchanged.
 
-**macOS follow-ups — the window "contract" to settle before broadening.** The
-coordinate model, frame/present model, and input set that both the higher Compose
-desktop APIs and the other-platform backends build against are still thin on macOS;
-settle them here once rather than re-doing them per platform:
-1. **HiDPI / Retina** — currently `contentsScale = 1.0`, `drawableSize` in points, so
-   Retina renders at 1x (soft, OS-upscaled). Track `window.backingScaleFactor`, size
-   the drawable in pixels, and scale the Skia canvas so layout stays in points. Fixes
-   the points-vs-pixels contract everything else inherits.
-2. **Frame pacing / run loop** — the loop is VM-driven `nextEventMatchingMask` polling
-   (~10 fps; repaints only when the VM loops; janky live-resize; no occlusion redraw;
-   no vsync). Move to a `CVDisplayLink`/vsync-presented redraw and pump the run loop so
-   the window stays responsive.
-3. **App lifecycle** — a minimal `NSApplicationDelegate` + main menu so Cmd-Q / Cmd-W /
-   activation / dock behave like a real app.
-4. **Live resize + display change** — track `windowDidResize` /
-   `viewDidChangeBackingProperties` (moving between monitors of different scale).
+**macOS window hardening — the "contract" the higher APIs + other backends build on.**
+
+Done:
+1. **HiDPI / Retina — DONE (`df2aac5f`).** The `CAMetalLayer` drawable is sized in
+   physical pixels at `window.backingScaleFactor` (matching `contentsScale`), and the
+   Skia canvas is scaled by that factor in `klio_win_surface`, so the display list draws
+   in points but rasterizes crisply. Input stays in points. Locks the points-vs-pixels
+   contract everything else inherits. Verified 2x on Retina.
+2. **App lifecycle — DONE (`da5aeb46`).** A minimal main menu with Quit (Cmd-Q). Window
+   close is left to the app.
+3. **Realtime live resize + batched input — DONE (`da5aeb46`, `0fd194cd`).** The content
+   view is layer-backed with an autoresizing Metal sublayer (Core Animation scales the
+   last frame during the modal drag), AND a native→VM render callback reflows for real:
+   `winPoll(handle, timeoutMs, onResize)` registers the callback for the call; the shim's
+   `NSWindowDidResizeNotification` observer fires during the drag, resizes the drawable,
+   and invokes it so the interpreter recomposes+redraws at the new size while its loop is
+   blocked (`invokeCallable`, the reentrant path coroutines use). `runApp` now renders
+   only on change (dirty flag) and drains all pending events per iteration before
+   rendering — previously rendering every iteration paced the loop to vsync and delayed
+   input after a resize burst. Verified: realtime reflow, instant clicks with/without
+   resize, lower idle CPU.
+
+Remaining:
+4. **Display change** — `viewDidChangeBackingProperties` (moving between monitors of
+   different scale) not yet handled; backing scale is only re-read on resize.
 5. **Input completeness** — modifiers, key repeat, scroll wheel, right-click; IME later.
 6. **Color management** — tag the surface's color space (sRGB / display P3) rather than
    DeviceRGB.
+7. **Resize memory** — a partial leak during live resize (RSS climbs ~200 MB, reclaims
+   only to ~180 MB, not baseline). Under investigation in the perf/memory review below.
 
-**Sequencing recommendation:** the small macOS hardening pass (items 1–3 lock the
-contract) → then the Compose desktop API surface (real `compose.ui.graphics` on the
-shim → `compose.ui` engine → foundation → material3; platform-agnostic, inherits the
-contract) → then broaden/verify the other platform backends (Win32; keep X11), each
-just implementing the same window contract. Not the reverse: broadening platforms first
-copies an unfinished contract 2–3×, and jumping to the API layer before HiDPI bakes a
-1x coordinate assumption into it.
+Minor/known: a little scale/hitch during a fast drag (nextDrawable blocks on vsync per
+resize step) — acceptable.
+
+**Perf/memory review (current focus, before the API surface).** Goals: (a) klio's
+baseline startup RSS with no compose/native resources, as low as possible; (b) compose
+UI + Skia memory footprint; (c) the resize leak (item 7); (d) CPU during idle and during
+activity, both the Skia/present side and the compose/Kotlin loop. Debug affordance:
+`KLIO_SKIA_DUMP=path` reads the first GPU frame back to a PNG.
+
+**Sequencing recommendation:** macOS hardening (items 1–3, done — the contract is locked)
+→ this perf/memory pass → the Compose desktop API surface (real `compose.ui.graphics` on
+the shim → `compose.ui` engine → foundation → material3; platform-agnostic, inherits the
+contract) → broaden/verify the other backends (Win32; keep X11), each implementing the
+same window contract. Not the reverse: broadening platforms first copies the contract
+2–3×, and jumping to the API layer before HiDPI would bake a 1x coordinate assumption in.
 
 **Bundled font — DONE.** A Latin subset (~15 KB) of Noto Sans Mono (Google, OFL
 1.1) is committed under `src/compose_ui/fonts/` and baked into a byte array
