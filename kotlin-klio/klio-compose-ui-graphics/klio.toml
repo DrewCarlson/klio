@@ -28,6 +28,15 @@ include = [
     "androidx/compose/ui/graphics/PathIterator.kt",
     "androidx/compose/ui/graphics/PathSegment.kt",
     "androidx/compose/ui/graphics/Matrix.kt",
+    # The Paint surface (klioMain supplies the actual value object) + the value
+    # types its properties reference (Shader / ColorFilter / PathEffect / etc.).
+    "androidx/compose/ui/graphics/Paint.kt",
+    "androidx/compose/ui/graphics/Shader.kt",
+    "androidx/compose/ui/graphics/ColorFilter.kt",
+    "androidx/compose/ui/graphics/ColorMatrix.kt",
+    "androidx/compose/ui/graphics/PathEffect.kt",
+    "androidx/compose/ui/graphics/ImageBitmap.kt",
+    "androidx/compose/ui/graphics/PixelMap.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
