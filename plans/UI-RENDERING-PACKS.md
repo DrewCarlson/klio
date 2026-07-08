@@ -169,8 +169,43 @@ throws `FileFailedToInitializeException` until those land (diagnosed via
 5. **Text shaping/measure/draw** — `ActualParagraph` (×3) + `MultiParagraph.
    drawMultiParagraph` over the Skia Paragraph shim (`src/compose_ui`, which already
    does SkFont wrap + Paragraph). This is the substantive part; the rest is plumbing.
-Then foundation → material3. ui-text is NOT yet in the parity/e2e list (its init
-failure would break e2e) — add it once the value-class + Saver actuals land.
+Then foundation → material3. ui-text is NOT yet in the parity/e2e list — add it
+once the two interpreter bugs below are fixed.
+
+**ui-text model actuals landed (`2a61e56b`)** with real semantics (adapted from
+the skiko sources); `FontWeight`/style init now clears the FontRasterizationSettings
+cascade. Two interpreter bugs the full stack surfaces still block end-to-end use —
+both root-caused, both in the resolution/init CORE (careful fixes, not one-off
+patches), both only appear once the large multi-pack graph is loaded together:
+
+1. **Companion method missing on a re-entrant/init-cascade receiver.** During
+   `AnnotatedString.Companion` init → `AnnotatedStringSaver` → `SpanStyle.kt`'s
+   top-level `TextForegroundStyle.from(DefaultColor)`, the `TextForegroundStyle`
+   (an `internal interface` with a companion holding the `from` overloads + a
+   nested `object Unspecified`) resolves to a companion INSTANCE whose class-def
+   has **n_methods=0** (proven with a dbg at the call_member miss in
+   host_call_member.zig), so `from` misses → `Vm::call_member from on
+   TextForegroundStyle.Companion` → the whole init cascade fails with
+   `FileFailedToInitializeException`. Standalone the same call works (the agent
+   confirmed a probe). So the mid-cascade companion receiver is a partial/shell
+   def. A minimal 2-file baked repro of the same shape hit a *related* init-order
+   symptom (a top-level val read before its initializer). Diagnose via
+   `KLIO_INIT_DEBUG=1`. Fix target: the object/companion init gate + the shell/
+   in-flight instance's class-def (host_globals.zig `ensureObjectSingleton*`,
+   `claimObjectInit`) — the shell must carry the full method table, or the
+   re-entrant read must not observe a method-less companion.
+2. **Multi-import `lerp` overload resolution.** `ui-graphics/Brush.kt` imports BOTH
+   `geometry.lerp` (Offset/Size) and `util.lerp` (Float) and calls
+   `lerp(Offset, Offset, Float)`. Alone it resolves; with ui-text loaded (more
+   `lerp` overloads in scope) the resolver fails and — wrongly — reports
+   `geometry.lerp is ... not imported` though it IS imported. This is the
+   bare-call / multi-import overload-resolution class (see the
+   `klio-imported-vs-unimported-bare-call-bug` memory). Fatal at run. Fix target:
+   the resolver's overload pick across multiple same-simple-name imports.
+
+These are the real remaining work for the compose stack: hardening klio's
+resolution/dispatch/init core under a large multi-pack graph. Each is a careful,
+isolated interpreter fix.
 
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.
