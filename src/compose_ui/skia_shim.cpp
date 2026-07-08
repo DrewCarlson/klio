@@ -735,6 +735,8 @@ struct KlioWindow {
     id<MTLCommandQueue> queue;
     sk_sp<GrDirectContext> grContext;
     GrMTLHandle drawable;  // this frame's CAMetalDrawable (retained until present)
+    CGFloat backingScale;  // points -> pixels; the drawable is sized in pixels and
+                           // the canvas is scaled by this so draws stay in points
 #endif
 };
 
@@ -749,12 +751,18 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
         [device release];
         return false;
     }
+    CGFloat scale = [kw->window backingScaleFactor];
+    if (scale < 1.0) scale = 1.0;
+    kw->backingScale = scale;
     CAMetalLayer* layer = [[CAMetalLayer layer] retain];  // own our ref
     layer.device = device;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = NO;  // Skia renders into the drawable's texture
-    layer.contentsScale = 1.0;
-    layer.drawableSize = CGSizeMake(w, h);
+    // Render at the display's backing scale: the drawable is sized in physical
+    // pixels (w*scale) and the canvas is scaled by `scale` (in klio_win_surface) so
+    // the UI draws in points but rasterizes crisply on Retina.
+    layer.contentsScale = scale;
+    layer.drawableSize = CGSizeMake(w * scale, h * scale);
     // A layer-HOSTING view (custom layer assigned) does not get its layer sized by
     // AppKit — set the on-screen frame explicitly or the drawable renders correctly
     // but composites at 0x0 (a blank window). Kept in sync on resize below.
@@ -864,6 +872,10 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
                 kBGRA_8888_SkColorType, nullptr, nullptr);
         }
         if (!surf) return nullptr;
+        // The drawable is sized in physical pixels; scale the canvas by the backing
+        // factor so the display list (in points) rasterizes at full resolution.
+        if (kw->backingScale != 1.0)
+            surf->getCanvas()->scale(kw->backingScale, kw->backingScale);
         kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);  // hold until present
         kw->surface = new KlioSurface();
         kw->surface->surface = surf;
@@ -968,8 +980,12 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
         if (type == 0 && (nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
 #if defined(KLIO_METAL)
             if (kw->grContext && kw->metalLayer) {
+                CGFloat scale = [kw->window backingScaleFactor];
+                if (scale < 1.0) scale = 1.0;
+                kw->backingScale = scale;
+                kw->metalLayer.contentsScale = scale;
                 kw->metalLayer.frame = NSMakeRect(0, 0, nw, nh);
-                kw->metalLayer.drawableSize = CGSizeMake(nw, nh);
+                kw->metalLayer.drawableSize = CGSizeMake(nw * scale, nh * scale);
             } else
 #endif
             {
