@@ -147,15 +147,11 @@ hit-test → state → recompose → redraw (COUNT increments live). Headless-sa
 `winOpen` returns 0 with no backend, so `runApp` returns immediately (no corpus
 output). macOS (Cocoa) / windows (Win32) window backends are the per-OS follow-up.
 
-**Open bug this surfaced (compose runtime, not windowing):** `var x by remember {
-mutableStateOf(0) }` inside a `@Composable` does not persist writes across
-recomposition — reads show the initial value forever. Isolated: standalone `var x by
-mutableStateOf(0)` works (0→5→8); `val s = remember { mutableStateOf(0) }` + `s.value`
-works and recomposes; ONLY the `by` + `remember` + composable combination fails. So
-the property-delegate desugaring of a `remember`ed `MutableState` mis-slots or
-mis-binds the delegate in the composition. `compose_ui_window.kt` uses the working
-`remember { mutableStateOf }` + `.value` form; the `by` form needs the interpreter
-fix.
+**Bug this surfaced (compose runtime) — FIXED (`aac66ad3`).** `var x by remember {
+mutableStateOf(0) }` inside a `@Composable` did not persist writes across recomposition
+— reads showed the initial value forever, because the property-delegate desugaring of a
+`remember`ed `MutableState` mis-dispatched `setValue`. Fixed with write-through for a
+delegated `var x by D`; `compose_ui_window.kt` now uses the `by remember` form directly.
 
 **Richer input — DONE (X11).** The shim poll now returns key (char + keysym via
 XLookupString), pointer-motion, and resize (ConfigureNotify, recreating the surface)
@@ -191,16 +187,62 @@ bring-up fails. Verified end-to-end here (renders + reads back correctly) — bu
 this host GL is software (Mesa llvmpipe), so it is a correctness proof of the path,
 not a speedup. Default builds stay raster.
 
-**macOS / Windows window backends — WRITTEN (unverified here).** The shim's
-windowing section now has one backend per OS behind the same C ABI (open / surface
-/ present / poll / close): X11 (`-DKLIO_X11`, verified), Win32 (`_WIN32` —
-`StretchDIBits` blit of the N32 surface, window-proc event queue) and Cocoa
-(`-DKLIO_COCOA`, opt-in `-Dcocoa` — compiles the shim as Objective-C++, presents by
-setting the content view's `CALayer.contents` to a `CGImage`, `NSApp` event pump).
-Both the Win32 and Cocoa backends are written against their platform APIs but are
-**not compiled or run-verified in this environment** — this host has no macOS/
-Windows toolchain (zig's Windows cross target also fails here), so they need
-building + checking on real hosts. The Linux/X11 path is unchanged and green.
+**macOS window backend — DONE (Cocoa + Metal GPU, verified on real hardware).**
+Commit `674031d8`. `zig build -Dcocoa` builds the Cocoa backend (shim compiled as
+Objective-C++); `-Dgpu` additionally compiles the Metal GPU surface (`-DKLIO_METAL`).
+The window brings up a `CAMetalLayer`, a Ganesh `GrDirectContext` (Metal), and per
+frame wraps the layer's next drawable as a GPU `SkSurface`
+(`SkSurfaces::WrapCAMetalLayer`), draws, `flushAndSubmit`s, and presents the drawable
+through the Metal command queue — falling back to a CPU-raster `CGImage` present if
+Metal bring-up fails. `KLIO_SKIA_VERBOSE=1` logs the active backend
+(`window backend: Metal (GPU)` / `raster (CPU)`). Verified live on an M-series Mac:
+the counter UI renders on the GPU and the render→present→poll loop runs clean;
+`examples/compose_ui_window.kt` now uses the `var count by remember { mutableStateOf(0) }`
+delegate form (the write-through bug below was fixed in `aac66ad3`). Three
+macOS-specific fixes were needed — none of the Cocoa path had ever compiled: the shim
+used `SkFontMgr_New_Custom_Empty`, absent in the macOS Skia pack → `SkFontMgr_New_CoreText`;
+build.zig left `-x objective-c++` applying to the linked `.a` archives → reset with
+`-x none`; and the structural one — the interpreter ran the VM on a large-stack
+*worker* thread, but AppKit windowing and the single-threaded Skia Metal context both
+require the process **main thread** (`NSWindow should only be instantiated on the main
+thread`). `safety.runOnBigStackMainThread` now switches to a 256 MB mmap'd stack
+in-thread (an aarch64/x86_64 asm SP switch) so `klio run` keeps the main thread while
+still getting the big stack (macOS only; tests/parity keep the worker thread). Also
+needs the `klio.compose.ui` + `androidx.compose.runtime` packs installed.
+
+**Windows (Win32) window backend — WRITTEN (unverified).** The `_WIN32` backend
+(`StretchDIBits` blit of the N32 surface, window-proc event queue) is written against
+the Win32 API but not compiled/run-verified — a Windows host is needed, and it will
+hit the same which-thread / message-pump question the macOS path did (the fix will
+likely reuse `runOnBigStackMainThread`). X11 (Linux) is verified and unchanged.
+
+**macOS follow-ups — the window "contract" to settle before broadening.** The
+coordinate model, frame/present model, and input set that both the higher Compose
+desktop APIs and the other-platform backends build against are still thin on macOS;
+settle them here once rather than re-doing them per platform:
+1. **HiDPI / Retina** — currently `contentsScale = 1.0`, `drawableSize` in points, so
+   Retina renders at 1x (soft, OS-upscaled). Track `window.backingScaleFactor`, size
+   the drawable in pixels, and scale the Skia canvas so layout stays in points. Fixes
+   the points-vs-pixels contract everything else inherits.
+2. **Frame pacing / run loop** — the loop is VM-driven `nextEventMatchingMask` polling
+   (~10 fps; repaints only when the VM loops; janky live-resize; no occlusion redraw;
+   no vsync). Move to a `CVDisplayLink`/vsync-presented redraw and pump the run loop so
+   the window stays responsive.
+3. **App lifecycle** — a minimal `NSApplicationDelegate` + main menu so Cmd-Q / Cmd-W /
+   activation / dock behave like a real app.
+4. **Live resize + display change** — track `windowDidResize` /
+   `viewDidChangeBackingProperties` (moving between monitors of different scale).
+5. **Input completeness** — modifiers, key repeat, scroll wheel, right-click; IME later.
+6. **Color management** — tag the surface's color space (sRGB / display P3) rather than
+   DeviceRGB.
+
+**Sequencing recommendation:** the small macOS hardening pass (items 1–3 lock the
+contract) → then the Compose desktop API surface (real `compose.ui.graphics` on the
+shim → `compose.ui` engine → foundation → material3; platform-agnostic, inherits the
+contract) → then broaden/verify the other platform backends (Win32; keep X11), each
+just implementing the same window contract. Not the reverse: broadening platforms first
+copies an unfinished contract 2–3×, and jumping to the API layer before HiDPI bakes a
+1x coordinate assumption into it.
 
 **Bundled font — DONE.** A Latin subset (~15 KB) of Noto Sans Mono (Google, OFL
 1.1) is committed under `src/compose_ui/fonts/` and baked into a byte array
@@ -209,8 +251,9 @@ shim links. `ensureFonts` uses it as the default typeface (after a `$KLIO_SKIA_F
 override, before any system-font scan), so text renders self-contained on fontless
 hosts and deterministically everywhere. License at `src/compose_ui/fonts/LICENSE.txt`.
 
-Later: building + verifying the Win32/Cocoa backends on real macOS/Windows hosts; a
-GPU window surface (today's GPU path is offscreen).
+Later: building + verifying the Win32 backend on a real Windows host (Cocoa is done;
+the macOS GPU *window* surface is Metal — the offscreen Ganesh+EGL GPU path remains
+linux-only).
 
 ### Vendor the real compose.ui / foundation / material
 
