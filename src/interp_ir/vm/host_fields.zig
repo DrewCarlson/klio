@@ -1384,55 +1384,75 @@ fn receiverLabel(receiver: *const Value) []const u8 {
 
 /// Companion forwarding + nested-class/singleton resolution on a
 /// `Value::Class` receiver (the early companion path of `get_field`).
+/// Resolve `name` from `class_name`'s own companion object — the companion
+/// singleton itself for a `Foo.Companion` access, else a companion
+/// `const`/`val`/getter member. Returns null when the class has no companion or
+/// the companion has no such member (so a caller can keep walking the class
+/// hierarchy); `.err` on an init failure.
+fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) Allocator.Error!?EvalResult {
+    const cn: []const u8 = blk: {
+        const g = self.module.borrow();
+        defer g.deinit();
+        break :blk g.get().registry.companion_singletons.get(class_name) orelse return null;
+    };
+    // `Counter.Factory` — the companion name resolves to the singleton itself.
+    const suffix = try std.fmt.allocPrint(allocator, "$Companion${s}", .{name});
+    defer allocator.free(suffix);
+    if (std.mem.endsWith(u8, cn, suffix)) {
+        switch (try host_globals.ensureObjectSingleton(self, cn)) {
+            .ok => |maybe| if (maybe) |s| return ok(s),
+            .err => |e| return errRes(e),
+        }
+    }
+    const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+        .ok => |maybe| maybe,
+        .err => |e| return errRes(e),
+    };
+    if (singleton) |s| {
+        if (s == .Instance) {
+            const field_v: ?Value = blk: {
+                const g = s.Instance.borrow();
+                defer g.deinit();
+                break :blk g.get().get(name);
+            };
+            if (field_v) |v| return ok(v);
+            // No plain backing field — the companion member may be a
+            // `val` with a custom getter.
+            const comp_cls = className(s.Instance);
+            const getter: ?FuncId = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk lookupPairFunc(pg.get().instance_prop_getters, comp_cls, name);
+            };
+            if (getter) |fid| {
+                const mptr: *const Module = self.module.asPtr();
+                if (fid.int() < mptr.funcCount()) {
+                    return try evalGetter(self, allocator, fid, s);
+                }
+            }
+        }
+    }
+    return null;
+}
+
 fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const cls_name = blk: {
         const g = receiver.Class.borrow();
         defer g.deinit();
         break :blk g.get().name;
     };
-    const comp_name: ?[]const u8 = blk: {
-        const g = self.module.borrow();
-        defer g.deinit();
-        break :blk g.get().registry.companion_singletons.get(cls_name);
-    };
-    if (comp_name) |cn| {
-        // `Counter.Factory` — the companion name resolves to the
-        // companion singleton itself.
-        const suffix = try std.fmt.allocPrint(allocator, "$Companion${s}", .{name});
-        defer allocator.free(suffix);
-        if (std.mem.endsWith(u8, cn, suffix)) {
-            switch (try host_globals.ensureObjectSingleton(self, cn)) {
-                .ok => |maybe| if (maybe) |s| return ok(s),
-                .err => |e| return errRes(e),
-            }
-        }
-        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
-            .ok => |maybe| maybe,
-            .err => |e| return errRes(e),
-        };
-        if (singleton) |s| {
-            if (s == .Instance) {
-                const field_v: ?Value = blk: {
-                    const g = s.Instance.borrow();
-                    defer g.deinit();
-                    break :blk g.get().get(name);
-                };
-                if (field_v) |v| return ok(v);
-                // No plain backing field — the companion member may be a
-                // `val` with a custom getter.
-                const comp_cls = className(s.Instance);
-                const getter: ?FuncId = blk: {
-                    const pg = self.prog.borrow();
-                    defer pg.deinit();
-                    break :blk lookupPairFunc(pg.get().instance_prop_getters, comp_cls, name);
-                };
-                if (getter) |fid| {
-                    const mptr: *const Module = self.module.asPtr();
-                    if (fid.int() < mptr.funcCount()) {
-                        return try evalGetter(self, allocator, fid, s);
-                    }
-                }
-            }
+    // Companion member — the class's own companion first, then inherited ones
+    // up the superclass chain: `Sub.MinId` binds `Base.Companion.MinId` when
+    // `MinId` is a `const`/`val` on the superclass's companion.
+    {
+        var cur: ?[]const u8 = cls_name;
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer seen.deinit(allocator);
+        while (cur) |cn| {
+            if (containsStr(seen.items, cn)) break;
+            try seen.append(allocator, cn);
+            if (try companionMemberOfClass(self, allocator, cn, name)) |r| return r;
+            cur = firstSupertype(self, cn);
         }
     }
     // A nested object lifted as `Outer$Name`: resolve the mangled

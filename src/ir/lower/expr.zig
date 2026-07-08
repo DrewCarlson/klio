@@ -5122,6 +5122,40 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     const segments = callee.Path.segments;
     const name0 = segments[0].name;
 
+    // Secondary-ctor delegation / default-value thunk: a bare own-member call
+    // with no `this` in scope is a companion access — the enclosing instance
+    // does not exist yet, so `generateOetf(x)` inside `: this(generateOetf(x))`
+    // binds the companion's `generateOetf`, never an instance method. Dispatch
+    // it as a member call on the owner class value; the VM forwards a class
+    // receiver to its companion singleton, walking the superclass chain so an
+    // inherited companion member (declared on a superclass's companion) resolves
+    // too — `Sub.mk()` lowers to exactly this `LoadGlobal + CallMember` pair.
+    // Mirrors the value-read handling of the same case (a bare own-member read
+    // in a param thunk); `own_members` already includes own + inherited
+    // companion members, so a plain member name is filtered by `hasOwnMember`.
+    if (b.isParamThunk() and b.resolve("this") == null and
+        b.hasOwnMember(name0) and !classWithCompanion(b, name0))
+    {
+        if (b.ownerClass()) |owner| {
+            const cls = b.allocReg();
+            const on = try b.module.internConst(b.allocator, .{ .String = owner });
+            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nmc = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = cls,
+                .name = nmc,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
     // A captured outer that also names a top-level fn: route through value.
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
         b.module.funcId(name0) != null;

@@ -6505,28 +6505,35 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
         g.deinit();
     }
-    var first = true;
-    var queue: std.ArrayList([]const u8) = .empty;
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    try queue.append(allocator, class_name);
+    // Start from the receiver's ACTUAL class identity — its IR class id keyed
+    // by exact FQN — so a same-simple-name class in another package can never
+    // shadow it. The hierarchy is then walked by identity (each class's
+    // resolved supertype ids), never re-resolved from a collidable simple name.
+    const start_cid: ?ir.ClassId = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classIdByFqn(recv_fqn);
+    };
+    try queue.append(allocator, .{ .cid = start_cid, .name = class_name });
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
-        const cur_name = queue.items[head];
-        if (seen.contains(cur_name)) continue;
-        try seen.put(cur_name, {});
-
-        // Resolve the IR class: prefer FQN for the receiver's own class.
+        const item = queue.items[head];
+        // Resolve the IR class by identity (its id) when known; a
+        // synthesized/anonymous shape with no unambiguous id falls back to a
+        // simple-name match.
         var ir_class: ?ir.Class = null;
+        var cur_name: []const u8 = item.name;
         {
             const mg = self.module.borrow();
             defer mg.deinit();
             const mod = mg.get();
-            if (first) {
-                if (mod.classIdByFqn(recv_fqn)) |cid| {
-                    if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
-                }
+            if (item.cid) |cid| {
+                if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
             }
             if (ir_class == null) {
                 for (mod.classes.items) |c| {
@@ -6536,8 +6543,13 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                     }
                 }
             }
-            first = false;
+            // Dedup on the resolved class's FQN (identity) so two distinct
+            // classes that share a simple name are each walked once.
+            const dedup_key = if (ir_class) |irc| irc.fqn else cur_name;
+            if (seen.contains(dedup_key)) continue;
+            try seen.put(dedup_key, {});
             if (ir_class) |irc| {
+                cur_name = irc.name;
                 // Gather candidates named `name`. A `@LowPriorityInOverloadResolution`
                 // / `@Deprecated(level = ERROR)` member is a guard stub that only
                 // applies when no ordinary candidate (member or top-level extension)
@@ -6566,15 +6578,27 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
                         return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
+                // Enqueue the resolved supertypes by identity (their IR class
+                // ids) so the inherited-method walk follows the real class
+                // hierarchy, never a same-simple-name impostor.
+                for (irc.supertypes) |sid| {
+                    if (@intFromEnum(sid) < mod.classes.items.len) {
+                        try queue.append(allocator, .{ .cid = sid, .name = mod.classes.items[@intFromEnum(sid)].name });
+                    }
+                }
             }
         }
-        const cg = self.classes.borrow();
-        if (cg.get().get(cur_name)) |def| {
-            const dg = def.borrow();
-            for (dg.get().supertype_names) |sup| try queue.append(allocator, sup);
-            dg.deinit();
+        // Fallback for a receiver class with no unambiguous IR id (anonymous/
+        // synthesized): expand supertypes from the registered simple names.
+        if (ir_class == null) {
+            const cg = self.classes.borrow();
+            if (cg.get().get(cur_name)) |def| {
+                const dg = def.borrow();
+                for (dg.get().supertype_names) |sup| try queue.append(allocator, .{ .cid = null, .name = sup });
+                dg.deinit();
+            }
+            cg.deinit();
         }
-        cg.deinit();
     }
     return null;
 }
@@ -8639,60 +8663,97 @@ fn lastParamIsFunctionShaped(self: *VmHost, p: *const ir.Param) bool {
 
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
-    var start: []const u8 = undefined;
+    var start_name: []const u8 = undefined;
+    var recv_fqn: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
-        start = cg.get().name;
+        start_name = cg.get().name;
+        recv_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
-    var queue: std.ArrayList([]const u8) = .empty;
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    try queue.append(allocator, start);
+    // Walk the receiver's real class hierarchy by identity (IR class ids),
+    // starting from its exact FQN, so a same-simple-name class in another
+    // package can never shadow an inherited method.
+    const start_cid: ?ir.ClassId = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classIdByFqn(recv_fqn);
+    };
+    try queue.append(allocator, .{ .cid = start_cid, .name = start_name });
     var method_fid: ?FuncId = null;
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
-        const cur = queue.items[head];
-        if (seen.contains(cur)) continue;
-        try seen.put(cur, {});
+        const item = queue.items[head];
+        var ir_class: ?ir.Class = null;
         {
             const mg = self.module.borrow();
+            defer mg.deinit();
             const mod = mg.get();
-            for (mod.classes.items) |c| {
-                if (std.mem.eql(u8, c.name, cur)) {
-                    for (c.methods) |fid| {
-                        if (funcAt(mod, fid)) |f| {
-                            if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
-                                // A name match alone is not a candidate:
-                                // the member must be *applicable* to the
-                                // supplied args (an unsupplied param needs
-                                // a default or vararg slot, a named arg
-                                // needs a matching param, a typed arg must
-                                // not definitely mismatch), or Kotlin
-                                // resolution moves on to the next tier.
-                                if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
-                                    method_fid = fid;
-                                    break;
-                                }
+            if (item.cid) |cid| {
+                if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
+            }
+            if (ir_class == null) {
+                for (mod.classes.items) |c| {
+                    if (std.mem.eql(u8, c.name, item.name)) {
+                        ir_class = c;
+                        break;
+                    }
+                }
+            }
+            // Dedup on the resolved class's FQN (identity) so two distinct
+            // classes that share a simple name are each walked once.
+            const dedup_key = if (ir_class) |irc| irc.fqn else item.name;
+            if (seen.contains(dedup_key)) continue;
+            try seen.put(dedup_key, {});
+            if (ir_class) |irc| {
+                for (irc.methods) |fid| {
+                    if (funcAt(mod, fid)) |f| {
+                        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
+                            // A name match alone is not a candidate:
+                            // the member must be *applicable* to the
+                            // supplied args (an unsupplied param needs
+                            // a default or vararg slot, a named arg
+                            // needs a matching param, a typed arg must
+                            // not definitely mismatch), or Kotlin
+                            // resolution moves on to the next tier.
+                            if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
+                                method_fid = fid;
+                                break;
                             }
                         }
                     }
                 }
-                if (method_fid != null) break;
+                if (method_fid == null) {
+                    // Enqueue resolved supertypes by identity so the walk
+                    // follows the real hierarchy, never a same-simple-name
+                    // impostor.
+                    for (irc.supertypes) |sid| {
+                        if (@intFromEnum(sid) < mod.classes.items.len) {
+                            try queue.append(allocator, .{ .cid = sid, .name = mod.classes.items[@intFromEnum(sid)].name });
+                        }
+                    }
+                }
             }
-            mg.deinit();
         }
         if (method_fid != null) break;
-        const cg = self.classes.borrow();
-        if (cg.get().get(cur)) |def| {
-            const dg = def.borrow();
-            for (dg.get().supertype_names) |s| try queue.append(allocator, s);
-            dg.deinit();
+        // Fallback for a receiver class with no unambiguous IR id (anonymous/
+        // synthesized): expand supertypes from the registered simple names.
+        if (ir_class == null) {
+            const cg = self.classes.borrow();
+            if (cg.get().get(item.name)) |def| {
+                const dg = def.borrow();
+                for (dg.get().supertype_names) |s| try queue.append(allocator, .{ .cid = null, .name = s });
+                dg.deinit();
+            }
+            cg.deinit();
         }
-        cg.deinit();
     }
     if (method_fid) |fid| {
         const all = try prependReceiver(allocator, receiver, args);

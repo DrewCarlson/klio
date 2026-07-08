@@ -835,6 +835,34 @@ fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasses, o
     for (c.supertypes) |*st| try collectHierarchyMemberNames(st.name.name, by_name, out, seen);
 }
 
+/// Collect the companion-object member names declared by `start` and each of
+/// its supertypes. A subclass sees an inherited companion's members under their
+/// bare names (Kotlin: `MinId` inside `Rgb` binds `ColorSpace.Companion.MinId`);
+/// a secondary-constructor delegation/default thunk has no `this` to walk at
+/// runtime, so those names must be in its static member set to resolve as a
+/// companion access rather than an unbound global.
+fn collectHierarchyCompanionMemberNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
+    const gop = try seen.getOrPut(start);
+    if (gop.found_existing) return;
+    const c = (by_name.get(start) orelse return).get();
+    for (c.members) |*m| {
+        if (m.* == .Class and m.Class.is_companion) {
+            const comp = &m.Class;
+            for (comp.members) |*cm| {
+                switch (cm.*) {
+                    .Function => |*f| try out.put(f.name.name, {}),
+                    .Property => |p| try out.put(p.name.name, {}),
+                    else => {},
+                }
+            }
+            for (comp.primary_params) |*p| {
+                if (p.property != null) try out.put(p.name.name, {});
+            }
+        }
+    }
+    for (c.supertypes) |*st| try collectHierarchyCompanionMemberNames(st.name.name, by_name, out, seen);
+}
+
 /// Int literals narrow to i32 and Double literals narrow to f32, matching
 /// Kotlin's Int/Float literal types.
 fn literalToConst(e: *const ast.Expr) ?Const {
@@ -2362,6 +2390,15 @@ fn buildModuleWithOverrides(
                 },
                 else => {},
             }
+        }
+        // Inherited companion members: a delegation/default thunk references a
+        // superclass companion's constant/function by its bare name (`MinId`
+        // inside `Rgb`, from `ColorSpace.Companion`), and has no `this` to walk
+        // at runtime — resolve it statically as a companion access.
+        {
+            var seen_sup = StringSet.init(a);
+            defer seen_sup.deinit();
+            for (c.supertypes) |*st| try collectHierarchyCompanionMemberNames(st.name.name, &file_classes, &own_members, &seen_sup);
         }
         var entries = try a.alloc(SecondaryCtorEntry, c.secondary_ctors.len);
         for (c.secondary_ctors, 0..) |*sc, sc_idx| {
