@@ -716,18 +716,38 @@ fun runApp(
     }
     var frame = 0
     var running = true
-    while (running && (maxFrames < 0 || frame < maxFrames)) {
+    var dirty = true
+    // Invoked by the windowing backend during a live resize (while the modal drag
+    // blocks this loop) so the UI relayouts and redraws in realtime; w/h in points.
+    val onResize: (Int, Int) -> Unit = { w, h ->
+        ui.resize(w / scale, h / scale, scale)
         __composeui_winRender(handle, ui.displayList(scale))
-        val ev = __composeui_winPoll(handle, 100)
-        val type = (ev shr 32).toInt()
-        val a = ((ev shr 16) and 0xFFFF).toInt()
-        val b = (ev and 0xFFFF).toInt()
-        when (type) {
-            2 -> running = false                             // close
-            1 -> ui.click(a / scale, b / scale, scale)       // click: a=x, b=y
-            3 -> ui.key(a, b, scale)                          // key: a=char, b=keysym
-            4 -> ui.hover(a / scale, b / scale, scale)        // move: a=x, b=y
-            5 -> ui.resize(a / scale, b / scale, scale)       // resize: a=w, b=h (px)
+    }
+    while (running && (maxFrames < 0 || frame < maxFrames)) {
+        // Present only when the frame changed. Rendering every iteration paces the
+        // whole loop to vsync (nextDrawable blocks), which would gate event
+        // processing behind the render throttle and delay input after a burst.
+        if (dirty) {
+            __composeui_winRender(handle, ui.displayList(scale))
+            dirty = false
+        }
+        // Block for one event, then drain any others without rendering between them,
+        // so a backlog (e.g. moves accumulated during a resize) processes at once and
+        // the resulting state is drawn in a single frame.
+        var ev = __composeui_winPoll(handle, 100, onResize)
+        while (true) {
+            val type = (ev shr 32).toInt()
+            val a = ((ev shr 16) and 0xFFFF).toInt()
+            val b = (ev and 0xFFFF).toInt()
+            when (type) {
+                2 -> running = false                             // close
+                1 -> { ui.click(a / scale, b / scale, scale); dirty = true }   // a=x, b=y
+                3 -> { ui.key(a, b, scale); dirty = true }                      // a=char, b=keysym
+                4 -> { ui.hover(a / scale, b / scale, scale); dirty = true }    // a=x, b=y
+                5 -> { ui.resize(a / scale, b / scale, scale); dirty = true }   // a=w, b=h
+            }
+            if (type == 0 || !running) break
+            ev = __composeui_winPoll(handle, 0, onResize)  // drain remaining, non-blocking
         }
         frame += 1
     }

@@ -729,6 +729,11 @@ struct KlioWindow {
     int w;
     int h;
     KlioSurface* surface;
+    // Live-resize render callback (set by the app around a poll). When present, the
+    // resize notification observer drives a fresh frame during the modal drag.
+    void (*resizeCb)(void*, int, int);
+    void* resizeCtx;
+    id resizeObserver;
 #if defined(KLIO_METAL)
     CAMetalLayer* metalLayer;  // nil when the raster path is in use
     id<MTLDevice> device;
@@ -818,7 +823,46 @@ static void klioSetupMenu(const char* title) {
     [menuBar release];
 }
 
+// Resize the Metal drawable to a new point size at the current backing scale.
+static void klioApplyMetalResize(KlioWindow* kw, int nw, int nh) {
+#if defined(KLIO_METAL)
+    if (!(kw->grContext && kw->metalLayer)) return;
+    CGFloat scale = [kw->window backingScaleFactor];
+    if (scale < 1.0) scale = 1.0;
+    kw->backingScale = scale;
+    kw->metalLayer.contentsScale = scale;
+    kw->metalLayer.drawableSize = CGSizeMake(nw * scale, nh * scale);
+#else
+    (void)kw;
+    (void)nw;
+    (void)nh;
+#endif
+}
+
+// Live-resize notification handler. With a render callback set (during a poll), it
+// resizes the drawable and drives a fresh frame so the UI reflows in realtime while
+// the modal resize loop blocks the VM's own loop. Without a callback it does nothing
+// and the poll loop handles the resize on drag end (the non-live path).
+static void klioWinResized(KlioWindow* kw) {
+    if (!kw || !kw->resizeCb) return;
+    const int nw = static_cast<int>([kw->view bounds].size.width);
+    const int nh = static_cast<int>([kw->view bounds].size.height);
+    if (nw <= 0 || nh <= 0 || (nw == kw->w && nh == kw->h)) return;
+    klioApplyMetalResize(kw, nw, nh);
+    kw->w = nw;
+    kw->h = nh;
+    kw->resizeCb(kw->resizeCtx, nw, nh);
+}
+
 extern "C" {
+
+// Set (or clear, with null) the live-resize render callback. The app sets it around
+// a poll so the callback value stays live for the call's duration.
+void klio_win_set_resize_cb(KlioWindow* kw, void (*cb)(void*, int, int), void* ctx) {
+    if (!kw) return;
+    kw->resizeCb = cb;
+    kw->resizeCtx = ctx;
+}
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
     if (w <= 0 || h <= 0) return nullptr;
@@ -845,6 +889,15 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         kw->w = w;
         kw->h = h;
         kw->surface = nullptr;
+        kw->resizeCb = nullptr;
+        kw->resizeCtx = nullptr;
+        // Fires during a live resize (the modal drag) — reflows the UI in realtime
+        // when a render callback is registered for the current poll.
+        kw->resizeObserver = [[[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowDidResizeNotification
+                        object:window
+                         queue:nil
+                    usingBlock:^(NSNotification* note) { (void)note; klioWinResized(kw); }] retain];
 #if defined(KLIO_METAL)
         kw->metalLayer = nil;
         kw->device = nil;
@@ -1028,6 +1081,11 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
 
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
+    if (kw->resizeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:kw->resizeObserver];
+        [kw->resizeObserver release];
+        kw->resizeObserver = nil;
+    }
     if (kw->surface) klio_skia_free(kw->surface);
 #if defined(KLIO_METAL)
     if (kw->drawable) {

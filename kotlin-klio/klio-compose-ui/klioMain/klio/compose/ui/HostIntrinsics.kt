@@ -42,8 +42,9 @@ internal fun __composeui_winRender(handle: Long, displayList: String): Long =
 
 // Waits up to timeoutMs for an event; returns (type << 32) | (a << 16) | b.
 // type 0 none, 1 click (a=x b=y), 2 close, 3 key (a=char b=keysym),
-// 4 move (a=x b=y), 5 resize (a=w b=h).
-internal fun __composeui_winPoll(handle: Long, timeoutMs: Int): Long =
+// 4 move (a=x b=y), 5 resize (a=w b=h). `onResize(w, h)` is invoked during a live
+// resize (the modal drag) so the UI can reflow in realtime; w/h are in points.
+internal fun __composeui_winPoll(handle: Long, timeoutMs: Int, onResize: (Int, Int) -> Unit): Long =
     error("intrinsic klio.compose.ui.__composeui_winPoll not installed")
 
 internal fun __composeui_winClose(handle: Long): Long =

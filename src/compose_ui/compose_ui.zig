@@ -14,6 +14,8 @@ const stdlib = @import("stdlib");
 const Value = runtime.Value;
 const EvalResult = runtime.EvalResult;
 const CallCtx = runtime.CallCtx;
+const IntrinsicHost = runtime.IntrinsicHost;
+const Output = runtime.Output;
 const HostBindings = stdlib.HostBindings;
 const Error = std.mem.Allocator.Error;
 
@@ -73,6 +75,7 @@ const Skia = struct {
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
     winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
     winClose: *const fn (?*SkWindow) callconv(.c) void,
+    winSetResizeCb: *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void,
 };
 
 var skia_state: ?Skia = null;
@@ -121,6 +124,7 @@ fn loadSkia() ?*Skia {
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
+        .winSetResizeCb = F.get(&lib, "winSetResizeCb", "klio_win_set_resize_cb") orelse return skiaLoadFail(&lib),
     };
     skia_state = s;
     return &skia_state.?;
@@ -318,17 +322,46 @@ fn winRender(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
-/// `__composeui_winPoll(handle, timeoutMs): Long` — wait up to timeoutMs for an
-/// event; returns `(type << 32) | (x << 16) | y` where type is 0 none, 1 click,
-/// 2 close.
+/// Registered for the duration of a `winPoll` so the shim's live-resize observer
+/// can drive a frame while the modal drag blocks the VM's loop. Holds the render
+/// callback (a live poll argument, so no separate GC root is needed) plus the host
+/// handle and output to invoke it through.
+const ResizeCb = struct {
+    host: IntrinsicHost,
+    callback: Value,
+    out: Output,
+};
+
+/// C trampoline the shim calls on each live-resize step: invokes the Kotlin render
+/// callback with the new (width, height) in points, which recomposes and redraws.
+fn resizeTrampoline(user: ?*anyopaque, w: c_int, h: c_int) callconv(.c) void {
+    const rc: *ResizeCb = @ptrCast(@alignCast(user orelse return));
+    var args = [_]Value{ Value.newInt(@intCast(w)), Value.newInt(@intCast(h)) };
+    _ = rc.host.invokeCallable(&rc.callback, &args, rc.out) catch {};
+}
+
+/// `__composeui_winPoll(handle, timeoutMs, onResize?): Long` — wait up to timeoutMs
+/// for an event; returns `(type << 32) | (x << 16) | y` where type is 0 none, 1
+/// click, 2 close. When `onResize: (Int, Int) -> Unit` is supplied it is invoked
+/// during a live resize so the UI reflows in realtime.
 fn winPoll(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 2) return ok(Value.newLong(2 << 32));
     const skia = loadSkia() orelse return ok(Value.newLong(2 << 32));
     const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(2 << 32));
     const timeout: c_int = @intCast(@max(0, argInt(ctx.args[1])));
+    // Register the live-resize render callback (if given) for this poll only. `rc`
+    // stays valid on the stack for the whole `skia.winPoll` call, and the callback
+    // is a live argument so the VM keeps it rooted.
+    var rc: ResizeCb = undefined;
+    const has_cb = ctx.args.len >= 3 and ctx.args[2] != .Null;
+    if (has_cb) {
+        rc = .{ .host = ctx.host, .callback = ctx.args[2], .out = ctx.out };
+        skia.winSetResizeCb(win, resizeTrampoline, &rc);
+    }
     var x: c_int = 0;
     var y: c_int = 0;
     const t = skia.winPoll(win, timeout, &x, &y);
+    if (has_cb) skia.winSetResizeCb(win, null, null);
     const packed_ev: i64 = (@as(i64, t) << 32) |
         (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
         @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
