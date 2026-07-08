@@ -9,8 +9,13 @@ package androidx.compose.ui.graphics
 
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 
 // The platform canvas handle. klio draws through the Skia shim by surface handle,
 // so this is only a marker for Canvas's framework-canvas accessor.
@@ -162,6 +167,34 @@ fun klioDrawToPng(width: Int, height: Int, path: String, block: Canvas.() -> Uni
     val handle = __skia_surf_new(width, height)
     if (handle == 0L) return false
     KlioCanvas(handle).block()
+    val ok = __skia_surf_save_png(handle, path) != 0L
+    __skia_surf_free(handle)
+    return ok
+}
+
+/**
+ * klio helper: render a real [DrawScope] block onto an offscreen [width] x
+ * [height] surface (at [density] px/dp) through the upstream [CanvasDrawScope],
+ * and save it as a PNG. Returns false (no-op) when no Skia backend is present.
+ * This is the DrawScope entry point — the same one a desktop Compose program's
+ * `Canvas { … }` composable ultimately drives.
+ */
+fun klioRenderToPng(
+    width: Int,
+    height: Int,
+    density: Float,
+    path: String,
+    block: DrawScope.() -> Unit,
+): Boolean {
+    val handle = __skia_surf_new(width, height)
+    if (handle == 0L) return false
+    CanvasDrawScope().draw(
+        Density(density),
+        LayoutDirection.Ltr,
+        KlioCanvas(handle),
+        Size(width.toFloat(), height.toFloat()),
+        block,
+    )
     val ok = __skia_surf_save_png(handle, path) != 0L
     __skia_surf_free(handle)
     return ok

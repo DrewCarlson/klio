@@ -40,6 +40,14 @@ include = [
     # The Canvas surface (klioMain supplies the actual over the Skia shim).
     "androidx/compose/ui/graphics/Canvas.kt",
     "androidx/compose/ui/graphics/Vertices.kt",
+    # The DrawScope layer — pure Kotlin over Canvas.
+    "androidx/compose/ui/graphics/drawscope/DrawScopeMarker.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawTransform.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawContext.kt",
+    "androidx/compose/ui/graphics/drawscope/DrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/CanvasDrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/ContentDrawScope.kt",
+    "androidx/compose/ui/graphics/drawscope/EmptyCanvas.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",
