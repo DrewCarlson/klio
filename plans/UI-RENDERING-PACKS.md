@@ -22,12 +22,17 @@ one-pack-per-upstream-module rule are in [MULTIPLATFORM.md](MULTIPLATFORM.md)
   host intrinsics. A draw pass records a **display list** of ops — the deterministic,
   Skia-independent test artifact (PNG bytes are the visual proof). Optional GPU:
   Ganesh+EGL (Linux, opt-in) and Metal (macOS window).
-- **Live windows** — X11 (Linux, verified) and **macOS Cocoa + Metal GPU** (verified
-  on hardware): a real window runs render → present → poll → dispatch, with
-  HiDPI/Retina, a Quit menu, realtime live-resize (native→VM reflow callback),
-  batched input, keyboard/hover/pointer, a `TextField`, and word-wrapped `Paragraph`
-  text. A bundled Latin font (`src/compose_ui/fonts/`) makes text self-contained.
-  Win32 backend is written but unverified (needs a Windows host).
+- **Live windows** — **SDL2 (Linux, verified: software + GPU)** and **macOS Cocoa +
+  Metal GPU** (verified on hardware): a real window runs render → present → poll →
+  dispatch, with a Quit menu, live-resize, batched input, keyboard/hover/pointer, a
+  `TextField`, and word-wrapped `Paragraph` text. A bundled Latin font
+  (`src/compose_ui/fonts/`) makes text self-contained. The Linux backend is SDL2
+  (one C ABI, `-DKLIO_SDL`): SDL picks X11 or Wayland at runtime, so it covers the
+  broad desktop matrix; the raster path uploads the N32 surface to a streaming
+  texture, and `-Dgpu` wraps the window's GL framebuffer as a Skia Ganesh surface
+  (verified on an NVIDIA RTX 6000 via zink, GL 4.6, real on-screen GPU rendering),
+  falling back to raster if GL bring-up fails. Win32 backend is written but
+  unverified (needs a Windows host).
 - **klio-authored ui-core** (`klio.compose.ui`) — `LayoutNode` emit →
   measure/layout/draw, a `Modifier` chain, `Column`/`Row`/`Box`/`Text`/`Button`/
   `LazyColumn`, pointer input, `MaterialTheme` via CompositionLocal, `runApp`. This
@@ -101,5 +106,11 @@ Vendor per module (one pack each; expand the sparse checkout via
 - **Pack-image companion-`val` import aliasing** — in a baked pack image,
   `import X.Companion.Y` doesn't alias the qualified singleton `X.Y` (`===` false);
   correct from source. Blocks colour/style singleton identity in shipped packs.
-- **Other backends:** verify Win32 on a Windows host; the offscreen Ganesh+EGL GPU
-  path is Linux-only (the macOS window GPU surface is Metal).
+- **Other backends:** verify Win32 on a Windows host. The Linux window is SDL2
+  (raster + on-screen Ganesh GPU over SDL's GL context); the offscreen Ganesh+EGL
+  path also remains for headless GPU. The macOS window GPU surface is Metal.
+- **SDL notes:** the Linux backend targets SDL2 (in every distro's repos today).
+  The on-screen GPU path assembles Skia's **native** (GLX) GL interface — the
+  loader-assembled interface crashes in zink's extension enumeration. Only editing
+  keys (Backspace/Delete) are mapped from key-downs; printable input comes through
+  `SDL_TEXTINPUT`, reported with the X11-style keysyms the interim ui-core expects.
