@@ -92,7 +92,7 @@ pub const ClassDef = struct {
     /// One nested class binding: simple name -> resolved `ClassDef`.
     pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
 
-    const MAX_WALK = 128;
+    pub const MAX_WALK = 128;
 
     /// GC tracer for the class graph. Marks every cell a class reaches:
     /// supertypes, nested/companion/enclosing/object-singleton, the captured

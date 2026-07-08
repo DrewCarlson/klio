@@ -7409,33 +7409,50 @@ fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
     return false;
 }
 
-/// Set of class names (with parents) reachable through the enclosing-this
-/// chain, including each instance's `outer` links.
+/// Append `cls` and its full transitive supertype closure — the superclass
+/// chain AND every implemented interface, recursively — to `out` in
+/// innermost-first order, deduped by pointer identity through `seen`. A
+/// member-extension declared as a superclass or interface default body is in
+/// scope wherever an enclosing `this` carries that owner ANYWHERE in its
+/// hierarchy, so the closure (not just the single `parent` chain) is what
+/// gates its visibility. Class pointers are arena-backed and immutable after
+/// linking, so reading `name`/`fqn`/`parent`/`interfaces` off `asPtr()` needs
+/// no borrow (mirrors `ClassDef.findMethodWalk`).
+fn collectClassClosure(
+    cls: *const ClassDef,
+    out: *std.ArrayList(*const ClassDef),
+    seen: *std.ArrayList(*const ClassDef),
+    allocator: Allocator,
+) void {
+    for (seen.items) |p| if (p == cls) return;
+    if (seen.items.len > ClassDef.MAX_WALK) return;
+    seen.append(allocator, cls) catch return;
+    out.append(allocator, cls) catch return;
+    if (cls.parent) |p| collectClassClosure(p.asPtr(), out, seen, allocator);
+    for (cls.interfaces) |iface| collectClassClosure(iface.asPtr(), out, seen, allocator);
+}
+
+/// Set of class names (with the full supertype closure — superclasses AND
+/// interfaces) reachable through the enclosing-this chain, including each
+/// instance's `outer` links.
 fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.StringHashMap(void) {
     var set: std.StringHashMap(void) = .init(allocator);
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
+    var closure: std.ArrayList(*const ClassDef) = .empty;
+    defer closure.deinit(allocator);
+    var seen: std.ArrayList(*const ClassDef) = .empty;
+    defer seen.deinit(allocator);
     for (chain) |v| {
         var cur: ?Value = v;
         while (cur) |cv| {
             if (cv == .Instance) {
                 const g = cv.Instance.borrow();
-                const cg = g.get().class.borrow();
-                set.put(cg.get().name, {}) catch {};
-                set.put(cg.get().fqn, {}) catch {};
-                var p = blk: {
-                    const pp = cg.get().parent;
-                    break :blk if (pp) |x| x.clone() else null;
-                };
-                cg.deinit();
-                while (p) |pp| {
-                    const ppg = pp.borrow();
-                    set.put(ppg.get().name, {}) catch {};
-                    set.put(ppg.get().fqn, {}) catch {};
-                    const next = ppg.get().parent;
-                    ppg.deinit();
-                    pp.deinit();
-                    p = if (next) |x| x.clone() else null;
+                closure.clearRetainingCapacity();
+                collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
+                for (closure.items) |cd| {
+                    set.put(cd.name, {}) catch {};
+                    set.put(cd.fqn, {}) catch {};
                 }
                 const outer = g.get().outer;
                 g.deinit();
@@ -8074,26 +8091,21 @@ fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.Error
     var v: std.ArrayList([]const u8) = .empty;
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
+    var closure: std.ArrayList(*const ClassDef) = .empty;
+    defer closure.deinit(allocator);
+    // Persistent across the whole chain: a supertype shared by an inner and
+    // an outer `this` is ranked at its innermost occurrence (first match
+    // wins in `applicExtOwnerRankCb`), so it must appear only once.
+    var seen: std.ArrayList(*const ClassDef) = .empty;
+    defer seen.deinit(allocator);
     for (chain) |value| {
         var cur: ?Value = value;
         while (cur) |cv| {
             if (cv == .Instance) {
                 const g = cv.Instance.borrow();
-                const cg = g.get().class.borrow();
-                try v.append(allocator, cg.get().name);
-                var p = blk: {
-                    const pp = cg.get().parent;
-                    break :blk if (pp) |x| x.clone() else null;
-                };
-                cg.deinit();
-                while (p) |pp| {
-                    const ppg = pp.borrow();
-                    try v.append(allocator, ppg.get().name);
-                    const next = ppg.get().parent;
-                    ppg.deinit();
-                    pp.deinit();
-                    p = if (next) |x| x.clone() else null;
-                }
+                closure.clearRetainingCapacity();
+                collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
+                for (closure.items) |cd| try v.append(allocator, cd.name);
                 const outer = g.get().outer;
                 g.deinit();
                 cur = outer;
