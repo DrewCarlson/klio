@@ -763,13 +763,15 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
     // the UI draws in points but rasterizes crisply on Retina.
     layer.contentsScale = scale;
     layer.drawableSize = CGSizeMake(w * scale, h * scale);
-    // A layer-HOSTING view (custom layer assigned) does not get its layer sized by
-    // AppKit — set the on-screen frame explicitly or the drawable renders correctly
-    // but composites at 0x0 (a blank window). Kept in sync on resize below.
-    layer.frame = NSMakeRect(0, 0, w, h);
     layer.opaque = YES;
-    [kw->view setLayer:layer];
+    // Layer-backed view + an autoresizing Metal sublayer: during a live resize
+    // AppKit resizes the backing layer and Core Animation scales the last presented
+    // drawable to fill (live visual feedback while the modal resize loop blocks the
+    // VM); the VM re-renders at the new drawableSize when its loop resumes.
+    layer.frame = NSMakeRect(0, 0, w, h);
+    layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     [kw->view setWantsLayer:YES];
+    [kw->view.layer addSublayer:layer];
 
     GrMtlBackendContext backend = {};
     backend.fDevice.retain((GrMTLHandle)device);
@@ -795,6 +797,27 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
 }
 #endif  // KLIO_METAL
 
+// Minimal main menu so the window behaves like a real app: Quit (Cmd-Q). Window
+// close is left to the app to wire if it wants it. Once per process.
+static void klioSetupMenu(const char* title) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    NSString* name = title ? [NSString stringWithUTF8String:title] : @"klio";
+    NSMenu* menuBar = [[NSMenu alloc] init];
+    NSMenuItem* appItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:appItem];
+    [NSApp setMainMenu:menuBar];
+    NSMenu* appMenu = [[NSMenu alloc] init];
+    [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", name]
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [appMenu release];
+    [appItem release];
+    [menuBar release];
+}
+
 extern "C" {
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
@@ -802,6 +825,7 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        klioSetupMenu(title);
         NSRect frame = NSMakeRect(0, 0, w, h);
         NSWindow* window = [[NSWindow alloc]
             initWithContentRect:frame
