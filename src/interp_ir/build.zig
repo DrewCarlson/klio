@@ -1955,6 +1955,11 @@ fn buildModuleWithOverrides(
                 else => {},
             }
         }
+        // Companion-object members, enum entries, and nested-class names are
+        // visible under their bare names in a primary-ctor default value
+        // (`class Stroke(cap: StrokeCap = DefaultCap)` reads the companion's
+        // `DefaultCap`), the same as inside a method body.
+        try ir.lower.decl.addVisibleMemberNames(c, &own_members);
         var prop_init_params: std.ArrayList([]const u8) = .empty;
         defer prop_init_params.deinit(a);
         try prop_init_params.append(a, "this");
@@ -1965,11 +1970,20 @@ fn buildModuleWithOverrides(
             if (p.default != null) any_ctor_default = true;
         }
         if (any_ctor_default) {
+            // A ctor default runs before `this` exists — the runtime passes a
+            // null receiver. Give the receiver slot a non-`this` name so a bare
+            // companion member (`cap = DefaultCap`) resolves against the
+            // companion object (the param-thunk path) rather than a null-`this`
+            // field read. Previous params still resolve by their own names.
+            var ctor_default_params: std.ArrayList([]const u8) = .empty;
+            defer ctor_default_params.deinit(a);
+            try ctor_default_params.append(a, "$ctor_default_recv");
+            for (c.primary_params) |*p| try ctor_default_params.append(a, p.name.name);
             var slots = try a.alloc(?FuncId, c.primary_params.len);
             for (c.primary_params, 0..) |*p, i| {
                 if (p.default) |*e| {
                     const nm = try std.fmt.allocPrint(a, "__ctor_default_{s}_{s}", .{ c.name.name, p.name.name });
-                    slots[i] = try ir.lower.lowerAccessorExpr(module, c.name.name, &own_members, prop_init_params.items, e, nm);
+                    slots[i] = try ir.lower.lowerExprAsParamThunkScoped(module, ctor_default_params.items, e, nm, c.name.name, &own_members);
                 } else {
                     slots[i] = null;
                 }
