@@ -129,8 +129,27 @@ so desktop Compose programs are source-compatible.
 `compose.foundation` (Box/Row/Column/Text/Image, scroll, gesture, `Lazy*` on
 subcomposition), then `compose.material3` (mostly verbatim on foundation).
 
+Dependency chain (surveyed from foundation's imports; sparse-checkout expanded to
+`compose/foundation/foundation/src/commonMain` — 342 files, 67 expects): foundation
+needs two modules NOT yet vendored — **`androidx.compose.ui.text`** (341 refs;
+needs the shim's text-shaping actuals) and **`androidx.compose.animation.core`**
+(120 refs; mostly pure-Kotlin animation math). So the vendoring order is
+**ui-text + animation-core → foundation → material3**. Its `androidx.compose.ui.*`
+needs (node/input/layout/platform/semantics) are satisfied by the vendored ui-core
+engine; unit/graphics/geometry/util by their packs.
+
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.
+Each module's pack builds with unimplemented actuals throwing at runtime (the
+graphics/ui-core pattern), so the API surface lands incrementally; end-to-end
+rendering follows the ui-engine Owner/render driver (§2).
+
+### Operational note — rebuild packs after a binary change
+
+A pack IMAGE is only consistent with the interpreter binary it was built against.
+After changing the interpreter, rebuild every pack you have installed
+(`klio pack build <dir>` + `klio pack install`); a stale image can misresolve
+(it read as a spurious cross-pack enum shadow until the ui-core pack was rebuilt).
 
 ## Deferred / open
 
