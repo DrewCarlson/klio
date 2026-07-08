@@ -56,6 +56,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_skew", canvasSkew);
     try b.register("androidx.compose.ui.graphics.__skia_c_clip_rect", canvasClipRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_clip_path", canvasClipPath);
+    try b.register("androidx.compose.ui.graphics.__skia_c_set_shader", canvasSetShader);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rect", canvasDrawRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_rrect", canvasDrawRRect);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_oval", canvasDrawOval);
@@ -123,6 +124,7 @@ const Skia = struct {
     cSkew: ?CXYFn,
     cClipRect: ?CClipRectFn,
     cClipPath: ?CClipPathFn,
+    cSetShader: ?CSetShaderFn,
     cDrawRect: ?CDrawRectFn,
     cDrawRRect: ?CDrawRRectFn,
     cDrawOval: ?CDrawRectFn,
@@ -150,6 +152,7 @@ const CXYFn = *const fn (?*SkSurface, f32, f32) callconv(.c) void;
 const CRotateFn = *const fn (?*SkSurface, f32) callconv(.c) void;
 const CClipRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, c_int) callconv(.c) void;
 const CClipPathFn = *const fn (?*SkSurface, [*:0]const u8, c_int) callconv(.c) void;
+const CSetShaderFn = *const fn (?*SkSurface, [*:0]const u8) callconv(.c) void;
 // The trailing (argb, style, strokeWidth, cap, join, aa) is the packed paint.
 const CDrawRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
@@ -208,6 +211,7 @@ fn loadSkia() ?*Skia {
         .cSkew = lib.lookup(CXYFn, "klio_skia_c_skew"),
         .cClipRect = lib.lookup(CClipRectFn, "klio_skia_c_clip_rect"),
         .cClipPath = lib.lookup(CClipPathFn, "klio_skia_c_clip_path"),
+        .cSetShader = lib.lookup(CSetShaderFn, "klio_skia_c_set_shader"),
         .cDrawRect = lib.lookup(CDrawRectFn, "klio_skia_c_draw_rect"),
         .cDrawRRect = lib.lookup(CDrawRRectFn, "klio_skia_c_draw_rrect"),
         .cDrawOval = lib.lookup(CDrawRectFn, "klio_skia_c_draw_oval"),
@@ -617,6 +621,21 @@ fn canvasClipPath(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// `__skia_c_set_shader(handle, gradientText)` — arm the next draw's gradient
+/// shader (empty text clears it). The Canvas actual sets it around a brush draw.
+fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cSetShader orelse return ok(Value.newLong(0));
+    const pg = ctx.args[1].String.borrow();
+    defer pg.deinit();
+    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(txt);
+    f(surf, txt.ptr);
+    return ok(Value.newLong(0));
+}
+
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -693,7 +712,8 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_path_op") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_path") != null);
-    try testing.expectEqual(@as(usize, 24), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_shader") != null);
+    try testing.expectEqual(@as(usize, 25), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

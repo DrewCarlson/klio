@@ -33,6 +33,7 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkTypeface.h"
 #include "include/encode/SkPngEncoder.h"
+#include "include/effects/SkGradient.h"
 #include "include/pathops/SkPathOps.h"
 // Font manager factory: the macOS Skia pack ships CoreText, not the custom-empty
 // port (that symbol is absent), so select per platform.
@@ -521,10 +522,84 @@ void klio_skia_free_cstr(char* s) { std::free(s); }
 // ---------------------------------------------------------------------------
 namespace {
 
+// A shader parsed from klio's serialized gradient text, applied to the next
+// draw's paint. A gradient brush sets this before the draw and clears it after.
+static thread_local sk_sp<SkShader> g_pendingShader;
+
+static SkTileMode tileModeFrom(int m) {
+    switch (m) {
+        case 1: return SkTileMode::kRepeat;
+        case 2: return SkTileMode::kMirror;
+        case 3: return SkTileMode::kDecal;
+        default: return SkTileMode::kClamp;
+    }
+}
+
+// Text: "L|fromX,fromY|toX,toY|tile|argb0,pos0;argb1,pos1;…" (L linear, R radial:
+// "R|cx,cy|radius|tile|stops…"). Returns null on a malformed string.
+static sk_sp<SkShader> makeShaderFromText(const char* text) {
+    if (!text || !*text) return nullptr;
+    std::string s(text);
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (true) {
+        size_t bar = s.find('|', start);
+        parts.push_back(s.substr(start, bar == std::string::npos ? std::string::npos : bar - start));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    if (parts.size() < 5) return nullptr;
+    const bool linear = parts[0] == "L";
+    std::vector<SkColor4f> colors;
+    std::vector<SkScalar> pos;
+    {
+        std::string& stops = parts[4];
+        size_t p = 0;
+        while (p < stops.size()) {
+            size_t semi = stops.find(';', p);
+            std::string tok = stops.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
+            if (!tok.empty()) {
+                size_t comma = tok.find(',');
+                if (comma != std::string::npos) {
+                    uint32_t argb = (uint32_t)strtoul(tok.substr(0, comma).c_str(), nullptr, 10);
+                    float sp = strtof(tok.substr(comma + 1).c_str(), nullptr);
+                    colors.push_back(SkColor4f::FromColor(toColor(argb)));
+                    pos.push_back(sp);
+                }
+            }
+            if (semi == std::string::npos) break;
+            p = semi + 1;
+        }
+    }
+    if (colors.size() < 2) return nullptr;
+    const int tile = atoi(parts[3].c_str());
+    SkGradient::Colors gc(SkSpan<const SkColor4f>(colors.data(), colors.size()),
+                          SkSpan<const SkScalar>(pos.data(), pos.size()),
+                          tileModeFrom(tile), nullptr);
+    SkGradient grad(gc, SkGradient::Interpolation{});
+    if (linear) {
+        float fx = 0, fy = 0, tx = 0, ty = 0;
+        sscanf(parts[1].c_str(), "%f,%f", &fx, &fy);
+        sscanf(parts[2].c_str(), "%f,%f", &tx, &ty);
+        SkPoint pts[2] = {{fx, fy}, {tx, ty}};
+        return SkShaders::LinearGradient(pts, grad, nullptr);
+    } else {
+        float cx = 0, cy = 0, radius = 0;
+        sscanf(parts[1].c_str(), "%f,%f", &cx, &cy);
+        radius = strtof(parts[2].c_str(), nullptr);
+        return SkShaders::RadialGradient(SkPoint{cx, cy}, radius, grad, nullptr);
+    }
+}
+
+extern "C" void klio_skia_c_set_shader(KlioSurface* /*s*/, const char* text) {
+    g_pendingShader = makeShaderFromText(text);
+}
+
 SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, int join, int aa) {
     SkPaint p;
     p.setAntiAlias(aa != 0);
     p.setColor(toColor(argb));
+    if (g_pendingShader) p.setShader(g_pendingShader);
     if (style == 1) {  // Stroke (0 = Fill; compose has no separate FillAndStroke)
         p.setStyle(SkPaint::kStroke_Style);
         p.setStrokeWidth(strokeWidth);
@@ -1503,3 +1578,5 @@ void klio_win_close(void*) {}
 }  // extern "C"
 
 #endif
+
+// gradient shader support

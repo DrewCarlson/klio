@@ -38,6 +38,7 @@ internal fun __skia_c_rotate(handle: Long, degrees: Float): Long = error("intrin
 internal fun __skia_c_skew(handle: Long, sx: Float, sy: Float): Long = error("intrinsic __skia_c_skew not installed")
 internal fun __skia_c_clip_rect(handle: Long, l: Float, t: Float, r: Float, b: Float, clipOp: Int): Long = error("intrinsic __skia_c_clip_rect not installed")
 internal fun __skia_c_clip_path(handle: Long, pathText: String, clipOp: Int): Long = error("intrinsic __skia_c_clip_path not installed")
+internal fun __skia_c_set_shader(handle: Long, gradientText: String): Long = error("intrinsic __skia_c_set_shader not installed")
 internal fun __skia_c_draw_rect(handle: Long, l: Float, t: Float, r: Float, b: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_rect not installed")
 internal fun __skia_c_draw_rrect(handle: Long, l: Float, t: Float, r: Float, b: Float, rx: Float, ry: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_rrect not installed")
 internal fun __skia_c_draw_oval(handle: Long, l: Float, t: Float, r: Float, b: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_oval not installed")

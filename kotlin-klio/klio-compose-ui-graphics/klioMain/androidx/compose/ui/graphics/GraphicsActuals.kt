@@ -15,15 +15,47 @@ import androidx.compose.ui.graphics.colorspace.ColorSpace
 // return type; it is never instantiated (asFrameworkPaint throws by default).
 actual class NativePaint
 
-// An opaque handle to a platform shader. Gradient / image / composite shaders
-// are not yet wired to the Skia shim, so their factories are pending; the type
-// exists so Paint.shader (nullable, default null) resolves.
-actual class Shader
+// A platform shader. Gradient shaders carry a serialized description ([klioText],
+// "L|from|to|tile|argb,pos;…" / "R|center|radius|tile|…") the Skia shim
+// reconstructs at draw time; a null/empty text is a not-yet-supported shader.
+actual class Shader {
+    internal var klioText: String = ""
+}
 
 internal actual class TransformShader actual constructor() {
     actual var shader: Shader? = null
 
     actual fun transform(matrix: Matrix?) {}
+}
+
+// A gradient colour as packed 0xAARRGGBB from the colour's own channels (avoiding
+// toArgb's deferred colourspace path), matching how KlioCanvas packs paint.
+private fun gradientArgb(c: Color): Int {
+    val a = (c.alpha * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val r = (c.red * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val g = (c.green * 255f + 0.5f).toInt().coerceIn(0, 255)
+    val b = (c.blue * 255f + 0.5f).toInt().coerceIn(0, 255)
+    return (a shl 24) or (r shl 16) or (g shl 8) or b
+}
+
+private fun tileModeCode(tileMode: TileMode): Int = when (tileMode) {
+    TileMode.Repeated -> 1
+    TileMode.Mirror -> 2
+    TileMode.Decal -> 3
+    else -> 0
+}
+
+private fun stops(colors: List<Color>, colorStops: List<Float>?): String {
+    val sb = StringBuilder()
+    for (i in colors.indices) {
+        val pos = colorStops?.getOrNull(i) ?: if (colors.size == 1) 0f else i.toFloat() / (colors.size - 1)
+        // argb is unsigned; print as an unsigned Long so the shim reads all 32 bits.
+        sb.append((gradientArgb(colors[i]).toLong() and 0xFFFFFFFFL).toString())
+        sb.append(",")
+        sb.append(pos)
+        sb.append(";")
+    }
+    return sb.toString()
 }
 
 internal actual fun ActualLinearGradientShader(
@@ -32,7 +64,9 @@ internal actual fun ActualLinearGradientShader(
     colors: List<Color>,
     colorStops: List<Float>?,
     tileMode: TileMode,
-): Shader = throw NotImplementedError("gradient shaders are not yet supported")
+): Shader = Shader().apply {
+    klioText = "L|${from.x},${from.y}|${to.x},${to.y}|${tileModeCode(tileMode)}|${stops(colors, colorStops)}"
+}
 
 internal actual fun ActualRadialGradientShader(
     center: Offset,
@@ -40,13 +74,15 @@ internal actual fun ActualRadialGradientShader(
     colors: List<Color>,
     colorStops: List<Float>?,
     tileMode: TileMode,
-): Shader = throw NotImplementedError("gradient shaders are not yet supported")
+): Shader = Shader().apply {
+    klioText = "R|${center.x},${center.y}|$radius|${tileModeCode(tileMode)}|${stops(colors, colorStops)}"
+}
 
 internal actual fun ActualSweepGradientShader(
     center: Offset,
     colors: List<Color>,
     colorStops: List<Float>?,
-): Shader = throw NotImplementedError("gradient shaders are not yet supported")
+): Shader = throw NotImplementedError("sweep gradient shaders are not yet supported")
 
 internal actual fun ActualImageShader(
     image: ImageBitmap,
