@@ -45,8 +45,8 @@ one-pack-per-upstream-module rule are in [MULTIPLATFORM.md](MULTIPLATFORM.md)
   color-science colorspace package + the drawing-parameter value classes
   BlendMode/StrokeCap/PathFillType/…). No Skia in this layer.
 
-Examples: `compose_{color,density,ui,ui_click,ui_lazy,ui_material,ui_text,
-ui_window,ui_input,ui_png}.kt`, `mosaic_hello.kt`.
+Examples: `compose_{color,density,path,paint,pathop,ui,ui_click,ui_geometry,
+ui_lazy,ui_material,ui_text,ui_window,ui_input,ui_png}.kt`, `mosaic_hello.kt`.
 
 ### Interpreter fixes this vendoring drove (all general, landed)
 
@@ -62,14 +62,27 @@ collisions, and interface-inherited member-extensions via a `with` receiver (the
 
 ### 1. Skia-backed `compose.ui.graphics` (the current frontier)
 
-The pure-Kotlin graphics is done; the next layer is the **Skia-backed** drawing
-API — real `androidx.compose.ui.graphics.Canvas` / `Paint` / `Path` / `Shader` /
-`ImageBitmap` and the `graphics.drawscope.DrawScope`, implemented as **klioMain
-actuals over the `src/compose_ui` shim**. This is where the vendored graphics API
-meets the renderer. Suggested order: `Path` → `Paint` → `Canvas` → `DrawScope`.
-Each upstream `expect`/platform type gets a klioMain actual that calls the shim's
-`extern "C"` entry points (extend the shim as needed). `Shape`/`Outline` sit just
-above (`Outline.Generic` needs `Path`), unblocking `RoundedCornerShape` etc.
+The pure-Kotlin graphics is done, and the Skia-backed drawing API is landing as
+**klioMain actuals over the `src/compose_ui` shim** in the order `Path` → `Paint`
+→ `Canvas` → `DrawScope`:
+
+- **`Path` — done.** A pure-Kotlin command buffer (`KlioPath`): build ops,
+  `getBounds`, `isEmpty`/`isConvex`, `translate`, `addPath`, `PathIterator`; higher-
+  level shapes decompose to cubics on add. `Path.op` (union/intersect/difference/
+  xor) runs through the shim's `SkPathOps` via the `__skia_path_op` intrinsic.
+  Examples: `compose_path.kt`, `compose_pathop.kt`.
+- **`Paint` — done.** A plain value object (`KlioPaint`): fill/stroke, colour,
+  stroke width/cap/join/miter, blend mode, alpha, AA, filter quality. The shader /
+  colour-filter / path-effect / `ImageBitmap` factories throw pending (they need
+  the shim's shader/filter/bitmap surface); the slots resolve and default to null.
+  Example: `compose_paint.kt`.
+- **`Canvas` + `DrawScope` — next.** A `Canvas` actual over a `KlioSurface` that
+  draws through the shim (extend it with an `SkCanvas` transform/clip/`drawPath`
+  surface + a graphics-namespace draw intrinsic, the same wiring `Path.op` uses),
+  then vendor `graphics.drawscope.{DrawScope,CanvasDrawScope,DrawContext,
+  DrawTransform}` so a real upstream `DrawScope` block rasterizes to a PNG. Then
+  the deferred shader/filter/bitmap actuals. `Shape`/`Outline` sit just above
+  (`Outline.Generic` needs `Path`), unblocking `RoundedCornerShape` etc.
 
 ### 2. Real `androidx.compose.ui` engine
 
