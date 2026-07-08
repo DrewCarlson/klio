@@ -1,11 +1,13 @@
 # androidx.compose.ui — the real Compose UI foundation math layer, vendored
 # verbatim from the compose-multiplatform-core submodule (shared with the compose
 # runtime pack). This is genuine androidx.compose.ui code: the geometry
-# (Offset/Size/Rect/RoundRect), unit (Dp/IntOffset/IntSize/Constraints), and util
-# (packFloats/lerp) packages — pure Kotlin over inline value classes, no Skia. The
+# (Offset/Size/Rect/RoundRect), unit (Dp/IntOffset/IntSize/Constraints), util
+# (packFloats/lerp), and graphics (the Color inline value class + the color-science
+# colorspace package) packages — pure Kotlin over inline value classes, no Skia. The
 # klioMain layer supplies the handful of platform `expect` actuals (float-bit
-# helpers, fastRoundToInt, no-op tracing). The heavier ui-unit files that pull in
-# Density/FontScaling/TextUnit are excluded for this first cut.
+# helpers, fastRoundToInt, no-op tracing) plus androidx.annotation marker stubs. The
+# heavier ui-unit files that pull in Density/FontScaling/TextUnit are excluded for this
+# first cut.
 [library]
 id = "androidx.compose.ui"
 version = "1.11.1"
@@ -51,17 +53,34 @@ include = [
     "androidx/compose/ui/unit/Velocity.kt",
 ]
 
-# klioMain: the platform `expect` actuals (float bits, fastRoundToInt, tracing).
-#
-# ui-graphics (the real Color inline value class + the colorspace package) is
-# ready to vendor here too — it is pure color-science math — but the consumed
-# Color.kt's `import kotlin.math.max`/`min` is preempted by the vendored
-# same-module (different-package) `androidx.compose.ui.unit.max`/`min`: klio's
-# bare-call resolver binds the out-of-scope `ui.unit.max(Dp, Dp)` over the
-# explicitly imported `kotlin.math.max(Float, Float)`. Minimal repro: two files,
-# `import kotlin.math.max` in one and an unimported `other.max(Dp, Dp)` in the
-# other, calling `max(0.5f, 0.7f)`. Vendoring Color waits on that resolver fix
-# (a named import must win over an unimported same-name candidate).
+# ui-graphics: the real Color inline value class + the full colorspace package
+# (pure color-science math over Float/Long bit-packing — no Skia). Color.kt and
+# each colorspace file are consumed verbatim from upstream. Their
+# `androidx.annotation.*` range/size markers and `androidx.collection`
+# int-object map are supplied by the klioMain stubs and the collection pack dep.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/graphics/Color.kt",
+    "androidx/compose/ui/graphics/InlineClassHelper.kt",
+    "androidx/compose/ui/graphics/colorspace/Adaptation.kt",
+    "androidx/compose/ui/graphics/colorspace/ColorModel.kt",
+    "androidx/compose/ui/graphics/colorspace/ColorSpace.kt",
+    "androidx/compose/ui/graphics/colorspace/ColorSpaces.kt",
+    "androidx/compose/ui/graphics/colorspace/Connector.kt",
+    "androidx/compose/ui/graphics/colorspace/Illuminant.kt",
+    "androidx/compose/ui/graphics/colorspace/Lab.kt",
+    "androidx/compose/ui/graphics/colorspace/Oklab.kt",
+    "androidx/compose/ui/graphics/colorspace/RenderIntent.kt",
+    "androidx/compose/ui/graphics/colorspace/Rgb.kt",
+    "androidx/compose/ui/graphics/colorspace/TransferParameters.kt",
+    "androidx/compose/ui/graphics/colorspace/WhitePoint.kt",
+    "androidx/compose/ui/graphics/colorspace/Xyz.kt",
+]
+
+# klioMain: the platform `expect` actuals (float bits, fastRoundToInt, tracing)
+# plus the androidx.annotation range/size marker stubs the vendored graphics
+# sources import.
 [[source]]
 root = "klioMain"
 
@@ -69,3 +88,7 @@ root = "klioMain"
 id = "stdlib"
 [[deps]]
 id = "androidx.compose.runtime"
+# Connector.kt uses androidx.collection.mutableIntObjectMapOf for its
+# colorspace-connection cache.
+[[deps]]
+id = "androidx.collection"

@@ -80,6 +80,43 @@ const ObjectInitState = root.ObjectInitState;
 pub const FILE_INIT_FAILED_FQN = "kotlin.native.internal.FileFailedToInitializeException";
 const FILE_INIT_FAILED_MSG = "There was an error during file or class initialization";
 
+/// Env-gated (`KLIO_INIT_DEBUG`) trace of the raw error that failed an
+/// `object`/companion initializer, printed at the point of first failure so
+/// the true root cause is visible even when later re-accesses (`.failed`)
+/// bury it under a cause-less `FileFailedToInitializeException`.
+fn initDebugLog(name: []const u8, e: EvalError) void {
+    if (runtime.getenvSlice("KLIO_INIT_DEBUG") == null) return;
+    switch (e) {
+        .Throw => |t| switch (t) {
+            .Exception => |ex| {
+                const fg = ex.fqn.borrow();
+                defer fg.deinit();
+                std.debug.print("[init-debug] {s} FAILED: throw {s}", .{ name, fg.get().bytes });
+                if (ex.message) |m| {
+                    const mg = m.borrow();
+                    defer mg.deinit();
+                    std.debug.print(": {s}", .{mg.get().bytes});
+                }
+                std.debug.print("\n", .{});
+            },
+            .Instance => |inst| {
+                const g = inst.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                std.debug.print("[init-debug] {s} FAILED: throw instance {s}\n", .{ name, cg.get().fqn });
+            },
+            else => std.debug.print("[init-debug] {s} FAILED: throw <value>\n", .{name}),
+        },
+        .Unbound => |s| std.debug.print("[init-debug] {s} FAILED: Unbound `{s}`\n", .{ name, s }),
+        .CalleeFailed => |s| std.debug.print("[init-debug] {s} FAILED: CalleeFailed `{s}`\n", .{ name, s }),
+        .Unimplemented => |s| std.debug.print("[init-debug] {s} FAILED: Unimplemented `{s}`\n", .{ name, s }),
+        .Type => |s| std.debug.print("[init-debug] {s} FAILED: Type `{s}`\n", .{ name, s }),
+        .Unsupported => |s| std.debug.print("[init-debug] {s} FAILED: Unsupported `{s}`\n", .{ name, s }),
+        else => std.debug.print("[init-debug] {s} FAILED: eval error {s}\n", .{ name, @tagName(e) }),
+    }
+}
+
 fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!EvalError {
     const fqn = try runtime.strInit(allocator, FILE_INIT_FAILED_FQN);
     const msg = try runtime.strInit(allocator, FILE_INIT_FAILED_MSG);
@@ -272,6 +309,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             return .{ .ok = inst };
         },
         .err => |e| {
+            initDebugLog(name, e);
             markObjectFailed(self, name);
             // First access surfaces the failure wrapped with the original
             // throwable as its cause; non-throw eval errors (an unresolved
@@ -388,6 +426,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             return .{ .ok = inst };
         },
         .err => |e| {
+            initDebugLog(fqn, e);
             markObjectFailed(self, fqn);
             switch (e) {
                 .Throw => |cause| return .{ .err = try fileInitFailedThrow(allocator, cause) },
