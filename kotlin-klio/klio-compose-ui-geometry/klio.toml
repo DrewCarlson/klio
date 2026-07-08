@@ -1,0 +1,30 @@
+# androidx.compose.ui:ui-geometry — the compose UI geometry module, vendored
+# verbatim. One klio pack per upstream Gradle module: the `androidx.compose.ui.geometry`
+# package (Offset / Size / Rect / RoundRect / CornerRadius / MutableRect) — pure
+# Kotlin over inline value classes, no Skia, built on ui-util's bit-packing.
+[library]
+id = "androidx.compose.ui.geometry"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-geometry/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/geometry/GeometryUtils.kt",
+    "androidx/compose/ui/geometry/InlineClassHelper.kt",
+    "androidx/compose/ui/geometry/Offset.kt",
+    "androidx/compose/ui/geometry/Size.kt",
+    "androidx/compose/ui/geometry/CornerRadius.kt",
+    "androidx/compose/ui/geometry/Rect.kt",
+    "androidx/compose/ui/geometry/RoundRect.kt",
+    "androidx/compose/ui/geometry/MutableRect.kt",
+]
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.ui.util"
