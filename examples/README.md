@@ -75,6 +75,7 @@ Run any program with:
 | `dsl_dotted_head.kt`          | Dotted-head resolution inside receiver lambdas: a package-qualified head (`kotlin.math.*`) flattens to a global while a receiver-member dotted access walks `this`. |
 | `vararg_spread.kt`            | `vararg` and the spread operator.                           |
 | `deep_call_chain.kt`         | A 40-deep method-call chain (`sb.append(x).append(x)…`) — a type-checker regression guard: re-typing the receiver at each level was O(2^depth). |
+| `ctor_vs_factory.kt`         | A class with a same-named factory that fills a default parameter — a single-arg call (`Packed(3f)`) must pick the factory, not the value-class constructor. |
 | `vararg_nonfinal.kt`         | `vararg` before a trailing defaulted parameter, called positionally (top-level, inline, member). |
 | `class_factory_overload.kt`  | Same-name factory function vs constructor, disambiguated by argument type and arity. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |

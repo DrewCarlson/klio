@@ -1924,10 +1924,18 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
         const f = m.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-        const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+        // Arity that honors default parameters: a call may omit trailing
+        // defaulted params (`CornerRadius(8f)` calls `fun CornerRadius(x, y = x)`),
+        // so require only `provided in [required, total]` — not an exact match.
+        const arity_ok = blk: {
+            if (m.decl_user_arity.get(fid.int())) |da| {
+                break :blk da.has_vararg or (provided >= da.required and provided <= da.total);
+            }
+            const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
+            break :blk vararg or f.params.len == provided;
+        };
+        if (!arity_ok) continue;
         if (clean_only) {
-            const arity_ok = f.params.len == provided or vararg;
-            if (!arity_ok) continue;
             var score: i32 = 0;
             var clean = true;
             for (args, 0..) |a, i| {
@@ -1945,8 +1953,7 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
                 best_score = score;
             }
         } else {
-            const arity_ok = f.params.len == provided or vararg;
-            if (arity_ok) return fid;
+            return fid;
         }
     }
     return best_fid;
