@@ -513,6 +513,91 @@ void klio_skia_free_cstr(char* s) { std::free(s); }
 }  // extern "C"
 
 // ---------------------------------------------------------------------------
+// Canvas surface. The real androidx.compose.ui.graphics.Canvas actual drives an
+// SkCanvas on a KlioSurface: save/restore + transforms, clips, and shape/path
+// draws with a full paint (style / stroke width / cap / join / antialias).
+// Colours arrive with alpha already folded in, so this layer only carries the
+// geometric paint state.
+// ---------------------------------------------------------------------------
+namespace {
+
+SkPaint klioCanvasPaint(uint32_t argb, int style, float strokeWidth, int cap, int join, int aa) {
+    SkPaint p;
+    p.setAntiAlias(aa != 0);
+    p.setColor(toColor(argb));
+    if (style == 1) {  // Stroke (0 = Fill; compose has no separate FillAndStroke)
+        p.setStyle(SkPaint::kStroke_Style);
+        p.setStrokeWidth(strokeWidth);
+        p.setStrokeCap(cap == 1 ? SkPaint::kRound_Cap : cap == 2 ? SkPaint::kSquare_Cap
+                                                                 : SkPaint::kButt_Cap);
+        p.setStrokeJoin(join == 1 ? SkPaint::kRound_Join : join == 2 ? SkPaint::kBevel_Join
+                                                                     : SkPaint::kMiter_Join);
+    } else {
+        p.setStyle(SkPaint::kFill_Style);
+    }
+    return p;
+}
+
+SkCanvas* klioCanvasOf(KlioSurface* s) { return s ? s->surface->getCanvas() : nullptr; }
+
+}  // namespace
+
+extern "C" {
+
+void klio_skia_c_save(KlioSurface* s) { if (auto* c = klioCanvasOf(s)) c->save(); }
+void klio_skia_c_restore(KlioSurface* s) { if (auto* c = klioCanvasOf(s)) c->restore(); }
+void klio_skia_c_translate(KlioSurface* s, float dx, float dy) { if (auto* c = klioCanvasOf(s)) c->translate(dx, dy); }
+void klio_skia_c_scale(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->scale(sx, sy); }
+void klio_skia_c_rotate(KlioSurface* s, float deg) { if (auto* c = klioCanvasOf(s)) c->rotate(deg); }
+void klio_skia_c_skew(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->skew(sx, sy); }
+
+// clipOp: 0 difference, 1 intersect (matching ClipOp).
+void klio_skia_c_clip_rect(KlioSurface* s, float l, float t, float r, float b, int clipOp) {
+    if (auto* c = klioCanvasOf(s))
+        c->clipRect(SkRect::MakeLTRB(l, t, r, b),
+                    clipOp == 0 ? SkClipOp::kDifference : SkClipOp::kIntersect, true);
+}
+void klio_skia_c_clip_path(KlioSurface* s, const char* pathText, int clipOp) {
+    if (auto* c = klioCanvasOf(s))
+        c->clipPath(klioBuildPath(pathText),
+                    clipOp == 0 ? SkClipOp::kDifference : SkClipOp::kIntersect, true);
+}
+
+void klio_skia_c_draw_rect(KlioSurface* s, float l, float t, float r, float b,
+                           uint32_t argb, int style, float sw, int cap, int join, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawRect(SkRect::MakeLTRB(l, t, r, b), klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+void klio_skia_c_draw_rrect(KlioSurface* s, float l, float t, float r, float b, float rx, float ry,
+                            uint32_t argb, int style, float sw, int cap, int join, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeLTRB(l, t, r, b), rx, ry),
+                     klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+void klio_skia_c_draw_oval(KlioSurface* s, float l, float t, float r, float b,
+                           uint32_t argb, int style, float sw, int cap, int join, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawOval(SkRect::MakeLTRB(l, t, r, b), klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+void klio_skia_c_draw_circle(KlioSurface* s, float cx, float cy, float rad,
+                             uint32_t argb, int style, float sw, int cap, int join, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawCircle(cx, cy, rad, klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+void klio_skia_c_draw_line(KlioSurface* s, float x0, float y0, float x1, float y1,
+                           uint32_t argb, float sw, int cap, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawLine(x0, y0, x1, y1, klioCanvasPaint(argb, 1, sw, cap, 0, aa));
+}
+void klio_skia_c_draw_path(KlioSurface* s, const char* pathText,
+                           uint32_t argb, int style, float sw, int cap, int join, int aa) {
+    if (auto* c = klioCanvasOf(s))
+        c->drawPath(klioBuildPath(pathText), klioCanvasPaint(argb, style, sw, cap, join, aa));
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
 // Windowing — a live on-screen surface + input event loop, one backend per OS
 // behind the same C ABI (open / surface / present / poll / close):
 //   SDL    (-DKLIO_SDL)   — Linux (and any SDL2 platform); raster (N32 premul ==
