@@ -1,0 +1,117 @@
+# androidx.compose.ui.text — text model + styling (AnnotatedString, TextStyle,
+# SpanStyle/ParagraphStyle, FontFamily/FontWeight, TextLayoutResult), vendored
+# verbatim. A dependency of compose.foundation. Text SHAPING/measure/draw
+# (ActualParagraph, drawMultiParagraph) are klioMain actuals over the Skia
+# Paragraph shim; landing incrementally, so those defer to runtime for now.
+[library]
+id = "androidx.compose.ui.text"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui-text/src/commonMain/kotlin"
+include = [
+    "androidx/compose/ui/text/AnnotatedString.kt",
+    "androidx/compose/ui/text/AtomicReference.kt",
+    "androidx/compose/ui/text/Bullet.kt",
+    "androidx/compose/ui/text/CharHelpers.kt",
+    "androidx/compose/ui/text/ComposeUiTextFlags.kt",
+    "androidx/compose/ui/text/ExperimentalTextApi.kt",
+    "androidx/compose/ui/text/font/DelegatingFontLoaderForDeprecatedUsage.kt",
+    "androidx/compose/ui/text/font/FontFamily.kt",
+    "androidx/compose/ui/text/font/FontFamilyResolver.kt",
+    "androidx/compose/ui/text/font/FontFamilyTypefaceAdapter.kt",
+    "androidx/compose/ui/text/font/Font.kt",
+    "androidx/compose/ui/text/font/FontListFontFamilyTypefaceAdapter.kt",
+    "androidx/compose/ui/text/font/FontLoadingStrategy.kt",
+    "androidx/compose/ui/text/font/FontMatcher.kt",
+    "androidx/compose/ui/text/font/FontStyle.kt",
+    "androidx/compose/ui/text/font/FontSynthesis.kt",
+    "androidx/compose/ui/text/font/FontVariation.kt",
+    "androidx/compose/ui/text/font/FontWeight.kt",
+    "androidx/compose/ui/text/font/Typeface.kt",
+    "androidx/compose/ui/text/input/EditCommand.kt",
+    "androidx/compose/ui/text/input/EditingBuffer.kt",
+    "androidx/compose/ui/text/input/EditProcessor.kt",
+    "androidx/compose/ui/text/input/GapBuffer.kt",
+    "androidx/compose/ui/text/input/ImeAction.kt",
+    "androidx/compose/ui/text/input/ImeOptions.kt",
+    "androidx/compose/ui/text/input/InputEventCallback.kt",
+    "androidx/compose/ui/text/input/KeyboardCapitalization.kt",
+    "androidx/compose/ui/text/input/KeyboardType.kt",
+    "androidx/compose/ui/text/input/MathUtils.kt",
+    "androidx/compose/ui/text/input/OffsetMapping.kt",
+    "androidx/compose/ui/text/input/PlatformImeOptions.kt",
+    "androidx/compose/ui/text/input/TextFieldValue.kt",
+    "androidx/compose/ui/text/input/TextInputService.kt",
+    "androidx/compose/ui/text/input/VisualTransformation.kt",
+    "androidx/compose/ui/text/internal/InlineClassHelper.kt",
+    "androidx/compose/ui/text/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/ui/text/InternalTextApi.kt",
+    "androidx/compose/ui/text/intl/Locale.kt",
+    "androidx/compose/ui/text/intl/LocaleList.kt",
+    "androidx/compose/ui/text/intl/PlatformLocale.kt",
+    "androidx/compose/ui/text/LinkAnnotation.kt",
+    "androidx/compose/ui/text/LinkInteractionListener.kt",
+    "androidx/compose/ui/text/MultiParagraphIntrinsics.kt",
+    "androidx/compose/ui/text/MultiParagraph.kt",
+    "androidx/compose/ui/text/ParagraphIntrinsics.kt",
+    "androidx/compose/ui/text/Paragraph.kt",
+    "androidx/compose/ui/text/ParagraphStyle.kt",
+    "androidx/compose/ui/text/Placeholder.kt",
+    "androidx/compose/ui/text/platform/Dispatcher.kt",
+    "androidx/compose/ui/text/platform/PlatformMultiParagraphDraw.kt",
+    "androidx/compose/ui/text/platform/PlatformParagraph.kt",
+    "androidx/compose/ui/text/platform/PlatformString.kt",
+    "androidx/compose/ui/text/platform/Synchronization.kt",
+    "androidx/compose/ui/text/PlatformTextStyle.kt",
+    "androidx/compose/ui/text/Savers.kt",
+    "androidx/compose/ui/text/SpanStyle.kt",
+    "androidx/compose/ui/text/StringAnnotation.kt",
+    "androidx/compose/ui/text/String.kt",
+    "androidx/compose/ui/text/style/BaselineShift.kt",
+    "androidx/compose/ui/text/style/Hyphens.kt",
+    "androidx/compose/ui/text/style/LineBreak.kt",
+    "androidx/compose/ui/text/style/LineHeightStyle.kt",
+    "androidx/compose/ui/text/style/ResolvedTextDirection.kt",
+    "androidx/compose/ui/text/style/TextAlign.kt",
+    "androidx/compose/ui/text/style/TextDecoration.kt",
+    "androidx/compose/ui/text/style/TextDirection.kt",
+    "androidx/compose/ui/text/style/TextForegroundStyle.kt",
+    "androidx/compose/ui/text/style/TextGeometricTransform.kt",
+    "androidx/compose/ui/text/style/TextIndent.kt",
+    "androidx/compose/ui/text/style/TextMotion.kt",
+    "androidx/compose/ui/text/style/TextOverflow.kt",
+    "androidx/compose/ui/text/TextGranularity.kt",
+    "androidx/compose/ui/text/TextInclusionStrategy.kt",
+    "androidx/compose/ui/text/TextLayoutResult.kt",
+    "androidx/compose/ui/text/TextLinkStyles.kt",
+    "androidx/compose/ui/text/TextMeasurer.kt",
+    "androidx/compose/ui/text/TextPainter.kt",
+    "androidx/compose/ui/text/TextRange.kt",
+    "androidx/compose/ui/text/TextStyle.kt",
+    "androidx/compose/ui/text/TtsAnnotation.kt",
+    "androidx/compose/ui/text/UrlAnnotation.kt",
+]
+
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.ui.util"
+[[deps]]
+id = "androidx.compose.ui.geometry"
+[[deps]]
+id = "androidx.compose.ui.unit"
+[[deps]]
+id = "androidx.compose.ui.graphics"
+[[deps]]
+id = "androidx.collection"
+[[deps]]
+id = "kotlinx.atomicfu"
