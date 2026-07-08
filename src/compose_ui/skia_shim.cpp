@@ -711,10 +711,14 @@ void klio_win_close(KlioWindow* kw) {
 #import <QuartzCore/CAMetalLayer.h>
 #include "include/core/SkColorSpace.h"
 #include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlBackendSurface.h"
 #include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlTypes.h"
 #include "include/gpu/ganesh/mtl/SkSurfaceMetal.h"
 #include "include/ports/SkCFObject.h"
 #endif
@@ -751,6 +755,11 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
     layer.framebufferOnly = NO;  // Skia renders into the drawable's texture
     layer.contentsScale = 1.0;
     layer.drawableSize = CGSizeMake(w, h);
+    // A layer-HOSTING view (custom layer assigned) does not get its layer sized by
+    // AppKit — set the on-screen frame explicitly or the drawable renders correctly
+    // but composites at 0x0 (a blank window). Kept in sync on resize below.
+    layer.frame = NSMakeRect(0, 0, w, h);
+    layer.opaque = YES;
     [kw->view setLayer:layer];
     [kw->view setWantsLayer:YES];
 
@@ -769,6 +778,9 @@ static bool klioMetalInit(KlioWindow* kw, int w, int h) {
     kw->metalLayer = layer;
     kw->grContext = ctx;
     kw->drawable = nullptr;
+    // The GPU window never goes through klio_skia_new, so load the typeface here or
+    // text draws are silently skipped (g_typeface stays null).
+    ensureFonts();
     if (std::getenv("KLIO_SKIA_VERBOSE"))
         fprintf(stderr, "[klio-skia] window backend: Metal (GPU)\n");
     return true;
@@ -836,12 +848,23 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
             CFRelease(kw->drawable);
             kw->drawable = nullptr;
         }
-        GrMTLHandle drawable = nullptr;
-        sk_sp<SkSurface> surf = SkSurfaces::WrapCAMetalLayer(
-            kw->grContext.get(), (GrMTLHandle)kw->metalLayer, kTopLeft_GrSurfaceOrigin,
-            1, kBGRA_8888_SkColorType, nullptr, nullptr, &drawable);
-        if (!surf || !drawable) return nullptr;
-        kw->drawable = (GrMTLHandle)CFRetain(drawable);  // keep it alive to present
+        // Acquire this frame's drawable and wrap its texture as a Ganesh render
+        // target. (Managing the drawable directly, rather than WrapCAMetalLayer,
+        // because that helper does not hand back the drawable to present here.)
+        id<CAMetalDrawable> d = [kw->metalLayer nextDrawable];
+        const int pw = static_cast<int>(kw->metalLayer.drawableSize.width);
+        const int ph = static_cast<int>(kw->metalLayer.drawableSize.height);
+        sk_sp<SkSurface> surf;
+        if (d && d.texture) {
+            GrMtlTextureInfo texInfo;
+            texInfo.fTexture.retain((GrMTLHandle)d.texture);
+            GrBackendRenderTarget backendRT = GrBackendRenderTargets::MakeMtl(pw, ph, texInfo);
+            surf = SkSurfaces::WrapBackendRenderTarget(
+                kw->grContext.get(), backendRT, kTopLeft_GrSurfaceOrigin,
+                kBGRA_8888_SkColorType, nullptr, nullptr);
+        }
+        if (!surf) return nullptr;
+        kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);  // hold until present
         kw->surface = new KlioSurface();
         kw->surface->surface = surf;
         return kw->surface;
@@ -856,6 +879,17 @@ void klio_win_present(KlioWindow* kw) {
     if (kw->grContext && kw->metalLayer) {
         if (!kw->surface || !kw->drawable) return;
         kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+        // Debug: $KLIO_SKIA_DUMP reads back the first rendered GPU frame to a PNG so
+        // the on-GPU render can be inspected without on-screen capture.
+        if (const char* dump = std::getenv("KLIO_SKIA_DUMP")) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                const int rc = klio_skia_save_png(kw->surface, dump);
+                if (std::getenv("KLIO_SKIA_VERBOSE"))
+                    fprintf(stderr, "[klio-skia] present dump rc=%d -> %s\n", rc, dump);
+            }
+        }
         @autoreleasepool {
             id<CAMetalDrawable> d = (id<CAMetalDrawable>)kw->drawable;
             id<MTLCommandBuffer> cmd = [kw->queue commandBuffer];
@@ -934,6 +968,7 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
         if (type == 0 && (nw != kw->w || nh != kw->h) && nw > 0 && nh > 0) {
 #if defined(KLIO_METAL)
             if (kw->grContext && kw->metalLayer) {
+                kw->metalLayer.frame = NSMakeRect(0, 0, nw, nh);
                 kw->metalLayer.drawableSize = CGSizeMake(nw, nh);
             } else
 #endif
