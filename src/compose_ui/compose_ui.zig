@@ -44,6 +44,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.compose.ui.__composeui_winRender", winRender);
     try b.register("klio.compose.ui.__composeui_winPoll", winPoll);
     try b.register("klio.compose.ui.__composeui_winClose", winClose);
+    try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     return b;
 }
 
@@ -83,6 +84,10 @@ const Skia = struct {
     savePng: *const fn (?*SkSurface, [*:0]const u8) callconv(.c) c_int,
     encodePng: *const fn (?*SkSurface, *usize) callconv(.c) ?[*]u8,
     freeBuffer: *const fn ([*]u8) callconv(.c) void,
+    // Optional graphics helpers (present in current builds; guarded so a stale
+    // shared library degrades instead of failing the whole Skia load).
+    pathOp: ?PathOpFn,
+    freeCstr: ?FreeCstrFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
@@ -94,6 +99,8 @@ const Skia = struct {
 };
 
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
+const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
+const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -136,6 +143,8 @@ fn loadSkia() ?*Skia {
         .savePng = F.get(&lib, "savePng", "klio_skia_save_png") orelse return skiaLoadFail(&lib),
         .encodePng = F.get(&lib, "encodePng", "klio_skia_encode_png") orelse return skiaLoadFail(&lib),
         .freeBuffer = F.get(&lib, "freeBuffer", "klio_skia_free_buffer") orelse return skiaLoadFail(&lib),
+        .pathOp = lib.lookup(PathOpFn, "klio_skia_path_op"),
+        .freeCstr = lib.lookup(FreeCstrFn, "klio_skia_free_cstr"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
@@ -405,6 +414,31 @@ fn winHandle(v: Value) ?*SkWindow {
     const h: u64 = @bitCast(argInt(v));
     if (h == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(h)));
+}
+
+/// `androidx.compose.ui.graphics.__skia_path_op(a: String, b: String, op: Int): String?`
+/// — combine two serialized path command buffers with a boolean op (SkPathOps).
+/// Returns the result command buffer, or null when the op fails or no Skia
+/// backend is available (the caller then leaves its path unchanged).
+fn pathOp(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.Null);
+    const skia = loadSkia() orelse return ok(Value.Null);
+    const op_fn = skia.pathOp orelse return ok(Value.Null);
+    const free_fn = skia.freeCstr orelse return ok(Value.Null);
+    const a = ctx.allocator;
+    const ag = ctx.args[0].String.borrow();
+    defer ag.deinit();
+    const bg = ctx.args[1].String.borrow();
+    defer bg.deinit();
+    const az = std.fmt.allocPrintSentinel(a, "{s}", .{ag.get().bytes}, 0) catch return ok(Value.Null);
+    defer a.free(az);
+    const bz = std.fmt.allocPrintSentinel(a, "{s}", .{bg.get().bytes}, 0) catch return ok(Value.Null);
+    defer a.free(bz);
+    const op: c_int = @intCast(argInt(ctx.args[2]));
+    const res = op_fn(az.ptr, bz.ptr, op) orelse return ok(Value.Null);
+    defer free_fn(res);
+    const owned = try a.dupe(u8, std.mem.span(res));
+    return ok(Value{ .String = try runtime.strInitOwned(a, owned) });
 }
 
 const testing = std.testing;

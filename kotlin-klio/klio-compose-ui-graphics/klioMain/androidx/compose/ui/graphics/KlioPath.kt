@@ -365,10 +365,58 @@ internal class KlioPath : Path {
     }
 
     override fun op(path1: Path, path2: Path, operation: PathOperation): Boolean {
-        // Boolean path operations require the native rasterizer; wired to the Skia
-        // shim in a follow-up. Union/Difference/Intersect/Xor are not yet available
-        // through the pure-Kotlin path.
-        throw NotImplementedError("Path boolean operations are not yet supported")
+        // Boolean path ops run through the Skia shim: serialize both operands,
+        // combine, and load the result back into this path.
+        val a = (path1 as? KlioPath)?.serialize() ?: return false
+        val b = (path2 as? KlioPath)?.serialize() ?: return false
+        val opCode = when (operation) {
+            PathOperation.Difference -> 0
+            PathOperation.Intersect -> 1
+            PathOperation.Union -> 2
+            PathOperation.Xor -> 3
+            PathOperation.ReverseDifference -> 4
+            else -> return false
+        }
+        val result = __skia_path_op(a, b, opCode) ?: return false
+        loadFrom(result)
+        return true
+    }
+
+    /** Serialize the verb buffer to the shim's textual command format. */
+    internal fun serialize(): String {
+        val sb = StringBuilder()
+        var p = 0
+        for (v in verbs) {
+            when (v) {
+                VERB_MOVE -> { sb.append("m ${pts[p]} ${pts[p + 1]}\n"); p += 2 }
+                VERB_LINE -> { sb.append("l ${pts[p]} ${pts[p + 1]}\n"); p += 2 }
+                VERB_QUAD -> {
+                    sb.append("q ${pts[p]} ${pts[p + 1]} ${pts[p + 2]} ${pts[p + 3]}\n"); p += 4
+                }
+                VERB_CUBIC -> {
+                    sb.append("c ${pts[p]} ${pts[p + 1]} ${pts[p + 2]} ${pts[p + 3]} ${pts[p + 4]} ${pts[p + 5]}\n"); p += 6
+                }
+                VERB_CLOSE -> sb.append("z\n")
+            }
+        }
+        return sb.toString()
+    }
+
+    /** Replace this path's contents with a shim command buffer. */
+    internal fun loadFrom(text: String) {
+        reset()
+        for (line in text.split('\n')) {
+            val t = line.trim()
+            if (t.isEmpty()) continue
+            val f = t.split(' ')
+            when (f[0]) {
+                "m" -> moveTo(f[1].toFloat(), f[2].toFloat())
+                "l" -> lineTo(f[1].toFloat(), f[2].toFloat())
+                "q" -> quadraticTo(f[1].toFloat(), f[2].toFloat(), f[3].toFloat(), f[4].toFloat())
+                "c" -> cubicTo(f[1].toFloat(), f[2].toFloat(), f[3].toFloat(), f[4].toFloat(), f[5].toFloat(), f[6].toFloat())
+                "z" -> close()
+            }
+        }
     }
 
     private fun setPrimitive(wasEmpty: Boolean) {

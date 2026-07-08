@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string>
 #include <vector>
 
 #include "include/core/SkBitmap.h"
@@ -24,6 +25,7 @@
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
+#include "include/core/SkPathBuilder.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkRRect.h"
 #include "include/core/SkRect.h"
@@ -31,6 +33,7 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkTypeface.h"
 #include "include/encode/SkPngEncoder.h"
+#include "include/pathops/SkPathOps.h"
 // Font manager factory: the macOS Skia pack ships CoreText, not the custom-empty
 // port (that symbol is absent), so select per platform.
 #if defined(__APPLE__)
@@ -393,6 +396,119 @@ uint8_t* klio_skia_encode_png(KlioSurface* s, size_t* out_len) {
 }
 
 void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Path boolean ops. SkPath <-> a serialized command buffer (one op per line):
+//   m x y | l x y | q x1 y1 x2 y2 | c x1 y1 x2 y2 x3 y3 | z
+// ---------------------------------------------------------------------------
+namespace {
+
+SkPath klioBuildPath(const char* cmds) {
+    SkPathBuilder b;
+    if (!cmds) return b.detach();
+    const char* p = cmds;
+    while (*p) {
+        while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        const char verb = *p++;
+        int n = 0;
+        switch (verb) {
+            case 'm': case 'l': n = 2; break;
+            case 'q': n = 4; break;
+            case 'c': n = 6; break;
+            default: n = 0; break;  // 'z' and unknown carry no coordinates
+        }
+        float v[6] = {0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < n; i++) v[i] = std::strtof(p, const_cast<char**>(&p));
+        switch (verb) {
+            case 'm': b.moveTo(v[0], v[1]); break;
+            case 'l': b.lineTo(v[0], v[1]); break;
+            case 'q': b.quadTo(v[0], v[1], v[2], v[3]); break;
+            case 'c': b.cubicTo(v[0], v[1], v[2], v[3], v[4], v[5]); break;
+            case 'z': b.close(); break;
+            default: break;
+        }
+        while (*p && *p != '\n') p++;
+    }
+    return b.detach();
+}
+
+std::string klioSerializePath(const SkPath& path) {
+    std::string out;
+    char buf[160];
+    SkPath::Iter iter(path, false);
+    SkPoint pts[4];
+    SkPath::Verb verb;
+    while ((verb = iter.next(pts)) != SkPath::kDone_Verb) {
+        switch (verb) {
+            case SkPath::kMove_Verb:
+                std::snprintf(buf, sizeof(buf), "m %g %g\n", pts[0].fX, pts[0].fY);
+                out += buf;
+                break;
+            case SkPath::kLine_Verb:
+                std::snprintf(buf, sizeof(buf), "l %g %g\n", pts[1].fX, pts[1].fY);
+                out += buf;
+                break;
+            case SkPath::kQuad_Verb:
+                std::snprintf(buf, sizeof(buf), "q %g %g %g %g\n", pts[1].fX, pts[1].fY, pts[2].fX, pts[2].fY);
+                out += buf;
+                break;
+            case SkPath::kConic_Verb: {
+                // Boolean ops rarely emit conics; approximate as quads so the
+                // klio-side buffer stays move/line/quad/cubic only.
+                SkPoint quads[5];
+                const int cnt = SkPath::ConvertConicToQuads(pts[0], pts[1], pts[2], iter.conicWeight(), quads, 1);
+                for (int i = 0; i < cnt; i++) {
+                    std::snprintf(buf, sizeof(buf), "q %g %g %g %g\n",
+                                  quads[2 * i + 1].fX, quads[2 * i + 1].fY,
+                                  quads[2 * i + 2].fX, quads[2 * i + 2].fY);
+                    out += buf;
+                }
+                break;
+            }
+            case SkPath::kCubic_Verb:
+                std::snprintf(buf, sizeof(buf), "c %g %g %g %g %g %g\n",
+                              pts[1].fX, pts[1].fY, pts[2].fX, pts[2].fY, pts[3].fX, pts[3].fY);
+                out += buf;
+                break;
+            case SkPath::kClose_Verb:
+                out += "z\n";
+                break;
+            default:
+                break;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+extern "C" {
+
+// Apply a boolean op to two serialized paths. op: 0 difference, 1 intersect,
+// 2 union, 3 xor, 4 reverse-difference (matching PathOperation). Returns a
+// malloc'd result buffer (free via klio_skia_free_cstr), or null on failure.
+char* klio_skia_path_op(const char* a, const char* b, int op) {
+    if (op < 0 || op > 4) return nullptr;
+    SkPath result;
+    const SkPath pa = klioBuildPath(a);
+    const SkPath pb = klioBuildPath(b);
+    if (!Op(pa, pb, static_cast<SkPathOp>(op), &result)) return nullptr;
+    const std::string s = klioSerializePath(result);
+    char* out = static_cast<char*>(std::malloc(s.size() + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, s.c_str(), s.size() + 1);
+    return out;
+}
+
+// Whether the serialized path is convex.
+int klio_skia_path_convex(const char* cmds) {
+    return klioBuildPath(cmds).isConvex() ? 1 : 0;
+}
+
+void klio_skia_free_cstr(char* s) { std::free(s); }
 
 }  // extern "C"
 
