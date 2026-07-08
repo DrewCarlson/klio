@@ -54,10 +54,27 @@ target today.
    (`IntRange.iterator()` from `IntProgression`) that walked the class hierarchy by
    **simple name** and was shadowed by the same-simple-name `androidx.annotation.IntRange`
    — now walked by `ClassId`/FQN identity. `KLIO_INIT_DEBUG` surfaces swallowed
-   object-init causes. Residual follow-up: colorspace **conversion**
-   (`convert`/`compositeOver`) needs the top-level `Connectors` cache, whose
-   `mutableIntObjectMapOf(k, v, …)` variadic init on an `internal val` is not yet
-   resolving — construction + luminance do not touch it.
+   object-init causes. Also fixed since: **inherited** companion members
+   (`const`/`fun` on a superclass's companion) now resolve both qualified
+   (`Sub.MinId`) and bare in a ctor-delegation thunk — `classReceiverField` walks
+   the superclass companion chain, and the delegation thunks' static member set +
+   call rewrite include inherited companion members.
+
+   Residual follow-up — colorspace **conversion** only (`convert`/`compositeOver`;
+   construction + luminance do not touch it): the top-level `Connectors` cache
+   (`Connector.kt`, `internal val Connectors = mutableIntObjectMapOf(…)`) defers
+   at startup and fails on re-drive. Its init chain (`Connector(...)` →
+   `ColorSpace.adapt` → a new `Rgb` whose `isSrgb` companion fn calls the
+   overloaded `compare`) hits a companion-function-body **overload-dispatch** gap:
+   a 2-arg top-level `compare(FloatArray, FloatArray)` call inside `isSrgb`
+   dispatches as a member call on the `Rgb` class value (whose companion only
+   declares the 3-arg `compare`) and misses, instead of falling through to the
+   applicable top-level overload. NOT minimally reproducible — every faithful
+   small repro (companion fn shadowing a top-level overload name, init-block
+   caller, multi-overload, arity-mismatch) resolves correctly; the trigger is
+   entangled with the real typed overloads (`WhitePoint`/`TransferParameters?`),
+   `ColorSpaces.SrgbPrimaries` (top-level property arg), and the deferred-init
+   context. Deferred pending a reproducible isolation.
 2. **Pack-image companion-`val` import aliasing.** In a *baked* pack image,
    `import X.Companion.Y` does not alias the class-qualified singleton `X.Y`
    (`===` is false); correct when the pack loads from source. Blocks colour/style
