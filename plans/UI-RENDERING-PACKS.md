@@ -43,17 +43,21 @@ target today.
 
 ## Open bugs
 
-1. **Color colorspace static-init fails.** With the real `androidx.compose.ui.graphics`
-   Color + colorspace package added to the graphics pack (Color.kt + the 13-file
-   colorspace math), any use of `Color` throws `FileFailedToInitializeException` from
-   the `ColorSpaces` object init — `Rgb(...)`'s init block (`computeXYZMatrix` /
-   `inverse3x3` / `isWideGamut` / `isSrgb`, or the `DoubleFunction` SAM oetf/eotf,
-   or secondary-ctor delegation). `Illuminant.D65` inits fine; the failure is inside
-   the `Rgb` constructor. The wrapped cause is swallowed (matches kotlin-native) —
-   surface it (temporary print at `host_globals.zig` init-failure catch) to find the
-   failing op. The graphics pack additions are currently reverted; re-add
-   (ui-graphics `[[source]]` + colorspace files + `androidx.annotation` klioMain
-   stubs + `androidx.collection` dep) to reproduce.
+1. **Color colorspace static-init — FIXED.** The real `androidx.compose.ui.graphics`
+   Color + full colorspace package is vendored and working (`Color(...)` channel
+   decode, luminance, companion palette; `examples/compose_color.kt`). The
+   `ColorSpaces` `FileFailedToInitializeException` peeled down to two genuine
+   interpreter bugs, both fixed: (a) a bare companion-`fun` call in a secondary
+   constructor's `: this(…)` delegation args resolved to an unbound global (the
+   delegation-arg thunk has no `this`; now dispatched as a member call on the owner
+   class value that forwards to the companion); (b) an inherited-method dispatch
+   (`IntRange.iterator()` from `IntProgression`) that walked the class hierarchy by
+   **simple name** and was shadowed by the same-simple-name `androidx.annotation.IntRange`
+   — now walked by `ClassId`/FQN identity. `KLIO_INIT_DEBUG` surfaces swallowed
+   object-init causes. Residual follow-up: colorspace **conversion**
+   (`convert`/`compositeOver`) needs the top-level `Connectors` cache, whose
+   `mutableIntObjectMapOf(k, v, …)` variadic init on an `internal val` is not yet
+   resolving — construction + luminance do not touch it.
 2. **Pack-image companion-`val` import aliasing.** In a *baked* pack image,
    `import X.Companion.Y` does not alias the class-qualified singleton `X.Y`
    (`===` is false); correct when the pack loads from source. Blocks colour/style
@@ -320,9 +324,10 @@ linux-only).
 
 The geometry/unit/util math layer is vendored and running. Remaining, in order:
 
-- **`androidx.compose.ui.graphics`** — Color + colorspace (blocked on open bug #1),
-  then `Canvas`/`Paint`/`Path`/`ImageBitmap` as klioMain actuals over the Skia shim
-  (this is where the Skia backend and the vendored graphics API meet).
+- **`androidx.compose.ui.graphics`** — Color + colorspace done (working; see bug #1);
+  next `Canvas`/`Paint`/`Path`/`ImageBitmap` as klioMain actuals over the Skia shim
+  (this is where the Skia backend and the vendored graphics API meet), plus the
+  `Connectors`-cache follow-up for colorspace conversion.
 - **`androidx.compose.ui`** (the ~240-file engine) — the real `LayoutNode`,
   `Modifier.Node` chain, measure/layout/draw, `Constraints`/`Placeable`, pointer
   input, focus, semantics. Vendor incrementally; the klio-authored ui-core proves
@@ -338,5 +343,6 @@ Each consumes upstream common code; klio supplies platform actuals (the Skia
 ### Sequencing
 
 Skia backend (fetch libs → C shim → build wiring → PNG sink → richer DrawScope) →
-unblock Color/graphics (bug #1) → vendor real `compose.ui.graphics` on the shim →
-real `compose.ui` engine → foundation → material3 → GPU/windowing.
+Color/graphics unblocked (bug #1, done) → vendor the rest of `compose.ui.graphics`
+(Canvas/Paint/Path) on the shim → real `compose.ui` engine → foundation →
+material3 → GPU/windowing.
