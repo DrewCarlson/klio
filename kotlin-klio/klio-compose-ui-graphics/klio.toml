@@ -62,6 +62,7 @@ include = [
 root = "../klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonMain/kotlin"
 include = [
     "androidx/compose/ui/graphics/Color.kt",
+    "androidx/compose/ui/graphics/Float16.kt",
     "androidx/compose/ui/graphics/InlineClassHelper.kt",
     "androidx/compose/ui/graphics/colorspace/Adaptation.kt",
     "androidx/compose/ui/graphics/colorspace/ColorModel.kt",
