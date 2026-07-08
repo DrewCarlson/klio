@@ -1151,7 +1151,7 @@ const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
 /// Number of in-repo packs the parity pipeline can load from source.
-pub const N_PACK_DIRS = 8;
+pub const N_PACK_DIRS = 11;
 
 fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
@@ -1163,6 +1163,9 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-mosaic" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-util" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-geometry" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-unit" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-graphics" }),
     };
 }
@@ -1185,7 +1188,7 @@ fn collectKotlinxPackSources(
     // diverge from the base identity.
     const mask = try packMaskFor(io, import_prefixes, imports_coroutines, arena);
     for (pack_dirs, 0..) |pack_dir, idx| {
-        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+        if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
 
         const sources = switch (try collectManifestSources(arena, io, pack_dir)) {
             .err => |e| return .{ .err = e },
@@ -1428,11 +1431,11 @@ const PackMeta = struct {
     deps: []const []const u8,
 };
 
-fn baseKey(mode: LoadMode, mask: u8, full: bool) u32 {
-    // `mask` occupies a full u8 (one bit per in-repo pack, up to N_PACK_DIRS),
-    // so it lands in bits 1..8 and `mode` sits above it — no overlap even when
-    // the top mask bit is set.
-    return (@as(u32, @intFromEnum(mode)) << 16) | (@as(u32, mask) << 1) | @intFromBool(full);
+fn baseKey(mode: LoadMode, mask: u16, full: bool) u32 {
+    // `mask` occupies a full u16 (one bit per in-repo pack, up to N_PACK_DIRS),
+    // so it lands in bits 1..16 and `mode` sits above it (bit 24+) — no overlap
+    // even when the top mask bit is set.
+    return (@as(u32, @intFromEnum(mode)) << 24) | (@as(u32, mask) << 1) | @intFromBool(full);
 }
 
 /// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
@@ -1580,8 +1583,8 @@ fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.
 /// Which in-repo packs `import_prefixes` pulls in, as a bitmask over
 /// `kotlinxPackDirs` order. Mirrors `collectKotlinxPackSources`' selection
 /// (including coroutines forcing atomicfu).
-fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u8 {
-    var mask: u8 = 0;
+fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!u16 {
+    var mask: u16 = 0;
     var idx: usize = 0;
     while (idx < N_PACK_DIRS) : (idx += 1) {
         const meta = try packMeta(io, idx);
@@ -1598,7 +1601,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
             }
         }
         if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
-        if (wanted) mask |= @as(u8, 1) << @intCast(idx);
+        if (wanted) mask |= @as(u16, 1) << @intCast(idx);
     }
     // Manifest-dependency closure: a selected pack pulls the packs its
     // klio.toml declares, transitively (compose -> kotlinx.coroutines +
@@ -1608,15 +1611,15 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
         changed = false;
         var i: usize = 0;
         while (i < N_PACK_DIRS) : (i += 1) {
-            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+            if (mask & (@as(u16, 1) << @intCast(i)) == 0) continue;
             const m = try packMeta(io, i);
             for (m.deps) |dep| {
                 var j: usize = 0;
                 while (j < N_PACK_DIRS) : (j += 1) {
-                    if (mask & (@as(u8, 1) << @intCast(j)) != 0) continue;
+                    if (mask & (@as(u16, 1) << @intCast(j)) != 0) continue;
                     const jm = try packMeta(io, j);
                     if (std.mem.eql(u8, jm.lib_id, dep)) {
-                        mask |= @as(u8, 1) << @intCast(j);
+                        mask |= @as(u16, 1) << @intCast(j);
                         changed = true;
                     }
                 }
@@ -1628,7 +1631,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
 
 /// Whether the stdlib load gate opens fully for this prefix set (mirrors
 /// `embeddedStdlibSources`' `load_gated`).
-fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: u8, scratch: Allocator) Allocator.Error!bool {
+fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: u16, scratch: Allocator) Allocator.Error!bool {
     const meta = try stdlibMeta(io);
     if (!meta.any_non_implicit) return true;
     var it = import_prefixes.keyIterator();
@@ -1639,7 +1642,7 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
     }
     var idx: usize = 0;
     while (idx < N_PACK_DIRS) : (idx += 1) {
-        if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+        if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
         const pmeta = try packMeta(io, idx);
         for (pmeta.import_prefixes) |imp| {
             for (meta.pkgs) |pkg| {
@@ -1652,7 +1655,7 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
 
 /// Get or build the dependency snapshot for (mode, pack mask, gate).
 /// Returns null when that base is not snapshot-safe.
-fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     base_lock.lock();
     defer base_lock.unlock();
 
@@ -1666,7 +1669,7 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!
     return entry;
 }
 
-fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     if (try loadBakedBase(a, io, mode, mask, full)) |entry| return entry;
     return buildBaseEntryFromSource(a, io, mode, mask, full);
 }
@@ -1676,7 +1679,7 @@ fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Al
 /// interpreter modules change, and each test run step's cache manifest
 /// covers the image bytes. Only the EmbeddedOnly bases are baked; other
 /// keys — and any read/decode failure — take the source build below.
-fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     if (mode != .EmbeddedOnly or mask != 0) return null;
     const dir = (runtime.procEnvGetVar(a, "KLIO_PARITY_BASE_IMAGES") catch null) orelse return null;
     const path = try std.fmt.allocPrint(a, "{s}/embedded-gate{d}.klio-image", .{ dir, @intFromBool(full) });
@@ -1697,7 +1700,7 @@ pub fn bakeEmbeddedBase(allocator: Allocator, io: Io, full: bool) Allocator.Erro
     return try interp_ir.image.bake(allocator, entry.base, entry.map, .{});
 }
 
-fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u8, full: bool) Allocator.Error!?*const BaseEntry {
+fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
 
@@ -1709,7 +1712,7 @@ fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u8, full
         var sources: std.ArrayList(PackSource) = .empty;
         defer sources.deinit(a);
         for (pack_dirs, 0..) |dir, idx| {
-            if (mask & (@as(u8, 1) << @intCast(idx)) == 0) continue;
+            if (mask & (@as(u16, 1) << @intCast(idx)) == 0) continue;
             const manifest_sources = switch (try collectManifestSources(a, io, dir)) {
                 .err => return null,
                 .ok => |s| s,
@@ -1816,7 +1819,7 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
     }
 
     base_lock.lock();
-    const mask: u8 = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
+    const mask: u16 = if (mode == .EmbeddedOnly) 0 else packMaskFor(io, &prefixes, imports_coroutines, arena) catch |e| {
         base_lock.unlock();
         return e;
     };
