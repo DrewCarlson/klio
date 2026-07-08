@@ -1341,6 +1341,31 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
             .err => |e| return .{ .err = e },
         }
     }
+    // A package-qualified reference to an `object` (`demo.Singleton`,
+    // `androidx…drawscope.Fill`) is keyed by its FQN, not the by-simple-name
+    // object registry, so the read above misses and the raw global is the
+    // classifier. Map the FQN to the object's simple name and resolve through
+    // the SAME path the bare name takes, so both yield the one singleton — but
+    // only when the FQN names a genuine object (its simple name is a registered
+    // object), so a qualified reference to a regular class stays the class value.
+    if (raw == null or raw.? != .Instance) {
+        const obj_simple: ?[]const u8 = blk_obj: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            const cid = m.classIdByFqn(name) orelse break :blk_obj null;
+            if (cid.int() >= m.classes.items.len) break :blk_obj null;
+            const simple = m.classes.items[cid.int()].name;
+            if (!progHasObjectName(self, simple)) break :blk_obj null;
+            break :blk_obj simple;
+        };
+        if (obj_simple) |simple| {
+            switch (try ensureObjectSingleton(self, simple)) {
+                .ok => |maybe| if (maybe) |v| return .{ .ok = v },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
     if (raw) |rv| {
         if (rv == .Delegate) {
             const is_uninit_notnull = blk2: {

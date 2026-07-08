@@ -77,6 +77,7 @@ Run any program with:
 | `deep_call_chain.kt`         | A 40-deep method-call chain (`sb.append(x).append(x)…`) — a type-checker regression guard: re-typing the receiver at each level was O(2^depth). |
 | `ctor_vs_factory.kt`         | A class with a same-named factory that fills a default parameter — a single-arg call (`Packed(3f)`) must pick the factory, not the value-class constructor. |
 | `ctor_default_companion.kt`  | A primary-constructor default value reading a companion-object member (`cap = DefaultCap`, like androidx `Stroke`) resolves against the companion, not a null `this`; a default reading a previous parameter resolves by name. |
+| `qualified_object.kt`        | A package-qualified reference to an `object` (`demo.Config`) resolves to the one singleton — identical to the bare name, with writes visible through both — not a separate class classifier. |
 | `vararg_nonfinal.kt`         | `vararg` before a trailing defaulted parameter, called positionally (top-level, inline, member). |
 | `class_factory_overload.kt`  | Same-name factory function vs constructor, disambiguated by argument type and arity. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
