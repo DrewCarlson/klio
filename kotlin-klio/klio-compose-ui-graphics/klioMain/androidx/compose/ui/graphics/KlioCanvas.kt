@@ -60,6 +60,20 @@ private fun ClipOp.code(): Int = if (this == ClipOp.Difference) 0 else 1
  * point, and vertex draws need surfaces not yet vendored and throw pending.
  */
 internal class KlioCanvas(private val handle: Long) : Canvas {
+    // A gradient brush sets paint.shader; arm it on the shim for the next draw
+    // (the shader defines the pixels, overriding the flat colour) and clear it
+    // after so a later solid draw isn't tinted.
+    private fun beginShader(paint: Paint): Boolean {
+        val text = paint.shader?.klioText ?: ""
+        if (text.isEmpty()) return false
+        __skia_c_set_shader(handle, text)
+        return true
+    }
+
+    private fun endShader(active: Boolean) {
+        if (active) __skia_c_set_shader(handle, "")
+    }
+
     override fun save() { __skia_c_save(handle) }
 
     override fun restore() { __skia_c_restore(handle) }
@@ -94,19 +108,27 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
     }
 
     override fun drawRect(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
+        val sh = beginShader(paint)
         __skia_c_draw_rect(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endShader(sh)
     }
 
     override fun drawRoundRect(left: Float, top: Float, right: Float, bottom: Float, radiusX: Float, radiusY: Float, paint: Paint) {
+        val sh = beginShader(paint)
         __skia_c_draw_rrect(handle, left, top, right, bottom, radiusX, radiusY, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endShader(sh)
     }
 
     override fun drawOval(left: Float, top: Float, right: Float, bottom: Float, paint: Paint) {
+        val sh = beginShader(paint)
         __skia_c_draw_oval(handle, left, top, right, bottom, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endShader(sh)
     }
 
     override fun drawCircle(center: Offset, radius: Float, paint: Paint) {
+        val sh = beginShader(paint)
         __skia_c_draw_circle(handle, center.x, center.y, radius, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endShader(sh)
     }
 
     override fun drawArc(left: Float, top: Float, right: Float, bottom: Float, startAngle: Float, sweepAngle: Float, useCenter: Boolean, paint: Paint) {
@@ -124,7 +146,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
 
     override fun drawPath(path: Path, paint: Paint) {
         val t = (path as? KlioPath)?.serialize() ?: return
+        val sh = beginShader(paint)
         __skia_c_draw_path(handle, t, paint.argb(), paint.styleCode(), paint.strokeWidth, paint.capCode(), paint.joinCode(), paint.aaCode())
+        endShader(sh)
     }
 
     override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint): Unit =

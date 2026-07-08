@@ -1891,6 +1891,11 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // binding's functional type so a `T.() -> R` receiver lambda (zero value
     // parameters) drops its `it` and resolves bare members through the
     // receiver bound at invocation, rather than a spurious `it` parameter.
+    // The arity recorded at the call site (by span), authoritative when the
+    // per-argument `pending_lambda_arity` was not set on this emit path.
+    if (expected_arity == -1) {
+        if (b.lambdaArgArity(expr.span())) |ar| expected_arity = ar;
+    }
     if (expected_arity == -1) {
         if (b.peekExpected()) |exp| {
             if (exp.function) |ft| {
@@ -2855,6 +2860,37 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
+
+    // Record each lambda argument's expected value-parameter arity by span,
+    // taken from the resolved callee's parameter types, BEFORE the args are
+    // lowered. `lowerLambda` reads it authoritatively, so a receiver lambda
+    // (`T.() -> R`, arity 0) drops its `it` no matter which emit branch lowers
+    // the argument — the per-arg `pending_lambda_arity` is set only on some
+    // paths, which is why a non-trailing receiver-lambda argument otherwise
+    // stays an `it`-lambda and its bare member calls fall through to globals.
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const cnm = callee.Path.segments[0].name;
+        // Only when the callee name is UNAMBIGUOUS (a single same-named
+        // function): the arity then definitely matches the resolved overload.
+        // With overloads, `funcId` is a heuristic that may name the wrong one,
+        // whose arity would wrongly drop a needed `it`.
+        const unambiguous = if (b.module.func_name_index.get(cnm)) |ids| ids.items.len == 1 else false;
+        if (unambiguous) {
+            if (b.module.funcId(cnm)) |fid| {
+                if (b.module.funcById(fid)) |f| {
+                    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                    if (try argFnArities(b, f, args, ast_arg_names, recv_off)) |ar| {
+                        defer b.allocator.free(ar);
+                        for (args, 0..) |*a, i| {
+                            if ((a.* == .Lambda or a.* == .AnonFun) and i < ar.len and ar[i] >= 0) {
+                                b.recordLambdaArgArity(a.span(), ar[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Context parameters: the stdlib `context(v..., block)` scope function
     // and `contextOf<T>()` accessor lower to dedicated context-stack ops so
@@ -5622,6 +5658,15 @@ fn recordOutOfScopeCall(
         },
     };
     if (!precise and !loose_out_of_scope) return false;
+    // The index ranked at least one candidate in a visible tier (a named
+    // import, own package, wildcard, or default import): the call resolves
+    // among those in-scope candidates at runtime — a type-dispatched overload
+    // set the runtime picks by argument types. A heuristic fallback that
+    // happened to land on an invisible same-name namesake (e.g. Brush.kt's
+    // `lerp(Offset, Offset, Float)` when many packs contribute out-of-scope
+    // `lerp` overloads) does NOT make it an out-of-scope reference. Only a set
+    // whose every rankable candidate is out of scope is genuinely unresolved.
+    if (index_res.tier < ir.Module.other_package_tier) return false;
     if (!isNonExt(b, final_id)) return false;
     const tier = b.module.bareCallTierOf(final_id, name, b.self_package, file) orelse return false;
     if (tier != ir.Module.other_package_tier) return false;

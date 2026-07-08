@@ -435,6 +435,15 @@ pub const FuncBuilder = struct {
     /// keeps the single-`it` binding.
     pending_lambda_arity: i16 = -1,
 
+    /// A lambda ARGUMENT's expected value-parameter arity, keyed by the lambda
+    /// expression's span, recorded once at the call-lowering entry from the
+    /// resolved callee's parameter type. `lowerLambda` reads it as the
+    /// authoritative arity so a receiver lambda drops its `it` regardless of
+    /// which emit branch lowers the argument — the per-arg `pending_lambda_arity`
+    /// is only set on some paths, so a non-trailing receiver-lambda argument
+    /// (`f({ member() }, other)`) would otherwise stay an `it`-lambda.
+    lambda_arg_arity: std.AutoHashMap(span_mod.Span, i16) = undefined,
+
     /// Per-argument bitmask: bit `i` set means the lambda value-parameter `i`
     /// of the argument currently being lowered has a broad-collection declared
     /// type (`Iterable`/`Collection`) coming from the *callee parameter's*
@@ -483,6 +492,7 @@ pub const FuncBuilder = struct {
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
+            .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
@@ -525,6 +535,7 @@ pub const FuncBuilder = struct {
         self.blocks.deinit(a);
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
+        self.lambda_arg_arity.deinit();
         self.outer_names.deinit();
         self.capture_order.deinit(a);
         self.capture_regs.deinit();
@@ -1000,6 +1011,17 @@ pub const FuncBuilder = struct {
     pub fn setSelfDeclSpan(self: *FuncBuilder, sp: span_mod.Span) void {
         self.self_decl_span = sp;
     }
+    /// Record a lambda argument's expected value-parameter arity, keyed by the
+    /// lambda expression's span (from the resolved callee at the call site).
+    pub fn recordLambdaArgArity(self: *FuncBuilder, sp: span_mod.Span, arity: i16) void {
+        self.lambda_arg_arity.put(sp, arity) catch {};
+    }
+
+    /// The recorded expected arity for the lambda argument at `sp`, if any.
+    pub fn lambdaArgArity(self: *const FuncBuilder, sp: span_mod.Span) ?i16 {
+        return self.lambda_arg_arity.get(sp);
+    }
+
     pub fn setBodySpan(self: *FuncBuilder, sp: span_mod.Span) void {
         self.body_span = sp;
     }
