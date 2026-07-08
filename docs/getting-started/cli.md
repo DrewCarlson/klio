@@ -16,9 +16,7 @@ the live list.
 | `klio repl`             | Placeholder prompt — currently echoes input; not yet a live evaluator.                   |
 | `klio bake [files...]`  | Pre-bake the stdlib image cache (see below). `klio run` does this automatically on first use. |
 
-`klio run` accepts a legacy `--ir-vm` flag for backwards
-compatibility; it is ignored, because the IR Vm is the only run path.
-`klio run` also takes `--virtual-time` (deterministic virtual time
+`klio run` takes `--virtual-time` (deterministic virtual time
 for coroutines) and `--feature <pack>/<feature>` (enable a
 feature-gated pack surface, repeatable); `klio test` accepts the
 same two.

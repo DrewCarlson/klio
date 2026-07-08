@@ -57,7 +57,6 @@ const USAGE =
     \\                             off: interpreter + never-free arena.
     \\
     \\Run options:
-    \\  --ir-vm                    Accepted for compatibility (no-op).
     \\  --virtual-time             Use deterministic virtual time for coroutines.
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
     \\
@@ -191,9 +190,7 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--ir-vm")) {
-            // Accepted for compatibility; the IR Vm is the only path.
-        } else if (std.mem.eql(u8, a, "--virtual-time")) {
+        if (std.mem.eql(u8, a, "--virtual-time")) {
             virtual_time = true;
         } else if (std.mem.eql(u8, a, "--feature")) {
             i += 1;
