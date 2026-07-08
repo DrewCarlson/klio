@@ -167,7 +167,7 @@ pub fn typedDefaultForInit(init: *const ast.Expr) TypedDefault {
 
 /// `(name, FuncId)` top-level property initializer entry, plus the
 /// declared type's pre-init default category.
-pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none };
+pub const NameFunc = struct { name: []const u8, func: FuncId, default: TypedDefault = .none, file: u32 = 0 };
 
 /// Per enum-entry constructor-arg thunks.
 pub const EnumEntryArgInit = struct {
@@ -2487,7 +2487,7 @@ fn buildModuleWithOverrides(
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
     }
     for (decls) |*d| {
@@ -2522,12 +2522,12 @@ fn buildModuleWithOverrides(
             // driving the initializer out of order; non-literal unannotated
             // initializers keep the on-demand path (`.none`).
             const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
-            try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt });
+            try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt, .file = p.span.file.int() });
         } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
-            try top_level_props.append(a, .{ .name = p.name.name, .func = fid });
+            try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
         if (p.delegate == null) {
             if (p.context_params.len != 0) module.has_context_decls = true;
