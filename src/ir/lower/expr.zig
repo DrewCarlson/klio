@@ -5658,6 +5658,15 @@ fn recordOutOfScopeCall(
         },
     };
     if (!precise and !loose_out_of_scope) return false;
+    // The index ranked at least one candidate in a visible tier (a named
+    // import, own package, wildcard, or default import): the call resolves
+    // among those in-scope candidates at runtime — a type-dispatched overload
+    // set the runtime picks by argument types. A heuristic fallback that
+    // happened to land on an invisible same-name namesake (e.g. Brush.kt's
+    // `lerp(Offset, Offset, Float)` when many packs contribute out-of-scope
+    // `lerp` overloads) does NOT make it an out-of-scope reference. Only a set
+    // whose every rankable candidate is out of scope is genuinely unresolved.
+    if (index_res.tier < ir.Module.other_package_tier) return false;
     if (!isNonExt(b, final_id)) return false;
     const tier = b.module.bareCallTierOf(final_id, name, b.self_package, file) orelse return false;
     if (tier != ir.Module.other_package_tier) return false;
