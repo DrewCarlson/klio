@@ -386,9 +386,13 @@ pub fn liftClassRecursive(
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
                     try ctx.mangled_nested.put(qualified, mangled);
                     lifted.name = .{ .name = mangled, .span = nested.name.span };
-                    if (is_private) {
-                        try putAlias(ctx, c.name.name, nested.name.name, mangled);
-                    }
+                    // Register the bare-name alias whenever the class is mangled,
+                    // not only for a private one: a mangled nested class
+                    // referenced by bare name inside its declaring subtree (a
+                    // colliding value class read for a companion member) needs
+                    // the alias so `scopeTypeRename` rewrites the reference to
+                    // the mangled name.
+                    try putAlias(ctx, c.name.name, nested.name.name, mangled);
                 } else {
                     a.free(qualified);
                 }
