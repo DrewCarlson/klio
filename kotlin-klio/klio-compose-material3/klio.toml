@@ -282,3 +282,5 @@ id = "androidx.compose.foundation.layout"
 id = "androidx.compose.animation.core"
 [[deps]]
 id = "androidx.collection"
+[[deps]]
+id = "androidx.graphics.shapes"
