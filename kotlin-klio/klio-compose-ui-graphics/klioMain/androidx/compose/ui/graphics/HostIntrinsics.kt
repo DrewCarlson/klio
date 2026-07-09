@@ -45,3 +45,11 @@ internal fun __skia_c_draw_oval(handle: Long, l: Float, t: Float, r: Float, b: F
 internal fun __skia_c_draw_circle(handle: Long, cx: Float, cy: Float, radius: Float, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_circle not installed")
 internal fun __skia_c_draw_line(handle: Long, x0: Float, y0: Float, x1: Float, y1: Float, argb: Int, sw: Float, cap: Int, aa: Int): Long = error("intrinsic __skia_c_draw_line not installed")
 internal fun __skia_c_draw_path(handle: Long, pathText: String, argb: Int, style: Int, sw: Float, cap: Int, join: Int, aa: Int): Long = error("intrinsic __skia_c_draw_path not installed")
+
+// Text: draw a single run with its baseline origin at (x, y) onto the canvas
+// (honouring its transform/clip); measure a run's advance width; read a font
+// vertical metric (which: 0 ascent<0, 1 descent>0, 2 leading) at a pixel size.
+internal fun __skia_c_draw_text(handle: Long, text: String, x: Float, y: Float, sizePx: Float, argb: Int): Long = error("intrinsic __skia_c_draw_text not installed")
+internal fun __composeui_text_width(text: String, sizePx: Float): Float = error("intrinsic __composeui_text_width not installed")
+internal fun __composeui_font_metric(sizePx: Float, which: Int): Float = error("intrinsic __composeui_font_metric not installed")
+internal fun __skia_c_concat(handle: Long, sx: Float, kx: Float, tx: Float, ky: Float, sy: Float, ty: Float): Long = error("intrinsic __skia_c_concat not installed")

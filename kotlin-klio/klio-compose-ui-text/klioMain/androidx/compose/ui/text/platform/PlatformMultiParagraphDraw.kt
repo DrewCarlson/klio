@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.drawscope.DrawStyle
 import androidx.compose.ui.text.MultiParagraph
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.util.fastForEach
 
 internal actual fun MultiParagraph.drawMultiParagraph(
     canvas: Canvas,
@@ -33,5 +34,10 @@ internal actual fun MultiParagraph.drawMultiParagraph(
     drawStyle: DrawStyle?,
     blendMode: BlendMode,
 ) {
-    error("androidx.compose.ui.text text shaping actual not yet wired to the klio Skia shim")
+    canvas.save()
+    paragraphInfoList.fastForEach {
+        it.paragraph.paint(canvas, brush, alpha, shadow, decoration, drawStyle, blendMode)
+        canvas.translate(0f, it.paragraph.height)
+    }
+    canvas.restore()
 }

@@ -1129,6 +1129,44 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         if (stdlib.primitive_companion_const(simple, name)) |v| return ok(v);
     }
+    // A NESTED CLASS of the receiver's class (or a lexically-enclosing class):
+    // a bare `Nested` referenced inside `Outer`'s own body resolves to the
+    // nested classifier, NOT to a same-named companion member. Uses the nesting
+    // tree (built at VM setup from FQNs), so it resolves uniformly for source
+    // and baked-pack classes — a source program takes an enclosing-instance walk
+    // that a baked pack lacks, which otherwise fell through to the companion
+    // fallback below. A nested object resolves to its singleton.
+    if (!member_probe and receiver.* == .Instance) {
+        const cn0 = className(receiver.Instance);
+        const nested_id: ?ir.ClassId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const oid = mg.get().classId(cn0) orelse break :blk null;
+            break :blk mg.get().classIdNestedIn(oid, name);
+        };
+        if (nested_id) |cid| {
+            const nfqn: ?[]const u8 = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                break :blk mg.get().classFqnById(cid);
+            };
+            if (nfqn) |fqn| {
+                switch (try host_globals.ensureObjectSingleton(self, fqn)) {
+                    .ok => |maybe| if (maybe) |v| {
+                        if (v == .Instance) return ok(v);
+                    },
+                    .err => |e| return errRes(e),
+                }
+                const def: ?ObjRef(ClassDef) = blk: {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(fqn)) |d| break :blk d.clone();
+                    break :blk null;
+                };
+                if (def) |d| return ok(.{ .Class = d });
+            }
+        }
+    }
     // Companion fallback for an instance receiver: a companion `val` is
     // in scope unqualified inside the class's own member bodies. The
     // member probe skips it — companions ride the bare-name walk as

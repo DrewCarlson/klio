@@ -63,6 +63,10 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_circle", canvasDrawCircle);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_line", canvasDrawLine);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_path", canvasDrawPath);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_text", canvasDrawText);
+    try b.register("androidx.compose.ui.graphics.__composeui_text_width", textWidth);
+    try b.register("androidx.compose.ui.graphics.__composeui_font_metric", fontMetric);
+    try b.register("androidx.compose.ui.graphics.__skia_c_concat", canvasConcat);
     return b;
 }
 
@@ -131,6 +135,9 @@ const Skia = struct {
     cDrawCircle: ?CDrawCircleFn,
     cDrawLine: ?CDrawLineFn,
     cDrawPath: ?CDrawPathFn,
+    cMeasureTextWidth: ?CMeasureTextWidthFn,
+    cFontMetric: ?CFontMetricFn,
+    cConcat: ?CConcatFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
@@ -159,6 +166,9 @@ const CDrawRRectFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32, u32, 
 const CDrawCircleFn = *const fn (?*SkSurface, f32, f32, f32, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
 const CDrawLineFn = *const fn (?*SkSurface, f32, f32, f32, f32, u32, f32, c_int, c_int) callconv(.c) void;
 const CDrawPathFn = *const fn (?*SkSurface, [*:0]const u8, u32, c_int, f32, c_int, c_int, c_int) callconv(.c) void;
+const CMeasureTextWidthFn = *const fn ([*:0]const u8, f32) callconv(.c) f32;
+const CFontMetricFn = *const fn (f32, c_int) callconv(.c) f32;
+const CConcatFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32) callconv(.c) void;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -218,6 +228,9 @@ fn loadSkia() ?*Skia {
         .cDrawCircle = lib.lookup(CDrawCircleFn, "klio_skia_c_draw_circle"),
         .cDrawLine = lib.lookup(CDrawLineFn, "klio_skia_c_draw_line"),
         .cDrawPath = lib.lookup(CDrawPathFn, "klio_skia_c_draw_path"),
+        .cMeasureTextWidth = lib.lookup(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
+        .cFontMetric = lib.lookup(CFontMetricFn, "klio_skia_font_metric"),
+        .cConcat = lib.lookup(CConcatFn, "klio_skia_c_concat"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
@@ -698,6 +711,57 @@ fn canvasDrawPath(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// `__skia_c_draw_text(handle, text, x, y, sizePx, argb)` — draw a single text
+/// run with its baseline origin at (x, y) onto the surface's canvas, honouring
+/// the canvas's current transform/clip. The real Paragraph engine positions each
+/// wrapped line and calls this per line.
+fn canvasDrawText(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len < 6 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const tg = ctx.args[1].String.borrow();
+    defer tg.deinit();
+    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(txt);
+    const a = ctx.args;
+    skia.drawText(surf, txt.ptr, argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]));
+    return ok(Value.newLong(0));
+}
+
+/// `__composeui_text_width(text, sizePx): Float` — the advance width of a single
+/// unwrapped run at the given pixel size (the wrap pass measures candidate runs).
+fn textWidth(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .String) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.cMeasureTextWidth orelse return ok(.{ .Float = 0 });
+    const tg = ctx.args[0].String.borrow();
+    defer tg.deinit();
+    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(.{ .Float = 0 });
+    defer ctx.allocator.free(txt);
+    return ok(.{ .Float = f(txt.ptr, argFloat(ctx.args[1])) });
+}
+
+/// `__composeui_font_metric(sizePx, which): Float` — a font vertical metric at
+/// the given size: which=0 ascent (negative), 1 descent (positive), 2 leading.
+fn fontMetric(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.cFontMetric orelse return ok(.{ .Float = 0 });
+    return ok(.{ .Float = f(argFloat(ctx.args[0]), @intCast(argInt(ctx.args[1]))) });
+}
+
+/// `__skia_c_concat(handle, sx, kx, tx, ky, sy, ty)` — concat a 2D affine
+/// transform (Compose Matrix's affine components) onto the canvas.
+fn canvasConcat(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len < 7) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cConcat orelse return ok(Value.newLong(0));
+    const a = ctx.args;
+    f(surf, argFloat(a[1]), argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argFloat(a[5]), argFloat(a[6]));
+    return ok(Value.newLong(0));
+}
+
 const testing = std.testing;
 
 test "hostBindings registers the skia render + windowing sinks" {
@@ -713,7 +777,11 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_surf_new") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_path") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_set_shader") != null);
-    try testing.expectEqual(@as(usize, 25), b.len());
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_draw_text") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
+    try testing.expectEqual(@as(usize, 29), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

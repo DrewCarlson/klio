@@ -30,6 +30,16 @@ private fun <T> rememberObserved(c: Composer, computed: T): T {
 public val currentComposer: Composer
     get() = requireComposer()
 
+/**
+ * A stable hash identifying the enclosing composable's position in the
+ * composition tree. `rememberSaveable` keys its stored value by this (via
+ * `toString(radix)`) when the caller provides no explicit key. klio's
+ * `CompositeKeyHashCode` is a `Long`, so the upstream `.toString(radix)` /
+ * `.toLong()` operations are the stdlib `Long` ones.
+ */
+public val currentCompositeKeyHashCode: Long
+    @Composable get() = requireComposer().compositeKeyHashCode
+
 /** Remember a value across recompositions; [calculation] runs only on first composition. */
 public fun <T> remember(calculation: () -> T): T {
     val c = requireComposer()

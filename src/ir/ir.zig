@@ -1638,6 +1638,15 @@ pub const Module = struct {
         return m.get(decl_span);
     }
 
+    /// The DIRECT child class named `name` of `owner` (no enclosing-chain walk),
+    /// e.g. `owner`'s own `Companion` or nested class. Null if `owner` has no such
+    /// direct child, or the nesting tree is not yet built.
+    pub fn classDirectChild(self: *const Module, owner: ClassId, name: []const u8) ?ClassId {
+        const cm = &(self.class_children orelse return null);
+        if (cm.get(owner)) |kids| return kids.get(name);
+        return null;
+    }
+
     pub fn classIdNestedIn(self: *const Module, owner: ClassId, name: []const u8) ?ClassId {
         const cm = &(self.class_children orelse return null);
         const pm = &(self.class_parent orelse return null);
@@ -3044,6 +3053,12 @@ pub const Module = struct {
     /// Sentinel stored in `class_fqn_map` for a duplicated FQN — the lookup
     /// returns null so an ambiguous FQN never silently binds the wrong class.
     const class_id_ambiguous: ClassId = @enumFromInt(std.math.maxInt(u32));
+
+    /// The fully-qualified name of the class with id `id`, or null if out of range.
+    pub fn classFqnById(self: *const Module, id: ClassId) ?[]const u8 {
+        const c = idGet(Class, self.classes.items, id.int()) orelse return null;
+        return c.fqn;
+    }
 
     pub fn classIdByFqn(self: *const Module, fqn: []const u8) ?ClassId {
         if (self.class_fqn_map) |*m| {

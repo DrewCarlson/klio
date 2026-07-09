@@ -54,6 +54,20 @@ public interface Composer {
     /** The nearest provided value for [local], or its default. */
     public fun consume(local: CompositionLocal<*>): Any?
 
+    /**
+     * A snapshot of all CompositionLocals in scope at this point, as the immutable
+     * [CompositionLocalMap] the node engine stores on a LayoutNode (via
+     * `ComposeUiNode.SetResolvedCompositionLocals`) so Modifier.Nodes can read
+     * locals with `currentValueOf`.
+     */
+    public val currentCompositionLocalMap: CompositionLocalMap
+
+    /** A stable hash of the current group's position in the composition tree (the
+     * accumulated positional-key path from the root); backs
+     * `currentCompositeKeyHashCode`, which `rememberSaveable` uses to key stored
+     * state by call-site position. */
+    public val compositeKeyHashCode: Long
+
     // ----- node emission (the Applier path) -----
 
     /** True while emitting a freshly-inserted node ([createNode]); false when a
@@ -84,6 +98,13 @@ public interface Composer {
 
     /** Close the group opened by [startReplaceableGroup]. */
     public fun endReplaceableGroup()
+
+    /** Open a replaceable positional group (current upstream name for
+     * [startReplaceableGroup]). */
+    public fun startReplaceGroup(key: Int)
+
+    /** Close the group opened by [startReplaceGroup]. */
+    public fun endReplaceGroup()
 
     public companion object {
         /** Sentinel for an unwritten slot — distinct from any user value (incl. null). */
@@ -404,6 +425,14 @@ internal class KlioComposer : Composer {
         endGroup()
     }
 
+    override fun startReplaceGroup(key: Int) {
+        startGroup(key.toLong())
+    }
+
+    override fun endReplaceGroup() {
+        endGroup()
+    }
+
     /**
      * Bring [applier]'s children of the current node from [shadow] (their order
      * last pass) to [newOrder] (this pass's emission order): remove vanished
@@ -456,8 +485,22 @@ internal class KlioComposer : Composer {
 
     override fun startProviders(values: Array<out ProvidedValue<*>>) {
         val layer = HashMap<CompositionLocal<*>, Any?>()
-        for (pv in values) layer[pv.compositionLocal] = pv.value
+        for (pv in values) {
+            // `providesDefault` binds only when no enclosing provider already
+            // supplies the local; the outer binding wins otherwise.
+            if (pv.isDefault && isLocalProvided(pv.compositionLocal)) continue
+            layer[pv.compositionLocal] = pv.value
+        }
         localsStack.add(layer)
+    }
+
+    private fun isLocalProvided(local: CompositionLocal<*>): Boolean {
+        var i = localsStack.size - 1
+        while (i >= 0) {
+            if (localsStack[i].containsKey(local)) return true
+            i = i - 1
+        }
+        return false
     }
 
     override fun endProviders() {
@@ -473,6 +516,25 @@ internal class KlioComposer : Composer {
         }
         return local.defaultFactory()
     }
+
+    override val currentCompositionLocalMap: CompositionLocalMap
+        get() {
+            if (localsStack.isEmpty()) return CompositionLocalMap.Empty
+            val merged = HashMap<CompositionLocal<*>, Any?>()
+            for (layer in localsStack) merged.putAll(layer) // outer→inner; inner wins
+            return KlioCompositionLocalMap(merged)
+        }
+
+    override val compositeKeyHashCode: Long
+        get() {
+            var hash = 0L
+            var g: GroupNode? = if (stack.isEmpty()) root else current()
+            while (g != null) {
+                hash = hash * 31L + g.key
+                g = g.parent
+            }
+            return hash
+        }
 
     // ----- effects -----
 

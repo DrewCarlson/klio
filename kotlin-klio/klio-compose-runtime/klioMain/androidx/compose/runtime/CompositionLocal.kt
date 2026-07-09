@@ -22,11 +22,16 @@ public class ProvidableCompositionLocal<T> internal constructor(defaultFactory: 
 
     /** Bind this local to [value] for a [CompositionLocalProvider] subtree. */
     public infix fun provides(value: T): ProvidedValue<T> = ProvidedValue(this, value)
+
+    /** Bind this local to [value] only if no enclosing provider already binds it. */
+    public infix fun providesDefault(value: T): ProvidedValue<T> =
+        ProvidedValue(this, value, isDefault = true)
 }
 
 public class ProvidedValue<T> internal constructor(
     public val compositionLocal: CompositionLocal<T>,
     public val value: T,
+    internal val isDefault: Boolean = false,
 )
 
 /** A CompositionLocal whose value is read reactively (re-read on change).

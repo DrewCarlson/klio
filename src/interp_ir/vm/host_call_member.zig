@@ -1204,9 +1204,35 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     _ = allocator;
     const mg = self.module.borrow();
     defer mg.deinit();
-    if (mg.get().classIsOrExtends(sn, pn)) return true;
-    // The static head is unknown to the recorded hierarchy: undecidable.
-    if (mg.get().registry.class_super_names.get(sn) == null) return null;
+    const mod = mg.get();
+    // Resolve `sn` against EVERY class sharing that simple name, not just the
+    // one the simple-name-keyed hierarchy map happens to hold. Compose vendors
+    // two distinct `Node` types (`Modifier.Node : DelegatableNode` and an
+    // unrelated `Node : NodeParent`); the map keeps only the first, so a lookup
+    // of the wrong one would claim a spurious mismatch. A definite `false` may
+    // be returned only when the name resolves unambiguously and still fails to
+    // reach `pn`; an ambiguous or unknown head is undecidable (`null`), which
+    // keeps the candidate for the runtime-type check to judge.
+    var matches: usize = 0;
+    var relates = false;
+    for (mod.class_index.items) |entry| {
+        if (!std.mem.eql(u8, simpleName(entry.name), sn)) continue;
+        matches += 1;
+        if (std.mem.eql(u8, simpleName(entry.name), pn)) {
+            relates = true;
+            continue;
+        }
+        if (mod.registry.class_super_names.get(entry.name)) |chain| {
+            for (chain) |s| {
+                if (std.mem.eql(u8, simpleName(s), pn)) {
+                    relates = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (relates) return true;
+    if (matches != 1) return null;
     return false;
 }
 
@@ -2246,10 +2272,15 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // class whose registered name the supertype walk cannot relate;
     // decline to adjudicate.
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
-    // A typealiased param type adjudicates under its expansion, never the
-    // alias's simple name — another file may register an unrelated class
-    // under that name (the coroutines file-private `typealias Node =
-    // LockFreeLinkedListNode` vs ktor's nested `engines.Node`).
+    // A typealiased param type also adjudicates under its expansion. But the
+    // alias table is keyed by SIMPLE NAME globally, so a file-private
+    // `typealias` in one module shadows an unrelated real class of the same
+    // name in another (compose foundation's `internal typealias NodeList =
+    // MutableIntList` vs kotlinx.coroutines' real `class NodeList`). Adjudicate
+    // the arg against BOTH the original name and the expansion — a match on
+    // either is not a definite mismatch, so an ambiguous name never refutes a
+    // value that satisfies one of its readings.
+    const orig = pn;
     pn = resolveAliasName(self, pn);
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
 
@@ -2293,11 +2324,12 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // the hierarchy walk never reaches the inherited range overload. Refuting the
     // scalar param lets the walk fall through to it.
     if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
-    // Only adjudicate when the parameter names a known user class.
+    // Only adjudicate when the parameter names a known user class (under
+    // either reading of an aliased name).
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(pn) == null) return false;
+        if (cg.get().get(pn) == null and cg.get().get(orig) == null) return false;
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
@@ -2345,9 +2377,9 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
             }.m;
             // Positive proof only: a chain may itself truncate at a pack
             // boundary, so its silence never upgrades to definite mismatch.
-            if (tailMatch(start, pn)) return false;
+            if (tailMatch(start, pn) or tailMatch(start, orig)) return false;
             for (chain) |sup| {
-                if (tailMatch(sup, pn)) return false;
+                if (tailMatch(sup, pn) or tailMatch(sup, orig)) return false;
             }
         }
     }
@@ -2360,12 +2392,15 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        if (std.mem.eql(u8, cur, pn)) return false; // arg IS-A param type.
+        // arg IS-A param type (under either reading of an aliased name).
+        if (std.mem.eql(u8, cur, pn) or std.mem.eql(u8, cur, orig)) return false;
         // A lifted nested/inner class is registered under `Outer$Name`;
         // a type reference written `Outer.Name` collapses to `Name`, so
         // match the mangled tail too.
-        if (cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
-            std.mem.endsWith(u8, cur, pn)) return false;
+        if ((cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
+            std.mem.endsWith(u8, cur, pn)) or
+            (cur.len > orig.len and cur[cur.len - orig.len - 1] == '$' and
+                std.mem.endsWith(u8, cur, orig))) return false;
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch {};
         const cg = self.classes.borrow();
@@ -6591,6 +6626,21 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) and !f.low_priority) {
+                            // A member EXTENSION found among the class's own
+                            // methods binds the dispatch receiver as its
+                            // EXTENSION receiver (params[0]). When the receiver
+                            // is only the owner/dispatch instance and provably
+                            // not the declared extension-receiver type, that
+                            // direct bind is wrong: the call resolves through
+                            // the extension path instead (owner from the
+                            // enclosing `this`, extension receiver from an outer
+                            // implicit receiver — e.g. `with(node) { measure() }`
+                            // inside a MeasureScope coordinator). Skip it so the
+                            // receiver walk continues to the true extension
+                            // receiver.
+                            if (isMemberExt(mod, fid) and f.params.len > 0 and
+                                std.mem.eql(u8, f.params[0].name, "this") and
+                                receiverDefinitelyNotParam(self, &f.params[0].ty, receiver)) continue;
                             // Kotlin collection-stub bridge: a candidate whose
                             // declared param names a CLASS type param with a
                             // bound the runtime argument refutes is skipped,
@@ -8890,6 +8940,19 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
+                            // A member EXTENSION found among the class's own
+                            // methods binds the dispatch receiver as its
+                            // EXTENSION receiver (params[0]). When the receiver
+                            // is only the owner/dispatch instance and provably
+                            // not the declared extension-receiver type, the
+                            // direct bind is wrong: the call resolves through the
+                            // extension path (owner from the enclosing `this`,
+                            // extension receiver from an outer implicit receiver).
+                            // Skip it so this walk does not mis-bind the owner as
+                            // the extension receiver.
+                            if (isMemberExt(mod, fid) and f.params.len > 0 and
+                                std.mem.eql(u8, f.params[0].name, "this") and
+                                receiverDefinitelyNotParam(self, &f.params[0].ty, receiver)) continue;
                             // A name match alone is not a candidate:
                             // the member must be *applicable* to the
                             // supplied args (an unsupplied param needs

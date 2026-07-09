@@ -60,6 +60,10 @@ private fun ClipOp.code(): Int = if (this == ClipOp.Difference) 0 else 1
  * point, and vertex draws need surfaces not yet vendored and throw pending.
  */
 internal class KlioCanvas(private val handle: Long) : Canvas {
+    // The surface handle, exposed within the pack so the ui-text Paragraph engine
+    // can draw glyph runs onto this exact canvas (same transform/clip state).
+    internal val nativeHandle: Long get() = handle
+
     // A gradient brush sets paint.shader; arm it on the shim for the next draw
     // (the shader defines the pixels, overriding the flat colour) and clear it
     // after so a later solid draw isn't tinted.
@@ -90,9 +94,16 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
 
     override fun skew(sx: Float, sy: Float) { __skia_c_skew(handle, sx, sy) }
 
-    // DrawScope composes its transforms through translate/scale/rotate; a raw
-    // matrix concat is uncommon and left unapplied for now.
-    override fun concat(matrix: Matrix) {}
+    // Concat the matrix's 2D affine part (scale/skew/rotate/translate) onto the
+    // canvas. Layer transforms from graphicsLayer{} reach the canvas this way.
+    override fun concat(matrix: Matrix) {
+        val v = matrix.values
+        __skia_c_concat(
+            handle,
+            v[Matrix.ScaleX], v[Matrix.SkewX], v[Matrix.TranslateX],
+            v[Matrix.SkewY], v[Matrix.ScaleY], v[Matrix.TranslateY],
+        )
+    }
 
     override fun clipRect(left: Float, top: Float, right: Float, bottom: Float, clipOp: ClipOp) {
         __skia_c_clip_rect(handle, left, top, right, bottom, clipOp.code())
