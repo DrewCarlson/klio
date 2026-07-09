@@ -11,6 +11,7 @@ const build = @import("../build.zig");
 
 const decl = @import("decl.zig");
 const expr_mod = @import("expr.zig");
+const ast_scan = @import("ast_scan.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -190,6 +191,10 @@ pub fn lowerInitBlockWithParams(
     b.setOwnerClass(owner_class);
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    // Box body `var`s (and params) a nested lambda mutates into shared cells,
+    // exactly as a normal function body does — otherwise a `var` an init block
+    // mutates from inside a lambda captures a copy and the write is lost.
+    try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
@@ -224,12 +229,32 @@ pub fn lowerInitBlock(
     defer b.deinit();
     b.setOwnerClass(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    try setInitBlockBoxedVars(&b, allocator, &.{"this"}, block);
     try bindParams(&b, &.{"this"});
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.has_receiver_param = true;
     return pushFunc(module, func);
+}
+
+/// Compute the set of `var`s (body decls plus params) that a nested lambda in
+/// the init block mutates, and mark them for boxing so the lambda closes over
+/// a shared cell. Mirrors the body-`var` boxing in `lowerFunctionBody`.
+fn setInitBlockBoxedVars(
+    b: *FuncBuilder,
+    allocator: Allocator,
+    params: []const []const u8,
+    block: *const ast.Block,
+) Allocator.Error!void {
+    var boxed = try ast_scan.computeBoxedVars(allocator, block.stmts);
+    var assigned = StringSet.init(allocator);
+    defer assigned.deinit();
+    try ast_scan.namesAssignedInLambdas(block.stmts, &assigned);
+    for (params) |pname| {
+        if (assigned.contains(pname)) try boxed.put(pname, {});
+    }
+    b.setBoxedVars(boxed);
 }
 
 /// Lower an instance accessor body.
