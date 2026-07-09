@@ -1,0 +1,20 @@
+# androidx.compose.runtime.saveable — the Saver abstraction (Saver interface +
+# Saver(save, restore) factory + SaverScope + autoSaver), vendored verbatim.
+# A dependency of compose.ui.ui-text (AnnotatedString/SpanStyle savers) and
+# compose.foundation. The @Composable-driven pieces (rememberSaveable,
+# SaveableStateRegistry) are not vendored — only the pure Saver surface.
+[library]
+id = "androidx.compose.runtime.saveable"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/runtime/runtime-saveable/src/commonMain/kotlin"
+include = [
+    "androidx/compose/runtime/saveable/Saver.kt",
+]
+
+[[deps]]
+id = "stdlib"

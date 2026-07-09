@@ -104,6 +104,8 @@ id = "stdlib"
 [[deps]]
 id = "androidx.compose.runtime"
 [[deps]]
+id = "androidx.compose.runtime.saveable"
+[[deps]]
 id = "androidx.compose.ui.util"
 [[deps]]
 id = "androidx.compose.ui.geometry"
