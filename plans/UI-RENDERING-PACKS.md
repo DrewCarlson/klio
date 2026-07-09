@@ -100,7 +100,41 @@ The earlier per-`Path`/`Paint` notes are folded into the above.
   the deferred shader/filter/bitmap actuals. `Shape`/`Outline` sit just above
   (`Outline.Generic` needs `Path`), unblocking `RoundedCornerShape` etc.
 
-### 2. Real `androidx.compose.ui` engine — the current frontier
+### 2. Real `androidx.compose.ui` engine — running through measure/layout into draw
+
+The klio Owner + render tier is built (`klio-compose-ui-core/klioMain`:
+`KlioComposeHost.kt` — `KlioComposeOwner` over the vendored `MeasureAndLayoutDelegate`,
+a direct-draw `KlioOwnedLayer`, the platform CompositionLocals provider, minimal
+platform services, and a `renderComposeToPng` headless entry). The runtime gained
+`CompositionLocalMap` + `Composer.currentCompositionLocalMap` (so `Layout` can store
+resolved locals on a node), a headless `SnapshotStateObserver`, and vendored
+`MutableVector`. The pointer value classes are ported from skikoMain.
+
+`renderComposeToPng { Box(Modifier.size(100.dp).drawBehind { drawRect(Color.Red) }) }`
+now composes, constructs the Owner + root `LayoutNode`, provides the platform locals,
+runs measure + layout, and reaches the DRAW phase. Several general interpreter bugs
+surfaced along the way, root-caused and fixed:
+- a nested-class value loaded by id resolved the ENCLOSING class's companion (an enum
+  nested in a class, `LayoutNode.LayoutState.Idle`, became `LayoutNode.Companion.Idle`)
+  — `lookupGlobalById` now takes the class's OWN companion via `classDirectChild`, not
+  the chain-walking `classIdNestedIn`;
+- an imported nested-enum entry (`import Outer.State.Idle`) kept its intermediate
+  classifier segment instead of collapsing to `Outer.Idle`.
+
+**Current blocker** (a klio pack-build defect, precisely characterized, not yet fixed):
+the abstract base class `NodeCoordinator` is present in the ui-core `include` and its
+methods load + dispatch, but its `ClassDef` is DROPPED from the baked pack's module
+class table (its two concrete subclasses `InnerNodeCoordinator` /
+`LayoutModifierNodeCoordinator` are present). So constructing an `InnerNodeCoordinator`
+cannot resolve its parent (`classDefByName("NodeCoordinator")` misses everywhere), the
+body-property init chain is just `[InnerNodeCoordinator]`, and `NodeCoordinator`'s
+stored fields (`layer`, `wrapped`, …) never materialize — a `Vm::get_field layer on
+InnerNodeCoordinator` at draw. The likely cause is the pre-built pack's pruning
+dropping an `internal abstract` class that is only referenced as a supertype within
+the pack (a small hand-written repro of `internal abstract` + subclass instantiation
+does NOT reproduce, so it is specific to the supertype-only + pack-build-prune case).
+A defensive `parentDefForInit` (resolve a null-linked parent by name at construction)
+is in place but cannot help while the class is entirely absent from the table.
 
 The ~240-file engine (sparse-checkout expanded: `compose/ui/ui/src/commonMain`):
 `LayoutNode`, the `Modifier.Node` chain, measure/layout/draw, `Constraints`
