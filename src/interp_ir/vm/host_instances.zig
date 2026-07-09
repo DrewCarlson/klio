@@ -165,13 +165,27 @@ fn headInSet(head: []const u8, set: []const []const u8) bool {
 const integral_heads = [_][]const u8{ "Int", "Long", "Short", "Byte", "UInt", "ULong", "UShort", "UByte", "Char" };
 const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "Iterable", "MutableIterable", "List", "MutableList", "Set", "MutableSet", "Sequence" };
 
+/// Whether a constructor parameter declared `declared` can accept `arg`. A
+/// class-instance argument must be a subtype of a concrete class-typed
+/// parameter; otherwise a `this(...)` / constructor delegation whose named args
+/// map to a differently-typed constructor (e.g. a `color: Color`/`Int`
+/// secondary vs the primary's `textForegroundStyle: TextForegroundStyle`) would
+/// silently bind the wrong slot. Type parameters (`T`, `E`) and `Any` accept
+/// anything; non-instance values (primitives, null, lambdas) are left to the
+/// arity/family logic.
+fn paramAcceptsArg(declared: []const u8, arg: *const Value) bool {
+    if (arg.* != .Instance) return true;
+    if (std.mem.eql(u8, declared, "Any")) return true;
+    if (declared.len <= 2 and isAllUpper(declared)) return true;
+    return instanceOfClassName(arg, declared);
+}
+
 fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
     var best_score: i32 = -1;
     outer: for (entries) |e| {
         if (e.param_count != args.len) continue;
-        if (first == null) first = e;
         var score: i32 = 0;
         var i: usize = 0;
         while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
@@ -200,7 +214,11 @@ fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []c
                 continue;
             }
             if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
+            if (!paramAcceptsArg(declared, &args[i])) continue :outer;
         }
+        // Reached only when no parameter disqualified this candidate: it is a
+        // genuine arity+type match, so it is eligible as the fallback too.
+        if (first == null) first = e;
         if (score > best_score) {
             best_score = score;
             best = e;
@@ -1506,10 +1524,22 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
                         break;
                     }
                 }
-                if (all_default) {
-                    chosen = e;
-                    break;
+                if (!all_default) continue;
+                // The provided args must type-match this larger candidate's
+                // params (same subtype guard as chooseSecondaryCtor), so the
+                // fallback does not bind a class value to a mismatched slot and
+                // re-select the wrong ctor a `this(...)` delegation should skip.
+                var typ_ok = true;
+                var j: usize = 0;
+                while (j < args.len and j < e.param_type_heads.len) : (j += 1) {
+                    if (!paramAcceptsArg(e.param_type_heads[j], &args[j])) {
+                        typ_ok = false;
+                        break;
+                    }
                 }
+                if (!typ_ok) continue;
+                chosen = e;
+                break;
             }
         }
     }
