@@ -2740,22 +2740,30 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     }
                 }
             }
-            // Custom property setter declared on the class or a base.
+            // Custom property setter declared on the class or a base. Walk the
+            // FULL transitive supertype set, not a single `firstSupertype`
+            // chain: a class may inherit the setter from a base that is not its
+            // first-declared supertype (`MeasurePassDelegate : Placeable(),
+            // Measurable` — the `firstSupertype` chain follows the `Measurable`
+            // interface and never reaches `Placeable`, so the custom
+            // `measuredSize` setter was skipped and the write hit the backing
+            // field directly, its side effects lost).
             const setter_fid: ?FuncId = blk: {
-                var cur: ?[]const u8 = class_name;
-                var seen: std.ArrayList([]const u8) = .empty;
-                defer seen.deinit(allocator);
-                while (cur) |cn| {
-                    cur = null;
-                    if (containsStr(seen.items, cn)) break;
-                    try seen.append(allocator, cn);
-                    {
+                {
+                    const pg = self.prog.borrow();
+                    const hit = lookupPairFunc(pg.get().instance_prop_setters, class_name, real_name);
+                    pg.deinit();
+                    if (hit) |f| break :blk f;
+                }
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (mg.get().registry.class_super_names.get(class_name)) |chain| {
+                    for (chain) |cn| {
                         const pg = self.prog.borrow();
                         const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
                         pg.deinit();
                         if (hit) |f| break :blk f;
                     }
-                    cur = firstSupertype(self, cn);
                 }
                 break :blk null;
             };

@@ -4374,16 +4374,33 @@ fn inlineTargetForBareCall(
     // scope, and the two bodies differ.)
     if (pick) |pf| {
         if (b.ownerClass()) |enclosing| {
-            if (pf.receiver_type == null and !inlineOwnerInEnclosingHierarchy(b, enclosing, pf)) {
-                if (inline_state.candidatesForName(nm)) |cands| {
-                    if (cands.len >= 2) {
-                        for (cands) |cf| {
-                            if (cf == pf or cf.receiver_type != null) continue;
-                            if (inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) {
-                                pick = cf;
-                                break;
+            // The pick is an inline member of a class the enclosing class does
+            // NOT belong to. A bare call inside a member binds `this.<name>`, so
+            // an unrelated class's namesake is never the target.
+            if (pf.receiver_type == null) {
+                if (inline_state.inlineMemberOwner(pf)) |powner| {
+                    if (!b.module.classIsOrExtends(enclosing, powner)) {
+                        // Prefer a same-name inline overload declared in the
+                        // enclosing class's own hierarchy, if one exists.
+                        var replaced = false;
+                        if (inline_state.candidatesForName(nm)) |cands| {
+                            if (cands.len >= 2) {
+                                for (cands) |cf| {
+                                    if (cf == pf or cf.receiver_type != null) continue;
+                                    if (inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) {
+                                        pick = cf;
+                                        replaced = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
+                        // Otherwise, if the enclosing class declares its own
+                        // member of this name, decline the splice so the normal
+                        // member-call path binds it — a class's own `head`
+                        // (even non-inline) wins over an unrelated class's
+                        // inline `head`, whose body would run on the wrong `this`.
+                        if (!replaced and b.hasEnclosingMember(nm)) return null;
                     }
                 }
             }
