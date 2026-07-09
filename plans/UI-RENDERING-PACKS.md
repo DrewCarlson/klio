@@ -126,6 +126,22 @@ so desktop Compose programs are source-compatible.
 
 ### 3. foundation → material3
 
+**API surface + MaterialTheme theming — DONE.** The real
+`androidx.compose.material3` pack (over ui-text, foundation, foundation-layout,
+graphics-shapes) builds `lightColorScheme`/`darkColorScheme`/`Typography` (real
+token font sizes)/`Shapes`/`ColorScheme.copy`, and `MaterialTheme(colorScheme=…,
+typography=…) { … }` runs inside a `Composition`: it provides the theme through
+its `CompositionLocal`s and reading `MaterialTheme.colorScheme`/`typography`/
+`shapes` inside content returns the provided values, including a nested
+`MaterialTheme` that overrides its subtree and restores the outer theme.
+`example: compose_material3.kt`. The two ui-text init/resolution bugs noted below
+are cleared (the whole stack loads + runs). Rendering actual COMPONENTS
+(`Text`/`Surface`/`Button`) is the remaining piece: it needs the platform
+`CompositionLocal`s (`LocalFontFamilyResolver`, `LocalDensity`, …) provided at the
+composition root, the ui-text text-shaping actuals wired to the Skia shim
+(`createFontFamilyResolver`/`ActualParagraph` — §5 below), and the ui-engine
+Owner + measure/layout/draw (§2). See the `klio-material3-api-surface` memory.
+
 `compose.foundation` (Box/Row/Column/Text/Image, scroll, gesture, `Lazy*` on
 subcomposition), then `compose.material3` (mostly verbatim on foundation).
 
