@@ -795,13 +795,18 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
             sg.deinit();
             if (own) |v| return v;
             // A class with a companion answers with the companion's
-            // published singleton by ID as well.
+            // published singleton by ID as well. This must be the class's OWN
+            // companion (a DIRECT child) — not `classIdNestedIn`, which walks up
+            // the enclosing chain, so a nested class with no companion of its
+            // own (`enum LayoutNode.LayoutState`) would wrongly answer with the
+            // ENCLOSING class's companion, turning the nested-class value into
+            // `Outer.Companion`.
             const comp_id: ?ir.ClassId = blk: {
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 const m = mg.get();
                 if (cid.int() >= m.classes.items.len) break :blk null;
-                break :blk m.classIdNestedIn(cid, "Companion");
+                break :blk m.classDirectChild(cid, "Companion");
             };
             if (comp_id) |cc| {
                 const sg2 = self.singletons_by_id.borrow();

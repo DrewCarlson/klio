@@ -1198,6 +1198,10 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // Member read on `this` via GetField when the owning class declares
         // this name. A companioned class name is excepted: it is its companion
         // singleton, resolved by the classifier sentinel below, not a field.
+        // A NESTED classifier of the enclosing class (`enum LayoutState` inside
+        // `LayoutNode`, referenced bare) is also excepted: it is a class
+        // reference, not an instance member, so it falls to the class-ref
+        // lowering below (which loads the nested class and reads the enum entry).
         if (b.hasOwnMember(name0) and !classWithCompanion(b, name0)) {
             if (b.resolve("this")) |this_reg| {
                 const dst = b.allocReg();
@@ -1296,11 +1300,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (b.resolve(name0) == null) {
             if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
                 const sp = segments[0].span;
-                var rsegs = [_]ast.Ident{
-                    .{ .name = rw.cls, .span = sp },
-                    .{ .name = rw.member, .span = sp },
-                };
-                const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
+                const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+                for (rw.segs, 0..) |s, k| rsegs[k] = .{ .name = s, .span = sp };
+                const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
                 return lowerExpr(b, &qualified);
             }
             // A member brought in bare by `import EnumOrObject.*`
@@ -1498,14 +1500,23 @@ fn sgetterName(b: *FuncBuilder, name: []const u8) Allocator.Error!ConstId {
     return b.module.internConst(b.allocator, .{ .String = name });
 }
 
-const ImportRewrite = struct { cls: []const u8, member: []const u8 };
+const ImportRewrite = struct { segs: []const []const u8 };
 
-/// Resolve a bare name imported via `import a.b.C.MEMBER` into the
-/// `(C, MEMBER)` companion access pair, when the import path names a class
-/// this module declares.
+/// Resolve a bare name imported via `import a.b.C…MEMBER` into the qualified
+/// access path starting at the rightmost segment naming a class this module
+/// declares (dropping the leading package). Intermediate segments between the
+/// class and the member are preserved (`import Outer.State.Idle` → the nested
+/// `Outer.State.Idle`), EXCEPT an explicit `Companion` hop, which is dropped
+/// because a companion member is reached through the class itself
+/// (`import X.Companion.member` → `X.member`). Returns null when the path names
+/// no declared class, or the class is the leaf (a bare type reference).
 fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?ImportRewrite {
     const segs = b.module.importAliasIn(file, name) orelse return null;
-    // Find the rightmost segment naming a class the module declares.
+    // Find the rightmost segment naming a class the module declares (skips the
+    // leading package), then extend left across any enclosing-class chain so the
+    // path starts at the OUTERMOST (top-level, globally loadable) class — a bare
+    // nested class name (`LayoutState`) is not itself loadable, but the qualified
+    // `Outer.LayoutState.Idle` resolves the nested classifier then the entry.
     var cls_idx: ?usize = null;
     var i = segs.len;
     while (i > 0) {
@@ -1516,10 +1527,23 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
         }
     }
     const ci = cls_idx orelse return null;
-    if (ci + 1 < segs.len) {
-        return .{ .cls = segs[ci], .member = segs[segs.len - 1] };
+    if (ci + 1 >= segs.len) return null; // class is the leaf: a type reference
+
+    var start = ci;
+    while (start > 0 and b.module.classId(segs[start - 1]) != null) start -= 1;
+
+    const last = segs.len - 1;
+    var out = b.allocator.alloc([]const u8, segs.len - start) catch return null;
+    var n: usize = 0;
+    var j = start;
+    while (j < segs.len) : (j += 1) {
+        // Drop an intermediate `Companion` hop — `X.member` resolves the
+        // companion member — but keep a nested classifier (`Outer.State`).
+        if (j != start and j != last and std.mem.eql(u8, segs[j], "Companion")) continue;
+        out[n] = segs[j];
+        n += 1;
     }
-    return null;
+    return .{ .segs = out[0..n] };
 }
 
 /// A bare name brought into scope by `import EnumOrObject.*` resolves to that
@@ -2994,11 +3018,13 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const head = callee.Path.segments[0];
         if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
             if (importCompanionRewrite(b, head.span.file, head.name)) |rw| {
-                var recv_segs = [_]ast.Ident{.{ .name = rw.cls, .span = head.span }};
-                var recv = Expr{ .Path = .{ .segments = &recv_segs, .span = head.span } };
+                const sp = head.span;
+                const recv_segs = try b.allocator.alloc(ast.Ident, rw.segs.len - 1);
+                for (rw.segs[0 .. rw.segs.len - 1], 0..) |s, k| recv_segs[k] = .{ .name = s, .span = sp };
+                var recv = Expr{ .Path = .{ .segments = recv_segs, .span = sp } };
                 var new_callee = Expr{ .Member = .{
                     .receiver = &recv,
-                    .name = .{ .name = rw.member, .span = head.span },
+                    .name = .{ .name = rw.segs[rw.segs.len - 1], .span = sp },
                     .safe = false,
                     .span = callee.Path.span,
                 } };
@@ -6643,6 +6669,24 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
         // scoped classifier lookup, no string-mangled probing.
         if (b.module.classId(oc)) |owner_id| {
             if (b.module.classIdNestedIn(owner_id, name0)) |cid| return cid;
+            // The nesting tree (`class_children`) is built at VM setup, AFTER
+            // this lowering runs for a baked pack's bodies, so it can be empty
+            // here. Derive the nesting directly from FQNs (which `classIdByFqn`
+            // resolves without the tree): a bare `Nested` inside `a.b.Outer`
+            // resolves to `a.b.Outer.Nested`, walking up the enclosing-class
+            // FQNs so a reference to an outer-scope nested class still binds.
+            if (b.module.classFqnById(owner_id)) |ofqn| {
+                var pfqn: []const u8 = ofqn;
+                var hops: usize = 0;
+                while (hops < 16) : (hops += 1) {
+                    const cand = std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ pfqn, name0 }) catch break;
+                    defer b.allocator.free(cand);
+                    if (b.module.classIdByFqn(cand)) |cid| return cid;
+                    const dot = std.mem.lastIndexOfScalar(u8, pfqn, '.') orelse break;
+                    pfqn = pfqn[0..dot];
+                    if (b.module.classIdByFqn(pfqn) == null) break; // left the class nest
+                }
+            }
         }
     }
     // A receiver context whose owner chain is unknown here (a super-arg /

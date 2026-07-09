@@ -20,6 +20,7 @@
 #include "include/core/SkColor.h"
 #include "include/core/SkData.h"
 #include "include/core/SkFont.h"
+#include "include/core/SkFontMetrics.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkImageInfo.h"
@@ -366,6 +367,32 @@ float klio_skia_measure_paragraph(const char* utf8, float width, float size) {
     return n * size * kLineSpacing;
 }
 
+// The advance width (px) of a single unwrapped run `utf8` at `size`. 0 without a
+// font. The real Paragraph engine wraps in Kotlin off this measurement.
+float klio_skia_measure_text_width(const char* utf8, float size) {
+    ensureFonts();
+    if (!utf8 || !g_typeface) return 0;
+    SkFont font(g_typeface, size);
+    return font.measureText(utf8, std::strlen(utf8), SkTextEncoding::kUTF8);
+}
+
+// Font vertical metrics (px) at `size`: ascent is negative (above baseline),
+// descent positive (below), leading the recommended extra line gap. `which`
+// selects one so a single-value intrinsic can read each. 0 without a font.
+float klio_skia_font_metric(float size, int which) {
+    ensureFonts();
+    if (!g_typeface) return 0;
+    SkFont font(g_typeface, size);
+    SkFontMetrics m;
+    font.getMetrics(&m);
+    switch (which) {
+        case 0: return m.fAscent;   // negative
+        case 1: return m.fDescent;  // positive
+        case 2: return m.fLeading;
+        default: return 0;
+    }
+}
+
 // Encode the surface to a PNG file. Returns 0 on success, nonzero on failure.
 int klio_skia_save_png(KlioSurface* s, const char* path) {
     if (!s || !path) return 1;
@@ -625,6 +652,16 @@ void klio_skia_c_translate(KlioSurface* s, float dx, float dy) { if (auto* c = k
 void klio_skia_c_scale(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->scale(sx, sy); }
 void klio_skia_c_rotate(KlioSurface* s, float deg) { if (auto* c = klioCanvasOf(s)) c->rotate(deg); }
 void klio_skia_c_skew(KlioSurface* s, float sx, float sy) { if (auto* c = klioCanvasOf(s)) c->skew(sx, sy); }
+
+// Concat a 2D affine transform (Compose Matrix's affine components: scaleX,
+// skewX, transX, skewY, scaleY, transY) onto the canvas.
+void klio_skia_c_concat(KlioSurface* s, float sx, float kx, float tx, float ky, float sy, float ty) {
+    if (auto* c = klioCanvasOf(s)) {
+        SkMatrix m;
+        m.setAll(sx, kx, tx, ky, sy, ty, 0, 0, 1);
+        c->concat(m);
+    }
+}
 
 // clipOp: 0 difference, 1 intersect (matching ClipOp).
 void klio_skia_c_clip_rect(KlioSurface* s, float l, float t, float r, float b, int clipOp) {

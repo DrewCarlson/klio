@@ -55,6 +55,9 @@ include = [
     "androidx/compose/runtime/internal/Atomic.kt",
     "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
     "androidx/compose/runtime/platform/Synchronization.kt",
+    # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
+    # uses pervasively. Standalone (stdlib only), consumed straight from upstream.
+    "androidx/compose/runtime/collection/MutableVector.kt",
 ]
 
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state

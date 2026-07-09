@@ -54,6 +54,14 @@ public interface Composer {
     /** The nearest provided value for [local], or its default. */
     public fun consume(local: CompositionLocal<*>): Any?
 
+    /**
+     * A snapshot of all CompositionLocals in scope at this point, as the immutable
+     * [CompositionLocalMap] the node engine stores on a LayoutNode (via
+     * `ComposeUiNode.SetResolvedCompositionLocals`) so Modifier.Nodes can read
+     * locals with `currentValueOf`.
+     */
+    public val currentCompositionLocalMap: CompositionLocalMap
+
     // ----- node emission (the Applier path) -----
 
     /** True while emitting a freshly-inserted node ([createNode]); false when a
@@ -473,6 +481,14 @@ internal class KlioComposer : Composer {
         }
         return local.defaultFactory()
     }
+
+    override val currentCompositionLocalMap: CompositionLocalMap
+        get() {
+            if (localsStack.isEmpty()) return CompositionLocalMap.Empty
+            val merged = HashMap<CompositionLocal<*>, Any?>()
+            for (layer in localsStack) merged.putAll(layer) // outer→inner; inner wins
+            return KlioCompositionLocalMap(merged)
+        }
 
     // ----- effects -----
 

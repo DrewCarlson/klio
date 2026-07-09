@@ -1,0 +1,35 @@
+/*
+ * Copyright 2024 The klio Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ */
+
+package androidx.compose.ui.graphics
+
+// The klio Skia backend's text metrics + drawing, exposed to the ui-text pack,
+// which implements the real androidx.compose.ui.text.Paragraph over these. All
+// sizes and coordinates are in pixels. The bundled font is used for every run
+// (klio's shim ignores per-typeface requests), so these take only text + size.
+
+/** Advance width (px) of a single unwrapped run at [sizePx]. */
+fun klioTextWidth(text: String, sizePx: Float): Float = __composeui_text_width(text, sizePx)
+
+/** Font ascent (px, negative: above the baseline) at [sizePx]. */
+fun klioFontAscent(sizePx: Float): Float = __composeui_font_metric(sizePx, 0)
+
+/** Font descent (px, positive: below the baseline) at [sizePx]. */
+fun klioFontDescent(sizePx: Float): Float = __composeui_font_metric(sizePx, 1)
+
+/** Recommended extra line leading (px) at [sizePx]. */
+fun klioFontLeading(sizePx: Float): Float = __composeui_font_metric(sizePx, 2)
+
+/**
+ * Draw a single text run with its baseline origin at ([x], [y]) onto [canvas],
+ * honouring the canvas's current transform and clip. [argb] is packed as
+ * 0xAARRGGBB. A no-op for a canvas that is not klio's Skia-backed one.
+ */
+fun klioDrawTextRun(canvas: Canvas, text: String, x: Float, y: Float, sizePx: Float, argb: Int) {
+    val h = (canvas as? KlioCanvas)?.nativeHandle ?: return
+    __skia_c_draw_text(h, text, x, y, sizePx, argb)
+}
