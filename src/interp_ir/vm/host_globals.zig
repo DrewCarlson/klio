@@ -854,8 +854,17 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     // value class in another pack sharing a top-level enum's
                     // name) would otherwise hijack this resolution — routing the
                     // enum to the other class's companion. Only forward to the
-                    // companion when THIS class (cid) actually declares one.
-                    if (!is_object and m.classIdNestedIn(cid, "Companion") == null) break :blk null;
+                    // companion when it actually belongs to THIS class (cid):
+                    // either cid declares a nested `Companion`, or the recorded
+                    // singleton name is one of cid's own lifted members (a
+                    // lifted companion is renamed away from the literal
+                    // `Companion`, e.g. `LineHeightStyle$Alignment$Companion$…`).
+                    if (!is_object) {
+                        const cn_opt = m.registry.companion_singletons.get(cls_name);
+                        const own = m.classIdNestedIn(cid, "Companion") != null or
+                            (cn_opt != null and std.mem.startsWith(u8, cn_opt.?, cls_name));
+                        if (!own) break :blk null;
+                    }
                     if (m.registry.companion_singletons.get(cls_name)) |cn| break :blk cn;
                     if (is_object) break :blk cls_name;
                     break :blk null;
