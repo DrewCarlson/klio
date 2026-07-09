@@ -173,10 +173,19 @@ const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "I
 /// silently bind the wrong slot. Type parameters (`T`, `E`) and `Any` accept
 /// anything; non-instance values (primitives, null, lambdas) are left to the
 /// arity/family logic.
-fn paramAcceptsArg(declared: []const u8, arg: *const Value) bool {
+fn paramAcceptsArg(self: *VmHost, declared: []const u8, arg: *const Value) bool {
     if (std.mem.eql(u8, declared, "Any")) return true;
     if (declared.len <= 2 and isAllUpper(declared)) return true;
-    if (arg.* == .Instance) return instanceOfClassName(arg, declared);
+    if (arg.* == .Instance) {
+        if (instanceOfClassName(arg, declared)) return true;
+        // Only disqualify when `declared` is a class the argument is NOT: a
+        // typealias or otherwise-unresolved receiver name (a `Point` alias for
+        // `FloatFloatPair`) has no ClassDef, so the mismatch is unconfirmed and
+        // the candidate must not be rejected.
+        const kd = classDefByName(self, declared);
+        if (kd) |d| d.deinit();
+        return kd == null;
+    }
     // A non-instance builtin value (String, a list, an Int, …) offered to a
     // parameter of a definitely-different builtin kind cannot match — a
     // `String` param must not swallow a `List` argument, which would let an
@@ -204,7 +213,7 @@ fn builtinTypeKind(head: []const u8) u8 {
     return 0;
 }
 
-fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
     var best_score: i32 = -1;
@@ -238,7 +247,7 @@ fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []c
                 continue;
             }
             if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
-            if (!paramAcceptsArg(declared, &args[i])) continue :outer;
+            if (!paramAcceptsArg(self, declared, &args[i])) continue :outer;
         }
         // Reached only when no parameter disqualified this candidate: it is a
         // genuine arity+type match, so it is eligible as the fallback too.
@@ -714,7 +723,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         return .{ .ok = {} };
     }
     const entries = secondaryCtors(self, class_fqn, class_name);
-    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
+    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     const entry = chosen orelse {
         // No secondary ctor takes this shape: the class delegates through
         // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
@@ -1578,7 +1587,7 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
-    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(entries, args);
+    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     if (chosen == null) {
         for (entries) |e| {
             if (e.param_count > args.len) {
@@ -1598,7 +1607,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
                 var typ_ok = true;
                 var j: usize = 0;
                 while (j < args.len and j < e.param_type_heads.len) : (j += 1) {
-                    if (!paramAcceptsArg(e.param_type_heads[j], &args[j])) {
+                    if (!paramAcceptsArg(self, e.param_type_heads[j], &args[j])) {
                         typ_ok = false;
                         break;
                     }
