@@ -7770,7 +7770,15 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 // is authoritative where per-fid default thunks are not.
                 if (declArityRefuses(self, c.fid, args.len)) continue;
                 if (declared_recv) |dn| {
-                    if (staticReceiverApplicable(self, allocator, dn, c.fid, &c.func.params[0].ty) == false) continue;
+                    // A companion extension (`fun X.Companion.f`) called through
+                    // the class value (`X.f`) has declared receiver `X` but a
+                    // `X.Companion` receiver type; the class-value access
+                    // forwards to the companion, so the class-vs-companion
+                    // mismatch must not drop it.
+                    const rty = &c.func.params[0].ty;
+                    const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
+                        std.mem.eql(u8, rty.name, "Companion");
+                    if (!is_companion_recv and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) continue;
                 }
                 filtered.append(allocator, c) catch {};
             }
