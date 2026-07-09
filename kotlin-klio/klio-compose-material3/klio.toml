@@ -253,6 +253,9 @@ include = [
     "androidx/compose/material3/tokens/XSmallIconButtonTokens.kt",
 ]
 
+[[source]]
+root = "klioMain"
+
 [[deps]]
 id = "stdlib"
 [[deps]]
