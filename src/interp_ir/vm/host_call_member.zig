@@ -3665,8 +3665,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 const icg = ig.get().class.borrow();
                 defer icg.deinit();
                 const fqn = icg.get().fqn;
+                // Default companion: fqn ends `.Companion`. A NAMED companion
+                // (`companion object Factory`) instead has fqn
+                // `Enclosing.<Name>` and its lifted class name carries the
+                // `$Companion$` marker — strip the last fqn segment to the
+                // enclosing class so `Outer.Nested(args)` still constructs the
+                // nested class rather than missing as a companion member.
                 if (std.mem.endsWith(u8, fqn, ".Companion"))
                     break :blk fqn[0 .. fqn.len - ".Companion".len];
+                if (std.mem.indexOf(u8, icg.get().name, "$Companion$") != null) {
+                    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| break :blk fqn[0..dot];
+                }
                 break :blk null;
             };
             if (enc_fqn) |enc| {
