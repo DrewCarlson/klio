@@ -1745,7 +1745,20 @@ pub const Module = struct {
         var first: ?FuncId = null;
         var first_user: ?FuncId = null;
         var first_body: ?FuncId = null;
+        // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+        // overload is not a source-level candidate — it must never be the
+        // canonical heuristic pick while an ordinary same-name overload exists
+        // (a hidden binary-compat form that delegates to the real overload by
+        // name would otherwise self-recurse). Keep it only as the last resort
+        // for a name whose every overload is low-priority.
+        var first_lp: ?FuncId = null;
         for (candidates) |id| {
+            if (self.funcById(id)) |f| {
+                if (f.low_priority) {
+                    if (first_lp == null) first_lp = id;
+                    continue;
+                }
+            }
             if (first == null) first = id;
             if (self.funcById(id)) |f| {
                 if (first_body == null and f.hasBody()) first_body = id;
@@ -1756,7 +1769,7 @@ pub const Module = struct {
         // Prefer body over bodyless: a same-name `expect` (bodyless)
         // should not hide a same-name `actual` / non-expect body
         // sibling.
-        return first_user orelse first_body orelse first;
+        return first_user orelse first_body orelse first orelse first_lp;
     }
 
     /// Whether any top-level function with this simple name exists.
@@ -2545,18 +2558,31 @@ pub const Module = struct {
     }
 
     fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape) ?FuncId {
-        const fallback = self.funcId(name);
+        // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+        // overload is not a source-level candidate (kotlinc hides it; it exists
+        // only for binary compatibility). The index and `phaseBLadder` already
+        // skip it; the declared-arity fallback must too, or a bare call whose
+        // arity matches ONLY the hidden overload (`lightColorScheme(primary =
+        // c)` — the hidden binary-compat form has the same leading params)
+        // statically binds it, and a hidden form that delegates to the real
+        // overload by name self-recurses.
+        const fallback = blk: {
+            const f = self.funcId(name) orelse break :blk null;
+            if (self.funcById(f)) |ff| if (ff.low_priority) break :blk null;
+            break :blk f;
+        };
         const want_u32: u32 = @intCast(want);
         const fallback_fits = blk: {
             if (fallback) |fid| {
                 if (self.declArityOf(fid)) |n| break :blk n == want_u32 and self.declSigCompatible(fid, args);
-            }
+            } else break :blk false;
             break :blk true;
         };
         if (fallback) |fid| {
             const tier = self.bareCallTierOf(fid, name, caller_pkg, caller_file) orelse 255;
             if (tier == other_package_tier) {
                 for (self.funcsBySimpleName(name)) |cid| {
+                    if (self.funcById(cid)) |cf| if (cf.low_priority) continue;
                     if (self.isNonExtFid(cid)) continue;
                     if (self.declArityOf(cid) != want_u32) continue;
                     if (!self.declSigCompatible(cid, args)) continue;
@@ -2567,9 +2593,11 @@ pub const Module = struct {
         }
         if (fallback_fits) return fallback;
         for (self.funcsBySimpleName(name)) |fid| {
+            if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
             if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         for (self.funcsBySimpleName(name)) |fid| {
+            if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
             if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         if (want > 0) {

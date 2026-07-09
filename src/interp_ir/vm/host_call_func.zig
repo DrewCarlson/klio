@@ -822,23 +822,42 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
         .identity_conflict = applicIdentityConflictCb,
     };
 
-    var best_func: ?FuncId = null;
-    var best_score: i32 = 0;
+    // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+    // overload is not a source-level candidate: score ordinary and low-priority
+    // candidates apart so an applicable ordinary overload always wins. Without
+    // this a hidden binary-compat form whose arity exactly matches the call
+    // (`f(a)` over `f(a, b = …)`) outscores the real overload here on the
+    // positional re-pick — the last picker in the chain — and, when it
+    // delegates to the real overload by name, self-recurses.
+    var best_ord: ?FuncId = null;
+    var best_ord_score: i32 = std.math.minInt(i32);
+    var best_low: ?FuncId = null;
+    var best_low_score: i32 = std.math.minInt(i32);
     if (positionalPoints(self, module, func, shapes, scope)) |s| {
-        best_func = func;
-        best_score = s;
+        if (f.low_priority) {
+            best_low = func;
+            best_low_score = s;
+        } else {
+            best_ord = func;
+            best_ord_score = s;
+        }
     }
     for (candidates) |cand| {
         if (cand.int() == func.int()) continue;
-        if (positionalPoints(self, module, cand, shapes, scope)) |total| {
-            if (best_func == null or total > best_score) {
-                best_func = cand;
-                best_score = total;
+        const total = positionalPoints(self, module, cand, shapes, scope) orelse continue;
+        const is_low = if (funcAt(module, cand)) |cf| cf.low_priority else false;
+        if (is_low) {
+            if (best_low == null or total > best_low_score) {
+                best_low = cand;
+                best_low_score = total;
             }
+        } else if (best_ord == null or total > best_ord_score) {
+            best_ord = cand;
+            best_ord_score = total;
         }
     }
 
-    return best_func;
+    return best_ord orelse best_low;
 }
 
 // Function-type / callability helpers shared with the root module.
@@ -1236,17 +1255,33 @@ pub fn pickNamedOverloadId(
         .identity_conflict = applicIdentityConflictCb,
     };
 
-    var best: ?FuncId = null;
-    var best_score: i32 = std.math.minInt(i32);
+    // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+    // overload is not a source-level candidate: it is chosen only when no
+    // ordinary overload applies. Score ordinary and low-priority candidates
+    // apart so an applicable ordinary overload always wins — otherwise a hidden
+    // binary-compat form whose leading params exactly match the call
+    // (`lightColorScheme(primary = c)`) outscores the real overload (whose
+    // extra roles are defaulted) and, when it delegates to the real one by
+    // name, self-recurses.
+    var best_ord: ?FuncId = null;
+    var best_ord_score: i32 = std.math.minInt(i32);
+    var best_low: ?FuncId = null;
+    var best_low_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
         const score = namedPoints(self, module, cand, shapes, scope) orelse continue;
-        if (best == null or score > best_score) {
-            best = cand;
-            best_score = score;
+        const is_low = if (funcAt(module, cand)) |cf| cf.low_priority else false;
+        if (is_low) {
+            if (best_low == null or score > best_low_score) {
+                best_low = cand;
+                best_low_score = score;
+            }
+        } else if (best_ord == null or score > best_ord_score) {
+            best_ord = cand;
+            best_ord_score = score;
         }
     }
 
-    return best;
+    return best_ord orelse best_low;
 }
 
 pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func_in: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
@@ -1677,6 +1712,31 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             }
         }
     }
+
+    // A same-named class constructor belongs to the same overload set as the
+    // top-level factory functions (Kotlin resolves them together, most-specific
+    // wins). Score the primary constructor with the same engine; when it binds
+    // STRICTLY better than the best factory, decline so the caller's ctor path
+    // constructs. Strict-better keeps the common factory-wraps-ctor pattern
+    // (equal signatures -> the factory still wins), while an exact-match
+    // constructor outranks a factory whose parameter only loosely accepts the
+    // args (a `List<Feature>` reaching a `FloatArray` param). Without this a
+    // factory that delegates `Foo(features, center)` back into the set — which
+    // should reach the constructor — re-picks a sibling factory and self-recurses.
+    if (best_ord != null) {
+        if (mg.get().classId(name)) |ccid| {
+            if (ccid.int() < mg.get().classes.items.len) {
+                const ctor_sig = applicability.SigView{
+                    .params = mg.get().classes.items[ccid.int()].primary_params,
+                    .has_body = true,
+                };
+                if (applicability.applicable(&ctor_sig, shapes, scope)) |csc| {
+                    if (csc.points > best_ord_score) return .{ .ok = null };
+                }
+            }
+        }
+    }
+
     const func = best_ord orelse fallback: {
         // Only fall to a low-priority overload when nothing better can bind: no
         // ordinary overload applied AND no same-name class constructor exists
