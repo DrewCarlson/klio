@@ -29,9 +29,17 @@ public class ProvidedValue<T> internal constructor(
     public val value: T,
 )
 
-/** A CompositionLocal whose value is read reactively (re-read on change). */
-public fun <T> compositionLocalOf(defaultFactory: () -> T): ProvidableCompositionLocal<T> =
-    ProvidableCompositionLocal(defaultFactory)
+/** A CompositionLocal whose value is read reactively (re-read on change).
+ *
+ * The [policy] parameter matches the upstream signature so consumers that pass
+ * an explicit mutation policy (`compositionLocalOf(structuralEqualityPolicy())
+ * { … }`, as material3's `LocalTextStyle` does) bind correctly; klio's composer
+ * reads the provided value reactively without the policy-based change dedup, so
+ * the policy is accepted and ignored. */
+public fun <T> compositionLocalOf(
+    policy: SnapshotMutationPolicy<T> = structuralEqualityPolicy(),
+    defaultFactory: () -> T,
+): ProvidableCompositionLocal<T> = ProvidableCompositionLocal(defaultFactory)
 
 /** A CompositionLocal whose subtree recomposes wholesale when its value changes. */
 public fun <T> staticCompositionLocalOf(defaultFactory: () -> T): ProvidableCompositionLocal<T> =
