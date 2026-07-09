@@ -8384,6 +8384,26 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         }
     }
 
+    // Named nested-class construction through an OBJECT qualifier
+    // (`Object.Nested(field = y)`, e.g. `MaterialTheme.Values(typography = t)`):
+    // the object's bare name lowered to its singleton value, so the receiver is
+    // an `.Instance`, not a `.Class`. Honor the names here — the positional path
+    // would bind a differently-ordered named-arg list to the wrong ctor params.
+    if (any_named and receiver.* == .Instance) {
+        const cid: ?ir.ClassId = blk: {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            const icg = ig.get().class.borrow();
+            defer icg.deinit();
+            if (!host_globals.progHasObjectName(self, icg.get().name)) break :blk null;
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const rid = mg.get().classIdByFqn(icg.get().fqn) orelse mg.get().classId(icg.get().name) orelse break :blk null;
+            break :blk mg.get().classIdNestedIn(rid, name);
+        };
+        if (cid) |c| return self.newInstanceNamed(allocator, c, args, arg_names, null);
+    }
+
     // Positional dispatch first.
     const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
