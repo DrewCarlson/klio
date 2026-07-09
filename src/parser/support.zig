@@ -86,9 +86,15 @@ pub fn rejectTrailingAssignment(p: *Parser) void {
     _ = expr.parseExpr(p);
 }
 
+/// True when the cursor is at a token that cannot begin an expression, so a
+/// jump keyword before it (`return` / `break` / `continue`) carries no value.
+/// Beyond a statement boundary (newline / `;` / `}` / EOF) this includes the
+/// closers `)` and `]` and the separator `,`, so a bare `return` in expression
+/// position parses — e.g. `x ?: return`, `f(x ?: return)`, `a[x ?: return]`,
+/// `listOf(x ?: return, y)`.
 pub fn atNewlineOrSemiOrClose(p: *const Parser) bool {
     return switch (peekKind(p).*) {
-        .Newline, .Semicolon, .Eof, .RBrace => true,
+        .Newline, .Semicolon, .Eof, .RBrace, .RParen, .RBracket, .Comma => true,
         else => false,
     };
 }
