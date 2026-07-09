@@ -2984,6 +2984,31 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A bare call to a companion member imported by name
+    // (`import X.Companion.member` then `member(args)`) dispatches on X's
+    // companion: rewrite the callee to the qualified `X.member` the same way a
+    // bare companion-imported name expression is rewritten, so the call reaches
+    // the companion method instead of an unresolved global. A local / captured /
+    // own-member binding of the name shadows the import (Kotlin scope order).
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const head = callee.Path.segments[0];
+        if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+            if (importCompanionRewrite(b, head.span.file, head.name)) |rw| {
+                var recv_segs = [_]ast.Ident{.{ .name = rw.cls, .span = head.span }};
+                var recv = Expr{ .Path = .{ .segments = &recv_segs, .span = head.span } };
+                var new_callee = Expr{ .Member = .{
+                    .receiver = &recv,
+                    .name = .{ .name = rw.member, .span = head.span },
+                    .safe = false,
+                    .span = callee.Path.span,
+                } };
+                var rewritten = expr.*;
+                rewritten.Call.callee = &new_callee;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
+
     // Empty stdlib container creator (`emptyList()`, `setOf()`, `mapOf()`)
     // typed only by its binding annotation. With no explicit creation-site
     // type argument the runtime value cannot carry its element head, so a

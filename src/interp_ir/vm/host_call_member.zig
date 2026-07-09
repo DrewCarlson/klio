@@ -3676,6 +3676,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (std.mem.indexOf(u8, icg.get().name, "$Companion$") != null) {
                     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| break :blk fqn[0..dot];
                 }
+                // An object singleton used as a nested-class qualifier
+                // (`Object.Nested(args)`): the bare object name lowered to its
+                // singleton value, so the enclosing class is the object's own.
+                if (host_globals.progHasObjectName(self, icg.get().name)) break :blk fqn;
                 break :blk null;
             };
             if (enc_fqn) |enc| {
