@@ -484,6 +484,14 @@ pub const Lexer = struct {
         if (std.ascii.isDigit(b)) {
             return self.lexNumber(start);
         }
+        // Leading-dot float (`.15f`): Kotlin makes the integer part optional.
+        // Unambiguous — a member name cannot start with a digit and `..` is a
+        // range token, so a `.` immediately before a digit is a float literal.
+        if (b == '.') {
+            if (self.peekByte(1)) |b1| {
+                if (std.ascii.isDigit(b1)) return self.lexNumber(start);
+            }
+        }
 
         // Punctuation / operators.
         if (try self.lexPunct(start)) |tok| {
