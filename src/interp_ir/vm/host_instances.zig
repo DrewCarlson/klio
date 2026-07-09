@@ -1218,7 +1218,49 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         }
         return newInstance(self, allocator, class, full.items, outer_hint);
     }
+    // A named-arg call to a same-named top-level FACTORY function (a class or
+    // interface with a factory, e.g. kotlinx `MutableSharedFlow(replay=…,
+    // extraBufferCapacity=…)`): reorder against the factory's own parameters.
+    // The positional `newInstance` below would bind the named args by position
+    // and mis-score the factory — or, for an interface, fail to instantiate.
+    if (findNamedFactory(self, class_name, arg_names)) |fid| {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        return self.callFuncNamed(allocator, mg.get(), fid, args, arg_names);
+    }
     return newInstance(self, allocator, class, args, outer_hint);
+}
+
+/// A same-named top-level factory function whose parameters include every
+/// supplied argument name, so a named-arg `Foo(name = v)` call can target the
+/// factory `fun Foo(name: T = …)` rather than a constructor. Excludes instance
+/// methods / extensions (a leading `this` receiver) and bodyless declarations.
+fn findNamedFactory(self: *VmHost, class_name: []const u8, arg_names: []const ?[]const u8) ?FuncId {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    for (m.funcsBySimpleName(class_name)) |fid| {
+        const f = m.funcById(fid) orelse continue;
+        if (!f.hasBody()) continue;
+        if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var all_match = true;
+        for (arg_names) |an| {
+            const nm = an orelse continue;
+            var found = false;
+            for (f.params) |p| {
+                if (std.mem.eql(u8, p.name, nm)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) return fid;
+    }
+    return null;
 }
 
 fn isIntrinsicClass(fqn: []const u8) bool {
