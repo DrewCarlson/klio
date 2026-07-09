@@ -1204,9 +1204,35 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     _ = allocator;
     const mg = self.module.borrow();
     defer mg.deinit();
-    if (mg.get().classIsOrExtends(sn, pn)) return true;
-    // The static head is unknown to the recorded hierarchy: undecidable.
-    if (mg.get().registry.class_super_names.get(sn) == null) return null;
+    const mod = mg.get();
+    // Resolve `sn` against EVERY class sharing that simple name, not just the
+    // one the simple-name-keyed hierarchy map happens to hold. Compose vendors
+    // two distinct `Node` types (`Modifier.Node : DelegatableNode` and an
+    // unrelated `Node : NodeParent`); the map keeps only the first, so a lookup
+    // of the wrong one would claim a spurious mismatch. A definite `false` may
+    // be returned only when the name resolves unambiguously and still fails to
+    // reach `pn`; an ambiguous or unknown head is undecidable (`null`), which
+    // keeps the candidate for the runtime-type check to judge.
+    var matches: usize = 0;
+    var relates = false;
+    for (mod.class_index.items) |entry| {
+        if (!std.mem.eql(u8, simpleName(entry.name), sn)) continue;
+        matches += 1;
+        if (std.mem.eql(u8, simpleName(entry.name), pn)) {
+            relates = true;
+            continue;
+        }
+        if (mod.registry.class_super_names.get(entry.name)) |chain| {
+            for (chain) |s| {
+                if (std.mem.eql(u8, simpleName(s), pn)) {
+                    relates = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (relates) return true;
+    if (matches != 1) return null;
     return false;
 }
 
@@ -6591,6 +6617,21 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) and !f.low_priority) {
+                            // A member EXTENSION found among the class's own
+                            // methods binds the dispatch receiver as its
+                            // EXTENSION receiver (params[0]). When the receiver
+                            // is only the owner/dispatch instance and provably
+                            // not the declared extension-receiver type, that
+                            // direct bind is wrong: the call resolves through
+                            // the extension path instead (owner from the
+                            // enclosing `this`, extension receiver from an outer
+                            // implicit receiver — e.g. `with(node) { measure() }`
+                            // inside a MeasureScope coordinator). Skip it so the
+                            // receiver walk continues to the true extension
+                            // receiver.
+                            if (isMemberExt(mod, fid) and f.params.len > 0 and
+                                std.mem.eql(u8, f.params[0].name, "this") and
+                                receiverDefinitelyNotParam(self, &f.params[0].ty, receiver)) continue;
                             // Kotlin collection-stub bridge: a candidate whose
                             // declared param names a CLASS type param with a
                             // bound the runtime argument refutes is skipped,
@@ -8890,6 +8931,19 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
+                            // A member EXTENSION found among the class's own
+                            // methods binds the dispatch receiver as its
+                            // EXTENSION receiver (params[0]). When the receiver
+                            // is only the owner/dispatch instance and provably
+                            // not the declared extension-receiver type, the
+                            // direct bind is wrong: the call resolves through the
+                            // extension path (owner from the enclosing `this`,
+                            // extension receiver from an outer implicit receiver).
+                            // Skip it so this walk does not mis-bind the owner as
+                            // the extension receiver.
+                            if (isMemberExt(mod, fid) and f.params.len > 0 and
+                                std.mem.eql(u8, f.params[0].name, "this") and
+                                receiverDefinitelyNotParam(self, &f.params[0].ty, receiver)) continue;
                             // A name match alone is not a candidate:
                             // the member must be *applicable* to the
                             // supplied args (an unsupplied param needs
