@@ -4324,6 +4324,13 @@ pub fn recvChainOf(b: *FuncBuilder, cur: []const u8) Allocator.Error![]const []c
 /// KLIO_RESOLVE_AUDIT `inline` records compare this pick against the
 /// simple-name narrowing's per call, a permanent regression detector
 /// for the fold (zero unexplained divergences over the corpus).
+/// Whether inline member fn `f` is declared on the enclosing class or one of
+/// its transitive supertypes — i.e. reachable as `this.<f>` from a member body.
+fn inlineOwnerInEnclosingHierarchy(b: *FuncBuilder, enclosing: []const u8, f: *const ast.Function) bool {
+    const owner = inline_state.inlineMemberOwner(f) orelse return false;
+    return b.module.classIsOrExtends(enclosing, owner);
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -4340,7 +4347,7 @@ fn inlineTargetForBareCall(
         args.len,
         shape.last_is_lambda,
     );
-    const pick: ?*const ast.Function = switch (ires.outcome) {
+    var pick: ?*const ast.Function = switch (ires.outcome) {
         .resolved => |fid| blk: {
             // Receiver preference, mirroring `preferredBareTarget`: an
             // extension the receiver narrowing matched (and that the
@@ -4357,6 +4364,48 @@ fn inlineTargetForBareCall(
         },
         .deferred => narrowed,
     };
+    // Same-simple-name inline MEMBER overloads declared in unrelated classes:
+    // a bare call inside a member binds `this.<name>`, so the overload must be
+    // one declared in the enclosing class's own hierarchy — never a namesake
+    // member of an unrelated class. The index resolves the bare name without a
+    // receiver, so it can pick either; correct it here. (`performingMeasure` is
+    // a member of both `NodeCoordinator` and the unrelated `LookaheadDelegate`;
+    // inside `InnerNodeCoordinator.measure` only the `NodeCoordinator` one is in
+    // scope, and the two bodies differ.)
+    if (pick) |pf| {
+        if (b.ownerClass()) |enclosing| {
+            // The pick is an inline member of a class the enclosing class does
+            // NOT belong to. A bare call inside a member binds `this.<name>`, so
+            // an unrelated class's namesake is never the target.
+            if (pf.receiver_type == null) {
+                if (inline_state.inlineMemberOwner(pf)) |powner| {
+                    if (!b.module.classIsOrExtends(enclosing, powner)) {
+                        // Prefer a same-name inline overload declared in the
+                        // enclosing class's own hierarchy, if one exists.
+                        var replaced = false;
+                        if (inline_state.candidatesForName(nm)) |cands| {
+                            if (cands.len >= 2) {
+                                for (cands) |cf| {
+                                    if (cf == pf or cf.receiver_type != null) continue;
+                                    if (inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) {
+                                        pick = cf;
+                                        replaced = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Otherwise, if the enclosing class declares its own
+                        // member of this name, decline the splice so the normal
+                        // member-call path binds it — a class's own `head`
+                        // (even non-inline) wins over an unrelated class's
+                        // inline `head`, whose body would run on the wrong `this`.
+                        if (!replaced and b.hasEnclosingMember(nm)) return null;
+                    }
+                }
+            }
+        }
+    }
     // An inline overload whose last parameter is a function type does not
     // apply when its matching argument is an object instance — e.g. a
     // `FlowCollector` passed to `Flow.collect`, where the real target is the

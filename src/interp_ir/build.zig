@@ -1556,6 +1556,18 @@ fn buildModuleWithOverrides(
     // container; `deinit` never dereferences the freed contents), so the
     // arena reclaims them and no growing leak accumulates.
     const tl = std.heap.page_allocator;
+    // Record the owner class of every inline member fn, keyed by AST pointer,
+    // so a bare call to a name declared as an inline member in several
+    // unrelated classes binds the enclosing class's own-hierarchy overload
+    // (`file_classes` here spans user + base classes, materialised to the same
+    // AST pointers `candidatesFor` returns).
+    {
+        ir.lower.resetInlineMemberOwners();
+        var fcit = file_classes.iterator();
+        while (fcit.next()) |e| {
+            registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
+        }
+    }
     {
         var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
         // Base inline fns first, preserving the whole-program declaration
@@ -2906,6 +2918,23 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
             .Class => |*inner| if (inner.is_companion) {
                 try collectConsts(module, cls_name, inner.members);
             },
+            else => {},
+        }
+    }
+}
+
+/// Register each inline member fn in `members` as owned by class `owner`,
+/// recursing into nested classes/objects (whose members belong to the nested
+/// type). Mirrors `collectInline`'s recursion so the owner map covers exactly
+/// the member inline fns the candidate table holds.
+fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void {
+    for (members) |*m| {
+        switch (m.*) {
+            .Function => |*f| if (f.is_inline and f.body != null) {
+                ir.lower.registerInlineMemberOwner(f, owner);
+            },
+            .Class => |*c| registerInlineMemberOwners(c.members, c.name.name),
+            .Object => |*o| registerInlineMemberOwners(o.members, o.name.name),
             else => {},
         }
     }
