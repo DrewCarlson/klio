@@ -2272,10 +2272,15 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // class whose registered name the supertype walk cannot relate;
     // decline to adjudicate.
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
-    // A typealiased param type adjudicates under its expansion, never the
-    // alias's simple name — another file may register an unrelated class
-    // under that name (the coroutines file-private `typealias Node =
-    // LockFreeLinkedListNode` vs ktor's nested `engines.Node`).
+    // A typealiased param type also adjudicates under its expansion. But the
+    // alias table is keyed by SIMPLE NAME globally, so a file-private
+    // `typealias` in one module shadows an unrelated real class of the same
+    // name in another (compose foundation's `internal typealias NodeList =
+    // MutableIntList` vs kotlinx.coroutines' real `class NodeList`). Adjudicate
+    // the arg against BOTH the original name and the expansion — a match on
+    // either is not a definite mismatch, so an ambiguous name never refutes a
+    // value that satisfies one of its readings.
+    const orig = pn;
     pn = resolveAliasName(self, pn);
     if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
 
@@ -2319,11 +2324,12 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // the hierarchy walk never reaches the inherited range overload. Refuting the
     // scalar param lets the walk fall through to it.
     if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
-    // Only adjudicate when the parameter names a known user class.
+    // Only adjudicate when the parameter names a known user class (under
+    // either reading of an aliased name).
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(pn) == null) return false;
+        if (cg.get().get(pn) == null and cg.get().get(orig) == null) return false;
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
@@ -2371,9 +2377,9 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
             }.m;
             // Positive proof only: a chain may itself truncate at a pack
             // boundary, so its silence never upgrades to definite mismatch.
-            if (tailMatch(start, pn)) return false;
+            if (tailMatch(start, pn) or tailMatch(start, orig)) return false;
             for (chain) |sup| {
-                if (tailMatch(sup, pn)) return false;
+                if (tailMatch(sup, pn) or tailMatch(sup, orig)) return false;
             }
         }
     }
@@ -2386,12 +2392,15 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        if (std.mem.eql(u8, cur, pn)) return false; // arg IS-A param type.
+        // arg IS-A param type (under either reading of an aliased name).
+        if (std.mem.eql(u8, cur, pn) or std.mem.eql(u8, cur, orig)) return false;
         // A lifted nested/inner class is registered under `Outer$Name`;
         // a type reference written `Outer.Name` collapses to `Name`, so
         // match the mangled tail too.
-        if (cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
-            std.mem.endsWith(u8, cur, pn)) return false;
+        if ((cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
+            std.mem.endsWith(u8, cur, pn)) or
+            (cur.len > orig.len and cur[cur.len - orig.len - 1] == '$' and
+                std.mem.endsWith(u8, cur, orig))) return false;
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch {};
         const cg = self.classes.borrow();
