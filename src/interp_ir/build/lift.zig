@@ -140,7 +140,18 @@ fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSu
             try walkField(allocator, &a.target, prop, mode);
             try walkField(allocator, &a.value, prop, mode);
         },
-        else => {},
+        // A local `val`/`var` in an accessor body (`val old = field`) carries
+        // its initializer in a `Decl.Property`; its `field` reference must be
+        // rewritten too. A local declaration cannot itself have custom
+        // accessors, so only the initializer / delegate is walked.
+        .Decl => |*d| {
+            if (d.* == .Property) {
+                const p = d.Property;
+                if (p.init) |*init| try walkField(allocator, init, prop, mode);
+                if (p.delegate) |del| try walkField(allocator, del, prop, mode);
+            }
+        },
+        .DestructuringDecl => |*dd| try walkField(allocator, &dd.init, prop, mode),
     }
 }
 
