@@ -126,6 +126,16 @@ threadlocal var inline_fn_ids: ?std.AutoHashMap(u32, FnField) = null;
 /// the whole inline forest under the lazy path).
 threadlocal var inline_id_by_fn: ?std.AutoHashMap(usize, u32) = null;
 
+/// Owner class simple name for each inline MEMBER fn AST pointer. Member
+/// inline fns carry no `FuncId` stub (the index never resolves them), so a
+/// bare call to a name declared as a member in several unrelated classes
+/// cannot pick the enclosing-hierarchy overload from the id registry. The
+/// build driver fills this by walking the class universe (user + base),
+/// keyed by the same AST pointers `candidatesFor` returns. Backed by the
+/// process-lifetime allocator so it survives cross-build teardown; the value
+/// strings live in the build arena and are replaced each build via `reset`.
+threadlocal var inline_member_owner: ?std.AutoHashMap(usize, []const u8) = null;
+
 /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
 /// splices) so transitive expansion cannot recurse without bound; past
 /// it, callers fall back to a normal call.
@@ -244,6 +254,32 @@ pub fn setShadowedInlineNames(names: StringSet) void {
 fn isShadowed(name: []const u8) bool {
     if (shadowed_inline_names) |*c| return c.contains(name);
     return false;
+}
+
+/// Public view of the same-name inline-fn candidate list, for the bare-call
+/// resolver's owner-class hierarchy disambiguation.
+pub fn candidatesForName(name: []const u8) ?[]const *const ast.Function {
+    return candidatesFor(name);
+}
+
+/// Drop the previous build's member-owner map and start a fresh one. Call
+/// once per build, before registering owners.
+pub fn resetInlineMemberOwners() void {
+    if (inline_member_owner) |*m| m.deinit();
+    inline_member_owner = std.AutoHashMap(usize, []const u8).init(std.heap.page_allocator);
+}
+
+/// Record that inline member fn `f` is declared directly on class `owner`.
+pub fn registerInlineMemberOwner(f: *const ast.Function, owner: []const u8) void {
+    if (inline_member_owner == null) resetInlineMemberOwners();
+    inline_member_owner.?.put(@intFromPtr(f), owner) catch {};
+}
+
+/// The class that declares inline member fn `f`, or null for a top-level
+/// inline fn (or a member the build driver did not walk).
+pub fn inlineMemberOwner(f: *const ast.Function) ?[]const u8 {
+    const m = inline_member_owner orelse return null;
+    return m.get(@intFromPtr(f));
 }
 
 fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
