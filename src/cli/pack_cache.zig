@@ -350,7 +350,7 @@ fn loadEmbeddedStdlibSources(
             continue;
         }
         const p = parser.Parser.new(allocator, fid, src, lexed.tokens);
-        const file_ast = p.parseFile();
+        var file_ast = p.parseFile();
         if (p.diagnostics.hasErrors()) {
             if (diag) {
                 for (p.diagnostics.diags()) |d| {
@@ -361,6 +361,7 @@ fn loadEmbeddedStdlibSources(
             continue;
         }
         lexed.deinit(allocator);
+        ast.expandFileClassAliases(allocator, &file_ast);
         const pkg = packagePathOf(allocator, file_ast) catch continue;
         parsed.append(allocator, .{ .pkg = pkg, .file = file_ast }) catch {
             allocator.free(pkg);
@@ -793,12 +794,13 @@ fn loadPackCandidate(
                     continue;
                 }
                 const p = parser.Parser.new(allocator, fid, src, lexed.tokens);
-                const file_ast = p.parseFile();
+                var file_ast = p.parseFile();
                 if (p.diagnostics.hasErrors()) {
                     lexed.deinit(allocator);
                     continue;
                 }
                 lexed.deinit(allocator);
+                ast.expandFileClassAliases(allocator, &file_ast);
                 if (file_ast.package) |pkg| {
                     const path = joinIdentPath(allocator, pkg.path) catch continue;
                     defer allocator.free(path);

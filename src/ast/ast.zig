@@ -63,6 +63,53 @@ pub const KotlinFile = struct {
     span: Span,
 };
 
+fn rewriteAliasedTypeName(ty: *TypeRef, aliases: *const std.StringHashMap([]const u8)) void {
+    if (ty.function != null) return;
+    if (aliases.get(ty.name.name)) |target| ty.name.name = target;
+}
+
+fn expandAliasesInDecls(decls: []Decl, aliases: *const std.StringHashMap([]const u8)) void {
+    for (decls) |*d| {
+        switch (d.*) {
+            .Function => |*f| {
+                for (f.params) |*p| rewriteAliasedTypeName(&p.ty, aliases);
+                if (f.receiver_type) |*rt| rewriteAliasedTypeName(rt, aliases);
+                if (f.return_type) |*rt| rewriteAliasedTypeName(rt, aliases);
+            },
+            .Class => |*c| {
+                for (c.primary_params) |*p| rewriteAliasedTypeName(&p.ty, aliases);
+                expandAliasesInDecls(c.members, aliases);
+            },
+            .Object => |*o| expandAliasesInDecls(o.members, aliases),
+            else => {},
+        }
+    }
+}
+
+/// Expand this file's class typealiases in every function signature the file
+/// declares (params, receiver, return) and in constructor parameters. A
+/// `private typealias Node = LockFreeLinkedListNode` is file-scoped in Kotlin,
+/// so resolving it here — where the alias is unambiguously in scope — replaces
+/// the bare simple name with the concrete class. Otherwise a same-simple-name
+/// real class in another module (compose's `Modifier.Node` vs kotlinx's
+/// `typealias Node`) can capture the param through the flat global name table
+/// at dispatch time. Mutates `file.decls` in place; call right after parsing a
+/// file that will be lowered.
+pub fn expandFileClassAliases(allocator: std.mem.Allocator, file: *KotlinFile) void {
+    var aliases = std.StringHashMap([]const u8).init(allocator);
+    defer aliases.deinit();
+    for (file.decls) |*d| {
+        if (d.* != .TypeAlias) continue;
+        const ta = &d.TypeAlias;
+        if (ta.target.function != null) continue;
+        if (ta.target.name.name.len == 0) continue;
+        if (std.mem.eql(u8, ta.target.name.name, ta.name.name)) continue;
+        aliases.put(ta.name.name, ta.target.name.name) catch return;
+    }
+    if (aliases.count() == 0) return;
+    expandAliasesInDecls(file.decls, &aliases);
+}
+
 pub const PackageHeader = struct {
     path: []Ident,
     span: Span,

@@ -1342,9 +1342,11 @@ fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const s
             }
             continue;
         }
+        var file_ast_mut = file_ast;
+        ast.expandFileClassAliases(a, &file_ast_mut);
         out_files.append(a, .{
             .rel_path = a.dupe(u8, f.rel_path) catch continue,
-            .kotlin_file = file_ast,
+            .kotlin_file = file_ast_mut,
         }) catch continue;
     }
     return .{ .files = out_files.toOwnedSlice(a) catch &.{} };
