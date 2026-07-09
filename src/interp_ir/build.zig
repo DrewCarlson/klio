@@ -431,6 +431,12 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         while (it.next()) |inner| inner.deinit();
         private_prop_renames.deinit();
     }
+    var private_func_renames = ir.build.FilePrivateRenames.init(allocator);
+    defer {
+        var it = private_func_renames.valueIterator();
+        while (it.next()) |inner| inner.deinit();
+        private_func_renames.deinit();
+    }
     {
         var name_files = std.StringHashMap(u32).init(allocator);
         defer name_files.deinit();
@@ -464,6 +470,44 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
             try gop.value_ptr.put(p.name.name, mangled);
             p.name = .{ .name = mangled, .span = p.name.span };
+        }
+        // File-private top-level FUNCTIONS: same story as private properties.
+        // Two files each declaring `private fun debugLog(...)` are file-scoped
+        // in Kotlin, but klio's function namespace is flat, so identical
+        // signatures read as conflicting overloads. Mangle each per file and
+        // record the rename so the declaring file's bare calls rewrite to it.
+        {
+            var fn_files = std.StringHashMap(u32).init(allocator);
+            defer fn_files.deinit();
+            var fn_counts = std.StringHashMap(u32).init(allocator);
+            defer fn_counts.deinit();
+            for (decls.items) |*d| {
+                if (d.* != .Function) continue;
+                const fdec = d.Function;
+                if (fdec.receiver_type != null) continue;
+                const fid = fdec.span.file.int();
+                const gop = try fn_counts.getOrPut(fdec.name.name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = 1;
+                    try fn_files.put(fdec.name.name, fid);
+                } else if (fn_files.get(fdec.name.name).? != fid) {
+                    gop.value_ptr.* += 1;
+                }
+            }
+            for (decls.items) |*d| {
+                if (d.* != .Function) continue;
+                const fdec = &d.Function;
+                if (fdec.receiver_type != null) continue;
+                if (fdec.visibility != .Private or fdec.is_expect or fdec.is_actual) continue;
+                const count = fn_counts.get(fdec.name.name) orelse 0;
+                if (count < 2) continue;
+                const fid = fdec.span.file.int();
+                const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ fdec.name.name, fid });
+                const gop = try private_func_renames.getOrPut(fid);
+                if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                try gop.value_ptr.put(fdec.name.name, mangled);
+                fdec.name = .{ .name = mangled, .span = fdec.name.span };
+            }
         }
         // Non-private decls of one simple name declared by two or more
         // packages: each gets its declaring-FQN slot.
@@ -563,6 +607,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     }
     const prev_renames = ir.build.setLowerFilePrivateRenames(&private_prop_renames);
     defer _ = ir.build.setLowerFilePrivateRenames(prev_renames);
+    const prev_fn_renames = ir.build.setLowerFilePrivateFuncRenames(&private_func_renames);
+    defer _ = ir.build.setLowerFilePrivateFuncRenames(prev_fn_renames);
 
     // Kotlin scopes a file-`private` top-level class or typealias to its
     // declaring file; the lowered type namespace is flat. Mangle a private

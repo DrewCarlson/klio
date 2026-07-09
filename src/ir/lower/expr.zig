@@ -2967,6 +2967,23 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A bare call to a file-private top-level function mangled per file (two
+    // files in one package each declaring the same-signature `private fun`)
+    // resolves to the calling file's mangled name. Locals / outer captures /
+    // own members still shadow it (Kotlin scope order).
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const head = callee.Path.segments[0];
+        if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
+            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+                var new_segs = [_]ast.Ident{.{ .name = renamed, .span = head.span }};
+                var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
+                var rewritten = expr.*;
+                rewritten.Call.callee = &new_callee;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
+
     // Empty stdlib container creator (`emptyList()`, `setOf()`, `mapOf()`)
     // typed only by its binding annotation. With no explicit creation-site
     // type argument the runtime value cannot carry its element head, so a
