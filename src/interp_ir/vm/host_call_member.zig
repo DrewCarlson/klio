@@ -7717,9 +7717,17 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (!extArityApplicable(self, &c.func, want)) continue;
             if (candidateArgsDisproven(self, &c.func, args)) continue;
             // Kotlin selects extensions against the receiver's DECLARED
-            // type: a definite static mismatch drops the candidate.
+            // type: a definite static mismatch drops the candidate. But a
+            // COMPANION extension (`fun X.Companion.f`) invoked through the
+            // class value `X.f` has declared receiver `X` and receiver type
+            // `X.Companion`: the class-value access forwards to the companion,
+            // which `strictReceiverProven` above already confirmed for this
+            // receiver, so do not drop it on the class-vs-companion mismatch.
             if (declared_recv) |dn| {
-                if (staticReceiverApplicable(self, allocator, dn, c.fid, &c.func.params[0].ty) == false) continue;
+                const rty = &c.func.params[0].ty;
+                const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
+                    std.mem.eql(u8, rty.name, "Companion");
+                if (!is_companion_recv and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) continue;
             }
             filtered.append(allocator, c) catch {};
         }
