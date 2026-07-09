@@ -405,7 +405,14 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
             break :blk .{ .Suspended = ss };
         },
         .CalleeFailed => |m| .{ .CalleeFailed = m },
-        else => |other| try typeErr(allocator, "{s}", .{@tagName(other)}),
+        // Preserve each message-carrying variant's TEXT: collapsing to the
+        // tag name (`@tagName`) buries the real failure ("IR eval: Type"
+        // instead of the actual diagnostic), which hides the true bug.
+        .Type => |s| .{ .Type = s },
+        .Unbound => |s| .{ .Unbound = s },
+        .Unimplemented => |s| .{ .Unimplemented = s },
+        .Arity => |s| .{ .Arity = s },
+        else => |other| try typeErr(allocator, "unexpected intrinsic result: {s}", .{@tagName(other)}),
     };
 }
 
@@ -7144,7 +7151,8 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // `lookupIntrinsic` borrows. Instance receivers vary by `hostHasMember` per
     // instance and are not cached; array builders use a different (no-prepend)
     // dispatch and are excluded.
-    const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name);
+    const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name) and
+        !(try userToplevelExtNamedExists(self, allocator, receiver, name));
     if (cacheable) {
         const key: root_mod.ProgramImage.MemberResolveKey = .{
             .type_p = @intFromPtr(type_fqn.ptr),
@@ -7241,7 +7249,7 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
     }
 
     if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name) and
-        !(try userToplevelExtShadows(self, allocator, receiver, name, args.len)))
+        !(try userToplevelExtShadows(self, allocator, receiver, name, args)))
     {
         for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
@@ -7396,8 +7404,35 @@ fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, a
 /// outranks an implicitly imported stdlib extension of the same name
 /// (`kotlin.to`), so the stdlib probe ladder must stand down and let the
 /// extension fallback bind the user's declaration.
-fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, argc: usize) Allocator.Error!bool {
-    const want = argc + 1;
+/// Whether the user program declares ANY top-level extension named `name`
+/// whose receiver type accepts `receiver` (ignoring the arguments). When true,
+/// the `(type, name)` → stdlib-member resolution is ARGUMENT-dependent (the
+/// extension shadows the builtin only for arguments it applies to), so it must
+/// NOT be memoized by (type, name) alone — else the first call's winner
+/// (`1 or 2` → builtin `Int.or`) is wrongly replayed for a different argument
+/// shape (`1 or NodeKind` → must reach the extension).
+fn userToplevelExtNamedExists(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (isMemberExt(mod, fid)) continue;
+        // A pack/stdlib package's extension normally must not pre-empt the
+        // probe ladder it dispatches — EXCEPT on a builtin scalar receiver,
+        // where the builtin operators (`Int.or`, …) are host intrinsics, not
+        // FuncIds, so a pack's operator overload (`Int.or(NodeKind)`) is a
+        // genuine distinct overload that must apply for its own argument type.
+        if (stdlib.isKnownPackage(f.package) and
+            (std.mem.startsWith(u8, f.package, "kotlin") or !isBuiltinScalar(receiver))) continue;
+        if (try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty)) return true;
+    }
+    return false;
+}
+
+fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!bool {
+    const want = args.len + 1;
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
@@ -7412,12 +7447,28 @@ fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
         // …) is the very surface the probe ladder dispatches, so its
         // same-named extensions must not pre-empt it. A user declaration
         // lives in a package no registry knows.
-        if (stdlib.isKnownPackage(f.package)) continue;
+        if (stdlib.isKnownPackage(f.package) and
+            (std.mem.startsWith(u8, f.package, "kotlin") or !isBuiltinScalar(receiver))) continue;
         if (f.params.len < want) continue;
         if (!extArityApplicable(self, &f, want)) continue;
         // Only a proven receiver match shadows: an inapplicable namesake
         // (a `String.to` against an `Int` receiver) leaves the stdlib path.
-        if (try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty)) return true;
+        if (!(try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty))) continue;
+        // The ARGUMENTS must also be applicable, else this extension is not a
+        // candidate for THIS call and must not shadow a same-named stdlib
+        // member: `fun Int.or(NodeKind)` does not apply to `1 or 2`, so the
+        // builtin `Int.or(Int)` must still win (a member outranks an
+        // inapplicable extension). A scalar argument against a user-class
+        // parameter is a definite mismatch.
+        var args_ok = true;
+        for (args, 0..) |*arg, i| {
+            if (i + 1 >= f.params.len) break;
+            if (!receiverCompatibleWithParam(arg, &f.params[i + 1].ty)) {
+                args_ok = false;
+                break;
+            }
+        }
+        if (args_ok) return true;
     }
     return false;
 }
