@@ -5340,7 +5340,13 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the invisible candidate. Order-independent (decided from this file's imports)
     // and gated on the import actually naming in-scope funcs, so it never invents
     // a target.
+    // A member of the enclosing class (or an own member) shadows a top-level
+    // import for a bare call — Kotlin resolves `circle()` inside a class whose
+    // companion declares `fun circle()` to that member, never to an
+    // `import ....circle`. Leave the shadowed name for the member-dispatch
+    // paths below instead of qualifying it to the import's FQN.
     if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
+        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0) and
         b.module.funcsBySimpleName(name0).len >= 1)
     {
         const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
@@ -5359,7 +5365,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                     }
                 }
             }
-            if (import_resolves) {
+            // An imported EXTENSION function (`RoundedPolygon.Companion.circle`)
+            // called with no explicit receiver has no `this` to carry: the
+            // qualified FQN rewrite would load it as a receiverless global and
+            // miss. Only a plain top-level function (the `kotlin.math.max`
+            // shape this rewrite exists for) qualifies.
+            const imp_is_extension = blk: {
+                if (b.module.funcIdByFqn(alias_paths[0].fqn)) |ifid| {
+                    if (b.module.funcById(ifid)) |iff| {
+                        break :blk iff.params.len != 0 and std.mem.eql(u8, iff.params[0].name, "this");
+                    }
+                }
+                break :blk false;
+            };
+            if (import_resolves and !imp_is_extension) {
                 const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
                 for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
                 const new_callee = try b.allocator.create(Expr);
