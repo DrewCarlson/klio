@@ -359,8 +359,22 @@ pub fn liftClassRecursive(
                 // name would collide with a top-level type that is also
                 // extended through the qualified form.
                 const is_private = nested.visibility == .Private;
+                // A nested class with its OWN companion, referenced by bare
+                // name for a companion member (`Alignment.Proportional` inside
+                // `LineHeightStyle`, where `Alignment` is a nested value class),
+                // must mangle+alias when its simple name collides with a
+                // top-level type (any package, including a dependency's) — the
+                // bare name otherwise resolves to the same-named top-level type
+                // at runtime and its companion member is not found. The
+                // qualified-supertype form is the older, narrower trigger.
+                const nested_has_companion = blk: {
+                    for (nested.members) |*nm| {
+                        if (nm.* == .Class and nm.Class.is_companion) break :blk true;
+                    }
+                    break :blk false;
+                };
                 const collides = ctx.top_level_type_names.contains(nested.name.name) and
-                    ctx.used_qualified_supertypes.contains(qualified);
+                    (ctx.used_qualified_supertypes.contains(qualified) or nested_has_companion);
                 var lifted = nested.*;
                 if (is_private or collides) {
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
