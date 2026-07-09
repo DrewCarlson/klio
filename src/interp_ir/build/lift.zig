@@ -359,13 +359,18 @@ pub fn liftClassRecursive(
                 // name would collide with a top-level type that is also
                 // extended through the qualified form.
                 const is_private = nested.visibility == .Private;
-                // A nested class with its OWN companion, referenced by bare
-                // name for a companion member (`Alignment.Proportional` inside
+                // A nested class with its OWN companion, referenced by bare name
+                // for a companion member (`Alignment.Proportional` inside
                 // `LineHeightStyle`, where `Alignment` is a nested value class),
-                // must mangle+alias when its simple name collides with a
-                // top-level type (any package, including a dependency's) — the
-                // bare name otherwise resolves to the same-named top-level type
-                // at runtime and its companion member is not found. The
+                // must mangle+alias UNCONDITIONALLY: a cross-module collision
+                // (its simple name vs another pack's top-level type, e.g.
+                // ui.Alignment loaded only once material3 pulls ui-core in beside
+                // ui-text) is NOT visible at this module's bake, so gating on a
+                // bake-visible collision misses it and the bare name resolves to
+                // the wrong same-named type at runtime. Mangling is safe: the
+                // class keeps its NESTED fqn (from the pre-lift span override),
+                // so external qualified refs still resolve, while bare refs in
+                // the declaring subtree rewrite through the alias. The
                 // qualified-supertype form is the older, narrower trigger.
                 const nested_has_companion = blk: {
                     for (nested.members) |*nm| {
@@ -373,8 +378,9 @@ pub fn liftClassRecursive(
                     }
                     break :blk false;
                 };
-                const collides = ctx.top_level_type_names.contains(nested.name.name) and
-                    (ctx.used_qualified_supertypes.contains(qualified) or nested_has_companion);
+                const collides = nested_has_companion or
+                    (ctx.top_level_type_names.contains(nested.name.name) and
+                        ctx.used_qualified_supertypes.contains(qualified));
                 var lifted = nested.*;
                 if (is_private or collides) {
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
