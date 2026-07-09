@@ -354,6 +354,9 @@ include = [
     "androidx/compose/foundation/text/selection/TextSelectionDelegate.kt",
 ]
 
+[[source]]
+root = "klioMain"
+
 [[deps]]
 id = "stdlib"
 [[deps]]
