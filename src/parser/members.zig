@@ -186,6 +186,29 @@ fn parseFunReceiverResult(p: *Parser) ReceiverResult {
                 };
                 t.type_args = args;
                 t.span = t.span.join(seg.span);
+            } else if (after != null and is(&after.?, .Dot) and
+                after_next != null and is(&after_next.?, .Ident) and after_2 != null and
+                (is(&after_2.?, .QuestionDot) or after_2.?.isQuestion()))
+            {
+                // Pattern: `.Ident ?. …` / `.Ident ? . …` — a NULLABLE qualified
+                // receiver (`Modifier.Node?.hit`). Fold the `.Ident` segment; the
+                // trailing `?` and the separating `.` before the function name are
+                // consumed below (the loop breaks on the `?`/`?.`, then the
+                // QuestionDot / expect-`.` logic runs).
+                _ = bump(p); // '.'
+                const seg = parseIdent(p, "type segment") orelse break;
+                t.name = Ident{
+                    .name = std.fmt.allocPrint(p.allocator, "{s}.{s}", .{ t.name.name, seg.name }) catch @panic("OOM"),
+                    .span = t.name.span.join(seg.span),
+                };
+                t.span = t.span.join(seg.span);
+                // A plain `?` (not the combined `?.`) is its own token: mark the
+                // receiver nullable + consume it here, leaving `.` for the name.
+                if (peekKind(p).*.isQuestion()) {
+                    t.nullable = true;
+                    _ = bump(p);
+                }
+                break;
             } else {
                 break;
             }

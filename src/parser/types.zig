@@ -154,6 +154,13 @@ pub fn parseTypeArgs(p: *Parser) []TypeArg {
     if (!isKind(peekKind(p), .Lt)) {
         return &.{};
     }
+    // Type arguments are fully bracketed by `<...>`, so a qualified path inside
+    // one (`Vec<A.B>`, `MutableVector<Modifier.Node>`) never conflicts with a
+    // trailing `.method` the caller is holding `suppress_qualified_path` for
+    // (an extension receiver). Always allow qualified paths within the args.
+    const saved_sqp = p.suppress_qualified_path;
+    p.suppress_qualified_path = false;
+    defer p.suppress_qualified_path = saved_sqp;
     _ = support.bump(p);
     var args: std.ArrayList(TypeArg) = .empty;
     while (true) {

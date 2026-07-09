@@ -1282,18 +1282,66 @@ fn parseBindingPair(a: std.mem.Allocator, key: []const u8, val: []const u8) !Bin
 /// the `sources` section to re-parse them later. Spans inside the bundle
 /// carry `SourceMap` `FileId`s allocated during the build. Allocated from
 /// `a`.
-fn buildAstBundle(a: std.mem.Allocator, files: []const schema.SourceFile) schema.AstBundle {
+/// The 1-based line + column of a byte offset in `src`, for a loud error.
+fn lineColOf(src: []const u8, byte: usize) struct { line: usize, col: usize } {
+    var line: usize = 1;
+    var col: usize = 1;
+    var i: usize = 0;
+    while (i < byte and i < src.len) : (i += 1) {
+        if (src[i] == '\n') {
+            line += 1;
+            col = 1;
+        } else col += 1;
+    }
+    return .{ .line = line, .col = col };
+}
+
+/// Parse each source file into a frozen AST. A lex or parse error is FATAL: the
+/// pack must never be built with a file silently dropped (a dropped file loses
+/// its classes while leaving dangling references, which surfaces much later as
+/// an opaque runtime miss). `out_err` is set to a file:line:col diagnostic on
+/// the first failing file so `buildLibraryPack` aborts loudly.
+fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const schema.SourceFile, out_err: *?Failure) schema.AstBundle {
     var out_files: std.ArrayList(schema.AstFile) = .empty;
     var map = SourceMap.init(a);
     for (files) |f| {
-        const id = map.add(f.rel_path, f.bytes) catch continue;
+        const id = map.add(f.rel_path, f.bytes) catch {
+            if (out_err.* == null) out_err.* = fail(gpa, "pack build: out of memory reading {s}", .{f.rel_path});
+            continue;
+        };
         const src = map.get(id).source;
-        var lx = Lexer.init(a, id, src) catch continue;
-        var lexed = lx.tokenize() catch continue;
-        if (lexed.diagnostics.hasErrors()) continue;
+        var lx = Lexer.init(a, id, src) catch {
+            if (out_err.* == null) out_err.* = fail(gpa, "pack build: cannot lex {s}", .{f.rel_path});
+            continue;
+        };
+        var lexed = lx.tokenize() catch {
+            if (out_err.* == null) out_err.* = fail(gpa, "pack build: lex failed for {s}", .{f.rel_path});
+            continue;
+        };
+        if (lexed.diagnostics.hasErrors()) {
+            if (out_err.* == null) {
+                for (lexed.diagnostics.diags()) |d| {
+                    if (d.severity != .Error) continue;
+                    const lc = lineColOf(src, d.primary.span.start);
+                    out_err.* = fail(gpa, "pack build: lex error in {s}:{d}:{d}: {s}", .{ f.rel_path, lc.line, lc.col, d.message });
+                    break;
+                }
+            }
+            continue;
+        }
         const p = Parser.new(a, id, src, lexed.tokens);
         const file_ast = p.parseFile();
-        if (p.diagnostics.hasErrors()) continue;
+        if (p.diagnostics.hasErrors()) {
+            if (out_err.* == null) {
+                for (p.diagnostics.diags()) |d| {
+                    if (d.severity != .Error) continue;
+                    const lc = lineColOf(src, d.primary.span.start);
+                    out_err.* = fail(gpa, "pack build: parse error in {s}:{d}:{d}: {s}", .{ f.rel_path, lc.line, lc.col, d.message });
+                    break;
+                }
+            }
+            continue;
+        }
         out_files.append(a, .{
             .rel_path = a.dupe(u8, f.rel_path) catch continue,
             .kotlin_file = file_ast,
@@ -1499,8 +1547,11 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const sources_bytes = (schema.encode(schema.SourceBundle, a, &source_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Frozen AST.
-    const ast_bundle = buildAstBundle(a, files);
+    // Frozen AST. A lex/parse failure in any file is fatal — never ship a pack
+    // with a source silently dropped.
+    var ast_err: ?Failure = null;
+    const ast_bundle = buildAstBundle(gpa, a, files, &ast_err);
+    if (ast_err) |e| return .{ .err = e };
     const ast_bytes = (schema.encode(schema.AstBundle, a, &ast_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
@@ -1712,7 +1763,7 @@ test "collectPackBindings: explicit entries sorted, then auto when enabled" {
     try std.testing.expect(out[1].overrides_interpreter);
 }
 
-test "buildAstBundle drops files that fail to parse" {
+test "buildAstBundle fails loudly on a parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1720,7 +1771,25 @@ test "buildAstBundle drops files that fail to parse" {
         .{ .rel_path = "ok/Good.kt", .bytes = "package ok\nfun f(): Int = 1\n" },
         .{ .rel_path = "bad/Broken.kt", .bytes = "fun (((\n" },
     };
-    const bundle = buildAstBundle(a, &files);
+    var err: ?Failure = null;
+    _ = buildAstBundle(std.testing.allocator, a, &files, &err);
+    // A broken file is NOT silently dropped — it is reported as a fatal error
+    // naming the file, so the pack is never built with a source missing.
+    try std.testing.expect(err != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.?, "bad/Broken.kt") != null);
+    std.testing.allocator.free(err.?);
+}
+
+test "buildAstBundle accepts a clean file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = [_]schema.SourceFile{
+        .{ .rel_path = "ok/Good.kt", .bytes = "package ok\nfun f(): Int = 1\n" },
+    };
+    var err: ?Failure = null;
+    const bundle = buildAstBundle(std.testing.allocator, a, &files, &err);
+    try std.testing.expect(err == null);
     try std.testing.expectEqual(@as(usize, 1), bundle.files.len);
     try std.testing.expectEqualStrings("ok/Good.kt", bundle.files[0].rel_path);
 }
