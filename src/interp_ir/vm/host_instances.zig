@@ -174,10 +174,34 @@ const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "I
 /// anything; non-instance values (primitives, null, lambdas) are left to the
 /// arity/family logic.
 fn paramAcceptsArg(declared: []const u8, arg: *const Value) bool {
-    if (arg.* != .Instance) return true;
     if (std.mem.eql(u8, declared, "Any")) return true;
     if (declared.len <= 2 and isAllUpper(declared)) return true;
-    return instanceOfClassName(arg, declared);
+    if (arg.* == .Instance) return instanceOfClassName(arg, declared);
+    // A non-instance builtin value (String, a list, an Int, …) offered to a
+    // parameter of a definitely-different builtin kind cannot match — a
+    // `String` param must not swallow a `List` argument, which would let an
+    // overloaded `this(...)` delegation pick a same-arity ctor with swapped
+    // parameters and recurse. Unknown kinds (0, e.g. a class type or a
+    // supertype like `Any`/`Number`) accept anything.
+    const gk = builtinTypeKind(valueTypeHead(arg.*));
+    const dk = builtinTypeKind(declared);
+    if (gk != 0 and dk != 0 and gk != dk) return false;
+    return true;
+}
+
+/// Coarse bucket for a builtin type head, so a definite cross-kind argument
+/// mismatch (a list for a string param) disqualifies a constructor candidate.
+/// `0` means "not a recognised concrete builtin" (class, type parameter, or a
+/// supertype like `Number`/`CharSequence`) and matches anything.
+fn builtinTypeKind(head: []const u8) u8 {
+    if (headInSet(head, &integral_heads)) return 1;
+    if (std.mem.eql(u8, head, "Float") or std.mem.eql(u8, head, "Double")) return 2;
+    if (std.mem.eql(u8, head, "Boolean")) return 3;
+    if (std.mem.eql(u8, head, "String")) return 5;
+    if (headInSet(head, &collectionish_heads)) return 6;
+    if (std.mem.eql(u8, head, "Map") or std.mem.eql(u8, head, "MutableMap") or
+        std.mem.eql(u8, head, "HashMap") or std.mem.eql(u8, head, "LinkedHashMap")) return 7;
+    return 0;
 }
 
 fn chooseSecondaryCtor(entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
