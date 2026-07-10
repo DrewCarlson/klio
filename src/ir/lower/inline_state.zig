@@ -269,6 +269,38 @@ pub fn resetInlineMemberOwners() void {
     inline_member_owner = std.AutoHashMap(usize, []const u8).init(std.heap.page_allocator);
 }
 
+/// Member/object property ASTs by `owner\x1fname`, so reified-type-argument
+/// inference can resolve a property-access argument's declared generic type
+/// (`Nodes.Draw` -> its getter's `NodeKind<DrawModifierNode>(…)`). Keys live in
+/// the build arena; the container follows the same cross-build teardown
+/// discipline as the other threadlocal tables (deinit never dereferences the
+/// arena-owned keys).
+threadlocal var member_prop_asts: ?std.StringHashMap(*const ast.Property) = null;
+
+/// Drop the previous build's property-AST map and start a fresh one.
+pub fn resetMemberPropAsts() void {
+    if (member_prop_asts) |*m| m.deinit();
+    member_prop_asts = std.StringHashMap(*const ast.Property).init(std.heap.page_allocator);
+}
+
+/// Record that class/object `owner` declares property `p`. First
+/// registration wins (mirrors `class_index` collision semantics).
+pub fn registerMemberPropAst(a: std.mem.Allocator, owner: []const u8, p: *const ast.Property) void {
+    if (member_prop_asts == null) resetMemberPropAsts();
+    const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, p.name.name }) catch return;
+    const gop = member_prop_asts.?.getOrPut(key) catch return;
+    if (gop.found_existing) return;
+    gop.value_ptr.* = p;
+}
+
+/// The property AST `owner` declares under `name`, or null.
+pub fn memberPropAst(owner: []const u8, name: []const u8) ?*const ast.Property {
+    const m = member_prop_asts orelse return null;
+    var buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ owner, name }) catch return null;
+    return m.get(key);
+}
+
 /// Record that inline member fn `f` is declared directly on class `owner`.
 pub fn registerInlineMemberOwner(f: *const ast.Function, owner: []const u8) void {
     if (inline_member_owner == null) resetInlineMemberOwners();

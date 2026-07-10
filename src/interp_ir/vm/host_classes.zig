@@ -552,6 +552,21 @@ fn lowerAndRegisterMethods(
                     defer tbl.deinit();
                     try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
                 }
+                // A custom setter registers its 1-arg thunk symmetrically, so a
+                // local class's `override var x set(value) { … }` dispatches on
+                // writes instead of landing on a phantom raw field.
+                if (p.setter) |setter| {
+                    const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
+                    const thunk = try host_instances.synthSetterThunk(allocator, p.name, vp, setter.body, p.is_override);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+                    const fid = func.id;
+                    const caps = try allocator.dupe(NameValue, capture_pairs);
+                    const key = try std.fmt.allocPrint(allocator, "$set${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    defer tbl.deinit();
+                    try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
+                }
                 // A complex initializer (`val items = mutableListOf<...>()`)
                 // lowers as a `$init$` thunk the construction pipeline runs;
                 // simple literals stay inline (`simpleLiteral`).

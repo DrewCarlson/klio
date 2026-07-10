@@ -2778,6 +2778,24 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
                     .err => |e| return .{ .err = e },
                 }
             }
+            // Anon-object / local-class custom setter: dispatch a `$set$<name>`
+            // anon method when one is registered for the receiver's class —
+            // the write-side mirror of the `$get$<name>` read path.
+            {
+                const setter_key = try std.fmt.allocPrint(allocator, "$set${s}", .{real_name});
+                defer allocator.free(setter_key);
+                const has_setter = blk: {
+                    const g = self.anon_methods.borrow();
+                    defer g.deinit();
+                    break :blk g.get().contains(anonKey(class_name, setter_key));
+                };
+                if (has_setter) {
+                    switch (try self.callMember(allocator, receiver, setter_key, &.{value})) {
+                        .ok => return .{ .ok = {} },
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+            }
             // Companion / parent / outer fallback for a write whose name
             // is not an own member of this instance.
             const has_own = blk: {
