@@ -763,6 +763,65 @@ fn notePropScope(
         if (std.mem.eql(u8, existing.fqn, fqn)) return;
     }
     try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
+    // A `const val` with a literal initializer records its value so the
+    // lowering can inline the constant at reference sites, exactly as
+    // kotlinc does.
+    if (p.is_const) {
+        if (p.init) |*init| {
+            if (constLiteralOf(init)) |cv| {
+                try module.registry.top_level_const_vals.put(fqn, cv);
+            }
+        }
+    }
+}
+
+/// The `ir.Const` for a compile-time-constant initializer expression: a
+/// plain literal, optionally under unary minus. Anything else (arithmetic,
+/// references, string templates with interpolation) returns null and the
+/// property keeps the ordinary global-read path.
+fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
+    switch (e.*) {
+        .IntLit => |il| {
+            switch (il.kind) {
+                .Int => {
+                    const v = std.math.cast(i32, il.value) orelse return null;
+                    return .{ .Int = v };
+                },
+                .Long => return .{ .Long = il.value },
+                .UInt => {
+                    const wide: u64 = @bitCast(il.value);
+                    const v = std.math.cast(u32, wide) orelse return null;
+                    return .{ .UInt = v };
+                },
+                .ULong => return .{ .ULong = @bitCast(il.value) },
+            }
+        },
+        .FloatLit => |fl| {
+            return switch (fl.kind) {
+                .Double => .{ .Double = fl.value },
+                .Float => .{ .Float = @floatCast(fl.value) },
+            };
+        },
+        .BoolLit => |bl| return .{ .Bool = bl.value },
+        .CharLit => |cl| return .{ .Char = cl.value },
+        .StringTemplate => |st| {
+            if (st.parts.len == 0) return .{ .String = "" };
+            if (st.parts.len == 1 and st.parts[0] == .Text) return .{ .String = st.parts[0].Text };
+            return null;
+        },
+        .Unary => |u| {
+            if (u.op != .Neg) return null;
+            const inner = constLiteralOf(u.expr) orelse return null;
+            return switch (inner) {
+                .Int => |v| .{ .Int = -%v },
+                .Long => |v| .{ .Long = -%v },
+                .Double => |v| .{ .Double = -v },
+                .Float => |v| .{ .Float = -v },
+                else => null,
+            };
+        },
+        else => return null,
+    }
 }
 
 fn declPackage(a: Allocator, decl_pkg: *const SpanStrMap, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {

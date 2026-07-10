@@ -434,6 +434,77 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
 /// when its position does not resolve (a runtime-internal / host dispatch point
 /// — marked so the gap is intelligible rather than reading as a truncated line).
 /// Caller owns the returned slice.
+/// `KLIO_SPIN_TRACE=<seconds>` diagnostic: at block boundaries, when the
+/// interval has elapsed, print the live frame chain (innermost first, with
+/// resolved file:line) to stderr — an execution that never returns names its
+/// loop. No effect when the env var is unset.
+var spin_interval_s: ?i64 = null;
+var spin_interval_read = false;
+threadlocal var spin_last_dump: i64 = 0;
+threadlocal var spin_check_counter: u64 = 0;
+
+fn spinDumpMaybe() void {
+    if (!spin_interval_read) {
+        spin_interval_read = true;
+        if (runtime.getenvSlice("KLIO_SPIN_TRACE")) |v| {
+            spin_interval_s = std.fmt.parseInt(i64, v, 10) catch 30;
+        }
+    }
+    const iv = spin_interval_s orelse return;
+    const now: i64 = @intCast(runtime.clockMonotonicNanos() / std.time.ns_per_s);
+    if (spin_last_dump == 0) {
+        spin_last_dump = now;
+        return;
+    }
+    if (now - spin_last_dump < iv) return;
+    spin_last_dump = now;
+    std.debug.print("[spin] frame chain (innermost first):\n", .{});
+    // Innermost frames' scalar registers — live loop state (probe offsets,
+    // masks, bit groups) for a loop that never terminates.
+    {
+        var rf = frame_chain;
+        var fi: usize = 0;
+        while (rf) |f0| : (rf = f0.gc_link) {
+            if (fi >= 3) break;
+            const n = @min(f0.regs.items.len, 60);
+            std.debug.print("  [regs#{d} {s}]", .{ fi, f0.func.name });
+            for (f0.regs.items[0..n], 0..) |*v, i| {
+                switch (v.*) {
+                    .Int => |x| std.debug.print(" r{d}=i{d}", .{ i, x }),
+                    .Long => |x| std.debug.print(" r{d}=L{d}", .{ i, x }),
+                    .Bool => |x| std.debug.print(" r{d}={}", .{ i, x }),
+                    else => {},
+                }
+            }
+            std.debug.print("\n", .{});
+            fi += 1;
+        }
+    }
+    var cur = frame_chain;
+    var depth: usize = 0;
+    while (cur) |f| : (cur = f.gc_link) {
+        const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
+        if (f.cur_span) |sp| {
+            var printed = false;
+            if (span.active_map) |m| {
+                if (m.getChecked(sp.file)) |sf| {
+                    const lc = sf.lineCol(sp.start);
+                    std.debug.print("  {s} ({s}:{d})\n", .{ label, sf.path, lc.line });
+                    printed = true;
+                }
+            }
+            if (!printed) std.debug.print("  {s} (f{d}@{d})\n", .{ label, @intFromEnum(sp.file), sp.start });
+        } else {
+            std.debug.print("  {s}\n", .{label});
+        }
+        depth += 1;
+        if (depth >= 32) {
+            std.debug.print("  ...\n", .{});
+            break;
+        }
+    }
+}
+
 fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![]u8 {
     if (fr.has_pos) {
         if (span.active_map) |m| {
@@ -1934,6 +2005,10 @@ fn runFrameInner(
         if (runtime.shouldAbandon()) {
             return errResult(.{ .Type = "daemon task abandoned at run boundary" });
         }
+        // Spin diagnostic (KLIO_SPIN_TRACE): cheap counter gate, then a
+        // wall-clock check inside.
+        spin_check_counter +%= 1;
+        if (spin_check_counter & 0xFFFF == 0) spinDumpMaybe();
         // GC safe point: at an opcode boundary all live Values are in registered
         // frames/globals (no host op mid-flight), so the collector can run.
         if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();

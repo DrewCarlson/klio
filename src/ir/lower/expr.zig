@@ -1246,6 +1246,24 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
+        // A visible top-level `const val` outranks a class binding from a
+        // less-visible scope: inside ScatterMap.kt the bare `Empty` is the
+        // file's compile-time constant, never kotlinx-atomicfu's file-private
+        // `object Empty` that shares the simple name in the flat class table.
+        // Compare scope tiers and inline the literal when the constant wins
+        // (Kotlin inlines const vals at every reference).
+        if (b.resolve(name0) == null and !b.knowsOuter(name0) and
+            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
+        {
+            if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
+                const ptier = b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
+                const ctier = b.module.classRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
+                if (ptier < ctier) {
+                    orEmitAudit(b, "top_level_prop", "ConstInline", name0);
+                    return try b.emitConst(cv);
+                }
+            }
+        }
         // A bare name that is a known class is a class reference. In a
         // receiver context a runtime receiver member shadows the
         // classifier (kotlinc: a property named like a class wins in
@@ -1341,6 +1359,16 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
             !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
         {
+            // Kotlin `const val` semantics: a reference to a visible
+            // top-level compile-time constant inlines its literal value.
+            // This also makes the read immune to the flat runtime global
+            // table, where a same-simple-name value published by another
+            // module can capture the name (androidx.collection's `Empty`
+            // sentinel vs compose's `LocaleList.Empty`).
+            if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
+                orEmitAudit(b, "top_level_prop", "ConstInline", name0);
+                return try b.emitConst(cv);
+            }
             // A bare read whose only declaration is an unimported
             // cross-package property is unresolved (kotlinc rejects it).
             if (b.module.topLevelPropFqn(name0)) |pfqn| {

@@ -84,6 +84,8 @@ Run any program with:
 | `class_factory_overload.kt`  | Same-name factory function vs constructor, disambiguated by argument type and arity. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
 | `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
+| `const_val_inline.kt`         | Top-level `const val`s inline at reference sites (compile-time constants, incl. unary minus). |
+| `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized nullable form `@Ann ((name: T) -> Unit)?`. |
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |

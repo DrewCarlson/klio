@@ -2991,6 +2991,37 @@ pub const Module = struct {
         return best_tier;
     }
 
+    /// The literal value of the top-level `const val` a bare reference to
+    /// `name` resolves to at this site, or null when the best-scoped
+    /// declaration is not a recorded compile-time constant (or the pick is
+    /// ambiguous). Kotlin inlines const vals at every reference; emitting
+    /// the literal keeps the read immune to the flat runtime global table,
+    /// where a same-simple-name value from another module can win.
+    pub fn topLevelConstLiteral(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?Const {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var best_fqn: ?[]const u8 = null;
+        var ambiguous = false;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t < best_tier) {
+                best_tier = t;
+                best_fqn = pd.fqn;
+                ambiguous = false;
+            } else if (t == best_tier and best_fqn != null and !std.mem.eql(u8, best_fqn.?, pd.fqn)) {
+                ambiguous = true;
+            }
+        }
+        if (ambiguous or best_tier == 255) return null;
+        const fqn = best_fqn orelse return null;
+        return self.registry.top_level_const_vals.get(fqn);
+    }
+
     /// The FQN of the first known top-level property declaration named
     /// `name`, for an out-of-scope value-reference diagnostic.
     pub fn topLevelPropFqn(self: *const Module, name: []const u8) ?[]const u8 {
@@ -3366,6 +3397,12 @@ pub const ModuleRegistry = struct {
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
     member_ext_owner_class: std.AutoHashMap(FuncId, []const u8),
+    /// Top-level `const val` literal values keyed by declaration FQN.
+    /// Kotlin inlines compile-time constants at every reference, so the
+    /// lowering reads the value here and emits the literal directly — a
+    /// bare `Empty` inside androidx.collection can never be captured by a
+    /// same-simple-name global another module published.
+    top_level_const_vals: std.StringHashMap(Const),
     /// Per-local-function default-arg thunks. Keyed by the local fn's
     /// lowered body `FuncId`; each slot holds the `FuncId` of a 0-arg
     /// thunk producing that parameter's default, or `null` for a
@@ -3461,6 +3498,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
+            .top_level_const_vals = std.StringHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
@@ -3525,6 +3563,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.class_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
+        self.top_level_const_vals.deinit();
         {
             var it = self.local_fn_defaults.valueIterator();
             while (it.next()) |list| list.deinit(a);
@@ -3648,6 +3687,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.member_ext_owner_class.iterator();
             while (it.next()) |e| try out.member_ext_owner_class.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_const_vals.iterator();
+            while (it.next()) |e| try out.top_level_const_vals.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.local_fn_defaults.iterator();

@@ -895,7 +895,13 @@ fn parenStartsFunctionType(p: *Parser) bool {
                 if (depth == 0) {
                     var j = i + 1;
                     while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
-                    return j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Arrow;
+                    if (j >= p.tokens.len) return false;
+                    // `(...) ->` is a function type; `(...)?` is a
+                    // parenthesized (usually function) type made nullable —
+                    // `@Composable ((iconColor: Color) -> Unit)?` — never
+                    // annotation arguments.
+                    return std.meta.activeTag(p.tokens[j].kind) == .Arrow or
+                        p.tokens[j].kind.isQuestion();
                 }
             },
             .Eof => return false,
