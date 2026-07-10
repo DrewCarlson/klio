@@ -1019,7 +1019,12 @@ pub fn tryInlineCallWithTypeArgs(
         const arg = if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null;
         var cls_reg_opt: ?Reg = null;
         if (arg) |a| {
-            const substituted = b.resolveReifiedTypeName(a.name.name) orelse a.name.name;
+            // The stamped name resolves through the scope rename too: a
+            // mangled nested class (`enumEntries<Item>()` where `Item`
+            // lifted as `A$Item`) must reach the runtime as the lifted
+            // name the class table actually holds.
+            const substituted = b.resolveReifiedTypeName(a.name.name) orelse
+                (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
             const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
             try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
         }

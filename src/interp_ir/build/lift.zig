@@ -261,7 +261,53 @@ pub const LiftCtx = struct {
     top_level_type_names: *const StringSet,
     mangled_nested: *MangledMap,
     used_qualified_supertypes: *const StringSet,
+    /// Nested class/object simple names declared MORE THAN ONCE across the
+    /// module (two `Builder`s under different outers). The flat lifted
+    /// namespace can hold only one, so every duplicate lifts mangled.
+    dup_nested_names: *const StringSet,
 };
+
+/// Collect nested class/object simple names that appear more than once
+/// across `decls` (recursively), so the lift mangles every one of them —
+/// `HexFormat.BytesHexFormat.Builder` and `HexFormat.NumberHexFormat.Builder`
+/// cannot share the flat name `Builder`.
+pub fn collectDupNestedNames(a: Allocator, decls: []const ast.Decl, out: *StringSet) Allocator.Error!void {
+    var counts = std.StringHashMap(u32).init(a);
+    defer counts.deinit();
+    for (decls) |*d| {
+        switch (d.*) {
+            .Class => |*c| try countNestedNames(&counts, c.members),
+            .Object => |*o| try countNestedNames(&counts, o.members),
+            else => {},
+        }
+    }
+    var it = counts.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* > 1) try out.put(e.key_ptr.*, {});
+    }
+}
+
+fn countNestedNames(counts: *std.StringHashMap(u32), members: []const ast.Decl) Allocator.Error!void {
+    for (members) |*m| {
+        switch (m.*) {
+            .Class => |*nc| {
+                if (!nc.is_companion) {
+                    const gop = try counts.getOrPut(nc.name.name);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                }
+                try countNestedNames(counts, nc.members);
+            },
+            .Object => |*no| {
+                const gop = try counts.getOrPut(no.name.name);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+                try countNestedNames(counts, no.members);
+            },
+            else => {},
+        }
+    }
+}
 
 /// Recursively walk a class's members and lift companion objects, plain
 /// nested classes, and inner classes to top-level entries in `out_decls`.
@@ -277,7 +323,8 @@ pub fn liftClassRecursive(
         if (m.* == .Object) {
             const co = &m.Object;
             const is_private0 = co.visibility == .Private;
-            const collides = ctx.top_level_type_names.contains(co.name.name);
+            const collides = ctx.top_level_type_names.contains(co.name.name) or
+                ctx.dup_nested_names.contains(co.name.name);
             var lifted_name: []const u8 = co.name.name;
             var alias_simple: ?[]const u8 = null;
             if (is_private0 or collides) {
@@ -390,6 +437,7 @@ pub fn liftClassRecursive(
                     break :blk false;
                 };
                 const collides = nested_has_companion or
+                    ctx.dup_nested_names.contains(nested.name.name) or
                     (ctx.top_level_type_names.contains(nested.name.name) and
                         ctx.used_qualified_supertypes.contains(qualified));
                 var lifted = nested.*;

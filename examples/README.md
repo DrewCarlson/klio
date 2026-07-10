@@ -92,6 +92,9 @@ Run any program with:
 | `member_ext_sibling_named.kt` | A member-extension invoked with named arguments seeds its owner as an enclosing receiver, so a bare sibling member-extension call inside the body resolves. |
 | `bounded_typeparam_receiver.kt` | A `where`-bounded generic extension never binds a receiver outside its bounds, even when the static receiver hint says otherwise. |
 | `delegated_member_named_args.kt` | Class delegation serving a member invoked with named arguments binds parameters by name through the forward. |
+| `positional_lambda_binding.kt` | Two positional lambdas with a defaulted third lambda parameter bind positionally; the trailing-lambda shift fires only when the callable does not fit its positional slot. |
+| `companion_import_identity.kt` | A named companion-member import aliases the same value as the qualified read and outranks a same-named class in expression position. |
+| `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |

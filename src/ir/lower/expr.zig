@@ -1264,6 +1264,23 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
+        // A NAMED companion-member import outranks a same-named class in
+        // expression position (kotlinc: `import Layout.Companion.Marker`
+        // binds the value `Marker` even when an `interface Marker` is in
+        // scope — the classifier only matters in type position). Rewrite
+        // to the qualified companion access before the class arm below
+        // can capture the name.
+        if (b.resolve(name0) == null and !b.knowsOuter(name0) and
+            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
+        {
+            if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
+                const sp = segments[0].span;
+                const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+                for (rw.segs, 0..) |s2, k| rsegs[k] = .{ .name = s2, .span = sp };
+                const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
+                return lowerExpr(b, &qualified);
+            }
+        }
         // A bare name that is a known class is a class reference. In a
         // receiver context a runtime receiver member shadows the
         // classifier (kotlinc: a property named like a class wins in
@@ -1545,8 +1562,13 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
     // path starts at the OUTERMOST (top-level, globally loadable) class — a bare
     // nested class name (`LayoutState`) is not itself loadable, but the qualified
     // `Outer.LayoutState.Idle` resolves the nested classifier then the entry.
+    // The scan excludes the LEAF segment: the leaf is the imported member,
+    // and a same-named CLASS elsewhere in scope must not capture it —
+    // `import Layout.Companion.Marker` next to an `interface Marker` still
+    // rewrites to `Layout.Marker`. (A bare `import a.b.SomeClass` type
+    // reference has no member segment and simply finds no class here.)
     var cls_idx: ?usize = null;
-    var i = segs.len;
+    var i = segs.len - 1;
     while (i > 0) {
         i -= 1;
         if (b.module.classId(segs[i]) != null) {
@@ -1555,7 +1577,6 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
         }
     }
     const ci = cls_idx orelse return null;
-    if (ci + 1 >= segs.len) return null; // class is the leaf: a type reference
 
     var start = ci;
     while (start > 0 and b.module.classId(segs[start - 1]) != null) start -= 1;
@@ -3494,7 +3515,7 @@ fn lowerCallWithWritebackPath(
     const dst = b.allocReg();
     if (segments.len == 1) {
         if (bound_id) |func_id| {
-            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
@@ -4048,7 +4069,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .LoadGlobal = .{ .dst = gv, .name = cn } });
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             const dst = b.allocReg();
             try b.push(.{ .CallValue = .{
                 .dst = dst,
@@ -4285,7 +4306,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     // Carry explicit call-site type arguments so an intrinsic container
     // creator (`listOf<Byte>(…)`) stamps and coerces its element type.
-    const type_args = try internTypeArgs(b.allocator, b.module, call.type_args);
+    const type_args = try helpers.internTypeArgsScoped(b, call.type_args);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -5558,7 +5579,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 const bind_id = ires.pick() orelse func_id;
                 const run = try lowerArgRun(b, args);
                 const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+                const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
                 const dst = b.allocReg();
                 try b.push(.{ .Call = .{
                     .dst = dst,
@@ -6534,7 +6555,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     // vararg, so the trailing lambda is the only filler). Name the lambda
     // to the last parameter so the runtime binds it correctly.
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
-    var type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     if (type_args.len == 0) {
         if (try spliceReifiedTypeArgs(b, func_id)) |stamped| type_args = stamped;
     }
@@ -6721,8 +6742,28 @@ fn enumClassOfPath(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
     if (qual_cid) |cid| {
         if (cid.int() < b.module.classes.items.len) {
             // The registered (lifted) name is what the runtime type-arg
-            // lookup resolves.
+            // lookup resolves — already unique, so no owner qualification
+            // on top (a mangled `EnumEntriesListTest$EmptyEnum` must not
+            // stamp as `EnumEntriesListTest.EnumEntriesListTest$EmptyEnum`).
             name = b.module.classes.items[cid.int()].name;
+            if (std.mem.indexOfScalar(u8, name, '$') != null) owner_hint = null;
+        }
+    }
+    // A nested-enum reference whose class lifted under a mangled name
+    // resolves through the rename: a QUALIFIED reference through its
+    // owner's alias table (`EnumEntriesListTest.EmptyEnum` ->
+    // `EnumEntriesListTest$EmptyEnum`), a bare one through the lexical
+    // scope-rename ladder (`EmptyEnum` -> `EnumEntriesFactoryTest$EmptyEnum`).
+    if (b.module.classId(name) == null) {
+        if (owner_hint) |o| {
+            if (b.module.registry.nested_object_aliases.get(o)) |m| {
+                if (m.get(name)) |rn| {
+                    name = rn;
+                    owner_hint = null;
+                }
+            }
+        } else if (scopeTypeRename(b, name, e.span().file.int())) |rn| {
+            name = rn;
         }
     }
     if (b.module.classId(name) == null) return null;
@@ -6825,7 +6866,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const dst = b.allocReg();
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
-    var type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     // The deferred form keeps the reified splice substitution too: a
     // spliced `enumEntriesIntrinsic()` lowered in a receiver context
     // (a lambda body) is otherwise blind at the runtime intrinsic.
@@ -6913,7 +6954,7 @@ fn emitValueCall(
     try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -7027,7 +7068,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     } else {
         arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     }
-    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
 
     if (!synth_names_needed and !was_cast) {
         // Member-of-receiver precedence: route through call_member on `this`.
@@ -7304,7 +7345,7 @@ fn lowerUnresolvedBareCall(
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
         const dst = b.allocReg();
         try b.push(.{ .CallValue = .{
             .dst = dst,
@@ -7327,7 +7368,7 @@ fn lowerUnresolvedBareCall(
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
         const dst = b.allocReg();
         try b.push(.{ .CallValue = .{
             .dst = dst,
@@ -7353,7 +7394,7 @@ fn lowerUnresolvedBareCall(
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm0 } });
         const run0 = try lowerArgRun(b, args);
         const arg_names0 = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const type_args0 = try internTypeArgs(b.allocator, b.module, ast_type_args);
+        const type_args0 = try helpers.internTypeArgsScoped(b, ast_type_args);
         const dst0 = b.allocReg();
         try b.push(.{ .CallValue = .{
             .dst = dst0,
@@ -7417,7 +7458,7 @@ fn lowerUnresolvedBareCall(
             .recv = this_reg,
             .func = static_ext,
             .static_recv = try cmgStaticRecv(b),
-            .type_args = try internTypeArgs(b.allocator, b.module, ast_type_args),
+            .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
         } });
         return dst;
     }
@@ -7432,7 +7473,7 @@ fn lowerUnresolvedBareCall(
         .n_args = run[1],
         .arg_names = arg_names,
         .static_recv = try cmgStaticRecv(b),
-        .type_args = try internTypeArgs(b.allocator, b.module, ast_type_args),
+        .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
     } });
     return dst;
 }
@@ -7519,7 +7560,7 @@ fn lowerFqnFlattenCall(
         if (pick) |func_id| {
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             const dst = b.allocReg();
             try b.push(.{ .Call = .{
                 .dst = dst,
@@ -7772,7 +7813,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             for (args, 0..) |*a, i| arg_regs[i + 1] = try lowerExpr(b, a);
             const start = try packContiguous(b, arg_regs);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             const dst = b.allocReg();
             // The cast picked this overload by its declared receiver type;
             // mark the call exact so the runtime overload re-resolution
@@ -7810,7 +7851,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             for (args, 0..) |*a, i| arg_regs[i + 1] = try lowerExpr(b, a);
             const start = try packContiguous(b, arg_regs);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+            const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
             const dst = b.allocReg();
             try b.push(.{ .Call = .{
                 .dst = dst,
