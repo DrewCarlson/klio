@@ -3259,7 +3259,25 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
         var supertype_names = try allocator.alloc([]const u8, supertypes.len);
         for (supertypes, 0..) |*t, i| {
-            supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse t.name.name;
+            supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse sup: {
+                // A qualified supertype (`object : Modifier.Node()`) names a
+                // lifted nested class registered under its mangled name
+                // (`Modifier$Node`). Recording the bare simple name would make
+                // the inherited-method walk resolve ANY same-named class —
+                // compose has several unrelated `Node`s.
+                if (t.qualified_path) |qp| {
+                    const mangled = try allocator.dupe(u8, qp);
+                    for (mangled) |*ch| {
+                        if (ch.* == '.') ch.* = '$';
+                    }
+                    if (classDefByName(self, mangled)) |def| {
+                        def.deinit();
+                        break :sup mangled;
+                    }
+                    allocator.free(mangled);
+                }
+                break :sup t.name.name;
+            };
         }
 
         // First non-interface supertype as resolved parent class.
