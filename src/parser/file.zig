@@ -886,10 +886,14 @@ fn parseAnnotationsCtx(p: *Parser, in_type_position: bool) []Annotation {
 fn parenStartsFunctionType(p: *Parser) bool {
     if (std.meta.activeTag(support.peekKind(p).*) != .LParen) return false;
     var depth: usize = 0;
+    var saw_arrow_inside = false;
     var i = p.pos;
     while (i < p.tokens.len) : (i += 1) {
         switch (std.meta.activeTag(p.tokens[i].kind)) {
             .LParen => depth += 1,
+            .Arrow => {
+                if (depth >= 1) saw_arrow_inside = true;
+            },
             .RParen => {
                 depth -= 1;
                 if (depth == 0) {
@@ -899,9 +903,17 @@ fn parenStartsFunctionType(p: *Parser) bool {
                     // `(...) ->` is a function type; `(...)?` is a
                     // parenthesized (usually function) type made nullable —
                     // `@Composable ((iconColor: Color) -> Unit)?` — never
+                    // annotation arguments. A close followed by `)` with an
+                    // arrow INSIDE is the nested parenthesized form
+                    // `(@Composable (() -> Unit))?` — a type, not args.
+                    // With an arrow INSIDE the parens, a close followed by a
+                    // param-list terminator is the parenthesized function
+                    // type itself (`track: @Composable ((S) -> Unit),`), not
                     // annotation arguments.
-                    return std.meta.activeTag(p.tokens[j].kind) == .Arrow or
-                        p.tokens[j].kind.isQuestion();
+                    const jk = std.meta.activeTag(p.tokens[j].kind);
+                    return jk == .Arrow or
+                        p.tokens[j].kind.isQuestion() or
+                        (saw_arrow_inside and (jk == .RParen or jk == .Comma or jk == .Eq));
                 }
             },
             .Eof => return false,

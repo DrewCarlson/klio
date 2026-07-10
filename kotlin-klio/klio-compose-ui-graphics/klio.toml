@@ -56,6 +56,8 @@ include = [
     # Brush — SolidColor is a plain Paint colour; gradient brushes build but need
     # the (deferred) shader actuals to paint.
     "androidx/compose/ui/graphics/Brush.kt",
+    # Shadow — a plain data holder (color/offset/blur) TextStyle references.
+    "androidx/compose/ui/graphics/Shadow.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",

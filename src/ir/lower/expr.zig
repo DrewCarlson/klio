@@ -4454,8 +4454,87 @@ fn inlineTargetForBareCall(
             return null;
         }
     }
+    // Argument type evidence corrects a shape-picked sibling: the splice
+    // selectors above rank by NAME + arity + receiver only, so two inline
+    // overloads that differ in a parameter's TYPE tie and the first
+    // registered one wins — `visitAncestors(mask: Int, ...)` binding a
+    // `NodeKind` argument whose real target is the `(type: NodeKind<T>, ...)`
+    // sibling. When the declared/derived head of an argument DISPROVES the
+    // pick's parameter (a user-class head against a primitive parameter, or
+    // two distinct known classes), re-pick the sibling the evidence fits.
+    if (pick) |pf| {
+        if (inlineEvidenceRejects(b, pf, args)) {
+            var better: ?*const ast.Function = null;
+            if (inline_state.candidatesForName(nm)) |cands| {
+                for (cands) |cf| {
+                    if (cf == pf) continue;
+                    if ((cf.receiver_type == null) != (pf.receiver_type == null)) continue;
+                    if (!inlineShapeFits(cf, args, shape)) continue;
+                    if (inlineEvidenceRejects(b, cf, args)) continue;
+                    better = cf;
+                    break;
+                }
+            }
+            // No sibling fits either: decline the splice entirely so the
+            // dynamic call path resolves on runtime values.
+            pick = better;
+        }
+    }
     inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);
     return pick;
+}
+
+/// Whether argument type evidence definitely excludes inline candidate `f`
+/// for this call: a positional argument whose evidence head is a known user
+/// class bound to a builtin-kind parameter (`NodeKind` -> `Int`), or two
+/// distinct known class heads with no shared name. Conservative — unknown
+/// evidence or parameter kinds never reject.
+fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const Expr) bool {
+    const positional_n = if (args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    }) args.len - 1 else args.len;
+    for (args[0..positional_n], 0..) |*a, i| {
+        if (i >= f.params.len) break;
+        const ev = argDeclTypeRef(b, a) orelse continue;
+        const ehead = std.mem.trimEnd(u8, ev.name, "?");
+        const pname = f.params[i].ty.name.name;
+        const phead = std.mem.trimEnd(u8, pname, "?");
+        if (std.mem.eql(u8, ehead, phead)) continue;
+        const e_builtin = paramLitKind(ehead);
+        const p_builtin = paramLitKind(phead);
+        // A known user class where a builtin kind is required (or vice
+        // versa) is a definite mismatch.
+        if (p_builtin != null and e_builtin == null and b.module.classId(ehead) != null) return true;
+        if (p_builtin == null and e_builtin != null and b.module.classId(phead) != null and
+            b.module.registry.class_type_param_bounds.get(phead) == null and
+            !typeNameIsParam(f, phead)) return true;
+    }
+    return false;
+}
+
+/// Whether `name` is one of `f`'s declared type parameters.
+fn typeNameIsParam(f: *const ast.Function, name: []const u8) bool {
+    for (f.type_params) |*tp| {
+        if (std.mem.eql(u8, tp.name.name, name)) return true;
+    }
+    return false;
+}
+
+/// Shape fit for an evidence re-pick: every positional argument has a
+/// parameter slot, a trailing lambda has a last parameter to bind, and every
+/// unfilled parameter carries a default.
+fn inlineShapeFits(f: *const ast.Function, args: []const Expr, shape: CallShape) bool {
+    const has_trailing = shape.last_is_lambda;
+    const positional_n = if (has_trailing and args.len > 0) args.len - 1 else args.len;
+    if (f.params.len < args.len) return false;
+    if (has_trailing and f.params.len == 0) return false;
+    var i: usize = positional_n;
+    const last = if (has_trailing) f.params.len - 1 else f.params.len;
+    while (i < last) : (i += 1) {
+        if (f.params[i].default == null) return false;
+    }
+    return true;
 }
 
 /// Whether a bare call to inline fn `f` must be spliced at the call
@@ -5144,8 +5223,39 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .As and !arg.As.safe) {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
+    // A qualified object/class property read (`Nodes.Traversable`, parsed
+    // as a Member access on a bare class-name receiver): the registered
+    // per-class property type head is the argument's static type —
+    // `visitAncestors(Nodes.Traversable) { }` must resolve against
+    // `NodeKind`, not bind the sibling `(mask: Int, ...)` overload.
+    if (arg.* == .Member and !arg.Member.safe) {
+        const recv = arg.Member.receiver;
+        if (recv.* == .Path and recv.Path.segments.len == 1) {
+            const owner = recv.Path.segments[0].name;
+            if (owner.len != 0 and std.ascii.isUpper(owner[0]) and
+                b.resolve(owner) == null and b.module.classId(owner) != null)
+            {
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
+        return null;
+    }
     if (arg.* != .Path) return null;
     const p = arg.Path;
+    // Same qualified property-read evidence for the two-segment Path form.
+    if (p.segments.len == 2) {
+        const owner = p.segments[0].name;
+        if (owner.len != 0 and std.ascii.isUpper(owner[0]) and
+            b.resolve(owner) == null and b.module.classId(owner) != null)
+        {
+            if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = p.segments[1].name })) |head| {
+                return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+        }
+        return null;
+    }
     if (p.segments.len != 1) return null;
     if (b.localDeclType(p.segments[0].name)) |t| {
         return .{ .name = t, .nullable = b.localDeclNullable(p.segments[0].name), .args = &.{} };

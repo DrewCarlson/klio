@@ -218,6 +218,16 @@ pub fn currentCallSiteSpan() ?ir.Span {
     return if (frame_chain) |fr| fr.cur_span else null;
 }
 
+/// The declaring package of the innermost executing frame's function.
+/// Null-receiver extension-property dispatch keys on it: same-name
+/// nullable extension properties in different packages resolve to the
+/// one the executing code can see.
+pub fn currentFramePackage() ?[]const u8 {
+    const fr = frame_chain orelse return null;
+    const pkg = fr.func.package;
+    return if (pkg.len == 0) null else pkg;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory
@@ -1452,11 +1462,19 @@ pub fn evalWithCapturesChained(
     if (result == .ok) {
         coerceIntToLongTy(func.return_ty, &result.ok);
     }
-    // The body ran: an `Unimplemented` escaping it is a real failure of
-    // an executed statement, not a dispatch miss. Re-tag it so no
-    // enclosing candidate walk retries (and re-executes) this body.
-    if (result == .err and result.err == .Unimplemented) {
-        result = errResult(.{ .CalleeFailed = result.err.Unimplemented });
+    // The body ran: a resolution-class error escaping it (`Unimplemented`,
+    // `Unbound`, `Type`, `Unsupported`, `Arity`) is a real failure of an
+    // executed statement, not a dispatch miss. Re-tag it so no enclosing
+    // candidate walk retries (and re-executes) this body — a walker that
+    // re-runs a body which already performed side effects corrupts state
+    // (a measure pass re-measuring already-measured children).
+    if (result == .err) {
+        switch (result.err) {
+            .Unimplemented, .Unbound, .Type, .Unsupported, .Arity => |m| {
+                result = errResult(.{ .CalleeFailed = m });
+            },
+            else => {},
+        }
     }
     return result;
 }
@@ -3768,6 +3786,32 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             return .cont;
                         },
                         .err => |e| return raiseStep(frame, e),
+                    }
+                }
+                // A qualified class/companion member the lowering flattened to
+                // one global name (`import X.Companion.Y` baked as the FQN
+                // `pkg.X.Y`): no such global binding exists, but the owner
+                // class does — split at the last dot and read the member off
+                // the class value (which serves companion fields), so the
+                // import aliases the SAME value `X.Y` reads.
+                if (std.mem.lastIndexOfScalar(u8, name_str, '.')) |dot| {
+                    if (dot != 0 and dot + 1 < name_str.len) {
+                        const owner_v: ?Value = switch (try host.lookupGlobalThrowing(allocator, name_str[0..dot])) {
+                            .ok => |maybe| maybe,
+                            .err => null,
+                        };
+                        if (owner_v) |ov| {
+                            if (ov == .Class or ov == .Instance) {
+                                switch (try host.getField(allocator, &ov, name_str[dot + 1 ..])) {
+                                    .ok => |fv| {
+                                        fv.retain();
+                                        try frame.write(lg.dst, fv);
+                                        return .cont;
+                                    },
+                                    .err => {},
+                                }
+                            }
+                        }
                     }
                 }
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});

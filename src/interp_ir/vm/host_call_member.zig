@@ -21,6 +21,7 @@ const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
+const host_call_value = @import("host_call_value.zig");
 const host_fields = @import("host_fields.zig");
 
 const Allocator = std.mem.Allocator;
@@ -3417,6 +3418,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // sibling overload the static evidence excluded.
     if (!no_ext) {
         if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv)) |r| return r;
+        // An enclosing SAM conversion of a fun interface whose single
+        // abstract method is a MEMBER EXTENSION on this receiver's type
+        // (`with(policy) { scope.measure(w, h) }` where `policy` is
+        // `MeasurePolicy { ... }`): the abstract slot lowers no func, so
+        // the extension fallback has no candidate — the stored lambda
+        // serves the call with the receiver bound as its `this`.
+        if (try enclosingSamMemberExtDispatch(self, allocator, receiver, name, args)) |r| return r;
+        // An enclosing anonymous-object instance whose site declares a
+        // MEMBER-EXTENSION override accepting this receiver
+        // (`with(verticalArrangement) { measureScope.arrange(...) }` where
+        // the arrangement is `object : Vertical { override fun
+        // Density.arrange(...) }`): anonymous classes register methods in
+        // the per-site table, not the module func index, so the extension
+        // fallback never sees them.
+        if (try enclosingAnonMemberExtDispatch(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // Range → List re-dispatch: a last-resort member surface only. It must
@@ -4463,10 +4479,101 @@ fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
             break :blk true;
         };
         if (dispatch_lambda) {
+            // A fun interface whose single abstract method is a MEMBER
+            // EXTENSION (`fun interface MeasurePolicy { fun
+            // MeasureScope.measure(...) }`): kotlinc scopes the SAM lambda's
+            // body with the extension receiver as `this`, so a bare
+            // `layout(...)` inside `MeasurePolicy { ... }` resolves against
+            // the MeasureScope. Bind the innermost enclosing receiver that
+            // implements the declared extension-receiver type.
+            if (samMemberExtRecvType(self, cls_name, name)) |recv_ty| {
+                const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+                defer allocator.free(entries);
+                for (entries) |e| {
+                    if (e.v != .Instance) continue;
+                    if (receiverImplementsType(self, &e.v, recv_ty)) {
+                        return try host_call_value.callValueWithThis(self, allocator, &t, &e.v, args, &.{});
+                    }
+                }
+            }
             return try callValueRec(self, allocator, &t, args);
         }
     }
     return null;
+}
+
+/// Dispatch `receiver.name(args)` through an enclosing anonymous-object
+/// instance whose class declares a member-extension method of this name
+/// accepting the receiver: the anon-site method runs with the receiver
+/// bound as its extension `this` and the anon instance as the enclosing
+/// dispatch receiver.
+fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
+    defer allocator.free(arity_name);
+    for (entries) |e| {
+        if (e.v != .Instance) continue;
+        var cls_name: []const u8 = undefined;
+        {
+            const g = e.v.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            cls_name = cg.get().name;
+            cg.deinit();
+        }
+        const hit = lookupAnonMethod(self, allocator, cls_name, arity_name, name) orelse continue;
+        // Only a member-EXTENSION method serves this arm; its lowered form
+        // binds the extension receiver as `this` (params[0]) with the
+        // declared receiver type.
+        const hg = hit.module.borrow();
+        const hf = funcAt(hg.get(), hit.func);
+        const is_member_ext = hf != null and hf.?.kind == .member_extension and
+            hf.?.params.len != 0 and std.mem.eql(u8, hf.?.params[0].name, "this");
+        const recv_ty: []const u8 = if (is_member_ext) hf.?.params[0].ty.name else "";
+        hg.deinit();
+        if (!is_member_ext) continue;
+        if (!receiverImplementsType(self, receiver, recv_ty)) continue;
+        ir.eval.pushEnclosing(&e.v);
+        defer ir.eval.popEnclosing();
+        return try invokeAnonMethod(self, allocator, receiver, hit, args, null);
+    }
+    return null;
+}
+
+/// Dispatch `receiver.name(args)` through an enclosing SAM instance whose
+/// fun interface declares `name` as an abstract member extension accepting
+/// this receiver: the stored lambda runs with the receiver bound as `this`.
+fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        if (e.v != .Instance) continue;
+        var cls_name: []const u8 = undefined;
+        var target: ?Value = null;
+        {
+            const g = e.v.Instance.borrow();
+            defer g.deinit();
+            target = g.get().get("__sam_target__");
+            if (target == null) continue;
+            const cg = g.get().class.borrow();
+            cls_name = cg.get().name;
+            cg.deinit();
+        }
+        const recv_ty = samMemberExtRecvType(self, cls_name, name) orelse continue;
+        if (!receiverImplementsType(self, receiver, recv_ty)) continue;
+        return try host_call_value.callValueWithThis(self, allocator, &target.?, receiver, args, &.{});
+    }
+    return null;
+}
+
+/// The declared extension-receiver type head of `cls`'s abstract member
+/// extension named `name`, when the class (a fun interface serving a SAM
+/// conversion) declares one — null otherwise.
+fn samMemberExtRecvType(self: *VmHost, cls: []const u8, name: []const u8) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().registry.iface_member_ext_recv.get(.{ .a = cls, .b = name });
 }
 
 fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
@@ -7424,6 +7531,17 @@ fn isMemberExt(mod: *const Module, fid: FuncId) bool {
 fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
+    if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+        if (funcAt(mod, fid)) |f| {
+            if (std.mem.eql(u8, f.name, "arrange")) {
+                std.debug.print("[mev] fid={d} owner={s} vis={}\n", .{ fid.int(), owner, visible_owners.contains(owner) });
+                var it = visible_owners.keyIterator();
+                std.debug.print("[mev] set:", .{});
+                while (it.next()) |k| std.debug.print(" {s}", .{k.*});
+                std.debug.print("\n", .{});
+            }
+        }
+    }
     if (visible_owners.contains(owner)) return true;
     // A member extension declared in an `object`/companion is callable
     // wherever the singleton is importable (`import C.Companion.f`): its
@@ -8048,11 +8166,33 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         // as a transferable enclosing receiver for the duration of the
         // call.
         var pushed_owner = false;
+        var sam_target: ?Value = null;
         if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
             if (try memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
-                ir.eval.pushEnclosing(&inst);
-                pushed_owner = true;
+                // A bodyless member-extension declaration whose owner is a
+                // SAM conversion (`MeasurePolicy { measurables, constraints
+                // -> ... }`): the fun interface's single method IS the
+                // member-extension, so the stored lambda serves the call —
+                // with the EXTENSION receiver bound as the lambda's `this`,
+                // exactly as kotlinc scopes the lambda body (`layout(...)`
+                // inside it resolves against the MeasureScope receiver).
+                if (funcAt(mod, c.fid) != null and !funcAt(mod, c.fid).?.hasBody()) {
+                    if (inst == .Instance) {
+                        const g = inst.Instance.borrow();
+                        sam_target = g.get().get("__sam_target__");
+                        g.deinit();
+                    }
+                }
+                if (sam_target == null) {
+                    ir.eval.pushEnclosing(&inst);
+                    pushed_owner = true;
+                }
             }
+        }
+        if (sam_target) |t| {
+            const r2 = try host_call_value.callValueWithThis(self, allocator, &t, &all[0], all[1..], &.{});
+            mg.deinit();
+            return r2;
         }
         // Memoize an owner-independent pick: no member-extension competes for
         // this name and the winner is itself top-level, so the (receiver

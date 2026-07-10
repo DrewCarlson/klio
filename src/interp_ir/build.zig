@@ -405,8 +405,12 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     var decl_pkg = SpanStrMap.init(allocator);
     defer decl_pkg.deinit();
 
+    var file_pkgs = std.AutoHashMap(ir.FileId, []const u8).init(allocator);
     for (files) |*f| {
         const prefix = try packagePrefix(allocator, f.package);
+        if (prefix.len != 0) {
+            try file_pkgs.put(f.span.file, prefix);
+        }
         for (f.decls) |*d| {
             try collectClassFqns(allocator, d, prefix, &fqn_overrides);
             try collectDeclPkgs(allocator, d, prefix, &decl_pkg);
@@ -676,6 +680,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
+    ir.pending_file_packages = file_pkgs;
     return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg, base, out_lifted);
 }
 
@@ -907,6 +912,35 @@ fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasses, o
 /// The declared head of a class property's type, substituting a class
 /// type-parameter name with its upper bound's head. Null when nothing
 /// static is known (no bound, unresolvable).
+/// The single expression a property's static head may be inferred from: its
+/// initializer, or — for an accessor-only property — the getter's
+/// single-expression body.
+fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
+    if (prop.init) |*init| return init;
+    if (prop.getter) |g| {
+        if (g.body == .Expr) return &g.body.Expr;
+    }
+    return null;
+}
+
+/// Constructor-call head evidence for a property with no declared type: the
+/// initializer (or single-expression getter) constructs a class declared in
+/// this file set (`val Traversable get() = NodeKind<T>(mask)` -> `NodeKind`).
+/// Only a name that IS a declared class counts — a same-shaped factory call
+/// may return a different type, so an unknown callee proves nothing.
+fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]const u8 {
+    const src = propHeadSourceExpr(prop) orelse return null;
+    if (src.* != .Call) return null;
+    const callee = src.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
+    for (decls) |*d| {
+        if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
+    }
+    return null;
+}
+
 fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     const head = ty.name.name;
     for (c.type_params) |*tp| {
@@ -1438,37 +1472,55 @@ fn buildModuleWithOverrides(
     // names substituted by their bound's head (`data: T` in
     // `IterableTests<T : Iterable<String>>` records `Iterable`; an
     // init-inferred property takes the declared return type of the member
-    // function its initializer calls). A call on the property then
-    // resolves against the STATIC type, as kotlinc does.
+    // function its initializer calls, or the constructed class's head when
+    // the initializer / getter single-expression is a constructor call —
+    // `object Nodes { inline val Traversable get() = NodeKind<T>(...) }`
+    // records `NodeKind`). A call on the property then resolves against
+    // the STATIC type, as kotlinc does.
     for (decls) |*d| {
-        if (d.* != .Class) continue;
-        const c = &d.Class;
-        for (c.primary_params) |*pp| {
-            if (pp.property == null) continue;
-            if (classPropHead(c, &pp.ty)) |head| {
-                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
-            }
-        }
-        for (c.members) |*m| {
-            if (m.* != .Property) continue;
-            const prop = m.Property;
-            const ty_opt: ?*const ast.TypeRef = if (prop.ty) |*t| t else blk: {
-                const init_expr = &(prop.init orelse break :blk null);
-                if (init_expr.* != .Call) break :blk null;
-                const callee = init_expr.Call.callee;
-                if (callee.* != .Path or callee.Path.segments.len != 1) break :blk null;
-                const fname = callee.Path.segments[0].name;
-                for (c.members) |*fm| {
-                    if (fm.* != .Function) continue;
-                    if (!std.mem.eql(u8, fm.Function.name.name, fname)) continue;
-                    if (fm.Function.return_type) |*rt| break :blk rt;
-                    break :blk null;
+        if (d.* == .Class) {
+            const c = &d.Class;
+            for (c.primary_params) |*pp| {
+                if (pp.property == null) continue;
+                if (classPropHead(c, &pp.ty)) |head| {
+                    try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
                 }
-                break :blk null;
-            };
-            const ty = ty_opt orelse continue;
-            if (classPropHead(c, ty)) |head| {
-                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+            }
+            for (c.members) |*m| {
+                if (m.* != .Property) continue;
+                const prop = m.Property;
+                const ty_opt: ?*const ast.TypeRef = if (prop.ty) |*t| t else blk: {
+                    const src = propHeadSourceExpr(prop) orelse break :blk null;
+                    if (src.* != .Call) break :blk null;
+                    const callee = src.Call.callee;
+                    if (callee.* != .Path or callee.Path.segments.len != 1) break :blk null;
+                    const fname = callee.Path.segments[0].name;
+                    for (c.members) |*fm| {
+                        if (fm.* != .Function) continue;
+                        if (!std.mem.eql(u8, fm.Function.name.name, fname)) continue;
+                        if (fm.Function.return_type) |*rt| break :blk rt;
+                        break :blk null;
+                    }
+                    break :blk null;
+                };
+                if (ty_opt) |ty| {
+                    if (classPropHead(c, ty)) |head| {
+                        try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                    }
+                } else if (propCtorHeadEvidence(prop, decls)) |head| {
+                    try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                }
+            }
+        } else if (d.* == .Object) {
+            const o = &d.Object;
+            for (o.members) |*m| {
+                if (m.* != .Property) continue;
+                const prop = m.Property;
+                if (prop.ty) |*ty| {
+                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.name.name);
+                } else if (propCtorHeadEvidence(prop, decls)) |head| {
+                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
+                }
             }
         }
     }
@@ -2786,6 +2838,22 @@ fn buildModuleWithOverrides(
                     }
                 } else {
                     gop2.value_ptr.* = fid;
+                }
+                // A second, package-qualified key: same-name nullable
+                // extension properties in different packages (an internal
+                // `RowColumnParentData?.weight` and an internal
+                // `ButtonGroupParentData?.weight`) blank the bare-name
+                // entry, but the reading code sits in the declaring
+                // package, so the executing frame's package still
+                // disambiguates at the null-receiver dispatch.
+                const pkg_key = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ ep_pkg, p.name.name });
+                const gop3 = try nullable_ext_props.getOrPut(pkg_key);
+                if (gop3.found_existing) {
+                    if (gop3.value_ptr.*) |prev| {
+                        if (prev != fid) gop3.value_ptr.* = null;
+                    }
+                } else {
+                    gop3.value_ptr.* = fid;
                 }
             }
             // A member-extension property's accessor body has its
