@@ -540,7 +540,13 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         },
     };
 
-    if (std.mem.eql(u8, nm, v_ty)) {
+    // A dotted nested param type whose class lifted under a mangled key
+    // (`Modifier.Node` when several `Node`s exist) compares by that key, so
+    // it matches the argument's registered class name exactly.
+    const nm_mangled = host_call_member.mangledClassKeyOf(self, nm);
+    if (std.mem.eql(u8, nm, v_ty) or
+        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty)))
+    {
         const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
         return 100 + d;
     }
@@ -551,6 +557,12 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
+    // Float values are stored Double-tagged (and vice versa after arithmetic):
+    // the two float widths are one value domain at runtime, so either width's
+    // parameter accepts either tag — `Density(density = 1f)` must bind the
+    // `density: Float` factory when the value arrives as a Double.
+    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
+        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
 
     // A callable argument against a function-typed parameter. A `::name`
     // member reference loads as a `.Function`; a constructor reference loads
@@ -606,13 +618,18 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             }
             if (already) continue;
             seen.append(self.allocator, cur.name) catch return null;
-            if (std.mem.eql(u8, cur.name, nm)) {
+            const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
+            if (std.mem.eql(u8, cur.name, nm) or
+                std.mem.eql(u8, cur_key, nm_mangled orelse nm))
+            {
                 const d: i32 = if (cur.depth > 50) 50 else cur.depth;
                 return 60 - d;
             }
             const cg = self.classes.borrow();
             defer cg.deinit();
-            if (cg.get().get(cur.name)) |def_ref| {
+            // A dotted supertype ascends through its mangled entry.
+            const def_hit = cg.get().get(cur.name) orelse cg.get().get(cur_key);
+            if (def_hit) |def_ref| {
                 const dg = def_ref.borrow();
                 defer dg.deinit();
                 for (dg.get().supertype_names) |sup| {
@@ -763,10 +780,16 @@ fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8)
         }
         if (already) continue;
         seen.append(self.allocator, cur.name) catch return null;
-        if (std.mem.eql(u8, cur.name, target)) return cur.depth;
+        const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
+        if (std.mem.eql(u8, cur.name, target) or
+            std.mem.eql(u8, cur_key, host_call_member.mangledClassKeyOf(self, target) orelse target))
+        {
+            return cur.depth;
+        }
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(cur.name)) |def_ref| {
+        // A dotted supertype ascends through its mangled entry.
+        if (cg.get().get(cur.name) orelse cg.get().get(cur_key)) |def_ref| {
             const dg = def_ref.borrow();
             defer dg.deinit();
             for (dg.get().supertype_names) |sup| {

@@ -110,10 +110,22 @@ platform services, and a `renderComposeToPng` headless entry). The runtime gaine
 resolved locals on a node), a headless `SnapshotStateObserver`, and vendored
 `MutableVector`. The pointer value classes are ported from skikoMain.
 
-`renderComposeToPng { Box(Modifier.size(100.dp).drawBehind { drawRect(Color.Red) }) }`
-now composes, constructs the Owner + root `LayoutNode`, provides the platform locals,
-runs measure + layout, and reaches the DRAW phase. Several general interpreter bugs
-surfaced along the way, root-caused and fixed:
+**§2 is DONE end-to-end.** `renderComposeToPng` runs the full real engine:
+compose → Owner + root `LayoutNode` → measure → layout → placement → draw →
+Skia PNG. Verified by decoding pixels: the Box `drawBehind` render is an exact
+100×100 red block, and the FULL material3 scene (`MaterialTheme { Surface {
+Column { Text, Button { Text } } } }`) renders with the M3 surface tone
+`#FEF7FF`, the primary `#6750A4` button, and real `#1D1B20` glyphs
+(commits `01f0e90d`, `080c08de`). The measure/placement/draw phases drove a
+dozen general interpreter fixes — dispatch walks no longer re-run failed
+bodies (the double-measure root), SAM/anon-object member-extension receivers,
+argument-type-aware inline-splice picks, spliced bodies resolving in their
+donor file's package, owner seeding for named member-extension calls, strict
+`where`-bound checks, named-arg class delegation, and parser support for the
+annotated function-type/setter forms material3 uses. material-ripple is
+vendored as its own pack (material3 depends on it).
+
+Earlier general fixes from the measure bring-up:
 - a nested-class value loaded by id resolved the ENCLOSING class's companion (an enum
   nested in a class, `LayoutNode.LayoutState.Idle`, became `LayoutNode.Companion.Idle`)
   — `lookupGlobalById` now takes the class's OWN companion via `classDirectChild`, not
@@ -121,7 +133,7 @@ surfaced along the way, root-caused and fixed:
 - an imported nested-enum entry (`import Outer.State.Idle`) kept its intermediate
   classifier segment instead of collapsing to `Outer.Idle`.
 
-**Current blocker** (a klio pack-build defect, precisely characterized, not yet fixed):
+**Resolved blocker** (fixed en route; kept for the record):
 the abstract base class `NodeCoordinator` is present in the ui-core `include` and its
 methods load + dispatch, but its `ClassDef` is DROPPED from the baked pack's module
 class table (its two concrete subclasses `InnerNodeCoordinator` /
@@ -169,12 +181,36 @@ its `CompositionLocal`s and reading `MaterialTheme.colorScheme`/`typography`/
 `shapes` inside content returns the provided values, including a nested
 `MaterialTheme` that overrides its subtree and restores the outer theme.
 `example: compose_material3.kt`. The two ui-text init/resolution bugs noted below
-are cleared (the whole stack loads + runs). Rendering actual COMPONENTS
-(`Text`/`Surface`/`Button`) is the remaining piece: it needs the platform
-`CompositionLocal`s (`LocalFontFamilyResolver`, `LocalDensity`, …) provided at the
-composition root, the ui-text text-shaping actuals wired to the Skia shim
-(`createFontFamilyResolver`/`ActualParagraph` — §5 below), and the ui-engine
-Owner + measure/layout/draw (§2). See the `klio-material3-api-surface` memory.
+are cleared (the whole stack loads + runs). Rendering actual COMPONENTS is **DONE**:
+`Text`/`Surface`/`Button` render through the real engine with correct M3
+theming (see §2). The remaining component work is interactivity (pointer
+input + ripple animation in a live window) and the wider component sweep
+(scroll, gesture, `Lazy*` on subcomposition, Image).
+
+**Interactivity (WIP):** the real-engine window/scene tier exists —
+`androidx.compose.ui.window.runComposeWindow` (native window, frames drawn
+by the Owner straight onto the window surface via
+`__composeui_winSurface`/`winPresent`/`winClear`) and `KlioComposeScene`
+(headless ImageComposeScene analogue with synthetic `click`/`hover` through
+`PointerInputEventProcessor`; klio actuals for `PointerInputEvent` +
+`InternalPointerEvent`). The synthetic click now runs the engine's full
+hit-test chain cleanly (down+up dispatch, `HitTestResult` iteration,
+sibling-share walk); the dispatch fixes it forced are listed in the
+interpreter-notes below. Still open on this path: the suspend
+`pointerInput` handler coroutine is never started by the first delivered
+event (`clicks` stays 0 — the `SuspendingPointerInputModifierNodeImpl`
+block needs its launch-on-first-event wiring driven through the scene's
+dispatcher), and under the full material3 pack set the click dies in
+`HitPathTracker` on `super.buildCache: owner_class Node has no parent`:
+TWO same-named cross-package TOP-LEVEL classes (foundation's
+`text.input.internal.Node` vs ui's pointer-input `Node`) collide in the
+flat class table. Mangling non-private top-levels needs the simple-name
+symbol index and the import channels to resolve renamed classifiers
+first (a straight rename pass broke `ResolvedStyle`-scale public
+references), so that lands with the resolution-unification work. Also
+open: a `@Composable` trailing CONSTRUCTOR lambda misbinds the ctor's
+other args (plain lambdas fine; `KlioComposeScene` uses `setContent`
+instead).
 
 `compose.foundation` (Box/Row/Column/Text/Image, scroll, gesture, `Lazy*` on
 subcomposition), then `compose.material3` (mostly verbatim on foundation).
@@ -285,9 +321,11 @@ After changing the interpreter, rebuild every pack you have installed
   display-list serialize/parse round-trip. Zero-code lever: ship ReleaseFast (~2×
   smaller than Debug). Idle CPU (~0.3%) and the resize "leak" (proven bounded/
   GC-managed) need no action. See the `klio-perf-memory-review` memory.
-- **Pack-image companion-`val` import aliasing** — in a baked pack image,
-  `import X.Companion.Y` doesn't alias the qualified singleton `X.Y` (`===` false);
-  correct from source. Blocks colour/style singleton identity in shipped packs.
+- **Pack-image companion-`val` import aliasing — FIXED** (`01f0e90d`,
+  `2b98f72d`): the flattened-global read falls back to the owner class's
+  member, and a named companion-member import outranks a same-named class, so
+  `import X.Companion.Y` aliases the SAME instance `X.Y` yields (`===` holds)
+  in baked packs.
 - **Other backends:** verify Win32 on a Windows host. The Linux window is SDL2
   (raster + on-screen Ganesh GPU over SDL's GL context); the offscreen Ganesh+EGL
   path also remains for headless GPU. The macOS window GPU surface is Metal.

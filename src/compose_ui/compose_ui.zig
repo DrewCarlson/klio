@@ -44,6 +44,17 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("klio.compose.ui.__composeui_winRender", winRender);
     try b.register("klio.compose.ui.__composeui_winPoll", winPoll);
     try b.register("klio.compose.ui.__composeui_winClose", winClose);
+    try b.register("klio.compose.ui.__composeui_winSurface", winSurfaceOf);
+    try b.register("klio.compose.ui.__composeui_winPresent", winPresent);
+    try b.register("klio.compose.ui.__composeui_winClear", winClear);
+    // The real-engine window driver (androidx.compose.ui.window.KlioWindow)
+    // declares the same host entrypoints under its own package.
+    try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
+    try b.register("androidx.compose.ui.window.__composeui_winPoll", winPoll);
+    try b.register("androidx.compose.ui.window.__composeui_winClose", winClose);
+    try b.register("androidx.compose.ui.window.__composeui_winSurface", winSurfaceOf);
+    try b.register("androidx.compose.ui.window.__composeui_winPresent", winPresent);
+    try b.register("androidx.compose.ui.window.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -488,6 +499,37 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(packed_ev));
 }
 
+/// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
+/// usable with the `androidx.compose.ui.graphics.__skia_c_*` draw intrinsics
+/// (the same surface type `__skia_surf_new` yields), or 0. The real ui engine's
+/// `KlioCanvas` draws frames directly onto it.
+fn winSurfaceOf(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(surface)))));
+}
+
+/// `__composeui_winPresent(handle): Long` — present the window's surface.
+fn winPresent(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    skia.winPresent(win);
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winClear(handle, argb): Long` — clear the window's surface.
+fn winClear(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surface = skia.winSurface(win) orelse return ok(Value.newLong(0));
+    skia.clear(surface, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(argInt(ctx.args[1])))))));
+    return ok(Value.newLong(1));
+}
+
 /// `__composeui_winClose(handle): Long`
 fn winClose(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
@@ -781,7 +823,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 29), b.len());
+    try testing.expectEqual(@as(usize, 38), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

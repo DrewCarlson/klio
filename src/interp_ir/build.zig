@@ -2064,6 +2064,12 @@ fn buildModuleWithOverrides(
             placed.fqn = module.funcByIdMut(id).?.fqn;
             placed.package = module.funcByIdMut(id).?.package;
             module.funcByIdMut(id).?.* = placed;
+            // Kotlin scopes a private top-level declaration to its FILE:
+            // record it so dispatch never binds a private extension from
+            // another file.
+            if (f.visibility == .Private) {
+                try module.registry.private_fn_files.put(id, f.name.span.file);
+            }
             if (std.mem.eql(u8, f.name.name, "main")) main_id = id;
             try module.top_level.append(a, id);
 
@@ -2166,15 +2172,24 @@ fn buildModuleWithOverrides(
             // companion member (`cap = DefaultCap`) resolves against the
             // companion object (the param-thunk path) rather than a null-`this`
             // field read. Previous params still resolve by their own names.
+            //
+            // An INNER class's defaults DO have a lexical receiver: the
+            // enclosing instance (`val maxIndex: Int = size` reads the outer
+            // `size`; Kotlin forbids reading the class's own members here,
+            // and an inner class cannot declare a companion). The slot is
+            // named `this` so a bare name lowers through the method-body
+            // member-or-global walk, and the runtime passes the OUTER
+            // instance in that slot.
             var ctor_default_params: std.ArrayList([]const u8) = .empty;
             defer ctor_default_params.deinit(a);
-            try ctor_default_params.append(a, "$ctor_default_recv");
+            try ctor_default_params.append(a, if (c.is_inner) "this" else "$ctor_default_recv");
             for (c.primary_params) |*p| try ctor_default_params.append(a, p.name.name);
             var slots = try a.alloc(?FuncId, c.primary_params.len);
+            const ctor_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
             for (c.primary_params, 0..) |*p, i| {
                 if (p.default) |*e| {
                     const nm = try std.fmt.allocPrint(a, "__ctor_default_{s}_{s}", .{ c.name.name, p.name.name });
-                    slots[i] = try ir.lower.lowerExprAsParamThunkScoped(module, ctor_default_params.items, e, nm, c.name.name, &own_members);
+                    slots[i] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, ctor_default_params.items, e, nm, c.name.name, &own_members, ctor_enclosing);
                 } else {
                     slots[i] = null;
                 }

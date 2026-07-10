@@ -436,10 +436,20 @@ pub fn liftClassRecursive(
                     }
                     break :blk false;
                 };
+                // A nested class whose simple name matches ANY top-level
+                // type in the image mangles unconditionally, like a nested
+                // object: the image build combines every pack, so a flat
+                // lift here clobbers (or is clobbered by) the top-level in
+                // the shared class table regardless of extension shape —
+                // ui-graphics' `IntervalTree.Node` lifted flat displaced
+                // ui's top-level `HitPathTracker`-file `Node`, and
+                // `super.buildCache` then found a parentless `Node`. The
+                // qualified-supertype condition stays only as history: the
+                // collision itself is the hazard, not how the class is
+                // extended.
                 const collides = nested_has_companion or
                     ctx.dup_nested_names.contains(nested.name.name) or
-                    (ctx.top_level_type_names.contains(nested.name.name) and
-                        ctx.used_qualified_supertypes.contains(qualified));
+                    ctx.top_level_type_names.contains(nested.name.name);
                 var lifted = nested.*;
                 if (is_private or collides) {
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });

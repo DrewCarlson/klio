@@ -43,6 +43,12 @@ import androidx.compose.ui.input.InputModeManager
 import androidx.compose.ui.input.InputModeManagerImpl
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.PointerIconService
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.PointerInputEvent
+import androidx.compose.ui.input.pointer.PointerInputEventData
+import androidx.compose.ui.input.pointer.PointerInputEventProcessor
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.PositionCalculator
 import androidx.compose.ui.layout.RootMeasurePolicy
 import androidx.compose.ui.modifier.ModifierLocalManager
 import androidx.compose.ui.node.LayoutNode
@@ -513,6 +519,96 @@ internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Com
  * [height] px PNG at [path] (at [density] px/dp). Returns false if no Skia backend
  * is present. This is klio's `renderComposeScene` equivalent.
  */
+/**
+ * A headless composition over the real ui engine — klio's analogue of
+ * `ImageComposeScene`: compose once, then re-render frames, rasterize to PNG,
+ * and dispatch synthetic pointer input through the engine's own hit testing
+ * (`PointerInputEventProcessor`), driving `clickable`/`Button` semantics
+ * exactly as a native window does.
+ */
+class KlioComposeScene(
+    private var width: Int,
+    private var height: Int,
+    density: Float = 1f,
+) {
+    private val recomposer = Recomposer()
+    internal val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+    private val composition = Composition(KlioUiApplier(owner.root), recomposer)
+    private val pointerProcessor = PointerInputEventProcessor(owner.root)
+    private var uptime = 0L
+
+    /** Set (or replace) the scene's content and run the first frame. */
+    fun setContent(content: @Composable () -> Unit) {
+        composition.setContent {
+            ProvideKlioCompositionLocals(owner) { content() }
+        }
+        frame()
+    }
+
+    private object IdentityPositions : PositionCalculator {
+        override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
+        override fun localToScreen(localPosition: Offset): Offset = localPosition
+    }
+
+    /** Recompose pending invalidations and run measure + layout. */
+    fun frame() {
+        recomposer.recompose()
+        owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
+        owner.measureAndLayoutForFrame()
+    }
+
+    private fun pointer(x: Float, y: Float, down: Boolean, hover: Boolean) {
+        uptime += 8
+        val position = Offset(x, y)
+        val data = PointerInputEventData(
+            id = PointerId(0),
+            uptime = uptime,
+            positionOnScreen = position,
+            position = position,
+            down = down,
+            pressure = 1f,
+            type = PointerType.Mouse,
+            activeHover = hover,
+            scaleGestureFactor = 1f,
+            panGestureOffset = Offset.Zero,
+        )
+        pointerProcessor.process(
+            PointerInputEvent(uptime, listOf(data)),
+            IdentityPositions,
+        )
+    }
+
+    /** Press + release at ([x], [y]) through the engine's hit testing, then re-frame. */
+    fun click(x: Float, y: Float) {
+        pointer(x, y, down = true, hover = false)
+        pointer(x, y, down = false, hover = false)
+        frame()
+    }
+
+    /** Move the hover pointer to ([x], [y]), then re-frame. */
+    fun hover(x: Float, y: Float) {
+        pointer(x, y, down = false, hover = true)
+        frame()
+    }
+
+    fun resize(newWidth: Int, newHeight: Int) {
+        width = newWidth
+        height = newHeight
+        frame()
+    }
+
+    /** Rasterize the current frame to a PNG. False without a Skia backend. */
+    fun renderToPng(path: String): Boolean {
+        frame()
+        return klioDrawToPng(width, height, path) { owner.drawTo(this) }
+    }
+
+    fun dispose() {
+        composition.dispose()
+        recomposer.close()
+    }
+}
+
 fun renderComposeToPng(
     width: Int,
     height: Int,

@@ -662,6 +662,9 @@ pub fn lowerFunctionWithFile(
     var placed = func;
     placed.id = id;
     try module.recordFuncDeclSpan(a, f.name.span, id);
+    if (f.visibility == .Private) {
+        try module.registry.private_fn_files.put(id, f.name.span.file);
+    }
     const nm = f.name.name;
     try module.func_index.append(a, .{ .name = nm, .id = id });
     try funcNameIndexPush(module, nm, id);

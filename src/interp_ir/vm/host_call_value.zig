@@ -132,6 +132,16 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().bytes;
             };
+            // Dispatch under the reference's creation-site file: a
+            // file-private target is visible to the reference where it
+            // was written, not where a combinator invokes it.
+            var ref_pushed = false;
+            var ref_prev: ?ir.eval.RefSiteOverride = null;
+            if (host_call_member.boundRefFile(callee)) |bf| {
+                ref_prev = ir.eval.pushRefSiteFile(bf);
+                ref_pushed = true;
+            }
+            defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
             // An unbound class-method reference (`Long::toByte`, `String::plus`)
             // consumes its first argument as the receiver. The reference's
             // captured receiver is the type itself: a `.Class` value, or — when
@@ -392,6 +402,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().bytes;
             };
+            var ref_pushed = false;
+            var ref_prev: ?ir.eval.RefSiteOverride = null;
+            if (host_call_member.boundRefFile(callee)) |bf| {
+                ref_prev = ir.eval.pushRefSiteFile(bf);
+                ref_pushed = true;
+            }
+            defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
             if (rv == .Class and args.len == 1) {
                 return host_fields.getField(self, allocator, &args[0], name);
             }
@@ -1118,6 +1135,13 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 defer g.deinit();
                 break :blk g.get().bytes;
             };
+            var ref_pushed = false;
+            var ref_prev: ?ir.eval.RefSiteOverride = null;
+            if (host_call_member.boundRefFile(callee)) |bf| {
+                ref_prev = ir.eval.pushRefSiteFile(bf);
+                ref_pushed = true;
+            }
+            defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
             return host_call_member.callMember(self, allocator, this_value, name, args);
         }
     }

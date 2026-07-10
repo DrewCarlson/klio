@@ -266,6 +266,20 @@ fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]con
     return g.get().parent_ctor_args.get(sideTableKey(fqn, name));
 }
 
+/// The `this` slot for a primary-ctor default-arg thunk: an INNER class's
+/// default expressions evaluate with the enclosing instance as the lexical
+/// receiver (`val maxIndex: Int = size` inside `inner class ... ` reads the
+/// OUTER `size` — the instance under construction does not exist yet), so
+/// the constructing frame's outer hint fills the slot. Non-inner classes
+/// have no outer receiver in scope: their slot stays Null.
+fn ctorThunkThisSlot(class_def: ObjRef(ClassDef), outer_hint: ?*const Value) Value {
+    const oh = outer_hint orelse return .Null;
+    const dg = class_def.borrow();
+    defer dg.deinit();
+    if (!dg.get().is_inner) return .Null;
+    return oh.*;
+}
+
 fn primaryDefaultThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const ?FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
@@ -572,13 +586,22 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     // A same-simple-name exact match is rejected when the parameter is written
     // qualified to a specific class and the argument's runtime class provably
     // denotes a different class in another package.
-    if (std.mem.eql(u8, nm, v_ty) and !overload_match.crossPackageIdentityConflict(self, param_ty, arg)) return 100;
+    const nm_mangled = host_call_member.mangledClassKeyOf(self, nm);
+    if ((std.mem.eql(u8, nm, v_ty) or
+        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty))) and
+        !overload_match.crossPackageIdentityConflict(self, param_ty, arg)) return 100;
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (arg.* == .Null and param_ty.nullable) return 50;
     // Numeric widening.
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
+    // Float values are stored Double-tagged (and vice versa after arithmetic):
+    // the two float widths are one value domain at runtime, so either width's
+    // parameter accepts either tag — `Density(density = 1f)` must bind the
+    // `density: Float` factory when the value arrives as a Double.
+    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
+        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
     // Callable arg against a function-typed param.
     var arg_arity: ?usize = null;
     switch (arg.*) {
@@ -619,11 +642,14 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             }
             if (already) continue;
             seen.append(self.allocator, cur.name) catch return null;
-            if (std.mem.eql(u8, cur.name, nm)) {
+            const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
+            if (std.mem.eql(u8, cur.name, nm) or
+                std.mem.eql(u8, cur_key, nm_mangled orelse nm))
+            {
                 const d = @min(cur.depth, 50);
                 return 60 - d;
             }
-            if (classDefByName(self, cur.name)) |def| {
+            if (classDefByName(self, cur.name) orelse classDefByName(self, cur_key)) |def| {
                 const dg = def.borrow();
                 for (dg.get().supertype_names) |sup| {
                     queue.append(self.allocator, .{ .name = sup, .depth = cur.depth + 1 }) catch {};
@@ -1131,7 +1157,8 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                             .ok => |func| {
                                 var thunk_args: std.ArrayList(Value) = .empty;
                                 defer thunk_args.deinit(allocator);
-                                try thunk_args.append(allocator, .Null); // `this`
+                                const tslot: Value = if (class_def) |d| ctorThunkThisSlot(d, outer_hint) else .Null;
+                                try thunk_args.append(allocator, tslot); // `this`
                                 try thunk_args.appendSlice(allocator, final_args.items);
                                 while (thunk_args.items.len < primary_names.items.len + 1) {
                                     try thunk_args.append(allocator, .Null);
@@ -1560,6 +1587,15 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
         if (best_fid) |fid| {
             return self.callFunc(allocator, m, fid, args);
         }
+        if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+            std.debug.print("[ifact] {s} nargs={d} cands={d} tags:", .{ class_name, args.len, m.funcsBySimpleName(class_name).len });
+            for (args) |*av| std.debug.print(" {s}", .{@tagName(av.*)});
+            std.debug.print("\n", .{});
+            for (m.funcsBySimpleName(class_name)) |fid2| {
+                const f2 = m.funcById(fid2) orelse continue;
+                std.debug.print("[ifact] fid={d} body={} np={d} p0={s} def1={}\n", .{ fid2.int(), f2.hasBody(), f2.params.len, if (f2.params.len > 0) f2.params[0].name else "-", funcParamHasDefault(self, fid2, 1) });
+            }
+        }
     }
     return throwInstantiation(self, allocator, "Cannot create an instance of an interface: {s}", class_name);
 }
@@ -1911,7 +1947,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                                 .ok => |func| {
                                     var thunk_args: std.ArrayList(Value) = .empty;
                                     defer thunk_args.deinit(allocator);
-                                    try thunk_args.append(allocator, .Null); // `this`
+                                    try thunk_args.append(allocator, ctorThunkThisSlot(class_def, outer_hint)); // `this`
                                     try thunk_args.appendSlice(allocator, effective.items);
                                     while (thunk_args.items.len < n_primary + 1) {
                                         try thunk_args.append(allocator, .Null);
@@ -1957,6 +1993,7 @@ fn padParentCtorDefaults(
     fqn: ?[]const u8,
     name: []const u8,
     args: *std.ArrayList(Value),
+    outer_hint: ?*const Value,
 ) Allocator.Error!UnitOrErr {
     const n_primary = classDefPrimaryParamCount(parent_def);
     if (args.items.len >= n_primary) return .{ .ok = {} };
@@ -1992,7 +2029,7 @@ fn padParentCtorDefaults(
                             .ok => |func| {
                                 var thunk_args: std.ArrayList(Value) = .empty;
                                 defer thunk_args.deinit(allocator);
-                                try thunk_args.append(allocator, .Null); // `this`
+                                try thunk_args.append(allocator, ctorThunkThisSlot(parent_def, outer_hint)); // `this`
                                 try thunk_args.appendSlice(allocator, args.items);
                                 while (thunk_args.items.len < n_primary + 1) {
                                     try thunk_args.append(allocator, .Null);
@@ -2296,7 +2333,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         // Fill any trailing primary-ctor params the subclass omitted from
         // its `super(...)` delegation with the parent's defaults.
         if (parent_def) |d| {
-            switch (try padParentCtorDefaults(self, allocator, d, pref.fqn, pname, &parent_args)) {
+            switch (try padParentCtorDefaults(self, allocator, d, pref.fqn, pname, &parent_args, outer_hint)) {
                 .ok => {},
                 .err => |e| {
                     d.deinit();

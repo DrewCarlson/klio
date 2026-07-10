@@ -1172,6 +1172,33 @@ fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *cons
 /// the runtime value is a subtype carrying a same-name extension.
 /// `null` ⇒ undecidable statically (unresolvable static class); the
 /// caller falls back to the runtime-type proof.
+/// The lifted key for a dotted nested-class reference (`Modifier.Node` ->
+/// its scope-keyed mangled name when the simple name collided at lift), or
+/// null when the name is not dotted / carries no mangle entry.
+fn mangledNestedKey(mod: *const Module, name: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '.') == null) return null;
+    // Last two segments (`a.b.C.D` -> `C.D`) key the mangle table.
+    var last: ?usize = null;
+    var prev: ?usize = null;
+    for (name, 0..) |ch, i| {
+        if (ch == '.') {
+            prev = last;
+            last = i;
+        }
+    }
+    const start = if (prev) |p| p + 1 else 0;
+    return mod.registry.mangled_nested.get(name[start..]);
+}
+
+/// The lifted mangle key for a dotted class-name string via the module's
+/// mangle table, or null when none applies. Precise: only a table hit
+/// canonicalizes, so two unrelated same-simple-name classes never merge.
+pub fn mangledClassKeyOf(self: *VmHost, name: []const u8) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mangledNestedKey(mg.get(), name);
+}
+
 fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []const u8, fid: FuncId, ty: *const TypeRef) ?bool {
     var pn = simpleName(ty.name);
     pn = std.mem.trimEnd(u8, pn, "?");
@@ -1179,6 +1206,15 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     // prover's universal cases.
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (typeParamOf(self, fid, pn)) return true;
+    // A dotted nested receiver whose class lifted under a mangled key
+    // (`Modifier.Node` when another `Node` exists) canonicalizes to that
+    // key, so it compares equal to a hint that resolved the same class
+    // through the lexical rename ladder.
+    {
+        const mg0 = self.module.borrow();
+        defer mg0.deinit();
+        if (mangledNestedKey(mg0.get(), std.mem.trimEnd(u8, ty.name, "?"))) |m| pn = m;
+    }
     // The short-all-uppercase type-param heuristic only applies to a
     // head that is NOT a registered class (`W5` is a class, `T`/`TT`
     // are type params).
@@ -1206,6 +1242,9 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
+    // A dotted hint canonicalizes through the same mangle table as `pn`.
+    if (mangledNestedKey(mod, std.mem.trimEnd(u8, static_name, "?"))) |m| sn = m;
+    if (std.mem.eql(u8, sn, pn)) return true;
     // Resolve `sn` against EVERY class sharing that simple name, not just the
     // one the simple-name-keyed hierarchy map happens to hold. Compose vendors
     // two distinct `Node` types (`Modifier.Node : DelegatableNode` and an
@@ -1217,9 +1256,20 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     var matches: usize = 0;
     var relates = false;
     for (mod.class_index.items) |entry| {
-        if (!std.mem.eql(u8, simpleName(entry.name), sn)) continue;
+        // A lift-mangled nested class (`Modifier$Node`) still answers for its
+        // source simple name: a bare hint (`Node`) recorded where the rename
+        // ladder could not see the mangle is ambiguous across ALL variants,
+        // and the mangled entry itself may be the one that relates.
+        const ehead = blk: {
+            const sn2 = simpleName(entry.name);
+            if (std.mem.lastIndexOfScalar(u8, sn2, '$')) |i| {
+                if (i + 1 < sn2.len) break :blk sn2[i + 1 ..];
+            }
+            break :blk sn2;
+        };
+        if (!(std.mem.eql(u8, simpleName(entry.name), sn) or std.mem.eql(u8, ehead, sn))) continue;
         matches += 1;
-        if (std.mem.eql(u8, simpleName(entry.name), pn)) {
+        if (std.mem.eql(u8, simpleName(entry.name), pn) or std.mem.eql(u8, entry.name, pn)) {
             relates = true;
             continue;
         }
@@ -1228,6 +1278,14 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
                 if (std.mem.eql(u8, simpleName(s), pn)) {
                     relates = true;
                     break;
+                }
+                // A dotted supertype whose class lifted mangled compares by
+                // its canonical key (`: Modifier.Node()` vs pn `Modifier$Node`).
+                if (mangledNestedKey(mod, s)) |m| {
+                    if (std.mem.eql(u8, m, pn)) {
+                        relates = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1935,7 +1993,10 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
         },
         else => v_ty = simpleName(arg.typeFqn()),
     }
-    if (std.mem.eql(u8, nm, v_ty)) {
+    const nm_mangled = mangledClassKeyOf(self, nm);
+    if (std.mem.eql(u8, nm, v_ty) or
+        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty)))
+    {
         const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
         return 100 + d;
     }
@@ -1944,6 +2005,12 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
+    // Float values are stored Double-tagged (and vice versa after arithmetic):
+    // the two float widths are one value domain at runtime, so either width's
+    // parameter accepts either tag — `Density(density = 1f)` must bind the
+    // `density: Float` factory when the value arrives as a Double.
+    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
+        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
 
     const arg_arity: ?usize = switch (arg.*) {
         .IrClosure => |c| blk: {
@@ -2027,7 +2094,8 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
         seen.put(e.name, {}) catch {};
         if (std.mem.eql(u8, simpleName(e.name), tn)) return e.depth;
         const cg = self.classes.borrow();
-        if (cg.get().get(e.name)) |d| {
+        const e_key = mangledClassKeyOf(self, e.name) orelse e.name;
+        if (cg.get().get(e.name) orelse cg.get().get(e_key)) |d| {
             const dg = d.borrow();
             for (dg.get().supertype_names) |sn| queue.append(a, .{ .name = sn, .depth = e.depth + 1 }) catch {};
             dg.deinit();
@@ -3767,9 +3835,26 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         defer g.deinit();
         const cg = g.get().class.borrow();
         defer cg.deinit();
+        missTraceMaybe(name);
         return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
     }
+    missTraceMaybe(name);
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
+}
+
+/// `KLIO_MISS_TRACE=<name>` diagnostic: when a call_member dispatch for
+/// exactly `<name>` reaches the total-miss tail, print the live frame chain
+/// (the miss may still be tolerated by an outer walk; each firing is one
+/// candidate path that failed).
+fn missTraceMaybe(name: []const u8) void {
+    if (!missTraceWant(name)) return;
+    std.debug.print("[miss] call_member `{s}` total miss\n", .{name});
+    ir.eval.dumpFrameChainForDiagAlways();
+}
+
+fn missTraceWant(name: []const u8) bool {
+    const want = runtime.getenvSlice("KLIO_MISS_TRACE") orelse return false;
+    return std.mem.eql(u8, want, name);
 }
 
 /// Free an `Unimplemented` result's message iff it is the dispatch-miss message
@@ -4598,6 +4683,15 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if (std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "simpleName")) {
         return null; // handled by get_field
     }
+    // Dispatch under the reference's creation-site file (private
+    // visibility is decided where the reference was written).
+    var ref_pushed = false;
+    var ref_prev: ?ir.eval.RefSiteOverride = null;
+    if (boundRefFile(receiver)) |bf| {
+        ref_prev = ir.eval.pushRefSiteFile(bf);
+        ref_pushed = true;
+    }
+    defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
     // Property-delegation protocol on a bound property reference
     // (`var x by data::prop` / `by Data::prop`): read/write the
     // referenced property. A Class-bound ref takes the instance from
@@ -7528,6 +7622,32 @@ fn isMemberExt(mod: *const Module, fid: FuncId) bool {
 /// `member_ext_owner_class.get(fid)`-then-`visible_owners.contains(owner)`
 /// behavior exactly: the kind selects the gated funcs, the side table
 /// supplies the owner.
+/// Whether `fid` is a FILE-PRIVATE top-level function whose declaring file
+/// is not the currently executing frame's file — Kotlin scopes a private
+/// top-level declaration to its file, so such a candidate is invisible here
+/// (a file-private `Rect.size()` must never capture `changes.size()`).
+fn privateFnHiddenHere(self: *VmHost, mod: *const Module, fid: FuncId) bool {
+    _ = self;
+    const decl_file = mod.registry.private_fn_files.get(fid) orelse return false;
+    // A dispatching bound reference carries its creation-site file; the
+    // reference site, not the dynamic caller, decides private visibility.
+    if (ir.eval.refSiteFile()) |f| return f.int() != decl_file.int();
+    const sp = ir.eval.currentCallSiteSpan() orelse return false;
+    return sp.file.int() != decl_file.int();
+}
+
+/// A bound reference's creation-site file (`__bound_file__`), if recorded
+/// on its synth instance. The invoke arms re-install it around their
+/// by-name dispatch via `ir.eval.pushRefSiteFile`.
+pub fn boundRefFile(callee: *const Value) ?ir.FileId {
+    if (callee.* != .Instance) return null;
+    const g = callee.Instance.borrow();
+    defer g.deinit();
+    const v = g.get().get("__bound_file__") orelse return null;
+    if (v != .Int) return null;
+    return ir.FileId.from(@intCast(v.Int));
+}
+
 fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
@@ -7876,6 +7996,7 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
 
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
+    if (missTraceWant(name)) std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s}\n", .{ strict_ext, args.len, receiver.typeFqn() });
 
     // Inline-cache fast path. A prior *owner-independent* resolution of this
     // (receiver class, name, arg types) to a top-level extension dispatches
@@ -7909,17 +8030,37 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         const mg = self.module.borrow();
         defer mg.deinit();
         const mod = mg.get();
+        const mtrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+        if (mtrace) {
+            std.debug.print("[extfb] name={s} simple-name fids={d} want={d} args:", .{ name, mod.funcsBySimpleName(name).len, want });
+            for (args) |*a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a.*))});
+            std.debug.print("\n", .{});
+        }
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
-            if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) {
+                if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
+                continue;
+            }
             if (isMemberExt(mod, fid)) saw_member_ext = true;
-            if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
+            if (privateFnHiddenHere(self, mod, fid)) {
+                if (mtrace) std.debug.print("[extfb]  fid={d} private-skip\n", .{fid.int()});
+                continue;
+            }
+            if (!memberExtVisible(self, mod, fid, &visible_owners)) {
+                if (mtrace) std.debug.print("[extfb]  fid={d} owner-skip\n", .{fid.int()});
+                continue;
+            }
             // An unsettled bodyless header is not executable — selecting
             // it would re-enter `callFunc`'s bodyless ladder and cycle,
             // and it must not outrank a real serving in a later walk arm.
             // A call statically bound to such a header no-ops in
             // `callFunc`'s bodyless arm; here it simply never competes.
-            if (!host_call_func.executableForm(self, mod, fid, want)) continue;
+            if (!host_call_func.executableForm(self, mod, fid, want)) {
+                if (mtrace) std.debug.print("[extfb]  fid={d} bodyless-skip\n", .{fid.int()});
+                continue;
+            }
+            if (mtrace) std.debug.print("[extfb]  fid={d} CANDIDATE recv={s}\n", .{ fid.int(), if (mod.decl_sigs.get(fid.int())) |sg| (if (sg.receiver_ty) |rt| rt.name else "-") else "-" });
             try candidates.append(allocator, .{ .fid = fid, .func = f });
         }
     }
@@ -7977,7 +8118,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                     try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty)
             else
                 try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty);
-            if (!recv_fits) continue;
+            if (!recv_fits) {
+                if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict recv-unproven static_recv={s}\n", .{ c.fid.int(), static_recv orelse "-" });
+                continue;
+            }
             // A type-parameter receiver's declared bounds bind in the strict
             // pass too: `fun <T> T.observeReads where T : Modifier.Node`
             // never takes a ContentDrawScope receiver, however generically
@@ -8026,11 +8170,21 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         // never considers the extension (`Pipeline.execute` is not a
         // candidate on a coroutine receiver).
         {
+            const mtr = missTraceWant(name);
             var filtered: std.ArrayList(Candidate) = .empty;
             for (candidates.items) |c| {
-                if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
-                if (builtinReceiverDisproven(receiver, c.func.params[0].ty.name)) continue;
-                if (candidateArgsDisproven(self, &c.func, args)) continue;
+                if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) {
+                    if (mtr) std.debug.print("[extfb]  fid={d} lenient bound-skip\n", .{c.fid.int()});
+                    continue;
+                }
+                if (builtinReceiverDisproven(receiver, c.func.params[0].ty.name)) {
+                    if (mtr) std.debug.print("[extfb]  fid={d} lenient builtin-disproof\n", .{c.fid.int()});
+                    continue;
+                }
+                if (candidateArgsDisproven(self, &c.func, args)) {
+                    if (mtr) std.debug.print("[extfb]  fid={d} lenient args-disproof\n", .{c.fid.int()});
+                    continue;
+                }
                 // Arity applicability holds in the lenient pass too: a
                 // candidate that REQUIRES more args than supplied cannot
                 // take this call — Null-padding it silently runs the
@@ -8038,7 +8192,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 // the `(fromIndex, toIndex)` variant with Null indices).
                 // Judged by the DECLARED arity (required/vararg), which
                 // is authoritative where per-fid default thunks are not.
-                if (declArityRefuses(self, c.fid, args.len)) continue;
+                if (declArityRefuses(self, c.fid, args.len)) {
+                    if (mtr) std.debug.print("[extfb]  fid={d} lenient arity-refuse\n", .{c.fid.int()});
+                    continue;
+                }
                 if (declared_recv) |dn| {
                     // A companion extension (`fun X.Companion.f`) called through
                     // the class value (`X.f`) has declared receiver `X` but a
@@ -8048,7 +8205,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                     const rty = &c.func.params[0].ty;
                     const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
                         std.mem.eql(u8, rty.name, "Companion");
-                    if (!is_companion_recv and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) continue;
+                    if (!is_companion_recv and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) {
+                        if (mtr) std.debug.print("[extfb]  fid={d} lenient static-recv-refuse dn={s}\n", .{ c.fid.int(), dn });
+                        continue;
+                    }
                 }
                 filtered.append(allocator, c) catch {};
             }
@@ -8061,6 +8221,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (receiverCompatibleWithParam(receiver, &c.func.params[0].ty) and
                 !receiverDefinitelyNotParam(self, &c.func.params[0].ty, receiver)) any_compat = true;
         }
+        if (missTraceWant(name)) std.debug.print("[extfb] lenient survivors={d} any_compat={}\n", .{ candidates.items.len, any_compat });
         if (any_compat) {
             var filtered: std.ArrayList(Candidate) = .empty;
             for (candidates.items) |c| {
@@ -8184,11 +8345,17 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         const c = chosen.?;
         if (trace.enabled(name)) {
             const d = funcDefaults(self, &c.func);
-            trace.emit("map=ext_fallback_pick name={s} fqn={s} fid={d} strict={} nparams={d} ndefaults={d} recv_ty={s}", .{
+            trace.emit("map=ext_fallback_pick name={s} fqn={s} fid={d} strict={} nparams={d} ndefaults={d} recv_ty={s} p0={s} owner={s}", .{
                 name,                          c.func.fqn,
                 c.fid.int(),                   strict_ext,
                 c.func.params.len,             if (d) |dd| dd.len else 0,
                 c.func.params[0].ty.name,
+                c.func.params[0].name,
+                blk: {
+                    const mg2 = self.module.borrow();
+                    defer mg2.deinit();
+                    break :blk mg2.get().registry.member_ext_owner_class.get(c.fid) orelse "-";
+                },
             });
         }
         const all = try prependReceiver(allocator, receiver, args);
@@ -8900,6 +9067,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
             if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            if (privateFnHiddenHere(self, mod, fid)) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             // A candidate whose declared receiver definitely excludes this
             // runtime receiver is not applicable at all (kotlinc drops it):
@@ -9381,6 +9549,12 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
     const name_dup = try allocator.dupe(u8, name);
     try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try runtime.strInitOwned(allocator, name_dup) } });
+    // The reference's creation-site file: visibility of a file-private
+    // target is decided where the reference is written, so the invoke
+    // path re-installs this file while it dispatches by name.
+    if (ir.eval.currentCallSiteSpan()) |sp| {
+        try fields.append(allocator, .{ .name = "__bound_file__", .value = .{ .Int = @intCast(sp.file.int()) } });
+    }
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = synth_class,
         .fields = fields,
@@ -9448,7 +9622,15 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
         parent_name = firstSupertypeName(self, allocator, owner_class);
     }
     const start = parent_name orelse {
-        return .{ .err = try typeErr(allocator, "super.{s}: owner_class `{s}` has no parent", .{ name, owner_class }) };
+        const owner_fqn: []const u8 = blk: {
+            const g = self.classes.borrow();
+            defer g.deinit();
+            const d = g.get().get(owner_class) orelse break :blk "<unregistered>";
+            const dg = d.borrow();
+            defer dg.deinit();
+            break :blk dg.get().fqn;
+        };
+        return .{ .err = try typeErr(allocator, "super.{s}: owner_class `{s}` (table entry `{s}`) has no parent", .{ name, owner_class, owner_fqn }) };
     };
 
     // Walk the supertype chain starting at `start` and dispatch the first
