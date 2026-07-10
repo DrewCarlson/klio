@@ -746,6 +746,7 @@ const BuiltImage = struct {
     init_blocks: []NameFuncs,
     top_level_props: []build.NameFunc,
     extension_props: []PairFuncEntry,
+    nullable_ext_props: []build.StrFunc = &.{},
     extension_prop_setters: []PairFuncEntry,
     extension_prop_delegates: []PairFuncEntry = &.{},
     object_names: []const []const u8,
@@ -1434,6 +1435,14 @@ fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator
     out.init_blocks = try nameFuncsToSlice(a, &b.init_blocks);
     out.top_level_props = b.top_level_props.items;
     out.extension_props = try pairFuncToSlice(a, &b.extension_props);
+    {
+        var list: std.ArrayList(build.StrFunc) = .empty;
+        var it = b.nullable_ext_props.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.*) |fid| try list.append(a, .{ .name = e.key_ptr.*, .func = fid });
+        }
+        out.nullable_ext_props = try list.toOwnedSlice(a);
+    }
     out.extension_prop_setters = try pairFuncToSlice(a, &b.extension_prop_setters);
     out.extension_prop_delegates = try pairFuncToSlice(a, &b.extension_prop_delegates);
     out.object_names = b.object_names.items;
@@ -2160,6 +2169,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     for (img.init_blocks) |entry| try out.init_blocks.put(entry.name, @constCast(entry.funcs));
     try out.top_level_props.appendSlice(a, img.top_level_props);
     for (img.extension_props) |entry| try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.nullable_ext_props) |entry| try out.nullable_ext_props.put(entry.name, entry.func);
     for (img.extension_prop_setters) |entry| try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.extension_prop_delegates) |entry| try out.extension_prop_delegates.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     try out.object_names.appendSlice(a, img.object_names);

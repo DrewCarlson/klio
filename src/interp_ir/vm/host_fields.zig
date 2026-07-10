@@ -1088,6 +1088,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 // the read was already bound to this receiver, so the error
                 // (a genuine wrong-type access) propagates as before.
                 if (member_probe and r == .err and r.err == .Type) {
+                    ir.eval.dumpFrameChainForDiag();
                     return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, type_fqn }) });
                 }
                 return r;
@@ -1401,6 +1402,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
+    ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
     return errRes(.{ .Unimplemented = msg });
@@ -1901,6 +1903,19 @@ fn resolveExtensionPropImpl(
         defer pg.deinit();
         if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
         if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
+        return null;
+    }
+    // A null receiver dispatches an extension property declared on a NULLABLE
+    // receiver type (`val RowColumnParentData?.weight get() = this?.weight ?:
+    // 0f`) — kotlinc resolves that statically, so `parentData.weight` with a
+    // null parentData runs the getter, never a field read. Only an
+    // unambiguous single declaration binds by bare name.
+    if (receiver.* == .Null and !setters) {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().nullable_ext_props.get(name)) |maybe| {
+            if (maybe) |fid| return fid;
+        }
         return null;
     }
     {

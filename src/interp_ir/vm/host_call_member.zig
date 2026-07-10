@@ -1472,7 +1472,13 @@ fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8)
             while (queue.pop()) |c| {
                 if (seen.contains(c)) continue;
                 seen.put(c, {}) catch {};
-                if (std.mem.eql(u8, simpleName(c), pn)) return true;
+                const sn = simpleName(c);
+                if (std.mem.eql(u8, sn, pn)) return true;
+                // A lifted nested class registers under its mangled name
+                // (`Modifier$Node`); a bound written `Modifier.Node` carries
+                // the simple head `Node`, so match the `$` tail too.
+                if (sn.len > pn.len and sn[sn.len - pn.len - 1] == '$' and
+                    std.mem.endsWith(u8, sn, pn)) return true;
                 const cg = self.classes.borrow();
                 if (cg.get().get(c)) |d| {
                     const dg = d.borrow();
@@ -1511,7 +1517,13 @@ fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []cons
             while (queue.pop()) |c| {
                 if (seen.contains(c)) continue;
                 seen.put(c, {}) catch {};
-                if (std.mem.eql(u8, simpleName(c), pn)) return true;
+                const sn = simpleName(c);
+                if (std.mem.eql(u8, sn, pn)) return true;
+                // A lifted nested class registers under its mangled name
+                // (`Modifier$Node`); a bound written `Modifier.Node` carries
+                // the simple head `Node`, so match the `$` tail too.
+                if (sn.len > pn.len and sn[sn.len - pn.len - 1] == '$' and
+                    std.mem.endsWith(u8, sn, pn)) return true;
                 const cg = self.classes.borrow();
                 if (cg.get().get(c)) |d| {
                     const dg = d.borrow();
