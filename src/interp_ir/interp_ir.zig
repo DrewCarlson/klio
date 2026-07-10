@@ -109,6 +109,9 @@ pub const ProgramImage = struct {
     parent_ctor_args: std.StringHashMap([]FuncId),
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
+    /// Nullable-receiver extension-property getters by property name (unique
+    /// pick or null for ambiguous) — the dispatch key for a null receiver.
+    nullable_ext_props: std.StringHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
     /// Delegated extension properties: (receiver, prop) -> delegate thunk.
     extension_prop_delegates: PairFuncMap,
@@ -288,6 +291,7 @@ pub const ProgramImage = struct {
             .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
             .init_blocks = std.StringHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
+            .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
             .extension_prop_setters = PairFuncMap.init(allocator),
             .extension_prop_delegates = PairFuncMap.init(allocator),
             .secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator),
@@ -323,6 +327,7 @@ pub const ProgramImage = struct {
         self.parent_ctor_args.deinit();
         self.init_blocks.deinit();
         self.extension_props.deinit();
+        self.nullable_ext_props.deinit();
         self.extension_prop_setters.deinit();
         self.extension_prop_delegates.deinit();
         self.secondary_ctors.deinit();

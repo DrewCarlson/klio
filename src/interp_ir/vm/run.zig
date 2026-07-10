@@ -137,6 +137,9 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.extension_props.deinit();
         prog.extension_props = built.extension_props;
         built.extension_props = build.PairFuncMap.init(allocator);
+        prog.nullable_ext_props.deinit();
+        prog.nullable_ext_props = built.nullable_ext_props;
+        built.nullable_ext_props = @TypeOf(built.nullable_ext_props).init(allocator);
 
         prog.extension_prop_setters.deinit();
         prog.extension_prop_setters = built.extension_prop_setters;

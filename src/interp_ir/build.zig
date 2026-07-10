@@ -231,6 +231,11 @@ pub const BuiltModule = struct {
     top_level_props: std.ArrayList(NameFunc),
     /// Top-level extension properties, keyed by `(receiver type, prop)`.
     extension_props: PairFuncMap,
+    /// Getter FuncIds of extension properties declared on a NULLABLE receiver
+    /// (`val RowColumnParentData?.weight`), keyed by property name — the only
+    /// dispatch key available when the receiver evaluates to null. A name
+    /// declared on several nullable receivers is ambiguous and maps to null.
+    nullable_ext_props: std.StringHashMap(?FuncId),
     /// Extension-property setters keyed by `(receiver type, prop)`.
     extension_prop_setters: PairFuncMap,
     /// Delegated extension properties (`val R.x by expr`), keyed by
@@ -280,6 +285,7 @@ pub const BuiltModule = struct {
         self.init_blocks.deinit();
         self.top_level_props.deinit(self.allocator);
         self.extension_props.deinit();
+        self.nullable_ext_props.deinit();
         self.extension_prop_setters.deinit();
         self.extension_prop_delegates.deinit();
         self.object_names.deinit(self.allocator);
@@ -319,6 +325,7 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .init_blocks = std.StringHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
         .extension_props = PairFuncMap.init(allocator),
+        .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
         .extension_prop_setters = PairFuncMap.init(allocator),
         .extension_prop_delegates = PairFuncMap.init(allocator),
         .main = main,
@@ -2702,6 +2709,7 @@ fn buildModuleWithOverrides(
 
     // Top-level + companion/object extension properties.
     var extension_props = if (seed) |*s| s.extension_props else PairFuncMap.init(a);
+    var nullable_ext_props = if (seed) |*s| s.nullable_ext_props else std.StringHashMap(?FuncId).init(a);
     var extension_prop_setters = if (seed) |*s| s.extension_prop_setters else PairFuncMap.init(a);
     var extension_prop_delegates = if (seed) |*s| s.extension_prop_delegates else PairFuncMap.init(a);
     const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8 };
@@ -2770,6 +2778,16 @@ fn buildModuleWithOverrides(
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
             };
             try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
+            if (recv.nullable) {
+                const gop2 = try nullable_ext_props.getOrPut(p.name.name);
+                if (gop2.found_existing) {
+                    if (gop2.value_ptr.*) |prev| {
+                        if (prev != fid) gop2.value_ptr.* = null;
+                    }
+                } else {
+                    gop2.value_ptr.* = fid;
+                }
+            }
             // A member-extension property's accessor body has its
             // declaring class's `this` in lexical scope; tag the owner so
             // dispatch seeds the accessor frame with the owner instance.
@@ -2923,6 +2941,7 @@ fn buildModuleWithOverrides(
         .init_blocks = init_blocks,
         .top_level_props = top_level_props,
         .extension_props = extension_props,
+        .nullable_ext_props = nullable_ext_props,
         .extension_prop_delegates = extension_prop_delegates,
         .extension_prop_setters = extension_prop_setters,
         .main = main_id,
@@ -3748,6 +3767,10 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
     try copyPairMap(&out.extension_props, &base.extension_props);
+    {
+        var it = base.nullable_ext_props.iterator();
+        while (it.next()) |e| try out.nullable_ext_props.put(e.key_ptr.*, e.value_ptr.*);
+    }
     try copyPairMap(&out.extension_prop_delegates, &base.extension_prop_delegates);
     try copyPairMap(&out.extension_prop_setters, &base.extension_prop_setters);
     try out.object_names.appendSlice(a, base.object_names.items);

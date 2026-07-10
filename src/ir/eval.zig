@@ -443,6 +443,33 @@ var spin_interval_read = false;
 threadlocal var spin_last_dump: i64 = 0;
 threadlocal var spin_check_counter: u64 = 0;
 
+/// Diagnostic: print the live frame chain (as the spin tracer does), for an
+/// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
+pub fn dumpFrameChainForDiag() void {
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
+    var cur = frame_chain;
+    var depth: usize = 0;
+    while (cur) |f| : (cur = f.gc_link) {
+        const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
+        if (f.cur_span) |sp| {
+            var printed = false;
+            if (span.active_map) |m| {
+                if (m.getChecked(sp.file)) |sf| {
+                    const lc = sf.lineCol(sp.start);
+                    std.debug.print("  {s} ({s}:{d})\n", .{ label, sf.path, lc.line });
+                    printed = true;
+                }
+            }
+            if (!printed) std.debug.print("  {s} (f{d}@{d})\n", .{ label, @intFromEnum(sp.file), sp.start });
+        } else {
+            std.debug.print("  {s}\n", .{label});
+        }
+        depth += 1;
+        if (depth >= 40) break;
+    }
+}
+
 fn spinDumpMaybe() void {
     if (!spin_interval_read) {
         spin_interval_read = true;
