@@ -3400,6 +3400,17 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const name_str = constStr(frame.module, cmv.name) orelse
                 return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
             const fb = frame.read(cmv.fallback);
+            if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
+                const rcls: []const u8 = if (recv == .Instance) blk: {
+                    const g = recv.Instance.borrow();
+                    const cg = g.get().class.borrow();
+                    const n = cg.get().name;
+                    cg.deinit();
+                    g.deinit();
+                    break :blk n;
+                } else @tagName(recv);
+                std.debug.print("[pb] in={s}#{d} recv={s} fb={s}\n", .{ frame.func.name, frame.func.id.int(), rcls, @tagName(fb) });
+            }
             // The local/captured fallback only wins when the receiver has no
             // such member AND the fallback is actually invocable (a function
             // value or callable reference). A same-named non-callable local
@@ -4219,6 +4230,47 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     },
                 }
             }
+        }
+    }
+    if (resolved == null and runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placeApparentToRealOffset")) {
+        const cands2 = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
+        defer allocator.free(cands2);
+        std.debug.print("[par-miss] in={s}#{d} ncands={d}:", .{ frame.func.name, frame.func.id.int(), cands2.len });
+        for (cands2) |c| {
+            if (c.v == .Instance) {
+                const ig = c.v.Instance.borrow();
+                const cg = ig.get().class.borrow();
+                std.debug.print(" {s}", .{cg.get().name});
+                cg.deinit();
+                ig.deinit();
+            } else std.debug.print(" {s}", .{@tagName(c.v)});
+        }
+        std.debug.print("\n", .{});
+        {
+            var anc = frame.gc_link;
+            var ai: usize = 0;
+            std.debug.print("[par-anc]", .{});
+            while (anc) |af| : (anc = af.gc_link) {
+                std.debug.print(" <-{s}#{d}", .{ af.func.name, af.func.id.int() });
+                ai += 1;
+                if (ai >= 6) break;
+            }
+            std.debug.print("\n", .{});
+        }
+        {
+            const ents = try enclosingEntriesAlloc(allocator);
+            defer allocator.free(ents);
+            std.debug.print("[par-enc] n={d}:", .{ents.len});
+            for (ents) |e| {
+                if (e.v == .Instance) {
+                    const ig = e.v.Instance.borrow();
+                    const cg = ig.get().class.borrow();
+                    std.debug.print(" {s}{s}", .{ cg.get().name, if (e.isSubject()) @as([]const u8, "*") else "" });
+                    cg.deinit();
+                    ig.deinit();
+                } else std.debug.print(" {s}", .{@tagName(e.v)});
+            }
+            std.debug.print("\n", .{});
         }
     }
     var result: Value = undefined;

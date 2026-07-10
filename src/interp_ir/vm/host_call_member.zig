@@ -7707,6 +7707,35 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
     return set;
 }
 
+/// `delegateForward` with argument names threaded through, so a delegated
+/// member invoked with named arguments binds its parameters by name.
+fn delegateForwardNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
+    const inst = receiver.Instance;
+    var delegates: std.ArrayList(Value) = .empty;
+    defer delegates.deinit(allocator);
+    {
+        const g = inst.borrow();
+        defer g.deinit();
+        for (g.get().fields.items) |f| {
+            if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+            const iface = f.name["__delegate__".len..];
+            if (delegatedInterfaceDeclares(self, allocator, inst, iface, name) == false) continue;
+            try delegates.append(allocator, f.value);
+        }
+    }
+    for (delegates.items) |d| {
+        const r = try callMemberNamed(self, allocator, &d, name, args, arg_names);
+        switch (r) {
+            .ok => return r,
+            .err => |e| {
+                if (e != .Unimplemented) return r;
+                freeDispatchMiss(allocator, r);
+            },
+        }
+    }
+    return null;
+}
+
 fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, swallow_unimplemented_only: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var delegates: std.ArrayList(Value) = .empty;
@@ -7949,6 +7978,12 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             else
                 try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty);
             if (!recv_fits) continue;
+            // A type-parameter receiver's declared bounds bind in the strict
+            // pass too: `fun <T> T.observeReads where T : Modifier.Node`
+            // never takes a ContentDrawScope receiver, however generically
+            // the bare head reads. The static-hint shortcut above cannot see
+            // the bounds, so re-check them against the runtime receiver.
+            if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
             if (!extArityApplicable(self, &c.func, want)) continue;
             if (candidateArgsDisproven(self, &c.func, args)) continue;
             // Kotlin selects extensions against the receiver's DECLARED
@@ -8216,6 +8251,19 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
+    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, owner, "PlacementScope")) {
+        std.debug.print("[meoi] owner={s} nentries={d}:", .{ owner, entries.len });
+        for (entries) |e| {
+            if (e.v == .Instance) {
+                const g = e.v.Instance.borrow();
+                const cg = g.get().class.borrow();
+                std.debug.print(" {s}={}", .{ cg.get().name, receiverImplementsType(self, &e.v, owner) });
+                cg.deinit();
+                g.deinit();
+            } else std.debug.print(" {s}", .{@tagName(e.v)});
+        }
+        std.debug.print("\n", .{});
+    }
     for (entries) |e| {
         if (e.v != .Instance) continue;
         if (receiverImplementsType(self, &e.v, owner)) return e.v;
@@ -8800,6 +8848,12 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     // …)` binds the `ByteArray` member, not the `ByteString` extension.
     if (receiver.* == .Instance) {
         if (try instanceMethodWalkNamed(self, allocator, receiver, name, args, arg_names)) |r| return r;
+        // Class delegation with named arguments: a delegated interface
+        // member (`class LayoutNodeDrawScope(...) : DrawScope by
+        // canvasDrawScope` serving `drawRoundRect(brush = …, …)`) forwards
+        // to the delegate with the names intact — the positional forward
+        // later in the ladder scrambles the binding.
+        if (try delegateForwardNamed(self, allocator, receiver, name, args, arg_names)) |r| return r;
     }
     if (resolveExtOverloadLocal(self, allocator, name, receiver, args, arg_names)) |fid| {
         const all = try prependReceiver(allocator, receiver, args);
@@ -8810,7 +8864,21 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         @memcpy(names[1..], arg_names);
         const mg = self.module.borrow();
         const mod = mg.get();
+        // A member-extension's body has its declaring class's `this` in
+        // lexical scope. Seed the callee frame with that owner instance,
+        // exactly as `extensionFnFallback` does — without it a bare
+        // sibling call inside the body (`placeApparentToRealOffset`
+        // inside `PlacementScope`'s `placeWithLayer`) has no owner
+        // candidate and misses.
+        var pushed_owner = false;
+        if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
+            if (try memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
+                ir.eval.pushEnclosing(&inst);
+                pushed_owner = true;
+            }
+        }
         const r = try callFuncNamedRec(self, allocator, mod, fid, all, names);
+        if (pushed_owner) ir.eval.popEnclosing();
         mg.deinit();
         return r;
     }

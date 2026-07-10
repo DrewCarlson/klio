@@ -89,6 +89,9 @@ Run any program with:
 | `nullable_receiver_ext_prop.kt` | An extension property on a nullable receiver (`val T?.weight`) dispatches for a null receiver. |
 | `value_class_overload_pick.kt` | A value-class argument (an object property of inferred value-class type) binds the value-class overload over the underlying-primitive sibling, incl. at inline-splice sites forced by a non-local return. |
 | `sam_member_ext_receiver.kt` | A fun interface whose single abstract method is a member extension: the SAM lambda body is scoped with the extension receiver as `this`, and explicit-receiver calls through the SAM dispatch it. |
+| `member_ext_sibling_named.kt` | A member-extension invoked with named arguments seeds its owner as an enclosing receiver, so a bare sibling member-extension call inside the body resolves. |
+| `bounded_typeparam_receiver.kt` | A `where`-bounded generic extension never binds a receiver outside its bounds, even when the static receiver hint says otherwise. |
+| `delegated_member_named_args.kt` | Class delegation serving a member invoked with named arguments binds parameters by name through the forward. |
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |
