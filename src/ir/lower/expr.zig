@@ -3071,6 +3071,12 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // back to runtime dispatch.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and gate: {
         if (ast_type_args.len != 0 or b.peekExpected() != null) break :gate true;
+        // Statement position with no type args: splice anyway when the value
+        // arguments alone bind every reified parameter (a generic-class
+        // argument like `Nodes.Draw : NodeKind<DrawModifierNode>`), so the
+        // spliced `is T` checks the real class — runtime dispatch of the
+        // inline body would read a stale/unbound `T`.
+        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args)) break :gate true;
         const recv = callee.Member.receiver;
         if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
         const n = recv.Path.segments[0].name;

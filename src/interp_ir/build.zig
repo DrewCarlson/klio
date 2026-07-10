@@ -1563,9 +1563,20 @@ fn buildModuleWithOverrides(
     // AST pointers `candidatesFor` returns).
     {
         ir.lower.resetInlineMemberOwners();
+        ir.lower.resetMemberPropAsts();
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
+            registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name);
+        }
+        // Top-level objects (and any class the map above missed) from this
+        // build's decls — user files plus re-parsed pack sources.
+        for (decls) |*d| {
+            switch (d.*) {
+                .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
+                .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
+                else => {},
+            }
         }
     }
     {
@@ -2918,6 +2929,20 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
             .Class => |*inner| if (inner.is_companion) {
                 try collectConsts(module, cls_name, inner.members);
             },
+            else => {},
+        }
+    }
+}
+
+/// Register each property AST in `members` under its owner class/object,
+/// recursing into nested types, so reified-type-argument inference can
+/// resolve a property-access argument's generic type.
+fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8) void {
+    for (members) |*m| {
+        switch (m.*) {
+            .Property => |p| ir.lower.registerMemberPropAst(a, owner, p),
+            .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
+            .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
             else => {},
         }
     }

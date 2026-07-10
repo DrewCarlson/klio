@@ -309,7 +309,7 @@ fn inferReifiedTypeArgs(
     for (f.params, 0..) |*p, i| {
         if (i >= ordered.len) break;
         const arg = ordered[i] orelse continue;
-        try unifyParamAgainstArg(&p.ty, arg, &tp_names, &subst);
+        try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst);
     }
 
     // Fallback: unify the declared return type against the call's expected
@@ -331,12 +331,54 @@ fn inferReifiedTypeArgs(
     return out;
 }
 
+/// Whether a member call to inline extension `name` with these value
+/// arguments can bind EVERY reified type parameter by inference alone (no
+/// explicit `<…>`, no expected type) — the gate for splicing a reified
+/// inline extension in statement position, where `drawNode.dispatchForKind(
+/// Nodes.Draw) { … }` must splice so `is T` checks the argument's real
+/// generic type instead of dispatching at runtime with `T` unbound.
+pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const Expr) bool {
+    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    };
+    const trailing_arity: ?usize = if (args.len == 0) null else switch (args[args.len - 1]) {
+        .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
+        .AnonFun => |af| af.params.len,
+        else => null,
+    };
+    const shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda, .trailing_lambda_arity = trailing_arity };
+    const f = inline_state.inlineFnAstForRecvExt(name, shape, null, true) orelse return false;
+    if (f.receiver_type == null) return false;
+    var any_reified = false;
+    for (f.type_params) |tp| {
+        if (tp.is_reified) any_reified = true;
+    }
+    if (!any_reified) return false;
+    const ordered = allocator.alloc(?*const Expr, f.params.len) catch return false;
+    defer allocator.free(ordered);
+    for (ordered, 0..) |*slot, i| slot.* = if (i < args.len) &args[i] else null;
+    const probe = inferReifiedTypeArgs(allocator, f, &.{}, null, ordered) catch return false;
+    defer allocator.free(probe);
+    for (f.type_params, 0..) |tp, i| {
+        if (tp.is_reified and probe[i] == null) return false;
+    }
+    return true;
+}
+
 /// Unify one declared value-parameter type against its actual argument
 /// expression, recording any reified type-parameter solutions in `subst`.
 /// A function-typed parameter `(P…) -> R` unifies each declared parameter
 /// type against the lambda literal's corresponding annotation, so a reified
 /// `T` carried only by a lambda parameter is solved from `{ s: String -> … }`.
+/// A generic-class parameter (`kind: NodeKind<T>`) unifies against the
+/// argument's statically evident generic type — a constructor call with
+/// explicit call-site type args, or a property access whose declared type /
+/// accessor return type / expression body carries them (`Nodes.Draw` ->
+/// `NodeKind<DrawModifierNode>`), solving `T` so `is T` in the spliced body
+/// checks the real class.
 fn unifyParamAgainstArg(
+    allocator: Allocator,
     param_ty: *const TypeRef,
     arg: *const Expr,
     tp_names: *const std.StringHashMap(void),
@@ -353,7 +395,87 @@ fn unifyParamAgainstArg(
                 }
             }
         }
+        return;
     }
+    if (param_ty.type_args.len != 0) {
+        var mentions_tp = false;
+        for (param_ty.type_args) |*ta| {
+            if (!ta.is_star and tp_names.contains(ta.ty.name.name)) {
+                mentions_tp = true;
+                break;
+            }
+        }
+        if (!mentions_tp) return;
+        if (try argGenericTypeRef(allocator, arg, 0)) |aty| {
+            try unifyTypeParam(param_ty, aty, tp_names, subst);
+        }
+    }
+}
+
+/// The argument expression's generic type, when statically evident:
+/// a constructor/factory call with explicit `<…>` type args, or a
+/// property access resolvable through the member-property AST registry.
+/// Returns null when the type cannot be proven — inference stays
+/// positive-proof only.
+fn argGenericTypeRef(allocator: Allocator, arg: *const Expr, depth: usize) Allocator.Error!?*const TypeRef {
+    if (depth > 4) return null;
+    switch (arg.*) {
+        .Call => |*c| {
+            if (c.type_args.len == 0) return null;
+            if (c.callee.* != .Path) return null;
+            const segs = c.callee.Path.segments;
+            if (segs.len == 0) return null;
+            const head = segs[segs.len - 1];
+            if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
+            const targs = try allocator.alloc(ast.TypeArg, c.type_args.len);
+            for (c.type_args, 0..) |ta, i| {
+                targs[i] = .{ .variance = .Invariant, .is_star = false, .ty = ta, .span = ta.span };
+            }
+            const out = try allocator.create(TypeRef);
+            out.* = .{
+                .name = head,
+                .nullable = false,
+                .span = head.span,
+                .type_args = targs,
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            };
+            return out;
+        },
+        .Path => |*p| {
+            if (p.segments.len < 2) return null;
+            const owner = p.segments[p.segments.len - 2].name;
+            const name = p.segments[p.segments.len - 1].name;
+            return propGenericTypeRef(allocator, owner, name, depth);
+        },
+        .Member => |*m| {
+            if (m.receiver.* != .Path) return null;
+            const rs = m.receiver.Path.segments;
+            if (rs.len == 0) return null;
+            return propGenericTypeRef(allocator, rs[rs.len - 1].name, m.name.name, depth);
+        },
+        else => return null,
+    }
+}
+
+/// Resolve property `owner.name`'s generic type through the registered
+/// property AST: the declared type, the getter's return annotation, or —
+/// for an expression-body accessor / initializer — the expression itself.
+fn propGenericTypeRef(allocator: Allocator, owner: []const u8, name: []const u8, depth: usize) Allocator.Error!?*const TypeRef {
+    const p = inline_state.memberPropAst(owner, name) orelse return null;
+    if (p.ty) |*t| {
+        if (t.type_args.len != 0) return t;
+    }
+    if (p.getter) |g| {
+        if (g.return_type) |*rt| {
+            if (rt.type_args.len != 0) return rt;
+        }
+        if (g.body == .Expr) return argGenericTypeRef(allocator, &g.body.Expr, depth + 1);
+    }
+    if (p.init) |*init| return argGenericTypeRef(allocator, init, depth + 1);
+    return null;
 }
 
 /// Unify a declared type (which may mention type parameters) against a

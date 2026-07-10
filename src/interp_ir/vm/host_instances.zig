@@ -2775,6 +2775,37 @@ fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
     return false;
 }
 
+/// Like `synthThunk` but carrying the custom setter's single value parameter,
+/// so an anonymous-object / local-class `override var x set(value) { … }`
+/// lowers as a 1-arg method the field-write path can dispatch. The param
+/// slice is allocated from `allocator` (the thunk is lowered immediately, so
+/// any per-call allocator outliving the lowering works).
+pub fn synthSetterThunk(allocator: Allocator, name: ast.Ident, value_param: ast.Ident, body: ast.FunctionBody, is_override: bool) Allocator.Error!ast.Function {
+    var f = synthThunk(name, body, null, is_override);
+    const params = try allocator.alloc(ast.Param, 1);
+    params[0] = .{
+        .name = value_param,
+        .ty = .{
+            .name = .{ .name = "Any", .span = value_param.span },
+            .nullable = true,
+            .span = value_param.span,
+            .type_args = &.{},
+            .function = null,
+            .definitely_non_null = false,
+            .annotations = &.{},
+            .qualified_path = null,
+        },
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = value_param.span,
+    };
+    f.params = params;
+    return f;
+}
+
 /// Synthesize a body-less 0-arg getter/init thunk `Function` from an
 /// accessor or expression body so it can be lowered as an anon method.
 pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.TypeRef, is_override: bool) ast.Function {
@@ -3031,6 +3062,21 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
+                    tbl.deinit();
+                };
+                // A custom setter registers its 1-arg thunk symmetrically, so
+                // `obj.x = v` dispatches the override (`drawContext.canvas =
+                // canvas` writing through to the wrapped drawParams) instead of
+                // landing on a phantom raw field.
+                if (p.setter) |setter| if (!site_built) {
+                    const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
+                    const thunk = try synthSetterThunk(allocator, p.name, vp, setter.body, p.is_override);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+                    const fid = func.id;
+                    const key = try std.fmt.allocPrint(allocator, "$set${s}", .{p.name.name});
                     const tbl = self.anon_methods.borrowMut();
                     tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
                     tbl.deinit();

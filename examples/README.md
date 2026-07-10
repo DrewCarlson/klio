@@ -41,6 +41,7 @@ Run any program with:
 | `local_fn_overloads.kt`    | Same-named local functions as true overloads: call-site selection by arity and argument types, one overload calling its sibling (no self-recursion through the shared binding), selection from a nested lambda. |
 | `extension_property_delegates.kt` | Delegated extension properties (`val R.x by …`): bound-reference and top-level-var delegates, writes through `setValue`, a custom `getValue` operator receiving the `KProperty`, and bound property references (`obj::extVal`) reading through the delegate. |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |
+| `anon_object_setter.kt`    | An anonymous object overriding a `var` with a custom setter dispatches that setter on writes (the write-through `drawContext` pattern). |
 | `enums.kt`, `enum_companion.kt`, `enum_entries_interface.kt` | Enum entries, ctor args, per-entry overrides, `entries`/`values()`, enum companions. |
 | `sealed_when.kt`, `sealed_when_exhaustive.kt` | Sealed hierarchies with exhaustive `when`.  |
 | `data_object.kt`           | `data object`.                                                 |
@@ -82,6 +83,7 @@ Run any program with:
 | `vararg_nonfinal.kt`         | `vararg` before a trailing defaulted parameter, called positionally (top-level, inline, member). |
 | `class_factory_overload.kt`  | Same-name factory function vs constructor, disambiguated by argument type and arity. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
+| `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |

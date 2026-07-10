@@ -1,0 +1,2 @@
+draw: BgNode
+miss(mask=2)
