@@ -1913,6 +1913,21 @@ fn resolveExtensionPropImpl(
     if (receiver.* == .Null and !setters) {
         const pg = self.prog.borrow();
         defer pg.deinit();
+        // The executing frame's package first: same-name nullable
+        // extension properties in different packages blank the bare-name
+        // entry, but internal visibility means the reading code sits in
+        // the declaring package.
+        if (ir.eval.currentFramePackage()) |pkg| {
+            var buf: [256]u8 = undefined;
+            if (pkg.len + 1 + name.len <= buf.len) {
+                const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ pkg, name }) catch null;
+                if (key) |k| {
+                    if (pg.get().nullable_ext_props.get(k)) |maybe| {
+                        if (maybe) |fid| return fid;
+                    }
+                }
+            }
+        }
         if (pg.get().nullable_ext_props.get(name)) |maybe| {
             if (maybe) |fid| return fid;
         }

@@ -544,6 +544,13 @@ pub fn lowerClassWithExtras(
                 // (class, method) so the build pass can fold them onto
                 // the override's own (default-less) parameter slots.
                 try recordAbstractMemberDefaults(module, c, f);
+                // An abstract MEMBER-EXTENSION declaration records its
+                // extension-receiver type head: a SAM conversion of the
+                // fun interface binds this receiver as the lambda's
+                // implicit `this` at dispatch.
+                if (f.receiver_type) |*rt| {
+                    try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
+                }
                 continue;
             }
             // Use the method's own FuncId, not `funcs.len() - 1`:

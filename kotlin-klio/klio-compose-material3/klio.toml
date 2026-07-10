@@ -284,3 +284,5 @@ id = "androidx.compose.animation.core"
 id = "androidx.collection"
 [[deps]]
 id = "androidx.graphics.shapes"
+[[deps]]
+id = "androidx.compose.material.ripple"

@@ -960,6 +960,7 @@ const FuncIdMap = std.AutoHashMap;
 /// resolution BEFORE the module exists (lowering starts inside the build),
 /// parks it here, and the next module created on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
+pub threadlocal var pending_file_packages: ?std.AutoHashMap(FileId, []const u8) = null;
 /// Companion channel: per-expression static TYPE HEADS from typeck
 /// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
 /// applicability engine otherwise reconstructs from AST string probes.
@@ -1261,6 +1262,11 @@ pub const Module = struct {
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
             pending_eager_calls = null;
+        }
+        if (pending_file_packages) |pfp| {
+            out__.registry.file_packages.deinit();
+            out__.registry.file_packages = pfp;
+            pending_file_packages = null;
         }
         if (pending_eager_types) |pet| {
             out__.eager_types = pet;
@@ -1831,6 +1837,13 @@ pub const Module = struct {
     /// The full segment path of the first non-wildcard import whose
     /// leaf is `name`, as seen from source file `file`. A named import
     /// is file-scoped, so only imports declared in `file` are consulted.
+    /// The declared package of source file `file`, when known. Spliced
+    /// inline bodies carry donor-file spans; scope judgments follow the
+    /// span's file.
+    pub fn packageOfFile(self: *const Module, file: FileId) ?[]const u8 {
+        return self.registry.file_packages.get(file);
+    }
+
     pub fn importAliasIn(self: *const Module, file: FileId, name: []const u8) ?[]const []const u8 {
         const paths = self.importAliasPathsIn(file, name);
         if (paths.len == 0) return null;
@@ -2222,11 +2235,16 @@ pub const Module = struct {
     pub fn resolveBareCallIndexed(
         self: *const Module,
         name: []const u8,
-        caller_pkg: []const u8,
+        caller_pkg_in: []const u8,
         caller_file: FileId,
         want_arity: usize,
         last_arg_lambda: bool,
     ) BareCallResolution {
+        // Scope follows the call span's FILE: a spliced inline body carries
+        // the donor file's spans, so its bare calls resolve in the donor's
+        // package (`withFrameNanos` inside `withFrameMillis`'s body is a
+        // same-package call wherever the splice lands).
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         const cands = self.funcsBySimpleName(name);
         if (cands.len == 0) return BareCallResolution.deferred(.no_candidates);
 
@@ -2681,12 +2699,14 @@ pub const Module = struct {
         self: *const Module,
         alloc: std.mem.Allocator,
         name: []const u8,
-        caller_pkg: []const u8,
+        caller_pkg_in: []const u8,
         caller_file: FileId,
         args: []const applicability.ArgShape,
         last_arg_lambda: bool,
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
+        // Same file-follows-span package rule as `resolveBareCallIndexed`.
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         // Phase A — INDEX (authoritative when it resolves a unique FQN target).
         var ires = self.resolveBareCallIndexed(name, caller_pkg, caller_file, args.len, last_arg_lambda);
         if (ctx.cast_pick != null) {
@@ -3397,6 +3417,12 @@ pub const ModuleRegistry = struct {
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
     member_ext_owner_class: std.AutoHashMap(FuncId, []const u8),
+    /// (interface, method) → declared extension-receiver type head for
+    /// ABSTRACT member-extension declarations (`fun interface
+    /// MeasurePolicy { fun MeasureScope.measure(...) }`). The abstract
+    /// slot lowers no func, so the SAM dispatch reads the receiver type
+    /// here to bind the lambda's implicit `this`.
+    iface_member_ext_recv: StrPairMap([]const u8),
     /// Top-level `const val` literal values keyed by declaration FQN.
     /// Kotlin inlines compile-time constants at every reference, so the
     /// lowering reads the value here and emits the literal directly — a
@@ -3425,6 +3451,11 @@ pub const ModuleRegistry = struct {
     /// to the file, outranking the implicitly-imported built-ins in
     /// bare-call preference.
     import_wildcards: std.AutoHashMap(FileId, std.ArrayList([]const u8)),
+    /// Per-file (`FileId`) declared package path. A spliced inline body
+    /// carries the DONOR file's spans, so bare-call scope judgments must
+    /// follow the span's file — its package and imports — not the
+    /// recipient function's package.
+    file_packages: std.AutoHashMap(FileId, []const u8),
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
@@ -3498,12 +3529,14 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
+            .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
             .top_level_const_vals = std.StringHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
+            .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
@@ -3563,6 +3596,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.class_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
+        self.iface_member_ext_recv.deinit();
         self.top_level_const_vals.deinit();
         {
             var it = self.local_fn_defaults.valueIterator();
@@ -3598,6 +3632,7 @@ pub const ModuleRegistry = struct {
             }
             self.import_wildcards.deinit();
         }
+        self.file_packages.deinit();
         {
             var it = self.nested_object_aliases.valueIterator();
             while (it.next()) |inner| inner.deinit();
@@ -3689,6 +3724,10 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.member_ext_owner_class.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
+            var it = self.iface_member_ext_recv.iterator();
+            while (it.next()) |e| try out.iface_member_ext_recv.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
             var it = self.top_level_const_vals.iterator();
             while (it.next()) |e| try out.top_level_const_vals.put(e.key_ptr.*, e.value_ptr.*);
         }
@@ -3719,6 +3758,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.import_wildcards.iterator();
             while (it.next()) |e| try out.import_wildcards.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.file_packages.iterator();
+            while (it.next()) |e| try out.file_packages.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.nested_object_aliases.iterator();

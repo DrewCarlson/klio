@@ -1063,6 +1063,9 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         _ = expect(p, .LParen, "`(`") orelse return null;
         var acc_params: std.ArrayList(Ident) = .empty;
         if (!is(peekKind(p), .RParen)) {
+            // A setter parameter may carry annotations:
+            // `set(@Suppress("AutoBoxing") dateMillis) { ... }`.
+            _ = file.parseAnnotations(p);
             const par = parseIdent(p, "setter parameter") orelse return null;
             acc_params.append(p.allocator, par) catch @panic("OOM");
             if (is(peekKind(p), .Colon)) {

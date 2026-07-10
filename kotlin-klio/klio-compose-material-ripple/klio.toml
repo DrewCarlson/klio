@@ -1,0 +1,31 @@
+# androidx.compose.material:material-ripple — the ripple indication node the
+# material libraries attach to interactive components, vendored verbatim. One
+# klio pack per upstream Gradle module. The nonAndroidMain source set supplies
+# the platform actuals (CommonRippleNode serves the platform ripple).
+[library]
+id = "androidx.compose.material.ripple"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/material/material-ripple/src/commonMain/kotlin"
+
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/material/material-ripple/src/nonAndroidMain/kotlin"
+
+[[deps]]
+id = "stdlib"
+[[deps]]
+id = "kotlinx.coroutines"
+[[deps]]
+id = "androidx.collection"
+[[deps]]
+id = "androidx.compose.runtime"
+[[deps]]
+id = "androidx.compose.animation.core"
+[[deps]]
+id = "androidx.compose.foundation"
+[[deps]]
+id = "androidx.compose.ui"

@@ -85,8 +85,10 @@ Run any program with:
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
 | `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
 | `const_val_inline.kt`         | Top-level `const val`s inline at reference sites (compile-time constants, incl. unary minus). |
-| `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized nullable form `@Ann ((name: T) -> Unit)?`. |
+| `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized forms `@Ann ((name: T) -> Unit)?` / `(@Ann (() -> Unit))?` / `@Ann ((T) -> Unit)` and annotated setter parameters. |
 | `nullable_receiver_ext_prop.kt` | An extension property on a nullable receiver (`val T?.weight`) dispatches for a null receiver. |
+| `value_class_overload_pick.kt` | A value-class argument (an object property of inferred value-class type) binds the value-class overload over the underlying-primitive sibling, incl. at inline-splice sites forced by a non-local return. |
+| `sam_member_ext_receiver.kt` | A fun interface whose single abstract method is a member extension: the SAM lambda body is scoped with the extension receiver as `this`, and explicit-receiver calls through the SAM dispatch it. |
 | `typealias.kt`                | `typealias`.                                                |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |
