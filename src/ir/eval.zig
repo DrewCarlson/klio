@@ -228,6 +228,38 @@ pub fn currentFramePackage() ?[]const u8 {
     return if (pkg.len == 0) null else pkg;
 }
 
+/// Lexical-origin override for file-private visibility. Kotlin resolves a
+/// callable reference where it is WRITTEN: `.map(String::indentWidth)`
+/// referencing a file-private extension is legal in its declaring file even
+/// though `map` invokes it from another file. While a bound reference
+/// dispatches, the visibility file is the reference's creation site, not
+/// the dynamic caller. Scoped to the frame that was innermost at push: a
+/// candidate body run during dispatch executes in a DEEPER frame, so its
+/// own dispatches ignore the override and see their own files.
+pub const RefSiteOverride = struct { file: ir.FileId, frame: *const Frame };
+threadlocal var ref_site_override: ?RefSiteOverride = null;
+
+/// The active reference-site file, when the innermost frame is still the
+/// one the override was pushed under.
+pub fn refSiteFile() ?ir.FileId {
+    const o = ref_site_override orelse return null;
+    const fr = frame_chain orelse return null;
+    return if (fr == o.frame) o.file else null;
+}
+
+/// Install a reference-site override on the current innermost frame.
+/// Returns the previous override; the caller restores it via
+/// `popRefSiteFile` when its dispatch completes.
+pub fn pushRefSiteFile(file: ir.FileId) ?RefSiteOverride {
+    const prev = ref_site_override;
+    if (frame_chain) |fr| ref_site_override = .{ .file = file, .frame = fr };
+    return prev;
+}
+
+pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
+    ref_site_override = prev;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory
@@ -457,6 +489,12 @@ threadlocal var spin_check_counter: u64 = 0;
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
 pub fn dumpFrameChainForDiag() void {
     if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    dumpFrameChainForDiagAlways();
+}
+
+/// Ungated frame-chain dump for name-filtered diagnostics that gate at
+/// their own call site (e.g. `KLIO_MISS_TRACE`).
+pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
     var cur = frame_chain;
     var depth: usize = 0;
@@ -3826,9 +3864,17 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     }
                 }
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
+                }
+                dumpFrameChainForDiag();
                 return raiseStep(frame, .{ .Unbound = msg });
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-b] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
+                }
+                dumpFrameChainForDiag();
                 return raiseStep(frame, .{ .Unbound = msg });
             }
             v.retain();
@@ -3912,6 +3958,18 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             v = gv;
                         } else {
                             const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
+                            if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                                if (std.mem.eql(u8, w, bare_name)) {
+                                    std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={}\n", .{
+                                        bare_name,
+                                        name_str,
+                                        if (lt.func) |f| f.int() else null,
+                                        if (lt.class) |c| c.int() else null,
+                                        host.isShadowingCapture(bare_name),
+                                    });
+                                }
+                            }
+                            dumpFrameChainForDiag();
                             return raiseStep(frame, .{ .Unbound = msg });
                         }
                     },
@@ -4390,6 +4448,25 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     result = .Unit;
                 } else {
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                        if (std.mem.eql(u8, w, name_str)) {
+                            std.debug.print("[cmg-tail] name={s} func={?} class={?} this_tag={s} n_seen_err={} in_fn={s} recvp={} np={d} p0={s} nparams_vals={d} this_idx={d} ncaps={d}\n", .{
+                                name_str,
+                                if (cmg.func) |f| f.int() else null,
+                                if (cmg.class) |c| c.int() else null,
+                                @tagName(std.meta.activeTag(this_val)),
+                                first_real_err != null,
+                                frame.func.name,
+                                frame.func.has_receiver_param,
+                                frame.func.params.len,
+                                if (frame.func.params.len > 0) frame.func.params[0].name else "-",
+                                frame.params.items.len,
+                                cmg.this_idx,
+                                frame.captures.items.len,
+                            });
+                        }
+                    }
+                    dumpFrameChainForDiag();
                     return raiseStep(frame, .{ .Unbound = msg });
                 }
             }

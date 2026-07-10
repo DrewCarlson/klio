@@ -3417,6 +3417,11 @@ pub const ModuleRegistry = struct {
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
     member_ext_owner_class: std.AutoHashMap(FuncId, []const u8),
+    /// `FuncId` → declaring FILE of a `private` top-level function. Kotlin
+    /// scopes a private top-level declaration to its file, so a dispatch
+    /// walk must never pick a private extension from another file (a
+    /// file-private `Rect.size()` capturing `LongSparseArray.size()`).
+    private_fn_files: std.AutoHashMap(FuncId, FileId),
     /// (interface, method) → declared extension-receiver type head for
     /// ABSTRACT member-extension declarations (`fun interface
     /// MeasurePolicy { fun MeasureScope.measure(...) }`). The abstract
@@ -3529,6 +3534,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
+            .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
             .top_level_const_vals = std.StringHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
@@ -3596,6 +3602,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.class_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
+        self.private_fn_files.deinit();
         self.iface_member_ext_recv.deinit();
         self.top_level_const_vals.deinit();
         {
@@ -3722,6 +3729,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.member_ext_owner_class.iterator();
             while (it.next()) |e| try out.member_ext_owner_class.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.private_fn_files.iterator();
+            while (it.next()) |e| try out.private_fn_files.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.iface_member_ext_recv.iterator();

@@ -5352,6 +5352,10 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // `kotlinx.io.Segment` at its own construction site), inverting the
     // ctor-vs-factory decision.
     const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse return false;
+    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name, "Density")) {
+        const abs = cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract;
+        std.debug.print("[sbc] Density cid={d} abstract={} owner={s}\n", .{ cid.int(), abs, b.ownerClass() orelse "-" });
+    }
     // An abstract/interface/sealed class cannot be constructed, so a bare
     // `Name(args)` is never a constructor call — it is a same-named factory
     // function (`fun Random(seed): Random`). Resolve it as a function (the

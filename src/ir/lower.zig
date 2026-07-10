@@ -73,6 +73,7 @@ pub const lowerBlockAsUnaryThunk = mod.lowerBlockAsUnaryThunk;
 pub const lowerEmptyThunk = mod.lowerEmptyThunk;
 pub const lowerExprAsParamThunk = mod.lowerExprAsParamThunk;
 pub const lowerExprAsParamThunkScoped = mod.lowerExprAsParamThunkScoped;
+pub const lowerExprAsParamThunkScopedEnclosing = mod.lowerExprAsParamThunkScopedEnclosing;
 pub const lowerExprAsThunk = mod.lowerExprAsThunk;
 pub const lowerInitBlock = mod.lowerInitBlock;
 pub const lowerInitBlockWithParams = mod.lowerInitBlockWithParams;

@@ -421,6 +421,15 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const as_property = member_args.len == 0 and
                 root.memberIsProperty(self.allocator, &self.classes, &target, nm);
             var host = vmHost(self, out);
+            // Dispatch under the reference's creation-site file (private
+            // visibility is decided where the reference was written).
+            var ref_pushed = false;
+            var ref_prev: ?ir.eval.RefSiteOverride = null;
+            if (host_call_member.boundRefFile(callable)) |bf| {
+                ref_prev = ir.eval.pushRefSiteFile(bf);
+                ref_pushed = true;
+            }
+            defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
             const result = if (as_property)
                 try host.getField(self.allocator, &target, nm)
             else

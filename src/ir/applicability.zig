@@ -418,9 +418,21 @@ fn unknownArgScore(nm: []const u8) i32 {
 /// against `minOf(a: T, b: T)`), and anything else returns null so the caller
 /// falls back to the unknown base. Declared-type evidence can therefore only
 /// ever ADD points for a matching candidate; it never disqualifies one.
+/// The bare head for declared-type EVIDENCE comparison: the simple name,
+/// with a lift-mangled scope prefix (`Outer$Name`) stripped back to the
+/// source simple name — evidence compares what the declaration wrote, and
+/// the mangle is a lift-uniqueness artifact, not a different type head.
+fn evidenceHead(name: []const u8) []const u8 {
+    const sn = std.mem.trimEnd(u8, simpleName(name), "?");
+    if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+        if (i + 1 < sn.len) return sn[i + 1 ..];
+    }
+    return sn;
+}
+
 pub fn tyEvidenceScore(param_name: []const u8, arg_ty_name: []const u8, member: bool) ?i32 {
-    const pn = std.mem.trimEnd(u8, simpleName(param_name), "?");
-    const an = std.mem.trimEnd(u8, simpleName(arg_ty_name), "?");
+    const pn = evidenceHead(param_name);
+    const an = evidenceHead(arg_ty_name);
     if (pn.len == 0 or an.len == 0) return null;
     if (std.mem.eql(u8, pn, an)) return 100;
     const p_tp = pn.len <= 2 and (if (member) allUpperOrDigit(pn) else allAsciiUpper(pn));
@@ -491,8 +503,8 @@ pub fn tyEvidenceBonus(params: []const Param, args: []const ArgShape) i32 {
             if (tyEvidenceScore(params[i].ty.name, aty.name, false)) |s| {
                 total += s;
             } else {
-                const pn = std.mem.trimEnd(u8, simpleName(params[i].ty.name), "?");
-                const an = std.mem.trimEnd(u8, simpleName(aty.name), "?");
+                const pn = evidenceHead(params[i].ty.name);
+                const an = evidenceHead(aty.name);
                 if (isNumericHead(pn) and isNumericHead(an)) total += 80;
             }
             continue;

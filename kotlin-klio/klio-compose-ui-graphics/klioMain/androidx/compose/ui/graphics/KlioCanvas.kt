@@ -198,6 +198,16 @@ internal actual fun ActualCanvas(image: ImageBitmap): Canvas =
  * Skia backend is available, so it stays headless-safe. The real
  * `graphics.drawscope.DrawScope` render path wraps this same Canvas.
  */
+/**
+ * klio helper: draw [block] onto an EXISTING Skia surface handle (a window's
+ * surface from `__composeui_winSurface`, or an offscreen `__skia_surf_new`).
+ * The real ui engine's window driver renders frames through this.
+ */
+fun klioDrawToSurface(handle: Long, block: Canvas.() -> Unit) {
+    if (handle == 0L) return
+    KlioCanvas(handle).block()
+}
+
 fun klioDrawToPng(width: Int, height: Int, path: String, block: Canvas.() -> Unit): Boolean {
     val handle = __skia_surf_new(width, height)
     if (handle == 0L) return false

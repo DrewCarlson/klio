@@ -132,7 +132,7 @@ pub fn lowerExprAsParamThunk(
     expr: *const Expr,
     name: []const u8,
 ) Allocator.Error!FuncId {
-    return lowerExprAsParamThunkScoped(module, params, expr, name, null, null);
+    return lowerExprAsParamThunkScopedEnclosing(module, params, expr, name, null, null, null);
 }
 
 /// Like [`lowerExprAsParamThunk`] but additionally puts the
@@ -144,6 +144,23 @@ pub fn lowerExprAsParamThunkScoped(
     name: []const u8,
     owner_class: ?[]const u8,
     own_members: ?*const StringSet,
+) Allocator.Error!FuncId {
+    return lowerExprAsParamThunkScopedEnclosing(module, params, expr, name, owner_class, own_members, null);
+}
+
+/// Full form: additionally threads the lexically-enclosing class chain's
+/// member names, so a bare name in a nested class's ctor default that
+/// names an OUTER member resolves through the receiver walk (an inner
+/// class's defaults see the enclosing instance) instead of binding a
+/// same-named top-level declaration.
+pub fn lowerExprAsParamThunkScopedEnclosing(
+    module: *Module,
+    params: []const []const u8,
+    expr: *const Expr,
+    name: []const u8,
+    owner_class: ?[]const u8,
+    own_members: ?*const StringSet,
+    enclosing_members: ?*const StringSet,
 ) Allocator.Error!FuncId {
     const allocator = moduleAllocator(module);
     var b = try FuncBuilder.init(allocator, module);
@@ -157,9 +174,18 @@ pub fn lowerExprAsParamThunkScoped(
     if (own_members) |set| {
         b.setOwnMembers(try cloneOwnMembers(allocator, set));
     }
+    if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
+    // Record the bound params for a `this`-leading thunk (an INNER class's
+    // ctor-default): the eval `this`-parameter fallback reads them to
+    // recover the receiver, so a bare outer-member read resolves through
+    // the receiver walk. Other param thunks keep the empty metadata their
+    // callers expect.
+    if (leadsWithThis(params)) {
+        func.params = try accessorParams(allocator, params);
+    }
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
