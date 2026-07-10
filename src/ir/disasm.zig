@@ -97,7 +97,19 @@ fn argRun(w: *std.Io.Writer, args: ir.Reg, n: u32) !void {
 fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tally) !void {
     if (classify(inst)) |k| tally.add(k);
     switch (inst.*) {
-        .Const => |c| try w.print("r{d} <- Const c{d} ({s})", .{ reg(c.dst), c.value.int(), constLabel(m, c.value) }),
+        .Const => |c| {
+            try w.print("r{d} <- Const c{d} ({s}", .{ reg(c.dst), c.value.int(), constLabel(m, c.value) });
+            if (c.value.int() < m.consts.items.len) {
+                switch (m.consts.items[c.value.int()]) {
+                    .Int => |v| try w.print(" {d}", .{v}),
+                    .Long => |v| try w.print(" {d}", .{v}),
+                    .Bool => |v| try w.print(" {}", .{v}),
+                    .Double => |v| try w.print(" {d}", .{v}),
+                    else => {},
+                }
+            }
+            try w.writeAll(")");
+        },
         .LoadParam => |c| try w.print("r{d} <- LoadParam #{d}", .{ reg(c.dst), c.idx }),
         .LoadCapture => |c| try w.print("r{d} <- LoadCapture #{d}", .{ reg(c.dst), c.idx }),
         .Move => |c| try w.print("r{d} <- Move r{d}", .{ reg(c.dst), reg(c.src) }),
