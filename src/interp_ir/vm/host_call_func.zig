@@ -798,6 +798,34 @@ fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: 
     return sc.points;
 }
 
+/// Declared arity of a function-TYPE reference: `Function2` -> 2, an
+/// arrow-form name by counting its generic args (`args.len - 1`, the last
+/// being the return type). Null when the shape carries no arity.
+fn fnTypeArity(ty: *const TypeRef) ?usize {
+    const n = applicability.simpleName(ty.name);
+    if (std.mem.startsWith(u8, n, "Function")) {
+        const digits = n["Function".len..];
+        if (digits.len != 0) {
+            if (std.fmt.parseInt(usize, digits, 10)) |k| {
+                return k;
+            } else |_| {}
+        }
+    }
+    if (std.mem.indexOf(u8, ty.name, "->") != null and ty.args.len != 0) {
+        return ty.args.len - 1;
+    }
+    return null;
+}
+
+/// Declared parameter count of a callable VALUE, when known.
+fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
+    return switch (v.*) {
+        .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
+        .Function => |fv| fv.decl.params.len,
+        else => null,
+    };
+}
+
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
     const name = f.name;
@@ -1038,7 +1066,20 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         if (last_is_fn and trailing_is_callable) {
             const lead = args.items.len - 1;
             const last_param = f.params.len - 1;
-            if (lead < last_param) {
+            // The syntax bit (trailing lambda vs a plain positional lambda)
+            // does not survive lowering, so gate the shift on fit: when the
+            // callable's declared arity matches the POSITIONAL slot's
+            // function-type arity, the call is a positional bind and the
+            // gap params after it take their defaults — `render({ n -> },
+            // { a, b -> })` with a defaulted third lambda param binds the
+            // second lambda to the second param, never the third.
+            const positional_fits = lead < f.params.len and
+                isFunctionType(&f.params[lead].ty) and blk: {
+                    const pa = fnTypeArity(&f.params[lead].ty) orelse break :blk true;
+                    const ca = callableDeclaredArity(self, &args.items[args.items.len - 1]) orelse break :blk true;
+                    break :blk pa == ca;
+                };
+            if (lead < last_param and !positional_fits) {
                 if (funcDefaults(self, func)) |defaults| {
                     const trailing = args.items[args.items.len - 1];
                     args.items.len -= 1;
@@ -1464,6 +1505,9 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             (std.mem.eql(u8, f.name, "enumValues") or std.mem.eql(u8, f.name, "enumValueOf") or
                 std.mem.eql(u8, f.name, "enumEntries") or std.mem.eql(u8, f.name, "enumEntriesIntrinsic")))
         {
+            if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+                std.debug.print("[eev] fn={s} nta={d} ta0={s}\n", .{ f.name, type_args.len, if (type_args.len > 0) type_args[0] else "-" });
+            }
             if (type_args.len > 0 and type_args[0].len != 0) {
                 const tn = type_args[0];
                 const cls_value: ?Value = blk: {

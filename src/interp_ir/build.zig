@@ -1183,6 +1183,9 @@ fn buildModuleWithOverrides(
 
     var all_decls: std.ArrayList(Decl) = .empty;
 
+    var dup_nested_names = StringSet.init(a);
+    defer dup_nested_names.deinit();
+    try lift.collectDupNestedNames(a, file.decls, &dup_nested_names);
     var lift_ctx = lift.LiftCtx{
         .allocator = a,
         .out_decls = &all_decls,
@@ -1195,6 +1198,7 @@ fn buildModuleWithOverrides(
         .top_level_type_names = &top_level_type_names,
         .mangled_nested = &mangled_nested,
         .used_qualified_supertypes = &used_qualified_supertypes,
+        .dup_nested_names = &dup_nested_names,
     };
 
     // Pending aliases for mangled pack-private objects.

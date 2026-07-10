@@ -398,6 +398,23 @@ pub fn internTypeArgs(
     return out;
 }
 
+/// `internTypeArgs` with the lexical-scope type-rename ladder applied: a
+/// reified type argument naming a mangled nested class (`enumEntries<Item>()`
+/// inside a class whose nested `Item` lifted as `A$Item`) records the LIFTED
+/// name, so the runtime class lookup hits the real ClassDef.
+pub fn internTypeArgsScoped(
+    b: *FuncBuilder,
+    type_args: []const ast.TypeRef,
+) Allocator.Error![]ConstId {
+    if (type_args.len == 0) return &.{};
+    const out = try b.allocator.alloc(ConstId, type_args.len);
+    for (type_args, out) |t, *slot| {
+        const nm = expr_mod.scopeTypeRename(b, t.name.name, t.name.span.file.int()) orelse t.name.name;
+        slot.* = try b.module.internConst(b.allocator, .{ .String = nm });
+    }
+    return out;
+}
+
 pub fn astBinop(op: AstBinOp) BinOp {
     return switch (op) {
         .Add => .Add,
