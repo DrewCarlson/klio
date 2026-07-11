@@ -6,6 +6,27 @@ loop: redundant build work, redundant test children, slow interpreted
 iterations, cache pathology. This is the working document; keep measurements
 and decisions here.
 
+## Compose pack-set bake + warm run (2026-07-11 — LANDED)
+
+The compose dev loop's dominant costs both fell an order of magnitude:
+
+| Operation | Before | After | Fix |
+| --- | --- | --- | --- |
+| material3-set fresh bake | 117 s (lower 101.7 s) | **~12 s** (lower 6.5 s) | lazy lookup caches on `Module` (`packageHeadDeclared` prefix set, class name/FQN caches, const-intern dedup) — the lowering was O(refs × decls) in four linear scans |
+| warm-run pack load | 2.24 s per run | **0.52 s** | packs carry a precomputed `imports` section; the image hit path (`asts_needed=false`) skips lex+parse of every pack source |
+| warm realclick run, end to end | ~13 s | **~8.8 s** | above (prepare ≈ 1.7 s of it) |
+
+The image key includes the exe stamp (size+mtime), so a `zig build` forces a
+re-bake automatically — at ~12 s that is part of the loop, not a hazard.
+Rebuilding/installing a pack changes its hash and therefore the image key.
+
+Profiling tools that found this (all committed): `KLIO_PROF_ALL=1` starts the
+SIGPROF sampler at process ENTRY (the run-command hook only wraps the VM — a
+bake profiled without this collects almost nothing and the histogram lies);
+`KLIO_PROF_CALLERS=<substr>` prints caller/grandcaller attribution for leaf
+frames matching the substring; `KLIO_TRACE_STDLIB_IMAGE=1` bake lines carry
+parse/lower/serialize ms.
+
 ## Measurements (2026-07-04, M-series 10-core/64 GB, macOS, zig 0.16.0)
 
 | Operation | Cost | Notes |
