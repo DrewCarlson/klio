@@ -3458,6 +3458,12 @@ pub const ModuleRegistry = struct {
     class_super_names: std.StringHashMap([]const []const u8),
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
+    /// (class, property) pairs whose declared type is a RECEIVER function
+    /// type (`suspend Scope.() -> Unit`): a bare invocation of the stored
+    /// value inside a receiver context binds the implicit `this` as the
+    /// lambda's receiver (`_deprecatedPointerInputHandler!!()` inside the
+    /// pointer-input node runs the handler on the node's scope).
+    recv_fn_props: StrPairSet,
     /// `(class simple name, property name)` → the property's DECLARED
     /// type head, with a class type-parameter name substituted by its
     /// bound's head (`data: T` in `IterableTests<T : Iterable<String>>`
@@ -3584,6 +3590,7 @@ pub const ModuleRegistry = struct {
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
+            .recv_fn_props = StrPairSet.init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
@@ -3652,6 +3659,7 @@ pub const ModuleRegistry = struct {
             self.class_super_names.deinit();
         }
         self.delegated_body_props.deinit();
+        self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();

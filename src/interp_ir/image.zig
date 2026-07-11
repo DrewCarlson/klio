@@ -602,6 +602,7 @@ const RegistryImage = struct {
     file_packages: []KV(FileId, []const u8),
     top_level_const_vals: []KV([]const u8, ir.Const),
     member_method_fids: []KV([]const u8, FuncId),
+    recv_fn_props: []PairKey,
     private_shadow_props: []const []const u8,
     override_cell_props: []const []const u8,
     hierarchy_shadow_names: []struct { k: []const u8, names: []const []const u8, complete: bool },
@@ -1361,6 +1362,15 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         .file_packages = try autoMapToSlice(FileId, []const u8, a, &r.file_packages),
         .top_level_const_vals = try strMapToSlice(ir.Const, a, &r.top_level_const_vals),
         .member_method_fids = try strMapToSlice(FuncId, a, &r.member_method_fids),
+        .recv_fn_props = blk: {
+            var list = try a.alloc(PairKey, r.recv_fn_props.count());
+            var it = r.recv_fn_props.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b };
+            }
+            break :blk list;
+        },
         .private_shadow_props = try setToSlice(a, &r.private_shadow_props),
         .override_cell_props = try setToSlice(a, &r.override_cell_props),
         .hierarchy_shadow_names = blk: {
@@ -2069,6 +2079,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);
     for (ri.top_level_const_vals) |kv| try r.top_level_const_vals.put(kv.k, kv.v);
     for (ri.member_method_fids) |kv| try r.member_method_fids.put(kv.k, kv.v);
+    for (ri.recv_fn_props) |pk| try r.recv_fn_props.put(.{ .a = pk.a, .b = pk.b }, {});
     for (ri.private_shadow_props) |k| try r.private_shadow_props.put(k, {});
     for (ri.override_cell_props) |k| try r.override_cell_props.put(k, {});
     for (ri.hierarchy_shadow_names) |entry| {

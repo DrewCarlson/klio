@@ -2054,6 +2054,31 @@ fn buildModuleWithOverrides(
     // now-visible global.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
+    // Receiver-function-typed property flags, recorded BEFORE any body
+    // lowering: method bodies (and their lambdas) consult the registry
+    // while they lower, so the flags must exist first.
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        for (c.primary_params) |*pp| {
+            if (pp.ty.function) |ft| {
+                if (ft.receiver != null) {
+                    try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = pp.name.name }, {});
+                }
+            }
+        }
+        for (c.members) |*m| {
+            if (m.* != .Property) continue;
+            const p = m.Property;
+            if (p.ty) |pt| {
+                if (pt.function) |ft| {
+                    if (ft.receiver != null) {
+                        try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = p.name.name }, {});
+                    }
+                }
+            }
+        }
+    }
     for (decls) |*d| {
         if (d.* == .Class) {
             const c = &d.Class;
@@ -2657,7 +2682,16 @@ fn buildModuleWithOverrides(
             var param_names = try a.alloc([]const u8, sc.params.len);
             for (sc.params, 0..) |*p, i| param_names[i] = p.name.name;
             var param_type_heads = try a.alloc([]const u8, sc.params.len);
-            for (sc.params, 0..) |*p, i| param_type_heads[i] = simpleTypeHead(p.ty.name.name);
+            for (sc.params, 0..) |*p, i| {
+                // A function-typed parameter's name field is empty; record
+                // the arity-tagged head (`FunctionN`) so ctor overload
+                // selection can prefer this slot for a lambda argument over
+                // a same-arity sibling's SAM-class slot.
+                param_type_heads[i] = if (p.ty.function != null)
+                    try ir.lower.decl.loweredTypeName(a, &p.ty)
+                else
+                    simpleTypeHead(p.ty.name.name);
+            }
 
             var delegation_args: []const ast.Expr = &.{};
             var is_super = false;
