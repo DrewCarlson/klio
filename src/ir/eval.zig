@@ -3886,7 +3886,7 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                 }
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
-                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s} func={?} class={?} span={d}:{d} in_fn={s}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null, if (frame.cur_span) |sp| sp.file.int() else 0, if (frame.cur_span) |sp| sp.start else 0, frame.func.name });
                 }
                 dumpFrameChainForDiag();
                 return raiseStep(frame, .{ .Unbound = msg });
@@ -4120,6 +4120,41 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // when that is empty — the enclosing function's `this` *parameter*.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
+    // A lowering-committed INLINE INSTANCE METHOD with inferred reified
+    // type arguments: bind the stamped type-argument names as globals
+    // for the call's duration (the same channel the inline splice and
+    // `callFuncTyped` use), then let the NORMAL member walk dispatch —
+    // its enclosing-receiver pushes are what nested semantics blocks
+    // resolve against. `c.visitNodes(Kinds.OnRe) { … }` runs with
+    // `T = Lw` live so the framed body's `is T` checks the real class.
+    var mit_saved: std.ArrayList(struct { name: []const u8, prev: ?Value }) = .empty;
+    defer mit_saved.deinit(allocator);
+    defer {
+        var ri: usize = mit_saved.items.len;
+        while (ri > 0) {
+            ri -= 1;
+            const sv = mit_saved.items[ri];
+            if (comptime @hasDecl(H, "restoreGlobalBinding")) {
+                host.restoreGlobalBinding(sv.name, sv.prev);
+            }
+        }
+    }
+    if (cmg.func != null and cmg.type_args.len != 0 and comptime @hasDecl(H, "bindTypeParamGlobal")) {
+        if (frame.module.funcById(cmg.func.?)) |tf| {
+            if (tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this")) {
+                const tp_list = frame.module.registry.func_type_params.get(cmg.func.?);
+                const tp_names: []const []const u8 = if (tp_list) |l| l.items else &.{};
+                orAudit("CallMemberOrGlobal", name_str, "member_inline_typed", -1, null);
+                for (tp_names, 0..) |tpn, ti| {
+                    if (ti >= cmg.type_args.len) break;
+                    const arg_name = constStr(frame.module, cmg.type_args[ti]) orelse continue;
+                    if (arg_name.len == 0) continue;
+                    const prev = host.bindTypeParamGlobal(tpn, arg_name);
+                    try mit_saved.append(allocator, .{ .name = tpn, .prev = prev });
+                }
+            }
+        }
+    }
     // A bare callee whose name starts uppercase is usually a constructor /
     // type — but only when such a type exists. Kotlin has no capitalization
     // rule: DSL-style functions are capitalized (ktor's

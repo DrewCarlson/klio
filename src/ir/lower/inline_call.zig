@@ -349,22 +349,37 @@ pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const 
         else => null,
     };
     const shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda, .trailing_lambda_arity = trailing_arity };
-    const f = inline_state.inlineFnAstForRecvExt(name, shape, null, true) orelse return false;
-    if (f.receiver_type == null) return false;
-    var any_reified = false;
-    for (f.type_params) |tp| {
-        if (tp.is_reified) any_reified = true;
+    // Scan the full candidate set: the stub-index pick is blind to
+    // MEMBER-inline overloads (`NodeCoordinator.visitNodes(type, block)`
+    // next to its `(mask, block)` sibling), and the receiver-blind shape
+    // pick cannot separate them — a candidate qualifies when it takes a
+    // receiver (extension or member), declares a reified parameter, and
+    // the value arguments bind every one of them.
+    var single_buf: [1]*const ast.Function = undefined;
+    const cands: []const *const ast.Function = inline_state.candidatesForName(name) orelse blk: {
+        const f = inline_state.inlineFnAstForRecvExt(name, shape, null, true) orelse return false;
+        single_buf[0] = f;
+        break :blk single_buf[0..1];
+    };
+    for (cands) |f| {
+        if (f.receiver_type == null and inline_state.inlineMemberOwner(f) == null) continue;
+        var any_reified = false;
+        for (f.type_params) |tp| {
+            if (tp.is_reified) any_reified = true;
+        }
+        if (!any_reified) continue;
+        const ordered = allocator.alloc(?*const Expr, f.params.len) catch return false;
+        defer allocator.free(ordered);
+        for (ordered, 0..) |*slot, i| slot.* = if (i < args.len) &args[i] else null;
+        const probe = inferReifiedTypeArgs(allocator, f, &.{}, null, ordered, bb) catch return false;
+        defer allocator.free(probe);
+        var all_bound = true;
+        for (f.type_params, 0..) |tp, i| {
+            if (tp.is_reified and probe[i] == null) all_bound = false;
+        }
+        if (all_bound) return true;
     }
-    if (!any_reified) return false;
-    const ordered = allocator.alloc(?*const Expr, f.params.len) catch return false;
-    defer allocator.free(ordered);
-    for (ordered, 0..) |*slot, i| slot.* = if (i < args.len) &args[i] else null;
-    const probe = inferReifiedTypeArgs(allocator, f, &.{}, null, ordered, bb) catch return false;
-    defer allocator.free(probe);
-    for (f.type_params, 0..) |tp, i| {
-        if (tp.is_reified and probe[i] == null) return false;
-    }
-    return true;
+    return false;
 }
 
 /// Unify one declared value-parameter type against its actual argument
@@ -393,7 +408,15 @@ fn unifyParamAgainstArg(
     // solves the nested call's `T` from `type`'s recorded type.
     if (arg.* == .Path and arg.Path.segments.len == 1) {
         if (bb) |b| {
-            if (b.spliceParamTy(arg.Path.segments[0].name)) |aty| {
+            // Inside a spliced LAMBDA-ARGUMENT body the free names are the
+            // CALLER's (`lambda_splice_resolve` window): the enclosing
+            // splice's same-named parameter is a different binding, and
+            // unifying against its declared type mis-binds the nested
+            // reified parameter (the mask-overload's `block: (NodeB) ->
+            // Unit` captured `T := NodeB` for the outer lambda's
+            // `it.disp(type, block)`).
+            const in_lambda_window = b.lambda_splice_resolve != null;
+            if (!in_lambda_window) if (b.spliceParamTy(arg.Path.segments[0].name)) |aty| {
                 if (param_ty.function) |pft| {
                     if (aty.function) |aft| {
                         const n = @min(pft.params.len, aft.params.len);
@@ -410,7 +433,7 @@ fn unifyParamAgainstArg(
                     try unifyTypeParam(param_ty, &aty, tp_names, subst);
                 }
                 return;
-            }
+            };
         }
     }
     if (param_ty.function) |ft| {
@@ -733,6 +756,7 @@ pub fn tryInlineCallWithTypeArgs(
     // resolves here by receiver/shape narrowing: the inline target must
     // be a receiver extension, never a same-named top-level overload.
     var f: *const ast.Function = undefined;
+    if (inline_state.runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[ticwta] {s} target={} this_arg={} nta={d}\n", .{ fname, target != null, this_arg != null, type_args.len });
     if (target) |t| {
         f = t;
     } else {
@@ -998,9 +1022,57 @@ pub fn tryInlineCallWithTypeArgs(
     // the receiver expression (which IS a caller free name and needs the
     // window), suspend the window so the extension body's own bindings resolve
     // normally; it is restored after the body.
-    const ext_splice = f.receiver_type != null and this_arg != null;
+    // A member-inline fn spliced through an EXPLICIT receiver
+    // (`CC(e, a).pfw<E> { … }`, `coordinator.visitNodes(type) { … }`)
+    // binds that receiver as the body's `this` exactly like a
+    // receiver extension: the body's own member reads (`e.g()`) and its
+    // nested reified calls resolve against it. Without the binding the
+    // call fell to runtime member dispatch with the reified parameter
+    // dead (`E::class` reading the `kotlin.math.E` global).
+    const member_splice = f.receiver_type == null and this_arg != null and
+        inline_state.inlineMemberOwner(f) != null;
+    const ext_splice = (f.receiver_type != null or member_splice) and this_arg != null;
+    // The member body's bare sibling calls (`visitNodes(mask, include)`
+    // inside `visitNodes(type, block)`, `headToTail(...)`) must lower as
+    // member-shadowable dispatch on the bound `this`, exactly as the
+    // declaration lowering scopes them: activate the owner class and its
+    // hierarchy's member-name set for the splice.
+    var member_scope_prev_owner: ?[]const u8 = null;
+    var member_scope_prev_members: ?build.StringSet = null;
+    if (member_splice) {
+        const owner = inline_state.inlineMemberOwner(f).?;
+        member_scope_prev_owner = b.owner_class;
+        b.owner_class = owner;
+        var merged = build.StringSet.init(b.allocator);
+        var ok = true;
+        {
+            var it = b.enclosing_members.keyIterator();
+            while (it.next()) |k| merged.put(k.*, {}) catch {
+                ok = false;
+                break;
+            };
+        }
+        if (ok) {
+            if (b.module.registry.hierarchy_methods.get(owner)) |methods| {
+                var mit = methods.keyIterator();
+                while (mit.next()) |k| merged.put(k.*, {}) catch {};
+            }
+            var prev = merged;
+            std.mem.swap(build.StringSet, &prev, &b.enclosing_members);
+            member_scope_prev_members = prev;
+        } else {
+            merged.deinit();
+        }
+    }
+    defer if (member_splice) {
+        b.owner_class = member_scope_prev_owner;
+        if (member_scope_prev_members) |pm| {
+            b.enclosing_members.deinit();
+            b.enclosing_members = pm;
+        }
+    };
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
-    if (f.receiver_type != null) {
+    if (f.receiver_type != null or member_splice) {
         if (this_arg) |recv| {
             const rr = try lowerExpr(b, recv);
             try b.bind("this", rr);
@@ -1222,6 +1294,64 @@ fn substReifiedInTypeRef(b: *FuncBuilder, ty: *const TypeRef) Allocator.Error!Ty
 /// parameters carrying recorded types). Used to keep a splice whose
 /// trailing lambda under-declares the function-typed parameter's arity:
 /// arity only matters when the lambda is the sole evidence for `T`.
+/// Resolve the reified type-argument NAMES a call binds by inference
+/// (the same evidence `reifiedBindableFromArgs` proves), mapped through
+/// the active splice substitutions and scope renames — ready to stamp on
+/// a typed dispatch instruction. Null when any reified parameter stays
+/// unbound.
+pub fn inferReifiedNamesForCall(
+    b: *FuncBuilder,
+    f: *const Function,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    file: u32,
+) ?[]const []const u8 {
+    const ordered = b.allocator.alloc(?*const Expr, f.params.len) catch return null;
+    defer b.allocator.free(ordered);
+    for (ordered) |*slot| slot.* = null;
+    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    };
+    const lambda_to_last = last_is_lambda and args.len <= f.params.len and f.params.len > 0;
+    if (lambda_to_last) ordered[f.params.len - 1] = &args[args.len - 1];
+    const positional_n = if (lambda_to_last) args.len - 1 else args.len;
+    var next_pos: usize = 0;
+    for (args[0..positional_n], 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        if (nm) |name| {
+            const idx = paramIndex(f, name) orelse return null;
+            ordered[idx] = a;
+        } else {
+            while (next_pos < ordered.len and ordered[next_pos] != null) next_pos += 1;
+            if (next_pos >= ordered.len) return null;
+            ordered[next_pos] = a;
+            next_pos += 1;
+        }
+    }
+    const probe = inferReifiedTypeArgs(b.allocator, f, &.{}, null, ordered, b) catch return null;
+    defer b.allocator.free(probe);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (f.type_params, 0..) |tp, i| {
+        if (!tp.is_reified) continue;
+        const t = probe[i] orelse {
+            out.deinit(b.allocator);
+            return null;
+        };
+        const substituted = b.resolveReifiedTypeName(t.name.name) orelse
+            (expr_lower.scopeTypeRename(b, t.name.name, file) orelse t.name.name);
+        out.append(b.allocator, substituted) catch {
+            out.deinit(b.allocator);
+            return null;
+        };
+    }
+    if (out.items.len == 0) {
+        out.deinit(b.allocator);
+        return null;
+    }
+    return out.toOwnedSlice(b.allocator) catch null;
+}
+
 pub fn reifiedBindableFromArgs(
     b: *const FuncBuilder,
     f: *const Function,

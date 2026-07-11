@@ -2646,6 +2646,14 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             const delegates = classDelegateThunks(self, c.fqn, lookup_name);
             for (delegates) |sf| {
                 const fr = try funcAt(self, sf.func, "class delegate");
+                // The delegation expression evaluates in the class body's
+                // scope: an inner class's `Density by this@Outer` reaches
+                // the enclosing instance through the under-construction
+                // instance's outer link. Make the instance an enclosing
+                // receiver for the thunk so the labeled-this walk finds it.
+                var inst_v = Value{ .Instance = inst };
+                ir.eval.pushEnclosing(&inst_v);
+                defer ir.eval.popEnclosing();
                 switch (fr) {
                     .err => {},
                     .ok => |func| {

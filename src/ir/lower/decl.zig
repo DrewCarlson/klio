@@ -929,7 +929,11 @@ pub fn lowerMethodWithPrivate(
     // extensions use (the receiver is prepended as the implicit `this`).
     if (f.receiver_type != null) {
         const implicit = [_][]const u8{"this"};
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, null, null, enclosing_members, null, null);
+        // Owner class is threaded (own_members stays null — see above):
+        // a `::name` referencing an owner member must bind the DISPATCH
+        // receiver via the qualified-this walk, and the ref lowering
+        // keys that on the owner-class name.
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null, null);
         const id = module.nextFuncId();
         var placed = func;
         placed.id = id;
