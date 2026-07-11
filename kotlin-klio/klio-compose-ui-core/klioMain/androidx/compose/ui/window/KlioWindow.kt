@@ -53,9 +53,9 @@ fun runComposeWindow(
     density: Float = 1f,
     maxFrames: Int = -1,
     content: @Composable () -> Unit,
-) {
+): Boolean {
     val handle = __composeui_winOpen(width, height, title)
-    if (handle == 0L) return
+    if (handle == 0L) return false
 
     val recomposer = Recomposer()
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
@@ -155,8 +155,69 @@ fun runComposeWindow(
     __composeui_winClose(handle)
     composition.dispose()
     recomposer.close()
+    return true
 }
 
+/**
+ * Receiver scope of an [application] block; [exitApplication] requests the
+ * running window loop to stop, mirroring desktop Compose's ApplicationScope.
+ */
+interface ApplicationScope {
+    fun exitApplication()
+}
+
+/** State captured by a [Window] call inside an [application] block. */
+internal class KlioWindowRequest(
+    val title: String,
+    val width: Int,
+    val height: Int,
+    val content: @Composable () -> Unit,
+)
+
+internal class KlioApplicationScope : ApplicationScope {
+    var exited: Boolean = false
+    var request: KlioWindowRequest? = null
+    override fun exitApplication() {
+        exited = true
+    }
+}
+
+/**
+ * Declare the application's window, desktop-Compose style. Inside an
+ * [application] block a `Window(onCloseRequest = ::exitApplication) { … }`
+ * opens a native window running [content] through the real compose.ui
+ * engine. klio currently drives ONE window per application with its
+ * parameters fixed at open; the window closes when the user closes it or
+ * [ApplicationScope.exitApplication] runs.
+ */
+@Suppress("UNUSED_PARAMETER")
+fun ApplicationScope.Window(
+    onCloseRequest: () -> Unit,
+    title: String = "Untitled",
+    width: Int = 800,
+    height: Int = 600,
+    content: @Composable () -> Unit,
+) {
+    val scope = this
+    if (scope is KlioApplicationScope && scope.request == null) {
+        scope.request = KlioWindowRequest(title, width, height, content)
+    }
+}
+
+/**
+ * Run a compose application: [content] declares its [Window]; the loop
+ * drives it until close. Headless-safe (no windowing backend → returns
+ * after evaluating [content]). Returns true when a window actually opened.
+ */
+fun application(maxFrames: Int = -1, content: ApplicationScope.() -> Unit): Boolean {
+    val scope = KlioApplicationScope()
+    scope.content()
+    val req = scope.request ?: return false
+    if (scope.exited) return false
+    return runComposeWindow(req.width, req.height, req.title, maxFrames = maxFrames, content = req.content)
+}
+
+/** [runComposeWindow] that reports whether a native window opened. */
 // --- Host intrinsics (klio.compose.ui window surface, bound by FQN) ---------
 
 internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
