@@ -51,6 +51,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     // declares the same host entrypoints under its own package.
     try b.register("androidx.compose.ui.window.__composeui_winOpen", winOpen);
     try b.register("androidx.compose.ui.window.__composeui_winProbe", winProbe);
+    try b.register("androidx.compose.ui.window.__composeui_winSetTitle", winSetTitle);
+    try b.register("androidx.compose.ui.window.__composeui_winSetSize", winSetSize);
     try b.register("androidx.compose.ui.window.__composeui_winPoll", winPoll);
     try b.register("androidx.compose.ui.window.__composeui_winClose", winClose);
     try b.register("androidx.compose.ui.window.__composeui_winSurface", winSurfaceOf);
@@ -158,6 +160,8 @@ const Skia = struct {
     /// Optional: only the native live-resize backends (Cocoa) export this. A
     /// backend that reports resizes purely through `winPoll` (SDL) leaves it null.
     winSetResizeCb: ?ResizeCbFn,
+    winSetTitle: ?*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void,
+    winSetSize: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
 };
 
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
@@ -250,6 +254,9 @@ fn loadSkia() ?*Skia {
         .winClose = F.get(&lib, "winClose", "klio_win_close") orelse return skiaLoadFail(&lib),
         // Optional native-live-resize hook (Cocoa only); absent on SDL builds.
         .winSetResizeCb = lib.lookup(ResizeCbFn, "klio_win_set_resize_cb"),
+        // Optional (older shims lack them): recomposition-driven window params.
+        .winSetTitle = lib.lookup(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
+        .winSetSize = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
     };
     skia_state = s;
     return &skia_state.?;
@@ -423,6 +430,30 @@ fn replay(skia: *Skia, surface: *SkSurface, list: []const u8) void {
 /// `__composeui_winProbe(): Long` — 1 when a windowing backend (Skia native
 /// lib with a window driver) is loadable in this environment, else 0. Lets
 /// `application {}` report headless without opening anything.
+/// `__composeui_winSetTitle(handle, title): Long` — retitle a live window.
+fn winSetTitle(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.winSetTitle orelse return ok(Value.newLong(0));
+    const tg = ctx.args[1].String.borrow();
+    defer tg.deinit();
+    const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(title_z);
+    f(win, title_z.ptr);
+    return ok(Value.newLong(1));
+}
+
+/// `__composeui_winSetSize(handle, w, h): Long` — resize a live window.
+fn winSetSize(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const win = winHandle(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.winSetSize orelse return ok(Value.newLong(0));
+    f(win, @intCast(@max(1, argInt(ctx.args[1]))), @intCast(@max(1, argInt(ctx.args[2]))));
+    return ok(Value.newLong(1));
+}
+
 fn winProbe(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     const skia = loadSkia() orelse return ok(Value.newLong(0));
@@ -834,7 +865,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 39), b.len());
+    try testing.expectEqual(@as(usize, 41), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

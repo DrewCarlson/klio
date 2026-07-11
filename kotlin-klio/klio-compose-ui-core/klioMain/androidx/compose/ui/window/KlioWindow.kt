@@ -14,9 +14,12 @@
 
 package androidx.compose.ui.window
 
+import androidx.compose.runtime.AbstractApplier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.remember
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.klioDrawToSurface
 import androidx.compose.ui.input.pointer.PointerId
@@ -166,31 +169,77 @@ interface ApplicationScope {
     fun exitApplication()
 }
 
-/** State captured by a [Window] call inside an [application] block. */
-internal class KlioWindowRequest(
-    val title: String,
-    val width: Int,
-    val height: Int,
-    val content: @Composable () -> Unit,
-)
+/** The application composition emits no UI nodes of its own. */
+private class KlioNoopApplier : AbstractApplier<Unit>(Unit) {
+    override fun insertTopDown(index: Int, instance: Unit) {}
+    override fun insertBottomUp(index: Int, instance: Unit) {}
+    override fun remove(index: Int, count: Int) {}
+    override fun move(from: Int, to: Int, count: Int) {}
+    override fun onClear() {}
+}
 
-internal class KlioApplicationScope : ApplicationScope {
-    var exited: Boolean = false
-    var request: KlioWindowRequest? = null
+/** One live native window: its engine owner, content composition, and loop state. */
+internal class KlioWindowHolder(
+    val handle: Long,
+    val owner: KlioComposeOwner,
+    val composition: Composition,
+    val processor: PointerInputEventProcessor,
+    var w: Int,
+    var h: Int,
+    var title: String,
+) {
+    var uptime: Long = 0L
+    var dirty: Boolean = true
+    var closed: Boolean = false
+    var onCloseRequest: () -> Unit = {}
+}
+
+internal class KlioApplicationScope(
+    private val recomposer: Recomposer,
+    private val density: Float,
+) : ApplicationScope {
+    val windows = mutableListOf<KlioWindowHolder>()
+    var exited = false
+
     override fun exitApplication() {
         exited = true
+    }
+
+    fun open(title: String, width: Int, height: Int, content: @Composable () -> Unit): KlioWindowHolder? {
+        val handle = __composeui_winOpen(width, height, title)
+        if (handle == 0L) return null
+        val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
+        val composition = Composition(KlioUiApplier(owner.root), recomposer)
+        composition.setContent {
+            ProvideKlioCompositionLocals(owner) { content() }
+        }
+        val holder = KlioWindowHolder(
+            handle, owner, composition, PointerInputEventProcessor(owner.root),
+            width, height, title,
+        )
+        windows.add(holder)
+        return holder
+    }
+
+    fun close(holder: KlioWindowHolder) {
+        if (holder.closed) return
+        holder.closed = true
+        __composeui_winClose(holder.handle)
+        holder.composition.dispose()
     }
 }
 
 /**
- * Declare the application's window, desktop-Compose style. Inside an
- * [application] block a `Window(onCloseRequest = ::exitApplication) { … }`
- * opens a native window running [content] through the real compose.ui
- * engine. klio currently drives ONE window per application with its
- * parameters fixed at open; the window closes when the user closes it or
- * [ApplicationScope.exitApplication] runs.
+ * Declare a window inside an [application] block, desktop-Compose style. The
+ * window opens when this composable enters the composition and closes when it
+ * leaves — so a window gated on state (`if (show) Window(...)`) opens and
+ * closes with that state. [title], [width], and [height] are
+ * recomposition-driven: changing the state they read retitles/resizes the
+ * live native window. The native close button invokes [onCloseRequest]; the
+ * window only actually closes when the app's state stops composing it (or the
+ * whole application exits).
  */
-@Suppress("UNUSED_PARAMETER")
+@Composable
 fun ApplicationScope.Window(
     onCloseRequest: () -> Unit,
     title: String = "Untitled",
@@ -199,25 +248,153 @@ fun ApplicationScope.Window(
     content: @Composable () -> Unit,
 ) {
     val scope = this
-    if (scope is KlioApplicationScope && scope.request == null) {
-        scope.request = KlioWindowRequest(title, width, height, content)
+    if (scope !is KlioApplicationScope) return
+    val holder = remember { scope.open(title, width, height, content) }
+    if (holder != null) {
+        holder.onCloseRequest = onCloseRequest
+        if (holder.title != title) {
+            holder.title = title
+            __composeui_winSetTitle(holder.handle, title)
+        }
+        if (holder.w != width || holder.h != height) {
+            holder.w = width
+            holder.h = height
+            __composeui_winSetSize(holder.handle, width, height)
+            holder.dirty = true
+        }
+        DisposableEffect(Unit) {
+            onDispose { scope.close(holder) }
+        }
     }
 }
 
-/**
- * Run a compose application: [content] declares its [Window]; the loop
- * drives it until close. Headless-safe (no windowing backend → returns
- * after evaluating [content]). Returns true when a window actually opened.
- */
-fun application(maxFrames: Int = -1, content: ApplicationScope.() -> Unit): Boolean {
-    val scope = KlioApplicationScope()
-    scope.content()
-    val req = scope.request ?: return false
-    if (scope.exited) return false
-    return runComposeWindow(req.width, req.height, req.title, maxFrames = maxFrames, content = req.content)
+private fun renderWindowFrame(holder: KlioWindowHolder) {
+    holder.owner.setRootConstraints(Constraints(maxWidth = holder.w, maxHeight = holder.h))
+    holder.owner.measureAndLayoutForFrame()
+    val surface = __composeui_winSurface(holder.handle)
+    if (surface == 0L) return
+    __composeui_winClear(holder.handle, 0xFF000000.toInt())
+    klioDrawToSurface(surface) { holder.owner.drawTo(this) }
+    __composeui_winPresent(holder.handle)
+    holder.dirty = false
 }
 
-/** [runComposeWindow] that reports whether a native window opened. */
+private fun dispatchWindowPointer(holder: KlioWindowHolder, x: Int, y: Int, down: Boolean, hover: Boolean) {
+    holder.uptime += 8
+    val position = Offset(x.toFloat(), y.toFloat())
+    val data = PointerInputEventData(
+        id = PointerId(0),
+        uptime = holder.uptime,
+        positionOnScreen = position,
+        position = position,
+        down = down,
+        pressure = 1f,
+        type = PointerType.Mouse,
+        activeHover = hover,
+        scaleGestureFactor = 1f,
+        panGestureOffset = Offset.Zero,
+    )
+    val eventType = when {
+        down -> PointerEventType.Press
+        hover -> PointerEventType.Move
+        else -> PointerEventType.Release
+    }
+    holder.processor.process(
+        PointerInputEvent(
+            eventType,
+            holder.uptime,
+            listOf(data),
+            buttons = PointerButtons(isPrimaryPressed = down),
+        ),
+        IdentityPositionCalculator,
+    )
+}
+
+/** Drain one window's pending events; returns true when anything arrived. */
+private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
+    var any = false
+    val onResize: (Int, Int) -> Unit = { nw, nh ->
+        holder.w = nw
+        holder.h = nh
+        renderWindowFrame(holder)
+    }
+    var ev = __composeui_winPoll(holder.handle, timeoutMs, onResize)
+    while (true) {
+        val type = (ev shr 32).toInt()
+        val a = ((ev shr 16) and 0xFFFF).toInt()
+        val b = (ev and 0xFFFF).toInt()
+        when (type) {
+            2 -> {
+                any = true
+                holder.onCloseRequest()
+            }
+            1 -> {
+                any = true
+                dispatchWindowPointer(holder, a, b, down = true, hover = false)
+                dispatchWindowPointer(holder, a, b, down = false, hover = false)
+                holder.dirty = true
+            }
+            4 -> {
+                any = true
+                dispatchWindowPointer(holder, a, b, down = false, hover = true)
+                holder.dirty = true
+            }
+            5 -> {
+                any = true
+                holder.w = a
+                holder.h = b
+                holder.dirty = true
+            }
+        }
+        if (type == 0) break
+        ev = __composeui_winPoll(holder.handle, 0, onResize)
+    }
+    return any
+}
+
+/**
+ * Run a compose application: [content] is a COMPOSABLE block whose [Window]
+ * declarations manage native windows — multiple windows compose side by side,
+ * state-gated windows open/close with recomposition, and window parameters
+ * (title/size) follow the state they read. The loop drives recomposition,
+ * rendering, and input for every live window until [ApplicationScope.exitApplication]
+ * runs or the last window leaves the composition. Headless-safe (no windowing
+ * backend → windows never open and the loop ends). `maxFrames` bounds the loop
+ * for deterministic tests; a real app omits it. Returns true when at least one
+ * window opened.
+ */
+fun application(
+    maxFrames: Int = -1,
+    density: Float = 1f,
+    content: @Composable ApplicationScope.() -> Unit,
+): Boolean {
+    val recomposer = Recomposer()
+    val scope = KlioApplicationScope(recomposer, density)
+    val appComposition = Composition(KlioNoopApplier(), recomposer)
+    appComposition.setContent {
+        with(scope) { content() }
+    }
+    val openedAny = scope.windows.isNotEmpty()
+    var frame = 0
+    while (!scope.exited && (maxFrames < 0 || frame < maxFrames)) {
+        recomposer.recompose()
+        val live = scope.windows.filter { !it.closed }
+        if (live.isEmpty()) break
+        for (win in live) {
+            if (win.dirty) renderWindowFrame(win)
+        }
+        for (win in live) {
+            if (win.closed) continue
+            if (pumpWindow(win, 16)) win.dirty = true
+        }
+        frame += 1
+    }
+    for (win in scope.windows) scope.close(win)
+    appComposition.dispose()
+    recomposer.close()
+    return openedAny
+}
+
 // --- Host intrinsics (klio.compose.ui window surface, bound by FQN) ---------
 
 internal fun __composeui_winOpen(width: Int, height: Int, title: String): Long =
@@ -237,3 +414,9 @@ internal fun __composeui_winPresent(handle: Long): Long =
 
 internal fun __composeui_winClear(handle: Long, argb: Int): Long =
     error("intrinsic klio.compose.ui.__composeui_winClear not installed")
+
+internal fun __composeui_winSetTitle(handle: Long, title: String): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_winSetTitle not installed")
+
+internal fun __composeui_winSetSize(handle: Long, width: Int, height: Int): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_winSetSize not installed")
