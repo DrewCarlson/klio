@@ -1515,7 +1515,8 @@ pub fn evalWithCapturesChained(
                 // function.
                 if (runtime.getenvSlice("KLIO_AMP_TRACE")) |w| {
                     if (std.mem.indexOf(u8, m, w) != null) {
-                        std.debug.print("[amp] body={s} err={s} msg={s}\n", .{ func.name, @tagName(std.meta.activeTag(result.err)), m });
+                        std.debug.print("[amp] body={s} fqn={s} err={s} msg={s}\n", .{ func.name, func.fqn, @tagName(std.meta.activeTag(result.err)), m });
+                        dumpFrameChainForDiagAlways();
                     }
                 }
                 result = errResult(.{ .CalleeFailed = m });

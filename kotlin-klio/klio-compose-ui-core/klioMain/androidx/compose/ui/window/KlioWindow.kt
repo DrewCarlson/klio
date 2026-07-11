@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.klioDrawToSurface
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputEvent
 import androidx.compose.ui.input.pointer.PointerInputEventData
+import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerInputEventProcessor
 import androidx.compose.ui.input.pointer.PointerType
@@ -99,7 +100,12 @@ fun runComposeWindow(
             else -> PointerEventType.Release
         }
         pointerProcessor.process(
-            PointerInputEvent(eventType, uptime, listOf(data)),
+            PointerInputEvent(
+                eventType,
+                uptime,
+                listOf(data),
+                buttons = PointerButtons(isPrimaryPressed = down),
+            ),
             IdentityPositionCalculator,
         )
     }

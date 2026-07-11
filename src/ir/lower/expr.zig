@@ -1875,7 +1875,18 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // lambda locally and silently dropped the non-local return.
         b.terminate(.{ .LabeledReturn = .{ .label = lbl.name, .value = r } });
     } else if (b.isLambdaBody() and !b.isNamedLocalFn()) {
-        b.terminate(.{ .NonLocalReturn = r });
+        // A bare `return` in an argument lambda returns from the function
+        // the lambda is WRITTEN in. When the enclosing inline callee runs
+        // as a real frame (image-deferred / cross-pack body), the labeled
+        // form unwinds exactly to that frame (`frameMatchesLabel`); an
+        // untargeted non-local return would be absorbed by the first HOF
+        // boundary — `fastFirstOrNull`'s `return it` escaped its own body
+        // and became its CALLER's return value.
+        if (build.currentRealFn()) |ename| {
+            b.terminate(.{ .LabeledReturn = .{ .label = ename, .value = r } });
+        } else {
+            b.terminate(.{ .NonLocalReturn = r });
+        }
     } else {
         b.terminate(.{ .Return = r });
     }

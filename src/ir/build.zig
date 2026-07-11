@@ -137,6 +137,30 @@ pub fn filePrivateFuncRename(name: []const u8, file: u32) ?[]const u8 {
 /// simple name another file also claims as a type, and references —
 /// value-position heads and type positions (`as` / `is` / supertypes) —
 /// rewrite through the reference's own span file.
+/// The name of the REAL (named) function whose body is currently being
+/// lowered — the lexical target of a bare `return` inside an argument
+/// lambda. Kotlin only permits such a return toward an inline callee, and
+/// its meaning is "return from the function the lambda is WRITTEN in";
+/// when that inline function runs as a real frame (a cross-pack /
+/// image-deferred body the splicer could not flatten), the return must
+/// unwind exactly to that frame, not to whichever HOF boundary absorbs an
+/// untargeted non-local return first.
+threadlocal var current_real_fn: ?[]const u8 = null;
+
+pub fn pushCurrentRealFn(name: []const u8) ?[]const u8 {
+    const prev = current_real_fn;
+    current_real_fn = name;
+    return prev;
+}
+
+pub fn popCurrentRealFn(prev: ?[]const u8) void {
+    current_real_fn = prev;
+}
+
+pub fn currentRealFn() ?[]const u8 {
+    return current_real_fn;
+}
+
 pub const FileTypeRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
 
 threadlocal var lower_file_type_renames: ?*const FileTypeRenames = null;
