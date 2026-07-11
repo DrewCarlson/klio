@@ -197,7 +197,12 @@ pub fn boxedCellReg(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     const idx = try b.recordCapture(name);
     const c = b.allocReg();
     try b.push(.{ .LoadCapture = .{ .dst = c, .idx = idx } });
-    try b.bind(name, c);
+    // No rebind: a `when` arm lowers into its own BLOCK without a scope
+    // push, so binding the loaded reg here would let a use AFTER the join
+    // read a register only the (possibly untaken) arm block defines —
+    // `when (v) { 1 -> a++; 2 -> b++ }` left every sibling arm's cell
+    // reading Unit after the join. A fresh cell load per use is cheap and
+    // register-correct on every path.
     return c;
 }
 

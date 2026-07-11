@@ -13,6 +13,7 @@
 #include <cstring>
 #include <string>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "include/core/SkBitmap.h"
@@ -729,6 +730,15 @@ void klio_skia_c_draw_path(KlioSurface* s, const char* pathText,
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+// One routed event held for a window other than the one that polled: SDL's
+// event queue is process-global, so a poll on window A may pull window B's
+// event — it is parked on B and delivered by B's next poll.
+struct KlioPendingEv {
+    int type;
+    int a;
+    int b;
+};
+
 struct KlioWindow {
     SDL_Window* win = nullptr;
     SDL_Renderer* renderer = nullptr;  // raster present path (null in GPU mode)
@@ -736,12 +746,22 @@ struct KlioWindow {
     KlioSurface* surface = nullptr;
     int w = 0;
     int h = 0;
+    Uint32 id = 0;                     // SDL window id (event routing key)
+    std::vector<KlioPendingEv> pending;
+    size_t pendingHead = 0;
 #if defined(KLIO_GPU)
     SDL_GLContext gl = nullptr;
     sk_sp<GrDirectContext> grContext;  // per-window GL context for the on-screen GPU
     bool gpu = false;
 #endif
 };
+
+// Open windows by SDL id, for event routing. klio is single-threaded.
+static std::unordered_map<Uint32, KlioWindow*>& klioSdlWindows() {
+    static std::unordered_map<Uint32, KlioWindow*> m;
+    return m;
+}
+static int klioSdlOpenCount = 0;
 
 extern "C" void klio_win_close(KlioWindow* kw);  // used by the open error paths
 
@@ -896,6 +916,9 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
     // the raster renderer if any GL/Skia bring-up step fails.
     if (KlioWindow* gpuWin = klioSdlOpenGpu(w, h, title)) {
         SDL_StartTextInput();
+        gpuWin->id = SDL_GetWindowID(gpuWin->win);
+        klioSdlWindows()[gpuWin->id] = gpuWin;
+        ++klioSdlOpenCount;
         return gpuWin;
     }
 #endif
@@ -920,7 +943,25 @@ KlioWindow* klio_win_open(int w, int h, const char* title) {
         return nullptr;
     }
     SDL_StartTextInput();  // deliver typed characters as SDL_TEXTINPUT events
+    kw->id = SDL_GetWindowID(win);
+    klioSdlWindows()[kw->id] = kw;
+    ++klioSdlOpenCount;
     return kw;
+}
+
+// Update the native title (recomposition-driven window parameters).
+void klio_win_set_title(KlioWindow* kw, const char* title) {
+    if (!kw || !kw->win || !title) return;
+    SDL_SetWindowTitle(kw->win, title);
+}
+
+// Resize the native window; the surface follows via the routed
+// SIZE_CHANGED event (or immediately, so a frame drawn before the event
+// lands still targets the new extent).
+void klio_win_set_size(KlioWindow* kw, int w, int h) {
+    if (!kw || !kw->win || w <= 0 || h <= 0) return;
+    SDL_SetWindowSize(kw->win, w, h);
+    if (w != kw->w || h != kw->h) klioSdlSizeTo(kw, w, h);
 }
 
 // The surface the caller replays the display list onto before presenting.
@@ -955,15 +996,11 @@ void klio_win_present(KlioWindow* kw) {
 //   3 key       — outA=char (ASCII, 0 if non-printable), outB=keysym (X11-style)
 //   4 move      — outA=x, outB=y (pointer position)
 //   5 resize    — outA=width, outB=height (the surface is recreated to match)
-int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
-    if (!kw) return 2;
-    SDL_Event ev;
-    const int got = (timeoutMs > 0) ? SDL_WaitEventTimeout(&ev, timeoutMs)
-                                    : SDL_PollEvent(&ev);
-    if (!got) return 0;
+// Classify one SDL event against its TARGET window (which may not be the
+// polling one): the poll contract's (type, a, b). Resize applies the
+// surface change to the target.
+static int klioSdlClassify(KlioWindow* kw, const SDL_Event& ev, int* outA, int* outB) {
     switch (ev.type) {
-        case SDL_QUIT:
-            return 2;
         case SDL_WINDOWEVENT:
             if (ev.window.event == SDL_WINDOWEVENT_CLOSE) return 2;
             if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
@@ -1015,8 +1052,61 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
     }
 }
 
+int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
+    if (!kw) return 2;
+    // Deliver events routed here by another window's earlier poll first.
+    if (kw->pendingHead < kw->pending.size()) {
+        const KlioPendingEv pe = kw->pending[kw->pendingHead++];
+        if (kw->pendingHead == kw->pending.size()) {
+            kw->pending.clear();
+            kw->pendingHead = 0;
+        }
+        if (outA) *outA = pe.a;
+        if (outB) *outB = pe.b;
+        return pe.type;
+    }
+    SDL_Event ev;
+    const int got = (timeoutMs > 0) ? SDL_WaitEventTimeout(&ev, timeoutMs)
+                                    : SDL_PollEvent(&ev);
+    if (!got) return 0;
+    if (ev.type == SDL_QUIT) return 2;  // app-level quit: the poller reports close
+    // SDL's queue is process-global: route by the event's window id, parking
+    // another window's event on that window for its own next poll.
+    Uint32 wid;
+    switch (ev.type) {
+        case SDL_WINDOWEVENT: wid = ev.window.windowID; break;
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP: wid = ev.button.windowID; break;
+        case SDL_MOUSEMOTION: wid = ev.motion.windowID; break;
+        case SDL_TEXTINPUT: wid = ev.text.windowID; break;
+        case SDL_KEYDOWN:
+        case SDL_KEYUP: wid = ev.key.windowID; break;
+        default: wid = kw->id; break;
+    }
+    KlioWindow* target = kw;
+    if (wid != kw->id) {
+        auto it = klioSdlWindows().find(wid);
+        if (it == klioSdlWindows().end()) return 0;  // a closed window's straggler
+        target = it->second;
+    }
+    int a = 0;
+    int b = 0;
+    const int type = klioSdlClassify(target, ev, &a, &b);
+    if (target == kw) {
+        if (outA) *outA = a;
+        if (outB) *outB = b;
+        return type;
+    }
+    if (type != 0) target->pending.push_back({type, a, b});
+    return 0;
+}
+
 void klio_win_close(KlioWindow* kw) {
     if (!kw) return;
+    klioSdlWindows().erase(kw->id);
+    // The VIDEO subsystem is shared by every open window: quit it only
+    // when the last one closes.
+    const bool last = (--klioSdlOpenCount) <= 0;
     if (kw->surface) klio_skia_free(kw->surface);
 #if defined(KLIO_GPU)
     if (kw->gpu) {
@@ -1024,7 +1114,7 @@ void klio_win_close(KlioWindow* kw) {
         kw->grContext.reset();
         if (kw->gl) SDL_GL_DeleteContext(kw->gl);
         if (kw->win) SDL_DestroyWindow(kw->win);
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        if (last) SDL_QuitSubSystem(SDL_INIT_VIDEO);
         delete kw;
         return;
     }
@@ -1032,7 +1122,7 @@ void klio_win_close(KlioWindow* kw) {
     if (kw->tex) SDL_DestroyTexture(kw->tex);
     if (kw->renderer) SDL_DestroyRenderer(kw->renderer);
     if (kw->win) SDL_DestroyWindow(kw->win);
-    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (last) SDL_QuitSubSystem(SDL_INIT_VIDEO);
     delete kw;
 }
 
@@ -1174,6 +1264,19 @@ int klio_win_poll(KlioWindow* kw, int timeoutMs, int* outA, int* outB) {
         }
     }
     return 0;
+}
+
+void klio_win_set_title(KlioWindow* kw, const char* title) {
+    if (!kw || !title) return;
+    SetWindowTextA(kw->hwnd, title);
+}
+
+void klio_win_set_size(KlioWindow* kw, int w, int h) {
+    if (!kw || w <= 0 || h <= 0) return;
+    RECT r = {0, 0, w, h};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(kw->hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                 SWP_NOMOVE | SWP_NOZORDER);
 }
 
 void klio_win_close(KlioWindow* kw) {
@@ -1352,6 +1455,20 @@ void klio_win_set_resize_cb(KlioWindow* kw, void (*cb)(void*, int, int), void* c
     if (!kw) return;
     kw->resizeCb = cb;
     kw->resizeCtx = ctx;
+}
+
+void klio_win_set_title(KlioWindow* kw, const char* title) {
+    if (!kw || !kw->window || !title) return;
+    @autoreleasepool {
+        [kw->window setTitle:[NSString stringWithUTF8String:title]];
+    }
+}
+
+void klio_win_set_size(KlioWindow* kw, int w, int h) {
+    if (!kw || !kw->window || w <= 0 || h <= 0) return;
+    @autoreleasepool {
+        [kw->window setContentSize:NSMakeSize(w, h)];
+    }
 }
 
 KlioWindow* klio_win_open(int w, int h, const char* title) {
@@ -1612,6 +1729,8 @@ void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}
 int klio_win_poll(void*, int, int*, int*) { return 2; }
 void klio_win_close(void*) {}
+void klio_win_set_title(void*, const char*) {}
+void klio_win_set_size(void*, int, int) {}
 }  // extern "C"
 
 #endif

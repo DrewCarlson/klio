@@ -2744,7 +2744,21 @@ fn dispatchWithReceiver(self: *VmHost, allocator: Allocator, fqn: []const u8, fu
 // -------------------------------------------------------------------------
 
 pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
-    return callMemberInner(self, allocator, receiver, name, args, false);
+    const r = try callMemberInner(self, allocator, receiver, name, args, false);
+    // A raw callable value asked for a member nothing serves: the value
+    // stands in for a SAM instance (a lambda flowing where a fun interface
+    // is expected — `FlowCollector`'s `emit` on a collector that arrived as
+    // a plain function), so the single-abstract-method call IS an
+    // invocation of the callable. Direct-dispatch only: the bare-name
+    // resolver's candidate walks must keep their misses so outer receivers
+    // and extensions still get their turn.
+    if (r == .err and r.err == .Unimplemented and
+        (receiver.* == .Function or receiver.* == .IrClosure))
+    {
+        freeDispatchMiss(allocator, r);
+        return host_call_value.callValue(self, allocator, receiver, args);
+    }
+    return r;
 }
 
 /// `strict_ext` restricts the extension fallback to candidates whose

@@ -1037,6 +1037,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
+    const prev_real_fn = build.pushCurrentRealFn(f.name.name);
+    defer build.popCurrentRealFn(prev_real_fn);
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
 
