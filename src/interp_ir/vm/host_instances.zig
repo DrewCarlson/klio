@@ -2316,9 +2316,15 @@ fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
 ///    the enclosing class — matches the pre-class-keyed behavior).
 fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, outer_hint: ?*const Value) Allocator.Error!?Value {
     const want = enclosingClassNameOf(self, class_def, ir_name) orelse {
+        if (runtime.getenvSlice("KLIO_OUTER_TRACE")) |w| {
+            if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: no enclosing-class record, hint={}\n", .{ ir_name, outer_hint != null });
+        }
         if (outer_hint) |h| return h.*;
         return null;
     };
+    if (runtime.getenvSlice("KLIO_OUTER_TRACE")) |w| {
+        if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: want={s} hint={}\n", .{ ir_name, want, outer_hint != null });
+    }
     if (outer_hint) |h| {
         if (instanceOfClassName(h, want)) return h.*;
     }
