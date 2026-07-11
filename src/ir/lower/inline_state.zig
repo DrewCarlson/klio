@@ -10,7 +10,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const span = @import("span");
-const runtime = @import("runtime");
+pub const runtime = @import("runtime");
 
 const Allocator = std.mem.Allocator;
 const StringSet = std.StringHashMap(void);

@@ -10032,28 +10032,45 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
     defer allocator.free(chain);
     for (chain) |encl_v| {
         if (encl_v != .Instance) continue;
-        const o_inst = encl_v.Instance;
-        var ocur: ?ObjRef(ClassDef) = blk: {
-            const ig = o_inst.borrow();
-            defer ig.deinit();
-            break :blk ig.get().class.clone();
-        };
-        var inner_step: usize = 0;
-        while (ocur) |c| {
-            if (inner_step > 128) {
-                c.deinit();
-                break;
-            }
-            inner_step += 1;
-            const cg = c.borrow();
-            const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
-            const next = blk: {
-                break :blk if (cg.get().parent) |p| p.clone() else null;
+        // Each enclosing receiver is checked through its own OUTER links
+        // too: `this@Outer` inside an inner-class context (a delegation
+        // expression, a nested lambda) reaches the enclosing instance
+        // through the inner instance's outer chain — the enclosing
+        // receiver itself is the inner instance, not the target.
+        var walk: ?Value = encl_v;
+        var outer_step: usize = 0;
+        while (walk) |wv| {
+            if (outer_step > 128) break;
+            outer_step += 1;
+            if (wv != .Instance) break;
+            const o_inst = wv.Instance;
+            var ocur: ?ObjRef(ClassDef) = blk: {
+                const ig = o_inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().class.clone();
             };
-            cg.deinit();
-            c.deinit();
-            if (matched) return .{ .ok = .{ .Instance = o_inst.clone() } };
-            ocur = next;
+            var inner_step: usize = 0;
+            while (ocur) |c| {
+                if (inner_step > 128) {
+                    c.deinit();
+                    break;
+                }
+                inner_step += 1;
+                const cg = c.borrow();
+                const matched = std.mem.eql(u8, cg.get().name, qualifier) or std.mem.eql(u8, cg.get().fqn, qualifier);
+                const next = blk: {
+                    break :blk if (cg.get().parent) |p| p.clone() else null;
+                };
+                cg.deinit();
+                c.deinit();
+                if (matched) return .{ .ok = .{ .Instance = o_inst.clone() } };
+                ocur = next;
+            }
+            walk = blk: {
+                const ig = o_inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().outer;
+            };
         }
     }
     const known_class = blk: {
@@ -10081,7 +10098,20 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         return .{ .ok = receiver.* };
     }
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) ir.eval.dumpFrameChainForDiagAlways();
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        std.debug.print("[labeled-this] qualifier={s} recv={s} chain_len={d}\n", .{ qualifier, @tagName(std.meta.activeTag(receiver.*)), chain.len });
+        for (chain, 0..) |cv, i| {
+            const cname: []const u8 = if (cv == .Instance) blk: {
+                const g = cv.Instance.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                break :blk cg.get().name;
+            } else @tagName(std.meta.activeTag(cv));
+            std.debug.print("[labeled-this]   chain[{d}]={s}\n", .{ i, cname });
+        }
+        ir.eval.dumpFrameChainForDiagAlways();
+    }
     return .{ .err = try typeErr(allocator, "`this@{s}` is not bound in this scope", .{qualifier}) };
 }
 

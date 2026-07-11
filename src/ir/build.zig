@@ -23,7 +23,7 @@ const Terminator = ir.Terminator;
 const TypeRef = ir.TypeRef;
 const CatchHandler = ir.CatchHandler;
 
-const StringSet = std.StringHashMap(void);
+pub const StringSet = std.StringHashMap(void);
 const StringRegMap = std.StringHashMap(Reg);
 const StringFuncIdMap = std.StringHashMap(FuncId);
 

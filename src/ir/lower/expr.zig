@@ -526,9 +526,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
-            if (class_pick) |cid| {
-                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid, .ctor_ref = true } });
-            } else if (ref_pick) |fid| {
+            if (class_pick != null and !member_shadows_ref) {
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = class_pick.?, .ctor_ref = true } });
+            } else if (ref_pick != null and !member_shadows_ref) {
+                const fid = ref_pick.?;
                 const n = blk: {
                     if (b.module.funcById(fid)) |f| {
                         break :blk try b.module.internConst(b.allocator, .{ .String = f.fqn });
@@ -536,7 +537,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     break :blk nm;
                 };
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
-            } else if (b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) {
+            } else if ((b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) and !member_shadows_ref) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (ir.isAliasName(pr.name.name) and !member_shadows_ref) {
                 // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
@@ -551,7 +552,27 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
                 if (try resolveThisReg(b)) |this_reg| {
-                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm } });
+                    // Inside a MEMBER EXTENSION the frame's `this` is the
+                    // extension receiver; a `::name` referencing an OWNER
+                    // member must bind the dispatch receiver instead
+                    // (`::requestFocus` inside `SemanticsPropertyReceiver.
+                    // applySemantics()` of FocusableNode). Route through
+                    // the qualified-this runtime walk, which resolves the
+                    // enclosing owner instance over the outer/receiver
+                    // chains.
+                    var recv_reg = this_reg;
+                    if (member_shadows_ref) {
+                        if (b.ownerClass()) |own| {
+                            const ext_recv = b.recvTy();
+                            if (ext_recv != null and !std.mem.eql(u8, ext_recv.?, own)) {
+                                const qnm = try b.module.internConst(b.allocator, .{ .String = own });
+                                const qreg = b.allocReg();
+                                try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                                recv_reg = qreg;
+                            }
+                        }
+                    }
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm } });
                 } else {
                     try b.push(.{ .PropertyRef = .{ .dst = dst, .name = nm } });
                 }
@@ -3201,9 +3222,22 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         break :gate b.module.registry.companion_singletons.contains(n);
     }) {
         const mname = callee.Member.name.name;
+        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
         const reified_ext = blk: {
             if (inlineFnAst(mname)) |f| {
                 if (f.receiver_type != null and anyReified(f.type_params)) break :blk true;
+            }
+            // A reified MEMBER-inline fn is invisible to the top-level
+            // stub index: a qualified call (`CC(e, a).pfw<E> { … }`) must
+            // still splice, or the reified parameter dies at runtime.
+            if (inline_state.candidatesForName(mname)) |cands| {
+                for (cands) |cf| {
+                    if (anyReified(cf.type_params) and cf.receiver_type == null and
+                        inline_state.inlineMemberOwner(cf) != null)
+                    {
+                        break :blk true;
+                    }
+                }
             }
             break :blk false;
         };
@@ -3211,7 +3245,96 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            if (try tryInlineCallWithTypeArgs(b, mname, null, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+            // A member-inline overload set is invisible to the stub index
+            // the general resolution consults, and its receiver-blind
+            // shape pick cannot tell `visitNodes(mask: Int, block)` from
+            // the reified `visitNodes(type: NodeKind<T>, block)`. Pick
+            // here: the reified candidate whose type parameters the call
+            // can actually bind (explicit `<…>`, or inference from the
+            // value arguments) wins; otherwise leave the resolution to
+            // the general path.
+            var member_target: ?*const ast.Function = null;
+            if (ast_type_args.len != 0) {
+                if (inline_state.candidatesForName(mname)) |cands| {
+                    for (cands) |cf| {
+                        if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) == null) continue;
+                        if (!anyReified(cf.type_params)) continue;
+                        member_target = cf;
+                        break;
+                    }
+                }
+            }
+            if (ast_type_args.len == 0) blk_mit: {
+                const cands = inline_state.candidatesForName(mname) orelse break :blk_mit;
+                // Inference-bound reified MEMBER-inline call: the splice's
+                // runtime-enclosing parity is not established, so dispatch
+                // it as a statically-bound TYPED member call instead — the
+                // lowered instance method runs framed with its reified
+                // parameters bound from the inferred type-argument names
+                // (`c.visitNodes(Kinds.OnRe) { … }` binds `T = Lw`).
+                for (cands) |cf| {
+                    if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) == null) continue;
+                    if (!anyReified(cf.type_params)) continue;
+                    const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse {
+                        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
+                        continue;
+                    };
+                    const fid = blk: {
+                        for (b.module.funcsBySimpleName(mname)) |cand_fid| {
+                            const ds = b.module.decl_span.get(cand_fid.int()) orelse continue;
+                            if (ds.file.int() == cf.name.span.file.int() and ds.start == cf.name.span.start) {
+                                break :blk cand_fid;
+                            }
+                        }
+                        // Instance methods are not in the simple-name index;
+                        // match by declaration span over the full table.
+                        // User-file instance methods carry no decl-span
+                        // record; identify the overload by its declared
+                        // parameter-name sequence (`type, block` vs
+                        // `mask, block`) behind the implicit `this`.
+                        for (b.module.funcs.items) |*mf| {
+                            if (!std.mem.eql(u8, mf.name, mname)) continue;
+                            if (mf.kind != .instance_method) continue;
+                            if (mf.params.len != cf.params.len + 1) continue;
+                            var all_match = mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this");
+                            if (all_match) {
+                                for (cf.params, 0..) |*cp, pi| {
+                                    if (!std.mem.eql(u8, mf.params[pi + 1].name, cp.name.name)) {
+                                        all_match = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (all_match) break :blk mf.id;
+                        }
+                        break :blk null;
+                    } orelse {
+                        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null\n", .{mname});
+                        continue;
+                    };
+                    const recv = try lowerReceiver(b, receiver);
+                    const run = try lowerArgRun(b, args);
+                    const arg_names_c = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    var ta_ids = try b.allocator.alloc(ir.ConstId, names.len);
+                    for (names, 0..) |n, i| ta_ids[i] = try b.module.internConst(b.allocator, .{ .String = n });
+                    const nm = try b.module.internConst(b.allocator, .{ .String = mname });
+                    const dst = b.allocReg();
+                    orEmitAudit(b, "member_inline_typed", "CallMemberOrGlobal", mname);
+                    try b.push(.{ .CallMemberOrGlobal = .{
+                        .dst = dst,
+                        .this_idx = 0,
+                        .name = nm,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .arg_names = arg_names_c,
+                        .recv = recv,
+                        .func = fid,
+                        .type_args = ta_ids,
+                    } });
+                    return dst;
+                }
+            }
+            if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
                 return r;
             }
             // Splice bailed: fall back to a plain member dispatch.

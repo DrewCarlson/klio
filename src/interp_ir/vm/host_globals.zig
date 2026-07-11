@@ -974,6 +974,41 @@ fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []con
     return m.scopeTier(f.fqn, f.package, name, ref_pkg, cfile) != ir.Module.other_package_tier;
 }
 
+/// Bind a reified type-parameter NAME to the class value its type-ARGUMENT
+/// name resolves to, returning the shadowed global for restore. The same
+/// binding `callFuncTyped` installs, exposed for dispatch sites that must
+/// keep the normal member walk (its enclosing pushes) while a committed
+/// inline member's reified parameters stay live.
+pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name: []const u8) ?Value {
+    const cls_value: ?Value = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+        break :blk lookupGlobal(self, arg_name);
+    };
+    const prev = blk: {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        break :blk g.get().lookup(tp_name);
+    };
+    if (cls_value) |v| {
+        const g = self.globals.borrowMut();
+        defer g.deinit();
+        g.get().define(tp_name, v) catch {};
+    }
+    return prev;
+}
+
+pub fn restoreGlobalBinding(self: *VmHost, name: []const u8, prev: ?Value) void {
+    const g = self.globals.borrowMut();
+    defer g.deinit();
+    if (prev) |v| {
+        g.get().define(name, v) catch {};
+    } else {
+        g.get().removeLocal(name);
+    }
+}
+
 pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     const allocator = self.allocator;
     var top_prop_buf: [256]u8 = undefined;
