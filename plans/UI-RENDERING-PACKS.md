@@ -193,21 +193,20 @@ by the Owner straight onto the window surface via
 `__composeui_winSurface`/`winPresent`/`winClear`) and `KlioComposeScene`
 (headless ImageComposeScene analogue with synthetic `click`/`hover` through
 `PointerInputEventProcessor`; klio actuals for `PointerInputEvent` +
-`InternalPointerEvent`). The synthetic click now runs the engine's full
-hit-test chain cleanly (down+up dispatch, `HitTestResult` iteration,
-sibling-share walk); the dispatch fixes it forced are listed in the
-interpreter-notes below. Still open on this path: the suspend
-`pointerInput` handler coroutine is never started by the first delivered
-event (`clicks` stays 0 — the `SuspendingPointerInputModifierNodeImpl`
-block needs its launch-on-first-event wiring driven through the scene's
-dispatcher), and under the full material3 pack set the click dies in
-`HitPathTracker` on `super.buildCache: owner_class Node has no parent`:
-TWO same-named cross-package TOP-LEVEL classes (foundation's
-`text.input.internal.Node` vs ui's pointer-input `Node`) collide in the
-flat class table. Mangling non-private top-levels needs the simple-name
-symbol index and the import channels to resolve renamed classifiers
-first (a straight rename pass broke `ResolvedStyle`-scale public
-references), so that lands with the resolution-unification work. Also
+`InternalPointerEvent`). **The synthetic click DELIVERS**: a foundation
+`Box(Modifier.clickable { ... })` scene observes its onClick for every
+`scene.click` (hit test → `HitPathTracker` dispatch → the suspending
+pointer-input node → tap detection → `PressInteraction` flow →
+indication collection). Still open on this path: material3's `Button`
+(and the modern `Modifier.pointerInput` overload) hand the handler over
+as the NEW `PointerInputEventHandler` fun interface — a SUSPEND
+member-extension SAM — and `startCoroutineUndispatched` over that shape
+loses the continuation (`resumeWith` on `kotlin.Unit`); the foundation
+path uses the plain suspend-lambda constructor and completes. PUBLIC
+cross-package top-level name collisions (`internal` ones now lift
+mangled with a package-scoped rename channel) wait on the symbol index
+and import channels resolving renamed classifiers
+(resolution-unification). Also
 open: a `@Composable` trailing CONSTRUCTOR lambda misbinds the ctor's
 other args (plain lambdas fine; `KlioComposeScene` uses `setContent`
 instead).
