@@ -3999,7 +3999,12 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
             }
         }
     }
+    const nlr_dbg = if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| std.mem.eql(u8, efw, nm) else false;
     if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
+        if (nlr_dbg) {
+            const last_stmts: usize = if (args.len > 0 and args[args.len - 1] == .Lambda) args[args.len - 1].Lambda.body.stmts.len else 999;
+            std.debug.print("[tbie] synchronized file={d} in_fn={s} target-found needs={} nlr={} nstmts={d}\n", .{ callee.Path.segments[0].span.file.int(), build.currentRealFn() orelse "-", bareInlineNeedsSplice(b, nm, f, args), inline_call.argLambdaHasNonlocalReturn(args), last_stmts });
+        }
         // A reified inline overload whose type parameter lives only in
         // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
         // bind that parameter from a lambda that declares fewer
@@ -4019,8 +4024,10 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
             if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
                 return r;
             }
+            if (nlr_dbg) std.debug.print("[tbie] synchronized in_fn={s} SPLICE-DECLINED\n", .{build.currentRealFn() orelse "-"});
         }
     }
+    if (nlr_dbg) std.debug.print("[tbie] synchronized file={d} NO-TARGET-OR-DECLINED\n", .{callee.Path.segments[0].span.file.int()});
     return null;
 }
 
@@ -4653,20 +4660,64 @@ fn inlineOwnerInEnclosingHierarchy(b: *FuncBuilder, enclosing: []const u8, f: *c
     return b.module.classIsOrExtends(enclosing, owner);
 }
 
-/// Whether a plain top-level inline fn is visible at `caller_file` under
-/// Kotlin scoping: same package, exact or wildcard import, or a
-/// default-import package. Ranked with the same tiers as the symbol
-/// index (`scopeTier`); only the invisible tier (an unimported foreign
-/// package) is rejected. Unknown declaring package keeps the pick — the
-/// registry has no file record to judge it by.
-fn bareInlineVisibleFrom(b: *const FuncBuilder, f: *const ast.Function, caller_file: span.FileId) bool {
+/// The symbol-index scope tier of an inline candidate at a reference
+/// site (0 named-import … 5 invisible); unknown metadata ranks as the
+/// default-import tier so it neither wins nor loses against real
+/// records.
+fn inlineCandTier(b: *const FuncBuilder, f: *const ast.Function, caller_file: span.FileId) u8 {
     const m = b.module;
     const decl_file = f.name.span.file;
-    const decl_pkg = m.packageOfFile(decl_file) orelse return true;
+    const decl_pkg = m.packageOfFile(decl_file) orelse return 3;
     const caller_pkg = m.packageOfFile(caller_file) orelse b.self_package;
     var buf: [256]u8 = undefined;
-    const fqn = std.fmt.bufPrint(&buf, "{s}.{s}", .{ decl_pkg, f.name.name }) catch return true;
-    return m.scopeTier(fqn, decl_pkg, f.name.name, caller_pkg, caller_file) <= 3;
+    const fqn = std.fmt.bufPrint(&buf, "{s}.{s}", .{ decl_pkg, f.name.name }) catch return 3;
+    return m.scopeTier(fqn, decl_pkg, f.name.name, caller_pkg, caller_file);
+}
+
+/// Whether a plain top-level inline fn is visible at `caller_file` under
+/// Kotlin scoping: same package, exact or wildcard import, or a
+/// default-import package. Only the invisible tier (an unimported
+/// foreign package) is rejected.
+fn bareInlineVisibleFrom(b: *const FuncBuilder, f: *const ast.Function, caller_file: span.FileId) bool {
+    return inlineCandTier(b, f, caller_file) <= 3;
+}
+
+/// Re-rank a shape-based plain-inline pick by call-site visibility: with
+/// several same-name NON-extension inline candidates across packs (seven
+/// `synchronized` actuals in the compose set), the registration-order
+/// pick is bake-order-sensitive and can splice another pack's body.
+/// Kotlin resolves by scope — prefer the lowest tier among candidates
+/// that fit the call shape; ties keep the incumbent.
+fn retierPlainInlinePick(
+    b: *const FuncBuilder,
+    pick: *const ast.Function,
+    nm: []const u8,
+    shape: CallShape,
+    caller_file: span.FileId,
+) *const ast.Function {
+    if (pick.receiver_type != null or inline_state.inlineMemberOwner(pick) != null) return pick;
+    const cands = inline_state.candidatesForName(nm) orelse return pick;
+    if (cands.len < 2) return pick;
+    var best = pick;
+    var best_tier = inlineCandTier(b, pick, caller_file);
+    for (cands) |cf| {
+        if (cf == pick) continue;
+        if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) != null) continue;
+        if (shape.last_is_lambda) {
+            if (cf.params.len == 0) continue;
+            const lp = &cf.params[cf.params.len - 1];
+            if (lp.ty.function == null) continue;
+            if (cf.params.len != shape.want) continue;
+        } else if (cf.params.len != shape.want) {
+            continue;
+        }
+        const t = inlineCandTier(b, cf, caller_file);
+        if (t < best_tier) {
+            best_tier = t;
+            best = cf;
+        }
+    }
+    return best;
 }
 
 fn inlineTargetForBareCall(
@@ -4707,7 +4758,11 @@ fn inlineTargetForBareCall(
         // an unrelated pack's `max(a: Dp, b: Dp)`. Extension picks stay:
         // receiver narrowing, not package scope, is their discriminator.
         .deferred => blk: {
-            const nf = narrowed orelse break :blk null;
+            var nf = narrowed orelse break :blk null;
+            // A plain pick re-ranks by call-site scope tier: with several
+            // same-name plain inline candidates across packs (`synchronized`
+            // actuals), the registration-order pick is bake-order-sensitive.
+            nf = retierPlainInlinePick(b, nf, nm, shape, seg.span.file);
             // Member-inline fns are exempt: their discriminator is the
             // enclosing class hierarchy (checked below), not package
             // scope — `propertyFailsWith` on an implicit CompareContext
@@ -6036,7 +6091,25 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
 
     const shapes = try buildArgShapes(b, args, ast_arg_names);
     defer b.allocator.free(shapes);
-    const ctx = resolveCtxFor(b, name0, ast_type_args, cast_pick);
+    var ctx = resolveCtxFor(b, name0, ast_type_args, cast_pick);
+    ctx.nonlocal_return_lambda = inline_call.argLambdaHasNonlocalReturn(args) or blk: {
+        // A spliced forwarder passes the original lambda along as a
+        // parameter Path (`synchronized(lock, block)` inside another
+        // inline wrapper): follow the splice's lambda-argument map so a
+        // non-local `return` in the ORIGINAL literal still pins the
+        // static inline resolution.
+        for (args) |*a| {
+            if (a.* != .Path or a.Path.segments.len != 1) continue;
+            const lam = b.inlineLambdaFor(a.Path.segments[0].name) orelse continue;
+            if (lam.* != .Lambda) continue;
+            var one = [_]Expr{lam.*};
+            if (inline_call.argLambdaHasNonlocalReturn(&one)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| {
+        if (std.mem.eql(u8, efw, name0)) std.debug.print("[efset] nlr={} nargs={d} last_lambda={} file={d}\n", .{ ctx.nonlocal_return_lambda, args.len, lastArgIsLambda(args), segments[0].span.file.int() });
+    }
     const res = try b.module.resolveCall(b.allocator, name0, b.self_package, segments[0].span.file, shapes, last_arg_lambda, ctx);
     // Eager audit: where typeck recorded a pick for this call site,
     // compare it against the engine's answer. Audit-only — behavior

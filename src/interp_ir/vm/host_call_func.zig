@@ -311,6 +311,11 @@ fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
         .Arity => |s| .{ .Arity = s },
         .Unimplemented => |s| .{ .Unimplemented = s },
         .CalleeFailed => |s| .{ .CalleeFailed = s },
+        // A labeled return crossing a host intrinsic (`synchronized`'s
+        // block invoked through `invokeCallable`) keeps unwinding to its
+        // target frame — flattening it to a Type error stranded
+        // `return@fn` from inside kotlinx's synchronized blocks.
+        .LabeledReturn => |lr| .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } },
         else => typeErr(allocator, "{s}", .{@tagName(e)}),
     };
 }

@@ -1448,6 +1448,15 @@ pub fn evalWithCapturesIn(
 /// `LabeledReturn` and must unwind to the labeled lambda's frame.
 fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
     if (std.mem.eql(u8, func.name, label)) return true;
+    // A collision-mangled declaration (`makePending$f172`, a file-private
+    // or internal rename) still answers its SOURCE-name label: the
+    // lambda's non-local `return` was lowered against the declared name
+    // before the lift renamed the function.
+    if (func.name.len > label.len and func.name[label.len] == '$' and
+        std.mem.startsWith(u8, func.name, label))
+    {
+        return true;
+    }
     if (func.implicit_label) |il| return std.mem.eql(u8, il, label);
     return false;
 }
@@ -1499,10 +1508,20 @@ pub fn evalWithCapturesChained(
     // A labeled return whose target is this function exits it as a
     // normal return. Other labels propagate further outward until the
     // matching frame catches them.
+    if (result == .err and result.err == .LabeledReturn) {
+        if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+            std.debug.print("[lr-exit] label={s} func={s} match={}\n", .{ result.err.LabeledReturn.label, func.name, frameMatchesLabel(func, result.err.LabeledReturn.label) });
+        }
+    }
     if (result == .err and result.err == .LabeledReturn and
         frameMatchesLabel(func, result.err.LabeledReturn.label))
     {
         result = ok(result.err.LabeledReturn.value);
+    }
+    if (result == .err and result.err == .LabeledReturn) {
+        if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+            std.debug.print("[lr] label={s} passed_frame={s} implicit={s}\n", .{ result.err.LabeledReturn.label, func.name, func.implicit_label orelse "-" });
+        }
     }
     // A bare integer literal returned where the declared return type is
     // `Long` (`fun f(): Long = 0`) carries an `Int` tag out of the
@@ -2433,6 +2452,10 @@ fn runFrameInner(
                 return ok(v);
             },
             .LabeledReturn => |lr| {
+                if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+                    if (frame.cur_span) |sp| std.debug.print("[lr-raise] label={s} span={d}:{d} in_fn={s}\n", .{ lr.label, sp.file.int(), sp.start, frame.func.name });
+                    dumpFrameChainForDiagAlways();
+                }
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
                 v.retain();
                 if (frameMatchesLabel(frame.func, lr.label)) {

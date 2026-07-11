@@ -50,7 +50,19 @@ private fun launchEffect(c: KlioComposer, changed: Boolean, block: suspend Corou
         c.updateRememberedValue(holder)
         c.registerCleanup { holder.job?.cancel() }
     }
-    holder.job = effectScopeOf(c).launch { block() }
+    // Compose contract: the effect body runs AFTER the composition pass
+    // applies, never inline at its call site — a write inside the effect
+    // must invalidate a completed pass, not mutate state the same pass
+    // still reads (the eager Unconfined launch ran the body mid-
+    // composition). Queue the launch as a side effect of this pass.
+    // Compose contract: the effect body runs AFTER the composition pass
+    // applies, never inline at its call site — a write inside the effect
+    // must invalidate a completed pass, not mutate state the same pass
+    // still reads (the eager Unconfined launch ran the body mid-
+    // composition). Queue the launch as a side effect of this pass.
+    c.recordSideEffect {
+        holder.job = effectScopeOf(c).launch { block() }
+    }
 }
 
 /** Launch [block] on first composition and whenever [key1] changes. */

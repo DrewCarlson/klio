@@ -2499,7 +2499,19 @@ pub const Module = struct {
         /// tail `Call`, ahead of the member-shadowable walk — the receiver
         /// gate never re-routes a tail call.
         in_tailrec_body: bool = false,
+        /// A lambda argument contains a bare non-local `return`, which is
+        /// only legal against an INLINE callee: kotlinc resolves the call
+        /// statically to the inline function, so the member-shadowable
+        /// deferral must not re-route it (`synchronized(this) { … return
+        /// false … }` framed the block, and a park inside it lost the
+        /// enclosing frame the labeled return targets).
+        nonlocal_return_lambda: bool = false,
     };
+
+    fn funcIsInline(self: *const Module, id: FuncId) bool {
+        const f = self.funcById(id) orelse return false;
+        return f.is_inline;
+    }
 
     fn isNonExtFid(self: *const Module, id: FuncId) bool {
         const f = self.funcById(id) orelse return true;
@@ -2988,8 +3000,12 @@ pub const Module = struct {
             }
             // Non-extension: the member-shadowable gate, suppressed by a cast or
             // explicit type arguments (the static-resolution forms).
-            const static_ok = cast_static or ctx.has_type_args;
+            const static_ok = cast_static or ctx.has_type_args or
+                (ctx.nonlocal_return_lambda and self.funcIsInline(t));
             const shadow = ctx.in_receiver_context and member_shadowable and !static_ok;
+            if (runtime.getenvSlice("KLIO_EF_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name)) std.debug.print("[ef] {s} t={d} inline={} nlr={} recvctx={} shadowable={} shadow={} file={d}\n", .{ name, t.int(), self.funcIsInline(t), ctx.nonlocal_return_lambda, ctx.in_receiver_context, member_shadowable, shadow, caller_file.int() });
+            }
             if (!shadow) {
                 return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
