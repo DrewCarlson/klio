@@ -619,9 +619,7 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             if (already) continue;
             seen.append(self.allocator, cur.name) catch return null;
             const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
-            if (std.mem.eql(u8, cur.name, nm) or
-                std.mem.eql(u8, cur_key, nm_mangled orelse nm))
-            {
+            if (host_call_member.classHeadsMatch(self, cur.name, nm)) {
                 const d: i32 = if (cur.depth > 50) 50 else cur.depth;
                 return 60 - d;
             }
@@ -762,7 +760,12 @@ fn applicIdentityConflictCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *c
 fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
-    if (arg.* != .Instance) return null;
+    const strace = if (runtime.getenvSlice("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
+    if (arg.* != .Instance) {
+        if (strace) std.debug.print("[sub] target={s} arg-tag={s} -> null\n", .{ target, @tagName(std.meta.activeTag(arg.*)) });
+        return null;
+    }
+    if (strace) std.debug.print("[sub] target={s} head={s}\n", .{ target, overload_match.runtimeHead(arg) });
     var queue: std.ArrayList(QItem) = .empty;
     defer queue.deinit(self.allocator);
     var seen: std.ArrayList([]const u8) = .empty;
@@ -781,9 +784,7 @@ fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8)
         if (already) continue;
         seen.append(self.allocator, cur.name) catch return null;
         const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
-        if (std.mem.eql(u8, cur.name, target) or
-            std.mem.eql(u8, cur_key, host_call_member.mangledClassKeyOf(self, target) orelse target))
-        {
+        if (host_call_member.classHeadsMatch(self, cur.name, target)) {
             return cur.depth;
         }
         const cg = self.classes.borrow();
@@ -1731,7 +1732,11 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // push); the old per-call linear scan of the whole index was the
     // hottest frame in the interpreter profile.
     const candidates = eff.funcsBySimpleName(name);
-    if (candidates.len < 2) return .{ .ok = null };
+    const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    if (candidates.len < 2) {
+        if (ntrace) std.debug.print("[cno] {s} cands={d} -> decline\n", .{ name, candidates.len });
+        return .{ .ok = null };
+    }
 
     // Pick the best body-carrying overload by runtime arg types through
     // the shared applicability engine (proven zero-divergence against the
@@ -1767,7 +1772,9 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
             is_low = cf.low_priority;
         }
-        if (positionalPoints(self, eff, cand, shapes, scope)) |total| {
+        const pts = positionalPoints(self, eff, cand, shapes, scope);
+        if (ntrace) std.debug.print("[cno] {s} cand={d} pts={?}\n", .{ name, cand.int(), pts });
+        if (pts) |total| {
             if (is_low) {
                 if (best_low == null or total > best_low_score) {
                     best_low = cand;

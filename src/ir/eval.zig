@@ -1509,6 +1509,15 @@ pub fn evalWithCapturesChained(
     if (result == .err) {
         switch (result.err) {
             .Unimplemented, .Unbound, .Type, .Unsupported, .Arity => |m| {
+                // `KLIO_AMP_TRACE=<substr>` names the RUN body whose escape
+                // is being re-tagged — the frames are gone by the time the
+                // error surfaces, so this is the only record of the failing
+                // function.
+                if (runtime.getenvSlice("KLIO_AMP_TRACE")) |w| {
+                    if (std.mem.indexOf(u8, m, w) != null) {
+                        std.debug.print("[amp] body={s} err={s} msg={s}\n", .{ func.name, @tagName(std.meta.activeTag(result.err)), m });
+                    }
+                }
                 result = errResult(.{ .CalleeFailed = m });
             },
             else => {},

@@ -999,7 +999,13 @@ pub fn scopeTypeRename(b: *const FuncBuilder, name: []const u8, file: u32) ?[]co
     // An anon-object member body lowering at runtime carries its lexical
     // site's flattened renames (the side module's registries are empty).
     if (build.anonScopeRename(name)) |renamed| return renamed;
-    return build.fileTypeRename(name, file);
+    if (build.fileTypeRename(name, file)) |renamed| return renamed;
+    // Same-package cross-file reference to a package-renamed internal
+    // top-level classifier.
+    if (b.module.packageOfFile(ir.FileId.from(file))) |pkg| {
+        if (build.pkgTypeRename(name, pkg)) |renamed| return renamed;
+    }
+    return null;
 }
 
 /// Flatten every scope-true type rename visible at the current lexical
@@ -1027,6 +1033,14 @@ fn collectScopeRenames(b: *FuncBuilder, file: u32) Allocator.Error![]const ir.Sc
         var it = m.iterator();
         while (it.next()) |e| {
             try out.append(b.allocator, .{ .name = e.key_ptr.*, .renamed = e.value_ptr.* });
+        }
+    }
+    if (b.module.packageOfFile(ir.FileId.from(file))) |pkg| {
+        if (build.pkgTypeRenamesFor(pkg)) |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                try out.append(b.allocator, .{ .name = e.key_ptr.*, .renamed = e.value_ptr.* });
+            }
         }
     }
     return out.toOwnedSlice(b.allocator);
@@ -2767,6 +2781,37 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .n_args = @as(u32, @intCast(n_keys)) + 1,
                     .arg_names = &.{},
                 } });
+                return old;
+            }
+            // Safe-target postfix (`parent?.count++`): the receiver
+            // evaluates ONCE and a null receiver skips the whole
+            // get/inc/store (Kotlin's `?.` short-circuit) — running the
+            // unguarded sequence incremented `null` at the chain's root.
+            if (inner.* == .Member and inner.Member.safe) {
+                const m = inner.Member;
+                const recv = try lowerReceiver(b, m.receiver);
+                const null_r = try b.emitConst(.Null);
+                const is_null = b.allocReg();
+                try b.push(.{ .BinOp = .{ .dst = is_null, .op = .Eq, .lhs = recv, .rhs = null_r } });
+                const then_b = try b.allocBlock();
+                const else_b = try b.allocBlock();
+                const join = try b.allocBlock();
+                const old = b.allocReg();
+                b.terminate(.{ .Branch = .{ .cond = is_null, .t = then_b, .f = else_b } });
+                b.switchTo(then_b);
+                const n0 = try b.emitConst(.Null);
+                try b.push(.{ .Move = .{ .dst = old, .src = n0 } });
+                b.terminate(.{ .Goto = join });
+                b.switchTo(else_b);
+                const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+                const got = b.allocReg();
+                try b.push(.{ .GetField = .{ .dst = got, .receiver = recv, .field = field } });
+                const new = b.allocReg();
+                try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = got } });
+                try b.push(.{ .SetField = .{ .receiver = recv, .field = field, .value = new } });
+                try b.push(.{ .Move = .{ .dst = old, .src = got } });
+                b.terminate(.{ .Goto = join });
+                b.switchTo(join);
                 return old;
             }
             const s = try lowerExpr(b, inner);

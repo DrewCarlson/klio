@@ -495,6 +495,14 @@ fn literalEvidenceScore(param_name: []const u8, kind: LiteralKind) ?i32 {
 /// no static facts ranks exactly as before — evidence only ever ADDS
 /// preference for a matching candidate, never demotes or disqualifies one.
 pub fn tyEvidenceBonus(params: []const Param, args: []const ArgShape) i32 {
+    return tyEvidenceBonusScoped(params, args, .{});
+}
+
+/// `tyEvidenceBonus` with the caller's scope: the hierarchy oracle lets a
+/// declared head that is a SUBTYPE of the parameter head count as evidence
+/// (weaker than an exact head match), so two same-arity overloads split on
+/// which parameter type the argument's declared class actually reaches.
+pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scope: ApplicabilityScope) i32 {
     var total: i32 = 0;
     for (args, 0..) |*a, i| {
         if (i >= params.len) break;
@@ -505,7 +513,13 @@ pub fn tyEvidenceBonus(params: []const Param, args: []const ArgShape) i32 {
             } else {
                 const pn = evidenceHead(params[i].ty.name);
                 const an = evidenceHead(aty.name);
-                if (isNumericHead(pn) and isNumericHead(an)) total += 80;
+                if (isNumericHead(pn) and isNumericHead(an)) {
+                    total += 80;
+                } else if (scope.ext_is_subtype_name) |cb| {
+                    if (an.len != 0 and pn.len != 0 and !std.mem.eql(u8, pn, "Any")) {
+                        if (cb(scope.ctx.?, an, pn)) total += 60;
+                    }
+                }
             }
             continue;
         }
@@ -533,6 +547,20 @@ fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const Applic
     const v_ty = arg.runtime_class orelse {
         if (arg.ty) |aty| {
             if (tyEvidenceScore(nm, aty.name, member)) |s| return s;
+            // Hierarchy evidence: a declared head that is a SUBTYPE of the
+            // parameter head proves the candidate the same way a matching
+            // head does (`calculateNodeKindSetFrom(this)` inside
+            // DelegatingNode's initializer carries head `DelegatingNode`,
+            // which reaches `Modifier.Node` but never `Modifier.Element` —
+            // without this the two same-arity overloads tie and the wrong
+            // one wins on declaration order).
+            if (scope.ext_is_subtype_name) |cb| {
+                const ah = evidenceHead(aty.name);
+                const ph = evidenceHead(nm);
+                if (ah.len != 0 and ph.len != 0 and !std.mem.eql(u8, ph, "Any")) {
+                    if (cb(scope.ctx.?, ah, ph)) return 60;
+                }
+            }
         }
         return unknownArgScore(nm);
     };

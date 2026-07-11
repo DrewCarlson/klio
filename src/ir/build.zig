@@ -164,6 +164,33 @@ pub fn fileTypeRenamesFor(file: u32) ?*const std.StringHashMap([]const u8) {
     return m.getPtr(file);
 }
 
+/// Package-scoped type renames: an `internal` top-level classifier whose
+/// simple name collides with another top-level in the combined image
+/// lifts mangled, and every file OF ITS PACKAGE resolves the bare name
+/// through this map (the file map cannot serve same-package cross-file
+/// references; cross-package references name it through imports, which
+/// resolve by FQN and keep the source name via the fqn override).
+pub const PkgTypeRenames = std.StringHashMap(std.StringHashMap([]const u8));
+
+threadlocal var lower_pkg_type_renames: ?*const PkgTypeRenames = null;
+
+pub fn setLowerPkgTypeRenames(m: ?*const PkgTypeRenames) ?*const PkgTypeRenames {
+    const prev = lower_pkg_type_renames;
+    lower_pkg_type_renames = m;
+    return prev;
+}
+
+pub fn pkgTypeRename(name: []const u8, pkg: []const u8) ?[]const u8 {
+    const m = lower_pkg_type_renames orelse return null;
+    const inner = m.getPtr(pkg) orelse return null;
+    return inner.get(name);
+}
+
+pub fn pkgTypeRenamesFor(pkg: []const u8) ?*const std.StringHashMap([]const u8) {
+    const m = lower_pkg_type_renames orelse return null;
+    return m.getPtr(pkg);
+}
+
 /// Scope-true renames carried into a runtime anon-object member-body
 /// lowering: the lexical site's flattened rename snapshot from the
 /// `BuildObject` instruction. Installed around the side-module lowering

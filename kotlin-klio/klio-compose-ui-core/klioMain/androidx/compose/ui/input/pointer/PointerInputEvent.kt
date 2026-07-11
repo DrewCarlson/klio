@@ -7,33 +7,49 @@
 
 package androidx.compose.ui.input.pointer
 
+import androidx.collection.LongSparseArray
 import androidx.compose.ui.InternalCoreApi
 
 /**
- * klio actual: the processor consumes only the uptime and the per-pointer data
- * list; the window driver synthesizes these from the SDL/Cocoa event stream.
+ * klio actual, mirroring the skiko shape: the platform PointerEvent actual
+ * reads the event type, button, and modifier state off the internal event,
+ * so the synthesized stream carries them (the window driver fills Press/
+ * Release/Move; buttons and modifiers default to none).
  */
 @OptIn(InternalCoreApi::class)
-internal actual class PointerInputEvent(
+internal actual data class PointerInputEvent(
+    val eventType: PointerEventType,
     actual val uptime: Long,
     actual val pointers: List<PointerInputEventData>,
+    val buttons: PointerButtons = PointerButtons(0),
+    val keyboardModifiers: PointerKeyboardModifiers = PointerKeyboardModifiers(0),
+    val nativeEvent: Any? = null,
+    val button: PointerButton? = null,
 )
 
-/**
- * klio actual: changes keyed by pointer id, with active-hover derived from the
- * originating event's per-pointer data (the skiko semantics).
- */
 @OptIn(InternalCoreApi::class)
-internal actual class InternalPointerEvent actual constructor(
-    actual val changes: androidx.collection.LongSparseArray<PointerInputChange>,
-    private val pointerInputEvent: PointerInputEvent,
+internal actual class InternalPointerEvent(
+    val type: PointerEventType,
+    actual val changes: LongSparseArray<PointerInputChange>,
+    val buttons: PointerButtons,
+    val keyboardModifiers: PointerKeyboardModifiers,
+    val nativeEvent: Any?,
+    val button: PointerButton?,
 ) {
+    actual constructor(
+        changes: LongSparseArray<PointerInputChange>,
+        pointerInputEvent: PointerInputEvent,
+    ) : this(
+        pointerInputEvent.eventType,
+        changes,
+        pointerInputEvent.buttons,
+        pointerInputEvent.keyboardModifiers,
+        pointerInputEvent.nativeEvent,
+        pointerInputEvent.button,
+    )
+
     actual var suppressMovementConsumption: Boolean = false
 
-    actual fun activeHoverEvent(pointerId: PointerId): Boolean {
-        for (p in pointerInputEvent.pointers) {
-            if (p.id == pointerId) return p.activeHover
-        }
-        return false
-    }
+    actual fun activeHoverEvent(pointerId: PointerId): Boolean =
+        changes[pointerId.value]?.type == PointerType.Mouse
 }

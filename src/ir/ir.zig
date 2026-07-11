@@ -2527,8 +2527,60 @@ pub const Module = struct {
     /// ext trailing-lambda, non-ext trailing-lambda) with the shared
     /// `applicable()` as the per-candidate gate. Body-bearing candidates only;
     /// stubs are the INDEX's domain. Returns null when no candidate applies.
+    /// Lowering-side hierarchy oracle for the applicability engine: walks
+    /// `class_super_names` by evidence head (lift-mangle stripped), so
+    /// declared-type evidence can prove a subtype match where the plain
+    /// head comparison cannot. Interfaces and classes both live in the
+    /// registry chain.
+    fn evidenceSubtypeCb(ctx: *anyopaque, sub: []const u8, super: []const u8) bool {
+        const self: *const Module = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, sub, super)) return true;
+        var cur_buf: [32][]const u8 = undefined;
+        var stack_len: usize = 0;
+        cur_buf[stack_len] = sub;
+        stack_len += 1;
+        var seen_buf: [128][]const u8 = undefined;
+        var seen_len: usize = 0;
+        while (stack_len != 0) {
+            stack_len -= 1;
+            const cur = cur_buf[stack_len];
+            var already = false;
+            for (seen_buf[0..seen_len]) |s2| {
+                if (std.mem.eql(u8, s2, cur)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            if (seen_len < seen_buf.len) {
+                seen_buf[seen_len] = cur;
+                seen_len += 1;
+            }
+            const chain = self.registry.class_super_names.get(cur) orelse
+                (if (self.registry.mangled_nested.get(cur)) |m| self.registry.class_super_names.get(m) else null) orelse
+                continue;
+            for (chain) |sup_raw| {
+                var sn = sup_raw;
+                if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+                if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+                if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+                    if (i + 1 < sn.len) sn = sn[i + 1 ..];
+                }
+                if (std.mem.eql(u8, sn, super)) return true;
+                if (stack_len < cur_buf.len) {
+                    cur_buf[stack_len] = sn;
+                    stack_len += 1;
+                }
+            }
+        }
+        return false;
+    }
+
     fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape) ?FuncId {
-        const scope = applicability.ApplicabilityScope{};
+        const scope = applicability.ApplicabilityScope{
+            .ctx = @constCast(@ptrCast(self)),
+            .ext_is_subtype_name = evidenceSubtypeCb,
+        };
         var best: ?FuncId = null;
         var best_rung: u8 = 255;
         var best_bonus: i32 = 0;
@@ -2550,7 +2602,7 @@ pub const Module = struct {
             // that candidate (`minOf(a, b)` with `a: T` picks the generic
             // overload). Zero for every candidate when no arg carries
             // evidence, so evidence-free calls rank exactly as before.
-            const bonus = applicability.tyEvidenceBonus(sv.params, args);
+            const bonus = applicability.tyEvidenceBonusScoped(sv.params, args, scope);
             if (rung < best_rung or (rung == best_rung and bonus > best_bonus)) {
                 best_rung = rung;
                 best_bonus = bonus;

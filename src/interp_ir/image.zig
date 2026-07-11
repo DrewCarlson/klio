@@ -596,6 +596,15 @@ const RegistryImage = struct {
     nested_object_aliases: []KV([]const u8, []StrKV),
     mangled_nested: []StrKV,
     class_const_inits: []struct { a: []const u8, b: []const u8, v: ir.Const },
+    class_prop_type_heads: []PairStrEntry,
+    iface_member_ext_recv: []PairStrEntry,
+    private_fn_files: []KV(FuncId, FileId),
+    file_packages: []KV(FileId, []const u8),
+    top_level_const_vals: []KV([]const u8, ir.Const),
+    member_method_fids: []KV([]const u8, FuncId),
+    private_shadow_props: []const []const u8,
+    override_cell_props: []const []const u8,
+    hierarchy_shadow_names: []struct { k: []const u8, names: []const []const u8, complete: bool },
 };
 
 const ModuleImage = struct {
@@ -1346,8 +1355,41 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             }
             break :blk list;
         },
+        .class_prop_type_heads = try pairMapToSlice(a, &r.class_prop_type_heads),
+        .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
+        .private_fn_files = try autoMapToSlice(FuncId, FileId, a, &r.private_fn_files),
+        .file_packages = try autoMapToSlice(FileId, []const u8, a, &r.file_packages),
+        .top_level_const_vals = try strMapToSlice(ir.Const, a, &r.top_level_const_vals),
+        .member_method_fids = try strMapToSlice(FuncId, a, &r.member_method_fids),
+        .private_shadow_props = try setToSlice(a, &r.private_shadow_props),
+        .override_cell_props = try setToSlice(a, &r.override_cell_props),
+        .hierarchy_shadow_names = blk: {
+            const E = @TypeOf(out.registry.hierarchy_shadow_names[0]);
+            var list = try a.alloc(E, r.hierarchy_shadow_names.count());
+            var it = r.hierarchy_shadow_names.iterator();
+            var i: usize = 0;
+            while (it.next()) |entry| : (i += 1) {
+                list[i] = .{
+                    .k = entry.key_ptr.*,
+                    .names = try setToSlice(a, &entry.value_ptr.names),
+                    .complete = entry.value_ptr.complete,
+                };
+            }
+            break :blk list;
+        },
     };
     return true;
+}
+
+/// `StrPairMap([]const u8)` -> flat (a, b, v) triples for the image.
+fn pairMapToSlice(a: Allocator, m: anytype) Allocator.Error![]PairStrEntry {
+    var out = try a.alloc(PairStrEntry, m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .v = entry.value_ptr.* };
+    }
+    return out;
 }
 
 fn autoMapToSlice(comptime K: type, comptime V: type, a: Allocator, m: *const std.AutoHashMap(K, V)) Allocator.Error![]KV(K, V) {
@@ -2021,6 +2063,20 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     }
     for (ri.mangled_nested) |kv| try r.mangled_nested.put(kv.k, kv.v);
     for (ri.class_const_inits) |entry| try r.class_const_inits.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.class_prop_type_heads) |entry| try r.class_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
+    for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);
+    for (ri.top_level_const_vals) |kv| try r.top_level_const_vals.put(kv.k, kv.v);
+    for (ri.member_method_fids) |kv| try r.member_method_fids.put(kv.k, kv.v);
+    for (ri.private_shadow_props) |k| try r.private_shadow_props.put(k, {});
+    for (ri.override_cell_props) |k| try r.override_cell_props.put(k, {});
+    for (ri.hierarchy_shadow_names) |entry| {
+        try r.hierarchy_shadow_names.put(entry.k, .{
+            .names = try sliceToSet(a, entry.names),
+            .complete = entry.complete,
+        });
+    }
 
     try out.rebuildFuncNameIndex(a);
 }

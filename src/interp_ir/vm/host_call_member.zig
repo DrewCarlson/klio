@@ -1190,6 +1190,30 @@ fn mangledNestedKey(mod: *const Module, name: []const u8) ?[]const u8 {
     return mod.registry.mangled_nested.get(name[start..]);
 }
 
+/// Whether two class-name strings name the same type head across the
+/// lift's spellings: literal match, mangle-table canonical match, or the
+/// bare head (dots and the `Outer$` lift prefix stripped) match. The head
+/// fallback carries the same simple-name semantics the rest of the
+/// hierarchy walks use — a dotted supertype (`Modifier.Node`) must satisfy
+/// a parameter lowered to its bare head (`Node`).
+pub fn classHeadsMatch(self: *VmHost, a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    const ka = mangledClassKeyOf(self, a) orelse a;
+    const kb = mangledClassKeyOf(self, b) orelse b;
+    if (std.mem.eql(u8, ka, kb)) return true;
+    return std.mem.eql(u8, bareHead(a), bareHead(b));
+}
+
+fn bareHead(name: []const u8) []const u8 {
+    var sn = name;
+    if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+    if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+        if (i + 1 < sn.len) sn = sn[i + 1 ..];
+    }
+    return std.mem.trimEnd(u8, sn, "?");
+}
+
 /// The lifted mangle key for a dotted class-name string via the module's
 /// mangle table, or null when none applies. Precise: only a table hit
 /// canonicalizes, so two unrelated same-simple-name classes never merge.
