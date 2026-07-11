@@ -193,19 +193,47 @@ by the Owner straight onto the window surface via
 `__composeui_winSurface`/`winPresent`/`winClear`) and `KlioComposeScene`
 (headless ImageComposeScene analogue with synthetic `click`/`hover` through
 `PointerInputEventProcessor`; klio actuals for `PointerInputEvent` +
-`InternalPointerEvent`). **The synthetic click DELIVERS**: a foundation
-`Box(Modifier.clickable { ... })` scene observes its onClick for every
-`scene.click` (hit test → `HitPathTracker` dispatch → the suspending
-pointer-input node → tap detection → `PressInteraction` flow →
-indication collection). Still open on this path: material3's
-`Button` handler now reaches its pointer-input coroutine intact (the
-same-arity ctor-overload selection and the coroutine probe actuals
-fixed the delivery), but the gesture closure's IMAGE-DEFERRED body
-executes empty — its `detectTapGestures(...)` call neither lowers nor
-dispatches — so the tap detector never installs. The deferred
-AstLambda body pipeline for pack lambdas is the next root; the
-foundation path (plain suspend-lambda constructor, direct pointer
-state machine) completes. PUBLIC
+`InternalPointerEvent`). **The synthetic click DELIVERS for foundation AND
+material3**: `Box(Modifier.clickable { ... })` and a full
+`MaterialTheme > Surface > Column > Button(onClick)` scene both observe
+their onClick for every in-bounds `scene.click`, with the recomposed
+count label pixel-verified. The material3 chain needed five roots, all
+general-interpreter: (1) a reified inline fn whose trailing lambda
+under-declares the fn-typed param's arity refused to splice even when
+another argument (a `NodeKind<T>`) binds `T`, so the runtime saw an
+erased always-true `is T` and dispatched `onRemeasured` on
+`ClickableNode`; nested reified inline calls now also solve `T`
+lexically from enclosing-splice parameter types (`splice_param_tys`).
+(2) `instanceOfClassName` walked superclasses only — interface-typed
+ctor params rejected implementations (`TweenSpec` for
+`AnimationSpec<T>`), disqualifying the vectorizing secondary ctor;
+interface chains now count, and a confirmed subtype scores as positive
+ctor-overload evidence. (3) An unimported foreign pack's top-level fn
+could capture a bare call (`kotlin.math.max` under `import kotlin.math.*`
+resolving to `androidx.compose.ui.unit.max(Dp, Dp)`): the symbol index
+no longer *resolves* a unique candidate at the invisible tier, the
+applicability ladder and the runtime overload re-pick rank invisible
+candidates last, and the runtime bare-name global falls through to the
+intrinsic when the flat pick is out of scope at the reference site.
+(4) A fun-interface value that arrives as a RAW closure now dispatches:
+implicit SAM conversion wraps callable ctor args whose declared param
+type is a fun interface (the explicit `Iface { }` path already did),
+and the CMG walk serves a bare name that misses on a callable candidate
+by invoking it as the interface's single abstract method — with the
+next implicit receiver out handed as `this` for member-extension SAMs
+(`MeasurePolicy`'s `MeasureScope.measure`, `PointerInputEventHandler`'s
+`PointerInputScope.invoke`). (5) `probeCoroutineCreated` actuals.
+Raw `Layout(content, modifier) { measure }` + `Modifier.pointerInput`
+in USER source now runs its measure lambda and starts its pointer
+coroutine (PI-START); still open there: a late bare `set` VALUE read
+inside the spliced `fastFirstOrNull` raises `unresolved global` on the
+raw-Layout path only (foundation/material3 unaffected), and
+`launch(start = UNDISPATCHED)` runs its block twice (a dispatched
+re-delivery follows the synchronous run — pre-existing, now benign for
+clicks since both runs carry the right receiver). Explicit-receiver
+member-inline reified calls (`c.visitNodes(...)`, `CC(...).pfw<E>{}`)
+still fall to runtime with `T` unbound (implicit-this calls splice
+correctly). PUBLIC
 cross-package top-level name collisions (`internal` ones now lift
 mangled with a package-scoped rename channel) wait on the symbol index
 and import channels resolving renamed classifiers

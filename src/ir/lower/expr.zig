@@ -3193,7 +3193,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // argument like `Nodes.Draw : NodeKind<DrawModifierNode>`), so the
         // spliced `is T` checks the real class — runtime dispatch of the
         // inline body would read a stale/unbound `T`.
-        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args)) break :gate true;
+        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) break :gate true;
         const recv = callee.Member.receiver;
         if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
         const n = recv.Path.segments[0].name;
@@ -3888,7 +3888,8 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         const reified_underfilled = ast_type_args.len == 0 and
             anyReified(f.type_params) and
             inline_call_shape.trailing_lambda_arity != null and
-            reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?);
+            reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?) and
+            !inline_call.reifiedBindableFromArgs(b, f, args, ast_arg_names);
         if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
@@ -4529,6 +4530,22 @@ fn inlineOwnerInEnclosingHierarchy(b: *FuncBuilder, enclosing: []const u8, f: *c
     return b.module.classIsOrExtends(enclosing, owner);
 }
 
+/// Whether a plain top-level inline fn is visible at `caller_file` under
+/// Kotlin scoping: same package, exact or wildcard import, or a
+/// default-import package. Ranked with the same tiers as the symbol
+/// index (`scopeTier`); only the invisible tier (an unimported foreign
+/// package) is rejected. Unknown declaring package keeps the pick — the
+/// registry has no file record to judge it by.
+fn bareInlineVisibleFrom(b: *const FuncBuilder, f: *const ast.Function, caller_file: span.FileId) bool {
+    const m = b.module;
+    const decl_file = f.name.span.file;
+    const decl_pkg = m.packageOfFile(decl_file) orelse return true;
+    const caller_pkg = m.packageOfFile(caller_file) orelse b.self_package;
+    var buf: [256]u8 = undefined;
+    const fqn = std.fmt.bufPrint(&buf, "{s}.{s}", .{ decl_pkg, f.name.name }) catch return true;
+    return m.scopeTier(fqn, decl_pkg, f.name.name, caller_pkg, caller_file) <= 3;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -4560,7 +4577,26 @@ fn inlineTargetForBareCall(
             }
             break :blk inline_state.inlineAstById(fid.int());
         },
-        .deferred => narrowed,
+        // The index declined; the shape-narrowed pick stands in — but a
+        // plain (receiverless) inline fn is only a legal target when its
+        // declaring package is in scope at the call site. Without the
+        // filter, `max(permits, 0)` under `import kotlin.math.*` splices
+        // an unrelated pack's `max(a: Dp, b: Dp)`. Extension picks stay:
+        // receiver narrowing, not package scope, is their discriminator.
+        .deferred => blk: {
+            const nf = narrowed orelse break :blk null;
+            // Member-inline fns are exempt: their discriminator is the
+            // enclosing class hierarchy (checked below), not package
+            // scope — `propertyFailsWith` on an implicit CompareContext
+            // receiver must splice from any file.
+            if (nf.receiver_type == null and
+                inline_state.inlineMemberOwner(nf) == null and
+                !bareInlineVisibleFrom(b, nf, seg.span.file))
+            {
+                break :blk null;
+            }
+            break :blk nf;
+        },
     };
     // Same-simple-name inline MEMBER overloads declared in unrelated classes:
     // a bare call inside a member binds `this.<name>`, so the overload must be

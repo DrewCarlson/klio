@@ -279,6 +279,7 @@ fn inferReifiedTypeArgs(
     explicit: []const TypeRef,
     expected: ?*const TypeRef,
     ordered: []const ?*const Expr,
+    bb: ?*const FuncBuilder,
 ) Allocator.Error![]?TypeRef {
     var out = try allocator.alloc(?TypeRef, f.type_params.len);
     for (f.type_params, 0..) |_, i| {
@@ -309,7 +310,7 @@ fn inferReifiedTypeArgs(
     for (f.params, 0..) |*p, i| {
         if (i >= ordered.len) break;
         const arg = ordered[i] orelse continue;
-        try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst);
+        try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst, bb);
     }
 
     // Fallback: unify the declared return type against the call's expected
@@ -337,7 +338,7 @@ fn inferReifiedTypeArgs(
 /// inline extension in statement position, where `drawNode.dispatchForKind(
 /// Nodes.Draw) { … }` must splice so `is T` checks the argument's real
 /// generic type instead of dispatching at runtime with `T` unbound.
-pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const Expr) bool {
+pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const Expr, bb: ?*const FuncBuilder) bool {
     const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
         .Lambda, .AnonFun => true,
         else => false,
@@ -358,7 +359,7 @@ pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const 
     const ordered = allocator.alloc(?*const Expr, f.params.len) catch return false;
     defer allocator.free(ordered);
     for (ordered, 0..) |*slot, i| slot.* = if (i < args.len) &args[i] else null;
-    const probe = inferReifiedTypeArgs(allocator, f, &.{}, null, ordered) catch return false;
+    const probe = inferReifiedTypeArgs(allocator, f, &.{}, null, ordered, bb) catch return false;
     defer allocator.free(probe);
     for (f.type_params, 0..) |tp, i| {
         if (tp.is_reified and probe[i] == null) return false;
@@ -383,7 +384,35 @@ fn unifyParamAgainstArg(
     arg: *const Expr,
     tp_names: *const std.StringHashMap(void),
     subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
 ) Allocator.Error!void {
+    // An argument naming an enclosing splice's parameter carries that
+    // parameter's declared type (with the enclosing reified substitution
+    // already applied): `it.dispatchForKind(type, block)` inside a
+    // spliced `visitNodes(type: NodeKind<T>, block: (T) -> Unit)` body
+    // solves the nested call's `T` from `type`'s recorded type.
+    if (arg.* == .Path and arg.Path.segments.len == 1) {
+        if (bb) |b| {
+            if (b.spliceParamTy(arg.Path.segments[0].name)) |aty| {
+                if (param_ty.function) |pft| {
+                    if (aty.function) |aft| {
+                        const n = @min(pft.params.len, aft.params.len);
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try unifyTypeParam(&pft.params[i], &aft.params[i], tp_names, subst);
+                        }
+                        if (pft.receiver != null and aft.receiver != null) {
+                            try unifyTypeParam(&pft.receiver.?, &aft.receiver.?, tp_names, subst);
+                        }
+                        try unifyTypeParam(&pft.ret, &aft.ret, tp_names, subst);
+                    }
+                } else {
+                    try unifyTypeParam(param_ty, &aty, tp_names, subst);
+                }
+                return;
+            }
+        }
+    }
     if (param_ty.function) |ft| {
         if (arg.* == .Lambda) {
             const lam = &arg.Lambda;
@@ -802,7 +831,7 @@ pub fn tryInlineCallWithTypeArgs(
     // reified parameters (the `Json.encodeToString(value)` shape) splices
     // fine without a binding.
     {
-        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered);
+        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
         defer b.allocator.free(probe);
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
@@ -1000,7 +1029,7 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
-    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered);
+    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
     defer b.allocator.free(effective_type_args);
     const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
     var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
@@ -1075,6 +1104,19 @@ pub fn tryInlineCallWithTypeArgs(
         const prev = try b.bindReifiedType(tp.name.name, cls_reg);
         try reified_restores.append(b.allocator, .{ .name = tp.name.name, .prev = prev });
     }
+    // Record each parameter's declared type (with this splice's reified
+    // substitutions applied) so a nested reified inline call in the body
+    // that passes these parameters along can solve its own type
+    // parameters lexically.
+    const SpRestore = struct { name: []const u8, prev: ?ast.TypeRef };
+    var splice_ty_restores: std.ArrayList(SpRestore) = .empty;
+    defer splice_ty_restores.deinit(b.allocator);
+    defer for (splice_ty_restores.items) |sr| b.restoreSpliceParamTy(sr.name, sr.prev);
+    for (f.params) |*p| {
+        const sub = try substReifiedInTypeRef(b, &p.ty);
+        const sprev = try b.bindSpliceParamTy(p.name.name, sub);
+        try splice_ty_restores.append(b.allocator, .{ .name = p.name.name, .prev = sprev });
+    }
     // Mark body-declared `var`s that a nested closure writes as boxed so
     // their decl emits `MakeCell` and the closure's write lands on the
     // shared cell. (Params were boxed at bind time above; this covers
@@ -1144,6 +1186,77 @@ fn paramIndex(f: *const Function, name: []const u8) ?usize {
         if (std.mem.eql(u8, p.name.name, name)) return i;
     }
     return null;
+}
+
+/// Clone `ty` with the builder's active reified NAME substitutions
+/// applied (`NodeKind<T>` -> `NodeKind<LayoutAwareModifierNode>`),
+/// recursing through generic arguments and function-type positions.
+fn substReifiedInTypeRef(b: *FuncBuilder, ty: *const TypeRef) Allocator.Error!TypeRef {
+    var out = ty.*;
+    if (b.resolveReifiedTypeName(ty.name.name)) |actual| {
+        out.name = .{ .name = actual, .span = ty.name.span };
+    }
+    if (ty.type_args.len != 0) {
+        const targs = try b.allocator.alloc(ast.TypeArg, ty.type_args.len);
+        for (ty.type_args, 0..) |ta, i| {
+            targs[i] = ta;
+            if (!ta.is_star) targs[i].ty = try substReifiedInTypeRef(b, &ta.ty);
+        }
+        out.type_args = targs;
+    }
+    if (ty.function) |ft| {
+        const nf = try b.allocator.create(ast.FunctionTypeRef);
+        nf.* = ft.*;
+        if (ft.receiver) |*r| nf.receiver = try substReifiedInTypeRef(b, r);
+        const nparams = try b.allocator.alloc(TypeRef, ft.params.len);
+        for (ft.params, 0..) |*p, i| nparams[i] = try substReifiedInTypeRef(b, p);
+        nf.params = nparams;
+        nf.ret = try substReifiedInTypeRef(b, &ft.ret);
+        out.function = nf;
+    }
+    return out;
+}
+
+/// Whether every reified type parameter of `f` is solvable from the
+/// call's non-lambda arguments (explicit generic-typed values, splice
+/// parameters carrying recorded types). Used to keep a splice whose
+/// trailing lambda under-declares the function-typed parameter's arity:
+/// arity only matters when the lambda is the sole evidence for `T`.
+pub fn reifiedBindableFromArgs(
+    b: *const FuncBuilder,
+    f: *const Function,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+) bool {
+    const ordered = b.allocator.alloc(?*const Expr, f.params.len) catch return false;
+    defer b.allocator.free(ordered);
+    for (ordered) |*slot| slot.* = null;
+    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    };
+    const lambda_to_last = last_is_lambda and args.len <= f.params.len and f.params.len > 0;
+    if (lambda_to_last) ordered[f.params.len - 1] = &args[args.len - 1];
+    const positional_n = if (lambda_to_last) args.len - 1 else args.len;
+    var next_pos: usize = 0;
+    for (args[0..positional_n], 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        if (nm) |name| {
+            const idx = paramIndex(f, name) orelse return false;
+            ordered[idx] = a;
+        } else {
+            while (next_pos < ordered.len and ordered[next_pos] != null) next_pos += 1;
+            if (next_pos >= ordered.len) return false;
+            ordered[next_pos] = a;
+            next_pos += 1;
+        }
+    }
+    const probe = inferReifiedTypeArgs(b.allocator, f, &.{}, null, ordered, b) catch return false;
+    defer b.allocator.free(probe);
+    for (f.type_params, 0..) |tp, i| {
+        if (tp.is_reified and probe[i] == null) return false;
+    }
+    return true;
 }
 
 /// Index of a parameter that solves type parameter `tp_name` from a

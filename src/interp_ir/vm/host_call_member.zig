@@ -2756,6 +2756,19 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         (receiver.* == .Function or receiver.* == .IrClosure))
     {
         freeDispatchMiss(allocator, r);
+        // The interface method may declare an extension receiver
+        // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`):
+        // Kotlin resolves it from the call site's enclosing implicit
+        // receivers, and the lambda body's bare-member calls
+        // (`awaitPointerEventScope { … }`) resolve against it. Hand the
+        // innermost enclosing instance as `this`; a body that never
+        // reads a receiver is unaffected.
+        const encl = ir.eval.enclosingEntriesAlloc(allocator) catch &.{};
+        defer allocator.free(@constCast(encl));
+        for (encl) |e| {
+            if (e.v != .Instance) continue;
+            return host_call_value.callValueWithThis(self, allocator, receiver, &e.v, args, &.{});
+        }
         return host_call_value.callValue(self, allocator, receiver, args);
     }
     return r;
@@ -8079,7 +8092,19 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
 
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
-    if (missTraceWant(name)) std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s}\n", .{ strict_ext, args.len, receiver.typeFqn() });
+    if (missTraceWant(name)) {
+        const rk: []const u8 = switch (receiver.*) {
+            .Instance => |inst| blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                break :blk cg.get().fqn;
+            },
+            else => receiver.typeFqn(),
+        };
+        std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s}\n", .{ strict_ext, args.len, rk });
+    }
 
     // Inline-cache fast path. A prior *owner-independent* resolution of this
     // (receiver class, name, arg types) to a top-level extension dispatches

@@ -249,6 +249,14 @@ fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value)
             score += 2;
             continue;
         }
+        // Confirmed subtype (superclass or interface chain) is positive
+        // evidence, below an exact head match: `TweenSpec` fits an
+        // `AnimationSpec<T>` slot and must outrank a candidate whose slot
+        // (`VectorizedAnimationSpec<V>`) merely fails to disqualify.
+        if (args[i] == .Instance and instanceOfClassName(&args[i], declared)) {
+            score += 1;
+            continue;
+        }
         const decl_integral = headInSet(declared, &integral_heads);
         const decl_collish = headInSet(declared, &collectionish_heads);
         const got_integral = headInSet(got, &integral_heads);
@@ -2034,6 +2042,40 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
         return .{ .err = try typeErr(allocator, "{s}() expects {d} args, got {d}", .{ class_name, n_primary, effective.items.len }) };
     }
 
+    // Implicit SAM conversion at the constructor boundary: a raw callable
+    // bound to a parameter whose declared type is a fun interface wraps
+    // into a SAM instance, exactly as the explicit `Iface { … }` form
+    // does. The wrapped value is what dispatch relies on for the
+    // interface's method identity — a receiver-typed single method
+    // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`) can
+    // only bind its extension receiver through the instance's class.
+    for (effective.items, 0..) |a, i| {
+        if (a != .IrClosure and a != .Function) continue;
+        const declared: ?[]const u8 = blk: {
+            const dg = class_def.borrow();
+            defer dg.deinit();
+            if (i < dg.get().primary_params.len) break :blk dg.get().primary_params[i].declared_type;
+            break :blk null;
+        };
+        const dt = declared orelse continue;
+        if (dt.len == 0 or std.mem.startsWith(u8, dt, "Function")) continue;
+        const pd = classDefByName(self, dt) orelse continue;
+        defer pd.deinit();
+        if (!classDefIsFunInterface(pd)) continue;
+        const identity = nextInstanceId(self);
+        var fields: std.ArrayList(InstanceData.Field) = .empty;
+        if (runtime.reclaimEnabled()) a.retain();
+        try fields.append(allocator, .{ .name = "__sam_target__", .value = a });
+        const inst = try ObjRef(InstanceData).init(allocator, .{
+            .class = pd.clone(),
+            .fields = fields,
+            .outer = null,
+            .identity = identity,
+            .native_state = null,
+        });
+        effective.items[i] = .{ .Instance = inst };
+    }
+
     return materializeInstance(self, allocator, class_def, ir_name, effective.items, outer_hint);
 }
 
@@ -2185,7 +2227,8 @@ fn enclosingClassNameOf(self: *VmHost, class_def: ObjRef(ClassDef), ir_name: []c
 }
 
 /// True when `v` is an `Instance` whose class is `want` or a subtype of it
-/// (simple name or FQN, walking the resolved parent chain).
+/// (simple name or FQN, walking the resolved parent chain and each class's
+/// transitive interface supertypes).
 fn instanceOfClassName(v: *const Value, want: []const u8) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
@@ -2193,7 +2236,9 @@ fn instanceOfClassName(v: *const Value, want: []const u8) bool {
     var cur: ?ObjRef(ClassDef) = g.get().class.clone();
     while (cur) |c| {
         const cg = c.borrow();
-        const matched = std.mem.eql(u8, cg.get().name, want) or std.mem.eql(u8, cg.get().fqn, want);
+        const matched = std.mem.eql(u8, cg.get().name, want) or
+            std.mem.eql(u8, cg.get().fqn, want) or
+            classDefImplements(cg.get(), want, 0);
         const next: ?ObjRef(ClassDef) = if (cg.get().parent) |p| p.clone() else null;
         cg.deinit();
         c.deinit();
@@ -2202,6 +2247,26 @@ fn instanceOfClassName(v: *const Value, want: []const u8) bool {
             return true;
         }
         cur = next;
+    }
+    return false;
+}
+
+/// Whether `d` names `want` among its (transitive) interface supertypes.
+/// Walks resolved `interfaces` refs recursively and falls back to the raw
+/// `supertype_names` for interfaces never resolved into refs (builtin or
+/// cross-pack names) — an interface-typed parameter must accept a class
+/// implementing it (`TweenSpec` for `AnimationSpec<T>`).
+fn classDefImplements(d: *const ClassDef, want: []const u8, depth: u32) bool {
+    if (depth > 16) return false;
+    for (d.supertype_names) |sn| {
+        if (std.mem.eql(u8, sn, want)) return true;
+    }
+    for (d.interfaces) |iface| {
+        const fg = iface.borrow();
+        defer fg.deinit();
+        const idef = fg.get();
+        if (std.mem.eql(u8, idef.name, want) or std.mem.eql(u8, idef.fqn, want)) return true;
+        if (classDefImplements(idef, want, depth + 1)) return true;
     }
     return false;
 }

@@ -228,6 +228,17 @@ pub fn currentFramePackage() ?[]const u8 {
     return if (pkg.len == 0) null else pkg;
 }
 
+/// The nearest enclosing frame's declaring package, walking outward past
+/// frames without one (synthesized accessors / init thunks carry no
+/// package of their own; their lexical home is the calling frame's).
+pub fn nearestFramePackage() ?[]const u8 {
+    var cur = frame_chain;
+    while (cur) |f| : (cur = f.gc_link) {
+        if (f.func.package.len != 0) return f.func.package;
+    }
+    return null;
+}
+
 /// Lexical-origin override for file-private visibility. Kotlin resolves a
 /// callable reference where it is WRITTEN: `.map(String::indentWidth)`
 /// referencing a file-private extension is legal in its declaring file even
@@ -4215,6 +4226,23 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 static_recv_ty
             else
                 null;
+            // A bare `invoke()` on a callable candidate is a fun-interface
+            // dispatch (`with(pointerInputEventHandler) { invoke() }`): the
+            // interface method may declare an extension receiver, which
+            // Kotlin resolves from the ENCLOSING implicit receivers — the
+            // plain invoke arm would run the lambda with no receiver at
+            // all and strand its bare-member calls. Route it through the
+            // receiver-carrying bridge below.
+            if ((c.v == .IrClosure or c.v == .Function) and std.mem.eql(u8, name_str, "invoke")) {
+                if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
+                    .done => |v| {
+                        resolved = v;
+                        break;
+                    },
+                    .raised => |e| return raiseStep(frame, e),
+                };
+                continue;
+            }
             switch (if (committed_ext_h != null)
                 try host.callMemberMembersOnly(allocator, &c.v, name_str, arg_values, names, hint)
             else
@@ -4232,7 +4260,25 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     // would re-execute its side effects on an outer
                     // receiver — same doctrine as `CalleeFailed`.
                     .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
-                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+                    .Unimplemented => |m| {
+                        freeDispatchMissMsg(allocator, m);
+                        // A callable candidate is an unwrapped fun-interface
+                        // value: the bare name dispatches its single abstract
+                        // method to the lambda (`with(layoutNode.measurePolicy)
+                        // { measure(measurables, constraints) }` stores the
+                        // conversion-site lambda). Kotlin binds the INNERMOST
+                        // receiver, so the interface dispatch must win here —
+                        // before an outer receiver's same-name member (the
+                        // coordinator's 1-arg `measure`) grabs the call. A
+                        // closure has no real members, so nothing is shadowed.
+                        if (c.v == .IrClosure or c.v == .Function) {
+                            if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
+                                .done => |v| resolved = v,
+                                .raised => |re| return raiseStep(frame, re),
+                            };
+                            if (resolved != null) break;
+                        }
+                    },
                     else => if (first_real_err == null) {
                         first_real_err = e;
                     },
@@ -4368,7 +4414,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name)) {
+        const cno_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -4456,6 +4503,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (host.bareUnsettledHeaderNoOp(frame.module, name_str, arg_values.len)) {
                     orAudit("CallMemberOrGlobal", name_str, "unsettled_header_noop", -1, null);
                     result = .Unit;
+                } else if (this_val == .IrClosure or this_val == .Function) {
+                    // The innermost implicit receiver is a plain callable and
+                    // nothing else serves the name: a fun-interface value that
+                    // was never SAM-wrapped (`with(layoutNode.measurePolicy) {
+                    // measure(measurables, constraints) }` where the stored
+                    // policy is the conversion-site lambda). Kotlin dispatches
+                    // the interface's single abstract method to the lambda —
+                    // invoke it with the call's arguments.
+                    orAudit("CallMemberOrGlobal", name_str, "sam_receiver_invoke", -1, null);
+                    var sam_recv = this_val;
+                    switch (try host.callValueNamed(allocator, &sam_recv, arg_values, names)) {
+                        .ok => |v| result = v,
+                        .err => |e| return raiseStep(frame, e),
+                    }
                 } else {
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                     if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
@@ -4608,6 +4669,50 @@ const ImplicitCandidate = struct {
 /// while a `with`/`run`/`apply` subject brings only itself
 /// (`with(x) { … }` never puts `x`'s enclosing instances or companion in
 /// scope). Caller frees the returned slice.
+const SamInvokeOutcome = union(enum) { done: Value, raised: EvalError };
+
+/// Dispatch a bare name that missed (or is `invoke`) on a CALLABLE walk
+/// candidate as a fun-interface method: run the lambda with the next
+/// implicit receiver out handed as `this` (the interface method may be a
+/// member extension — `MeasurePolicy`'s `MeasureScope.measure` — whose
+/// body resolves bare names against that receiver). Returns null when the
+/// invocation itself reports a non-control-flow error, letting the walk
+/// continue.
+fn samCandidateInvoke(
+    comptime H: type,
+    allocator: Allocator,
+    frame: *Frame,
+    host: *H,
+    cands: []const ImplicitCandidate,
+    ci: usize,
+    name_str: []const u8,
+    arg_values: []const Value,
+    names: []const ?[]const u8,
+) Allocator.Error!?SamInvokeOutcome {
+    _ = frame;
+    var sam_recv = cands[ci].v;
+    const sam_this: ?Value = if (ci + 1 < cands.len) cands[ci + 1].v else null;
+    const sam_res = if (comptime @hasDecl(H, "callValueWithThis")) blk: {
+        if (sam_this) |st| break :blk try host.callValueWithThis(allocator, &sam_recv, &st, arg_values, names);
+        break :blk try host.callValueNamed(allocator, &sam_recv, arg_values, names);
+    } else try host.callValueNamed(allocator, &sam_recv, arg_values, names);
+    switch (sam_res) {
+        .ok => |v| {
+            orAudit("CallMemberOrGlobal", name_str, "sam_receiver_invoke", cands[ci].depth, &cands[ci].v);
+            return .{ .done = v };
+        },
+        .err => |se| switch (se) {
+            .Suspended, .CalleeFailed, .Throw, .NonLocalReturn, .LabeledReturn => return .{ .raised = se },
+            else => {
+                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[sam-inv] {s} swallowed err={s}\n", .{ name_str, @tagName(se) });
+                }
+                return null;
+            },
+        },
+    }
+}
+
 fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8, direct_this: ?Value) Allocator.Error![]ImplicitCandidate {
     var out: std.ArrayList(ImplicitCandidate) = .empty;
     errdefer out.deinit(allocator);
@@ -5997,7 +6102,9 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId) Allocator.Error!MaybeValueResult {
+        _ = caller_pkg;
+        _ = caller_file;
         _ = .{ self, allocator, module, name, args, arg_names, ctor_name };
         return .{ .ok = null };
     }

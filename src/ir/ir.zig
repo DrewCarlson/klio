@@ -1945,7 +1945,7 @@ pub const Module = struct {
         return null;
     }
 
-    fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+    pub fn scopeTier(self: *const Module, fqn: []const u8, pkg: []const u8, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
         for (self.importAliasPathsIn(caller_file, name)) |p| {
             if (std.mem.eql(u8, p.fqn, fqn)) return 0;
         }
@@ -2371,6 +2371,24 @@ pub const Module = struct {
             count += 1;
         }
         if (count == 1) {
+            // A unique match in a package the caller cannot see is not a
+            // resolution: kotlinc rejects the reference outright. Defer as
+            // an unimported set — the diagnostic layer reports it and the
+            // dynamic path keeps klio's lenient last resort. A candidate
+            // with no recorded package is a lift artifact with unreliable
+            // scoping metadata and keeps the lenient resolution.
+            const chosen_pkg_known = blk: {
+                const cfn = self.funcById(chosen.?) orelse break :blk false;
+                break :blk cfn.package.len != 0;
+            };
+            if (best_tier == other_package_tier and chosen_pkg_known) {
+                return .{
+                    .outcome = .{ .deferred = .unimported_set },
+                    .tier = best_tier,
+                    .tier_count = count,
+                    .first = chosen,
+                };
+            }
             return .{
                 .outcome = .{ .resolved = chosen.? },
                 .tier = best_tier,
@@ -2576,7 +2594,7 @@ pub const Module = struct {
         return false;
     }
 
-    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape) ?FuncId {
+    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId) ?FuncId {
         const scope = applicability.ApplicabilityScope{
             .ctx = @constCast(@ptrCast(self)),
             .ext_is_subtype_name = evidenceSubtypeCb,
@@ -2584,6 +2602,16 @@ pub const Module = struct {
         var best: ?FuncId = null;
         var best_rung: u8 = 255;
         var best_bonus: i32 = 0;
+        // A candidate in a package the caller cannot see (no import, not
+        // the own/default/shipped surface) is not a Kotlin resolution
+        // target. It never outranks a visible candidate — including the
+        // bodyless intrinsic stubs the ladder cannot rank (`kotlin.math.
+        // max` vs an unimported pack's `max(Dp, Dp)`), so an invisible
+        // applicable body must not preempt the declared-arity fallback.
+        // It is kept only as a last-resort lenient pick.
+        var best_invisible: ?FuncId = null;
+        var best_inv_rung: u8 = 255;
+        var best_inv_bonus: i32 = 0;
         for (self.funcsBySimpleName(name)) |id| {
             const f = self.funcById(id) orelse continue;
             if (f.low_priority) continue;
@@ -2603,13 +2631,43 @@ pub const Module = struct {
             // overload). Zero for every candidate when no arg carries
             // evidence, so evidence-free calls rank exactly as before.
             const bonus = applicability.tyEvidenceBonusScoped(sv.params, args, scope);
+            // Extensions stay in the visible pool regardless of tier:
+            // receiver-based resolution, not package scope, is their
+            // discriminator (an implicit receiver can supply them).
+            const invisible = !is_ext and
+                self.scopeTier(f.fqn, f.package, name, caller_pkg, caller_file) == other_package_tier;
+            if (invisible) {
+                if (rung < best_inv_rung or (rung == best_inv_rung and bonus > best_inv_bonus)) {
+                    best_inv_rung = rung;
+                    best_inv_bonus = bonus;
+                    best_invisible = id;
+                }
+                continue;
+            }
             if (rung < best_rung or (rung == best_rung and bonus > best_bonus)) {
                 best_rung = rung;
                 best_bonus = bonus;
                 best = id;
             }
         }
-        return best;
+        if (best != null) return best;
+        // No visible body candidate. When a visible bodyless/intrinsic
+        // form exists, defer to the declared-arity fallback (it ranks
+        // stubs); otherwise keep the lenient out-of-scope pick. An alias
+        // name is intrinsic-backed by definition — the host global serves
+        // it even when no Func entry exists to prove visibility.
+        if (best_invisible != null) {
+            if (isAliasName(name)) return null;
+            for (self.funcsBySimpleName(name)) |id| {
+                const f = self.funcById(id) orelse continue;
+                if (funcHasImplicitThis(f)) continue;
+                if (f.hasBody()) continue;
+                if (self.scopeTier(f.fqn, f.package, name, caller_pkg, caller_file) < other_package_tier) {
+                    return null;
+                }
+            }
+        }
+        return best_invisible;
     }
 
     fn declArityOf(self: *const Module, id: FuncId) ?u32 {
@@ -2780,7 +2838,7 @@ pub const Module = struct {
         // overload; otherwise the applicable() ladder ranks the body candidates,
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
-        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args);
+        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file);
         if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
             heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args);
         }
