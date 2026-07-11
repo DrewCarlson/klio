@@ -232,9 +232,24 @@ handler fires (scene_click HIT). Desktop-style entrypoints landed:
 window rendered by the real engine with clicks through
 `PointerInputEventProcessor`; headless it reports `opened=false`
 cleanly (examples/compose_window.kt, deterministic in both
-environments). One window per application, parameters fixed at open;
-multi-window and recomposition-driven window parameters are future
-work. Two follow-up roots landed: (a) the
+environments). Multi-window and recomposition-driven
+window parameters are DONE: `application {}` is a real composition (its
+block is `@Composable ApplicationScope.() -> Unit`), `Window(...)` is a
+composable managing its native window's lifecycle — state-gated windows
+open and close with recomposition, and title/size changes on a live
+window apply through `__composeui_winSetTitle`/`__composeui_winSetSize`.
+The SDL backend routes events per window (the global queue parks foreign
+events on the owning window) and ref-counts the VIDEO subsystem across
+closes. The loop drives `Recomposer.pumpFrame()` — a synchronous frame
+pump (frame-clock fan-out + recompose) — so effect-driven state repaints
+windows without input. LaunchedEffect bodies now run AFTER the pass
+applies (the Compose contract; the eager launch ran them mid-composition),
+which surfaced and fixed two interpreter roots: the runtime→eval error
+map dropped `.LabeledReturn` at host-intrinsic boundaries (`return@fn`
+inside kotlinx `synchronized` blocks), and same-name PLAIN inline picks
+now re-rank by call-site scope tier (seven `synchronized` actuals made
+registration order flaky). examples/compose_multiwindow.kt verifies the
+live retitle, the state-driven window close, and exit. Two follow-up roots landed: (a) the
 `launch(start = UNDISPATCHED)` body ran twice-or-more because three
 runtime arms treated ANY bare name missing on a callable receiver as
 that callable's SAM method — `probeCoroutineResumed(completion)` inside
