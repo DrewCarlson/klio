@@ -35,7 +35,7 @@ const lowerBlock = expr_lower.lowerBlock;
 /// type, looked up from a same-named non-extension function). Returns
 /// `null` when the type can't be inferred cheaply — the caller then falls
 /// back to shape-based overload resolution.
-fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
+pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
     const arg = this_arg orelse return b.recvTy();
     switch (arg.*) {
         .This, .Super => return b.recvTy(),

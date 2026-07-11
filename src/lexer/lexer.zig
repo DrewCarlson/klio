@@ -981,7 +981,17 @@ pub const Lexer = struct {
             // Closing quote(s).
             if (b == '"') {
                 if (raw) {
-                    if (self.peekByte(1) == @as(?u8, '"') and self.peekByte(2) == @as(?u8, '"')) {
+                    // A raw string closes on the LAST three quotes of a
+                    // run: `"""x""""` is `x"` (any quotes beyond the
+                    // closing triple belong to the content).
+                    var run: u32 = 1;
+                    while (self.peekByte(run) == @as(?u8, '"')) run += 1;
+                    if (run >= 3) {
+                        var extra = run - 3;
+                        while (extra > 0) : (extra -= 1) {
+                            try text.append(self.allocator, '"');
+                            self.pos += 1;
+                        }
                         try self.flushStringText(tokens, &text, segment_start);
                         self.pos += 3;
                         try tokens.append(self.allocator, .{
@@ -1796,6 +1806,37 @@ test "triple quoted raw string keeps backslashes and newlines" {
         if (t.kind == .ShortInterp and std.mem.eql(u8, t.kind.ShortInterp, "x")) has_x = true;
     }
     try testing.expect(has_x);
+}
+
+test "raw string closes on the last three quotes of a run" {
+    // """a"""" is the raw string `a"`: the run of four quotes ends the
+    // literal with its final three, and the first belongs to the content.
+    var r = try lex("\"\"\"a\"\"\"\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(testing.allocator);
+    for (r.tokens) |t| {
+        if (t.kind == .StringText) try texts.append(testing.allocator, t.kind.StringText);
+    }
+    try testing.expectEqual(@as(usize, 1), texts.items.len);
+    try testing.expectEqualStrings("a\"", texts.items[0]);
+}
+
+test "raw string quote runs around an interpolation" {
+    // """"${x}"""" is `"`, the interpolation, then `"` — the ktor
+    // RoutingResolveTrace form.
+    var r = try lex("\"\"\"\"${x}\"\"\"\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(testing.allocator);
+    for (r.tokens) |t| {
+        if (t.kind == .StringText) try texts.append(testing.allocator, t.kind.StringText);
+    }
+    try testing.expectEqual(@as(usize, 2), texts.items.len);
+    try testing.expectEqualStrings("\"", texts.items[0]);
+    try testing.expectEqualStrings("\"", texts.items[1]);
 }
 
 test "unterminated string diag" {

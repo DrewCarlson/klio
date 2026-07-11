@@ -104,6 +104,12 @@ pub const LoadOptions = struct {
     /// the stderr warning. Set by secondary loads (the stdlib-image extend
     /// pass) so a broken pack is reported once per run, not once per load.
     report_failures: bool = true,
+    /// When false, the caller consumes only the load's side products
+    /// (bindings, known packages, selection, import fixed point) and
+    /// drops the ASTs — the stdlib-image hit path. A pack carrying the
+    /// precomputed `imports` section then skips parsing its sources; a
+    /// pack without one parses as before.
+    asts_needed: bool = true,
 };
 
 /// `Result<PathBuf, String>` carried as data: `ok` is an owned path and
@@ -734,6 +740,7 @@ fn loadPackCandidate(
     out_asts: *std.ArrayList(KotlinFile),
     out_bindings: *HostBindings,
     new_imports: *std.ArrayList([]u8),
+    asts_needed: bool,
 ) Allocator.Error!void {
     const manifest = &c.manifest;
     const reader = &c.pack;
@@ -745,13 +752,60 @@ fn loadPackCandidate(
     for (manifest.implicit_packages) |p| {
         stdlib.registerKnownPackage(p);
     }
+    var loaded_from_sources = false;
+    var err: PackError = undefined;
+    // A caller that drops the ASTs needs only the packages, imports, and
+    // feature hints a parse would surface — served straight from the
+    // precomputed `imports` section when the pack carries one.
+    if (!asts_needed) {
+        if (reader.readSection(section_names.IMPORTS, &err) catch null) |payload| {
+            defer payload.deinit(allocator);
+            if (schema.decode(schema.ImportsBundle, allocator, payload.slice(), &err) catch null) |bundle_val| {
+                var bundle = bundle_val;
+                defer bundle.deinit(allocator);
+                loaded_from_sources = true;
+                for (bundle.files) |imf| {
+                    if (stdlib.isConsumptionDeferredSource(imf.rel_path)) continue;
+                    if (!sourceIsActive(imf.rel_path, manifest, active_features)) {
+                        if (inactiveGate(imf.rel_path, manifest, active_features)) |gate| {
+                            if (imf.pkg.len != 0) {
+                                var imp_it = user_imports.keyIterator();
+                                var matched = false;
+                                while (imp_it.next()) |imp| {
+                                    if (importMatchesPackage(allocator, imp.*, imf.pkg)) {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                                if (matched) {
+                                    feature_hints.append(allocator, .{
+                                        .lib = try allocator.dupe(u8, lib_id),
+                                        .feat = try allocator.dupe(u8, gate.feature),
+                                        .pkg = try allocator.dupe(u8, imf.pkg),
+                                    }) catch {};
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if (imf.pkg.len != 0) stdlib.registerKnownPackage(imf.pkg);
+                    for (imf.imports) |imp| {
+                        const joined = allocator.dupe(u8, imp) catch continue;
+                        new_imports.append(allocator, joined) catch allocator.free(joined);
+                    }
+                }
+            }
+        }
+        if (loaded_from_sources) {
+            try readPackBindings(allocator, reader, lib_id, merged, out_bindings);
+            return;
+        }
+    }
     // Re-parse the pack's Kotlin sources through the shared SourceMap
     // rather than decoding the frozen `ast` section: it assigns each pack
     // file a fresh FileId (spans never collide), and is immune to
     // AST-schema drift. Falls back to the frozen `ast` bundle only when
     // the `sources` section is absent.
-    var loaded_from_sources = false;
-    var err: PackError = undefined;
     if (reader.readSection(section_names.SOURCES, &err) catch null) |payload| {
         defer payload.deinit(allocator);
         if (schema.decode(schema.SourceBundle, allocator, payload.slice(), &err) catch null) |bundle_val| {
@@ -842,6 +896,17 @@ fn loadPackCandidate(
             }
         }
     }
+    try readPackBindings(allocator, reader, lib_id, merged, out_bindings);
+}
+
+fn readPackBindings(
+    allocator: Allocator,
+    reader: *const PackReader,
+    lib_id: []const u8,
+    merged: *const HostBindings,
+    out_bindings: *HostBindings,
+) Allocator.Error!void {
+    var err: PackError = undefined;
     if (reader.readSection(section_names.BINDINGS, &err) catch null) |payload| {
         defer payload.deinit(allocator);
         if (schema.decode(schema.BindingManifest, allocator, payload.slice(), &err) catch null) |bm_val| {
@@ -989,6 +1054,67 @@ fn loadInstalledPacksImpl(
         feature_hints.deinit(gpa);
     }
 
+    // Feature fixed point over MANIFESTS before any pack loads: a pack the
+    // user imports directly (`kotlinx.serialization.Serializable`) would
+    // otherwise load in the first pass, before another pack's manifest dep
+    // (`io.ktor`'s `client-serialization` asking `kotlinx.serialization/
+    // json`) has recorded its feature request — whether the chain worked
+    // then depended on candidate iteration order (directory order). The
+    // prepass walks manifests alone (no sources), so every feature request
+    // reachable through manifest deps is known before the first real load.
+    {
+        var pre_wanted = std.StringHashMap(void).init(gpa);
+        defer freeStringSet(&pre_wanted);
+        var pre_prefixes = std.StringHashMap(void).init(gpa);
+        defer freeStringSet(&pre_prefixes);
+        {
+            var it = known_prefixes.keyIterator();
+            while (it.next()) |k| {
+                const dup = try gpa.dupe(u8, k.*);
+                const gop = try pre_prefixes.getOrPut(dup);
+                if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+            }
+        }
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (candidates) |*c| {
+                const lib_id = c.manifest.library_id;
+                if (!importPrefixMatches(gpa, &pre_prefixes, lib_id)) continue;
+                // Re-visit an already-seen manifest when its request set may
+                // have grown: the contribution loop below is idempotent.
+                if (!pre_wanted.contains(lib_id)) {
+                    const dup = try gpa.dupe(u8, lib_id);
+                    const gop = try pre_wanted.getOrPut(dup);
+                    if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+                    changed = true;
+                }
+                var active = try resolveActiveFeatures(gpa, &c.manifest, feature_reqs.getPtr(lib_id));
+                defer active.deinit();
+                for (c.manifest.features) |f| {
+                    if (!active.contains(f.name)) continue;
+                    for (f.deps) |dep| {
+                        const lib = if (std.mem.indexOfScalar(u8, dep, '/')) |slash| dep[0..slash] else dep;
+                        if (!pre_prefixes.contains(lib)) {
+                            const dup = try gpa.dupe(u8, lib);
+                            const gop = try pre_prefixes.getOrPut(dup);
+                            if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
+                            changed = true;
+                        }
+                        if (std.mem.indexOfScalar(u8, dep, '/')) |slash| {
+                            if (try addFeatureReqsChanged(gpa, &feature_reqs, dep[0..slash], dep[slash + 1 ..])) changed = true;
+                        }
+                    }
+                }
+                for (c.manifest.dependencies) |dep| {
+                    if (dep.features.len != 0) {
+                        if (try addFeatureSliceChanged(gpa, &feature_reqs, dep.library_id, dep.features)) changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     while (true) {
         var progressed = false;
         var new_imports: std.ArrayList([]u8) = .empty;
@@ -1067,6 +1193,7 @@ fn loadInstalledPacksImpl(
                 &out_asts,
                 &out_bindings,
                 &new_imports,
+                opts.asts_needed,
             );
         }
         if (!progressed) break;
@@ -1128,6 +1255,7 @@ fn loadInstalledPacksImpl(
     var shown: std.ArrayList([2][]const u8) = .empty;
     defer shown.deinit(gpa);
     for (feature_hints.items) |h| {
+        if (!opts.report_failures) break;
         if (loaded_pkgs.contains(h.pkg)) continue;
         var dup_exists = false;
         for (shown.items) |s| {
@@ -1214,6 +1342,46 @@ fn addFeatureSlice(
     for (feats) |feat| {
         if (!set.contains(feat)) try set.put(try allocator.dupe(u8, feat), {});
     }
+}
+
+/// `addFeatureReqs` that reports whether any feature was newly added —
+/// the manifest-prepass fixed point's termination signal.
+fn addFeatureReqsChanged(
+    allocator: Allocator,
+    reqs: *RequestedFeatures,
+    lib: []const u8,
+    feats: []const u8,
+) Allocator.Error!bool {
+    const set = try featureSetFor(allocator, reqs, lib);
+    var changed = false;
+    var it = std.mem.splitScalar(u8, feats, ',');
+    while (it.next()) |feat_raw| {
+        const feat = std.mem.trim(u8, feat_raw, " \t");
+        if (feat.len == 0) continue;
+        if (!set.contains(feat)) {
+            try set.put(try allocator.dupe(u8, feat), {});
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// `addFeatureSlice` that reports whether any feature was newly added.
+fn addFeatureSliceChanged(
+    allocator: Allocator,
+    reqs: *RequestedFeatures,
+    lib: []const u8,
+    feats: [][]const u8,
+) Allocator.Error!bool {
+    const set = try featureSetFor(allocator, reqs, lib);
+    var changed = false;
+    for (feats) |feat| {
+        if (!set.contains(feat)) {
+            try set.put(try allocator.dupe(u8, feat), {});
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 /// Get (or create) the requested-feature set for `lib`, owning the key.
@@ -1340,6 +1508,11 @@ pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
     const dest = std.fs.path.join(allocator, &.{ cache, name }) catch
         return .{ .err = allocator.dupe(u8, "out of memory") catch "" };
 
+    // Installing supersedes: drop any other installed version of the same
+    // library first. The loader keys packs by library id, so two versions
+    // side by side would leave the pick to directory order.
+    removeOtherVersions(allocator, fio, cache, manifest.library_id, name);
+
     // Copy bytes: read source, write destination.
     const bytes = std.Io.Dir.cwd().readFileAlloc(fio, src, allocator, .unlimited) catch |e| {
         allocator.free(dest);
@@ -1353,6 +1526,35 @@ pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
 
     rebuildCacheIndex(allocator, cache);
     return .{ .ok = dest };
+}
+
+/// Delete every installed `.klio-pack` whose library id (parsed from the
+/// filename convention `lib-id-<version>.klio-pack`) matches `lib_id`,
+/// except `keep_name`. Best-effort: an undeletable stale version is left
+/// for the loader's failure reporting to surface.
+fn removeOtherVersions(allocator: Allocator, fio: std.Io, cache: []const u8, lib_id: []const u8, keep_name: []const u8) void {
+    var dir = std.Io.Dir.cwd().openDir(fio, cache, .{ .iterate = true }) catch return;
+    defer dir.close(fio);
+    var stale: std.ArrayList([]u8) = .empty;
+    defer {
+        for (stale.items) |s| allocator.free(s);
+        stale.deinit(allocator);
+    }
+    var it = dir.iterate();
+    while (it.next(fio) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".klio-pack")) continue;
+        if (std.mem.eql(u8, entry.name, keep_name)) continue;
+        const id = packLibIdFromBasename(entry.name) orelse continue;
+        if (!std.mem.eql(u8, id, lib_id)) continue;
+        const dup = allocator.dupe(u8, entry.name) catch continue;
+        stale.append(allocator, dup) catch {
+            allocator.free(dup);
+            continue;
+        };
+    }
+    for (stale.items) |s| {
+        dir.deleteFile(fio, s) catch {};
+    }
 }
 
 // ---------------------------------------------------------------------

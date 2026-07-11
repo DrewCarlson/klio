@@ -411,6 +411,59 @@ pub const SourceFile = struct {
 };
 
 // ---------------------------------------------------------------------
+// imports
+// ---------------------------------------------------------------------
+
+/// Per-source package headers and import paths, precomputed at pack
+/// build from the parsed ASTs. Lets a loader that only needs the pack's
+/// import graph and package set (the stdlib-image hit path) skip
+/// lexing/parsing the carried sources entirely.
+pub const ImportsBundle = struct {
+    files: []ImportsFile = &.{},
+
+    pub const empty: ImportsBundle = .{ .files = &.{} };
+
+    pub fn eql(self: ImportsBundle, other: ImportsBundle) bool {
+        if (self.files.len != other.files.len) return false;
+        for (self.files, other.files) |a, b| {
+            if (!a.eql(b)) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *ImportsBundle, allocator: Allocator) void {
+        for (self.files) |*f| f.deinit(allocator);
+        allocator.free(self.files);
+        self.* = undefined;
+    }
+};
+
+pub const ImportsFile = struct {
+    /// Path relative to the library root; matches the `sources` entry so
+    /// feature gating applies identically to both sections.
+    rel_path: []const u8,
+    /// Dotted package header, empty when the file declares none.
+    pkg: []const u8,
+    /// Dotted import paths in declaration order (aliases dropped,
+    /// wildcard star omitted) — the same strings the source parse
+    /// contributes to the pack loader's import fixed point.
+    imports: [][]const u8,
+
+    pub fn eql(self: ImportsFile, other: ImportsFile) bool {
+        return std.mem.eql(u8, self.rel_path, other.rel_path) and
+            std.mem.eql(u8, self.pkg, other.pkg) and
+            eqlStrSlice(self.imports, other.imports);
+    }
+
+    pub fn deinit(self: *ImportsFile, allocator: Allocator) void {
+        allocator.free(self.rel_path);
+        allocator.free(self.pkg);
+        freeStrSlice(allocator, self.imports);
+        self.* = undefined;
+    }
+};
+
+// ---------------------------------------------------------------------
 // ast
 // ---------------------------------------------------------------------
 
