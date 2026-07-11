@@ -197,12 +197,15 @@ by the Owner straight onto the window surface via
 `Box(Modifier.clickable { ... })` scene observes its onClick for every
 `scene.click` (hit test → `HitPathTracker` dispatch → the suspending
 pointer-input node → tap detection → `PressInteraction` flow →
-indication collection). Still open on this path: material3's `Button`
-(and the modern `Modifier.pointerInput` overload) hand the handler over
-as the NEW `PointerInputEventHandler` fun interface — a SUSPEND
-member-extension SAM — and `startCoroutineUndispatched` over that shape
-loses the continuation (`resumeWith` on `kotlin.Unit`); the foundation
-path uses the plain suspend-lambda constructor and completes. PUBLIC
+indication collection). Still open on this path: material3's
+`Button` handler now reaches its pointer-input coroutine intact (the
+same-arity ctor-overload selection and the coroutine probe actuals
+fixed the delivery), but the gesture closure's IMAGE-DEFERRED body
+executes empty — its `detectTapGestures(...)` call neither lowers nor
+dispatches — so the tap detector never installs. The deferred
+AstLambda body pipeline for pack lambdas is the next root; the
+foundation path (plain suspend-lambda constructor, direct pointer
+state machine) completes. PUBLIC
 cross-package top-level name collisions (`internal` ones now lift
 mangled with a package-scoped rename channel) wait on the symbol index
 and import channels resolving renamed classifiers
