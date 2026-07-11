@@ -450,6 +450,7 @@ pub fn tryPrepare(
             .include_stdlib = false,
             .selection = &sel_tmp,
             .report_failures = false,
+            .asts_needed = false,
         }).bindings;
         for (sel_tmp.packs.items) |p| {
             const feats = gpa.alloc([]const u8, p.features.len) catch return null;

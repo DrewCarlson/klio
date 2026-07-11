@@ -1557,6 +1557,13 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const ast_bytes = (schema.encode(schema.AstBundle, a, &ast_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
+    // Imports: package headers + import paths per source, derived from the
+    // same parse. Loaders that only need the import graph (the stdlib-image
+    // hit path) read this instead of re-parsing `sources`.
+    const imports_bundle = buildImportsBundle(a, &ast_bundle) catch return .{ .err = fail(gpa, "out of memory", .{}) };
+    const imports_bytes = (schema.encode(schema.ImportsBundle, a, &imports_bundle, &perr) catch
+        return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
+
     // Frozen typeck. Collect the parsed `KotlinFile`s directly: in the
     // arena the bundle's files outlive this call, so a borrow is cheaper
     // than a clone.
@@ -1573,6 +1580,7 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     _ = writer.addRaw(section_names.MANIFEST, manifest_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addRaw(section_names.BINDINGS, bindings_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.SOURCES, sources_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
+    _ = writer.addSection(section_names.IMPORTS, imports_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.AST, ast_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     _ = writer.addSection(section_names.TYPECK, typeck_bytes.items, .None) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     var pack_bytes = (writer.finish(&perr) catch
@@ -1596,6 +1604,31 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
 
 fn writePack(gpa: std.mem.Allocator, out: []const u8, bytes: []const u8) VoidResult {
     return writeFileWithParents(gpa, out, bytes);
+}
+
+/// Package header + import paths per parsed source, in `ast` bundle
+/// order. Joined with `.` exactly as the pack loader's source-parse path
+/// joins them, so the two produce identical import-fixed-point inputs.
+fn buildImportsBundle(a: std.mem.Allocator, ast_bundle: *const schema.AstBundle) std.mem.Allocator.Error!schema.ImportsBundle {
+    const out_files = try a.alloc(schema.ImportsFile, ast_bundle.files.len);
+    for (ast_bundle.files, out_files) |f, *dst| {
+        const kf = &f.kotlin_file;
+        const pkg: []const u8 = if (kf.package) |p| try joinDottedPath(a, p.path) else "";
+        const imps = try a.alloc([]const u8, kf.imports.len);
+        for (kf.imports, imps) |imp, *slot| slot.* = try joinDottedPath(a, imp.path);
+        dst.* = .{ .rel_path = f.rel_path, .pkg = pkg, .imports = @constCast(imps) };
+    }
+    return .{ .files = out_files };
+}
+
+fn joinDottedPath(a: std.mem.Allocator, path: []const ast.Ident) std.mem.Allocator.Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    for (path, 0..) |id, i| {
+        if (i != 0) try buf.append(a, '.');
+        try buf.appendSlice(a, id.name);
+    }
+    return buf.toOwnedSlice(a);
 }
 
 // ---------------------------------------------------------------------

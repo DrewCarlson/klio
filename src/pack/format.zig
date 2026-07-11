@@ -98,6 +98,10 @@ pub const section_names = struct {
     /// `resolved`, `typeck`) are reserved for a later phase that
     /// adds serde derives across the front-end crates.
     pub const SOURCES: []const u8 = "sources";
+    /// Precomputed per-source package + import paths (`schema.ImportsBundle`),
+    /// derived from the same parse that fills `ast`. Optional; loaders that
+    /// need only the import graph read this instead of parsing `sources`.
+    pub const IMPORTS: []const u8 = "imports";
     pub const AST: []const u8 = "ast";
     pub const RESOLVED: []const u8 = "resolved";
     pub const TYPECK: []const u8 = "typeck";

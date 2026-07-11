@@ -3259,6 +3259,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     for (cands) |cf| {
                         if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) == null) continue;
                         if (!anyReified(cf.type_params)) continue;
+                        if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
                         member_target = cf;
                         break;
                     }
@@ -3275,6 +3276,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 for (cands) |cf| {
                     if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) == null) continue;
                     if (!anyReified(cf.type_params)) continue;
+                    if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
                     const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse {
                         if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
                         continue;
@@ -4145,7 +4147,19 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
                 (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
                     b.module.classId(nm) != null or anyClassNamed(b, nm));
-            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or
+            // A DECLARED MEMBER of the spliced receiver's own hierarchy
+            // (`fetchStreamingResponse()` inside a spliced member-inline
+            // `HttpStatement.body`) binds the receiver the same way an
+            // extension namesake does — the hierarchy shadow set answers
+            // membership even when the member is internal.
+            const member_of_recv = blk: {
+                const chain = recv_chain orelse break :blk false;
+                if (chain.len == 0) break :blk false;
+                const hs = b.module.registry.hierarchy_shadow_names.get(chain[0]) orelse break :blk false;
+                if (!hs.complete) break :blk false;
+                break :blk hs.names.contains(nm);
+            };
+            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
                 (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
             if (binds_this) {
                 if (b.resolve("this")) |bound_this| {
@@ -4657,7 +4671,31 @@ pub fn recvChainOf(b: *FuncBuilder, cur: []const u8) Allocator.Error![]const []c
 /// its transitive supertypes — i.e. reachable as `this.<f>` from a member body.
 fn inlineOwnerInEnclosingHierarchy(b: *FuncBuilder, enclosing: []const u8, f: *const ast.Function) bool {
     const owner = inline_state.inlineMemberOwner(f) orelse return false;
-    return b.module.classIsOrExtends(enclosing, owner);
+    return classIsOrExtendsHosted(b, enclosing, owner);
+}
+
+/// Whether a member-inline candidate's owner class is on the qualified
+/// call receiver's static type chain. An unknown receiver type keeps the
+/// candidate (the shape-based pick's historical behavior); a KNOWN
+/// receiver whose hierarchy does not include the owner rejects it —
+/// `resp.body<User>()` on an `HttpResponse` must not splice the
+/// unrelated `HttpStatement.body`.
+fn memberOwnerOnReceiverChain(b: *FuncBuilder, receiver: *const Expr, cf: *const ast.Function) Allocator.Error!bool {
+    const owner = inline_state.inlineMemberOwner(cf) orelse return true;
+    const head = (try inline_call.inferReceiverType(b, receiver)) orelse return true;
+    return classIsOrExtendsHosted(b, head, owner);
+}
+
+/// `classIsOrExtends` that also accepts `$Companion`-mangled names on
+/// either side by reducing them to their host class: a bare call inside
+/// `ContentType.Companion` is in scope of `HeaderValueWithParameters`'s
+/// companion members exactly when `ContentType` extends it.
+fn classIsOrExtendsHosted(b: *FuncBuilder, sub: []const u8, super: []const u8) bool {
+    if (b.module.classIsOrExtends(sub, super)) return true;
+    const sub_host = hostClassOfCompanion(sub) orelse sub;
+    const super_host = hostClassOfCompanion(super) orelse super;
+    if (sub_host.len == sub.len and super_host.len == super.len) return false;
+    return b.module.classIsOrExtends(sub_host, super_host);
 }
 
 /// The symbol-index scope tier of an inline candidate at a reference
@@ -4748,6 +4786,16 @@ fn inlineTargetForBareCall(
                 if (nf.receiver_type != null and bareInlineNeedsSplice(b, nm, nf, args)) {
                     break :blk nf;
                 }
+                // Same reasoning for a companion member reached through
+                // the enclosing class's hierarchy (`ContentType.Companion
+                // .parse` calling the inherited `HeaderValueWithParameters
+                // .Companion.parse`): companion scope is invisible to the
+                // index, and Kotlin ranks it above a top-level namesake.
+                if (nf.receiver_type == null and bareInlineNeedsSplice(b, nm, nf, args)) {
+                    if (inline_state.inlineMemberOwner(nf)) |nowner| {
+                        if (companionOwnerInEnclosingHierarchy(b, nowner)) break :blk nf;
+                    }
+                }
             }
             break :blk inline_state.inlineAstById(fid.int());
         },
@@ -4791,7 +4839,7 @@ fn inlineTargetForBareCall(
             // an unrelated class's namesake is never the target.
             if (pf.receiver_type == null) {
                 if (inline_state.inlineMemberOwner(pf)) |powner| {
-                    if (!b.module.classIsOrExtends(enclosing, powner)) {
+                    if (!classIsOrExtendsHosted(b, enclosing, powner)) {
                         // Prefer a same-name inline overload declared in the
                         // enclosing class's own hierarchy, if one exists.
                         var replaced = false;
@@ -5001,8 +5049,39 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         }
         break :blk false;
     };
+    // An inline member of a COMPANION object reached through the enclosing
+    // class's hierarchy (`ContentType.Companion.parse` calling the inherited
+    // `HeaderValueWithParameters.Companion.parse`): the splice is the only
+    // route — member dispatch has no enclosing-supertype-companion walk on
+    // the call side, and the bare-global fallback binds an unrelated
+    // namesake (or nothing). Kotlin resolves this statically, so splice it.
+    const companion_super_member = f.receiver_type == null and blk: {
+        const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
+        break :blk companionOwnerInEnclosingHierarchy(b, owner);
+    };
     return !recv_mismatch and
-        (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member);
+        (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member or
+            companion_super_member);
+}
+
+/// True when `owner` names a companion object (a `$Companion`-mangled
+/// lifted class) whose HOST class is the enclosing class — or an
+/// ancestor of it. Both sides reduce to their host class: a bare call
+/// written inside `Sub.Companion` or inside `Sub`'s own body sees the
+/// companion members of `Sub`'s superclasses (Kotlin's static scope).
+fn companionOwnerInEnclosingHierarchy(b: *FuncBuilder, owner: []const u8) bool {
+    const o_host = hostClassOfCompanion(owner) orelse return false;
+    const e = b.ownerClass() orelse return false;
+    const e_host = hostClassOfCompanion(e) orelse e;
+    return b.module.classIsOrExtends(e_host, o_host);
+}
+
+/// The class a `$Companion` mangle belongs to (`Base$Companion` →
+/// `Base`), or null when `name` is not a companion mangle.
+fn hostClassOfCompanion(name: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, name, "$Companion") orelse return null;
+    if (idx == 0) return null;
+    return name[0..idx];
 }
 
 /// Audit one inline-target resolution (the `inline` records of

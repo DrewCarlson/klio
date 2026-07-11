@@ -22,6 +22,7 @@ root = "upstream/ktor-io/common/src"
 include = [
     "io/ktor/utils/io/Annotations.kt",
     "io/ktor/utils/io/Deprecation.kt",
+    "io/ktor/utils/io/core/Input.kt",
     "io/ktor/utils/io/core/Buffer.kt",
     "io/ktor/utils/io/core/Strings.kt",
     "io/ktor/utils/io/core/ByteReadPacket.kt",
@@ -145,6 +146,7 @@ include = [
     "io/ktor/http/content/OutgoingContent.kt",
     "io/ktor/http/content/TextContent.kt",
     "io/ktor/http/content/ByteArrayContent.kt",
+    "io/ktor/http/content/Multipart.kt",
 ]
 
 # nonJvm engine loader: the `engines` registry (`append` + iteration) the
