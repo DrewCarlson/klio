@@ -2800,6 +2800,44 @@ fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
 /// a callable field whose arity matches the call and the class also has a
 /// same-named vararg method, invoke the field: the property is the intended
 /// target for this argument shape.
+fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (receiver.* != .Instance) return null;
+    const flagged = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const reg = &mg.get().registry;
+        var cur: ?[]const u8 = blk2: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk2 cg.get().name;
+        };
+        var hops: usize = 0;
+        while (cur) |cn| : (hops += 1) {
+            if (hops > 32) break;
+            if (reg.recv_fn_props.get(.{ .a = cn, .b = name }) != null) break :blk true;
+            const chain = reg.class_super_names.get(cn) orelse break;
+            if (chain.len == 0) break;
+            var sn = chain[0];
+            if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+            cur = sn;
+        }
+        break :blk false;
+    };
+    if (!flagged) return null;
+    const field_val: Value = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const v = g.get().get(name) orelse return null;
+        v.retain();
+        break :blk v;
+    };
+    defer field_val.release(allocator);
+    if (callableFieldArity(self, &field_val) == null) return null;
+    return try host_call_value.callValueWithThis(self, allocator, &field_val, receiver, args, &.{});
+}
+
 fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance) return null;
     const field_val: Value = blk: {
@@ -2837,6 +2875,13 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // A property whose declared type is a RECEIVER function type
+    // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
+    // Kotlin runs the stored lambda with the owning instance as its
+    // receiver (`_deprecatedPointerInputHandler!!()` inside the
+    // pointer-input node runs on the node's PointerInputScope). Without
+    // the receiver the lambda's bare member reads fall to globals.
+    if (try recvFnFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
     // A function-typed property shadowed by a same-named vararg method: invoke
     // the property when the call's argument shape matches it (see the helper).
     if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
@@ -8822,6 +8867,10 @@ pub fn callMemberNamedDeclared(self: *VmHost, allocator: Allocator, receiver: *c
 }
 
 fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // Receiver-function-typed property invoked as a call (see
+    // `recvFnFieldInvoke` on the static ladder): the stored lambda runs
+    // with the owning instance as its receiver.
+    if (try recvFnFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;

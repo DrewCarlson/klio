@@ -176,6 +176,23 @@ const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "I
 fn paramAcceptsArg(self: *VmHost, declared: []const u8, arg: *const Value) bool {
     if (std.mem.eql(u8, declared, "Any")) return true;
     if (declared.len <= 2 and isAllUpper(declared)) return true;
+    // A function-typed parameter accepts any callable argument regardless of
+    // the recorded arity head — a receiver-style suspend lambda's declared
+    // head (`Function0`) and the closure's own shape count receivers
+    // differently, and rejecting here let a `this(...)`-delegating secondary
+    // constructor lose its lambda to the primary's SAM slot
+    // (`SuspendingPointerInputModifierNodeImpl`'s deprecated handler ctor).
+    if (std.mem.startsWith(u8, declared, "Function")) {
+        return switch (arg.*) {
+            .IrClosure, .Function => true,
+            .Instance => blk: {
+                const g = arg.Instance.borrow();
+                defer g.deinit();
+                break :blk g.get().get("__sam_target__") != null;
+            },
+            else => false,
+        };
+    }
     if (arg.* == .Instance) {
         if (instanceOfClassName(arg, declared)) return true;
         // Only disqualify when `declared` is a class the argument is NOT: a
@@ -213,51 +230,64 @@ fn builtinTypeKind(head: []const u8) u8 {
     return 0;
 }
 
+/// Type-fit of one ctor candidate's declared param heads against the
+/// runtime args, on the shared scale `chooseSecondaryCtor` ranks with:
+/// exact head +2, family match +1 (+2 for a callable meeting a
+/// FunctionN head, which is Kotlin's more-specific pick vs a SAM slot),
+/// definite cross-family mismatch = null (disqualified).
+fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
+    var score: i32 = 0;
+    var i: usize = 0;
+    while (i < args.len and i < heads.len) : (i += 1) {
+        const declared = heads[i];
+        const got = valueTypeHead(args[i]);
+        if (std.mem.eql(u8, declared, got)) {
+            score += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, declared, "Function") and isCallableArg(&args[i])) {
+            score += 2;
+            continue;
+        }
+        const decl_integral = headInSet(declared, &integral_heads);
+        const decl_collish = headInSet(declared, &collectionish_heads);
+        const got_integral = headInSet(got, &integral_heads);
+        const got_collish = headInSet(got, &collectionish_heads);
+        if (decl_collish and got_collish) {
+            score += 1;
+            continue;
+        }
+        if (decl_integral and got_integral) {
+            score += 1;
+            continue;
+        }
+        if ((decl_integral and got_collish) or (decl_collish and got_integral)) return null;
+        if (!paramAcceptsArg(self, declared, &args[i])) return null;
+    }
+    return score;
+}
+
+fn isCallableArg(v: *const Value) bool {
+    return switch (v.*) {
+        .IrClosure, .Function => true,
+        else => false,
+    };
+}
+
 fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
-    var first: ?root.build.SecondaryCtorEntry = null;
     var best: ?root.build.SecondaryCtorEntry = null;
     var best_score: i32 = -1;
-    outer: for (entries) |e| {
+    for (entries) |e| {
         if (e.param_count != args.len) continue;
-        var score: i32 = 0;
-        var i: usize = 0;
-        while (i < args.len and i < e.param_type_heads.len) : (i += 1) {
-            const declared = e.param_type_heads[i];
-            const got = valueTypeHead(args[i]);
-            if (std.mem.eql(u8, declared, got)) {
-                score += 2;
-                continue;
-            }
-            // Family compatibility: a declared Collection/Iterable head
-            // accepts any collection-shaped value; integral heads accept
-            // integral values. A DEFINITE cross-family mismatch (an Int
-            // param offered a List — `ArrayDeque(initialCapacity)` vs
-            // `ArrayDeque(elements)`) disqualifies the candidate so the
-            // right same-arity overload wins regardless of order.
-            const decl_integral = headInSet(declared, &integral_heads);
-            const decl_collish = headInSet(declared, &collectionish_heads);
-            const got_integral = headInSet(got, &integral_heads);
-            const got_collish = headInSet(got, &collectionish_heads);
-            if (decl_collish and got_collish) {
-                score += 1;
-                continue;
-            }
-            if (decl_integral and got_integral) {
-                score += 1;
-                continue;
-            }
-            if ((decl_integral and got_collish) or (decl_collish and got_integral)) continue :outer;
-            if (!paramAcceptsArg(self, declared, &args[i])) continue :outer;
-        }
+        const score = scoreCtorHeads(self, e.param_type_heads, args) orelse continue;
         // Reached only when no parameter disqualified this candidate: it is a
         // genuine arity+type match, so it is eligible as the fallback too.
-        if (first == null) first = e;
         if (score > best_score) {
             best_score = score;
             best = e;
         }
     }
-    return if (best != null) best else first;
+    return best;
 }
 
 fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
@@ -1415,8 +1445,36 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         }
         break :blk false;
     };
+    // A same-arity primary/secondary pair selects by TYPE, like any other
+    // overload set: when the best-fitting secondary scores strictly better
+    // than the primary's declared heads (a lambda meeting the secondary's
+    // FunctionN slot vs the primary's SAM-class slot —
+    // `SuspendingPointerInputModifierNodeImpl`'s deprecated-handler ctor),
+    // the secondary takes the call.
+    const same_arity_secondary_better = args.len == n_primary_initial and n_primary_initial != 0 and blk: {
+        var best_sec: i32 = -1;
+        for (secondaryCtors(self, classDefFqn(class_def), class_name)) |e| {
+            if (e.param_count != args.len) continue;
+            if (scoreCtorHeads(self, e.param_type_heads, args)) |sc| {
+                if (sc > best_sec) best_sec = sc;
+            }
+        }
+        if (best_sec < 0) break :blk false;
+        const prim_score = blk2: {
+            var heads: std.ArrayList([]const u8) = .empty;
+            defer heads.deinit(allocator);
+            const dg = class_def.borrow();
+            defer dg.deinit();
+            for (dg.get().primary_params) |*p| {
+                heads.append(allocator, p.declared_type orelse "") catch break :blk2 @as(?i32, 0);
+            }
+            break :blk2 scoreCtorHeads(self, heads.items, args);
+        };
+        const prim = prim_score orelse break :blk true;
+        break :blk best_sec > prim;
+    };
     const shell_guarded = ctorGuardContains(class_name);
-    if (!shell_guarded and (args.len != n_primary_initial or zero_primary_secondary)) {
+    if (!shell_guarded and (args.len != n_primary_initial or zero_primary_secondary or same_arity_secondary_better)) {
         if (try dispatchSecondaryCtor(self, allocator, class, class_def, args, outer_hint)) |res| {
             return res;
         }

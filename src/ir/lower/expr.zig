@@ -2984,12 +2984,24 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.sib_expected_ty = sib_prev_ty;
     }
     const call = expr.Call;
-    const callee = call.callee;
+    // `dep!!()` calls the value a not-null-asserted BARE NAME holds: keep
+    // the bare-name call machinery (member-vs-global walk, and with it the
+    // receiver-function-typed property arm) by unwrapping the assertion at
+    // the callee — a null value still fails at the invoke, matching the
+    // assertion's intent.
+    const callee = blk: {
+        var c = call.callee;
+        while (c.* == .Postfix and c.Postfix.op == .NotNull and
+            (c.Postfix.expr.* == .Path or c.Postfix.expr.* == .Member))
+        {
+            c = c.Postfix.expr;
+        }
+        break :blk c;
+    };
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
-
     // Record each lambda argument's expected value-parameter arity by span,
     // taken from the resolved callee's parameter types, BEFORE the args are
     // lowered. `lowerLambda` reads it authoritatively, so a receiver lambda
@@ -3590,14 +3602,30 @@ fn lowerCallWithWritebackPath(
             // on `this`. The index never resolves members (`bound_id` is null),
             // so without this it falls to an unresolved global LoadGlobal.
             const this_reg = b.resolve("this").?;
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = this_reg,
-                .name = try b.module.internConst(b.allocator, .{ .String = segments[0].name }),
-                .args = args_start,
-                .n_args = n_args,
-                .arg_names = arg_names,
-            } });
+            if (calleeRecvFnFlag(b, callee)) {
+                // A receiver-function-typed property invoked bare: read the
+                // stored callable and run it with `this` as its receiver.
+                const cal = b.allocReg();
+                const fld = try b.module.internConst(b.allocator, .{ .String = segments[0].name });
+                try b.push(.{ .GetField = .{ .dst = cal, .receiver = this_reg, .field = fld } });
+                try b.push(.{ .CallValueWithThis = .{
+                    .dst = dst,
+                    .callee = cal,
+                    .receiver = this_reg,
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                } });
+            } else {
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = this_reg,
+                    .name = try b.module.internConst(b.allocator, .{ .String = segments[0].name }),
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                } });
+            }
         } else {
             const callee_r = blk: {
                 if (b.resolve(segments[0].name) != null) {
@@ -3609,6 +3637,43 @@ fn lowerCallWithWritebackPath(
                     break :blk r;
                 }
             };
+            if (calleeRecvFnFlag(b, callee) and inReceiverContext(b)) {
+                const this_idx = try b.recordCapture("this");
+                const this_r = b.allocReg();
+                try b.push(.{ .LoadCapture = .{ .dst = this_r, .idx = this_idx } });
+                try b.push(.{ .CallValueWithThis = .{
+                    .dst = dst,
+                    .callee = callee_r,
+                    .receiver = this_r,
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                } });
+            } else {
+                try b.push(.{ .CallValue = .{
+                    .dst = dst,
+                    .callee = callee_r,
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                } });
+            }
+        }
+    } else {
+        const callee_r = try lowerExpr(b, callee);
+        if (calleeRecvFnFlag(b, callee) and inReceiverContext(b)) {
+            const this_idx = try b.recordCapture("this");
+            const this_r = b.allocReg();
+            try b.push(.{ .LoadCapture = .{ .dst = this_r, .idx = this_idx } });
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = callee_r,
+                .receiver = this_r,
+                .args = args_start,
+                .n_args = n_args,
+                .arg_names = arg_names,
+            } });
+        } else {
             try b.push(.{ .CallValue = .{
                 .dst = dst,
                 .callee = callee_r,
@@ -3617,17 +3682,39 @@ fn lowerCallWithWritebackPath(
                 .arg_names = arg_names,
             } });
         }
-    } else {
-        const callee_r = try lowerExpr(b, callee);
-        try b.push(.{ .CallValue = .{
-            .dst = dst,
-            .callee = callee_r,
-            .args = args_start,
-            .n_args = n_args,
-            .arg_names = arg_names,
-        } });
     }
     return dst;
+}
+
+
+/// The bare name a call's callee reads, unwrapped through `!!`, when that
+/// name's declared type is a RECEIVER function type — a local/param flag
+/// or an own/enclosing-class property in the registry. Such an invocation
+/// binds the implicit `this` as the lambda's receiver.
+fn calleeRecvFnFlag(b: *FuncBuilder, callee: *const Expr) bool {
+    var cur = callee;
+    while (cur.* == .Postfix and cur.Postfix.op == .NotNull) cur = cur.Postfix.expr;
+    const name = switch (cur.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return false,
+        .Member => |m| blk: {
+            if (m.receiver.* == .Path and m.receiver.Path.segments.len == 1 and
+                std.mem.eql(u8, m.receiver.Path.segments[0].name, "this"))
+            {
+                break :blk m.name.name;
+            }
+            return false;
+        },
+        else => return false,
+    };
+    if (b.localDeclRecvFn(name)) return true;
+    var owner = b.ownerClass() orelse build.currentOwnerClass();
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = name }) != null) return true;
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    return false;
 }
 
 /// Compact a list of registers into a contiguous run, returning the start

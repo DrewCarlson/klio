@@ -161,6 +161,25 @@ pub fn currentRealFn() ?[]const u8 {
     return current_real_fn;
 }
 
+/// The owner class of the REAL function whose body is lowering, visible to
+/// nested lambda builders (which carry no owner of their own) — the
+/// receiver-function-typed property flag resolves through it.
+threadlocal var current_owner_class: ?[]const u8 = null;
+
+pub fn pushCurrentOwnerClass(name: ?[]const u8) ?[]const u8 {
+    const prev = current_owner_class;
+    current_owner_class = name;
+    return prev;
+}
+
+pub fn popCurrentOwnerClass(prev: ?[]const u8) void {
+    current_owner_class = prev;
+}
+
+pub fn currentOwnerClass() ?[]const u8 {
+    return current_owner_class;
+}
+
 pub const FileTypeRenames = std.AutoHashMap(u32, std.StringHashMap([]const u8));
 
 threadlocal var lower_file_type_renames: ?*const FileTypeRenames = null;
@@ -398,6 +417,7 @@ pub const FuncBuilder = struct {
     /// used by inline-overload receiver narrowing.
     local_decl_types: std.StringHashMap([]const u8),
     local_decl_nullable: std.StringHashMap(void),
+    local_decl_recv_fn: std.StringHashMap(void),
     /// Recorded initializer expression per un-annotated local, so the
     /// narrowing can infer a type from the init call's return type. The
     /// AST outlives the lowering pass.
@@ -573,6 +593,7 @@ pub const FuncBuilder = struct {
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap([]const u8).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
+            .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
@@ -645,6 +666,7 @@ pub const FuncBuilder = struct {
         }
         self.local_decl_types.deinit();
         self.local_decl_nullable.deinit();
+        self.local_decl_recv_fn.deinit();
         self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
         self.receiver_lambda_params.deinit();
@@ -1125,6 +1147,15 @@ pub const FuncBuilder = struct {
     }
     pub fn localDeclNullable(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_decl_nullable.contains(name);
+    }
+    /// Record that the local's declared type is a RECEIVER function type
+    /// (`suspend Scope.() -> Unit`), so a bare invocation binds the
+    /// implicit `this` as the lambda's receiver.
+    pub fn setLocalDeclRecvFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.local_decl_recv_fn.put(name, {});
+    }
+    pub fn localDeclRecvFn(self: *const FuncBuilder, name: []const u8) bool {
+        return self.local_decl_recv_fn.contains(name);
     }
     pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
         try self.local_init_exprs.put(name, e);

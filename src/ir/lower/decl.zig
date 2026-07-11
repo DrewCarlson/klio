@@ -142,6 +142,9 @@ pub fn emitContextParamLoads(
             try b.bind(cp.name.name, dst);
             try b.setLocalDeclType(cp.name.name, cp.ty.name.name);
             if (cp.ty.nullable) try b.setLocalDeclNullable(cp.name.name);
+            if (cp.ty.function) |ft| {
+                if (ft.receiver != null) try b.setLocalDeclRecvFn(cp.name.name);
+            }
         }
     }
 }
@@ -1039,6 +1042,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     const a = module.registry.allocator;
     const prev_real_fn = build.pushCurrentRealFn(f.name.name);
     defer build.popCurrentRealFn(prev_real_fn);
+    const prev_owner = build.pushCurrentOwnerClass(owner_class);
+    defer build.popCurrentOwnerClass(prev_owner);
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
 
@@ -1077,6 +1082,9 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     for (f.params) |*p| {
         try b.setLocalDeclType(p.name.name, p.ty.name.name);
         if (p.ty.nullable) try b.setLocalDeclNullable(p.name.name);
+        if (p.ty.function) |ft| {
+            if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);
+        }
     }
     // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
     // qualified `this@fn` in a nested lambda (e.g.
