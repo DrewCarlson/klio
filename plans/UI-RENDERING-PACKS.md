@@ -224,8 +224,17 @@ next implicit receiver out handed as `this` for member-extension SAMs
 (`MeasurePolicy`'s `MeasureScope.measure`, `PointerInputEventHandler`'s
 `PointerInputScope.invoke`). (5) `probeCoroutineCreated` actuals.
 Raw `Layout(content, modifier) { measure }` + `Modifier.pointerInput`
-in USER source now runs its measure lambda and starts its pointer
-coroutine exactly once. Two follow-up roots landed: (a) the
+in USER source delivers END-TO-END: measure runs, the pointer coroutine
+starts once, `awaitPointerEventScope` receives events, and the user
+handler fires (scene_click HIT). Desktop-style entrypoints landed:
+`application { Window(onCloseRequest = ::exitApplication) { … } }` in
+`androidx.compose.ui.window` drives `runComposeWindow` — a native SDL2
+window rendered by the real engine with clicks through
+`PointerInputEventProcessor`; headless it reports `opened=false`
+cleanly (examples/compose_window.kt, deterministic in both
+environments). One window per application, parameters fixed at open;
+multi-window and recomposition-driven window parameters are future
+work. Two follow-up roots landed: (a) the
 `launch(start = UNDISPATCHED)` body ran twice-or-more because three
 runtime arms treated ANY bare name missing on a callable receiver as
 that callable's SAM method — `probeCoroutineResumed(completion)` inside
@@ -241,13 +250,17 @@ receiver chain when there is no owner class and swaps in the extension
 whose declared receiver is on the chain. The extension-fallback ladder
 also stops ranking candidates whose surplus parameters lack defaults
 (trailing-callable-aware), which had let the 3-user-param
-`startCoroutineUninterceptedOrReturn` variant steal a 2-arg call. Still
-open on the raw-Layout path: a `this@SuspendingPointerInputModifierNodeImpl`
-read raises "not bound" inside the pointer dispatch when the handler is
-a raw user lambda (foundation/material3 unaffected). Explicit-receiver
-member-inline reified calls (`c.visitNodes(...)`, `CC(...).pfw<E>{}`)
-still fall to runtime with `T` unbound (implicit-this calls splice
-correctly). PUBLIC
+`startCoroutineUninterceptedOrReturn` variant steal a 2-arg call. The
+label-this raise on that path is fixed (class-DELEGATION thunks run
+with the under-construction instance as an enclosing receiver, and the
+labeled-this walk follows each enclosing entry's OUTER links).
+Explicit-receiver member-inline reified calls work in all shapes:
+explicit `<T>` splices with the owner scope active; inference-bound
+calls emit a typed member dispatch whose stamped type-argument names
+bind as globals around the normal member walk; and callable references
+inside member extensions bind the DISPATCH owner (`::requestFocus` in
+`SemanticsPropertyReceiver.applySemantics()`), with enclosing members
+shadowing global `::name` forms. PUBLIC
 cross-package top-level name collisions (`internal` ones now lift
 mangled with a package-scoped rename channel) wait on the symbol index
 and import channels resolving renamed classifiers
