@@ -453,6 +453,13 @@ pub const FuncBuilder = struct {
     /// `E`), recorded alongside `reified_type_binds` so nested calls in
     /// the spliced body can be stamped with static type args.
     reified_type_names: std.StringHashMap([]const u8),
+    /// Splice-scoped param-name -> declared type (with the splice's
+    /// reified substitutions applied). A nested reified inline call whose
+    /// argument is a spliced parameter (`it.dispatchForKind(type, block)`
+    /// inside a spliced `visitNodes` body) infers its own type parameter
+    /// from this lexical record — the argument expression alone carries
+    /// no type evidence.
+    splice_param_tys: std.StringHashMap(ast.TypeRef),
     /// Stack of user `finally { … }` blocks (innermost on top) whose
     /// lexical scope encloses the current cursor. A `return X` reached
     /// during inline expansion replays each finally body inline before
@@ -604,6 +611,7 @@ pub const FuncBuilder = struct {
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
             .reified_type_names = std.StringHashMap([]const u8).init(allocator),
+            .splice_param_tys = std.StringHashMap(ast.TypeRef).init(allocator),
             .is_lambda_body = false,
             .is_anon_fn_body = false,
             .is_named_local_fn = false,
@@ -676,6 +684,7 @@ pub const FuncBuilder = struct {
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
         self.reified_type_names.deinit();
+        self.splice_param_tys.deinit();
         self.finally_stack.deinit(a);
         self.inline_return.deinit(a);
         self.inline_stack.deinit(a);
@@ -1335,6 +1344,24 @@ pub const FuncBuilder = struct {
     }
     pub fn resolveReifiedTypeName(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
         return self.reified_type_names.get(name);
+    }
+    /// Record a splice parameter's declared type (post reified
+    /// substitution); returns the shadowed entry so the splice restores
+    /// it on exit.
+    pub fn bindSpliceParamTy(self: *FuncBuilder, name: []const u8, ty: ast.TypeRef) Allocator.Error!?ast.TypeRef {
+        const prev = self.splice_param_tys.get(name);
+        try self.splice_param_tys.put(name, ty);
+        return prev;
+    }
+    pub fn restoreSpliceParamTy(self: *FuncBuilder, name: []const u8, prev: ?ast.TypeRef) void {
+        if (prev) |t| {
+            self.splice_param_tys.put(name, t) catch {};
+        } else {
+            _ = self.splice_param_tys.remove(name);
+        }
+    }
+    pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
+        return self.splice_param_tys.get(name);
     }
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);

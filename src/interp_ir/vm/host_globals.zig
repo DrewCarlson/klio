@@ -954,10 +954,31 @@ fn topPropReadKey(self: *VmHost, name: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "__klio_topfield__{s}", .{name}) catch name;
 }
 
+/// Whether a bare simple-name global-fn pick is visible from the
+/// executing reference site (frame package + current statement's file).
+/// No frame context, or a candidate without package metadata, keeps the
+/// pick — only a confirmed unimported foreign package rejects it.
+fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []const u8) bool {
+    _ = self;
+    const f = m.funcById(fid) orelse return true;
+    if (f.package.len == 0) return true;
+    const ref_file: ?ir.FileId = ir.eval.refSiteFile() orelse
+        (if (ir.eval.currentCallSiteSpan()) |sp| sp.file else null);
+    // The reference package follows the executing statement's FILE when
+    // the module records it (synthesized accessor frames carry no
+    // package of their own); the frame's declared package is the
+    // fallback. No context at all keeps the pick.
+    const file_pkg: ?[]const u8 = if (ref_file) |rf| m.packageOfFile(rf) else null;
+    const ref_pkg = file_pkg orelse (ir.eval.nearestFramePackage() orelse return true);
+    const cfile = ref_file orelse ir.FileId.from(std.math.maxInt(u32));
+    return m.scopeTier(f.fqn, f.package, name, ref_pkg, cfile) != ir.Module.other_package_tier;
+}
+
 pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     const allocator = self.allocator;
     var top_prop_buf: [256]u8 = undefined;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
+    const gtrace = if (runtime.getenvSlice("KLIO_GLOBAL_TRACE")) |w| std.mem.eql(u8, w, name) else false;
 
     const cached: ?Value = blk: {
         const g = self.globals.borrow();
@@ -1005,6 +1026,7 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     }
 
     if (cached) |v| {
+        if (gtrace) std.debug.print("[gtrace] {s} arm=cached kind={s}\n", .{ name, @tagName(v) });
         // Delegate auto-resolve for top-level `var/val X by <delegate>`.
         if (v == .Delegate) {
             const d = v.Delegate;
@@ -1089,7 +1111,7 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
             }
             break :pick null;
         } else null;
-        const chosen: ?FuncId = by_fqn orelse if (m.funcId(name)) |fid| pick: {
+        var chosen: ?FuncId = by_fqn orelse if (m.funcId(name)) |fid| pick: {
             if (isExtFid(fid, m)) {
                 for (m.funcsBySimpleName(name)) |c| {
                     if (!isExtFid(c, m)) {
@@ -1103,7 +1125,49 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
                 break :pick fid;
             }
         } else null;
+        // A bare simple-name pick must be visible from the executing
+        // reference site: a first-registered namesake from an unimported
+        // foreign package (`androidx...unit.max` for a `kotlin.math.*`
+        // caller) is not Kotlin's target — prefer a visible sibling, or
+        // fall through so the stdlib/intrinsic resolution below serves
+        // the name. Exact-FQN (dotted) references bind as written.
+        if (by_fqn == null) {
+            if (chosen) |fid| {
+                if (!bareGlobalFnVisible(self, m, fid, name)) {
+                    var replacement: ?FuncId = null;
+                    for (m.funcsBySimpleName(name)) |c| {
+                        if (c.int() == fid.int()) continue;
+                        if (isExtFid(c, m)) continue;
+                        const f = m.funcById(c) orelse continue;
+                        if (!f.hasBody()) continue;
+                        if (bareGlobalFnVisible(self, m, c, name)) {
+                            replacement = c;
+                            break;
+                        }
+                    }
+                    // Discard the invisible pick only when something
+                    // visible can actually serve the name — a visible
+                    // sibling, or the stdlib/intrinsic resolution below.
+                    // Otherwise keep the lenient pick: turning a
+                    // previously-resolving reference into `unresolved
+                    // global` breaks receivers the walk still serves
+                    // (`LongSparseArray.set` reached through an inline
+                    // splice with no import record at runtime).
+                    if (replacement != null) {
+                        chosen = replacement;
+                    } else {
+                        const stdlib_serves = lookupIntrinsic(self, name) != null or blk: {
+                            const pg = self.prog.borrow();
+                            defer pg.deinit();
+                            break :blk pg.get().defaultImportGlobal(name) != null or pg.get().packBareAlias(name) != null;
+                        };
+                        if (stdlib_serves) chosen = null;
+                    }
+                }
+            }
+        }
         if (chosen) |fid| {
+            if (gtrace) std.debug.print("[gtrace] {s} arm=fn fid={d} fqn={s}\n", .{ name, fid.int(), if (m.funcById(fid)) |ff| ff.fqn else "?" });
             if (funcValueById(self, allocator, fid)) |v| return v;
         }
     }
@@ -1139,6 +1203,7 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
                     const r = dispatchIntrinsic(self, allocator, fqn, func, &.{}) catch return null;
                     if (r == .ok) return r.ok;
                 }
+                if (gtrace) std.debug.print("[gtrace] {s} arm=intrinsic fqn={s}\n", .{ name, fqn });
                 return .{ .Intrinsic = .{ .fqn = fqn, .func = func } };
             }
         }

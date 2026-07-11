@@ -1720,7 +1720,7 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
@@ -1771,6 +1771,17 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
             is_low = cf.low_priority;
+            // A plain top-level candidate in a package the reference site
+            // cannot see is not a Kotlin resolution target — an unimported
+            // pack's `max(Dp, Dp)` must not swallow `kotlin.math.max(Int,
+            // Int)` just because the intrinsic carries no rankable body.
+            // Extensions stay: receiver narrowing is their discriminator.
+            if (caller_pkg.len != 0 and
+                !(cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")))
+            {
+                const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
+                if (eff.scopeTier(cf.fqn, cf.package, name, caller_pkg, cfile) == ir.Module.other_package_tier) continue;
+            }
         }
         const pts = positionalPoints(self, eff, cand, shapes, scope);
         if (ntrace) std.debug.print("[cno] {s} cand={d} pts={?}\n", .{ name, cand.int(), pts });
