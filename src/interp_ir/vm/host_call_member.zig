@@ -2815,6 +2815,53 @@ pub fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
     }
 }
 
+/// Whether instance `v` could serve bare `name` as a receiver: a member
+/// somewhere in its class hierarchy (the lowered `hierarchy_methods`
+/// name set, which covers abstract members and overrides alike), a
+/// method/body property on its `ClassDef` chain, or an extension whose
+/// declared receiver the class chain reaches. The SAM-callable walk arm
+/// consults DEEPER candidates through this before invoking an in-scope
+/// callable as a fun-interface method — kotlinc binds an outer implicit
+/// receiver's member or extension (`collect(this)` inside an
+/// `unsafeFlow` block binds the outer Flow's `collect`) over the
+/// interface-method reading of a captured lambda.
+pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
+    _ = self;
+    if (v.* != .Instance) return "-";
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return cg.get().name;
+}
+
+pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const cls_name = cg.get().name;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        if (m.registry.hierarchy_methods.get(cls_name)) |methods| {
+            if (methods.contains(name)) return true;
+        }
+        // extCouldApply rebuilds its lazy index when the func table has
+        // grown; VM execution is single-threaded, so the cast is sound.
+        if (@constCast(m).extCouldApply(allocator, cls_name, name)) return true;
+    }
+    const def = g.get().class.clone();
+    defer def.deinit();
+    if (ClassDef.findMethod(def, allocator, name)) |hit| {
+        hit.class.deinit();
+        return true;
+    }
+    return false;
+}
+
 /// A function-typed property can share its name with a vararg member method
 /// (`val createFrom: (Array<out String>) -> T` alongside
 /// `fun createFrom(vararg items: String): T = createFrom(items)`). Kotlin

@@ -4754,9 +4754,29 @@ fn samCandidateInvoke(
             if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
             return null;
         }
+        // A DEEPER implicit receiver that can serve the name (a member of
+        // its hierarchy or an applicable extension) outranks the
+        // interface-method reading of this callable: `collect(this)`
+        // inside an `unsafeFlow { }` block binds the outer Flow receiver's
+        // `collect`, never the captured action lambda. Decline so the walk
+        // reaches that receiver.
+        if (comptime @hasDecl(H, "valueCouldServeName")) {
+            var j = ci + 1;
+            while (j < cands.len) : (j += 1) {
+                if (host.valueCouldServeName(allocator, &cands[j].v, name_str)) return null;
+            }
+        }
     }
     var sam_recv = cands[ci].v;
-    if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-walk] name={s} nargs={d}\n", .{ name_str, arg_values.len });
+    if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) {
+        std.debug.print("[sam-walk] name={s} nargs={d} ci={d} n={d} tags:", .{ name_str, arg_values.len, ci, cands.len });
+        for (cands, 0..) |c, k| {
+            const served = if (comptime @hasDecl(H, "valueCouldServeName")) host.valueCouldServeName(allocator, &c.v, name_str) else false;
+            const cls: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&c.v) else "?";
+            std.debug.print(" [{d}]{s}({s})/serve={}", .{ k, @tagName(c.v), cls, served });
+        }
+        std.debug.print("\n", .{});
+    }
     const sam_this: ?Value = if (ci + 1 < cands.len) cands[ci + 1].v else null;
     const sam_res = if (comptime @hasDecl(H, "callValueWithThis")) blk: {
         if (sam_this) |st| break :blk try host.callValueWithThis(allocator, &sam_recv, &st, arg_values, names);

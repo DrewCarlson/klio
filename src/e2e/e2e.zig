@@ -51,6 +51,9 @@ fn runCorpus(jit_on: bool) !void {
         const a = run_arena.allocator();
         const base = std.fs.path.basename(kt);
         const stem = base[0 .. base.len - ".kt".len];
+        if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
+            if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
+        }
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
@@ -122,6 +125,9 @@ test "e2e corpus matches expected output" {
         const a = run_arena.allocator();
         const base = std.fs.path.basename(kt);
         const stem = base[0 .. base.len - ".kt".len];
+        if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
+            if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
+        }
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
