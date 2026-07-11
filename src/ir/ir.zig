@@ -1040,6 +1040,36 @@ pub const Module = struct {
     /// maps to `class_id_ambiguous` so the lookup returns null (the scan's
     /// ambiguity guard). Built with `class_id_map`; null until then.
     class_fqn_map: ?std.StringHashMap(ClassId) = null,
+    /// Allocator for the lowering-phase lookup caches below, stored at
+    /// `init`. Null (e.g. a module assembled field-by-field from an image)
+    /// disables the caches; every cached lookup then takes its linear scan.
+    lookup_cache_gpa: ?Allocator = null,
+    /// Lowering-phase package-head set: every dot-aligned FQN prefix of
+    /// every declared func/class, plus `func_fqn_heads`. Topped up lazily
+    /// by growth counter; `addClass`'s stub-claim (the one in-place FQN
+    /// rewrite) adds the claimed FQN's prefixes. Prefixes are only ever
+    /// added, so the set never goes stale-positive relative to the scan.
+    pkg_head_cache: std.StringHashMapUnmanaged(void) = .empty,
+    pkg_head_funcs_n: usize = 0,
+    pkg_head_classes_n: usize = 0,
+    pkg_head_heads_done: bool = false,
+    pkg_head_cache_dead: bool = false,
+    /// Lowering-phase simple name → same-name `ClassId`s in `class_index`
+    /// order (the scan's first-wins/tier-tie order). Names in `class_index`
+    /// are immutable, so growth-counter top-up alone keeps this exact.
+    class_name_cache: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ClassId)) = .empty,
+    class_name_cache_n: usize = 0,
+    /// Lowering-phase FQN → `ClassId` (or `class_id_ambiguous`). The
+    /// stub-claim FQN rewrite patches this in place; an unpatchable case
+    /// (a stub FQN that was already ambiguous) kills the cache for the
+    /// rest of the build rather than risk divergence from the scan.
+    class_fqn_cache: std.StringHashMapUnmanaged(ClassId) = .empty,
+    class_fqn_cache_n: usize = 0,
+    class_fqn_cache_dead: bool = false,
+    /// `internConst` dedup: const hash → first `ConstId` with that hash.
+    /// A hash collision falls back to the linear scan for that value.
+    const_dedup: std.AutoHashMapUnmanaged(u64, ConstId) = .empty,
+    const_dedup_n: usize = 0,
     /// The classifier NESTING TREE, derived once from FQNs: for each class,
     /// its lexical parent class (null for top-level) and, per parent, the
     /// children keyed by their last FQN segment. One id-keyed structure
@@ -1250,6 +1280,7 @@ pub const Module = struct {
 
     pub fn init(allocator: Allocator) Module {
         var out__ = Module{
+            .lookup_cache_gpa = allocator,
             .func_name_index = std.StringHashMap(std.ArrayList(FuncId)).init(allocator),
             .registry = ModuleRegistry.init(allocator),
             .decl_user_params = std.AutoHashMap(u32, u32).init(allocator),
@@ -1379,6 +1410,14 @@ pub const Module = struct {
             m.deinit();
         }
         self.func_index.deinit(allocator);
+        if (self.lookup_cache_gpa) |cg| {
+            self.pkg_head_cache.deinit(cg);
+            var cn_it = self.class_name_cache.valueIterator();
+            while (cn_it.next()) |list| list.deinit(cg);
+            self.class_name_cache.deinit(cg);
+            self.class_fqn_cache.deinit(cg);
+            self.const_dedup.deinit(cg);
+        }
         var it = self.func_name_index.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
         self.func_name_index.deinit();
@@ -1475,10 +1514,37 @@ pub const Module = struct {
     /// Look up a class by simple name.
     pub fn classId(self: *const Module, name: []const u8) ?ClassId {
         if (self.class_id_map) |*m| return m.get(name);
+        if (self.classNameCandidates(name)) |ids| {
+            return if (ids.len == 0) null else ids[0];
+        }
         for (self.class_index.items) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.id;
         }
         return null;
+    }
+
+    /// The `ClassId`s registered under simple `name`, in `class_index`
+    /// order — the exact candidate sequence the linear scan visits. Null
+    /// when the lazy cache is unavailable (finalized module, no cache
+    /// allocator, or OOM); callers then run their scan. `class_index` is
+    /// append-only with immutable names, so a growth-counter top-up keeps
+    /// the cache an exact mirror.
+    fn classNameCandidates(self: *const Module, name: []const u8) ?[]const ClassId {
+        if (self.class_id_map != null) return null;
+        const gpa = self.lookup_cache_gpa orelse return null;
+        const mut: *Module = @constCast(self);
+        mut.topUpClassNameCache(gpa) catch return null;
+        if (mut.class_name_cache.getPtr(name)) |list| return list.items;
+        return &.{};
+    }
+
+    fn topUpClassNameCache(self: *Module, gpa: Allocator) Allocator.Error!void {
+        while (self.class_name_cache_n < self.class_index.items.len) : (self.class_name_cache_n += 1) {
+            const entry = self.class_index.items[self.class_name_cache_n];
+            const gop = try self.class_name_cache.getOrPut(gpa, entry.name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, entry.id);
+        }
     }
 
     /// Build the `class_id_map` overlay from `class_index` (first entry wins on a
@@ -1712,6 +1778,17 @@ pub const Module = struct {
     pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?ClassId {
         var best: ?ClassId = null;
         var best_tier: u8 = 255;
+        if (self.classNameCandidates(name)) |ids| {
+            for (ids) |cid| {
+                const c = idGet(Class, self.classes.items, cid.int()) orelse continue;
+                const t = self.scopeTier(c.fqn, c.package, name, caller_pkg, caller_file);
+                if (t < best_tier) {
+                    best_tier = t;
+                    best = cid;
+                }
+            }
+            return best;
+        }
         for (self.class_index.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
             const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
@@ -1822,6 +1899,14 @@ pub const Module = struct {
     /// and of whether the reference is lexically inside a lambda.
     pub fn packageHeadDeclared(self: *const Module, head: []const u8) bool {
         if (head.len == 0) return false;
+        if (self.class_id_map == null and !self.pkg_head_cache_dead) {
+            if (self.lookup_cache_gpa != null) {
+                const mut: *Module = @constCast(self);
+                if (mut.topUpPkgHeads()) {
+                    return mut.pkg_head_cache.contains(head);
+                } else |_| {}
+            }
+        }
         for (self.func_fqn_heads) |h| {
             if (std.mem.eql(u8, h, head)) return true;
         }
@@ -1832,6 +1917,23 @@ pub const Module = struct {
             if (fqnHasHeadSegment(c.fqn, head)) return true;
         }
         return false;
+    }
+
+    /// Bring `pkg_head_cache` up to date with the append-only func/class
+    /// tables. Prefix inserts are idempotent, so a partially-applied OOM
+    /// leaves the counters short and the next call resumes exactly there.
+    fn topUpPkgHeads(self: *Module) Allocator.Error!void {
+        const gpa = self.lookup_cache_gpa.?;
+        if (!self.pkg_head_heads_done) {
+            for (self.func_fqn_heads) |h| try self.pkg_head_cache.put(gpa, h, {});
+            self.pkg_head_heads_done = true;
+        }
+        while (self.pkg_head_funcs_n < self.funcs.items.len) : (self.pkg_head_funcs_n += 1) {
+            try insertFqnPrefixes(&self.pkg_head_cache, gpa, self.funcs.items[self.pkg_head_funcs_n].fqn);
+        }
+        while (self.pkg_head_classes_n < self.classes.items.len) : (self.pkg_head_classes_n += 1) {
+            try insertFqnPrefixes(&self.pkg_head_cache, gpa, self.classes.items[self.pkg_head_classes_n].fqn);
+        }
     }
 
     /// The full segment path of the first non-wildcard import whose
@@ -3192,7 +3294,19 @@ pub const Module = struct {
         // skip the same-name scan (the common, no-collision case stays cheap).
         if (self.classIndexEntryByName(class.name) != null) {
             var legacy_stub: ?ClassId = null;
-            for (self.class_index.items) |entry| {
+            if (self.classNameCandidates(class.name)) |ids| {
+                for (ids) |cid| {
+                    const existing = &self.classes.items[cid.int()];
+                    if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                        class.id = cid;
+                        self.classes.items[cid.int()] = class;
+                        return cid;
+                    }
+                    if (legacy_stub == null and existing.is_stub and std.mem.eql(u8, existing.fqn, class.name)) {
+                        legacy_stub = cid;
+                    }
+                }
+            } else for (self.class_index.items) |entry| {
                 if (!std.mem.eql(u8, entry.name, class.name)) continue;
                 const existing = &self.classes.items[entry.id.int()];
                 if (std.mem.eql(u8, existing.fqn, class.fqn)) {
@@ -3207,6 +3321,7 @@ pub const Module = struct {
             if (legacy_stub) |id| {
                 class.id = id;
                 self.classes.items[id.int()] = class;
+                self.fixupStubClaimCaches(id, class.name, class.fqn);
                 return id;
             }
         }
@@ -3218,6 +3333,9 @@ pub const Module = struct {
     }
 
     pub fn classIndexEntryByName(self: *const Module, name: []const u8) ?ClassId {
+        if (self.classNameCandidates(name)) |ids| {
+            return if (ids.len == 0) null else ids[0];
+        }
         for (self.class_index.items) |entry| {
             if (std.mem.eql(u8, entry.name, name)) return entry.id;
         }
@@ -3242,6 +3360,13 @@ pub const Module = struct {
             const id = m.get(fqn) orelse return null;
             return if (id == class_id_ambiguous) null else id;
         }
+        if (self.classFqnCacheLive()) {
+            const mut: *Module = @constCast(self);
+            if (mut.topUpClassFqnCache()) {
+                const id = mut.class_fqn_cache.get(fqn) orelse return null;
+                return if (id == class_id_ambiguous) null else id;
+            } else |_| {}
+        }
         // Only resolve when the FQN is unambiguous. A residual
         // collision must not silently bind the wrong class.
         var found: ?ClassId = null;
@@ -3251,6 +3376,60 @@ pub const Module = struct {
             found = c.id;
         }
         return found;
+    }
+
+    fn classFqnCacheLive(self: *const Module) bool {
+        return self.class_fqn_map == null and !self.class_fqn_cache_dead and
+            self.lookup_cache_gpa != null;
+    }
+
+    fn topUpClassFqnCache(self: *Module) Allocator.Error!void {
+        const gpa = self.lookup_cache_gpa.?;
+        while (self.class_fqn_cache_n < self.classes.items.len) : (self.class_fqn_cache_n += 1) {
+            const c = self.classes.items[self.class_fqn_cache_n];
+            const gop = try self.class_fqn_cache.getOrPut(gpa, c.fqn);
+            if (gop.found_existing) {
+                if (gop.value_ptr.* != c.id) gop.value_ptr.* = class_id_ambiguous;
+            } else gop.value_ptr.* = c.id;
+        }
+    }
+
+    /// Patch the lookup caches after `addClass` claims a reserved stub —
+    /// the one place a class's FQN changes in an existing slot. The FQN
+    /// map swaps the stub key for the real one (killing the cache when
+    /// the stub key was already ambiguous, where precise repair is
+    /// impossible); the package-head set gains the real FQN's prefixes
+    /// (prefixes are add-only, so nothing needs removing).
+    fn fixupStubClaimCaches(self: *Module, id: ClassId, stub_fqn: []const u8, new_fqn: []const u8) void {
+        if (std.mem.eql(u8, stub_fqn, new_fqn)) return;
+        const gpa = self.lookup_cache_gpa orelse return;
+        if (!self.class_fqn_cache_dead and id.int() < self.class_fqn_cache_n) {
+            var dead = false;
+            if (self.class_fqn_cache.get(stub_fqn)) |old| {
+                if (old == id) {
+                    _ = self.class_fqn_cache.remove(stub_fqn);
+                } else if (old == class_id_ambiguous) {
+                    dead = true;
+                }
+            }
+            if (!dead) {
+                if (self.class_fqn_cache.getOrPut(gpa, new_fqn)) |gop| {
+                    if (gop.found_existing) {
+                        if (gop.value_ptr.* != id) gop.value_ptr.* = class_id_ambiguous;
+                    } else gop.value_ptr.* = id;
+                } else |_| dead = true;
+            }
+            if (dead) {
+                self.class_fqn_cache.clearRetainingCapacity();
+                self.class_fqn_cache_n = 0;
+                self.class_fqn_cache_dead = true;
+            }
+        }
+        if (!self.pkg_head_cache_dead and id.int() < self.pkg_head_classes_n) {
+            insertFqnPrefixes(&self.pkg_head_cache, gpa, new_fqn) catch {
+                self.pkg_head_cache_dead = true;
+            };
+        }
     }
 
     /// Whether class `sub` is `super_name` itself, or transitively
@@ -3335,6 +3514,26 @@ pub const Module = struct {
     /// may free their temporary name/text buffer after interning.
     /// `Module.deinit` frees these copies.
     pub fn internConst(self: *Module, allocator: Allocator, c: Const) Allocator.Error!ConstId {
+        // Hash-keyed dedup over the append-only pool; first id with a
+        // given hash wins the slot (matching the scan's first-match), and
+        // a colliding value falls back to the scan for that call.
+        if (self.topUpConstDedup(allocator)) {
+            const h = constHash(c);
+            if (self.const_dedup.get(h)) |id| {
+                if (Const.eql(self.consts.items[id.int()], c)) return id;
+            } else {
+                const id = ConstId.from(@intCast(self.consts.items.len));
+                try self.consts.ensureUnusedCapacity(allocator, 1);
+                const owned: Const = switch (c) {
+                    .String => |s| .{ .String = try allocator.dupe(u8, s) },
+                    else => c,
+                };
+                self.consts.appendAssumeCapacity(owned);
+                self.const_dedup_n = self.consts.items.len;
+                try self.const_dedup.put(allocator, h, id);
+                return id;
+            }
+        } else |_| {}
         for (self.consts.items, 0..) |k, i| {
             if (Const.eql(k, c)) return ConstId.from(@intCast(i));
         }
@@ -3346,6 +3545,14 @@ pub const Module = struct {
         };
         self.consts.appendAssumeCapacity(owned);
         return id;
+    }
+
+    fn topUpConstDedup(self: *Module, gpa: Allocator) Allocator.Error!void {
+        while (self.const_dedup_n < self.consts.items.len) : (self.const_dedup_n += 1) {
+            const h = constHash(self.consts.items[self.const_dedup_n]);
+            const gop = try self.const_dedup.getOrPut(gpa, h);
+            if (!gop.found_existing) gop.value_ptr.* = ConstId.from(@intCast(self.const_dedup_n));
+        }
     }
 };
 
@@ -3404,6 +3611,46 @@ fn fqnHasHeadSegment(fqn: []const u8, head: []const u8) bool {
     return fqn.len > head.len and
         std.mem.startsWith(u8, fqn, head) and
         fqn[head.len] == '.';
+}
+
+/// Insert every dot-aligned prefix of `fqn` — exactly the `head` values
+/// `fqnHasHeadSegment(fqn, head)` accepts — into `set`. Keys alias `fqn`,
+/// which outlives the module's lookup caches.
+fn insertFqnPrefixes(set: *std.StringHashMapUnmanaged(void), gpa: Allocator, fqn: []const u8) Allocator.Error!void {
+    for (fqn, 0..) |ch, i| {
+        if (ch == '.') try set.put(gpa, fqn[0..i], {});
+    }
+}
+
+/// Structural hash paired with `Const.eql`: scalars hash their bit
+/// pattern (so NaN and ±0.0 follow the interning pool's bit-level
+/// equality), strings hash their bytes, and the tag seeds the hash so
+/// same-width variants stay distinct.
+fn constHash(c: Const) u64 {
+    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(c)));
+    switch (c) {
+        .Unit, .Null => {},
+        .Int => |v| h.update(std.mem.asBytes(&v)),
+        .Long => |v| h.update(std.mem.asBytes(&v)),
+        .UInt => |v| h.update(std.mem.asBytes(&v)),
+        .ULong => |v| h.update(std.mem.asBytes(&v)),
+        .UShort => |v| h.update(std.mem.asBytes(&v)),
+        .UByte => |v| h.update(std.mem.asBytes(&v)),
+        .Short => |v| h.update(std.mem.asBytes(&v)),
+        .Byte => |v| h.update(std.mem.asBytes(&v)),
+        .Double => |v| {
+            const bits: u64 = @bitCast(v);
+            h.update(std.mem.asBytes(&bits));
+        },
+        .Float => |v| {
+            const bits: u32 = @bitCast(v);
+            h.update(std.mem.asBytes(&bits));
+        },
+        .Bool => |v| h.update(std.mem.asBytes(&v)),
+        .Char => |v| h.update(std.mem.asBytes(&v)),
+        .String => |s| h.update(s),
+    }
+    return h.final();
 }
 
 /// The declaring package of a top-level decl whose fully-qualified name
