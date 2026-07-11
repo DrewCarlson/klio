@@ -265,6 +265,10 @@ pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!voi
                     const deferred_val = p.init == null and p.delegate == null and
                         p.getter == null and p.setter == null;
                     if (p.mutable or deferred_val) try out.put(p.name.name, {});
+                    // `val r = if (...) { var c ... }` — the initializer's
+                    // expression blocks declare capturable vars too.
+                    if (p.init) |*e| try collectVarDeclsExpr(e, out);
+                    if (p.delegate) |e| try collectVarDeclsExpr(e, out);
                 },
                 else => {},
             },
@@ -272,9 +276,10 @@ pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!voi
                 if (dd.mutable) {
                     for (dd.names) |n| try out.put(n.name, {});
                 }
+                try collectVarDeclsExpr(&dd.init, out);
             },
+            .Assign => |a| try collectVarDeclsExpr(&a.value, out),
             .Expr => |*e| try collectVarDeclsExpr(e, out),
-            else => {},
         }
     }
 }
@@ -282,6 +287,11 @@ pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!voi
 fn collectVarDeclsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     switch (e.*) {
         .Block => |b| try collectVarDecls(b.stmts, out),
+        // `return if (...) { var c ... }` — the returned expression's
+        // blocks declare capturable vars.
+        .Return => |r| {
+            if (r.value) |v| try collectVarDeclsExpr(v, out);
+        },
         .If => |f| {
             try collectVarDeclsExpr(f.then_branch, out);
             if (f.else_branch) |els| try collectVarDeclsExpr(els, out);

@@ -634,19 +634,31 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         while (it.next()) |inner| inner.deinit();
         file_type_renames.deinit();
     }
+    var pkg_type_renames = ir.build.PkgTypeRenames.init(allocator);
+    defer {
+        var it = pkg_type_renames.valueIterator();
+        while (it.next()) |inner| inner.deinit();
+        pkg_type_renames.deinit();
+    }
     {
         var name_files = std.StringHashMap(u32).init(allocator);
         defer name_files.deinit();
         var name_counts = std.StringHashMap(u32).init(allocator);
         defer name_counts.deinit();
+        // A name any expect/actual declaration claims is shared by design
+        // (the pair resolves as one classifier); it never participates in
+        // collision mangling.
+        var ea_names = StringSet.init(allocator);
+        defer ea_names.deinit();
         for (decls.items) |*d| {
-            const claim: ?struct { name: []const u8, fid: u32 } = switch (d.*) {
-                .Class => |*c| .{ .name = c.name.name, .fid = c.span.file.int() },
-                .Object => |*o| .{ .name = o.name.name, .fid = o.span.file.int() },
-                .TypeAlias => |*t| .{ .name = t.name.name, .fid = t.span.file.int() },
+            const claim: ?struct { name: []const u8, fid: u32, ea: bool } = switch (d.*) {
+                .Class => |*c| .{ .name = c.name.name, .fid = c.span.file.int(), .ea = c.is_expect or c.is_actual },
+                .Object => |*o| .{ .name = o.name.name, .fid = o.span.file.int(), .ea = o.is_expect or o.is_actual },
+                .TypeAlias => |*t| .{ .name = t.name.name, .fid = t.span.file.int(), .ea = false },
                 else => null,
             };
             const cl = claim orelse continue;
+            if (cl.ea) try ea_names.put(cl.name, {});
             const gop = try name_counts.getOrPut(cl.name);
             if (!gop.found_existing) {
                 gop.value_ptr.* = 1;
@@ -662,17 +674,37 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
                 else => null,
             };
             const tg = target orelse continue;
-            if (tg.vis != .Private or tg.is_ea) continue;
+            if ((tg.vis != .Private and tg.vis != .Internal) or tg.is_ea) continue;
+            if (ea_names.contains(tg.name.name)) continue;
             if ((name_counts.get(tg.name.name) orelse 0) < 2) continue;
+            // A file-`private` classifier is file-scoped: the per-file map
+            // serves every legal reference. An `internal` one cannot be
+            // named from another pack (module) at all, so its legal
+            // references are the declaring file (file map), same-package
+            // files (package map), and imports — which resolve by FQN and
+            // keep the source name via the fqn override. Without the
+            // mangle the combined image keeps ONE of the same-named
+            // top-levels: foundation's `text.input.internal.Node`
+            // displaced the ui pointer-dispatch `Node` and
+            // `super.buildCache` walked a parentless class.
             const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ tg.name.name, tg.fid });
             const gop = try file_type_renames.getOrPut(tg.fid);
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
             try gop.value_ptr.put(tg.name.name, mangled);
+            if (tg.vis == .Internal) {
+                if (file_pkgs.get(span.FileId.from(tg.fid))) |pkg| {
+                    const pgop = try pkg_type_renames.getOrPut(pkg);
+                    if (!pgop.found_existing) pgop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
+                    try pgop.value_ptr.put(tg.name.name, mangled);
+                }
+            }
             tg.name.* = .{ .name = mangled, .span = tg.name.span };
         }
     }
     const prev_ty_renames = ir.build.setLowerFileTypeRenames(&file_type_renames);
     defer _ = ir.build.setLowerFileTypeRenames(prev_ty_renames);
+    const prev_pkg_renames = ir.build.setLowerPkgTypeRenames(&pkg_type_renames);
+    defer _ = ir.build.setLowerPkgTypeRenames(prev_pkg_renames);
 
     const combined = KotlinFile{
         .package = null,

@@ -854,9 +854,31 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
             } else |_| {}
         },
         .Member => |m| {
-            if (m.safe) return;
             const recv = try lowerReceiver(b, m.receiver);
             const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+            if (m.safe) {
+                // `a?.b = v` stores only when the receiver is non-null
+                // (dropping the store entirely lost `parent?.count++`
+                // updates on every non-null parent).
+                const null_r = try b.emitConst(.Null);
+                const is_null = b.allocReg();
+                try b.push(.{ .BinOp = .{ .dst = is_null, .op = .Eq, .lhs = recv, .rhs = null_r } });
+                const skip_b = try b.allocBlock();
+                const store_b = try b.allocBlock();
+                const join = try b.allocBlock();
+                b.terminate(.{ .Branch = .{ .cond = is_null, .t = skip_b, .f = store_b } });
+                b.switchTo(skip_b);
+                b.terminate(.{ .Goto = join });
+                b.switchTo(store_b);
+                try b.push(.{ .SetField = .{
+                    .receiver = recv,
+                    .field = field,
+                    .value = combined,
+                } });
+                b.terminate(.{ .Goto = join });
+                b.switchTo(join);
+                return;
+            }
             try b.push(.{ .SetField = .{
                 .receiver = recv,
                 .field = field,

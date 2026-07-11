@@ -643,9 +643,7 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
             if (already) continue;
             seen.append(self.allocator, cur.name) catch return null;
             const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
-            if (std.mem.eql(u8, cur.name, nm) or
-                std.mem.eql(u8, cur_key, nm_mangled orelse nm))
-            {
+            if (host_call_member.classHeadsMatch(self, cur.name, nm)) {
                 const d = @min(cur.depth, 50);
                 return 60 - d;
             }

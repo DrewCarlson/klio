@@ -46,6 +46,7 @@ import androidx.compose.ui.input.pointer.PointerIconService
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputEvent
 import androidx.compose.ui.input.pointer.PointerInputEventData
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerInputEventProcessor
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.PositionCalculator
@@ -572,8 +573,13 @@ class KlioComposeScene(
             scaleGestureFactor = 1f,
             panGestureOffset = Offset.Zero,
         )
+        val eventType = when {
+            down -> PointerEventType.Press
+            hover -> PointerEventType.Move
+            else -> PointerEventType.Release
+        }
         pointerProcessor.process(
-            PointerInputEvent(uptime, listOf(data)),
+            PointerInputEvent(eventType, uptime, listOf(data)),
             IdentityPositions,
         )
     }
