@@ -2815,6 +2815,53 @@ pub fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
     }
 }
 
+/// Whether instance `v` could serve bare `name` as a receiver: a member
+/// somewhere in its class hierarchy (the lowered `hierarchy_methods`
+/// name set, which covers abstract members and overrides alike), a
+/// method/body property on its `ClassDef` chain, or an extension whose
+/// declared receiver the class chain reaches. The SAM-callable walk arm
+/// consults DEEPER candidates through this before invoking an in-scope
+/// callable as a fun-interface method — kotlinc binds an outer implicit
+/// receiver's member or extension (`collect(this)` inside an
+/// `unsafeFlow` block binds the outer Flow's `collect`) over the
+/// interface-method reading of a captured lambda.
+pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
+    _ = self;
+    if (v.* != .Instance) return "-";
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return cg.get().name;
+}
+
+pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const cls_name = cg.get().name;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        if (m.registry.hierarchy_methods.get(cls_name)) |methods| {
+            if (methods.contains(name)) return true;
+        }
+        // extCouldApply rebuilds its lazy index when the func table has
+        // grown; VM execution is single-threaded, so the cast is sound.
+        if (@constCast(m).extCouldApply(allocator, cls_name, name)) return true;
+    }
+    const def = g.get().class.clone();
+    defer def.deinit();
+    if (ClassDef.findMethod(def, allocator, name)) |hit| {
+        hit.class.deinit();
+        return true;
+    }
+    return false;
+}
+
 /// A function-typed property can share its name with a vararg member method
 /// (`val createFrom: (Array<out String>) -> T` alongside
 /// `fun createFrom(vararg items: String): T = createFrom(items)`). Kotlin
@@ -6663,6 +6710,35 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // anon-object `trace(message: String)` declines a trailing-lambda
         // call so the inline `Logger.trace(() -> String)` extension binds.
         if (!anonMethodDisproven(self, hit, args)) {
+            // A MEMBER-EXTENSION override binds its extension receiver from
+            // the enclosing implicit receivers, never from the dispatch
+            // owner itself: `with(policy) { measure(...) }` inside a
+            // MeasureScope runs the anon policy's `MeasureScope.measure`
+            // with the scope as `this` and the policy in dispatch scope.
+            const ext_recv_ty: ?[]const u8 = blk: {
+                const hg = hit.module.borrow();
+                defer hg.deinit();
+                const hf = funcAt(hg.get(), hit.func) orelse break :blk null;
+                if (hf.kind != .member_extension) break :blk null;
+                if (hf.params.len == 0 or !std.mem.eql(u8, hf.params[0].name, "this")) break :blk null;
+                break :blk hf.params[0].ty.name;
+            };
+            if (ext_recv_ty) |rt| {
+                if (!receiverImplementsType(self, receiver, rt)) {
+                    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+                    defer allocator.free(entries);
+                    for (entries) |e| {
+                        if (e.v != .Instance) continue;
+                        if (!receiverImplementsType(self, &e.v, rt)) continue;
+                        ir.eval.pushEnclosing(receiver);
+                        defer ir.eval.popEnclosing();
+                        return try invokeAnonMethod(self, allocator, &e.v, hit, args, inst);
+                    }
+                    // No satisfying receiver in scope: decline so the walk
+                    // can try the next candidate.
+                    return null;
+                }
+            }
             return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
         }
     }

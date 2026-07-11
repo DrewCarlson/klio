@@ -628,6 +628,7 @@ fn bakeAndPrepare(
     const exe = exeStamp(gpa) orelse return null;
     const stdlib_hash = stdlibContentHash(gpa) orelse return null;
 
+    const tb0 = runtime.clockMonotonicNanos();
     const dep_map = gpa.create(SourceMap) catch return null;
     dep_map.* = SourceMap.init(gpa);
     var report = pack_cache.EmbeddedReport{};
@@ -636,6 +637,7 @@ fn bakeAndPrepare(
         .embedded_report = &report,
         .selection = &selection,
     });
+    const tb_parse = runtime.clockMonotonicNanos();
 
     const key = imageKey(stdlib_hash, exe, report.gate_full, selection.packs.items);
     const hex = keyHex(key);
@@ -655,6 +657,7 @@ fn bakeAndPrepare(
         if (tombstoneExists(gpa, cache, hex)) return null;
     }
 
+    const tb_pre = runtime.clockMonotonicNanos();
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse {
         writeTombstone(gpa, cache, hex);
         trace(gpa, "unbakeable {s} (base not snapshot-safe)", .{hex});
@@ -662,6 +665,7 @@ fn bakeAndPrepare(
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
 
+    const tb_lower = runtime.clockMonotonicNanos();
     const bytes = (image.bake(gpa, base, dep_map, .{
         .known_packages = report.known_packages.items,
         .binding_fqns = report.binding_fqns.items,
@@ -672,7 +676,13 @@ fn bakeAndPrepare(
     };
     writeAtomic(gpa, cache, image_path, bytes);
     pruneImages(gpa, cache);
-    trace(gpa, "baked {s} ({d} bytes)", .{ hex, bytes.len });
+    trace(gpa, "baked {s} ({d} bytes; parse {d}ms, lower {d}ms, serialize {d}ms)", .{
+        hex,
+        bytes.len,
+        (tb_parse - tb0) / 1_000_000,
+        (tb_lower - tb_pre) / 1_000_000,
+        (runtime.clockMonotonicNanos() - tb_lower) / 1_000_000,
+    });
 
     // Extend straight from the in-memory base — no need to reload what we
     // just wrote.

@@ -372,12 +372,19 @@ fun application(
     val scope = KlioApplicationScope(recomposer, density)
     val appComposition = Composition(KlioNoopApplier(), recomposer)
     appComposition.setContent {
-        with(scope) { content() }
+        scope.content()
     }
     val openedAny = scope.windows.isNotEmpty()
     var frame = 0
     while (!scope.exited && (maxFrames < 0 || frame < maxFrames)) {
-        recomposer.recompose()
+        // One recomposition frame: state invalidated by effects or events
+        // (not only input) marks every live window for redraw — a title
+        // counter driven by LaunchedEffect repaints without a pointer.
+        if (recomposer.pumpFrame()) {
+            for (win in scope.windows) {
+                if (!win.closed) win.dirty = true
+            }
+        }
         val live = scope.windows.filter { !it.closed }
         if (live.isEmpty()) break
         for (win in live) {

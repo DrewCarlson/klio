@@ -102,6 +102,22 @@ public class Recomposer(
             return false
         }
 
+    /**
+     * Synchronous frame pump for driver loops (the window application
+     * loop): fan one frame to withFrameNanos awaiters (animations,
+     * produceState pacing), then recompose pending invalidations.
+     * Returns true when there was work — a caller redraws on it.
+     */
+    public fun pumpFrame(): Boolean {
+        val had = hasPendingWork
+        if (had) {
+            frameClock.sendFrame(frameNanos)
+            frameNanos += 16_666_666L
+        }
+        recompose()
+        return had
+    }
+
     /** Recompose every registered composition that has pending invalidations (synchronous). */
     public fun recompose() {
         for (c in compositions.toList()) {
