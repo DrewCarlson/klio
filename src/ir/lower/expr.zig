@@ -4638,6 +4638,42 @@ fn inlineTargetForBareCall(
                     }
                 }
             }
+        } else if (pf.receiver_type == null) {
+            // No enclosing class at all (a top-level extension body): a
+            // member-inline pick can only be in scope through an implicit
+            // receiver, and the receiver chain is known here. When the
+            // pick's owner is not on the chain, prefer the same-name
+            // EXTENSION overload whose declared receiver IS — inside
+            // `List<T>.fastFirstOrNull`, bare `fastForEach { }` must
+            // splice `List.fastForEach`, never `SlotIdsSet`'s member
+            // (whose body reads the wrong class's `set` field).
+            if (inline_state.inlineMemberOwner(pf)) |powner| {
+                const chain: ?[]const []const u8 = try narrowingRecvChain(b);
+                if (chain) |ch| {
+                    var owner_on_chain = false;
+                    for (ch) |cn| {
+                        if (std.mem.eql(u8, cn, powner)) {
+                            owner_on_chain = true;
+                            break;
+                        }
+                    }
+                    if (!owner_on_chain) {
+                        if (inline_state.candidatesForName(nm)) |cands| {
+                            for (cands) |cf| {
+                                if (cf == pf) continue;
+                                const rt = cf.receiver_type orelse continue;
+                                for (ch) |cn| {
+                                    if (std.mem.eql(u8, cn, rt.name.name)) {
+                                        pick = cf;
+                                        break;
+                                    }
+                                }
+                                if (pick != pf) break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     // An inline overload whose last parameter is a function type does not

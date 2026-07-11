@@ -2755,7 +2755,19 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     if (r == .err and r.err == .Unimplemented and
         (receiver.* == .Function or receiver.* == .IrClosure))
     {
+        // Interface-method reading is only plausible when the callable's
+        // declared parameter count matches the call (except `invoke`,
+        // which is every callable's own surface). Without the gate, an
+        // unresolved helper name dispatched with the block as `this`
+        // (`probeCoroutineResumed(completion)` inside
+        // `startCoroutineUndispatched`) invoked the coroutine block —
+        // every UNDISPATCHED launch body ran twice.
+        if (!std.mem.eql(u8, name, "invoke")) {
+            const n = callableFieldArity(self, receiver) orelse return r;
+            if (n != args.len) return r;
+        }
         freeDispatchMiss(allocator, r);
+        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-direct] name={s} nargs={d}\n", .{ name, args.len });
         // The interface method may declare an extension receiver
         // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`):
         // Kotlin resolves it from the call site's enclosing implicit
@@ -2788,7 +2800,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 
 /// An `IrClosure`/`Function` field's declared parameter count, or null when
 /// the value is not a closure-style callable.
-fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
+pub fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
     switch (v.*) {
         .IrClosure => |c| {
             const info = self.closures.get(@intCast(c.id)) orelse return null;
@@ -3288,10 +3300,35 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (r == .ok) return r;
     }
 
-    // SAM conversion on a callable receiver.
+    // SAM conversion on a callable receiver. The interface-method reading
+    // is only plausible when the callable's declared parameter count
+    // matches the call: without the gate, any unresolved helper name
+    // probed against a coroutine block invoked the block itself
+    // (`probeCoroutineResumed(completion)` inside
+    // `startCoroutineUndispatched` — every UNDISPATCHED launch body ran
+    // twice, `samsusp` ×N).
     if (isCallableOrIntrinsic(receiver)) {
         const has_ext = extWithThisLongerThanArgs(self, name, args.len);
-        if (!std.mem.eql(u8, name, "invoke") and !has_ext) {
+        const arity_ok = if (callableFieldArity(self, receiver)) |n| n == args.len else true;
+        // A bare name a top-level NON-extension function serves is that
+        // function, never the callable's interface method: kotlinc
+        // resolves `probeCoroutineResumed(completion)` to the top-level
+        // helper even inside an extension on a function type. Names with
+        // only member/extension forms (`FlowCollector`'s `emit` on a
+        // collector that arrived as a plain lambda) keep the SAM arm.
+        const toplevel_serves = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const mod = mg.get();
+            for (mod.funcsBySimpleName(name)) |fid| {
+                const f = funcAt(mod, fid) orelse continue;
+                if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+                break :blk true;
+            }
+            break :blk false;
+        };
+        if (!std.mem.eql(u8, name, "invoke") and !has_ext and arity_ok and !toplevel_serves) {
+            if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
             const r = try callValueRec(self, allocator, receiver, args);
             if (r == .ok) return r;
         }
@@ -8150,6 +8187,47 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
                 continue;
             }
+            // Surplus declared params beyond the supplied args are only
+            // fillable when every one carries a default (or is a
+            // vararg). Without this, the 3-user-param
+            // `(suspend R.(P) -> T).startCoroutineUninterceptedOrReturn`
+            // ranked for a 2-arg call, ran the coroutine block with the
+            // completion slot empty, failed late, and the walk re-ran
+            // the block through the right overload — every UNDISPATCHED
+            // launch body executed twice.
+            if (f.params.len > want) {
+                const defaults = funcDefaults(self, &f);
+                // A trailing callable argument binds the LAST declared
+                // parameter (the trailing-lambda convention), so the
+                // default-fillable gap sits between the positional args
+                // and that last slot (`launch(context, start, block)`
+                // called as `launch { }` needs defaults on context/start
+                // only). Otherwise the gap is everything past the args.
+                const last_arg_callable = args.len > 0 and switch (args[args.len - 1]) {
+                    .IrClosure, .Function => true,
+                    else => false,
+                };
+                const last_param_fn = std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function") or
+                    std.mem.eql(u8, f.params[f.params.len - 1].ty.name, "<function>");
+                var lo: usize = want;
+                var hi: usize = f.params.len;
+                if (last_arg_callable and last_param_fn) {
+                    lo = want - 1;
+                    hi = f.params.len - 1;
+                }
+                var fillable = true;
+                var k: usize = lo;
+                while (k < hi) : (k += 1) {
+                    if (!(f.params[k].is_vararg or paramHasDefault(defaults, k))) {
+                        fillable = false;
+                        break;
+                    }
+                }
+                if (!fillable) {
+                    if (mtrace) std.debug.print("[extfb]  fid={d} surplus-skip nparams={d}\n", .{ fid.int(), f.params.len });
+                    continue;
+                }
+            }
             if (isMemberExt(mod, fid)) saw_member_ext = true;
             if (privateFnHiddenHere(self, mod, fid)) {
                 if (mtrace) std.debug.print("[extfb]  fid={d} private-skip\n", .{fid.int()});
@@ -10003,6 +10081,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         return .{ .ok = receiver.* };
     }
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) ir.eval.dumpFrameChainForDiagAlways();
     return .{ .err = try typeErr(allocator, "`this@{s}` is not bound in this scope", .{qualifier}) };
 }
 

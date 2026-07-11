@@ -225,12 +225,26 @@ next implicit receiver out handed as `this` for member-extension SAMs
 `PointerInputScope.invoke`). (5) `probeCoroutineCreated` actuals.
 Raw `Layout(content, modifier) { measure }` + `Modifier.pointerInput`
 in USER source now runs its measure lambda and starts its pointer
-coroutine (PI-START); still open there: a late bare `set` VALUE read
-inside the spliced `fastFirstOrNull` raises `unresolved global` on the
-raw-Layout path only (foundation/material3 unaffected), and
-`launch(start = UNDISPATCHED)` runs its block twice (a dispatched
-re-delivery follows the synchronous run — pre-existing, now benign for
-clicks since both runs carry the right receiver). Explicit-receiver
+coroutine exactly once. Two follow-up roots landed: (a) the
+`launch(start = UNDISPATCHED)` body ran twice-or-more because three
+runtime arms treated ANY bare name missing on a callable receiver as
+that callable's SAM method — `probeCoroutineResumed(completion)` inside
+`startCoroutineUndispatched` (whose implicit `this` IS the coroutine
+block) invoked the block itself; all three arms now require the
+callable's declared arity to match AND no top-level non-extension
+function to serve the name (`invoke` stays lenient). (b) a bare
+`fastForEach { }` inside `List.fastFirstOrNull` spliced the WRONG
+overload — `SlotIdsSet`'s member (whose body reads its own `set`
+field) — because a member-inline pick with no enclosing class was never
+receiver-checked; the bare-inline target correction now consults the
+receiver chain when there is no owner class and swaps in the extension
+whose declared receiver is on the chain. The extension-fallback ladder
+also stops ranking candidates whose surplus parameters lack defaults
+(trailing-callable-aware), which had let the 3-user-param
+`startCoroutineUninterceptedOrReturn` variant steal a 2-arg call. Still
+open on the raw-Layout path: a `this@SuspendingPointerInputModifierNodeImpl`
+read raises "not bound" inside the pointer dispatch when the handler is
+a raw user lambda (foundation/material3 unaffected). Explicit-receiver
 member-inline reified calls (`c.visitNodes(...)`, `CC(...).pfw<E>{}`)
 still fall to runtime with `T` unbound (implicit-this calls splice
 correctly). PUBLIC

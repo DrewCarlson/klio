@@ -362,7 +362,13 @@ pub fn inlineFnAstForRecvExt(
     require_receiver: bool,
 ) ?*const ast.Function {
     if (isShadowed(name)) return null;
+    const ptrace = if (runtime.getenvSlice("KLIO_INLINE_PICK")) |w| std.mem.eql(u8, w, name) else false;
     const cands = candidatesFor(name) orelse return inlineFnAstFor(name, call);
+    if (ptrace) {
+        std.debug.print("[ipick] {s} n={d} chain0={s}:", .{ name, cands.len, if (recv_chain) |ch| (if (ch.len > 0) ch[0] else "<empty>") else "<null>" });
+        for (cands) |c| std.debug.print(" recv={s}/owner={s}/file={d}", .{ if (c.receiver_type) |rt| rt.name.name else "-", inlineMemberOwner(c) orelse "-", c.name.span.file.int() });
+        std.debug.print("\n", .{});
+    }
     if (cands.len < 2) return inlineFnAstFor(name, call);
 
     // Determine whether overloads span different receiver types and

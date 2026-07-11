@@ -3981,12 +3981,15 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                             if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
                                 if (std.mem.eql(u8, w, bare_name)) {
-                                    std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={}\n", .{
+                                    std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
                                         bare_name,
                                         name_str,
                                         if (lt.func) |f| f.int() else null,
                                         if (lt.class) |c| c.int() else null,
                                         host.isShadowingCapture(bare_name),
+                                        if (frame.cur_span) |sp| sp.file.int() else 0,
+                                        if (frame.cur_span) |sp| sp.start else 0,
+                                        frame.func.name,
                                     });
                                 }
                             }
@@ -4503,20 +4506,6 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (host.bareUnsettledHeaderNoOp(frame.module, name_str, arg_values.len)) {
                     orAudit("CallMemberOrGlobal", name_str, "unsettled_header_noop", -1, null);
                     result = .Unit;
-                } else if (this_val == .IrClosure or this_val == .Function) {
-                    // The innermost implicit receiver is a plain callable and
-                    // nothing else serves the name: a fun-interface value that
-                    // was never SAM-wrapped (`with(layoutNode.measurePolicy) {
-                    // measure(measurables, constraints) }` where the stored
-                    // policy is the conversion-site lambda). Kotlin dispatches
-                    // the interface's single abstract method to the lambda —
-                    // invoke it with the call's arguments.
-                    orAudit("CallMemberOrGlobal", name_str, "sam_receiver_invoke", -1, null);
-                    var sam_recv = this_val;
-                    switch (try host.callValueNamed(allocator, &sam_recv, arg_values, names)) {
-                        .ok => |v| result = v,
-                        .err => |e| return raiseStep(frame, e),
-                    }
                 } else {
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                     if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
@@ -4689,8 +4678,27 @@ fn samCandidateInvoke(
     arg_values: []const Value,
     names: []const ?[]const u8,
 ) Allocator.Error!?SamInvokeOutcome {
-    _ = frame;
+    // For any name other than `invoke`, the interface-method reading is
+    // only plausible when the callable's declared parameter count matches
+    // the call exactly, AND no top-level non-extension function serves
+    // the name — kotlinc resolves `probeCoroutineResumed(completion)` to
+    // the top-level helper even inside an extension on a function type,
+    // where the implicit `this` IS the coroutine block; invoking the
+    // block ran every UNDISPATCHED launch body twice. Names with only
+    // member/extension forms (`measure`, `emit`) keep the dispatch.
+    if (!std.mem.eql(u8, name_str, "invoke")) {
+        if (comptime @hasDecl(H, "callableFieldArity")) {
+            const n = host.callableFieldArity(&cands[ci].v) orelse return null;
+            if (n != arg_values.len) return null;
+        }
+        for (frame.module.funcsBySimpleName(name_str)) |fid| {
+            const f = frame.module.funcById(fid) orelse continue;
+            if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+            return null;
+        }
+    }
     var sam_recv = cands[ci].v;
+    if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-walk] name={s} nargs={d}\n", .{ name_str, arg_values.len });
     const sam_this: ?Value = if (ci + 1 < cands.len) cands[ci + 1].v else null;
     const sam_res = if (comptime @hasDecl(H, "callValueWithThis")) blk: {
         if (sam_this) |st| break :blk try host.callValueWithThis(allocator, &sam_recv, &st, arg_values, names);
