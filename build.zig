@@ -1054,7 +1054,14 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; opt-in)") orelse false;
 
     const run = b.addSystemCommand(&.{cxx});
-    run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    // -DNDEBUG matches the Release prebuilt: Skia headers define SK_DEBUG when
+    // NDEBUG is absent, and debug-only fields (SkDEBUGCODE members in types the
+    // skparagraph styles embed) change struct layouts across the ABI.
+    // _GLIBCXX_USE_CXX11_ABI=0 matches how the JetBrains linux skia-pack is
+    // compiled (its u16string symbols mangle pre-cxx11): std::basic_string
+    // values cross the skparagraph API by reference, so the layouts must agree.
+    run.addArgs(&.{ "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    if (os == .linux) run.addArg("-D_GLIBCXX_USE_CXX11_ABI=0");
     // The Cocoa backend needs the shim compiled as Objective-C++; -x applies to the
     // source that follows, so it must precede the source file.
     if (os == .macos and want_cocoa) {

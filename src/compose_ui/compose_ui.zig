@@ -85,6 +85,19 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
     try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
+    // The skparagraph engine, consumed by the androidx.compose.ui.text pack.
+    try b.register("androidx.compose.ui.text.platform.__skia_para_new", paraNew);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_layout", paraLayout);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_metric", paraMetric);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_line_metric", paraLineMetric);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_offset_at", paraOffsetAt);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_box", paraBox);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_range_rect", paraRangeRect);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_range_rect_count", paraRangeRectCount);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_word", paraWord);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_line_for", paraLineFor);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_paint", paraPaint);
+    try b.register("androidx.compose.ui.text.platform.__skia_para_free", paraFree);
     return b;
 }
 
@@ -160,6 +173,18 @@ const Skia = struct {
     cDrawText2: ?CDrawText2Fn,
     cDrawSurface: ?CDrawSurfaceFn,
     cDrawSurfaceRect: ?CDrawSurfaceRectFn,
+    paraNew: ?ParaNewFn,
+    paraLayout: ?ParaLayoutFn,
+    paraMetric: ?ParaMetricFn,
+    paraLineMetric: ?ParaLineMetricFn,
+    paraOffsetAt: ?ParaOffsetAtFn,
+    paraBox: ?ParaBoxFn,
+    paraRangeRect: ?ParaRangeRectFn,
+    paraRangeRectCount: ?ParaRangeRectCountFn,
+    paraWord: ?ParaWordFn,
+    paraLineFor: ?ParaLineForFn,
+    paraPaint: ?ParaPaintFn,
+    paraFree: ?ParaFreeFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
@@ -197,6 +222,19 @@ const SurfPixelFn = *const fn (?*SkSurface, c_int, c_int) callconv(.c) u32;
 const CDrawText2Fn = *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32, c_int) callconv(.c) void;
 const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32) callconv(.c) void;
 const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
+const KlioPara = anyopaque;
+const ParaNewFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) ?*KlioPara;
+const ParaLayoutFn = *const fn (?*KlioPara, f32) callconv(.c) void;
+const ParaMetricFn = *const fn (?*KlioPara, c_int) callconv(.c) f32;
+const ParaLineMetricFn = *const fn (?*KlioPara, c_int, c_int) callconv(.c) f32;
+const ParaOffsetAtFn = *const fn (?*KlioPara, f32, f32) callconv(.c) c_int;
+const ParaBoxFn = *const fn (?*KlioPara, c_int, c_int, c_int) callconv(.c) f32;
+const ParaRangeRectFn = *const fn (?*KlioPara, c_int, c_int, c_int, c_int) callconv(.c) f32;
+const ParaRangeRectCountFn = *const fn (?*KlioPara, c_int, c_int) callconv(.c) c_int;
+const ParaWordFn = *const fn (?*KlioPara, c_int) callconv(.c) i64;
+const ParaLineForFn = *const fn (?*KlioPara, c_int) callconv(.c) c_int;
+const ParaPaintFn = *const fn (?*KlioPara, ?*SkSurface, f32, f32) callconv(.c) void;
+const ParaFreeFn = *const fn (?*KlioPara) callconv(.c) void;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -263,6 +301,18 @@ fn loadSkia() ?*Skia {
         .cDrawText2 = lib.lookup(CDrawText2Fn, "klio_skia_c_draw_text2"),
         .cDrawSurface = lib.lookup(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
         .cDrawSurfaceRect = lib.lookup(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
+        .paraNew = lib.lookup(ParaNewFn, "klio_skia_para_new"),
+        .paraLayout = lib.lookup(ParaLayoutFn, "klio_skia_para_layout"),
+        .paraMetric = lib.lookup(ParaMetricFn, "klio_skia_para_metric"),
+        .paraLineMetric = lib.lookup(ParaLineMetricFn, "klio_skia_para_line_metric"),
+        .paraOffsetAt = lib.lookup(ParaOffsetAtFn, "klio_skia_para_offset_at"),
+        .paraBox = lib.lookup(ParaBoxFn, "klio_skia_para_box"),
+        .paraRangeRect = lib.lookup(ParaRangeRectFn, "klio_skia_para_range_rect"),
+        .paraRangeRectCount = lib.lookup(ParaRangeRectCountFn, "klio_skia_para_range_rect_count"),
+        .paraWord = lib.lookup(ParaWordFn, "klio_skia_para_word"),
+        .paraLineFor = lib.lookup(ParaLineForFn, "klio_skia_para_line_for"),
+        .paraPaint = lib.lookup(ParaPaintFn, "klio_skia_para_paint"),
+        .paraFree = lib.lookup(ParaFreeFn, "klio_skia_para_free"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
@@ -718,6 +768,118 @@ fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// `__skia_para_new(textUtf8, spec): Long` — build a styled paragraph; 0 when
+/// no Skia backend / no font is available (callers fall back to stub metrics).
+fn paraNew(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.paraNew orelse return ok(Value.newLong(0));
+    const tg = ctx.args[0].String.borrow();
+    defer tg.deinit();
+    const sg = ctx.args[1].String.borrow();
+    defer sg.deinit();
+    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(txt);
+    const spec = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{sg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(spec);
+    const para = f(txt.ptr, spec.ptr) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(para)))));
+}
+
+fn paraArg(v: Value) ?*KlioPara {
+    const h = argInt(v);
+    if (h == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(@as(u64, @bitCast(h)))));
+}
+
+fn paraLayout(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (skia.paraLayout) |f| if (paraArg(ctx.args[0])) |p| f(p, argFloat(ctx.args[1]));
+    return ok(Value.newLong(0));
+}
+
+fn paraMetric(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.paraMetric orelse return ok(.{ .Float = 0 });
+    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
+    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1]))) });
+}
+
+fn paraLineMetric(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.paraLineMetric orelse return ok(.{ .Float = 0 });
+    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
+    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2]))) });
+}
+
+fn paraOffsetAt(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const f = skia.paraOffsetAt orelse return ok(Value.newInt(0));
+    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(f(p, argFloat(ctx.args[1]), argFloat(ctx.args[2]))));
+}
+
+fn paraBox(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 4) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.paraBox orelse return ok(.{ .Float = 0 });
+    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
+    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])), @intCast(argInt(ctx.args[3]))) });
+}
+
+fn paraRangeRect(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 5) return ok(.{ .Float = 0 });
+    const skia = loadSkia() orelse return ok(.{ .Float = 0 });
+    const f = skia.paraRangeRect orelse return ok(.{ .Float = 0 });
+    const p = paraArg(ctx.args[0]) orelse return ok(.{ .Float = 0 });
+    return ok(.{ .Float = f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])), @intCast(argInt(ctx.args[3])), @intCast(argInt(ctx.args[4]))) });
+}
+
+fn paraRangeRectCount(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const f = skia.paraRangeRectCount orelse return ok(Value.newInt(0));
+    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(f(p, @intCast(argInt(ctx.args[1])), @intCast(argInt(ctx.args[2])))));
+}
+
+fn paraWord(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.paraWord orelse return ok(Value.newLong(0));
+    const p = paraArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    return ok(Value.newLong(f(p, @intCast(argInt(ctx.args[1])))));
+}
+
+fn paraLineFor(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(Value.newInt(0));
+    const skia = loadSkia() orelse return ok(Value.newInt(0));
+    const f = skia.paraLineFor orelse return ok(Value.newInt(0));
+    const p = paraArg(ctx.args[0]) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(f(p, @intCast(argInt(ctx.args[1])))));
+}
+
+fn paraPaint(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 4) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const f = skia.paraPaint orelse return ok(Value.newLong(0));
+    const p = paraArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    f(p, surf, argFloat(ctx.args[2]), argFloat(ctx.args[3]));
+    return ok(Value.newLong(0));
+}
+
+fn paraFree(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (skia.paraFree) |f| if (paraArg(ctx.args[0])) |p| f(p);
+    return ok(Value.newLong(0));
+}
+
 fn canvasSave(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len >= 1) if (surfArg(ctx.args[0])) |s| if (skia.cSave) |f| f(s);
@@ -942,7 +1104,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 45), b.len());
+    try testing.expectEqual(@as(usize, 57), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

@@ -26,6 +26,7 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.DrawStyle
 import androidx.compose.ui.graphics.isSpecified
+import androidx.compose.ui.graphics.klioCanvasHandle
 import androidx.compose.ui.graphics.klioDrawTextRun
 import androidx.compose.ui.graphics.klioDrawTextRun2
 import androidx.compose.ui.graphics.klioFontAscent
@@ -42,9 +43,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.GenericFontFamily
 import androidx.compose.ui.text.style.ResolvedTextDirection
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
@@ -95,11 +98,50 @@ private fun longestWordWidth(text: String, sizePx: Float): Float {
     return max
 }
 
+/** One fully-resolved styled run over [start, end) in UTF-16 units. */
+private class KlioRun(
+    val start: Int,
+    val end: Int,
+    val sizePx: Float,
+    val weight: Int,
+    val italic: Int,
+    val deco: Int,
+    val argb: Int,
+    val family: String,
+)
+
+// skparagraph TextDecoration bits.
+private const val DECO_UNDERLINE = 1
+private const val DECO_LINE_THROUGH = 4
+
+private fun TextDecoration.skBits(): Int {
+    var d = 0
+    if (TextDecoration.Underline in this) d = d or DECO_UNDERLINE
+    if (TextDecoration.LineThrough in this) d = d or DECO_LINE_THROUGH
+    return d
+}
+
+private fun FontFamily?.klioName(): String = (this as? GenericFontFamily)?.name ?: "-"
+
+// skparagraph TextAlign: left 0, right 1, center 2, justify 3, start 4, end 5.
+private fun TextAlign?.skAlign(): Int = when (this) {
+    TextAlign.Left -> 0
+    TextAlign.Right -> 1
+    TextAlign.Center -> 2
+    TextAlign.Justify -> 3
+    TextAlign.End -> 5
+    else -> 4
+}
+
 /**
- * The klio [Paragraph]: wraps a single-style run to a width in pure Kotlin off the
- * shim's per-run width measurement, then paints each line via [klioDrawTextRun].
- * The shim draws with one bundled font, so layout is size-driven and left-to-right;
- * spans/placeholders/bidi are not modelled (klio renders one style per run).
+ * The klio [Paragraph]. With a Skia backend it is a real skparagraph layout:
+ * the AnnotatedString's SpanStyles become styled runs (per-span size, weight,
+ * style, decoration, color, family) shaped and wrapped by skia::textlayout,
+ * with UTF-16 offsets flowing through unchanged — metrics, hit testing, word
+ * boundaries, and selection boxes all answer from the real layout. Headless
+ * (no backend) it falls back to a deterministic stub layout: a pure-Kotlin
+ * greedy wrap over the shim's (zeroed) width metrics, so programs keep
+ * running with stable output.
  */
 internal class KlioParagraph(
     val text: String,
@@ -112,9 +154,7 @@ internal class KlioParagraph(
 ) : Paragraph {
 
     // The SpanStyle ranges, in application order (a later span overrides the
-    // attributes it sets on the overlap). Only paint-level attributes are
-    // honoured — color, weight (synthetic bold), style (synthetic italic),
-    // and decoration — since the single bundled font shapes every run.
+    // attributes it sets on the overlap).
     private val spanRanges: List<AnnotatedString.Range<SpanStyle>> = run {
         val out = ArrayList<AnnotatedString.Range<SpanStyle>>()
         for (r in annotations) {
@@ -125,24 +165,121 @@ internal class KlioParagraph(
     }
 
     private val fontSizePx: Float = style.resolvedFontSizePx(density)
-    private val ascent: Float = klioFontAscent(fontSizePx)   // negative
-    private val descent: Float = klioFontDescent(fontSizePx) // positive
-    private val leading: Float = klioFontLeading(fontSizePx)
-    private val lineHeightPx: Float = (descent - ascent + leading).coerceAtLeast(fontSizePx)
+    private val baseWeight: Int = style.fontWeight?.weight ?: 400
+    private val baseItalic: Int = if (style.fontStyle == FontStyle.Italic) 1 else 0
+    private val baseDeco: Int = style.textDecoration?.skBits() ?: 0
+    private fun baseArgb(): Int = style.color.takeOrElse { Color.Black }.toKlioArgb()
+
+    // ---- resolved runs (shared by the native spec and styled stub paint) ----
+
+    private fun resolvedRuns(baseColor: Int, decoOverride: TextDecoration?): List<KlioRun> {
+        val overrideDeco = decoOverride?.skBits()
+        if (spanRanges.isEmpty()) {
+            val d = overrideDeco ?: baseDeco
+            if (d == 0 && baseWeight < 600 && baseItalic == 0) return emptyList()
+            return listOf(KlioRun(0, text.length, fontSizePx, baseWeight, baseItalic, d, baseColor, style.fontFamily.klioName()))
+        }
+        val out = ArrayList<KlioRun>()
+        var seg = 0
+        while (seg < text.length) {
+            var end = text.length
+            for (r in spanRanges) {
+                if (r.start in (seg + 1) until end) end = r.start
+                if (r.end in (seg + 1) until end) end = r.end
+            }
+            var size = fontSizePx
+            var weight = baseWeight
+            var italic = baseItalic
+            var deco = overrideDeco ?: baseDeco
+            var argb = baseColor
+            var family = style.fontFamily.klioName()
+            for (r in spanRanges) {
+                if (seg >= r.start && seg < r.end) {
+                    val st = r.item
+                    if (st.color.isSpecified) argb = st.color.toKlioArgb()
+                    if (st.fontSize != TextUnit.Unspecified && st.fontSize.isSp) {
+                        size = with(density) { st.fontSize.toPx() }
+                    }
+                    st.fontWeight?.let { weight = it.weight }
+                    st.fontStyle?.let { italic = if (it == FontStyle.Italic) 1 else 0 }
+                    st.textDecoration?.let { deco = it.skBits() }
+                    st.fontFamily?.let { family = it.klioName() }
+                }
+            }
+            out.add(KlioRun(seg, end, size, weight, italic, deco, argb, family))
+            seg = end
+        }
+        return out
+    }
+
+    private fun buildSpec(baseColor: Int, decoOverride: TextDecoration?): String {
+        val sb = StringBuilder()
+        val dir = if (style.textDirection == TextDirection.Rtl) 1 else 0
+        sb.append("p ").append(fontSizePx).append(' ').append(style.textAlign.skAlign()).append(' ')
+            .append(if (maxLines == Int.MAX_VALUE) 0 else maxLines).append(' ')
+            .append(if (ellipsis) 1 else 0).append(' ').append(dir).append(' ')
+            .append(baseWeight).append(' ').append(baseItalic).append(' ')
+            .append(decoOverride?.skBits() ?: baseDeco).append(' ')
+            .append(baseColor.toLong() and 0xFFFFFFFFL).append('\n')
+        for (r in resolvedRuns(baseColor, decoOverride)) {
+            sb.append("r ").append(r.start).append(' ').append(r.end).append(' ')
+                .append(r.sizePx).append(' ').append(r.weight).append(' ').append(r.italic).append(' ')
+                .append(r.deco).append(' ').append(r.argb.toLong() and 0xFFFFFFFFL).append(' ')
+                .append(r.family).append('\n')
+        }
+        return sb.toString()
+    }
+
+    // ---- native skparagraph layout ----
+
+    private var nativeBaseArgb: Int = baseArgb()
+    private var nativeDeco: TextDecoration? = null
+    private var native: Long = run {
+        val h = __skia_para_new(text, buildSpec(nativeBaseArgb, null))
+        if (h != 0L) __skia_para_layout(h, if (width > 0f) width else Float.MAX_VALUE)
+        h
+    }
+
+    private fun nativeRebuild(baseColor: Int, decoOverride: TextDecoration?) {
+        if (native != 0L) __skia_para_free(native)
+        native = __skia_para_new(text, buildSpec(baseColor, decoOverride))
+        if (native != 0L) __skia_para_layout(native, if (width > 0f) width else Float.MAX_VALUE)
+        nativeBaseArgb = baseColor
+        nativeDeco = decoOverride
+    }
+
+    private fun metric(which: Int): Float = __skia_para_metric(native, which)
+    private fun lineMetric(line: Int, which: Int): Float = __skia_para_line_metric(native, line, which)
+
+    // ---- stub layout (headless fallback; only computed when native == 0) ----
+
+    private val ascent: Float = if (native != 0L) 0f else klioFontAscent(fontSizePx)   // negative
+    private val descent: Float = if (native != 0L) 0f else klioFontDescent(fontSizePx) // positive
+    private val leading: Float = if (native != 0L) 0f else klioFontLeading(fontSizePx)
+    private val lineHeightPx: Float =
+        if (native != 0L) 0f else (descent - ascent + leading).coerceAtLeast(fontSizePx)
     private val baselineFromTop: Float = -ascent
 
-    private val allLines: List<KlioLine> = wrap()
+    private val allLines: List<KlioLine> = if (native != 0L) emptyList() else wrap()
     private val lines: List<KlioLine> =
         if (maxLines in 1 until allLines.size) allLines.subList(0, maxLines) else allLines
 
-    override val height: Float get() = lineCount * lineHeightPx
-    override val lineCount: Int get() = lines.size.coerceAtLeast(1)
-    override val didExceedMaxLines: Boolean get() = allLines.size > lines.size
-    override val firstBaseline: Float get() = baselineFromTop
-    override val lastBaseline: Float get() = (lineCount - 1) * lineHeightPx + baselineFromTop
+    override val height: Float
+        get() = if (native != 0L) metric(0) else lineCount * lineHeightPx
+    override val lineCount: Int
+        get() = if (native != 0L) metric(4).toInt().coerceAtLeast(1) else lines.size.coerceAtLeast(1)
+    override val didExceedMaxLines: Boolean
+        get() = if (native != 0L) metric(5) != 0f else allLines.size > lines.size
+    override val firstBaseline: Float
+        get() = if (native != 0L) lineMetric(0, 2) else baselineFromTop
+    override val lastBaseline: Float
+        get() = if (native != 0L) lineMetric(lineCount - 1, 2)
+        else (lineCount - 1) * lineHeightPx + baselineFromTop
 
-    override val minIntrinsicWidth: Float get() = longestWordWidth(text, fontSizePx)
-    override val maxIntrinsicWidth: Float get() = klioTextWidth(text.replace('\n', ' '), fontSizePx)
+    override val minIntrinsicWidth: Float
+        get() = if (native != 0L) metric(2) else longestWordWidth(text, fontSizePx)
+    override val maxIntrinsicWidth: Float
+        get() = if (native != 0L) metric(1) else klioTextWidth(text.replace('\n', ' '), fontSizePx)
 
     override val placeholderRects: List<Rect?> get() = emptyList()
 
@@ -192,35 +329,76 @@ internal class KlioParagraph(
     }
 
     private fun clampLine(i: Int) = i.coerceIn(0, lineCount - 1)
-    override fun getLineTop(lineIndex: Int): Float = clampLine(lineIndex) * lineHeightPx
-    override fun getLineBottom(lineIndex: Int): Float = (clampLine(lineIndex) + 1) * lineHeightPx
-    override fun getLineHeight(lineIndex: Int): Float = lineHeightPx
-    override fun getLineBaseline(lineIndex: Int): Float = getLineTop(lineIndex) + baselineFromTop
-    override fun getLineWidth(lineIndex: Int): Float = lines.getOrNull(lineIndex)?.width ?: 0f
-    override fun getLineLeft(lineIndex: Int): Float = lines.getOrNull(lineIndex)?.let { lineLeft(it) } ?: 0f
+
+    override fun getLineTop(lineIndex: Int): Float =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 0) else clampLine(lineIndex) * lineHeightPx
+
+    override fun getLineBottom(lineIndex: Int): Float =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 1) else (clampLine(lineIndex) + 1) * lineHeightPx
+
+    override fun getLineHeight(lineIndex: Int): Float =
+        if (native != 0L) getLineBottom(lineIndex) - getLineTop(lineIndex) else lineHeightPx
+
+    override fun getLineBaseline(lineIndex: Int): Float =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 2) else getLineTop(lineIndex) + baselineFromTop
+
+    override fun getLineWidth(lineIndex: Int): Float =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 4) else lines.getOrNull(lineIndex)?.width ?: 0f
+
+    override fun getLineLeft(lineIndex: Int): Float =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 3)
+        else lines.getOrNull(lineIndex)?.let { lineLeft(it) } ?: 0f
+
     override fun getLineRight(lineIndex: Int): Float =
-        lines.getOrNull(lineIndex)?.let { lineLeft(it) + it.width } ?: 0f
-    override fun getLineStart(lineIndex: Int): Int = lines.getOrNull(lineIndex)?.start ?: 0
+        if (native != 0L) getLineLeft(lineIndex) + getLineWidth(lineIndex)
+        else lines.getOrNull(lineIndex)?.let { lineLeft(it) + it.width } ?: 0f
+
+    override fun getLineStart(lineIndex: Int): Int =
+        if (native != 0L) lineMetric(clampLine(lineIndex), 5).toInt()
+        else lines.getOrNull(lineIndex)?.start ?: 0
+
     override fun getLineEnd(lineIndex: Int, visibleEnd: Boolean): Int =
-        lines.getOrNull(lineIndex)?.end ?: text.length
+        if (native != 0L) lineMetric(clampLine(lineIndex), if (visibleEnd) 6 else 8).toInt()
+        else lines.getOrNull(lineIndex)?.end ?: text.length
+
     override fun isLineEllipsized(lineIndex: Int): Boolean =
         ellipsis && didExceedMaxLines && lineIndex == lineCount - 1
 
     override fun getLineForOffset(offset: Int): Int {
+        if (native != 0L) return __skia_para_line_for(native, offset.coerceIn(0, text.length)).coerceIn(0, lineCount - 1)
         lines.forEachIndexed { i, l -> if (offset <= l.end) return i }
         return lineCount - 1
     }
 
-    override fun getLineForVerticalPosition(vertical: Float): Int =
-        (vertical / lineHeightPx).toInt().coerceIn(0, lineCount - 1)
+    override fun getLineForVerticalPosition(vertical: Float): Int {
+        if (native != 0L) {
+            var i = 0
+            val n = lineCount
+            while (i < n) {
+                if (vertical < lineMetric(i, 1)) return i
+                i++
+            }
+            return n - 1
+        }
+        return (vertical / lineHeightPx).toInt().coerceIn(0, lineCount - 1)
+    }
 
     override fun getHorizontalPosition(offset: Int, usePrimaryDirection: Boolean): Float {
+        if (native != 0L) {
+            val o = offset.coerceIn(0, text.length)
+            if (o < text.length) {
+                if (__skia_para_box(native, o, o + 1, 4) > 0f) return __skia_para_box(native, o, o + 1, 0)
+            }
+            if (o > 0 && __skia_para_box(native, o - 1, o, 4) > 0f) return __skia_para_box(native, o - 1, o, 2)
+            return getLineLeft(getLineForOffset(o))
+        }
         val line = lines.getOrNull(getLineForOffset(offset)) ?: return 0f
         val within = (offset - line.start).coerceIn(0, line.text.length)
         return lineLeft(line) + klioTextWidth(line.text.substring(0, within), fontSizePx)
     }
 
     override fun getOffsetForPosition(position: Offset): Int {
+        if (native != 0L) return __skia_para_offset_at(native, position.x, position.y).coerceIn(0, text.length)
         val line = lines.getOrNull(getLineForVerticalPosition(position.y)) ?: return 0
         val target = position.x - lineLeft(line)
         var i = 0
@@ -231,10 +409,32 @@ internal class KlioParagraph(
         return line.start + i
     }
 
-    override fun getParagraphDirection(offset: Int): ResolvedTextDirection = ResolvedTextDirection.Ltr
-    override fun getBidiRunDirection(offset: Int): ResolvedTextDirection = ResolvedTextDirection.Ltr
+    override fun getParagraphDirection(offset: Int): ResolvedTextDirection =
+        if (style.textDirection == TextDirection.Rtl) ResolvedTextDirection.Rtl else ResolvedTextDirection.Ltr
+
+    override fun getBidiRunDirection(offset: Int): ResolvedTextDirection {
+        if (native != 0L && offset < text.length) {
+            val rtl = __skia_para_range_rect(native, offset, offset + 1, 0, 4)
+            return if (rtl != 0f) ResolvedTextDirection.Rtl else ResolvedTextDirection.Ltr
+        }
+        return getParagraphDirection(offset)
+    }
 
     override fun getBoundingBox(offset: Int): Rect {
+        if (native != 0L) {
+            val o = offset.coerceIn(0, if (text.isEmpty()) 0 else text.length - 1)
+            if (text.isNotEmpty() && __skia_para_box(native, o, o + 1, 4) > 0f) {
+                return Rect(
+                    __skia_para_box(native, o, o + 1, 0),
+                    __skia_para_box(native, o, o + 1, 1),
+                    __skia_para_box(native, o, o + 1, 2),
+                    __skia_para_box(native, o, o + 1, 3),
+                )
+            }
+            val li = getLineForOffset(offset)
+            val x = getHorizontalPosition(offset, true)
+            return Rect(x, getLineTop(li), x, getLineBottom(li))
+        }
         val li = getLineForOffset(offset)
         val left = getHorizontalPosition(offset, true)
         val advance = lines.getOrNull(li)?.let {
@@ -252,6 +452,12 @@ internal class KlioParagraph(
 
     override fun getWordBoundary(offset: Int): TextRange {
         if (text.isEmpty()) return TextRange(0, 0)
+        if (native != 0L) {
+            val packed = __skia_para_word(native, offset.coerceIn(0, text.length - 1))
+            val s = (packed ushr 32).toInt()
+            val e = (packed and 0xFFFFFFFFL).toInt()
+            if (e in (s + 1)..text.length) return TextRange(s, e)
+        }
         val o = offset.coerceIn(0, text.length)
         var s = o
         var e = o
@@ -266,7 +472,25 @@ internal class KlioParagraph(
         inclusionStrategy: androidx.compose.ui.text.TextInclusionStrategy,
     ): TextRange = TextRange.Zero
 
-    override fun getPathForRange(start: Int, end: Int): Path = Path()
+    override fun getPathForRange(start: Int, end: Int): Path {
+        val p = Path()
+        if (native != 0L && end > start) {
+            val n = __skia_para_range_rect_count(native, start, end)
+            var i = 0
+            while (i < n) {
+                p.addRect(
+                    Rect(
+                        __skia_para_range_rect(native, start, end, i, 0),
+                        __skia_para_range_rect(native, start, end, i, 1),
+                        __skia_para_range_rect(native, start, end, i, 2),
+                        __skia_para_range_rect(native, start, end, i, 3),
+                    )
+                )
+                i++
+            }
+        }
+        return p
+    }
 
     override fun fillBoundingBoxes(range: TextRange, array: FloatArray, arrayStart: Int) {
         var i = arrayStart
@@ -278,13 +502,13 @@ internal class KlioParagraph(
         }
     }
 
-    // Paragraph-level style flags (bit0 bold, bit1 italic, bit2 underline,
-    // bit3 strikethrough); [deco] is paint()'s decoration override.
+    // ---- painting ----
+
+    // Paragraph-level style flags for the stub painter.
     private fun baseFlags(deco: TextDecoration?): Int {
         var f = 0
-        val w = style.fontWeight
-        if (w != null && w.weight >= 600) f = f or 1
-        if (style.fontStyle == FontStyle.Italic) f = f or 2
+        if (baseWeight >= 600) f = f or 1
+        if (baseItalic != 0) f = f or 2
         val d = deco ?: style.textDecoration
         if (d != null) {
             if (TextDecoration.Underline in d) f = f or 4
@@ -293,7 +517,17 @@ internal class KlioParagraph(
         return f
     }
 
+    private fun nativePaint(canvas: Canvas, argb: Int, deco: TextDecoration?) {
+        if (argb != nativeBaseArgb || deco != nativeDeco) nativeRebuild(argb, deco)
+        val surf = klioCanvasHandle(canvas)
+        if (surf != 0L && native != 0L) __skia_para_paint(native, surf, 0f, 0f)
+    }
+
     private fun paintLines(canvas: Canvas, argb: Int, deco: TextDecoration? = null) {
+        if (native != 0L) {
+            nativePaint(canvas, argb, deco)
+            return
+        }
         val bf = baseFlags(deco)
         lines.forEachIndexed { i, line ->
             if (line.text.isEmpty()) return@forEachIndexed
@@ -302,39 +536,21 @@ internal class KlioParagraph(
                 klioDrawTextRun(canvas, line.text, lineLeft(line), baseline, fontSizePx, argb)
                 return@forEachIndexed
             }
-            // Split the line at span boundaries; each segment draws with the
-            // attributes the covering spans resolve to (in application order).
             var x = lineLeft(line)
-            var seg = line.start
-            while (seg < line.end) {
-                var end = line.end
-                for (r in spanRanges) {
-                    if (r.start in (seg + 1) until end) end = r.start
-                    if (r.end in (seg + 1) until end) end = r.end
-                }
-                var c = argb
-                var f = bf
-                for (r in spanRanges) {
-                    if (seg >= r.start && seg < r.end) {
-                        val st = r.item
-                        if (st.color.isSpecified) c = st.color.toKlioArgb()
-                        val w = st.fontWeight
-                        if (w != null) f = if (w.weight >= 600) f or 1 else f and 1.inv()
-                        val fs = st.fontStyle
-                        if (fs != null) f = if (fs == FontStyle.Italic) f or 2 else f and 2.inv()
-                        val d = st.textDecoration
-                        if (d != null) {
-                            f = if (TextDecoration.Underline in d) f or 4 else f and 4.inv()
-                            f = if (TextDecoration.LineThrough in d) f or 8 else f and 8.inv()
-                        }
-                    }
-                }
-                val runText = line.text.substring(seg - line.start, end - line.start)
+            for (r in resolvedRuns(argb, deco)) {
+                val s = maxOf(r.start, line.start)
+                val e = minOf(r.end, line.end)
+                if (e <= s) continue
+                val runText = line.text.substring(s - line.start, e - line.start)
                 if (runText.isNotEmpty()) {
-                    klioDrawTextRun2(canvas, runText, x, baseline, fontSizePx, c, f)
+                    var f = 0
+                    if (r.weight >= 600) f = f or 1
+                    if (r.italic != 0) f = f or 2
+                    if (r.deco and DECO_UNDERLINE != 0) f = f or 4
+                    if (r.deco and DECO_LINE_THROUGH != 0) f = f or 8
+                    klioDrawTextRun2(canvas, runText, x, baseline, fontSizePx, r.argb, f)
                     x += klioTextWidth(runText, fontSizePx)
                 }
-                seg = end
             }
         }
     }
@@ -377,7 +593,8 @@ internal class KlioParagraph(
 
 /**
  * The klio [ParagraphIntrinsics]: carries the run so [ActualParagraph] can lay it
- * out at a width later, and reports intrinsic widths off the shim.
+ * out at a width later. With a Skia backend the intrinsic widths come from a
+ * real skparagraph layout at unbounded width; headless from the stub metrics.
  */
 internal class KlioParagraphIntrinsics(
     val text: String,
@@ -385,9 +602,9 @@ internal class KlioParagraphIntrinsics(
     val density: Density,
     val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
 ) : ParagraphIntrinsics {
-    private val fontSizePx = style.resolvedFontSizePx(density)
-    override val minIntrinsicWidth: Float = longestWordWidth(text, fontSizePx)
-    override val maxIntrinsicWidth: Float = klioTextWidth(text.replace('\n', ' '), fontSizePx)
+    private val measured = KlioParagraph(text, style, density, maxLines = 0, ellipsis = false, width = 0f, annotations = annotations)
+    override val minIntrinsicWidth: Float = measured.minIntrinsicWidth
+    override val maxIntrinsicWidth: Float = measured.maxIntrinsicWidth
     override val hasStaleResolvedFonts: Boolean = false
 }
 
