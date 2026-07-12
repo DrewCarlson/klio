@@ -50,6 +50,30 @@ public fun <T> compositionLocalOf(
 public fun <T> staticCompositionLocalOf(defaultFactory: () -> T): ProvidableCompositionLocal<T> =
     ProvidableCompositionLocal(defaultFactory)
 
+/**
+ * The scope a computed default runs in: it may read OTHER locals'
+ * current values (`LocalDensity.currentValue`), resolved through the
+ * active composer exactly like `CompositionLocal.current`.
+ */
+public interface CompositionLocalAccessorScope {
+    public val <T> CompositionLocal<T>.currentValue: T
+        @Suppress("UNCHECKED_CAST")
+        get() = requireComposer().consume(this) as T
+}
+
+private object KlioLocalAccessorScope : CompositionLocalAccessorScope
+
+/**
+ * A CompositionLocal whose DEFAULT is computed on demand (and may read other
+ * locals) instead of being a fixed value — upstream's
+ * `compositionLocalWithComputedDefaultOf`. The computation runs when the
+ * local is read with no enclosing provider, inside composition.
+ */
+public fun <T> compositionLocalWithComputedDefaultOf(
+    defaultComputation: CompositionLocalAccessorScope.() -> T,
+): ProvidableCompositionLocal<T> =
+    ProvidableCompositionLocal { KlioLocalAccessorScope.defaultComputation() }
+
 /** Provide [values] to [content]; each binding shadows any outer one. */
 @Composable
 public fun CompositionLocalProvider(vararg values: ProvidedValue<*>, content: @Composable () -> Unit) {

@@ -98,6 +98,23 @@ public fun <T> remember(key1: Any?, key2: Any?, key3: Any?, calculation: () -> T
     return value as T
 }
 
+/** Remember a value, recomputing whenever any of [keys] changes (upstream's vararg form). */
+public fun <T> remember(vararg keys: Any?, calculation: () -> T): T {
+    val c = requireComposer()
+    var invalid = false
+    for (k in keys) {
+        invalid = c.changed(k) || invalid
+    }
+    val value = c.rememberedValue()
+    if (invalid || value === Composer.Empty) {
+        val computed = calculation()
+        c.updateRememberedValue(computed)
+        return rememberObserved(c, computed)
+    }
+    @Suppress("UNCHECKED_CAST")
+    return value as T
+}
+
 /**
  * Remember a [MutableState] holding [newValue], updating it every composition.
  * Lets a long-lived lambda or effect read the latest value without restarting.

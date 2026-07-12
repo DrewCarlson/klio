@@ -51,6 +51,17 @@ include = [
     "androidx/compose/animation/core/VisibilityThresholds.kt",
 ]
 
+# The spline-based fling decay from the upstream `animation` module (the
+# platform scroll fling physics): three self-contained files consumed here
+# until the full androidx.compose.animation module gets its own pack.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/animation/animation/src/commonMain/kotlin"
+include = [
+    "androidx/compose/animation/FlingCalculator.kt",
+    "androidx/compose/animation/SplineBasedDecay.kt",
+    "androidx/compose/animation/SplineBasedFloatDecayAnimationSpec.kt",
+]
+
 [[source]]
 root = "klioMain"
 

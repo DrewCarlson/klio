@@ -74,6 +74,13 @@ public interface Composer {
      * prior pass's node is being reused ([useNode]). Drives `Updater` diffing. */
     public val inserting: Boolean
 
+    /**
+     * Whether the composer is currently SKIPPING content rather than
+     * composing it. klio decides skipping per group before the body runs
+     * (`shouldRunGroup`), so inside a running body this is always false.
+     */
+    public val skipping: Boolean
+
     /** The node-tree applier this composition renders into, or null for a
      * logic-only (side-effect) composition that emits no nodes. */
     public val applier: Applier<*>?
@@ -377,6 +384,9 @@ internal class KlioComposer : Composer {
 
     override val applier: Applier<*>?
         get() = applierNode
+
+    override val skipping: Boolean
+        get() = false
 
     override val inserting: Boolean
         get() = insertingStack.isNotEmpty() && insertingStack[insertingStack.size - 1]

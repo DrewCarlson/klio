@@ -1125,6 +1125,7 @@ pub fn tryInlineCallWithTypeArgs(
             // lifted as `A$Item`) must reach the runtime as the lifted
             // name the class table actually holds.
             const substituted = b.resolveReifiedTypeName(a.name.name) orelse
+                reifiedQualifiedName(b, a) orelse
                 (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
             const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
             try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
@@ -1143,7 +1144,8 @@ pub fn tryInlineCallWithTypeArgs(
                 // same path `Nested(args)` construction takes) so a reified
                 // `<PrivateNested>` binds its class instead of an unresolved
                 // global of the source name.
-                const resolved_name = expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name;
+                const resolved_name = reifiedQualifiedName(b, a) orelse
+                    (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor
@@ -1251,6 +1253,35 @@ pub fn tryInlineCallWithTypeArgs(
     b.popInlineName();
     inline_state.inlineExpandLeave();
     return result;
+}
+
+/// The runtime-resolvable class name for a reified type argument: a
+/// QUALIFIED nested reference (`IntervalList.Interval`) resolves to its
+/// lifted `$`-mangled class (`IntervalList$Interval`, trying deeper
+/// nesting when two segments miss); an unqualified name falls back to
+/// the lexical scope-rename ladder unchanged.
+fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
+    const qp = a.qualified_path orelse return null;
+    var segs: [8][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, qp, '.');
+    while (it.next()) |seg| {
+        if (n == segs.len) return null;
+        segs[n] = seg;
+        n += 1;
+    }
+    if (n < 2) return null;
+    var k: usize = 2;
+    while (k <= n) : (k += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        for (segs[n - k .. n], 0..) |seg, i| {
+            if (i != 0) buf.append(b.allocator, '$') catch return null;
+            buf.appendSlice(b.allocator, seg) catch return null;
+        }
+        const cand = buf.toOwnedSlice(b.allocator) catch return null;
+        if (b.module.classIdIndexed(cand, b.self_package, a.name.span.file) != null) return cand;
+    }
+    return null;
 }
 
 fn paramIndex(f: *const Function, name: []const u8) ?usize {
