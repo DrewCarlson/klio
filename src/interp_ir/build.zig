@@ -1587,11 +1587,18 @@ fn buildModuleWithOverrides(
             try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
             // Declared upper bounds of the class's type parameters, for
             // the collection-stub bridge disproof at method dispatch.
+            // Unbounded params are recorded with an `Any` bound (inert for
+            // the refute pass): dispatch needs the complete NAME list to
+            // tell a class-type-param-typed method param (`put(key: Key)`
+            // on `ConcurrentMap<Key, Value>`) from a nominal reference to
+            // an unrelated same-named class.
             if (!module.registry.class_type_param_bounds.contains(e.key_ptr.*)) {
                 var cbounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
                 for (e.value_ptr.get().type_params) |*tp| {
                     if (tp.upper_bound) |*ub| {
                         try cbounds.append(a, .{ .param = tp.name.name, .bound = ub.name.name });
+                    } else {
+                        try cbounds.append(a, .{ .param = tp.name.name, .bound = "Any" });
                     }
                 }
                 if (cbounds.items.len != 0) {

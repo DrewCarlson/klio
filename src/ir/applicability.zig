@@ -236,6 +236,13 @@ pub const ApplicabilityScope = struct {
     /// back to the static `isFunctionTypeRef`.
     func_type: ?*const fn (*anyopaque, *const TypeRef) bool = null,
 
+    /// Whether `name` is a TYPE VARIABLE in scope for candidate `fid` — one
+    /// of its own type parameters, or its owning class's. A type-variable
+    /// param accepts any argument instead of being read as a nominal class
+    /// (`put(key: Key)` on `ConcurrentMap<Key, Value>`). Null callback
+    /// (lowering / eager) keeps the static short-form-`T` rule only.
+    type_var: ?*const fn (*anyopaque, FuncId, []const u8) bool = null,
+
     /// `extReceiverSpecificity(receiver, ty_name)`: the extension `recv_match`
     /// tier.
     ext_recv_match: ?*const fn (*anyopaque, *const anyopaque, []const u8) i32 = null,
@@ -537,7 +544,7 @@ pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scop
 /// Score one (param, arg) pair. Higher is better; null disqualifies the
 /// candidate. Reproduces `host_call_func.zig` `overloadScoreArg` reading from
 /// `ArgShape`, deferring value-dependent deltas to the scope callbacks.
-fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
+fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
     const nm = param_ty.name;
     const member = scope.member;
 
@@ -650,6 +657,16 @@ fn scoreArg(param_ty: *const TypeRef, arg: *const ArgShape, scope: *const Applic
     if (nm.len <= 2 and short_typaram) return 5;
     // Unit param type — accept anything but rank lowest.
     if (std.mem.eql(u8, nm, "Unit")) return 1;
+    // A param typed as one of the candidate's in-scope TYPE VARIABLES (its
+    // own type parameters, or its owning class's — `put(key: Key)` on
+    // `ConcurrentMap<Key, Value>`) accepts anything, exactly like the
+    // short-form `T` above — even when an unrelated class shares the
+    // variable's name.
+    if (scope.type_var) |cb| {
+        if (sig.fid) |fid| {
+            if (cb(scope.ctx.?, fid, simpleName(nm))) return 5;
+        }
+    }
     return null;
 }
 
@@ -719,17 +736,17 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
                 var unknown: u16 = 0;
                 var k: usize = 0;
                 while (k < vpos) : (k += 1) {
-                    const sc = scoreArg(&params[k].ty, &args[k], &scope) orelse return null;
+                    const sc = scoreArg(sig, &params[k].ty, &args[k], &scope) orelse return null;
                     total += sc;
                     if (argIsProven(&args[k])) proven += 1 else unknown += 1;
                 }
                 const elem_ty = varargElementRef(&params[vpos].ty);
                 while (k < args.len - 1) : (k += 1) {
-                    const sc = scoreArg(&elem_ty, &args[k], &scope) orelse return null;
+                    const sc = scoreArg(sig, &elem_ty, &args[k], &scope) orelse return null;
                     total += sc;
                     if (argIsProven(&args[k])) proven += 1 else unknown += 1;
                 }
-                const ls = scoreArg(&params[params.len - 1].ty, &args[args.len - 1], &scope) orelse return null;
+                const ls = scoreArg(sig, &params[params.len - 1].ty, &args[args.len - 1], &scope) orelse return null;
                 total += ls;
                 if (argIsProven(&args[args.len - 1])) proven += 1 else unknown += 1;
                 return .{
@@ -770,11 +787,11 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
             var unknown: u16 = 0;
             var k: usize = 0;
             while (k < lead) : (k += 1) {
-                const sc = scoreArg(&params[k].ty, &args[k], &scope) orelse return null;
+                const sc = scoreArg(sig, &params[k].ty, &args[k], &scope) orelse return null;
                 total += sc;
                 if (argIsProven(&args[k])) proven += 1 else unknown += 1;
             }
-            const ls = scoreArg(&params[last_param].ty, &args[lead], &scope) orelse return null;
+            const ls = scoreArg(sig, &params[last_param].ty, &args[lead], &scope) orelse return null;
             total += ls;
             if (argIsProven(&args[lead])) proven += 1 else unknown += 1;
             return .{
@@ -815,7 +832,7 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     var idx: usize = 0;
     while (idx < params.len and idx < args.len) : (idx += 1) {
         if (vp != null and idx == vp.?) break;
-        const sc = scoreArg(&params[idx].ty, &args[idx], &scope) orelse return null;
+        const sc = scoreArg(sig, &params[idx].ty, &args[idx], &scope) orelse return null;
         total += sc;
         if (argIsProven(&args[idx])) proven += 1 else unknown += 1;
     }
@@ -825,7 +842,7 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         while (k < args.len) : (k += 1) {
             const a = &args[k];
             const target: *const TypeRef = if (a.is_spread) &params[v].ty else &elem;
-            const sc = scoreArg(target, a, &scope) orelse return null;
+            const sc = scoreArg(sig, target, a, &scope) orelse return null;
             total += sc;
             if (argIsProven(a)) proven += 1 else unknown += 1;
         }
@@ -877,11 +894,11 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
             var unknown: u16 = 0;
             var j: usize = 0;
             while (j < lead) : (j += 1) {
-                const sc = scoreArg(&effective[j].ty, &args[j], &scope) orelse return null;
+                const sc = scoreArg(sig, &effective[j].ty, &args[j], &scope) orelse return null;
                 total += sc;
                 if (argIsProven(&args[j])) proven += 1 else unknown += 1;
             }
-            const ls = scoreArg(&effective[last_param].ty, &args[lead], &scope) orelse return null;
+            const ls = scoreArg(sig, &effective[last_param].ty, &args[lead], &scope) orelse return null;
             total += ls;
             if (argIsProven(&args[lead])) proven += 1 else unknown += 1;
             return .{
@@ -914,7 +931,7 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
     var unknown: u16 = 0;
     var i: usize = 0;
     while (i < args.len and i < effective.len) : (i += 1) {
-        const sc = scoreArg(&effective[i].ty, &args[i], &scope) orelse return null;
+        const sc = scoreArg(sig, &effective[i].ty, &args[i], &scope) orelse return null;
         total += sc;
         if (argIsProven(&args[i])) proven += 1 else unknown += 1;
     }
@@ -944,7 +961,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     // Receiver score (`overloadScoreArg(params[0], receiver)`), saturating
     // *1000 into the numeric `score` tier.
     const recv_score: i32 = if (params.len > 0 and recv != null)
-        (scoreArg(&params[0].ty, &recv.?, &scope) orelse -1)
+        (scoreArg(sig, &params[0].ty, &recv.?, &scope) orelse -1)
     else
         -1;
     var score: i32 = recv_score *| 1000;
@@ -977,7 +994,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     for (args, 0..) |*a, idx| {
         const pidx = if (lambda_param != null and idx == args.len - 1) lambda_param.? else idx + 1;
         if (params.len > pidx) {
-            const arg_score = scoreArg(&params[pidx].ty, a, &scope);
+            const arg_score = scoreArg(sig, &params[pidx].ty, a, &scope);
             if (arg_score == null and !params[pidx].has_default and !params[pidx].is_vararg) applic = 0;
             score += arg_score orelse -1;
             if (!isTopOrGenericType(params[pidx].ty.name)) param_spec += 1;
@@ -1095,7 +1112,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         }
         const p = pos orelse return null; // a named arg with no matching param
         if (filled[p]) return null;
-        total += scoreArg(&params[p].ty, a, &scope) orelse 0;
+        total += scoreArg(sig, &params[p].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         filled[p] = true;
         if (bind) |bb| {
@@ -1113,7 +1130,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         if (!last_named and !filled[last_param] and
             isFunctionTypeRef(&params[last_param].ty) and args[last].is_lambda)
         {
-            total += scoreArg(&params[last_param].ty, &args[last], &scope) orelse 0;
+            total += scoreArg(sig, &params[last_param].ty, &args[last], &scope) orelse 0;
             if (argIsProven(&args[last])) proven += 1 else unknown += 1;
             filled[last_param] = true;
             trailing_lambda = last;
@@ -1139,7 +1156,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
             }
             return null; // too many positional args
         }
-        total += scoreArg(&params[pidx].ty, a, &scope) orelse 0;
+        total += scoreArg(sig, &params[pidx].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         if (bind) |bb| {
             if (i < bb.len) bb[i] = @intCast(pidx);
@@ -1365,6 +1382,25 @@ test "applicable member: callable arg vs concrete non-function param disqualifie
 var mock_subtype_depth: i32 = 3;
 fn mockSubtype(_: *anyopaque, _: *const anyopaque, _: []const u8) ?i32 {
     return mock_subtype_depth;
+}
+
+test "applicable member: a class-type-param-typed param accepts an unrelated instance through the type_var callback" {
+    var dummy: u8 = 0;
+    // `put(key: Key)` where `Key` is the owning class's type parameter — the
+    // arg's runtime class is unrelated (`Token`), which without the callback
+    // is a nominal mismatch (null).
+    const p = oneParam("Key");
+    const sig = SigView{ .params = &p, .fid = FuncId.from(3), .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Token", .value = @ptrCast(&dummy) }};
+    const tv = struct {
+        fn cb(_: *anyopaque, fid: FuncId, name: []const u8) bool {
+            return fid.int() == 3 and std.mem.eql(u8, name, "Key");
+        }
+    }.cb;
+    const without = ApplicabilityScope{ .member = true, .ctx = @ptrCast(&dummy) };
+    const with = ApplicabilityScope{ .member = true, .ctx = @ptrCast(&dummy), .type_var = tv };
+    try testing.expect(applicable(&sig, &args, without) == null);
+    try testing.expectEqual(@as(i32, 5), applicable(&sig, &args, with).?.points);
 }
 
 test "applicable member vs global: instance subtype tier formula differs" {
