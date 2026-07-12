@@ -359,12 +359,22 @@ TextPainter.paint all run through the REAL pack. Landed with it:
   `examples/compose_uitext.kt` exercises the surface deterministically in
   both headless and Skia environments.
 
-**Remaining ui-text depth (deferred, next milestone = skparagraph):** the shim
-draws with one bundled Latin typeface; per-span fontSize, real font families,
-FontSynthesis, bidi, and cursor/selection geometry over styled runs want the
-linked-but-unused skparagraph (`ParagraphBuilder` with styled runs replacing
-the manual SkFont wrap). That is the substantive text-engine upgrade; the
-current engine is faithful for single-size styled text.
+**skparagraph ADOPTED (2026-07-12):** the Paragraph engine is
+skia::textlayout — UTF-16 text + a serialized run spec (SpanStyles folded to
+consecutive resolved runs) build a real skparagraph layout over the bundled
+typeface. Per-span fontSize changes wrap/line heights; ICU shapes bidi; word
+boundaries, hit testing, cursor/selection boxes, and getPathForRange answer
+from the real layout. Headless keeps the deterministic pure-Kotlin stub wrap.
+Shim build ABI lessons (both were silent corruption): compile with -DNDEBUG
+(SK_DEBUG members change layouts vs the Release prebuilt) and, on linux,
+-D_GLIBCXX_USE_CXX11_ABI=0 (the JetBrains skia-pack manges u16string
+pre-cxx11; std::basic_string crosses the skparagraph API by reference).
+Remaining text depth: real font FILES/families (TypefaceFontProvider is in
+place; generic families alias the bundled face), paragraph-handle reclamation
+(instances leak their native handle today — bounded by text/style churn since
+compose caches layouts; add a registry with eviction+rebuild when foundation's
+BasicText drives real churn), placeholders, letter spacing / line-height
+multipliers.
 
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.
