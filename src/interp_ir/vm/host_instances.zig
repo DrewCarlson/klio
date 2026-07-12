@@ -12,6 +12,7 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
 const stdlib = @import("stdlib");
+const applicability = @import("applicability");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
@@ -693,6 +694,16 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
                 dg.deinit();
                 def.deinit();
             }
+        }
+    }
+    // Builtin runtime types satisfy their nominal supertypes (a mutable
+    // builtin list offered to a `List<T>` parameter, a String to a
+    // `CharSequence` one). Mirrors the full scorer so the primary-ctor
+    // satisfiability gate cannot misroute such calls to a secondary ctor.
+    for (applicability.builtinSupersOf(v_ty), 0..) |s, pos| {
+        if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, lastSegment(nm))) {
+            const dist: i32 = if (pos > 20) 20 else @intCast(pos);
+            return 75 - dist;
         }
     }
     return null;

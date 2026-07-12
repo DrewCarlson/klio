@@ -663,7 +663,21 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const same = scope == .Instance and receiver.* == .Instance and
                 ObjRef(InstanceData).ptrEq(scope.Instance, receiver.Instance);
             if (!same and !recv_stores_context) {
-                return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe);
+                // The intrinsic is the current continuation's context. A scope
+                // built by the stdlib `Continuation(context) {}` factory (a
+                // `startCoroutine` completion) declares only `context`, so
+                // prefer a scope-owned `coroutineContext` and fall back to its
+                // `context`; the empty context is the last resort.
+                if (vmhost.host_call_member.hostHasProperty(self, &scope, "coroutineContext")) {
+                    return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe);
+                }
+                if (vmhost.host_call_member.hostHasProperty(self, &scope, "context")) {
+                    return getFieldInner(self, allocator, &scope, "context", suppress_cc_redirect, member_probe);
+                }
+                switch (try host_globals.ensureObjectSingleton(self, "EmptyCoroutineContext")) {
+                    .ok => |maybe| if (maybe) |v| return ok(v),
+                    .err => |e| return errRes(e),
+                }
             }
         } else if (!recv_stores_context and receiver.* == .Instance and
             !vmhost.host_call_member.hostHasProperty(self, receiver, "coroutineContext"))

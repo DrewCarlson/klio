@@ -1538,6 +1538,14 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
                 .ok => |v| return .{ .ok = v },
                 .err => {},
             }
+            // A `startCoroutine` completion built by the stdlib
+            // `Continuation(context) {}` factory declares only `context`;
+            // the intrinsic is the current continuation's context, so read
+            // that before falling back to the empty context.
+            switch (try vmhost.host_fields.getField(self, allocator, &scope, "context")) {
+                .ok => |v| return .{ .ok = v },
+                .err => {},
+            }
         }
         switch (try ensureObjectSingleton(self, "EmptyCoroutineContext")) {
             .ok => |maybe| if (maybe) |v| return .{ .ok = v },
