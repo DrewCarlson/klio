@@ -369,12 +369,18 @@ Shim build ABI lessons (both were silent corruption): compile with -DNDEBUG
 (SK_DEBUG members change layouts vs the Release prebuilt) and, on linux,
 -D_GLIBCXX_USE_CXX11_ABI=0 (the JetBrains skia-pack manges u16string
 pre-cxx11; std::basic_string crosses the skparagraph API by reference).
-Remaining text depth: real font FILES/families (TypefaceFontProvider is in
-place; generic families alias the bundled face), paragraph-handle reclamation
-(instances leak their native handle today — bounded by text/style churn since
-compose caches layouts; add a registry with eviction+rebuild when foundation's
-BasicText drives real churn), placeholders, letter spacing / line-height
-multipliers.
+Text depth COMPLETE (2026-07-13): font FILES load real typefaces
+(`FontFamily(Font(path))` / `klioRegisterFontFile` through
+`klio_skia_font_register`; path-derived family aliases in the run spec);
+the paragraph-handle pool bounds native handles (192, oldest-first evict,
+revive-on-use); letterSpacing + lineHeight ride two appended spec fields
+(sp scales by density, em by run font size; line height = per-style
+height override); inline PLACEHOLDERS interleave with styled runs (`h`
+spec lines, PlaceholderVerticalAlign mapped, placeholderRects via the
+ph_count/ph_rect queries); getRangeForRect answers from corner
+hit-tests with word snapping. All pixel- or value-verified in both
+engines; headless stays deterministic (null placeholder rects, false
+font registration).
 
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.
