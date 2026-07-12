@@ -390,6 +390,14 @@ pub fn inlineFnAstForRecvExt(
         }
     }
 
+    // No receiver evidence at the call site at all: an extension-only
+    // overload set cannot be narrowed — splicing one binds a receiver
+    // the scope may not even contain (`get(it)` inside a plain lambda
+    // must fall to the receiver walk, not splice `HttpClient.get`).
+    // Decline; the normal dispatch paths decide against the real
+    // runtime receivers.
+    if (recv_chain == null and !has_toplevel) return null;
+
     // The effective receiver type: the most-derived chain entry that
     // any candidate declares as its receiver. A subclass extension
     // outranks a base-class one for a subclass receiver; when nothing

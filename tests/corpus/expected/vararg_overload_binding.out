@@ -1,0 +1,5 @@
+VARARG [hello] flag=false
+VARARG [a, b] flag=false
+LIST [l] flag=false
+VARARG [path/, /abc] flag=true
+GO [11]

@@ -7967,6 +7967,13 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
 
     const member_shadows_stdlib = receiver.* == .Instance and hostHasMember(self, receiver, name);
     const user_member_ext_shadows = try userMemberExtShadows(self, allocator, receiver, name, args.len);
+    // Scope-aware pack-extension shadowing: an in-scope (imported) pack
+    // extension outranks the implicit stdlib surface for this call site;
+    // a merely-POTENTIAL one makes the resolution file-dependent, so the
+    // (type, name) memoization below must stand down.
+    const pack_ext_shadow = try importedPackExtShadows(self, allocator, receiver, name, args.len);
+    const effective_cache_key: ?root_mod.ProgramImage.MemberResolveKey =
+        if (pack_ext_shadow == .none) cache_key else null;
     // `range in range`: the builtin `Range.contains` intrinsic takes an
     // ELEMENT, so a Range argument is inapplicable to every probe the
     // ladder could hit — leave it for the extension fallback, where a
@@ -7983,19 +7990,20 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
     }
 
     if (!member_shadows_stdlib and !user_member_ext_shadows and !range_in_range and
+        pack_ext_shadow != .shadows and
         !stdlib.isToplevelFunction(name) and
         !(try userToplevelExtShadows(self, allocator, receiver, name, args)))
     {
         for (probes[0..n]) |probe| {
             if (lookupIntrinsic(self, probe)) |func| {
-                if (cache_key) |key| memberCachePut(self, key, func, probe);
+                if (effective_cache_key) |key| memberCachePut(self, key, func, probe);
                 return try dispatchWithReceiver(self, allocator, probe, func, receiver, args);
             }
         }
     }
     // No intrinsic resolved: memoize the miss so the next identical call skips
     // the probe build + lookups and falls straight through to extension/global.
-    if (cache_key) |key| memberCachePut(self, key, null, "");
+    if (effective_cache_key) |key| memberCachePut(self, key, null, "");
     return null;
 }
 
@@ -8175,6 +8183,84 @@ fn userMemberExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Va
         }
     }
     return false;
+}
+
+/// A shipped-pack top-level extension the CALL SITE's file has in scope
+/// (same package, wildcard import, or named import) whose declared
+/// receiver provably holds shadows the stdlib type-name probe: Kotlin's
+/// scoping ranks an explicitly imported extension above the implicitly
+/// imported stdlib one (ktor's `Char.isLowerCase()` inside a ktor file
+/// importing `io.ktor.util.*` beats `kotlin.text.isLowerCase`). Returns
+/// `.shadows` when the ladder must stand down for THIS call site,
+/// `.potential` when such a candidate exists but is not in scope here
+/// (the resolution is file-dependent, so the caller must not memoize),
+/// and `.none` otherwise.
+const PackExtShadow = enum { none, potential, shadows };
+
+fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, argc: usize) Allocator.Error!PackExtShadow {
+    _ = allocator;
+    const want = argc + 1;
+    const sp = ir.eval.currentCallSiteSpan();
+    const dbg = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+    if (dbg) std.debug.print("[shadow] probe name={s} argc={d} cands={d} span={any}\n", .{ name, argc, blk: {
+        const mg2 = self.module.borrow();
+        defer mg2.deinit();
+        break :blk mg2.get().funcsBySimpleName(name).len;
+    }, sp });
+    var result: PackExtShadow = .none;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (isMemberExt(mod, fid)) continue;
+        if (!f.hasBody()) continue;
+        if (f.package.len == 0) continue;
+        // The stdlib's own packages ARE the ladder's surface.
+        if (std.mem.eql(u8, f.package, "kotlin") or std.mem.startsWith(u8, f.package, "kotlin.")) continue;
+        // Only shipped/pack packages here; plain user declarations are
+        // `userToplevelExtShadows`'s domain.
+        if (dbg) std.debug.print("[shadow] cand fqn={s} pkg={s} known={} body={}\n", .{ f.fqn, f.package, stdlib.isKnownPackage(f.package), f.hasBody() });
+        if (!stdlib.isKnownPackage(f.package)) continue;
+        if (f.params.len < want) {
+            var has_vararg = false;
+            for (f.params) |*p| {
+                if (p.is_vararg) {
+                    has_vararg = true;
+                    break;
+                }
+            }
+            if (!has_vararg) continue;
+        } else if (!extArityApplicable(self, &f, want)) continue;
+        // NOMINAL receiver match only: a generic / `Any` / function-shape
+        // receiver accepts anything and must not stand the whole ladder
+        // down (a pack `fun <T> T.get(...)` would otherwise shadow
+        // `String.get`). The declared head must be a concrete type the
+        // runtime receiver implements.
+        {
+            var rn = simpleName(f.params[0].ty.name);
+            rn = std.mem.trimEnd(u8, rn, "?");
+            if (std.mem.eql(u8, rn, "Any") or std.mem.eql(u8, rn, "Unit")) continue;
+            if (std.mem.startsWith(u8, rn, "Function")) continue;
+            if (rn.len > 0 and rn.len <= 2 and allUppercase(rn)) continue;
+            if (typeParamOf(self, fid, rn)) continue;
+            if (mod.registry.type_aliases.get(rn)) |t| {
+                if (!std.mem.eql(u8, t, rn)) rn = simpleName(t);
+            }
+            if (!receiverImplementsHead(self, receiver, rn)) continue;
+        }
+        result = .potential;
+        const file = (sp orelse continue).file;
+        const in_scope = mod.importWildcardIn(file, f.package) or blk: {
+            for (mod.importAliasPathsIn(file, name)) |p| {
+                if (std.mem.eql(u8, p.fqn, f.fqn)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (in_scope) return .shadows;
+    }
+    return result;
 }
 
 /// A visible USER (non-shipped) top-level extension whose declared
@@ -8529,7 +8615,21 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
-            if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) {
+            if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) {
+                if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
+                continue;
+            }
+            // Shape gate: enough declared params for the supplied args, OR
+            // a vararg param absorbing the surplus (`appendPathSegments
+            // (vararg components, encodeSlash = ...)` takes any number of
+            // positional components).
+            const has_vararg = blk: {
+                for (f.params) |*p| {
+                    if (p.is_vararg) break :blk true;
+                }
+                break :blk false;
+            };
+            if (f.params.len < want and !has_vararg) {
                 if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
                 continue;
             }
@@ -9615,7 +9715,20 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
         const mod = mg.get();
         for (mod.funcsBySimpleName(name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
-            if (!(f.params.len >= want and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+            // Shape gate with a vararg allowance: a vararg param absorbs
+            // surplus positional args, so the declared param count may sit
+            // below the supplied count.
+            if (f.params.len < want) {
+                var has_vararg = false;
+                for (f.params) |*p| {
+                    if (p.is_vararg) {
+                        has_vararg = true;
+                        break;
+                    }
+                }
+                if (!has_vararg) continue;
+            }
             if (privateFnHiddenHere(self, mod, fid)) continue;
             if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
             // A candidate whose declared receiver definitely excludes this
@@ -9744,10 +9857,15 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
             if (positional < effective.len) {
                 param = &effective[positional];
                 bound[positional] = true;
+                // A vararg parameter absorbs this and every later unnamed
+                // positional argument (Kotlin: params after a vararg bind
+                // by name only), so the cursor stays on it.
+                if (!effective[positional].is_vararg) positional += 1;
             } else if (effective.len == 0 or !effective[effective.len - 1].is_vararg) {
                 return false;
+            } else {
+                positional += 1;
             }
-            positional += 1;
         }
         if (param) |p| {
             if (!p.is_vararg and argDefinitelyNotParamType(self, &p.ty, a)) return false;

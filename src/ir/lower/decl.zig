@@ -89,6 +89,26 @@ fn appendUnique(a: Allocator, out: *std.ArrayList([]const u8), s: []const u8) Al
 /// into a fresh register via `Inst.LoadParam` so subsequent `Path { name }`
 /// reads route through the same register.
 // Param index is a u16 slot; a function's parameter count fits it.
+/// The materialized array head a `vararg x: T` parameter has inside the
+/// body: the primitive-specialized array for primitive elements, `Array`
+/// otherwise.
+fn varargArrayHead(elem: []const u8) []const u8 {
+    const eq = std.mem.eql;
+    if (eq(u8, elem, "Byte")) return "ByteArray";
+    if (eq(u8, elem, "Short")) return "ShortArray";
+    if (eq(u8, elem, "Int")) return "IntArray";
+    if (eq(u8, elem, "Long")) return "LongArray";
+    if (eq(u8, elem, "Char")) return "CharArray";
+    if (eq(u8, elem, "Boolean")) return "BooleanArray";
+    if (eq(u8, elem, "Float")) return "FloatArray";
+    if (eq(u8, elem, "Double")) return "DoubleArray";
+    if (eq(u8, elem, "UByte")) return "UByteArray";
+    if (eq(u8, elem, "UShort")) return "UShortArray";
+    if (eq(u8, elem, "UInt")) return "UIntArray";
+    if (eq(u8, elem, "ULong")) return "ULongArray";
+    return "Array";
+}
+
 pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!void {
     for (names, 0..) |name, i| {
         const dst = b.allocReg();
@@ -1083,8 +1103,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // Record each declared parameter's static type head so a cast-rebound call
     // can disambiguate overloads by an argument that names a parameter (an
     // `Iterable<Int>` parameter must not bind an `IntRange`-typed overload slot).
+    // A vararg parameter's static type inside the body is the MATERIALIZED
+    // array (`vararg path: String` is an `Array<out String>`), never the
+    // element type — recording the element head made `path.map { ... }`
+    // carry `declared_recv=String` and bind CharSequence extensions.
     for (f.params) |*p| {
-        try b.setLocalDeclType(p.name.name, p.ty.name.name);
+        try b.setLocalDeclType(p.name.name, if (p.is_vararg) varargArrayHead(p.ty.name.name) else p.ty.name.name);
         if (p.ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (p.ty.function) |ft| {
             if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);

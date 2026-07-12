@@ -509,7 +509,17 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
 pub fn debugPrintFrames() void {
     var cur = frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
-        std.debug.print("  at {s} span={any}\n", .{ if (f.func.fqn.len != 0) f.func.fqn else f.func.name, f.cur_span });
+        var path: []const u8 = "?";
+        var line: u32 = 0;
+        if (f.cur_span) |sp| {
+            if (span.active_map) |m| {
+                if (m.getChecked(sp.file)) |sf| {
+                    path = sf.path;
+                    line = sf.lineCol(sp.start).line;
+                }
+            }
+        }
+        std.debug.print("  at {s} ({s}:{d}) span={any}\n", .{ if (f.func.fqn.len != 0) f.func.fqn else f.func.name, path, line, f.cur_span });
     }
 }
 

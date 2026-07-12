@@ -235,3 +235,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `typealias_is_as.kt`       | `is`/`as` against a typealias head behave as against the aliased target (including `Unit` aliases). |
 | `private_helper_overload_capture.kt` | Private same-named class helpers decline calls their parameter/receiver types definitely cannot bind; Char numeric conversions. |
 | `range_in_range_operator.kt` | A user `operator LongRange.contains(LongRange)` decides range-in-range membership over the builtin element `contains`. |
+| `vararg_overload_binding.kt` | Non-final vararg binding (middle args absorbed, trailing defaults kept, named args past the vararg), List-vs-vararg overload selection, and the materialized Array type of a vararg param in its body. |

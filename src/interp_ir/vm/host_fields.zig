@@ -2959,6 +2959,10 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         return .{ .ok = {} };
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
+    if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
+        std.debug.print("[setfield-miss] `{s}` on `{s}` span={any}\n", .{ name, tf, ir.eval.currentCallSiteSpan() });
+        ir.eval.debugPrintFrames();
+    }
     const msg = try std.fmt.allocPrint(allocator, "Vm::set_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
     return .{ .err = .{ .Unimplemented = msg } };

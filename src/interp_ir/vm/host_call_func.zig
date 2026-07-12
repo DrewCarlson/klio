@@ -1002,13 +1002,26 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // defaulted / function-typed params) cannot bind by the simple
     // positional walk — the vararg must absorb the middle args while the
     // trailing params take the tail (`arrayData(vararg values,
-    // toArray: ...)` called `("a", "b", "c") { ... }`). Route through the
-    // reorder-aware named binder, which handles exactly this shape.
-    if (args_in.len > f.params.len and hasNonFinalVararg(f.params) and f.hasBody()) {
-        const no_names = try allocator.alloc(?[]const u8, args_in.len);
-        defer allocator.free(no_names);
-        @memset(no_names, null);
-        return callFuncNamed(self, allocator, module, func, args_in, no_names);
+    // toArray: ...)` called `("a", "b", "c") { ... }`), at ANY supplied
+    // arity: at-or-under declared arity the positional walk would put a
+    // raw element in the vararg slot and spill the next arg into the
+    // trailing param. Route through the reorder-aware named binder —
+    // except a pre-packed re-dispatch (the vararg slot already holds an
+    // Array at its positional index), which is already bound.
+    if (hasNonFinalVararg(f.params) and f.hasBody()) {
+        const prepacked = blk: {
+            if (args_in.len != f.params.len) break :blk false;
+            for (f.params, 0..) |*p, i| {
+                if (p.is_vararg) break :blk args_in[i] == .Array;
+            }
+            break :blk false;
+        };
+        if (!prepacked) {
+            const no_names = try allocator.alloc(?[]const u8, args_in.len);
+            defer allocator.free(no_names);
+            @memset(no_names, null);
+            return callFuncNamed(self, allocator, module, func, args_in, no_names);
+        }
     }
 
     // Bodyless `expect` / header-only decl: the link step settled its
