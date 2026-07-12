@@ -2321,9 +2321,18 @@ fn buildModuleWithOverrides(
                         break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, &.{"this"}, &rewritten, nm);
                     },
                 };
-                try instance_prop_getters.put(.{ .a = c.name.name, .b = p.name.name }, fid);
-                try getter_prop_names.put(p.name.name, {});
+                // A PRIVATE class's accessors register under the FQN key
+                // only: the SIMPLE slot is shared program-wide, and a
+                // private namesake (kotlinx-coroutines-test's `private
+                // class AtomicBoolean`) must never capture dispatch for an
+                // unrelated public class. Instances of the private class
+                // itself resolve through the FQN-first probe.
                 const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+                const class_private = c.visibility == .Private and !std.mem.eql(u8, cfqn, c.name.name);
+                if (!class_private) {
+                    try instance_prop_getters.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                }
+                try getter_prop_names.put(p.name.name, {});
                 if (!std.mem.eql(u8, cfqn, c.name.name)) {
                     try instance_prop_getters.put(.{ .a = cfqn, .b = p.name.name }, fid);
                 }
@@ -2347,7 +2356,14 @@ fn buildModuleWithOverrides(
                         break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, &.{ "this", setter_param_name }, &rewritten, nm);
                     },
                 };
-                try instance_prop_setters.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                const set_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+                const set_class_private = c.visibility == .Private and !std.mem.eql(u8, set_cfqn, c.name.name);
+                if (!set_class_private) {
+                    try instance_prop_setters.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                }
+                if (!std.mem.eql(u8, set_cfqn, c.name.name)) {
+                    try instance_prop_setters.put(.{ .a = set_cfqn, .b = p.name.name }, fid);
+                }
             }
         }
     }

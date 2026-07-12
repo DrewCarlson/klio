@@ -2849,11 +2849,34 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             // `measuredSize` setter was skipped and the write hit the backing
             // field directly, its side effects lost).
             const setter_fid: ?FuncId = blk: {
+                // FQN key first: distinct packs' same-simple-named classes
+                // keep distinct FQN keys even when the shared SIMPLE-name
+                // slot clobbers (kotlinx-coroutines-test's private `class
+                // AtomicBoolean` vs atomicfu's).
+                const rf = classFqnOf(inst);
+                if (!std.mem.eql(u8, rf, class_name)) {
+                    const pg = self.prog.borrow();
+                    const hit = lookupPairFunc(pg.get().instance_prop_setters, rf, real_name);
+                    pg.deinit();
+                    if (hit) |f| break :blk f;
+                }
                 {
                     const pg = self.prog.borrow();
                     const hit = lookupPairFunc(pg.get().instance_prop_setters, class_name, real_name);
                     pg.deinit();
-                    if (hit) |f| break :blk f;
+                    // The simple slot is shared program-wide: accept its fid
+                    // for the receiver's OWN class only when the setter's
+                    // declaring package matches the receiver class's package
+                    // (a foreign namesake's accessor must not intercept a
+                    // field-backed write on an unrelated class; the
+                    // same-package hit keeps `var counter set(value)` custom
+                    // setters over their backing field).
+                    if (hit) |f| {
+                        const mptr2: *const Module = self.module.asPtr();
+                        const fp: []const u8 = if (mptr2.funcById(f)) |ff| ff.package else "";
+                        const rpkg: []const u8 = if (std.mem.lastIndexOfScalar(u8, rf, '.')) |d| rf[0..d] else "";
+                        if (rpkg.len == 0 or fp.len == 0 or std.mem.eql(u8, fp, rpkg)) break :blk f;
+                    }
                 }
                 const mg = self.module.borrow();
                 defer mg.deinit();
@@ -2959,6 +2982,10 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         return .{ .ok = {} };
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
+    if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
+        std.debug.print("[setfield-miss] `{s}` on `{s}` span={any}\n", .{ name, tf, ir.eval.currentCallSiteSpan() });
+        ir.eval.debugPrintFrames();
+    }
     const msg = try std.fmt.allocPrint(allocator, "Vm::set_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);
     return .{ .err = .{ .Unimplemented = msg } };

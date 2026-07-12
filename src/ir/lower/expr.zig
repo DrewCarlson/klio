@@ -4800,7 +4800,16 @@ fn inlineTargetForBareCall(
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
     if (inline_state.isShadowedInlineName(nm)) return null;
-    const narrowed = inlineFnAstForRecv(nm, shape, try narrowingRecvChain(b));
+    // The active splice's declared receiver serves as evidence when the
+    // caller context has none of its own (a bare reified call inside a
+    // spliced extension body); it feeds only this pick, not binding.
+    const evid_chain: ?[]const []const u8 = if (try narrowingRecvChain(b)) |c|
+        c
+    else if (b.spliceRecvTy()) |srt|
+        try recvChainOf(b, srt)
+    else
+        null;
+    const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
     const ires = b.module.resolveBareCallIndexed(
         nm,
         b.self_package,
@@ -6160,18 +6169,26 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 // overloads stays eligible while any non-extension one exists.
                 var any_nonext = false;
                 var any_fqn_match = false;
+                var any_inline = false;
                 for (b.module.funcsBySimpleName(cand_name)) |cid| {
                     const cf = b.module.funcById(cid) orelse continue;
                     if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) {
                         import_resolves = true;
                         any_fqn_match = true;
+                        if (cf.is_inline) any_inline = true;
                         if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) {
                             any_nonext = true;
                         }
                     }
                 }
                 const imp_is_extension = any_fqn_match and !any_nonext;
-                if (import_resolves and !imp_is_extension) {
+                // An INLINE target stays with the splice machinery (which
+                // resolves aliases itself): rewriting `flow { ... }`
+                // (`unsafeFlow as flow` in every kotlinx flow operator) to a
+                // qualified CALL skips the splice, and the crossinline
+                // block's bare `collect` then lowers in a plain-lambda
+                // context and binds the wrong receiver.
+                if (import_resolves and !imp_is_extension and !any_inline) {
                     const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
                     for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
                     const new_callee = try b.allocator.create(Expr);
