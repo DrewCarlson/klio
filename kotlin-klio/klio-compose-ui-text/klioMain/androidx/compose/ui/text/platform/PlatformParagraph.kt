@@ -38,6 +38,7 @@ import androidx.compose.ui.text.Paragraph
 import androidx.compose.ui.text.ParagraphIntrinsics
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextGranularity
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
@@ -544,7 +545,25 @@ internal class KlioParagraph(
         rect: Rect,
         granularity: androidx.compose.ui.text.TextGranularity,
         inclusionStrategy: androidx.compose.ui.text.TextInclusionStrategy,
-    ): TextRange = TextRange.Zero
+    ): TextRange {
+        if (rect.isEmpty) return TextRange.Zero
+        // Corner hit-tests bound the covered offsets; Word granularity
+        // snaps both ends to their word boundaries. The inclusion
+        // strategy's finer partial-glyph decisions collapse to the
+        // corner-derived range (anything the rect touches is included).
+        val startOff = getOffsetForPosition(Offset(rect.left, rect.top))
+        val endOff = getOffsetForPosition(Offset(rect.right, rect.bottom))
+        if (endOff <= startOff) return TextRange.Zero
+        var s = startOff
+        var e = endOff
+        if (granularity == TextGranularity.Word) {
+            val ws = getWordBoundary(s)
+            val we = getWordBoundary(if (e > 0) e - 1 else e)
+            s = minOf(ws.start, s)
+            e = maxOf(we.end, e)
+        }
+        return TextRange(s.coerceIn(0, text.length), e.coerceIn(0, text.length))
+    }
 
     override fun getPathForRange(start: Int, end: Int): Path {
         val p = Path()
