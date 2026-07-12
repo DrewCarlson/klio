@@ -66,3 +66,11 @@ internal fun __skia_font_register(path: String, family: String): Boolean = false
  * does this implicitly with a path-derived family.
  */
 fun klioRegisterFontFile(path: String, family: String): Boolean = __skia_font_register(path, family)
+
+/** Placeholder box count in a laid-out paragraph. */
+@Suppress("UNUSED_PARAMETER")
+internal fun __skia_para_ph_count(handle: Long): Int = 0
+
+/** Placeholder box `i` edge (0 left, 1 top, 2 right, 3 bottom). */
+@Suppress("UNUSED_PARAMETER")
+internal fun __skia_para_ph_rect(handle: Long, i: Int, which: Int): Float = 0f

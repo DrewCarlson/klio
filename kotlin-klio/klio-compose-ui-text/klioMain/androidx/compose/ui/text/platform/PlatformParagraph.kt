@@ -38,6 +38,7 @@ import androidx.compose.ui.text.Paragraph
 import androidx.compose.ui.text.ParagraphIntrinsics
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextGranularity
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -134,6 +135,19 @@ private fun TextUnit.klioPx(density: Density, fontSizePx: Float): Float = when {
     else -> 0f
 }
 
+// skparagraph PlaceholderAlignment: baseline 0, aboveBaseline 1,
+// belowBaseline 2, top 3, bottom 4, middle 5 (the spec's `h` field).
+private fun PlaceholderVerticalAlign.skPhAlign(): Int = when (this) {
+    PlaceholderVerticalAlign.AboveBaseline -> 1
+    PlaceholderVerticalAlign.Top -> 3
+    PlaceholderVerticalAlign.Bottom -> 4
+    PlaceholderVerticalAlign.Center -> 5
+    PlaceholderVerticalAlign.TextTop -> 3
+    PlaceholderVerticalAlign.TextBottom -> 4
+    PlaceholderVerticalAlign.TextCenter -> 5
+    else -> 0
+}
+
 private fun FontFamily?.klioName(): String = when (this) {
     is GenericFontFamily -> name
     // A file-backed font list: register the first file font (once) and
@@ -173,6 +187,7 @@ internal class KlioParagraph(
     val ellipsis: Boolean,
     override val width: Float,
     val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
+    val placeholders: List<AnnotatedString.Range<Placeholder>> = emptyList(),
 ) : Paragraph {
 
     // The SpanStyle ranges, in application order (a later span overrides the
@@ -256,6 +271,14 @@ internal class KlioParagraph(
                 .append(r.deco).append(' ').append(r.argb.toLong() and 0xFFFFFFFFL).append(' ')
                 .append(r.family).append(' ')
                 .append(r.letterSpacingPx).append(' ').append(paraLineHeightPx).append('\n')
+        }
+        for (ph in placeholders) {
+            val w = ph.item.width.klioPx(density, fontSizePx)
+            val h = ph.item.height.klioPx(density, fontSizePx)
+            if (w <= 0f || h <= 0f) continue
+            sb.append("h ").append(ph.start).append(' ').append(ph.end).append(' ')
+                .append(w).append(' ').append(h).append(' ')
+                .append(ph.item.placeholderVerticalAlign.skPhAlign()).append('\n')
         }
         return sb.toString()
     }
@@ -356,7 +379,29 @@ internal class KlioParagraph(
     override val maxIntrinsicWidth: Float
         get() = if (isNative) metric(1) else klioTextWidth(text.replace('\n', ' '), fontSizePx)
 
-    override val placeholderRects: List<Rect?> get() = emptyList()
+    override val placeholderRects: List<Rect?>
+        get() {
+            if (!isNative || placeholders.isEmpty()) return placeholders.map { null }
+            val n = __skia_para_ph_count(nh())
+            val out = ArrayList<Rect?>(placeholders.size)
+            var i = 0
+            while (i < placeholders.size) {
+                if (i < n) {
+                    out.add(
+                        Rect(
+                            __skia_para_ph_rect(nh(), i, 0),
+                            __skia_para_ph_rect(nh(), i, 1),
+                            __skia_para_ph_rect(nh(), i, 2),
+                            __skia_para_ph_rect(nh(), i, 3),
+                        )
+                    )
+                } else {
+                    out.add(null)
+                }
+                i++
+            }
+            return out
+        }
 
     private fun wrap(): List<KlioLine> {
         val out = ArrayList<KlioLine>()
@@ -694,8 +739,9 @@ internal class KlioParagraphIntrinsics(
     val style: TextStyle,
     val density: Density,
     val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
+    val placeholders: List<AnnotatedString.Range<Placeholder>> = emptyList(),
 ) : ParagraphIntrinsics {
-    private val measured = KlioParagraph(text, style, density, maxLines = 0, ellipsis = false, width = 0f, annotations = annotations)
+    private val measured = KlioParagraph(text, style, density, maxLines = 0, ellipsis = false, width = 0f, annotations = annotations, placeholders = placeholders)
     override val minIntrinsicWidth: Float = measured.minIntrinsicWidth
     override val maxIntrinsicWidth: Float = measured.maxIntrinsicWidth
     override val hasStaleResolvedFonts: Boolean = false
@@ -712,7 +758,7 @@ internal actual fun ActualParagraph(
     width: Float,
     density: Density,
     resourceLoader: Font.ResourceLoader,
-): Paragraph = KlioParagraph(text, style, density, maxLines, ellipsis, width, annotations)
+): Paragraph = KlioParagraph(text, style, density, maxLines, ellipsis, width, annotations, placeholders)
 
 internal actual fun ActualParagraph(
     text: String,
@@ -729,6 +775,7 @@ internal actual fun ActualParagraph(
     ellipsis = overflow == TextOverflow.Ellipsis,
     width = constraints.maxWidth.toFloat(),
     annotations = annotations,
+    placeholders = placeholders,
 )
 
 internal actual fun ActualParagraph(
@@ -743,6 +790,7 @@ internal actual fun ActualParagraph(
         ellipsis = overflow == TextOverflow.Ellipsis,
         width = constraints.maxWidth.toFloat(),
         annotations = i.annotations,
+        placeholders = i.placeholders,
     )
 }
 
@@ -753,4 +801,4 @@ internal actual fun ActualParagraphIntrinsics(
     placeholders: List<AnnotatedString.Range<Placeholder>>,
     density: Density,
     fontFamilyResolver: FontFamily.Resolver,
-): ParagraphIntrinsics = KlioParagraphIntrinsics(text, style, density, annotations)
+): ParagraphIntrinsics = KlioParagraphIntrinsics(text, style, density, annotations, placeholders)

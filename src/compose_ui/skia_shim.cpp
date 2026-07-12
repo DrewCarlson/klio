@@ -642,6 +642,8 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
     skia::textlayout::TextStyle base;
     struct Run { size_t s, e; skia::textlayout::TextStyle ts; };
     std::vector<Run> runs;
+    struct Ph { size_t s, e; float w, h; int align; };
+    std::vector<Ph> phs;
 
     std::istringstream in(spec);
     std::string line;
@@ -684,6 +686,17 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
                 ts.setHeightOverride(true);
             }
             runs.push_back(Run{s, e, ts});
+        } else if (op == "h") {
+            // Placeholder: `h start end widthPx heightPx align` — the range's
+            // text is not added; an inline box of the given size takes its
+            // place. align maps PlaceholderVerticalAlign ordinals.
+            size_t s = 0, e = 0;
+            float w = 0, h = 0;
+            int align = 0;
+            ls >> s >> e >> w >> h >> align;
+            if (e > text.size()) e = text.size();
+            if (s >= e || w <= 0 || h <= 0) continue;
+            phs.push_back(Ph{s, e, w, h, align});
         }
     }
 
@@ -691,18 +704,59 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
     auto builder = skia::textlayout::ParagraphBuilder::make(ps, g_paraFonts, g_paraUnicode);
     if (ptrace) std::fprintf(stderr, "[para] builder=%d\n", builder ? 1 : 0);
     if (!builder) return nullptr;
-    if (runs.empty()) {
-        builder->addText(text);
-    } else {
-        size_t cursor = 0;
-        for (const auto& r : runs) {
-            if (r.s > cursor) builder->addText(text.substr(cursor, r.s - cursor));
-            builder->pushStyle(r.ts);
-            builder->addText(text.substr(r.s, r.e - r.s));
-            builder->pop();
-            cursor = r.e;
+    // Emit [cursor, limit) of the text, splitting styled runs at the
+    // boundary and replacing placeholder ranges with inline boxes.
+    auto phAlign = [](int a) {
+        using PA = skia::textlayout::PlaceholderAlignment;
+        switch (a) {
+            case 1: return PA::kAboveBaseline;
+            case 2: return PA::kBelowBaseline;
+            case 3: return PA::kTop;
+            case 4: return PA::kBottom;
+            case 5: return PA::kMiddle;
+            default: return PA::kBaseline;
         }
-        if (cursor < text.size()) builder->addText(text.substr(cursor));
+    };
+    auto styleAt = [&](size_t pos) -> const skia::textlayout::TextStyle* {
+        for (const auto& r : runs) {
+            if (pos >= r.s && pos < r.e) return &r.ts;
+        }
+        return nullptr;
+    };
+    auto addTextRange = [&](size_t s, size_t e) {
+        size_t cur = s;
+        while (cur < e) {
+            const auto* ts = styleAt(cur);
+            size_t end = e;
+            for (const auto& r : runs) {
+                if (r.s > cur && r.s < end) end = r.s;
+                if (r.e > cur && r.e < end) end = r.e;
+            }
+            if (ts) {
+                builder->pushStyle(*ts);
+                builder->addText(text.substr(cur, end - cur));
+                builder->pop();
+            } else {
+                builder->addText(text.substr(cur, end - cur));
+            }
+            cur = end;
+        }
+    };
+    if (phs.empty() && runs.empty()) {
+        builder->addText(text);
+    } else if (phs.empty()) {
+        addTextRange(0, text.size());
+    } else {
+        std::sort(phs.begin(), phs.end(), [](const Ph& a, const Ph& b) { return a.s < b.s; });
+        size_t cursor = 0;
+        for (const auto& ph : phs) {
+            if (ph.s > cursor) addTextRange(cursor, ph.s);
+            skia::textlayout::PlaceholderStyle pst(ph.w, ph.h, phAlign(ph.align),
+                                                   skia::textlayout::TextBaseline::kAlphabetic, 0.0f);
+            builder->addPlaceholder(pst);
+            cursor = ph.e;
+        }
+        if (cursor < text.size()) addTextRange(cursor, text.size());
     }
     if (ptrace) std::fprintf(stderr, "[para] text added\n");
     auto para = builder->Build();
@@ -711,6 +765,26 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
     auto* out = new KlioPara();
     out->para = std::move(para);
     return out;
+}
+
+// Number of placeholder boxes in the laid-out paragraph.
+extern "C" int32_t klio_skia_para_ph_count(KlioPara* p) {
+    if (!p) return 0;
+    return static_cast<int32_t>(p->para->getRectsForPlaceholders().size());
+}
+
+// which: 0 left, 1 top, 2 right, 3 bottom of placeholder box `i`.
+extern "C" float klio_skia_para_ph_rect(KlioPara* p, int32_t i, int32_t which) {
+    if (!p) return 0;
+    auto boxes = p->para->getRectsForPlaceholders();
+    if (i < 0 || static_cast<size_t>(i) >= boxes.size()) return 0;
+    const SkRect& r = boxes[static_cast<size_t>(i)].rect;
+    switch (which) {
+        case 0: return r.fLeft;
+        case 1: return r.fTop;
+        case 2: return r.fRight;
+        default: return r.fBottom;
+    }
 }
 
 void klio_skia_para_layout(KlioPara* p, float width) {
