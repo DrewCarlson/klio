@@ -162,6 +162,28 @@ fn isMapFamily(pn: []const u8) bool {
     return std.mem.eql(u8, pn, "Map") or std.mem.eql(u8, pn, "MutableMap");
 }
 
+/// Definite container-content disproof for the dispatch-side
+/// applicability checks: the declared type's generic arguments are
+/// provably incompatible with the container value's elements
+/// (`List<IntRange>` offered a list of LongRanges).
+pub fn valueDefinitelyNot(self: *VmHost, ty: *const TypeRef, v: *const Value) bool {
+    return valueMatches(self, ty, v, 0) == .disproven;
+}
+
+/// Whether `pn` is a builtin container or range-family head — a nominal
+/// surface no scalar/String/Bool/Char value can satisfy.
+pub fn isContainerOrRangeHead(pn: []const u8) bool {
+    if (isListFamily(pn) or isSetFamily(pn) or isMapFamily(pn)) return true;
+    for ([_][]const u8{
+        "IntRange",        "LongRange",        "CharRange",       "UIntRange",
+        "ULongRange",      "IntProgression",   "LongProgression", "CharProgression",
+        "UIntProgression", "ULongProgression", "ClosedRange",     "OpenEndRange",
+    }) |fam| {
+        if (std.mem.eql(u8, pn, fam)) return true;
+    }
+    return false;
+}
+
 /// One runtime value against one declared type. Definite-only: `disproven`
 /// requires positive evidence of incompatibility, everything uncertain is
 /// `unknown`.
@@ -223,6 +245,9 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         }) |fam| {
             if (std.mem.eql(u8, head, fam)) return .disproven;
         }
+        // A range satisfies Iterable (proven above) but is never a
+        // List/Set/Map/Collection.
+        if (isListFamily(head) or isSetFamily(head) or isMapFamily(head)) return .disproven;
         return .unknown;
     }
 

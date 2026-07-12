@@ -64,6 +64,49 @@ pub fn char_code(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
+/// `Char.toLong()` / `Char.toShort()` / `Char.toByte()` / `Char.toDouble()`
+/// / `Char.toFloat()` — the receiver's code as the target numeric type
+/// (`toShort`/`toByte` truncate like kotlinc).
+pub fn char_to_long(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.toLong");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(Value.newLong(@as(i64, u))),
+    };
+}
+
+pub fn char_to_short(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.toShort");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(Value.newShort(@as(i16, @bitCast(u)))),
+    };
+}
+
+pub fn char_to_byte(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.toByte");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(Value.newByte(@as(i8, @bitCast(@as(u8, @truncate(u)))))),
+    };
+}
+
+pub fn char_to_double(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.toDouble");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(.{ .Double = @floatFromInt(u) }),
+    };
+}
+
+pub fn char_to_float(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const r = recvChar(ctx.args, "Char.toFloat");
+    return switch (r) {
+        .err => |e| .{ .err = e },
+        .unit => |u| ok(.{ .Float = @floatFromInt(u) }),
+    };
+}
+
 /// `Char.getCategoryValue()` — the Unicode general-category code, from the
 /// compiled-in table (see `unicode_category.zig`).
 pub fn char_get_category_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

@@ -2505,9 +2505,31 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // the hierarchy walk never reaches the inherited range overload. Refuting the
     // scalar param lets the walk fall through to it.
     if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
-    // Only adjudicate when the parameter names a known user class (under
-    // either reading of an aliased name).
-    {
+    // Builtin container/range-family parameter heads: a scalar/String/
+    // Bool/Char argument definitely does not satisfy them (a String is
+    // never a `List<IntRange>`), and a container argument whose element
+    // knowledge provably contradicts the declared generic arguments is
+    // definite too (`List<LongRange>` offered to `List<IntRange>`). A
+    // packed `Array` stays non-definite through `valueDefinitelyNot`
+    // (pre-packed varargs), as does a wrong-kind range (already decided
+    // above for scalar heads, and by the element walk here).
+    const container_or_range_head = overload_match.isContainerOrRangeHead(pn);
+    if (container_or_range_head) {
+        switch (arg.*) {
+            .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => return true,
+            .List, .Set, .Map, .Range => return overload_match.valueDefinitelyNot(self, param_ty, arg),
+            // An Instance falls through to the hierarchy walk below: a
+            // user class that never reaches the container head in its
+            // supertype closure is definite (a `RangesSpecifier` is not a
+            // `List<IntRange>`), while an implementing class stays a
+            // candidate.
+            .Instance => {},
+            else => return false,
+        }
+    }
+    // Only adjudicate when the parameter names a known user class, or a
+    // builtin container/range head an Instance was offered to (above).
+    if (!container_or_range_head) {
         const cg = self.classes.borrow();
         defer cg.deinit();
         if (cg.get().get(pn) == null and cg.get().get(orig) == null) return false;
@@ -3512,7 +3534,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // `r.contains(x)` on a Range.
-    if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range) {
+    if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range and
+        args[0] != .Range) {
         const r = receiver.Range;
         // A descending progression (step < 0) has start > end; the membership
         // bounds run low..high regardless of iteration direction.
@@ -7943,7 +7966,13 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
     }
 
     const member_shadows_stdlib = receiver.* == .Instance and hostHasMember(self, receiver, name);
-    const user_member_ext_shadows = try userMemberExtShadows(self, allocator, name, args.len);
+    const user_member_ext_shadows = try userMemberExtShadows(self, allocator, receiver, name, args.len);
+    // `range in range`: the builtin `Range.contains` intrinsic takes an
+    // ELEMENT, so a Range argument is inapplicable to every probe the
+    // ladder could hit — leave it for the extension fallback, where a
+    // range-over-range operator (`LongRange.contains(LongRange)`) binds.
+    const range_in_range = receiver.* == .Range and args.len == 1 and
+        args[0] == .Range and std.mem.eql(u8, name, "contains");
 
     // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
@@ -7953,7 +7982,8 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         }
     }
 
-    if (!member_shadows_stdlib and !user_member_ext_shadows and !stdlib.isToplevelFunction(name) and
+    if (!member_shadows_stdlib and !user_member_ext_shadows and !range_in_range and
+        !stdlib.isToplevelFunction(name) and
         !(try userToplevelExtShadows(self, allocator, receiver, name, args)))
     {
         for (probes[0..n]) |probe| {
@@ -8122,7 +8152,7 @@ fn ownerIsObjectSingleton(self: *VmHost, owner: []const u8) bool {
 
 /// A visible member-extension on the receiver type declared in the
 /// enclosing-class chain shadows the stdlib type-name probe.
-fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, argc: usize) Allocator.Error!bool {
+fn userMemberExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, argc: usize) Allocator.Error!bool {
     var owners = try enclosingOwnerSet(self, allocator);
     defer owners.deinit();
     const want = argc + 1;
@@ -8134,7 +8164,14 @@ fn userMemberExtShadows(self: *VmHost, allocator: Allocator, name: []const u8, a
         const owner = mod.registry.member_ext_owner_class.get(fid) orelse continue;
         if (!owners.contains(owner)) continue;
         if (funcAt(mod, fid)) |f| {
-            if (f.params.len != 0 and f.params.len >= want) return true;
+            if (f.params.len == 0 or f.params.len < want) continue;
+            // The shadow holds only while the member-extension could
+            // actually bind this receiver: a definitely-disproven declared
+            // receiver (a private `IntRange.toLong()` against a `Long`)
+            // must leave the stdlib probe ladder in charge. Erased-generic
+            // receivers stay non-definite and keep shadowing.
+            if (argDefinitelyNotParamType(self, &f.params[0].ty, receiver)) continue;
+            return true;
         }
     }
     return false;

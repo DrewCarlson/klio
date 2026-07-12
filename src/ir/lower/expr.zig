@@ -809,8 +809,12 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     // `x in haystack` / `x !in haystack`.
     if (op == .In or op == .NotIn) {
         // `x in lo..hi` / `x in lo..<hi` with a range *literal* on the right
-        // lowers to `lo <= x && x <(=) hi`.
-        if (rhs.* == .Binary and (rhs.Binary.op == .Range or rhs.Binary.op == .RangeUntil)) {
+        // lowers to `lo <= x && x <(=) hi` — but only when `x` is provably a
+        // scalar element. A range-valued `x` dispatches `contains` instead
+        // (an in-scope `operator LongRange.contains(LongRange)` decides
+        // range-in-range; the element compare would be wrong for it).
+        if (rhs.* == .Binary and (rhs.Binary.op == .Range or rhs.Binary.op == .RangeUntil) and
+            !lhsIsRangeShaped(b, lhs)) {
             const r_op = rhs.Binary.op;
             const lo = rhs.Binary.lhs;
             const hi = rhs.Binary.rhs;
@@ -8214,6 +8218,23 @@ fn typeHead(s: []const u8) []const u8 {
 /// The static-type head of a call argument when it is a plain local whose
 /// declared type is known — used to disambiguate cast-rebound overloads by
 /// parameter type (an `Iterable<Int>` arg must not bind an `IntRange` param).
+/// Whether `lhs` of an `in` test is provably a RANGE value (a range
+/// literal, or a binding declared with a range-family type), so the
+/// element-compare inline for `x in lo..hi` must stand down in favor of a
+/// `contains` dispatch.
+fn lhsIsRangeShaped(b: *FuncBuilder, lhs: *const Expr) bool {
+    if (lhs.* == .Binary and (lhs.Binary.op == .Range or lhs.Binary.op == .RangeUntil)) return true;
+    const head = argStaticHead(b, lhs) orelse return false;
+    for ([_][]const u8{
+        "IntRange",        "LongRange",        "CharRange",       "UIntRange",
+        "ULongRange",      "IntProgression",   "LongProgression", "CharProgression",
+        "UIntProgression", "ULongProgression", "ClosedRange",     "OpenEndRange",
+    }) |fam| {
+        if (std.mem.eql(u8, head, fam)) return true;
+    }
+    return false;
+}
+
 fn argStaticHead(b: *FuncBuilder, a: *const Expr) ?[]const u8 {
     if (a.* != .Path) return null;
     const p = a.Path;

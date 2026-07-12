@@ -73,6 +73,7 @@ include = [
 root = "upstream/ktor-utils/common/src"
 include = [
     "io/ktor/util/Text.kt",
+    "io/ktor/util/Ranges.kt",
     "io/ktor/util/Collections.kt",
     "io/ktor/util/DelegatingMutableSet.kt",
     "io/ktor/util/CaseInsensitiveMap.kt",
