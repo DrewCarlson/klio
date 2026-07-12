@@ -2849,6 +2849,30 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             // `measuredSize` setter was skipped and the write hit the backing
             // field directly, its side effects lost).
             const setter_fid: ?FuncId = blk: {
+                // The receiver's OWN class storing the property wins over any
+                // custom-setter registration (mirrors the getter walk): the
+                // SIMPLE-name setter slot is shared across packs, so a foreign
+                // same-simple-named class's accessor (kotlinx-coroutines-test's
+                // private `class AtomicBoolean` vs atomicfu's field-backed one)
+                // must never intercept a plain stored-field write.
+                {
+                    const g = inst.borrow();
+                    defer g.deinit();
+                    const cg = g.get().class.borrow();
+                    defer cg.deinit();
+                    if (declaresStored(cg.get(), real_name)) break :blk null;
+                }
+                // FQN key first: distinct packs' same-simple-named classes
+                // keep distinct FQN keys even when the simple slot clobbers.
+                {
+                    const rf = classFqnOf(inst);
+                    if (!std.mem.eql(u8, rf, class_name)) {
+                        const pg = self.prog.borrow();
+                        const hit = lookupPairFunc(pg.get().instance_prop_setters, rf, real_name);
+                        pg.deinit();
+                        if (hit) |f| break :blk f;
+                    }
+                }
                 {
                     const pg = self.prog.borrow();
                     const hit = lookupPairFunc(pg.get().instance_prop_setters, class_name, real_name);
