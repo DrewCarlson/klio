@@ -292,6 +292,11 @@ pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
     ref_site_override = prev;
 }
 
+/// Simple name of the function the innermost active frame is executing.
+pub fn currentFuncName() ?[]const u8 {
+    return if (frame_chain) |fr| fr.func.name else null;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory
@@ -497,6 +502,15 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
         i += 1;
     }
     return try runtime.StackRef.init(allocator, .{ .frames = frames });
+}
+
+/// Debug helper: print the active frame chain (fqn + current span) to
+/// stderr. Env-gated call sites only.
+pub fn debugPrintFrames() void {
+    var cur = frame_chain;
+    while (cur) |f| : (cur = f.gc_link) {
+        std.debug.print("  at {s} span={any}\n", .{ if (f.func.fqn.len != 0) f.func.fqn else f.func.name, f.cur_span });
+    }
 }
 
 /// Append a captured stack trace to `out` as Kotlin-style `\n    at <fqn>
@@ -3947,6 +3961,9 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                             }
                         }
                     }
+                }
+                if (envVarSet("KLIO_UNRESOLVED_TRACE")) {
+                    std.debug.print("[unresolved] `{s}` in fn {s} (fqn={s}) span={any}\n", .{ name_str, frame.func.name, frame.func.fqn, frame.cur_span });
                 }
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                 if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {

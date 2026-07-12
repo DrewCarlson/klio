@@ -1679,3 +1679,19 @@ test "ctx: named entry in function-type context block rejected" {
     }
     try testing.expect(found);
 }
+
+test "extension receiver with qualified type inside generic args" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\internal fun Set<Map.Entry<String, List<String>>>.formUrlEncodeTo(out: Appendable) {}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    try testing.expectEqual(@as(usize, 1), out.file.decls.len);
+    const f = out.file.decls[0].Function;
+    try testing.expectEqualStrings("formUrlEncodeTo", f.name.name);
+    const recv = f.receiver_type.?;
+    try testing.expectEqualStrings("Set", recv.name.name);
+    try testing.expectEqual(@as(usize, 1), recv.type_args.len);
+    try testing.expectEqualStrings("Entry", recv.type_args[0].ty.name.name);
+}

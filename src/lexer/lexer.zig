@@ -244,8 +244,11 @@ pub const LexResult = struct {
 
 const Mode = union(enum) {
     Normal,
-    StringRegular,
-    StringRaw,
+    /// `dollars` is the interpolation-marker length: 1 for a plain string,
+    /// N for a multi-dollar string (`$$"..."`), where a template needs N
+    /// consecutive `$` and shorter runs are literal text.
+    StringRegular: struct { dollars: u8 },
+    StringRaw: struct { dollars: u8 },
     Interp: struct { brace_depth: u32 },
 };
 
@@ -304,13 +307,13 @@ pub const Lexer = struct {
                         },
                     }
                 },
-                .StringRegular => {
-                    try self.lexStringBody(&tokens, false);
+                .StringRegular => |m| {
+                    try self.lexStringBody(&tokens, false, m.dollars);
                     self.ws_before = false;
                     self.nl_before = false;
                 },
-                .StringRaw => {
-                    try self.lexStringBody(&tokens, true);
+                .StringRaw => |m| {
+                    try self.lexStringBody(&tokens, true, m.dollars);
                     self.ws_before = false;
                     self.nl_before = false;
                 },
@@ -445,16 +448,24 @@ pub const Lexer = struct {
             return .{ .kind = .BlockComment, .span = self.span(start) };
         }
 
-        // Strings.
-        if (b == '"') {
+        // Strings, including the multi-dollar interpolation prefix
+        // (`$$"..."` / `$$"""..."""`): N leading dollars set the template
+        // marker length; runs of fewer than N dollars inside are literal.
+        if (b == '"' or (b == '$' and self.multiDollarPrefixLen() != null)) {
+            var dollars: u8 = 1;
+            if (b == '$') {
+                const n = self.multiDollarPrefixLen().?;
+                dollars = if (n > 255) 255 else @intCast(n);
+                self.pos += n;
+            }
             // triple-quoted raw string?
             if (self.peekByte(1) == @as(?u8, '"') and self.peekByte(2) == @as(?u8, '"')) {
                 self.pos += 3;
-                try self.modes.append(self.allocator, .StringRaw);
+                try self.modes.append(self.allocator, .{ .StringRaw = .{ .dollars = dollars } });
                 return .{ .kind = .{ .StringQuote = .{ .triple = true } }, .span = self.span(start) };
             }
             self.pos += 1;
-            try self.modes.append(self.allocator, .StringRegular);
+            try self.modes.append(self.allocator, .{ .StringRegular = .{ .dollars = dollars } });
             return .{ .kind = .{ .StringQuote = .{ .triple = false } }, .span = self.span(start) };
         }
 
@@ -517,6 +528,16 @@ pub const Lexer = struct {
         _ = d.withCode("E0021");
         try self.emit(d);
         return .{ .kind = .Unknown, .span = self.span(start) };
+    }
+
+    /// Length of a `$`-run directly followed by a quote (`$$"`), i.e. a
+    /// multi-dollar string prefix. Null when the run does not end at `"`.
+    fn multiDollarPrefixLen(self: *const Lexer) ?u32 {
+        var n: u32 = 0;
+        while (self.peekByte(n) == @as(?u8, '$')) n += 1;
+        if (n == 0) return null;
+        if (self.peekByte(n) == @as(?u8, '"')) return n;
+        return null;
     }
 
     fn bumpInterpBrace(self: *Lexer, delta: i32) void {
@@ -962,7 +983,7 @@ pub const Lexer = struct {
         }
     }
 
-    fn lexStringBody(self: *Lexer, tokens: *std.ArrayList(Token), raw: bool) !void {
+    fn lexStringBody(self: *Lexer, tokens: *std.ArrayList(Token), raw: bool, dollars: u8) !void {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(self.allocator);
         const segment_start = self.pos;
@@ -978,7 +999,9 @@ pub const Lexer = struct {
                 return;
             };
 
-            // Closing quote(s).
+            // Closing quote(s). A raw string closes on the LAST three quotes
+            // of a quote run: `""""v""""` has content `"v"` (the extra
+            // quotes belong to the text), matching kotlinc.
             if (b == '"') {
                 if (raw) {
                     // A raw string closes on the LAST three quotes of a
@@ -1032,13 +1055,28 @@ pub const Lexer = struct {
                 continue;
             }
 
-            // Templates.
+            // Templates. A run of R dollars in an N-dollar string: R < N is
+            // literal text; R >= N leaves the leading R-N literal and the
+            // trailing N form the marker when `{` or an identifier follows.
             if (b == '$') {
+                var run: u32 = 0;
+                while (self.peekByte(run) == @as(?u8, '$')) run += 1;
+                if (run < dollars) {
+                    var i: u32 = 0;
+                    while (i < run) : (i += 1) try text.append(self.allocator, '$');
+                    self.pos += run;
+                    continue;
+                }
+                const extra = run - dollars;
+                const after = self.peekByte(run);
                 // `${expr}` form.
-                if (self.peekByte(1) == @as(?u8, '{')) {
+                if (after == @as(?u8, '{')) {
+                    var i: u32 = 0;
+                    while (i < extra) : (i += 1) try text.append(self.allocator, '$');
+                    self.pos += extra;
                     try self.flushStringText(tokens, &text, segment_start);
                     const interp_start = self.pos;
-                    self.pos += 2;
+                    self.pos += dollars + 1;
                     try tokens.append(self.allocator, .{
                         .kind = .InterpStart,
                         .span = Span.init(self.file, interp_start, self.pos),
@@ -1047,11 +1085,14 @@ pub const Lexer = struct {
                     return;
                 }
                 // `$ident` short form.
-                if (self.peekByte(1)) |b1| {
+                if (after) |b1| {
                     if (isIdentStartByte(b1)) {
+                        var i: u32 = 0;
+                        while (i < extra) : (i += 1) try text.append(self.allocator, '$');
+                        self.pos += extra;
                         try self.flushStringText(tokens, &text, segment_start);
                         const short_start = self.pos;
-                        self.pos += 1; // consume `$`
+                        self.pos += dollars; // consume the marker
                         const ident_start = self.pos;
                         while (self.peekByte(0)) |c| {
                             if (isIdentContByte(c)) {
@@ -1066,9 +1107,10 @@ pub const Lexer = struct {
                         return;
                     }
                 }
-                // Lone `$`, literal dollar sign.
-                try text.append(self.allocator, '$');
-                self.pos += 1;
+                // Dollar run with no template after it: literal dollars.
+                var i: u32 = 0;
+                while (i < run) : (i += 1) try text.append(self.allocator, '$');
+                self.pos += run;
                 continue;
             }
 
@@ -2008,4 +2050,46 @@ test "line comment is trivia" {
         filtered.items[0].IntLiteral.base == .Decimal and
         filtered.items[0].IntLiteral.suffix == .None);
     try testing.expect(filtered.items[1] == .Eof);
+}
+
+test "multi-dollar string: short runs literal, marker interpolates" {
+    var r = try lex("$$\"runTest$default and $${x} and $$y\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    const t = r.tokens;
+    var i: usize = 0;
+    try testing.expect(t[i].kind == .StringQuote and !t[i].kind.StringQuote.triple);
+    i += 1;
+    try testing.expect(t[i].kind == .StringText and
+        std.mem.eql(u8, t[i].kind.StringText, "runTest$default and "));
+    i += 1;
+    try testing.expect(t[i].kind == .InterpStart);
+    i += 1;
+    try testing.expect(t[i].kind == .Ident);
+    i += 1;
+    try testing.expect(t[i].kind == .InterpEnd);
+    i += 1;
+    try testing.expect(t[i].kind == .StringText and std.mem.eql(u8, t[i].kind.StringText, " and "));
+    i += 1;
+    try testing.expect(t[i].kind == .ShortInterp and std.mem.eql(u8, t[i].kind.ShortInterp, "y"));
+}
+
+test "multi-dollar triple-dollar: two dollars stay literal" {
+    var r = try lex("$$$\"a$$$b $$c\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    const t = r.tokens;
+    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, t[1].kind.StringText, "a"));
+    try testing.expect(t[2].kind == .ShortInterp and std.mem.eql(u8, t[2].kind.ShortInterp, "b"));
+    try testing.expect(t[3].kind == .StringText and std.mem.eql(u8, t[3].kind.StringText, " $$c"));
+}
+
+test "raw string quote-run: leading quote joins the content" {
+    var r = try lex("\"\"\"\"v\"\"\"\"");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!r.diagnostics.hasErrors());
+    const t = r.tokens;
+    try testing.expect(t[0].kind == .StringQuote and t[0].kind.StringQuote.triple);
+    try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, t[1].kind.StringText, "\"v\""));
+    try testing.expect(t[2].kind == .StringQuote and t[2].kind.StringQuote.triple);
 }
