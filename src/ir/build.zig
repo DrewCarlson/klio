@@ -352,6 +352,7 @@ pub const FuncBuilder = struct {
     /// matches the enclosing receiver instead of an arity-only pick.
     /// `null` for plain functions and class methods.
     recv_ty: ?[]const u8 = null,
+    splice_recv_ty: ?[]const u8 = null,
     /// See `callTrailingLambda`.
     cur_call_trailing: bool = false,
     /// Names declared on the owning class (methods, body
@@ -1001,6 +1002,18 @@ pub const FuncBuilder = struct {
     }
     pub fn setRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
         self.recv_ty = name;
+    }
+    /// The ACTIVE inline splice's declared extension receiver type.
+    /// Distinct from `recv_ty` (the enclosing function's own receiver):
+    /// it feeds receiver-EVIDENCE gates (the extensions-only inline
+    /// decline) without changing bare-call receiver BINDING inside the
+    /// spliced body's nested lambdas, which must keep resolving against
+    /// the runtime receiver walk.
+    pub fn setSpliceRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
+        self.splice_recv_ty = name;
+    }
+    pub fn spliceRecvTy(self: *const FuncBuilder) ?[]const u8 {
+        return self.splice_recv_ty;
     }
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;

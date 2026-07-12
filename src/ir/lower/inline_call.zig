@@ -356,8 +356,19 @@ pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const 
     // receiver (extension or member), declares a reified parameter, and
     // the value arguments bind every one of them.
     var single_buf: [1]*const ast.Function = undefined;
+    // The enclosing extension's declared receiver is receiver evidence for
+    // the extensions-only decline in `inlineFnAstForRecvExt` (a bare
+    // `filterIsInstance<T>()` inside `List<*>.countOf()` must stay
+    // spliceable, or the reified argument is lost to the runtime walk).
+    var chain_buf: [1][]const u8 = undefined;
+    const recv_chain: ?[]const []const u8 = blk: {
+        const b2 = bb orelse break :blk null;
+        const rt = b2.recvTy() orelse b2.spliceRecvTy() orelse break :blk null;
+        chain_buf[0] = rt;
+        break :blk chain_buf[0..1];
+    };
     const cands: []const *const ast.Function = inline_state.candidatesForName(name) orelse blk: {
-        const f = inline_state.inlineFnAstForRecvExt(name, shape, null, true) orelse return false;
+        const f = inline_state.inlineFnAstForRecvExt(name, shape, recv_chain, true) orelse return false;
         single_buf[0] = f;
         break :blk single_buf[0..1];
     };
@@ -770,7 +781,14 @@ pub fn tryInlineCallWithTypeArgs(
             else => null,
         };
         const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda, .trailing_lambda_arity = trailing_arity };
-        const recv_ty = try inferReceiverType(b, this_arg);
+        var recv_ty = try inferReceiverType(b, this_arg);
+        // A BARE call inside an extension body has the enclosing
+        // extension's declared receiver as its implicit receiver — that
+        // is real evidence (`filterIsInstance<T>()` inside
+        // `List<*>.countOf()` narrows on List), and without it the
+        // extensions-only decline below would push a reified splice to
+        // the runtime walk, losing the type argument.
+        if (recv_ty == null and this_arg == null) recv_ty = b.recvTy();
         const recv_chain: ?[]const []const u8 = if (recv_ty) |r|
             try expr_lower.recvChainOf(b, r)
         else
@@ -870,6 +888,15 @@ pub fn tryInlineCallWithTypeArgs(
         return null;
     }
     try b.pushInlineName(fname);
+    // The spliced extension's declared receiver is receiver EVIDENCE for
+    // the body's own inline gates (`filterIsInstance<T>()` inside
+    // `List<*>.countOf()` must stay spliceable) — via the dedicated
+    // splice channel, NOT `recv_ty`, so nested-lambda bare calls
+    // (`collect { }` inside a flow operator body) keep resolving through
+    // the runtime receiver walk instead of pinning to the innermost this.
+    const prev_splice_recv = b.spliceRecvTy();
+    if (f.receiver_type) |rt| b.setSpliceRecvTy(rt.name.name);
+    defer b.setSpliceRecvTy(prev_splice_recv);
     // Scope depth before the inline fn binds its parameters: a lambda
     // argument spliced from this call resolves its free names in these
     // caller scopes, not against the inline fn's parameter scope.
