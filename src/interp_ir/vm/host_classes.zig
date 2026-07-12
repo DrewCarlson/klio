@@ -117,6 +117,24 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `Any` is the universal supertype for non-null values.
     if (std.mem.eql(u8, ty.name, "Any")) return true;
 
+    // Typealias indirection: an `is`/`as` against an alias head
+    // (`typealias TR = Unit`) behaves as against the aliased target.
+    // Only when no real class owns the name; an `expect class` stub that
+    // an `actual typealias` supersedes is handled by the last-resort
+    // unfold at the end of this function.
+    {
+        const module_has_class = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classId(ty.name) != null;
+        };
+        if (!module_has_class) {
+            if (typeAliasTarget(self, ty.name)) |t| {
+                return instanceOf(self, value, .{ .name = t, .nullable = ty.nullable, .args = ty.args });
+            }
+        }
+    }
+
     // Reflection-style checks against synth bound refs. `Box::v` lowers
     // as an Instance with `__bound_receiver__` (a Class for unbound prop
     // refs, an Instance for bound method refs). Match KProperty /
@@ -362,7 +380,31 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         return true;
     }
     // Builtin runtime types satisfy their nominal supertypes.
-    return value.isRuntimeType(ty.name);
+    if (value.isRuntimeType(ty.name)) return true;
+    // Last resort: a typealias registered under the name (an `expect class`
+    // whose platform `actual` is a typealias keeps a class stub in the
+    // module, so the eager unfold above was gated off) — match against
+    // the aliased target.
+    if (typeAliasTarget(self, ty.name)) |t| {
+        return instanceOf(self, value, .{ .name = t, .nullable = ty.nullable, .args = ty.args });
+    }
+    return false;
+}
+
+/// Resolve a (possibly chained) `typealias` head to its final target, or
+/// null when the name is not an alias.
+fn typeAliasTarget(self: *VmHost, name: []const u8) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    var cur: []const u8 = name;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        const next = mg.get().registry.type_aliases.get(cur) orelse break;
+        if (std.mem.eql(u8, next, cur)) break;
+        cur = next;
+    }
+    if (cur.ptr == name.ptr) return null;
+    return cur;
 }
 
 /// Walk a class's direct + transitive interface supertypes, matching the

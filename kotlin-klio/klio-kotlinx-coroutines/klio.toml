@@ -11,6 +11,15 @@ root = "upstream/kotlinx-coroutines-core/common/src"
 [[source]]
 root = "klioMain"
 
+# kotlinx-coroutines-test (`kotlinx.coroutines.test.*`): TestScope /
+# TestDispatcher / TestCoroutineScheduler and the `runTest` builder, plus
+# the native actuals (TestResult = Unit, createTestResult = runBlocking).
+[[source]]
+root = "upstream/kotlinx-coroutines-test/common/src"
+
+[[source]]
+root = "upstream/kotlinx-coroutines-test/native/src"
+
 [[deps]]
 id = "stdlib"
 

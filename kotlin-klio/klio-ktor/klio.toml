@@ -173,6 +173,18 @@ include = [
     "io/ktor/http/content/TextContent.kt",
     "io/ktor/http/content/ByteArrayContent.kt",
     "io/ktor/http/content/Multipart.kt",
+    # Authorization header model (`parseAuthorizationHeader`,
+    # `HttpAuthHeader`) with its enum/constant siblings and the
+    # `ParseException` it throws.
+    "io/ktor/http/auth/AuthScheme.kt",
+    "io/ktor/http/auth/DigestAlgorithm.kt",
+    "io/ktor/http/auth/HeaderValueEncoding.kt",
+    "io/ktor/http/auth/HttpAuthHeader.kt",
+    "io/ktor/http/parsing/ParseException.kt",
+    # `splitHeaderValues`, called by the included `Headers.getSplitValues`.
+    "io/ktor/http/header/utils.kt",
+    # `formUrlEncode`/`formUrlEncodeTo` over parameter entries.
+    "io/ktor/http/HttpUrlEncoded.kt",
 ]
 
 # nonJvm engine loader: the `engines` registry (`append` + iteration) the
@@ -200,6 +212,24 @@ root = "upstream/ktor-http/posix/src"
 include = [
     "io/ktor/http/URLBuilderPosix.kt",
 ]
+
+# ktor-test-base + ktor-test-dispatcher (`io.ktor.test.*`,
+# `io.ktor.test.dispatcher.*`): the `runTest` wrapper over
+# kotlinx-coroutines-test, `runTestWithData`, and the real-time /
+# `testSuspend` runners the library's own commonTest files use. The
+# jvmAndPosix / posix roots carry the `actual`s (DummyTestResult,
+# `andThen`, `testSuspend`).
+[[source]]
+root = "upstream/ktor-shared/ktor-test-base/common/src"
+
+[[source]]
+root = "upstream/ktor-shared/ktor-test-base/jvmAndPosix/src"
+
+[[source]]
+root = "upstream/ktor-test-dispatcher/common/src"
+
+[[source]]
+root = "upstream/ktor-test-dispatcher/posix/src"
 
 # Upstream ktor-client-core commonMain. The whole module — the engine layer
 # (`EmptyContent`, the engine config base, the capability interface; note
@@ -373,6 +403,17 @@ requires = ["utils"]
 [features.events]
 sources = [
     "upstream/ktor-shared/ktor-events/common/src/",
+]
+requires = ["utils"]
+
+# ktor-test-base / ktor-test-dispatcher (`io.ktor.test.*`): the shared
+# test runners. Depends on ktor-utils (TestDefaults reads PlatformUtils).
+[features.test-base]
+sources = [
+    "upstream/ktor-shared/ktor-test-base/common/src/",
+    "upstream/ktor-shared/ktor-test-base/jvmAndPosix/src/",
+    "upstream/ktor-test-dispatcher/common/src/",
+    "upstream/ktor-test-dispatcher/posix/src/",
 ]
 requires = ["utils"]
 

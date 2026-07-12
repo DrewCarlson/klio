@@ -4000,6 +4000,12 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     if (b.inlineLambdaFor(nm)) |lam| {
         return try spliceInlineLambda(b, lam, args);
     }
+    // A local binding of a function-typed value (a plain fn param like
+    // `body: () -> T`, a local val) shadows every top-level namesake for a
+    // bare call — the call invokes the value, never an inline splice of an
+    // unrelated extension. A NON-function-typed local does not shadow a
+    // call (the `flow`-param case), matching the bare-function path.
+    if (b.resolve(nm) != null and !b.isNonFnParam(nm)) return null;
     const inline_call_shape = CallShape{
         .want = args.len,
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
@@ -6125,47 +6131,52 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // `import ....circle`. Leave the shadowed name for the member-dispatch
     // paths below instead of qualifying it to the import's FQN.
     if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
-        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0) and
-        b.module.funcsBySimpleName(name0).len >= 1)
+        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
     {
         const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
         if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
-            // The import resolves to real funcs of that FQN (a multi-overload
-            // symbol), OR to a stdlib intrinsic the func index does not enumerate
-            // (`isAliasName`, e.g. kotlin.math.max). Either way the qualified call
-            // reaches it.
-            var import_resolves = ir.isAliasName(name0);
-            if (!import_resolves) {
-                for (b.module.funcsBySimpleName(name0)) |cid| {
+            // A RENAMING import (`import a.b.f as g`) binds `g` with no
+            // function of that simple name in the module: the qualified
+            // rewrite is the only route to the target, and candidates are
+            // enumerated under the TARGET leaf.
+            const target_leaf = alias_paths[0].segs[alias_paths[0].segs.len - 1];
+            const renamed = !std.mem.eql(u8, target_leaf, name0);
+            const cand_name = if (renamed) target_leaf else name0;
+            if (renamed or b.module.funcsBySimpleName(name0).len >= 1) {
+                // The import resolves to real funcs of that FQN (a multi-overload
+                // symbol), OR to a stdlib intrinsic the func index does not enumerate
+                // (`isAliasName`, e.g. kotlin.math.max). Either way the qualified call
+                // reaches it.
+                var import_resolves = ir.isAliasName(cand_name);
+                // An imported EXTENSION function (`RoundedPolygon.Companion.circle`)
+                // called with no explicit receiver has no `this` to carry: the
+                // qualified FQN rewrite would load it as a receiverless global and
+                // miss. Only a plain top-level function (the `kotlin.math.max`
+                // shape this rewrite exists for) qualifies; an FQN with several
+                // overloads stays eligible while any non-extension one exists.
+                var any_nonext = false;
+                var any_fqn_match = false;
+                for (b.module.funcsBySimpleName(cand_name)) |cid| {
                     const cf = b.module.funcById(cid) orelse continue;
                     if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) {
                         import_resolves = true;
-                        break;
+                        any_fqn_match = true;
+                        if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) {
+                            any_nonext = true;
+                        }
                     }
                 }
-            }
-            // An imported EXTENSION function (`RoundedPolygon.Companion.circle`)
-            // called with no explicit receiver has no `this` to carry: the
-            // qualified FQN rewrite would load it as a receiverless global and
-            // miss. Only a plain top-level function (the `kotlin.math.max`
-            // shape this rewrite exists for) qualifies.
-            const imp_is_extension = blk: {
-                if (b.module.funcIdByFqn(alias_paths[0].fqn)) |ifid| {
-                    if (b.module.funcById(ifid)) |iff| {
-                        break :blk iff.params.len != 0 and std.mem.eql(u8, iff.params[0].name, "this");
-                    }
+                const imp_is_extension = any_fqn_match and !any_nonext;
+                if (import_resolves and !imp_is_extension) {
+                    const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
+                    for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
+                    const new_callee = try b.allocator.create(Expr);
+                    new_callee.* = Expr{ .Path = .{ .segments = new_segs, .span = callee.Path.span } };
+                    var new_call = call;
+                    new_call.callee = new_callee;
+                    const rewritten = Expr{ .Call = new_call };
+                    return try lowerCall(b, &rewritten);
                 }
-                break :blk false;
-            };
-            if (import_resolves and !imp_is_extension) {
-                const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
-                for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
-                const new_callee = try b.allocator.create(Expr);
-                new_callee.* = Expr{ .Path = .{ .segments = new_segs, .span = callee.Path.span } };
-                var new_call = call;
-                new_call.callee = new_callee;
-                const rewritten = Expr{ .Call = new_call };
-                return try lowerCall(b, &rewritten);
             }
         }
     }
@@ -8409,6 +8420,63 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 .exact = true,
             } });
             return dst;
+        }
+    }
+
+    // A RENAMING import (`import a.b.f as g`) used with an explicit
+    // receiver (`recv.g(args)`): no member or extension bears the alias
+    // name, so bind the aliased extension overload directly by FQN. The
+    // direct bind keeps a same-receiver namesake under the target's
+    // ORIGINAL name (e.g. a wrapper `TestScope.runTest` delegating to the
+    // aliased `kotlinx...runTest`) from capturing the call and recursing.
+    {
+        const alias_paths = b.module.importAliasPathsIn(name.span.file, name.name);
+        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
+            const target_leaf = alias_paths[0].segs[alias_paths[0].segs.len - 1];
+            if (!std.mem.eql(u8, target_leaf, name.name)) {
+                var chosen: ?FuncId = null;
+                var chosen_exact = false;
+                for (b.module.funcsBySimpleName(target_leaf)) |fid| {
+                    const f = b.module.funcById(fid) orelse continue;
+                    if (!f.hasBody()) continue;
+                    if (!std.mem.eql(u8, f.fqn, alias_paths[0].fqn)) continue;
+                    if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+                    const user = f.params.len - 1;
+                    const exact = user == args.len;
+                    const arity_ok = exact or (args.len < user and blk: {
+                        for (f.params[1 + args.len ..]) |p| {
+                            if (p.default == null and !p.is_vararg) break :blk false;
+                        }
+                        break :blk true;
+                    }) or (args.len > user and f.params.len != 0 and f.params[f.params.len - 1].is_vararg);
+                    if (!arity_ok) continue;
+                    if (chosen == null or (exact and !chosen_exact)) {
+                        chosen = fid;
+                        chosen_exact = exact;
+                    }
+                }
+                if (chosen) |func_id| {
+                    const recv_reg = try lowerReceiver(b, receiver);
+                    const arg_regs = try b.allocator.alloc(Reg, args.len + 1);
+                    defer b.allocator.free(arg_regs);
+                    arg_regs[0] = recv_reg;
+                    for (args, 0..) |*a, i| arg_regs[i + 1] = try lowerExpr(b, a);
+                    const start = try packContiguous(b, arg_regs);
+                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const type_args = try internTypeArgs(b.allocator, b.module, ast_type_args);
+                    const dst = b.allocReg();
+                    try b.push(.{ .Call = .{
+                        .dst = dst,
+                        .func = func_id,
+                        .args = start,
+                        .n_args = @intCast(arg_regs.len),
+                        .arg_names = arg_names,
+                        .type_args = type_args,
+                        .exact = true,
+                    } });
+                    return dst;
+                }
+            }
         }
     }
 

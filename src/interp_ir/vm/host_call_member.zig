@@ -4068,6 +4068,69 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    // A RENAMING import (`import a.b.f as g`) reached as a receiver call
+    // the lowering did not rewrite: on a total miss, resolve the alias
+    // from the call site's file and bind the aliased extension by FQN.
+    // The FQN restriction keeps a same-receiver namesake under the
+    // target's ORIGINAL name (a delegating wrapper) from capturing the
+    // retry and recursing. O(1)-gated: one hashmap probe per total miss.
+    if (ir.eval.currentCallSiteSpan()) |sp| {
+        var chosen: ?ir.FuncId = null;
+        var chosen_exact = false;
+        var retry_leaf: ?[]const u8 = null;
+        {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            const paths = m.importAliasPathsIn(sp.file, name);
+            if (paths.len == 1 and paths[0].segs.len >= 2) {
+                const target_leaf = paths[0].segs[paths[0].segs.len - 1];
+                if (!std.mem.eql(u8, target_leaf, name)) {
+                    retry_leaf = target_leaf;
+                    for (m.funcsBySimpleName(target_leaf)) |fid| {
+                        const f = m.funcById(fid) orelse continue;
+                        if (!f.hasBody()) continue;
+                        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) continue;
+                        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+                        const user = f.params.len - 1;
+                        const exact = user == args.len;
+                        const arity_ok = exact or (args.len < user and blk: {
+                            for (f.params[1 + args.len ..]) |p| {
+                                if (p.default == null and !p.is_vararg) break :blk false;
+                            }
+                            break :blk true;
+                        }) or (args.len > user and f.params[f.params.len - 1].is_vararg);
+                        if (!arity_ok) continue;
+                        if (chosen == null or (exact and !chosen_exact)) {
+                            chosen = fid;
+                            chosen_exact = exact;
+                        }
+                    }
+                }
+            }
+        }
+        if (chosen) |fid| {
+            const mg = self.module.borrow();
+            const mod: *const Module = mg.get();
+            mg.deinit();
+            const call_args = try allocator.alloc(Value, args.len + 1);
+            defer allocator.free(call_args);
+            call_args[0] = receiver.*;
+            @memcpy(call_args[1..], args);
+            return host_call_func.callFunc(self, allocator, mod, fid, call_args);
+        }
+        if (retry_leaf) |leaf| {
+            // No body-bearing overload under the aliased FQN: the target is
+            // intrinsic-backed (`kotlin.text.uppercase`). Re-dispatch under
+            // the target's real name. Self-recapture guard: a delegating
+            // wrapper bearing that simple name must not rebind itself.
+            const cur = ir.eval.currentFuncName() orelse "";
+            if (!std.mem.eql(u8, cur, leaf)) {
+                return callMemberRec(self, allocator, receiver, leaf, args);
+            }
+        }
+    }
+
     // Dispatch-miss: the message carries `Vm::call_member `name` on `fqn``,
     // which downstream fallbacks pattern-match (e.g. the object-singleton walk)
     // to tell a top-level miss for *this* name from a deeper genuine error.
@@ -4128,6 +4191,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
     }
     missTraceMaybe(name);
+    if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
+        std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
+        ir.eval.debugPrintFrames();
+    }
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
 }
 
