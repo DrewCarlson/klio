@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <string>
 #include <unordered_map>
@@ -37,6 +39,14 @@
 #include "include/encode/SkPngEncoder.h"
 #include "include/effects/SkGradient.h"
 #include "include/pathops/SkPathOps.h"
+#include "modules/skparagraph/include/DartTypes.h"
+#include "modules/skparagraph/include/FontCollection.h"
+#include "modules/skparagraph/include/Paragraph.h"
+#include "modules/skparagraph/include/ParagraphBuilder.h"
+#include "modules/skparagraph/include/ParagraphStyle.h"
+#include "modules/skparagraph/include/TextStyle.h"
+#include "modules/skparagraph/include/TypefaceFontProvider.h"
+#include "modules/skunicode/include/SkUnicode_icu.h"
 // Font manager factory: the macOS Skia pack ships CoreText, not the custom-empty
 // port (that symbol is absent), so select per platform.
 #if defined(__APPLE__)
@@ -491,6 +501,408 @@ void klio_skia_c_draw_surface_rect(
         nullptr,
         SkCanvas::kStrict_SrcRectConstraint);
 }
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
+// skparagraph text engine. A paragraph is built from UTF-16 text plus a
+// serialized run spec, laid out at a width, then queried/painted through a
+// handle. All indices at this API are UTF-16 code units (the text is added
+// as std::u16string, so skparagraph's own ranges are UTF-16 — compose /
+// AnnotatedString offsets pass straight through).
+//
+// Spec format (one op per line):
+//   p <sizePx> <align 0..3 l/c/r/j> <maxLines (0 = unlimited)> <ellipsis 0/1>
+//     <dir 0 ltr / 1 rtl> <weight 100..900> <italic 0/1> <deco bits: 1
+//     underline | 4 line-through> <argb>
+//   r <startU16> <endU16> <sizePx> <weight> <italic> <deco> <argb> <family>
+// Runs are consecutive, non-overlapping, and FULLY resolved (the Kotlin side
+// folds span overlap); `family` is `-` for the default face.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::u16string utf8ToUtf16(const char* s) {
+    std::u16string out;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p) {
+        uint32_t cp = 0;
+        int extra = 0;
+        if (*p < 0x80) {
+            cp = *p;
+        } else if ((*p >> 5) == 0x6) {
+            cp = *p & 0x1F;
+            extra = 1;
+        } else if ((*p >> 4) == 0xE) {
+            cp = *p & 0x0F;
+            extra = 2;
+        } else if ((*p >> 3) == 0x1E) {
+            cp = *p & 0x07;
+            extra = 3;
+        } else {
+            ++p;
+            continue;
+        }
+        ++p;
+        for (int i = 0; i < extra; ++i) {
+            if ((*p & 0xC0) != 0x80) break;
+            cp = (cp << 6) | (*p & 0x3F);
+            ++p;
+        }
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            out.push_back(static_cast<char16_t>(0xD800 + (cp >> 10)));
+            out.push_back(static_cast<char16_t>(0xDC00 + (cp & 0x3FF)));
+        } else {
+            out.push_back(static_cast<char16_t>(cp));
+        }
+    }
+    return out;
+}
+
+sk_sp<skia::textlayout::FontCollection> g_paraFonts;
+sk_sp<skia::textlayout::TypefaceFontProvider> g_paraProvider;
+sk_sp<SkUnicode> g_paraUnicode;
+bool g_para_tried = false;
+
+// The paragraph font collection: the bundled/env typeface registered under
+// its own family name plus the generic aliases compose programs use, and set
+// as the collection default so an unknown family falls back to it.
+void ensureParaFonts() {
+    if (g_para_tried) return;
+    g_para_tried = true;
+    ensureFonts();
+    if (!g_typeface) return;
+    auto provider = sk_make_sp<skia::textlayout::TypefaceFontProvider>();
+    provider->registerTypeface(g_typeface, SkString("klio"));
+    provider->registerTypeface(g_typeface, SkString("sans-serif"));
+    provider->registerTypeface(g_typeface, SkString("serif"));
+    provider->registerTypeface(g_typeface, SkString("monospace"));
+    provider->registerTypeface(g_typeface, SkString("cursive"));
+    auto fonts = sk_make_sp<skia::textlayout::FontCollection>();
+    fonts->setDefaultFontManager(provider, "klio");
+    g_paraUnicode = SkUnicodes::ICU::Make();
+    if (!g_paraUnicode) return;
+    g_paraProvider = provider;
+    g_paraFonts = fonts;
+}
+
+// Load a font FILE and register its typeface under `family` in the paragraph
+// font provider, so a run spec naming that family shapes with the real face.
+// Returns 1 on success. The collection's paragraph cache is cleared so
+// already-consulted family lookups re-resolve.
+extern "C" int32_t klio_skia_font_register(const char* path, const char* family) {
+    ensureParaFonts();
+    if (!g_paraProvider || !g_paraFonts || !g_fontMgr) return 0;
+    sk_sp<SkTypeface> tf = g_fontMgr->makeFromFile(path, 0);
+    if (!tf) return 0;
+    g_paraProvider->registerTypeface(tf, SkString(family));
+    g_paraFonts->clearCaches();
+    return 1;
+}
+
+skia::textlayout::TextStyle runStyle(float size, int weight, int italic, int deco, uint32_t argb, const char* family) {
+    skia::textlayout::TextStyle ts;
+    ts.setColor(toColor(argb));
+    ts.setFontSize(size);
+    ts.setFontStyle(SkFontStyle(weight, SkFontStyle::kNormal_Width,
+                                italic != 0 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
+    ts.setDecoration(static_cast<skia::textlayout::TextDecoration>(deco));
+    ts.setDecorationColor(toColor(argb));
+    std::vector<SkString> fams;
+    if (family && family[0] != '\0' && !(family[0] == '-' && family[1] == '\0')) fams.push_back(SkString(family));
+    fams.push_back(SkString("klio"));
+    ts.setFontFamilies(fams);
+    return ts;
+}
+
+}  // namespace
+
+struct KlioPara {
+    std::unique_ptr<skia::textlayout::Paragraph> para;
+    std::vector<skia::textlayout::LineMetrics> lines;
+    void refreshLines() {
+        lines.clear();
+        para->getLineMetrics(lines);
+    }
+};
+
+extern "C" {
+
+KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
+    const bool ptrace = std::getenv("KLIO_PARA_TRACE") != nullptr;
+    if (ptrace) std::fprintf(stderr, "[para] new enter\n");
+    ensureParaFonts();
+    if (ptrace) std::fprintf(stderr, "[para] fonts=%d unicode=%d\n", g_paraFonts ? 1 : 0, g_paraUnicode ? 1 : 0);
+    if (!utf8 || !spec || !g_paraFonts) return nullptr;
+    const std::u16string text = utf8ToUtf16(utf8);
+    if (ptrace) std::fprintf(stderr, "[para] u16len=%zu sizeof(ps)=%zu sizeof(ts)=%zu\n", text.size(), sizeof(skia::textlayout::ParagraphStyle), sizeof(skia::textlayout::TextStyle));
+
+    skia::textlayout::ParagraphStyle ps;
+    skia::textlayout::TextStyle base;
+    struct Run { size_t s, e; skia::textlayout::TextStyle ts; };
+    std::vector<Run> runs;
+    struct Ph { size_t s, e; float w, h; int align; };
+    std::vector<Ph> phs;
+
+    std::istringstream in(spec);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string op;
+        ls >> op;
+        if (op == "p") {
+            float size = 14;
+            int align = 0, maxLines = 0, ellipsis = 0, dir = 0, weight = 400, italic = 0, deco = 0;
+            unsigned long long argb = 0xFF000000ULL;
+            float letterSp = 0, lineH = 0;
+            ls >> size >> align >> maxLines >> ellipsis >> dir >> weight >> italic >> deco >> argb >> letterSp >> lineH;
+            ps.setTextAlign(static_cast<skia::textlayout::TextAlign>(align));
+            ps.setTextDirection(dir != 0 ? skia::textlayout::TextDirection::kRtl
+                                         : skia::textlayout::TextDirection::kLtr);
+            if (maxLines > 0) ps.setMaxLines(static_cast<size_t>(maxLines));
+            if (ellipsis != 0) ps.setEllipsis(std::u16string(u"…"));
+            base = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), nullptr);
+            if (letterSp != 0) base.setLetterSpacing(letterSp);
+            if (lineH > 0 && size > 0) {
+                base.setHeight(lineH / size);
+                base.setHeightOverride(true);
+            }
+            ps.setTextStyle(base);
+        } else if (op == "r") {
+            size_t s = 0, e = 0;
+            float size = 14;
+            int weight = 400, italic = 0, deco = 0;
+            unsigned long long argb = 0xFF000000ULL;
+            std::string fam;
+            float letterSp = 0, lineH = 0;
+            ls >> s >> e >> size >> weight >> italic >> deco >> argb >> fam >> letterSp >> lineH;
+            if (e > text.size()) e = text.size();
+            if (s >= e) continue;
+            auto ts = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), fam.c_str());
+            if (letterSp != 0) ts.setLetterSpacing(letterSp);
+            if (lineH > 0 && size > 0) {
+                ts.setHeight(lineH / size);
+                ts.setHeightOverride(true);
+            }
+            runs.push_back(Run{s, e, ts});
+        } else if (op == "h") {
+            // Placeholder: `h start end widthPx heightPx align` — the range's
+            // text is not added; an inline box of the given size takes its
+            // place. align maps PlaceholderVerticalAlign ordinals.
+            size_t s = 0, e = 0;
+            float w = 0, h = 0;
+            int align = 0;
+            ls >> s >> e >> w >> h >> align;
+            if (e > text.size()) e = text.size();
+            if (s >= e || w <= 0 || h <= 0) continue;
+            phs.push_back(Ph{s, e, w, h, align});
+        }
+    }
+
+    if (ptrace) std::fprintf(stderr, "[para] spec parsed, runs=%zu\n", runs.size());
+    auto builder = skia::textlayout::ParagraphBuilder::make(ps, g_paraFonts, g_paraUnicode);
+    if (ptrace) std::fprintf(stderr, "[para] builder=%d\n", builder ? 1 : 0);
+    if (!builder) return nullptr;
+    // Emit [cursor, limit) of the text, splitting styled runs at the
+    // boundary and replacing placeholder ranges with inline boxes.
+    auto phAlign = [](int a) {
+        using PA = skia::textlayout::PlaceholderAlignment;
+        switch (a) {
+            case 1: return PA::kAboveBaseline;
+            case 2: return PA::kBelowBaseline;
+            case 3: return PA::kTop;
+            case 4: return PA::kBottom;
+            case 5: return PA::kMiddle;
+            default: return PA::kBaseline;
+        }
+    };
+    auto styleAt = [&](size_t pos) -> const skia::textlayout::TextStyle* {
+        for (const auto& r : runs) {
+            if (pos >= r.s && pos < r.e) return &r.ts;
+        }
+        return nullptr;
+    };
+    auto addTextRange = [&](size_t s, size_t e) {
+        size_t cur = s;
+        while (cur < e) {
+            const auto* ts = styleAt(cur);
+            size_t end = e;
+            for (const auto& r : runs) {
+                if (r.s > cur && r.s < end) end = r.s;
+                if (r.e > cur && r.e < end) end = r.e;
+            }
+            if (ts) {
+                builder->pushStyle(*ts);
+                builder->addText(text.substr(cur, end - cur));
+                builder->pop();
+            } else {
+                builder->addText(text.substr(cur, end - cur));
+            }
+            cur = end;
+        }
+    };
+    if (phs.empty() && runs.empty()) {
+        builder->addText(text);
+    } else if (phs.empty()) {
+        addTextRange(0, text.size());
+    } else {
+        std::sort(phs.begin(), phs.end(), [](const Ph& a, const Ph& b) { return a.s < b.s; });
+        size_t cursor = 0;
+        for (const auto& ph : phs) {
+            if (ph.s > cursor) addTextRange(cursor, ph.s);
+            skia::textlayout::PlaceholderStyle pst(ph.w, ph.h, phAlign(ph.align),
+                                                   skia::textlayout::TextBaseline::kAlphabetic, 0.0f);
+            builder->addPlaceholder(pst);
+            cursor = ph.e;
+        }
+        if (cursor < text.size()) addTextRange(cursor, text.size());
+    }
+    if (ptrace) std::fprintf(stderr, "[para] text added\n");
+    auto para = builder->Build();
+    if (ptrace) std::fprintf(stderr, "[para] built=%d\n", para ? 1 : 0);
+    if (!para) return nullptr;
+    auto* out = new KlioPara();
+    out->para = std::move(para);
+    return out;
+}
+
+// Number of placeholder boxes in the laid-out paragraph.
+extern "C" int32_t klio_skia_para_ph_count(KlioPara* p) {
+    if (!p) return 0;
+    return static_cast<int32_t>(p->para->getRectsForPlaceholders().size());
+}
+
+// which: 0 left, 1 top, 2 right, 3 bottom of placeholder box `i`.
+extern "C" float klio_skia_para_ph_rect(KlioPara* p, int32_t i, int32_t which) {
+    if (!p) return 0;
+    auto boxes = p->para->getRectsForPlaceholders();
+    if (i < 0 || static_cast<size_t>(i) >= boxes.size()) return 0;
+    const SkRect& r = boxes[static_cast<size_t>(i)].rect;
+    switch (which) {
+        case 0: return r.fLeft;
+        case 1: return r.fTop;
+        case 2: return r.fRight;
+        default: return r.fBottom;
+    }
+}
+
+void klio_skia_para_layout(KlioPara* p, float width) {
+    if (!p) return;
+    p->para->layout(width);
+    p->refreshLines();
+}
+
+// which: 0 height, 1 maxIntrinsicWidth, 2 minIntrinsicWidth, 3 longestLine,
+// 4 lineCount, 5 didExceedMaxLines, 6 alphabeticBaseline (first line),
+// 7 ideographicBaseline.
+float klio_skia_para_metric(KlioPara* p, int which) {
+    if (!p) return 0;
+    switch (which) {
+        case 0: return p->para->getHeight();
+        case 1: return p->para->getMaxIntrinsicWidth();
+        case 2: return p->para->getMinIntrinsicWidth();
+        case 3: return p->para->getLongestLine();
+        case 4: return static_cast<float>(p->para->lineNumber());
+        case 5: return p->para->didExceedMaxLines() ? 1.0f : 0.0f;
+        case 6: return p->para->getAlphabeticBaseline();
+        case 7: return p->para->getIdeographicBaseline();
+        default: return 0;
+    }
+}
+
+// which: 0 top, 1 bottom, 2 baseline, 3 left, 4 width, 5 startU16,
+// 6 endU16 (excluding trailing whitespace), 7 endU16 (including newline),
+// 8 endU16 (raw), 9 hardBreak.
+float klio_skia_para_line_metric(KlioPara* p, int line, int which) {
+    if (!p || line < 0 || static_cast<size_t>(line) >= p->lines.size()) return 0;
+    const auto& m = p->lines[static_cast<size_t>(line)];
+    switch (which) {
+        case 0: return static_cast<float>(m.fBaseline - m.fAscent);
+        case 1: return static_cast<float>(m.fBaseline + m.fDescent);
+        case 2: return static_cast<float>(m.fBaseline);
+        case 3: return static_cast<float>(m.fLeft);
+        case 4: return static_cast<float>(m.fWidth);
+        case 5: return static_cast<float>(m.fStartIndex);
+        case 6: return static_cast<float>(m.fEndExcludingWhitespaces);
+        case 7: return static_cast<float>(m.fEndIncludingNewline);
+        case 8: return static_cast<float>(m.fEndIndex);
+        case 9: return m.fHardBreak ? 1.0f : 0.0f;
+        default: return 0;
+    }
+}
+
+int klio_skia_para_offset_at(KlioPara* p, float x, float y) {
+    if (!p) return 0;
+    return p->para->getGlyphPositionAtCoordinate(x, y).position;
+}
+
+// Union box of [startU16, endU16), tight height: which 0 l, 1 t, 2 r, 3 b;
+// which 4 = box count (for emptiness checks).
+float klio_skia_para_box(KlioPara* p, int s, int e, int which) {
+    if (!p || e <= s) return 0;
+    auto boxes = p->para->getRectsForRange(static_cast<unsigned>(s), static_cast<unsigned>(e),
+                                           skia::textlayout::RectHeightStyle::kTight,
+                                           skia::textlayout::RectWidthStyle::kTight);
+    if (which == 4) return static_cast<float>(boxes.size());
+    if (boxes.empty()) return 0;
+    SkRect u = boxes[0].rect;
+    for (size_t i = 1; i < boxes.size(); ++i) u.join(boxes[i].rect);
+    switch (which) {
+        case 0: return u.fLeft;
+        case 1: return u.fTop;
+        case 2: return u.fRight;
+        case 3: return u.fBottom;
+        default: return 0;
+    }
+}
+
+// The i-th box of [startU16, endU16) (max-height style, for selection
+// geometry): which 0 l, 1 t, 2 r, 3 b, 4 direction (0 ltr / 1 rtl).
+float klio_skia_para_range_rect(KlioPara* p, int s, int e, int idx, int which) {
+    if (!p || e <= s || idx < 0) return 0;
+    auto boxes = p->para->getRectsForRange(static_cast<unsigned>(s), static_cast<unsigned>(e),
+                                           skia::textlayout::RectHeightStyle::kMax,
+                                           skia::textlayout::RectWidthStyle::kTight);
+    if (static_cast<size_t>(idx) >= boxes.size()) return 0;
+    const auto& b = boxes[static_cast<size_t>(idx)];
+    switch (which) {
+        case 0: return b.rect.fLeft;
+        case 1: return b.rect.fTop;
+        case 2: return b.rect.fRight;
+        case 3: return b.rect.fBottom;
+        case 4: return b.direction == skia::textlayout::TextDirection::kRtl ? 1.0f : 0.0f;
+        default: return 0;
+    }
+}
+
+int klio_skia_para_range_rect_count(KlioPara* p, int s, int e) {
+    if (!p || e <= s) return 0;
+    auto boxes = p->para->getRectsForRange(static_cast<unsigned>(s), static_cast<unsigned>(e),
+                                           skia::textlayout::RectHeightStyle::kMax,
+                                           skia::textlayout::RectWidthStyle::kTight);
+    return static_cast<int>(boxes.size());
+}
+
+// Word containing the glyph at `offset`, packed ((start << 32) | end).
+long long klio_skia_para_word(KlioPara* p, int offset) {
+    if (!p) return 0;
+    auto r = p->para->getWordBoundary(static_cast<unsigned>(offset));
+    return (static_cast<long long>(r.start) << 32) | static_cast<long long>(r.end);
+}
+
+int klio_skia_para_line_for(KlioPara* p, int offset) {
+    if (!p) return 0;
+    const int n = p->para->getLineNumberAtUTF16Offset(static_cast<size_t>(offset));
+    return n < 0 ? static_cast<int>(p->lines.size()) - 1 : n;
+}
+
+void klio_skia_para_paint(KlioPara* p, KlioSurface* s, float x, float y) {
+    if (!p || !s) return;
+    p->para->paint(s->surface->getCanvas(), x, y);
+}
+
+void klio_skia_para_free(KlioPara* p) { delete p; }
 
 }  // extern "C"
 

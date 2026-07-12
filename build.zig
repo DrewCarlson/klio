@@ -23,6 +23,7 @@ const mod_list = [_]Mod{
     .{ .name = "span", .tested = true },
     .{ .name = "diagnostics", .deps = &.{"span"}, .tested = true },
     .{ .name = "ast", .deps = &.{"span"}, .tested = true },
+    .{ .name = "compose_pass", .deps = &.{ "ast", "span" }, .src = "src/compose_pass/compose_pass.zig", .tested = true },
     .{ .name = "runtime", .deps = &.{ "ast", "span" }, .tested = true },
     .{ .name = "types", .deps = &.{ "ast", "diagnostics", "span" }, .tested = true },
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
@@ -39,7 +40,7 @@ const mod_list = [_]Mod{
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
-    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability" }, .tested = true },
+    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass" }, .tested = true },
     .{ .name = "stdlib_pack", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "stdlib_gen", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "kotlinx_atomicfu", .deps = &.{ "runtime", "stdlib" }, .tested = true },
@@ -211,6 +212,29 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 40 },
+    // The upstream Compose runtime's own test suite (CompositionTests,
+    // RestartTests, MovableContentTests, the snapshot suites) run through a
+    // child `klio test` against the installed compose-runtime pack. The
+    // conformance signal for the implicit-composer hook.
+    .{ .name = "compose_runtime_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
+    // The same upstream suite against the ENGINE pack with the `@Composable`
+    // lowering plugin (KLIO_COMPOSE_PLUGIN=1) — the conformance signal for
+    // the plugin path replacing the implicit hook, and the whole compose
+    // gate once the cutover lands.
+    .{ .name = "compose_plugin_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-runtime-engine",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
@@ -685,6 +709,17 @@ pub fn build(b: *std.Build) void {
                 b.fmt("Run the {s} module test", .{m.name}),
             );
             one.dependOn(&run_t.step);
+            // Installable form for process-parallel gating: the fast gate
+            // fans shards of the corpus across CPUs as plain processes
+            // (KLIO_E2E_SHARD=K/N + --test-filter), which one serial
+            // in-build run step cannot.
+            const bin_inst = b.addInstallArtifact(t, .{ .dest_sub_path = b.fmt("itest-{s}", .{m.name}) });
+            const bin_one = b.step(
+                b.fmt("itest-{s}-bin", .{m.name}),
+                b.fmt("Install the {s} module test binary (+ data deps)", .{m.name}),
+            );
+            bin_one.dependOn(&bin_inst.step);
+            bin_one.dependOn(&base_images_install.step);
         } else {
             test_step.dependOn(&run_t.step);
         }
@@ -1054,7 +1089,14 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; opt-in)") orelse false;
 
     const run = b.addSystemCommand(&.{cxx});
-    run.addArgs(&.{ "-std=c++17", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    // -DNDEBUG matches the Release prebuilt: Skia headers define SK_DEBUG when
+    // NDEBUG is absent, and debug-only fields (SkDEBUGCODE members in types the
+    // skparagraph styles embed) change struct layouts across the ABI.
+    // _GLIBCXX_USE_CXX11_ABI=0 matches how the JetBrains linux skia-pack is
+    // compiled (its u16string symbols mangle pre-cxx11): std::basic_string
+    // values cross the skparagraph API by reference, so the layouts must agree.
+    run.addArgs(&.{ "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-shared", b.fmt("-I{s}", .{base}) });
+    if (os == .linux) run.addArg("-D_GLIBCXX_USE_CXX11_ABI=0");
     // The Cocoa backend needs the shim compiled as Objective-C++; -x applies to the
     // source that follows, so it must precede the source file.
     if (os == .macos and want_cocoa) {

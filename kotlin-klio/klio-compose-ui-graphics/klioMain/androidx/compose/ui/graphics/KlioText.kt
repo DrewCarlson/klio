@@ -44,3 +44,9 @@ fun klioDrawTextRun2(canvas: Canvas, text: String, x: Float, y: Float, sizePx: F
     val h = (canvas as? KlioCanvas)?.nativeHandle ?: return
     __skia_c_draw_text2(h, text, x, y, sizePx, argb, flags)
 }
+
+/**
+ * The Skia surface handle behind a klio [Canvas] (0 for any other canvas).
+ * The ui-text pack's skparagraph engine paints onto this handle directly.
+ */
+fun klioCanvasHandle(canvas: Canvas): Long = (canvas as? KlioCanvas)?.nativeHandle ?: 0L
