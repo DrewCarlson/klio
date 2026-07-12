@@ -456,6 +456,11 @@ pub const Lexer = struct {
             if (b == '$') {
                 const n = self.multiDollarPrefixLen().?;
                 dollars = if (n > 255) 255 else @intCast(n);
+                if (std.c.getenv("KLIO_DOLLAR_TRACE") != null) {
+                    const lo = if (self.pos > 80) self.pos - 80 else 0;
+                    const hi = @min(self.pos + 80, self.src.len);
+                    std.debug.print("[dollar-arm] file={d} pos={d} ctx=<{s}>\n", .{ self.file.int(), self.pos, self.src[lo..hi] });
+                }
                 self.pos += n;
             }
             // triple-quoted raw string?
