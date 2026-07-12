@@ -561,6 +561,7 @@ std::u16string utf8ToUtf16(const char* s) {
 }
 
 sk_sp<skia::textlayout::FontCollection> g_paraFonts;
+sk_sp<skia::textlayout::TypefaceFontProvider> g_paraProvider;
 sk_sp<SkUnicode> g_paraUnicode;
 bool g_para_tried = false;
 
@@ -582,7 +583,22 @@ void ensureParaFonts() {
     fonts->setDefaultFontManager(provider, "klio");
     g_paraUnicode = SkUnicodes::ICU::Make();
     if (!g_paraUnicode) return;
+    g_paraProvider = provider;
     g_paraFonts = fonts;
+}
+
+// Load a font FILE and register its typeface under `family` in the paragraph
+// font provider, so a run spec naming that family shapes with the real face.
+// Returns 1 on success. The collection's paragraph cache is cleared so
+// already-consulted family lookups re-resolve.
+extern "C" int32_t klio_skia_font_register(const char* path, const char* family) {
+    ensureParaFonts();
+    if (!g_paraProvider || !g_paraFonts || !g_fontMgr) return 0;
+    sk_sp<SkTypeface> tf = g_fontMgr->makeFromFile(path, 0);
+    if (!tf) return 0;
+    g_paraProvider->registerTypeface(tf, SkString(family));
+    g_paraFonts->clearCaches();
+    return 1;
 }
 
 skia::textlayout::TextStyle runStyle(float size, int weight, int italic, int deco, uint32_t argb, const char* family) {
@@ -637,13 +653,19 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
             float size = 14;
             int align = 0, maxLines = 0, ellipsis = 0, dir = 0, weight = 400, italic = 0, deco = 0;
             unsigned long long argb = 0xFF000000ULL;
-            ls >> size >> align >> maxLines >> ellipsis >> dir >> weight >> italic >> deco >> argb;
+            float letterSp = 0, lineH = 0;
+            ls >> size >> align >> maxLines >> ellipsis >> dir >> weight >> italic >> deco >> argb >> letterSp >> lineH;
             ps.setTextAlign(static_cast<skia::textlayout::TextAlign>(align));
             ps.setTextDirection(dir != 0 ? skia::textlayout::TextDirection::kRtl
                                          : skia::textlayout::TextDirection::kLtr);
             if (maxLines > 0) ps.setMaxLines(static_cast<size_t>(maxLines));
             if (ellipsis != 0) ps.setEllipsis(std::u16string(u"…"));
             base = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), nullptr);
+            if (letterSp != 0) base.setLetterSpacing(letterSp);
+            if (lineH > 0 && size > 0) {
+                base.setHeight(lineH / size);
+                base.setHeightOverride(true);
+            }
             ps.setTextStyle(base);
         } else if (op == "r") {
             size_t s = 0, e = 0;
@@ -651,10 +673,17 @@ KlioPara* klio_skia_para_new(const char* utf8, const char* spec) {
             int weight = 400, italic = 0, deco = 0;
             unsigned long long argb = 0xFF000000ULL;
             std::string fam;
-            ls >> s >> e >> size >> weight >> italic >> deco >> argb >> fam;
+            float letterSp = 0, lineH = 0;
+            ls >> s >> e >> size >> weight >> italic >> deco >> argb >> fam >> letterSp >> lineH;
             if (e > text.size()) e = text.size();
             if (s >= e) continue;
-            runs.push_back(Run{s, e, runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), fam.c_str())});
+            auto ts = runStyle(size, weight, italic, deco, static_cast<uint32_t>(argb), fam.c_str());
+            if (letterSp != 0) ts.setLetterSpacing(letterSp);
+            if (lineH > 0 && size > 0) {
+                ts.setHeight(lineH / size);
+                ts.setHeightOverride(true);
+            }
+            runs.push_back(Run{s, e, ts});
         }
     }
 

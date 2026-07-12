@@ -54,3 +54,15 @@ internal fun __skia_para_paint(handle: Long, surface: Long, x: Float, y: Float):
 
 internal fun __skia_para_free(handle: Long): Long =
     error("intrinsic __skia_para_free not installed")
+
+/** Register a font FILE's typeface under `family` in the paragraph provider. */
+@Suppress("UNUSED_PARAMETER")
+internal fun __skia_font_register(path: String, family: String): Boolean = false
+
+/**
+ * Load a font FILE (TTF/OTF) and register its typeface under [family] for
+ * paragraph shaping. Returns true when a Skia backend is present and the
+ * file loaded; false headless or on a bad path. `FontFamily(Font(path))`
+ * does this implicitly with a path-derived family.
+ */
+fun klioRegisterFontFile(path: String, family: String): Boolean = __skia_font_register(path, family)

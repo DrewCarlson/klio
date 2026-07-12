@@ -43,7 +43,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontListFontFamily
 import androidx.compose.ui.text.font.GenericFontFamily
+import androidx.compose.ui.text.font.KlioFileFont
 import androidx.compose.ui.text.style.ResolvedTextDirection
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -108,6 +110,7 @@ private class KlioRun(
     val deco: Int,
     val argb: Int,
     val family: String,
+    val letterSpacingPx: Float,
 )
 
 // skparagraph TextDecoration bits.
@@ -121,7 +124,25 @@ private fun TextDecoration.skBits(): Int {
     return d
 }
 
-private fun FontFamily?.klioName(): String = (this as? GenericFontFamily)?.name ?: "-"
+/** A TextUnit in px for the spec: sp scales by density, em by the run's
+ * font size; Unspecified (or a non-positive value) contributes 0. */
+private fun TextUnit.klioPx(density: Density, fontSizePx: Float): Float = when {
+    this == TextUnit.Unspecified -> 0f
+    isSp -> with(density) { toPx() }
+    isEm -> value * fontSizePx
+    else -> 0f
+}
+
+private fun FontFamily?.klioName(): String = when (this) {
+    is GenericFontFamily -> name
+    // A file-backed font list: register the first file font (once) and
+    // shape with its path-derived family alias.
+    is FontListFontFamily -> {
+        val ff = fonts.firstOrNull { it is KlioFileFont } as? KlioFileFont
+        if (ff != null) KlioFileFont.aliasFor(ff) else "-"
+    }
+    else -> "-"
+}
 
 // skparagraph TextAlign: left 0, right 1, center 2, justify 3, start 4, end 5.
 private fun TextAlign?.skAlign(): Int = when (this) {
@@ -168,6 +189,8 @@ internal class KlioParagraph(
     private val baseWeight: Int = style.fontWeight?.weight ?: 400
     private val baseItalic: Int = if (style.fontStyle == FontStyle.Italic) 1 else 0
     private val baseDeco: Int = style.textDecoration?.skBits() ?: 0
+    private val baseLetterSpacingPx: Float = style.letterSpacing.klioPx(density, fontSizePx)
+    private val paraLineHeightPx: Float = style.lineHeight.klioPx(density, fontSizePx)
     private fun baseArgb(): Int = style.color.takeOrElse { Color.Black }.toKlioArgb()
 
     // ---- resolved runs (shared by the native spec and styled stub paint) ----
@@ -177,7 +200,7 @@ internal class KlioParagraph(
         if (spanRanges.isEmpty()) {
             val d = overrideDeco ?: baseDeco
             if (d == 0 && baseWeight < 600 && baseItalic == 0) return emptyList()
-            return listOf(KlioRun(0, text.length, fontSizePx, baseWeight, baseItalic, d, baseColor, style.fontFamily.klioName()))
+            return listOf(KlioRun(0, text.length, fontSizePx, baseWeight, baseItalic, d, baseColor, style.fontFamily.klioName(), baseLetterSpacingPx))
         }
         val out = ArrayList<KlioRun>()
         var seg = 0
@@ -193,6 +216,7 @@ internal class KlioParagraph(
             var deco = overrideDeco ?: baseDeco
             var argb = baseColor
             var family = style.fontFamily.klioName()
+            var letterSp = baseLetterSpacingPx
             for (r in spanRanges) {
                 if (seg >= r.start && seg < r.end) {
                     val st = r.item
@@ -204,9 +228,12 @@ internal class KlioParagraph(
                     st.fontStyle?.let { italic = if (it == FontStyle.Italic) 1 else 0 }
                     st.textDecoration?.let { deco = it.skBits() }
                     st.fontFamily?.let { family = it.klioName() }
+                    if (st.letterSpacing != TextUnit.Unspecified) {
+                        letterSp = st.letterSpacing.klioPx(density, size)
+                    }
                 }
             }
-            out.add(KlioRun(seg, end, size, weight, italic, deco, argb, family))
+            out.add(KlioRun(seg, end, size, weight, italic, deco, argb, family, letterSp))
             seg = end
         }
         return out
@@ -220,12 +247,14 @@ internal class KlioParagraph(
             .append(if (ellipsis) 1 else 0).append(' ').append(dir).append(' ')
             .append(baseWeight).append(' ').append(baseItalic).append(' ')
             .append(decoOverride?.skBits() ?: baseDeco).append(' ')
-            .append(baseColor.toLong() and 0xFFFFFFFFL).append('\n')
+            .append(baseColor.toLong() and 0xFFFFFFFFL).append(' ')
+            .append(baseLetterSpacingPx).append(' ').append(paraLineHeightPx).append('\n')
         for (r in resolvedRuns(baseColor, decoOverride)) {
             sb.append("r ").append(r.start).append(' ').append(r.end).append(' ')
                 .append(r.sizePx).append(' ').append(r.weight).append(' ').append(r.italic).append(' ')
                 .append(r.deco).append(' ').append(r.argb.toLong() and 0xFFFFFFFFL).append(' ')
-                .append(r.family).append('\n')
+                .append(r.family).append(' ')
+                .append(r.letterSpacingPx).append(' ').append(paraLineHeightPx).append('\n')
         }
         return sb.toString()
     }

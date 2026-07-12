@@ -98,6 +98,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.text.platform.__skia_para_line_for", paraLineFor);
     try b.register("androidx.compose.ui.text.platform.__skia_para_paint", paraPaint);
     try b.register("androidx.compose.ui.text.platform.__skia_para_free", paraFree);
+    try b.register("androidx.compose.ui.text.platform.__skia_font_register", fontRegister);
     return b;
 }
 
@@ -185,6 +186,7 @@ const Skia = struct {
     paraLineFor: ?ParaLineForFn,
     paraPaint: ?ParaPaintFn,
     paraFree: ?ParaFreeFn,
+    fontRegister: ?FontRegisterFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
@@ -235,6 +237,7 @@ const ParaWordFn = *const fn (?*KlioPara, c_int) callconv(.c) i64;
 const ParaLineForFn = *const fn (?*KlioPara, c_int) callconv(.c) c_int;
 const ParaPaintFn = *const fn (?*KlioPara, ?*SkSurface, f32, f32) callconv(.c) void;
 const ParaFreeFn = *const fn (?*KlioPara) callconv(.c) void;
+const FontRegisterFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) i32;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -313,6 +316,7 @@ fn loadSkia() ?*Skia {
         .paraLineFor = lib.lookup(ParaLineForFn, "klio_skia_para_line_for"),
         .paraPaint = lib.lookup(ParaPaintFn, "klio_skia_para_paint"),
         .paraFree = lib.lookup(ParaFreeFn, "klio_skia_para_free"),
+        .fontRegister = lib.lookup(FontRegisterFn, "klio_skia_font_register"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
@@ -880,6 +884,21 @@ fn paraFree(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+fn fontRegister(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .String or ctx.args[1] != .String) return ok(Value{ .Bool = false });
+    const skia = loadSkia() orelse return ok(Value{ .Bool = false });
+    const f = skia.fontRegister orelse return ok(Value{ .Bool = false });
+    const pg = ctx.args[0].String.borrow();
+    defer pg.deinit();
+    const fg = ctx.args[1].String.borrow();
+    defer fg.deinit();
+    const path = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{pg.get().bytes}, 0) catch return ok(Value{ .Bool = false });
+    defer ctx.allocator.free(path);
+    const fam = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{fg.get().bytes}, 0) catch return ok(Value{ .Bool = false });
+    defer ctx.allocator.free(fam);
+    return ok(Value{ .Bool = f(path.ptr, fam.ptr) != 0 });
+}
+
 fn canvasSave(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len >= 1) if (surfArg(ctx.args[0])) |s| if (skia.cSave) |f| f(s);
@@ -1104,7 +1123,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 57), b.len());
+    try testing.expectEqual(@as(usize, 58), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {
