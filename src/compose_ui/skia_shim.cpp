@@ -338,6 +338,35 @@ void klio_skia_draw_text(KlioSurface* s, const char* utf8, float x, float y, flo
         utf8, std::strlen(utf8), SkTextEncoding::kUTF8, x, y, font, p);
 }
 
+// Styled run: `flags` bit0 = synthetic bold (embolden; advances unchanged),
+// bit1 = synthetic italic (skew), bit2 = underline, bit3 = strikethrough.
+// Backs per-span AnnotatedString painting off the single bundled typeface.
+void klio_skia_c_draw_text2(KlioSurface* s, const char* utf8, float x, float y, float size, uint32_t argb, int flags) {
+    if (!s || !utf8 || !g_typeface) return;
+    SkFont font(g_typeface, size);
+    font.setEdging(SkFont::Edging::kAntiAlias);
+    if (flags & 1) font.setEmbolden(true);
+    if (flags & 2) font.setSkewX(-0.25f);
+    SkPaint p;
+    fillPaint(p, argb);
+    const size_t len = std::strlen(utf8);
+    SkCanvas* canvas = s->surface->getCanvas();
+    canvas->drawSimpleText(utf8, len, SkTextEncoding::kUTF8, x, y, font, p);
+    if (flags & (4 | 8)) {
+        const float w = font.measureText(utf8, len, SkTextEncoding::kUTF8);
+        SkPaint line;
+        strokePaint(line, argb, size * 0.06f < 1.0f ? 1.0f : size * 0.06f);
+        if (flags & 4) {
+            const float uy = y + size * 0.12f;
+            canvas->drawLine(x, uy, x + w, uy, line);
+        }
+        if (flags & 8) {
+            const float sy2 = y - size * 0.28f;
+            canvas->drawLine(x, sy2, x + w, sy2, line);
+        }
+    }
+}
+
 // Lay out UTF-8 text within `width` px (word-wrapped, aligned: 0 left, 1 center,
 // 2 right) and paint it with its top-left at (x, y). No-op without a font.
 void klio_skia_draw_paragraph(KlioSurface* s, const char* utf8, float x, float y, float width, float size, uint32_t argb, int align) {
@@ -425,6 +454,43 @@ uint8_t* klio_skia_encode_png(KlioSurface* s, size_t* out_len) {
 }
 
 void klio_skia_free_buffer(uint8_t* buf) { std::free(buf); }
+
+// One pixel as ARGB (unpremultiplied), or 0 when out of range / unreadable.
+// Backs ImageBitmap.readPixels; per-pixel readback keeps the ABI scalar-only.
+uint32_t klio_skia_surf_pixel(KlioSurface* s, int x, int y) {
+    if (!s) return 0;
+    SkPixmap pm;
+    SkBitmap backing;
+    if (!surfaceToPixmap(s, pm, backing)) return 0;
+    if (x < 0 || y < 0 || x >= pm.width() || y >= pm.height()) return 0;
+    return static_cast<uint32_t>(pm.getColor(x, y));
+}
+
+// Blit `src`'s current contents onto `dst`: the plain form places the snapshot
+// at (x, y); the rect form maps `src`'s (sl,st,sr,sb) onto `dst`'s (dl,dt,dr,db)
+// with bilinear sampling. Backs Canvas.drawImage / drawImageRect.
+void klio_skia_c_draw_surface(KlioSurface* dst, KlioSurface* src, float x, float y) {
+    if (!dst || !src) return;
+    sk_sp<SkImage> img = src->surface->makeImageSnapshot();
+    if (!img) return;
+    dst->surface->getCanvas()->drawImage(img, x, y, SkSamplingOptions(SkFilterMode::kLinear), nullptr);
+}
+
+void klio_skia_c_draw_surface_rect(
+    KlioSurface* dst, KlioSurface* src,
+    float sl, float st, float sr, float sb,
+    float dl, float dt, float dr, float db) {
+    if (!dst || !src) return;
+    sk_sp<SkImage> img = src->surface->makeImageSnapshot();
+    if (!img) return;
+    dst->surface->getCanvas()->drawImageRect(
+        img,
+        SkRect::MakeLTRB(sl, st, sr, sb),
+        SkRect::MakeLTRB(dl, dt, dr, db),
+        SkSamplingOptions(SkFilterMode::kLinear),
+        nullptr,
+        SkCanvas::kStrict_SrcRectConstraint);
+}
 
 }  // extern "C"
 

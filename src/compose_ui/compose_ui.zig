@@ -81,6 +81,10 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.graphics.__composeui_text_width", textWidth);
     try b.register("androidx.compose.ui.graphics.__composeui_font_metric", fontMetric);
     try b.register("androidx.compose.ui.graphics.__skia_c_concat", canvasConcat);
+    try b.register("androidx.compose.ui.graphics.__skia_surf_pixel", surfPixel);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_text2", canvasDrawText2);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface", canvasDrawSurface);
+    try b.register("androidx.compose.ui.graphics.__skia_c_draw_surface_rect", canvasDrawSurfaceRect);
     return b;
 }
 
@@ -152,6 +156,10 @@ const Skia = struct {
     cMeasureTextWidth: ?CMeasureTextWidthFn,
     cFontMetric: ?CFontMetricFn,
     cConcat: ?CConcatFn,
+    surfPixel: ?SurfPixelFn,
+    cDrawText2: ?CDrawText2Fn,
+    cDrawSurface: ?CDrawSurfaceFn,
+    cDrawSurfaceRect: ?CDrawSurfaceRectFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
@@ -185,6 +193,10 @@ const CDrawPathFn = *const fn (?*SkSurface, [*:0]const u8, u32, c_int, f32, c_in
 const CMeasureTextWidthFn = *const fn ([*:0]const u8, f32) callconv(.c) f32;
 const CFontMetricFn = *const fn (f32, c_int) callconv(.c) f32;
 const CConcatFn = *const fn (?*SkSurface, f32, f32, f32, f32, f32, f32) callconv(.c) void;
+const SurfPixelFn = *const fn (?*SkSurface, c_int, c_int) callconv(.c) u32;
+const CDrawText2Fn = *const fn (?*SkSurface, [*:0]const u8, f32, f32, f32, u32, c_int) callconv(.c) void;
+const CDrawSurfaceFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32) callconv(.c) void;
+const CDrawSurfaceRectFn = *const fn (?*SkSurface, ?*SkSurface, f32, f32, f32, f32, f32, f32, f32, f32) callconv(.c) void;
 
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
@@ -247,6 +259,10 @@ fn loadSkia() ?*Skia {
         .cMeasureTextWidth = lib.lookup(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
         .cFontMetric = lib.lookup(CFontMetricFn, "klio_skia_font_metric"),
         .cConcat = lib.lookup(CConcatFn, "klio_skia_c_concat"),
+        .surfPixel = lib.lookup(SurfPixelFn, "klio_skia_surf_pixel"),
+        .cDrawText2 = lib.lookup(CDrawText2Fn, "klio_skia_c_draw_text2"),
+        .cDrawSurface = lib.lookup(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
+        .cDrawSurfaceRect = lib.lookup(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
@@ -658,6 +674,50 @@ fn surfFree(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// `__skia_surf_pixel(handle, x, y): Long` — one pixel as ARGB (0 when out of
+/// range, unreadable, or headless).
+fn surfPixel(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.surfPixel orelse return ok(Value.newLong(0));
+    const x: c_int = @intCast(argInt(ctx.args[1]));
+    const y: c_int = @intCast(argInt(ctx.args[2]));
+    return ok(Value.newLong(@intCast(f(surf, x, y))));
+}
+
+/// `__skia_c_draw_surface(dst, src, x, y): Long` — blit src's contents at (x, y).
+fn canvasDrawSurface(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 4) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    if (skia.cDrawSurface) |f| f(dst, src, argFloat(ctx.args[2]), argFloat(ctx.args[3]));
+    return ok(Value.newLong(0));
+}
+
+/// `__skia_c_draw_surface_rect(dst, src, sl, st, sr, sb, dl, dt, dr, db): Long`
+/// — map src's (sl,st,sr,sb) onto dst's (dl,dt,dr,db).
+fn canvasDrawSurfaceRect(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 10) return ok(Value.newLong(0));
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    const dst = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const src = surfArg(ctx.args[1]) orelse return ok(Value.newLong(0));
+    if (skia.cDrawSurfaceRect) |f| f(
+        dst,
+        src,
+        argFloat(ctx.args[2]),
+        argFloat(ctx.args[3]),
+        argFloat(ctx.args[4]),
+        argFloat(ctx.args[5]),
+        argFloat(ctx.args[6]),
+        argFloat(ctx.args[7]),
+        argFloat(ctx.args[8]),
+        argFloat(ctx.args[9]),
+    );
+    return ok(Value.newLong(0));
+}
+
 fn canvasSave(ctx: *CallCtx) Error!EvalResult {
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len >= 1) if (surfArg(ctx.args[0])) |s| if (skia.cSave) |f| f(s);
@@ -812,6 +872,23 @@ fn canvasDrawText(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(0));
 }
 
+/// `__skia_c_draw_text2(handle, text, x, y, sizePx, argb, flags): Long` — a
+/// styled run at a baseline origin: flags bit0 bold, bit1 italic, bit2
+/// underline, bit3 strikethrough.
+fn canvasDrawText2(ctx: *CallCtx) Error!EvalResult {
+    const skia = loadSkia() orelse return ok(Value.newLong(0));
+    if (ctx.args.len < 7 or ctx.args[1] != .String) return ok(Value.newLong(0));
+    const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
+    const f = skia.cDrawText2 orelse return ok(Value.newLong(0));
+    const tg = ctx.args[1].String.borrow();
+    defer tg.deinit();
+    const txt = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    defer ctx.allocator.free(txt);
+    const a = ctx.args;
+    f(surf, txt.ptr, argFloat(a[2]), argFloat(a[3]), argFloat(a[4]), argU32(a[5]), @intCast(argInt(a[6])));
+    return ok(Value.newLong(0));
+}
+
 /// `__composeui_text_width(text, sizePx): Float` — the advance width of a single
 /// unwrapped run at the given pixel size (the wrap pass measures candidate runs).
 fn textWidth(ctx: *CallCtx) Error!EvalResult {
@@ -865,7 +942,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 41), b.len());
+    try testing.expectEqual(@as(usize, 45), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

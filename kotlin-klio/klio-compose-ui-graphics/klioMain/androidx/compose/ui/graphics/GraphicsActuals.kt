@@ -125,14 +125,15 @@ internal actual fun actualStampedPathEffect(
     style: StampedPathEffectStyle,
 ): PathEffect = throw NotImplementedError("path effects are not yet supported")
 
-// ImageBitmap construction / decoding (pending the Skia shim's bitmap surface).
+// An ImageBitmap is an offscreen Skia surface (KlioImageBitmap); headless it
+// carries a 0 handle and stays a functional no-op.
 internal actual fun ActualImageBitmap(
     width: Int,
     height: Int,
     config: ImageBitmapConfig,
     hasAlpha: Boolean,
     colorSpace: ColorSpace,
-): ImageBitmap = throw NotImplementedError("ImageBitmap is not yet supported")
+): ImageBitmap = KlioImageBitmap(width, height, config, hasAlpha, colorSpace)
 
 internal actual fun createImageBitmap(bytes: ByteArray): ImageBitmap =
     throw NotImplementedError("ImageBitmap decoding is not yet supported")

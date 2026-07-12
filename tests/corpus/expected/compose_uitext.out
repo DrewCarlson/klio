@@ -1,0 +1,7 @@
+text=plain bold-blue then underlined
+spans=2
+span0=6..15 bold=true
+merged size=16.0.sp weight=FontWeight(weight=700)
+merged italic=true align=Center
+paragraph lines>=1: true
+paragraph width=120.0
