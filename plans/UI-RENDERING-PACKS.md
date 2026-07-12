@@ -327,43 +327,44 @@ throws `FileFailedToInitializeException` until those land (diagnosed via
 5. **Text shaping/measure/draw** — `ActualParagraph` (×3) + `MultiParagraph.
    drawMultiParagraph` over the Skia Paragraph shim (`src/compose_ui`, which already
    does SkFont wrap + Paragraph). This is the substantive part; the rest is plumbing.
-Then foundation → material3. ui-text is NOT yet in the parity/e2e list — add it
-once the two interpreter bugs below are fixed.
+Then foundation → material3.
 
-**ui-text model actuals landed (`2a61e56b`)** with real semantics (adapted from
-the skiko sources); `FontWeight`/style init now clears the FontRasterizationSettings
-cascade. Two interpreter bugs the full stack surfaces still block end-to-end use —
-both root-caused, both in the resolution/init CORE (careful fixes, not one-off
-patches), both only appear once the large multi-pack graph is loaded together:
+**ui-text FUNCTIONAL end to end** (2026-07-12): both blocking interpreter bugs
+above resolved by intervening core work (companion init cascade + multi-import
+overloads); the styling model (AnnotatedString spans, TextStyle merge),
+Paragraph/TextMeasurer measurement (real shaping/wrap off the shim's font
+metrics under a Skia backend; deterministic stubs headless), and
+TextPainter.paint all run through the REAL pack. Landed with it:
 
-1. **Companion method missing on a re-entrant/init-cascade receiver.** During
-   `AnnotatedString.Companion` init → `AnnotatedStringSaver` → `SpanStyle.kt`'s
-   top-level `TextForegroundStyle.from(DefaultColor)`, the `TextForegroundStyle`
-   (an `internal interface` with a companion holding the `from` overloads + a
-   nested `object Unspecified`) resolves to a companion INSTANCE whose class-def
-   has **n_methods=0** (proven with a dbg at the call_member miss in
-   host_call_member.zig), so `from` misses → `Vm::call_member from on
-   TextForegroundStyle.Companion` → the whole init cascade fails with
-   `FileFailedToInitializeException`. Standalone the same call works (the agent
-   confirmed a probe). So the mid-cascade companion receiver is a partial/shell
-   def. A minimal 2-file baked repro of the same shape hit a *related* init-order
-   symptom (a top-level val read before its initializer). Diagnose via
-   `KLIO_INIT_DEBUG=1`. Fix target: the object/companion init gate + the shell/
-   in-flight instance's class-def (host_globals.zig `ensureObjectSingleton*`,
-   `claimObjectInit`) — the shell must carry the full method table, or the
-   re-entrant read must not observe a method-less companion.
-2. **Multi-import `lerp` overload resolution.** `ui-graphics/Brush.kt` imports BOTH
-   `geometry.lerp` (Offset/Size) and `util.lerp` (Float) and calls
-   `lerp(Offset, Offset, Float)`. Alone it resolves; with ui-text loaded (more
-   `lerp` overloads in scope) the resolver fails and — wrongly — reports
-   `geometry.lerp is ... not imported` though it IS imported. This is the
-   bare-call / multi-import overload-resolution class (see the
-   `klio-imported-vs-unimported-bare-call-bug` memory). Fatal at run. Fix target:
-   the resolver's overload pick across multiple same-simple-name imports.
+- **ImageBitmap over an offscreen Skia surface** (`KlioImageBitmap` +
+  `ActualCanvas(image)`; `Canvas.drawImage`/`drawImageRect` blit via surface
+  snapshots; `readPixels` through the `__skia_surf_pixel` intrinsic) — so
+  `TextPainter.paint(Canvas(ImageBitmap(w,h)), result)` renders standalone
+  and `toPixelMap()` verifies pixels.
+- **Styled span painting**: `KlioParagraph` splits each laid-out line at
+  SpanStyle boundaries and paints runs with per-span color, synthetic
+  bold/italic, and underline/strikethrough (`klioDrawTextRun2` /
+  `klio_skia_c_draw_text2`; advances match the plain run so mixed-style
+  lines lay out off one measurement). Per-span fontSize/typeface still
+  follow the paragraph style — full multi-size shaping arrives with the
+  skparagraph adoption below.
+- **Named-argument overload correctness** (general interpreter fixes the
+  pack surfaced): `callFuncTypedInner` re-picks NAME-AWARE when the call
+  carries named args (the positional cache re-pick was overriding eval's
+  correct named pick — `ParagraphIntrinsics(annotations = …)` bound the
+  deprecated `spanStyles` overload and silently defaulted it), and
+  `callNamedOverload` attaches arg names to its applicability shapes so
+  an overload lacking a supplied name is inapplicable.
+- ui-text + runtime-saveable joined the parity/e2e pack dirs;
+  `examples/compose_uitext.kt` exercises the surface deterministically in
+  both headless and Skia environments.
 
-These are the real remaining work for the compose stack: hardening klio's
-resolution/dispatch/init core under a large multi-pack graph. Each is a careful,
-isolated interpreter fix.
+**Remaining ui-text depth (deferred, next milestone = skparagraph):** the shim
+draws with one bundled Latin typeface; per-span fontSize, real font families,
+FontSynthesis, bidi, and cursor/selection geometry over styled runs want the
+linked-but-unused skparagraph (`ParagraphBuilder` with styled runs replacing
+the manual SkFont wrap). That is the substantive text-engine upgrade; the
+current engine is faithful for single-size styled text.
 
 Vendor per module (one pack each; expand the sparse checkout via
 `scripts/init-compose-submodule.sh`), klioMain supplying only platform actuals.

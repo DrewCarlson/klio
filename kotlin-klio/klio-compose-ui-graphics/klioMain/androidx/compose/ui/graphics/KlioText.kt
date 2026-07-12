@@ -33,3 +33,14 @@ fun klioDrawTextRun(canvas: Canvas, text: String, x: Float, y: Float, sizePx: Fl
     val h = (canvas as? KlioCanvas)?.nativeHandle ?: return
     __skia_c_draw_text(h, text, x, y, sizePx, argb)
 }
+
+/**
+ * Draw a STYLED text run: [flags] bit0 = synthetic bold, bit1 = synthetic
+ * italic, bit2 = underline, bit3 = strikethrough. Advances match the plain
+ * run (synthetic styles keep glyph metrics), so mixed-style lines lay out
+ * with [klioTextWidth] measurements.
+ */
+fun klioDrawTextRun2(canvas: Canvas, text: String, x: Float, y: Float, sizePx: Float, argb: Int, flags: Int) {
+    val h = (canvas as? KlioCanvas)?.nativeHandle ?: return
+    __skia_c_draw_text2(h, text, x, y, sizePx, argb, flags)
+}

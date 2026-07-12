@@ -25,7 +25,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.DrawStyle
+import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.klioDrawTextRun
+import androidx.compose.ui.graphics.klioDrawTextRun2
 import androidx.compose.ui.graphics.klioFontAscent
 import androidx.compose.ui.graphics.klioFontDescent
 import androidx.compose.ui.graphics.klioFontLeading
@@ -34,10 +36,12 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.Paragraph
 import androidx.compose.ui.text.ParagraphIntrinsics
 import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.ResolvedTextDirection
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -104,7 +108,21 @@ internal class KlioParagraph(
     val maxLines: Int,
     val ellipsis: Boolean,
     override val width: Float,
+    val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
 ) : Paragraph {
+
+    // The SpanStyle ranges, in application order (a later span overrides the
+    // attributes it sets on the overlap). Only paint-level attributes are
+    // honoured — color, weight (synthetic bold), style (synthetic italic),
+    // and decoration — since the single bundled font shapes every run.
+    private val spanRanges: List<AnnotatedString.Range<SpanStyle>> = run {
+        val out = ArrayList<AnnotatedString.Range<SpanStyle>>()
+        for (r in annotations) {
+            val item = r.item
+            if (item is SpanStyle) out.add(AnnotatedString.Range(item, r.start, r.end))
+        }
+        out
+    }
 
     private val fontSizePx: Float = style.resolvedFontSizePx(density)
     private val ascent: Float = klioFontAscent(fontSizePx)   // negative
@@ -260,10 +278,63 @@ internal class KlioParagraph(
         }
     }
 
-    private fun paintLines(canvas: Canvas, argb: Int) {
+    // Paragraph-level style flags (bit0 bold, bit1 italic, bit2 underline,
+    // bit3 strikethrough); [deco] is paint()'s decoration override.
+    private fun baseFlags(deco: TextDecoration?): Int {
+        var f = 0
+        val w = style.fontWeight
+        if (w != null && w.weight >= 600) f = f or 1
+        if (style.fontStyle == FontStyle.Italic) f = f or 2
+        val d = deco ?: style.textDecoration
+        if (d != null) {
+            if (TextDecoration.Underline in d) f = f or 4
+            if (TextDecoration.LineThrough in d) f = f or 8
+        }
+        return f
+    }
+
+    private fun paintLines(canvas: Canvas, argb: Int, deco: TextDecoration? = null) {
+        val bf = baseFlags(deco)
         lines.forEachIndexed { i, line ->
-            if (line.text.isNotEmpty()) {
-                klioDrawTextRun(canvas, line.text, lineLeft(line), getLineBaseline(i), fontSizePx, argb)
+            if (line.text.isEmpty()) return@forEachIndexed
+            val baseline = getLineBaseline(i)
+            if (spanRanges.isEmpty() && bf == 0) {
+                klioDrawTextRun(canvas, line.text, lineLeft(line), baseline, fontSizePx, argb)
+                return@forEachIndexed
+            }
+            // Split the line at span boundaries; each segment draws with the
+            // attributes the covering spans resolve to (in application order).
+            var x = lineLeft(line)
+            var seg = line.start
+            while (seg < line.end) {
+                var end = line.end
+                for (r in spanRanges) {
+                    if (r.start in (seg + 1) until end) end = r.start
+                    if (r.end in (seg + 1) until end) end = r.end
+                }
+                var c = argb
+                var f = bf
+                for (r in spanRanges) {
+                    if (seg >= r.start && seg < r.end) {
+                        val st = r.item
+                        if (st.color.isSpecified) c = st.color.toKlioArgb()
+                        val w = st.fontWeight
+                        if (w != null) f = if (w.weight >= 600) f or 1 else f and 1.inv()
+                        val fs = st.fontStyle
+                        if (fs != null) f = if (fs == FontStyle.Italic) f or 2 else f and 2.inv()
+                        val d = st.textDecoration
+                        if (d != null) {
+                            f = if (TextDecoration.Underline in d) f or 4 else f and 4.inv()
+                            f = if (TextDecoration.LineThrough in d) f or 8 else f and 8.inv()
+                        }
+                    }
+                }
+                val runText = line.text.substring(seg - line.start, end - line.start)
+                if (runText.isNotEmpty()) {
+                    klioDrawTextRun2(canvas, runText, x, baseline, fontSizePx, c, f)
+                    x += klioTextWidth(runText, fontSizePx)
+                }
+                seg = end
             }
         }
     }
@@ -275,7 +346,7 @@ internal class KlioParagraph(
 
     @Deprecated("Use the new paint function that takes canvas as the only required parameter.")
     override fun paint(canvas: Canvas, color: Color, shadow: Shadow?, textDecoration: TextDecoration?) {
-        paintLines(canvas, resolvedArgb(color))
+        paintLines(canvas, resolvedArgb(color), textDecoration)
     }
 
     override fun paint(
@@ -286,7 +357,7 @@ internal class KlioParagraph(
         drawStyle: DrawStyle?,
         blendMode: BlendMode,
     ) {
-        paintLines(canvas, resolvedArgb(color))
+        paintLines(canvas, resolvedArgb(color), textDecoration)
     }
 
     override fun paint(
@@ -300,7 +371,7 @@ internal class KlioParagraph(
     ) {
         val base = (brush as? SolidColor)?.value ?: style.color.takeOrElse { Color.Black }
         val a = if (alpha.isNaN()) base.alpha else (base.alpha * alpha).coerceIn(0f, 1f)
-        paintLines(canvas, base.copy(alpha = a).toKlioArgb())
+        paintLines(canvas, base.copy(alpha = a).toKlioArgb(), textDecoration)
     }
 }
 
@@ -312,6 +383,7 @@ internal class KlioParagraphIntrinsics(
     val text: String,
     val style: TextStyle,
     val density: Density,
+    val annotations: List<AnnotatedString.Range<out AnnotatedString.Annotation>> = emptyList(),
 ) : ParagraphIntrinsics {
     private val fontSizePx = style.resolvedFontSizePx(density)
     override val minIntrinsicWidth: Float = longestWordWidth(text, fontSizePx)
@@ -330,7 +402,7 @@ internal actual fun ActualParagraph(
     width: Float,
     density: Density,
     resourceLoader: Font.ResourceLoader,
-): Paragraph = KlioParagraph(text, style, density, maxLines, ellipsis, width)
+): Paragraph = KlioParagraph(text, style, density, maxLines, ellipsis, width, annotations)
 
 internal actual fun ActualParagraph(
     text: String,
@@ -346,6 +418,7 @@ internal actual fun ActualParagraph(
     text, style, density, maxLines,
     ellipsis = overflow == TextOverflow.Ellipsis,
     width = constraints.maxWidth.toFloat(),
+    annotations = annotations,
 )
 
 internal actual fun ActualParagraph(
@@ -359,6 +432,7 @@ internal actual fun ActualParagraph(
         i.text, i.style, i.density, maxLines,
         ellipsis = overflow == TextOverflow.Ellipsis,
         width = constraints.maxWidth.toFloat(),
+        annotations = i.annotations,
     )
 }
 
@@ -369,4 +443,4 @@ internal actual fun ActualParagraphIntrinsics(
     placeholders: List<AnnotatedString.Range<Placeholder>>,
     density: Density,
     fontFamilyResolver: FontFamily.Resolver,
-): ParagraphIntrinsics = KlioParagraphIntrinsics(text, style, density)
+): ParagraphIntrinsics = KlioParagraphIntrinsics(text, style, density, annotations)

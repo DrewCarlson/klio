@@ -53,3 +53,9 @@ internal fun __skia_c_draw_text(handle: Long, text: String, x: Float, y: Float, 
 internal fun __composeui_text_width(text: String, sizePx: Float): Float = error("intrinsic __composeui_text_width not installed")
 internal fun __composeui_font_metric(sizePx: Float, which: Int): Float = error("intrinsic __composeui_font_metric not installed")
 internal fun __skia_c_concat(handle: Long, sx: Float, kx: Float, tx: Float, ky: Float, sy: Float, ty: Float): Long = error("intrinsic __skia_c_concat not installed")
+
+// ImageBitmap: read one pixel as ARGB (0 when headless / out of range); blit a
+// source surface onto a canvas surface (plain offset, or src-rect → dst-rect).
+internal fun __skia_surf_pixel(handle: Long, x: Int, y: Int): Long = error("intrinsic __skia_surf_pixel not installed")
+internal fun __skia_c_draw_surface(dst: Long, src: Long, x: Float, y: Float): Long = error("intrinsic __skia_c_draw_surface not installed")
+internal fun __skia_c_draw_surface_rect(dst: Long, src: Long, sl: Float, st: Float, sr: Float, sb: Float, dl: Float, dt: Float, dr: Float, db: Float): Long = error("intrinsic __skia_c_draw_surface_rect not installed")

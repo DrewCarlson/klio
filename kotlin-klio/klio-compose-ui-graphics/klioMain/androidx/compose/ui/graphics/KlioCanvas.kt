@@ -162,8 +162,11 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         endShader(sh)
     }
 
-    override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint): Unit =
-        throw NotImplementedError("Canvas.drawImage requires ImageBitmap support")
+    override fun drawImage(image: ImageBitmap, topLeftOffset: Offset, paint: Paint) {
+        val src = image.klioSurfaceHandle()
+        if (src == 0L) return
+        __skia_c_draw_surface(handle, src, topLeftOffset.x, topLeftOffset.y)
+    }
 
     override fun drawImageRect(
         image: ImageBitmap,
@@ -172,7 +175,22 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
         dstOffset: IntOffset,
         dstSize: IntSize,
         paint: Paint,
-    ): Unit = throw NotImplementedError("Canvas.drawImageRect requires ImageBitmap support")
+    ) {
+        val src = image.klioSurfaceHandle()
+        if (src == 0L) return
+        __skia_c_draw_surface_rect(
+            handle,
+            src,
+            srcOffset.x.toFloat(),
+            srcOffset.y.toFloat(),
+            (srcOffset.x + srcSize.width).toFloat(),
+            (srcOffset.y + srcSize.height).toFloat(),
+            dstOffset.x.toFloat(),
+            dstOffset.y.toFloat(),
+            (dstOffset.x + dstSize.width).toFloat(),
+            (dstOffset.y + dstSize.height).toFloat(),
+        )
+    }
 
     override fun drawPoints(pointMode: PointMode, points: List<Offset>, paint: Paint): Unit =
         throw NotImplementedError("Canvas.drawPoints is not yet supported")
@@ -188,9 +206,9 @@ internal class KlioCanvas(private val handle: Long) : Canvas {
     override fun disableZ() {}
 }
 
-/** klio has no ImageBitmap-backed canvas yet (ImageBitmap construction is pending). */
+/** A canvas over an [ImageBitmap]'s backing surface (see [KlioImageBitmap]). */
 internal actual fun ActualCanvas(image: ImageBitmap): Canvas =
-    throw NotImplementedError("Canvas over an ImageBitmap is not yet supported")
+    KlioCanvas(image.klioSurfaceHandle())
 
 /**
  * klio helper: create an offscreen [width] x [height] surface, draw [block] onto

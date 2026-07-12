@@ -1333,23 +1333,30 @@ pub fn pickNamedOverloadId(
     // (`lightColorScheme(primary = c)`) outscores the real overload (whose
     // extra roles are defaulted) and, when it delegates to the real one by
     // name, self-recurses.
+    const pno_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, f0.name) else false;
     var best_ord: ?FuncId = null;
     var best_ord_score: i32 = std.math.minInt(i32);
     var best_low: ?FuncId = null;
     var best_low_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
-        const score = namedPoints(self, module, cand, shapes, scope) orelse continue;
+        const score = namedPoints(self, module, cand, shapes, scope);
+        if (pno_trace) {
+            const cf0 = funcAt(module, cand);
+            std.debug.print("[pno] {s} cand={d} nparams={d} score={?}\n", .{ f0.name, cand.int(), if (cf0) |cf| cf.params.len else 0, score });
+        }
+        const sc = score orelse continue;
         const is_low = if (funcAt(module, cand)) |cf| cf.low_priority else false;
         if (is_low) {
-            if (best_low == null or score > best_low_score) {
+            if (best_low == null or sc > best_low_score) {
                 best_low = cand;
-                best_low_score = score;
+                best_low_score = sc;
             }
-        } else if (best_ord == null or score > best_ord_score) {
+        } else if (best_ord == null or sc > best_ord_score) {
             best_ord = cand;
-            best_ord_score = score;
+            best_ord_score = sc;
         }
     }
+    if (pno_trace) std.debug.print("[pno] {s} baked={d} -> best_ord={?} best_low={?}\n", .{ f0.name, func.int(), if (best_ord) |b0| b0.int() else null, if (best_low) |b0| b0.int() else null });
 
     return best_ord orelse best_low;
 }
@@ -1627,8 +1634,23 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
     }
 
     // Overload resolution. Skipped for an `exact` call: the lowering
-    // already resolved the overload from an explicit argument cast.
-    const resolved: FuncId = if (exact) func else (pickOverloadCached(self, module, func, args) orelse func);
+    // already resolved the overload from an explicit argument cast. A call
+    // with NAMED arguments re-picks name-aware — the positional cache pick
+    // would re-route to a sibling that lacks the supplied names, silently
+    // defaulting the mismatched parameters (`ParagraphIntrinsics(
+    // annotations = …)` bound the deprecated spanStyles overload).
+    const has_named = blk: {
+        for (arg_names) |n| {
+            if (n != null) break :blk true;
+        }
+        break :blk false;
+    };
+    const resolved: FuncId = if (exact)
+        func
+    else if (has_named)
+        (pickNamedOverloadId(self, module, func, args, arg_names, false) orelse func)
+    else
+        (pickOverloadCached(self, module, func, args) orelse func);
 
     // Incompatible-receiver guard: a bare call baked to a top-level
     // extension whose declared receiver is a user/pack class, with an
@@ -1745,12 +1767,23 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
 
     // Pick the best body-carrying overload by runtime arg types through
     // the shared applicability engine (proven zero-divergence against the
-    // legacy scorer over the full sweep before the flip).
+    // legacy scorer over the full sweep before the flip). Named arguments
+    // participate: an overload that lacks a supplied arg name is
+    // INAPPLICABLE (kotlinc's rule) — without this, a named call binds a
+    // positional namesake and silently defaults the mismatched parameter
+    // (`ParagraphIntrinsics(annotations = …)` picked the deprecated
+    // `spanStyles` overload and dropped the annotations).
     if (args.len > 24) return .{ .ok = null };
+    var any_named = false;
     var shapes_buf: [24]applicability.ArgShape = undefined;
     const shapes = shapes_buf[0..args.len];
-    for (args, 0..) |*a, i| shapes[i] = shapeOfValue(self, a);
+    for (args, 0..) |*a, i| {
+        shapes[i] = shapeOfValue(self, a);
+        shapes[i].named = if (i < arg_names.len) arg_names[i] else null;
+        if (shapes[i].named != null) any_named = true;
+    }
     const scope = applicability.ApplicabilityScope{
+        .named = any_named,
         .ctx = @ptrCast(self),
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
