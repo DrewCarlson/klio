@@ -979,6 +979,30 @@ pub fn setTrailingLambdaCall(on: bool) void {
     trailing_lambda_call = on;
 }
 
+/// Active receiver-formed bodyless redirects: (fid, receiver identity)
+/// pairs currently on the dispatch stack. Bounded — overflow entries are
+/// dropped (the guard then simply cannot fire for them).
+threadlocal var bodyless_active: [32]struct { fid: u32, ident: u64 } = undefined;
+threadlocal var bodyless_active_len: usize = 0;
+
+fn bodylessRedirectActive(func: FuncId, ident: u64) bool {
+    for (bodyless_active[0..bodyless_active_len]) |e| {
+        if (e.fid == func.int() and e.ident == ident) return true;
+    }
+    return false;
+}
+
+fn bodylessRedirectPush(func: FuncId, ident: u64) void {
+    if (bodyless_active_len < bodyless_active.len) {
+        bodyless_active[bodyless_active_len] = .{ .fid = @intCast(func.int()), .ident = ident };
+        bodyless_active_len += 1;
+    }
+}
+
+fn bodylessRedirectPop() void {
+    if (bodyless_active_len > 0) bodyless_active_len -= 1;
+}
+
 pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_in: []const Value) Allocator.Error!EvalResult {
     const trailing_syntax = trailing_lambda_call;
     trailing_lambda_call = false;
@@ -1035,9 +1059,37 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             break :blk g.get().resolvedRedirectTarget(module, func, args_in.len);
         };
         if (target) |cand| {
+            // Re-entrancy guard for RECEIVER-formed headers: an abstract
+            // member (`Comparable.compareTo`) re-entered through its own
+            // redirect with the SAME receiver has no implementation for
+            // that value — kotlinc would never compile the call. Without
+            // the guard the sibling's body re-misses on the receiver and
+            // the pair recurses to a native stack overflow (two lambdas
+            // compared via `Comparable.compareTo` under a same-named
+            // pack member). Value-recursion through a receiverless
+            // `expect` header stays untouched.
+            const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+            const recv_ident: u64 = if (has_this and args_in.len != 0) blk: {
+                const v = args_in[0];
+                break :blk switch (v) {
+                    .Instance => |i| @intFromPtr(i.cell),
+                    .IrClosure => |c| @as(u64, @intCast(c.id)),
+                    .Int => |x| @as(u64, @bitCast(@as(i64, x))),
+                    .Long => |x| @as(u64, @bitCast(x)),
+                    else => @as(u64, @intFromEnum(std.meta.activeTag(v))),
+                };
+            } else 0;
+            if (has_this and bodylessRedirectActive(func, recv_ident)) {
+                return .{ .err = typeErr(allocator, "abstract `{s}` has no implementation applicable to this receiver", .{f.name}) };
+            }
             if (trace.enabled(f.name)) {
                 const g = funcAt(module, cand);
                 trace.emit("map=bodyless_sibling name={s} fqn={s}", .{ f.name, if (g) |gg| gg.fqn else "?" });
+            }
+            if (has_this) {
+                bodylessRedirectPush(func, recv_ident);
+                defer bodylessRedirectPop();
+                return callFunc(self, allocator, module, cand, args_in);
             }
             return callFunc(self, allocator, module, cand, args_in);
         }

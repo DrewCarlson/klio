@@ -2400,6 +2400,47 @@ fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
 /// it outright).
 fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
     if (argDefinitelyNotParamType(self, param_ty, receiver)) return true;
+    // A function value implements only the Function* surface (plus
+    // Any/type variables): a NOMINAL receiver type it does not satisfy
+    // is definite. Without this a sole lenient extension survivor like
+    // `Comparable<T>.compareTo` binds a lambda receiver, and its body's
+    // member re-dispatch loops back to the same pick forever (two
+    // lambdas compared through a pack's same-named member).
+    switch (receiver.*) {
+        .Function, .IrClosure, .BoundMethod, .BoundUserMethod => {
+            const pn = simpleName(param_ty.name);
+            if (param_ty.nullable) return false;
+            if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
+            if (pn.len <= 2 and allUppercase(pn)) return false;
+            // Any function-shaped type name stays a candidate for a
+            // callable receiver: `Function*`, suspend forms, and the
+            // lowered `<function>` marker (`startCoroutineCancellable`
+            // on `(suspend () -> Unit)`).
+            if (std.mem.indexOf(u8, pn, "Function") != null) return false;
+            if (std.mem.indexOf(u8, pn, "->") != null) return false;
+            if (std.mem.startsWith(u8, pn, "suspend")) return false;
+            if (std.mem.eql(u8, pn, "<function>")) return false;
+            if (receiver.isRuntimeType(pn)) return false;
+            // A `fun interface` (SAM) receiver type: a lambda serves it
+            // (`emitAll` on a FlowCollector-shaped collector lambda), so
+            // it is never definite. A plain interface (`Comparable`) or
+            // class is: kotlinc converts lambdas only to fun interfaces.
+            // An UNKNOWN name (no registered ClassDef) stays a candidate.
+            {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                if (cg.get().get(pn)) |def| {
+                    const dg = def.borrow();
+                    defer dg.deinit();
+                    if (dg.get().is_fun_interface) return false;
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        },
+        else => {},
+    }
     if (receiver.* == .Class) {
         const pn = param_ty.name;
         if (param_ty.nullable) return false;
