@@ -49,6 +49,28 @@ public fun DisposableEffect(key1: Any?, effect: DisposableEffectScope.() -> Disp
     }
 }
 
+/** Effect re-run whenever any of [keys] changes (upstream's vararg form). */
+public fun DisposableEffect(
+    vararg keys: Any?,
+    effect: DisposableEffectScope.() -> DisposableEffectResult,
+) {
+    val c = requireComposer() as KlioComposer
+    var keyChanged = false
+    for (k in keys) {
+        keyChanged = c.changed(k) || keyChanged
+    }
+    val prev = c.rememberedValue()
+    if (keyChanged || prev === Composer.Empty) {
+        if (prev is DisposableEffectResult) {
+            c.removeDisposer(prev)
+            prev.onDispose()
+        }
+        val result = InternalDisposableEffectScope.effect()
+        c.addDisposer(result)
+        c.updateRememberedValue(result)
+    }
+}
+
 /** Effect tied to [key1]+[key2]. */
 public fun DisposableEffect(
     key1: Any?,

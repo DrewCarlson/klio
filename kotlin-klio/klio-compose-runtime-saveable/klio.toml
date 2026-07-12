@@ -13,6 +13,12 @@ auto_bindings = true
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/runtime/runtime-saveable/src/commonMain/kotlin"
 include = [
+    "androidx/compose/runtime/saveable/ListSaver.kt",
+    "androidx/compose/runtime/saveable/MapSaver.kt",
+    "androidx/compose/runtime/saveable/RememberSaveable.kt",
+    "androidx/compose/runtime/saveable/SaveableStateHolder.kt",
+    "androidx/compose/runtime/saveable/SaveableStateRegistry.kt",
+    "androidx/compose/runtime/saveable/SaveableStateRegistryWrapper.kt",
     "androidx/compose/runtime/saveable/Saver.kt",
 ]
 

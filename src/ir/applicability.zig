@@ -688,6 +688,63 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     if (!sig.has_body) return null;
 
     const last_vararg = params.len > 0 and params[params.len - 1].is_vararg;
+
+    // NON-FINAL vararg + trailing lambda: `remember(vararg keys, calculation)`
+    // called as `remember(k1 … kn) { … }`. The lambda binds the final
+    // function-typed parameter out of sequence, leading args fill the params
+    // before the vararg, the vararg absorbs the positional middle, and any
+    // params strictly between the vararg and the lambda must carry defaults
+    // (Kotlin fills them only by name).
+    const mid_vararg: ?usize = blk: {
+        for (params, 0..) |p, pi| {
+            if (p.is_vararg and pi + 1 < params.len) break :blk pi;
+        }
+        break :blk null;
+    };
+    if (mid_vararg) |vpos| {
+        if (args.len > 0 and args[args.len - 1].is_lambda and
+            isFunctionTypeRef(&params[params.len - 1].ty) and args.len - 1 >= vpos)
+        {
+            var gap_ok = true;
+            var gi = vpos + 1;
+            while (gi < params.len - 1) : (gi += 1) {
+                if (!paramHasDefault(sig, gi)) {
+                    gap_ok = false;
+                    break;
+                }
+            }
+            if (gap_ok) {
+                var total: i32 = -1;
+                var proven: u16 = 0;
+                var unknown: u16 = 0;
+                var k: usize = 0;
+                while (k < vpos) : (k += 1) {
+                    const sc = scoreArg(&params[k].ty, &args[k], &scope) orelse return null;
+                    total += sc;
+                    if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+                }
+                const elem_ty = varargElementRef(&params[vpos].ty);
+                while (k < args.len - 1) : (k += 1) {
+                    const sc = scoreArg(&elem_ty, &args[k], &scope) orelse return null;
+                    total += sc;
+                    if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+                }
+                const ls = scoreArg(&params[params.len - 1].ty, &args[args.len - 1], &scope) orelse return null;
+                total += ls;
+                if (argIsProven(&args[args.len - 1])) proven += 1 else unknown += 1;
+                return .{
+                    .points = total,
+                    .proven_args = proven,
+                    .unknown_args = unknown,
+                    .exact_arity = false,
+                    .low_priority = sig.low_priority,
+                    .is_member = sig.is_member,
+                    .binding = .{ .trailing_lambda_param = @intCast(params.len - 1) },
+                };
+            }
+        }
+    }
+
     if (params.len < args.len and !last_vararg) return null;
 
     // Trailing-lambda rule: the last arg binds out of sequence to the last

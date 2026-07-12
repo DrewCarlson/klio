@@ -845,7 +845,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);
         var found = false;
-        while (cur) |cn| {
+        while (cur) |cn_raw| {
+            // A dotted nested supertype (`Modifier.Node`) lifted under a
+            // mangled key registers its properties there; canonicalize the
+            // hop so the inherited member is seen (Kotlin resolves the
+            // member over a same-named extension property).
+            const cn = canon: {
+                const cg0 = self.classes.borrow();
+                defer cg0.deinit();
+                if (cg0.get().get(cn_raw) != null) break :canon cn_raw;
+                break :canon host_call_member.mangledClassKeyOf(self, cn_raw) orelse cn_raw;
+            };
             cur = null;
             if (containsStr(seen.items, cn)) break;
             try seen.append(allocator, cn);
@@ -863,6 +873,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             // extension property — Kotlin resolves the member first. Without
             // this a member-reading extension recurses (`val Route.application
             // get() = when (this) { is RoutingRoot -> application; … }`).
+            var parent_name: ?[]const u8 = null;
             {
                 const cg = self.classes.borrow();
                 const def = cg.get().get(cn);
@@ -874,12 +885,21 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     for (dg.get().primary_params) |p| {
                         if (p.property != null and std.mem.eql(u8, p.name, name)) found = true;
                     }
+                    // Prefer the RESOLVED parent-class link for the next hop:
+                    // supertype_names' first entry may be an interface when the
+                    // parent class was recorded through the resolved link only
+                    // (BackwardsCompatNode : Modifier.Node(), LayoutModifierNode…).
+                    if (dg.get().parent) |par| {
+                        const ng = par.borrow();
+                        parent_name = ng.get().name;
+                        ng.deinit();
+                    }
                     dg.deinit();
                 }
                 cg.deinit();
                 if (found) break;
             }
-            cur = firstSupertype(self, cn);
+            cur = parent_name orelse firstSupertype(self, cn);
         }
         break :blk found;
     };
@@ -3104,13 +3124,27 @@ fn companionSimpleName(mangled: []const u8) []const u8 {
 }
 
 fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    if (cg.get().get(cn)) |d| {
-        const dg = d.borrow();
-        defer dg.deinit();
-        const sts = dg.get().supertype_names;
-        return if (sts.len > 0) sts[0] else null;
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(cn)) |d| {
+            const dg = d.borrow();
+            defer dg.deinit();
+            const sts = dg.get().supertype_names;
+            return if (sts.len > 0) sts[0] else null;
+        }
+    }
+    // A dotted nested name (`Modifier.Node`) may register under its lifted
+    // mangled key.
+    if (host_call_member.mangledClassKeyOf(self, cn)) |m| {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(m)) |d| {
+            const dg = d.borrow();
+            defer dg.deinit();
+            const sts = dg.get().supertype_names;
+            return if (sts.len > 0) sts[0] else null;
+        }
     }
     return null;
 }

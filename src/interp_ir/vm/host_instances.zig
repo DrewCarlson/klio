@@ -3238,6 +3238,46 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
                     tbl.deinit();
                 };
+                // A `by`-delegated property registers a getter thunk that
+                // dispatches `getValue` on the delegate instance (stored as a
+                // `<name>$klio_delegate` field by the complex-init pass), so a
+                // bare read inside a sibling member — or a qualified read from
+                // outside — resolves instead of missing as a phantom field.
+                if (p.delegate != null) if (!site_built) {
+                    const dfield = try std.fmt.allocPrint(allocator, "{s}$klio_delegate", .{p.name.name});
+                    const recv_expr = try allocator.create(ast.Expr);
+                    const segs = try allocator.alloc(ast.Ident, 1);
+                    segs[0] = .{ .name = dfield, .span = p.name.span };
+                    recv_expr.* = .{ .Path = .{ .segments = segs, .span = p.name.span } };
+                    const callee = try allocator.create(ast.Expr);
+                    callee.* = .{ .Member = .{
+                        .receiver = recv_expr,
+                        .name = .{ .name = "getValue", .span = p.name.span },
+                        .safe = false,
+                        .span = p.name.span,
+                    } };
+                    const call_args = try allocator.alloc(ast.Expr, 2);
+                    call_args[0] = .{ .NullLit = .{ .span = p.name.span } };
+                    call_args[1] = .{ .NullLit = .{ .span = p.name.span } };
+                    const arg_names = try allocator.alloc(?[]const u8, 2);
+                    arg_names[0] = null;
+                    arg_names[1] = null;
+                    const body_expr: ast.Expr = .{ .Call = .{
+                        .callee = callee,
+                        .args = call_args,
+                        .arg_names = arg_names,
+                        .type_args = &.{},
+                        .is_infix = false,
+                        .span = p.name.span,
+                    } };
+                    const thunk = synthThunk(p.name, .{ .Expr = body_expr }, p.ty, p.is_override);
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+                    const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = func.id, .captures = &.{} }) catch {};
+                    tbl.deinit();
+                };
                 // A custom setter registers its 1-arg thunk symmetrically, so
                 // `obj.x = v` dispatches the override (`drawContext.canvas =
                 // canvas` writing through to the wrapped drawParams) instead of
@@ -3277,6 +3317,18 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
+            if (p.delegate) |*dexpr| {
+                const dfield = try std.fmt.allocPrint(allocator, "{s}$klio_delegate", .{p.name.name});
+                const thunk_name: ast.Ident = .{
+                    .name = try std.fmt.allocPrint(allocator, "$init${s}", .{dfield}),
+                    .span = p.name.span,
+                };
+                const thunk = synthThunk(thunk_name, .{ .Expr = dexpr.*.* }, null, false);
+                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
+                try complex_local.append(allocator, .{ .name = dfield, .module = sub_ref, .func = func.id });
+                continue;
+            }
             const init_expr: *const ast.Expr = if (p.init) |*e|
                 e
             else if (p.explicit_field) |ef|
@@ -3729,6 +3781,14 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         const cpi: ?AnonComplexInit = blk: {
             for (complex_prop_inits) |c| {
                 if (std.mem.eql(u8, c.name, pname)) break :blk c;
+                // A delegated property's initializer stores the DELEGATE
+                // instance under `<name>$klio_delegate`.
+                if (c.name.len == pname.len + "$klio_delegate".len and
+                    std.mem.startsWith(u8, c.name, pname) and
+                    std.mem.endsWith(u8, c.name, "$klio_delegate"))
+                {
+                    break :blk c;
+                }
             }
             break :blk null;
         };
