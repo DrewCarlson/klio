@@ -240,46 +240,91 @@ internal class KlioParagraph(
         h
     }
 
+    /** True when this paragraph shaped through skparagraph at construction.
+     * The mode never changes afterwards: an EVICTED native paragraph revives
+     * through [nh], it never falls back to the headless stub (whose layout
+     * fields are only computed for stub-mode paragraphs). */
+    private val isNative: Boolean = native != 0L
+
+    init {
+        if (isNative) registryAdd(this)
+    }
+
+    /** The live native handle, reviving an evicted paragraph. Every
+     * intrinsic call goes through this accessor. */
+    private fun nh(): Long {
+        if (isNative && native == 0L) {
+            native = __skia_para_new(text, buildSpec(nativeBaseArgb, nativeDeco))
+            if (native != 0L) __skia_para_layout(native, if (width > 0f) width else Float.MAX_VALUE)
+            registryAdd(this)
+        }
+        return native
+    }
+
     private fun nativeRebuild(baseColor: Int, decoOverride: TextDecoration?) {
-        if (native != 0L) __skia_para_free(native)
+        if (native != 0L) __skia_para_free(native) else if (isNative) registryAdd(this)
         native = __skia_para_new(text, buildSpec(baseColor, decoOverride))
         if (native != 0L) __skia_para_layout(native, if (width > 0f) width else Float.MAX_VALUE)
         nativeBaseArgb = baseColor
         nativeDeco = decoOverride
     }
 
-    private fun metric(which: Int): Float = __skia_para_metric(native, which)
-    private fun lineMetric(line: Int, which: Int): Float = __skia_para_line_metric(native, line, which)
+    /** Registry eviction callback: free the handle; [nh] revives on demand. */
+    internal fun evictNative() {
+        if (native != 0L) {
+            __skia_para_free(native)
+            native = 0L
+        }
+    }
+
+    private fun metric(which: Int): Float = __skia_para_metric(nh(), which)
+    private fun lineMetric(line: Int, which: Int): Float = __skia_para_line_metric(nh(), line, which)
+
+    internal companion object {
+        // Bounded pool of live skparagraph handles: compose caches layouts,
+        // but a scrolling LazyColumn churns paragraphs without ever
+        // disposing them. Oldest-first eviction; an evicted paragraph
+        // re-shapes on next use.
+        private const val MAX_LIVE = 192
+        private val live = ArrayDeque<KlioParagraph>()
+
+        private fun registryAdd(p: KlioParagraph) {
+            live.addLast(p)
+            while (live.size > MAX_LIVE) {
+                live.removeFirst().evictNative()
+            }
+        }
+    }
 
     // ---- stub layout (headless fallback; only computed when native == 0) ----
 
-    private val ascent: Float = if (native != 0L) 0f else klioFontAscent(fontSizePx)   // negative
-    private val descent: Float = if (native != 0L) 0f else klioFontDescent(fontSizePx) // positive
-    private val leading: Float = if (native != 0L) 0f else klioFontLeading(fontSizePx)
+    private val ascent: Float = if (isNative) 0f else klioFontAscent(fontSizePx)   // negative
+    private val descent: Float = if (isNative) 0f else klioFontDescent(fontSizePx) // positive
+    private val leading: Float = if (isNative) 0f else klioFontLeading(fontSizePx)
     private val lineHeightPx: Float =
-        if (native != 0L) 0f else (descent - ascent + leading).coerceAtLeast(fontSizePx)
+        if (isNative) 0f else (descent - ascent + leading).coerceAtLeast(fontSizePx)
     private val baselineFromTop: Float = -ascent
 
-    private val allLines: List<KlioLine> = if (native != 0L) emptyList() else wrap()
+    private val allLines: List<KlioLine> = if (isNative) emptyList() else wrap()
     private val lines: List<KlioLine> =
         if (maxLines in 1 until allLines.size) allLines.subList(0, maxLines) else allLines
 
     override val height: Float
-        get() = if (native != 0L) metric(0) else lineCount * lineHeightPx
+        get() = if (isNative) metric(0) else lineCount * lineHeightPx
     override val lineCount: Int
-        get() = if (native != 0L) metric(4).toInt().coerceAtLeast(1) else lines.size.coerceAtLeast(1)
+        get() = if (isNative) metric(4).toInt().coerceAtLeast(1) else lines.size.coerceAtLeast(1)
     override val didExceedMaxLines: Boolean
-        get() = if (native != 0L) metric(5) != 0f else allLines.size > lines.size
+        get() = if (isNative) metric(5) != 0f else allLines.size > lines.size
     override val firstBaseline: Float
-        get() = if (native != 0L) lineMetric(0, 2) else baselineFromTop
+        get() = if (isNative) lineMetric(0, 2) else baselineFromTop
     override val lastBaseline: Float
-        get() = if (native != 0L) lineMetric(lineCount - 1, 2)
+        get() = if (isNative) lineMetric(lineCount - 1, 2)
         else (lineCount - 1) * lineHeightPx + baselineFromTop
 
     override val minIntrinsicWidth: Float
-        get() = if (native != 0L) metric(2) else longestWordWidth(text, fontSizePx)
+        get() = if (isNative) metric(2) else longestWordWidth(text, fontSizePx)
     override val maxIntrinsicWidth: Float
-        get() = if (native != 0L) metric(1) else klioTextWidth(text.replace('\n', ' '), fontSizePx)
+        get() = if (isNative) metric(1) else klioTextWidth(text.replace('\n', ' '), fontSizePx)
 
     override val placeholderRects: List<Rect?> get() = emptyList()
 
@@ -331,47 +376,47 @@ internal class KlioParagraph(
     private fun clampLine(i: Int) = i.coerceIn(0, lineCount - 1)
 
     override fun getLineTop(lineIndex: Int): Float =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 0) else clampLine(lineIndex) * lineHeightPx
+        if (isNative) lineMetric(clampLine(lineIndex), 0) else clampLine(lineIndex) * lineHeightPx
 
     override fun getLineBottom(lineIndex: Int): Float =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 1) else (clampLine(lineIndex) + 1) * lineHeightPx
+        if (isNative) lineMetric(clampLine(lineIndex), 1) else (clampLine(lineIndex) + 1) * lineHeightPx
 
     override fun getLineHeight(lineIndex: Int): Float =
-        if (native != 0L) getLineBottom(lineIndex) - getLineTop(lineIndex) else lineHeightPx
+        if (isNative) getLineBottom(lineIndex) - getLineTop(lineIndex) else lineHeightPx
 
     override fun getLineBaseline(lineIndex: Int): Float =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 2) else getLineTop(lineIndex) + baselineFromTop
+        if (isNative) lineMetric(clampLine(lineIndex), 2) else getLineTop(lineIndex) + baselineFromTop
 
     override fun getLineWidth(lineIndex: Int): Float =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 4) else lines.getOrNull(lineIndex)?.width ?: 0f
+        if (isNative) lineMetric(clampLine(lineIndex), 4) else lines.getOrNull(lineIndex)?.width ?: 0f
 
     override fun getLineLeft(lineIndex: Int): Float =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 3)
+        if (isNative) lineMetric(clampLine(lineIndex), 3)
         else lines.getOrNull(lineIndex)?.let { lineLeft(it) } ?: 0f
 
     override fun getLineRight(lineIndex: Int): Float =
-        if (native != 0L) getLineLeft(lineIndex) + getLineWidth(lineIndex)
+        if (isNative) getLineLeft(lineIndex) + getLineWidth(lineIndex)
         else lines.getOrNull(lineIndex)?.let { lineLeft(it) + it.width } ?: 0f
 
     override fun getLineStart(lineIndex: Int): Int =
-        if (native != 0L) lineMetric(clampLine(lineIndex), 5).toInt()
+        if (isNative) lineMetric(clampLine(lineIndex), 5).toInt()
         else lines.getOrNull(lineIndex)?.start ?: 0
 
     override fun getLineEnd(lineIndex: Int, visibleEnd: Boolean): Int =
-        if (native != 0L) lineMetric(clampLine(lineIndex), if (visibleEnd) 6 else 8).toInt()
+        if (isNative) lineMetric(clampLine(lineIndex), if (visibleEnd) 6 else 8).toInt()
         else lines.getOrNull(lineIndex)?.end ?: text.length
 
     override fun isLineEllipsized(lineIndex: Int): Boolean =
         ellipsis && didExceedMaxLines && lineIndex == lineCount - 1
 
     override fun getLineForOffset(offset: Int): Int {
-        if (native != 0L) return __skia_para_line_for(native, offset.coerceIn(0, text.length)).coerceIn(0, lineCount - 1)
+        if (isNative) return __skia_para_line_for(nh(), offset.coerceIn(0, text.length)).coerceIn(0, lineCount - 1)
         lines.forEachIndexed { i, l -> if (offset <= l.end) return i }
         return lineCount - 1
     }
 
     override fun getLineForVerticalPosition(vertical: Float): Int {
-        if (native != 0L) {
+        if (isNative) {
             var i = 0
             val n = lineCount
             while (i < n) {
@@ -384,12 +429,12 @@ internal class KlioParagraph(
     }
 
     override fun getHorizontalPosition(offset: Int, usePrimaryDirection: Boolean): Float {
-        if (native != 0L) {
+        if (isNative) {
             val o = offset.coerceIn(0, text.length)
             if (o < text.length) {
-                if (__skia_para_box(native, o, o + 1, 4) > 0f) return __skia_para_box(native, o, o + 1, 0)
+                if (__skia_para_box(nh(), o, o + 1, 4) > 0f) return __skia_para_box(nh(), o, o + 1, 0)
             }
-            if (o > 0 && __skia_para_box(native, o - 1, o, 4) > 0f) return __skia_para_box(native, o - 1, o, 2)
+            if (o > 0 && __skia_para_box(nh(), o - 1, o, 4) > 0f) return __skia_para_box(nh(), o - 1, o, 2)
             return getLineLeft(getLineForOffset(o))
         }
         val line = lines.getOrNull(getLineForOffset(offset)) ?: return 0f
@@ -398,7 +443,7 @@ internal class KlioParagraph(
     }
 
     override fun getOffsetForPosition(position: Offset): Int {
-        if (native != 0L) return __skia_para_offset_at(native, position.x, position.y).coerceIn(0, text.length)
+        if (isNative) return __skia_para_offset_at(nh(), position.x, position.y).coerceIn(0, text.length)
         val line = lines.getOrNull(getLineForVerticalPosition(position.y)) ?: return 0
         val target = position.x - lineLeft(line)
         var i = 0
@@ -413,22 +458,22 @@ internal class KlioParagraph(
         if (style.textDirection == TextDirection.Rtl) ResolvedTextDirection.Rtl else ResolvedTextDirection.Ltr
 
     override fun getBidiRunDirection(offset: Int): ResolvedTextDirection {
-        if (native != 0L && offset < text.length) {
-            val rtl = __skia_para_range_rect(native, offset, offset + 1, 0, 4)
+        if (isNative && offset < text.length) {
+            val rtl = __skia_para_range_rect(nh(), offset, offset + 1, 0, 4)
             return if (rtl != 0f) ResolvedTextDirection.Rtl else ResolvedTextDirection.Ltr
         }
         return getParagraphDirection(offset)
     }
 
     override fun getBoundingBox(offset: Int): Rect {
-        if (native != 0L) {
+        if (isNative) {
             val o = offset.coerceIn(0, if (text.isEmpty()) 0 else text.length - 1)
-            if (text.isNotEmpty() && __skia_para_box(native, o, o + 1, 4) > 0f) {
+            if (text.isNotEmpty() && __skia_para_box(nh(), o, o + 1, 4) > 0f) {
                 return Rect(
-                    __skia_para_box(native, o, o + 1, 0),
-                    __skia_para_box(native, o, o + 1, 1),
-                    __skia_para_box(native, o, o + 1, 2),
-                    __skia_para_box(native, o, o + 1, 3),
+                    __skia_para_box(nh(), o, o + 1, 0),
+                    __skia_para_box(nh(), o, o + 1, 1),
+                    __skia_para_box(nh(), o, o + 1, 2),
+                    __skia_para_box(nh(), o, o + 1, 3),
                 )
             }
             val li = getLineForOffset(offset)
@@ -452,8 +497,8 @@ internal class KlioParagraph(
 
     override fun getWordBoundary(offset: Int): TextRange {
         if (text.isEmpty()) return TextRange(0, 0)
-        if (native != 0L) {
-            val packed = __skia_para_word(native, offset.coerceIn(0, text.length - 1))
+        if (isNative) {
+            val packed = __skia_para_word(nh(), offset.coerceIn(0, text.length - 1))
             val s = (packed ushr 32).toInt()
             val e = (packed and 0xFFFFFFFFL).toInt()
             if (e in (s + 1)..text.length) return TextRange(s, e)
@@ -474,16 +519,16 @@ internal class KlioParagraph(
 
     override fun getPathForRange(start: Int, end: Int): Path {
         val p = Path()
-        if (native != 0L && end > start) {
-            val n = __skia_para_range_rect_count(native, start, end)
+        if (isNative && end > start) {
+            val n = __skia_para_range_rect_count(nh(), start, end)
             var i = 0
             while (i < n) {
                 p.addRect(
                     Rect(
-                        __skia_para_range_rect(native, start, end, i, 0),
-                        __skia_para_range_rect(native, start, end, i, 1),
-                        __skia_para_range_rect(native, start, end, i, 2),
-                        __skia_para_range_rect(native, start, end, i, 3),
+                        __skia_para_range_rect(nh(), start, end, i, 0),
+                        __skia_para_range_rect(nh(), start, end, i, 1),
+                        __skia_para_range_rect(nh(), start, end, i, 2),
+                        __skia_para_range_rect(nh(), start, end, i, 3),
                     )
                 )
                 i++
@@ -520,11 +565,11 @@ internal class KlioParagraph(
     private fun nativePaint(canvas: Canvas, argb: Int, deco: TextDecoration?) {
         if (argb != nativeBaseArgb || deco != nativeDeco) nativeRebuild(argb, deco)
         val surf = klioCanvasHandle(canvas)
-        if (surf != 0L && native != 0L) __skia_para_paint(native, surf, 0f, 0f)
+        if (surf != 0L && isNative) __skia_para_paint(nh(), surf, 0f, 0f)
     }
 
     private fun paintLines(canvas: Canvas, argb: Int, deco: TextDecoration? = null) {
-        if (native != 0L) {
+        if (isNative) {
             nativePaint(canvas, argb, deco)
             return
         }
