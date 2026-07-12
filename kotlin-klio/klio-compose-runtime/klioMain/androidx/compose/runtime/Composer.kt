@@ -205,6 +205,11 @@ internal class KlioComposer : Composer {
     // CompositionLocal provider layers, outermost first.
     private val localsStack = ArrayList<HashMap<CompositionLocal<*>, Any?>>()
 
+    /** Locals inherited from the parent composition (a subcomposition created
+     * through `rememberCompositionContext`): the parent's merged provider
+     * snapshot, consulted after this composer's own provider layers. */
+    internal var baseLocals: HashMap<CompositionLocal<*>, Any?>? = null
+
     // Effects: side effects queued during a pass (run after it), the live
     // DisposableEffect results (disposed on key change / composition dispose),
     // and generic cleanups (e.g. cancelling a remembered CoroutineScope).
@@ -510,7 +515,8 @@ internal class KlioComposer : Composer {
             if (localsStack[i].containsKey(local)) return true
             i = i - 1
         }
-        return false
+        val base = baseLocals
+        return base != null && base.containsKey(local)
     }
 
     override fun endProviders() {
@@ -524,13 +530,17 @@ internal class KlioComposer : Composer {
             if (layer.containsKey(local)) return layer[local]
             i = i - 1
         }
+        val base = baseLocals
+        if (base != null && base.containsKey(local)) return base[local]
         return local.defaultFactory()
     }
 
     override val currentCompositionLocalMap: CompositionLocalMap
         get() {
-            if (localsStack.isEmpty()) return CompositionLocalMap.Empty
+            val base = baseLocals
+            if (localsStack.isEmpty() && base == null) return CompositionLocalMap.Empty
             val merged = HashMap<CompositionLocal<*>, Any?>()
+            if (base != null) merged.putAll(base)
             for (layer in localsStack) merged.putAll(layer) // outer→inner; inner wins
             return KlioCompositionLocalMap(merged)
         }
@@ -552,7 +562,10 @@ internal class KlioComposer : Composer {
      * composition created from it recomposes under the same recomposer. */
     fun buildContext(): CompositionContext {
         val rec = recomposer ?: error("rememberCompositionContext requires a recomposer")
-        return KlioCompositionContext(rec)
+        val merged = HashMap<CompositionLocal<*>, Any?>()
+        baseLocals?.let { merged.putAll(it) }
+        for (layer in localsStack) merged.putAll(layer)
+        return KlioCompositionContext(rec, merged)
     }
 
     fun recordSideEffect(effect: () -> Unit) {
@@ -583,6 +596,17 @@ internal class KlioComposer : Composer {
     /** Track a remembered RememberObserver (its onRemembered already ran). */
     fun registerRememberObserver(observer: RememberObserver) {
         rememberObservers.add(observer)
+    }
+
+    /** Forget everything composed (slots, invalidations, child order) so the
+     * composer can host fresh content in the same applier tree. Runs the
+     * disposers first, exactly like [disposeAll]. */
+    fun resetForReuse() {
+        disposeAll()
+        root.children.clear()
+        rootChildOrder = ArrayList()
+        invalidated.clear()
+        runSet = null
     }
 
     /** Dispose every live DisposableEffect + cleanup + RememberObserver, in reverse order. */

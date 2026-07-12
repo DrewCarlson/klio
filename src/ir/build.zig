@@ -352,6 +352,8 @@ pub const FuncBuilder = struct {
     /// matches the enclosing receiver instead of an arity-only pick.
     /// `null` for plain functions and class methods.
     recv_ty: ?[]const u8 = null,
+    /// See `callTrailingLambda`.
+    cur_call_trailing: bool = false,
     /// Names declared on the owning class (methods, body
     /// properties, primary-ctor properties). Used by method-
     /// body lowering to know whether an unqualified `foo(...)`
@@ -1002,6 +1004,19 @@ pub const FuncBuilder = struct {
     }
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
+    }
+    /// Whether the Call expression currently being lowered supplied its
+    /// final argument as a TRAILING lambda (`f(x) { … }`). Set by
+    /// `lowerCall` from the parser's syntax bit; consumed by the call
+    /// instruction emitters so the runtime binder can bind the lambda to
+    /// the LAST parameter exactly when the source syntax says so.
+    pub fn callTrailingLambda(self: *const FuncBuilder) bool {
+        return self.cur_call_trailing;
+    }
+    pub fn setCallTrailingLambda(self: *FuncBuilder, on: bool) bool {
+        const prev = self.cur_call_trailing;
+        self.cur_call_trailing = on;
+        return prev;
     }
     /// Replace the own-members set. Takes ownership of `set`.
     pub fn setOwnMembers(self: *FuncBuilder, set: StringSet) void {

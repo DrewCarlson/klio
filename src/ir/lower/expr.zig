@@ -671,6 +671,17 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // with the snapshotted env on each call.
             var outer_names = try b.visibleNames();
             defer outer_names.deinit();
+            // A receiver lambda binds `this` through the closure's capture
+            // slot rather than a scope binding, so `visibleNames` misses it
+            // (a method body binds it as a param and includes it). The
+            // enclosing receiver is part of the anon's closed-over env: a
+            // supertype ctor arg (`object : Prov(this)`) evaluates against
+            // this snapshot before the object exists.
+            if (!outer_names.contains("this") and
+                (b.resolve("this") != null or b.capturesThisSlot() or b.knowsOuter("this")))
+            {
+                try outer_names.put("this", {});
+            }
             const captured_names = try setToSlice(b.allocator, &outer_names);
             const captures = try b.allocator.alloc(Reg, captured_names.len);
             for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
@@ -3005,6 +3016,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.sib_expected_ty = sib_prev_ty;
     }
     const call = expr.Call;
+    const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
+    defer _ = b.setCallTrailingLambda(prev_trailing);
     // `dep!!()` calls the value a not-null-asserted BARE NAME holds: keep
     // the bare-name call machinery (member-vs-global walk, and with it the
     // receiver-function-typed property arm) by unwrapping the assertion at
@@ -3326,6 +3339,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .dst = dst,
                         .this_idx = 0,
                         .name = nm,
+                        .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names_c,
@@ -3349,6 +3363,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .dst = dst,
                 .receiver = recv,
                 .name = nm,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
@@ -3383,6 +3398,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             .dst = v,
             .receiver = recv,
             .name = nm,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
@@ -3569,6 +3585,7 @@ fn lowerCallWithWritebackMember(
         .dst = dst,
         .receiver = recv,
         .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = args_start,
         .n_args = @intCast(args.len),
         .arg_names = arg_names,
@@ -3665,6 +3682,7 @@ fn lowerCallWithWritebackPath(
                     .dst = dst,
                     .this_idx = this_idx,
                     .name = nmc,
+                    .trailing_lambda = b.callTrailingLambda(),
                     .args = args_start,
                     .n_args = @intCast(arg_regs.len),
                     .arg_names = an,
@@ -3712,6 +3730,7 @@ fn lowerCallWithWritebackPath(
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = args_start,
                 .n_args = n_args,
                 .arg_names = arg_names,
@@ -4171,6 +4190,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .dst = dst,
                         .receiver = bound_this,
                         .name = nmc,
+                        .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
@@ -4201,6 +4221,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .dst = dst,
                         .this_idx = 0,
                         .name = nmc,
+                        .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
@@ -4219,6 +4240,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .dst = dst,
                         .this_idx = this_idx,
                         .name = nmc,
+                        .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
@@ -4262,6 +4284,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             .dst = dst,
             .receiver = recv,
             .name = nm,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
@@ -4332,6 +4355,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .dst = dst,
                 .receiver = this_reg,
                 .name = nmc,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
@@ -5964,6 +5988,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 .dst = dst,
                 .receiver = cls,
                 .name = nmc,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
@@ -6060,6 +6085,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 try b.push(.{ .Call = .{
                     .dst = dst,
                     .func = bind_id,
+                    .trailing_lambda = b.callTrailingLambda(),
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
@@ -6967,6 +6993,8 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
+    const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
+    defer _ = b.setCallTrailingLambda(prev_trailing);
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
@@ -7057,6 +7085,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = func_id,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
@@ -7371,6 +7400,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .dst = dst,
         .this_idx = this_idx,
         .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
@@ -7599,6 +7629,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
             .dst = dst,
             .receiver = this_reg,
             .name = nmc,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = uargs[0],
             .n_args = uargs[1],
             .arg_names = uarg_names,
@@ -7615,6 +7646,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = func_id,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
@@ -7748,6 +7780,7 @@ fn lowerImplicitThisCall(
         try b.push(.{ .Call = .{
             .dst = dst,
             .func = fid,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = args_start,
             .n_args = run[1] + 1,
             .arg_names = arg_names,
@@ -7777,6 +7810,7 @@ fn lowerImplicitThisCall(
             .this_idx = this_idx,
             .recv = this_reg,
             .name = nm,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
@@ -7946,6 +7980,7 @@ fn lowerUnresolvedBareCall(
             .dst = dst,
             .this_idx = 0,
             .name = nm,
+            .trailing_lambda = b.callTrailingLambda(),
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
@@ -7963,6 +7998,7 @@ fn lowerUnresolvedBareCall(
         .dst = dst,
         .this_idx = this_idx,
         .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
@@ -8059,6 +8095,7 @@ fn lowerFqnFlattenCall(
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
@@ -8106,6 +8143,7 @@ fn lowerFqnGlobalCall(
                     .dst = dst,
                     .receiver = recv,
                     .name = mname,
+                    .trailing_lambda = b.callTrailingLambda(),
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
@@ -8317,6 +8355,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = start,
                 .n_args = @intCast(arg_regs.len),
                 .arg_names = arg_names,
@@ -8350,6 +8389,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             try b.push(.{ .Call = .{
                 .dst = dst,
                 .func = func_id,
+                .trailing_lambda = b.callTrailingLambda(),
                 .args = start,
                 .n_args = @intCast(arg_regs.len),
                 .arg_names = arg_names,

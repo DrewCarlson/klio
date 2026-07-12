@@ -145,6 +145,25 @@ public fun <T> key(vararg keys: Any?, block: @Composable () -> T): T {
 }
 
 /**
+ * Recyclable content: on a [key] change the composition subtree is replaced.
+ * klio rebuilds replaced nodes instead of recycling them, so this is [key]
+ * with the reuse contract's name.
+ */
+public fun ReusableContent(key: Any?, content: @Composable () -> Unit) {
+    key(key) { content() }
+}
+
+/**
+ * Host for deactivatable content: while [active] is false the content
+ * composes as deleted (klio drops its nodes and rebuilds on reactivation).
+ */
+public fun ReusableContentHost(active: Boolean, content: @Composable () -> Unit) {
+    key(active) {
+        if (active) content()
+    }
+}
+
+/**
  * A [CompositionContext] for the current composition, remembered across
  * recompositions. A subcomposition created with `Composition(applier, context)`
  * is reparented to it, so it recomposes under the same recomposer as its parent —

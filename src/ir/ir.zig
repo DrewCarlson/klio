@@ -202,6 +202,12 @@ pub const Inst = union(enum) {
         /// re-resolution must NOT override it by the argument's runtime
         /// value type — the cast is the source's deliberate selection.
         exact: bool = false,
+        /// The source supplied the final argument as a trailing lambda
+        /// (`f(x) { … }`). Kotlin binds that lambda to the LAST
+        /// parameter; a positional lambda (`f(x, { … })`) binds its own
+        /// slot. The bit survives lowering so an under-applied call over
+        /// defaulted middle params binds by syntax, not by a fit guess.
+        trailing_lambda: bool = false,
     },
     /// `receiver.lambda(args)` — invoke a callable with a
     /// receiver bound as `this` inside the body. Used for
@@ -295,6 +301,11 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId = &.{},
+        /// The source supplied the final argument as a trailing lambda
+        /// (`recv.f(x) { … }`). Kotlin binds that lambda to the LAST
+        /// parameter of an under-applied call; without the bit the binder
+        /// falls back to an arity-fit guess. See `Inst.Call.trailing_lambda`.
+        trailing_lambda: bool = false,
         /// The receiver's DECLARED type head when lowering knows it (a
         /// bare call on the implicit `this` of an extension body, whose
         /// static type is the extension's declared receiver). Kotlin
@@ -447,6 +458,8 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId,
+        /// Trailing-lambda syntax bit; see `Inst.CallMember.trailing_lambda`.
+        trailing_lambda: bool = false,
         /// The scope-resolved class when the bare name is a constructor
         /// call the index bound; the global leg constructs exactly this
         /// class instead of re-resolving the simple name.
@@ -820,6 +833,10 @@ pub const Func = struct {
     /// top-level user function a positional, exact-arity call dispatches straight
     /// to its body. See `eval`'s `.Call` fast path.
     fast_call: u16 = 0,
+    /// Index of `"this"` in `capture_order`, cached on first use by
+    /// `callerThisValue` (hot: every GetField in a lambda frame consults
+    /// it). `-2` = not yet computed, `-1` = no `this` capture.
+    this_cap_idx: i32 = -2,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under

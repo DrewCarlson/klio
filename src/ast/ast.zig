@@ -711,6 +711,11 @@ pub const Expr = union(enum) {
         /// rather than `name(a, b)`. The type checker requires the resolved
         /// callee to carry the `infix` modifier in that case.
         is_infix: bool,
+        /// True when the source supplied the final argument as a TRAILING
+        /// lambda (`f(x) { … }`), which Kotlin binds to the LAST parameter.
+        /// A parenthesized lambda (`f(x, { … })`) binds positionally and
+        /// leaves this false.
+        has_trailing_lambda: bool = false,
         span: Span,
     },
     Index: struct {

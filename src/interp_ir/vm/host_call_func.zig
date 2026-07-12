@@ -968,7 +968,20 @@ pub fn callFuncFast(self: *VmHost, allocator: Allocator, module: *const Module, 
     return ir.eval.evalWith(VmHost, allocator, module, f, args_list, self);
 }
 
+/// Trailing-lambda syntax bit for the next `callFunc` bind (see
+/// `Inst.Call.trailing_lambda`): the `Call` exec sets it just before
+/// dispatch and clears it after; `callFunc` consumes it once at entry.
+/// Kotlin binds a trailing lambda to the LAST parameter regardless of
+/// arity fit, which the positional heuristic below cannot know alone.
+threadlocal var trailing_lambda_call: bool = false;
+
+pub fn setTrailingLambdaCall(on: bool) void {
+    trailing_lambda_call = on;
+}
+
 pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_in: []const Value) Allocator.Error!EvalResult {
+    const trailing_syntax = trailing_lambda_call;
+    trailing_lambda_call = false;
     const f = funcAt(module, func) orelse
         return .{ .err = typeErr(allocator, "unknown FuncId {d}", .{func.int()}) };
 
@@ -1108,7 +1121,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                     const ca = callableDeclaredArity(self, &args.items[args.items.len - 1]) orelse break :blk true;
                     break :blk pa == ca;
                 };
-            if (lead < last_param and !positional_fits) {
+            if (lead < last_param and (trailing_syntax or !positional_fits)) {
                 if (funcDefaults(self, func)) |defaults| {
                     const trailing = args.items[args.items.len - 1];
                     args.items.len -= 1;

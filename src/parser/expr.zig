@@ -833,6 +833,7 @@ fn appendTrailingLambda(
                 .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
                 .type_args = type_args,
                 .is_infix = c.is_infix,
+                .has_trailing_lambda = true,
                 .span = sp,
             } };
         },
@@ -847,6 +848,7 @@ fn appendTrailingLambda(
                 .arg_names = arg_names,
                 .type_args = extra_type_args,
                 .is_infix = false,
+                .has_trailing_lambda = true,
                 .span = sp,
             } };
         },

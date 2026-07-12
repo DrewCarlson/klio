@@ -8,6 +8,7 @@ id = "androidx.compose.runtime.saveable"
 version = "1.11.1"
 abi = 1
 implicit_packages = []
+source_roots = ["klioMain"]
 auto_bindings = true
 
 [[source]]

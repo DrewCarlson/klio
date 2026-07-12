@@ -118,6 +118,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.instance_prop_getters = built.instance_prop_getters;
         built.instance_prop_getters = build.PairFuncMap.init(allocator);
 
+        prog.getter_prop_names.deinit();
+        prog.getter_prop_names = built.getter_prop_names;
+        built.getter_prop_names = std.StringHashMap(void).init(allocator);
+
         prog.instance_prop_setters.deinit();
         prog.instance_prop_setters = built.instance_prop_setters;
         built.instance_prop_setters = build.PairFuncMap.init(allocator);
@@ -137,6 +141,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.extension_props.deinit();
         prog.extension_props = built.extension_props;
         built.extension_props = build.PairFuncMap.init(allocator);
+
+        prog.owner_keyed_ext_names.deinit();
+        prog.owner_keyed_ext_names = built.owner_keyed_ext_names;
+        built.owner_keyed_ext_names = std.StringHashMap(void).init(allocator);
         prog.nullable_ext_props.deinit();
         prog.nullable_ext_props = built.nullable_ext_props;
         built.nullable_ext_props = @TypeOf(built.nullable_ext_props).init(allocator);

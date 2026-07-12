@@ -382,6 +382,31 @@ Each module's pack builds with unimplemented actuals throwing at runtime (the
 graphics/ui-core pattern), so the API surface lands incrementally; end-to-end
 rendering follows the ui-engine Owner/render driver (§2).
 
+**foundation + material3 over the real text stack — DONE (2026-07-12):**
+the real `androidx.compose.foundation` LazyColumn/scroll path renders end
+to end — SubcomposeLayout drives per-item subcomposition, items measure
+through foundation `BasicText` into the skparagraph engine, and
+`LazyListState` (initial index, `layoutInfo`) carries the scroll window
+(pixel-verified: 20-item list renders `item 0..`; `initialFirstVisibleItemIndex
+= 10` starts the window at `row 10`). material3 `Text` routes through the
+same stack (upstream Text.kt -> BasicText), pixel-verified across the
+typography scale (headlineLarge > bodyMedium > labelSmall real glyph
+sizes). Runtime pieces this landed: ReusableComposition
+(setContentWithReuse/deactivate over a composer reset; klio rebuilds
+nodes rather than recycling), ReusableContent/Host, subcompositions
+inheriting the parent composition's CompositionLocal snapshot, and a
+minimal androidx.savedstate/androidx.lifecycle surface in the saveable
+pack for the upstream SaveableStateRegistryWrapper. The interpreter
+roots it drove (trailing-lambda syntax bit through lowering; anon
+super-ctor args seeing the receiver-lambda `this`; capture-source vs
+bound-receiver decoupling for member-ext overrides; owner-qualified
+private member-ext property keys + the lexical receiver tower walk;
+`this@Interface` implements-matching; accessor-backed fn-prop invokes)
+are in the commit log. Examples: `compose_foundation_lazy.kt`,
+`compose_material3_text.kt`. Render-tier examples stay corpus-SKIP (the
+e2e source-pack set stops at ui-text; baking ui-core/foundation/material3
+per e2e run is not worth the gate time — the compose battery covers them).
+
 ### Operational note — rebuild packs after a binary change
 
 A pack IMAGE is only consistent with the interpreter binary it was built against.

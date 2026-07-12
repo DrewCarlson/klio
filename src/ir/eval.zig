@@ -228,6 +228,27 @@ pub fn currentFramePackage() ?[]const u8 {
     return if (pkg.len == 0) null else pkg;
 }
 
+/// Every executing frame's bound `this` (the this param, or the closure's
+/// captured `this` slot), innermost first — the lexical receiver tower of
+/// the current call stack. The member-extension owner walk consults it
+/// when the dynamic enclosing chain has no matching entry (a property
+/// read inside nested lambdas whose frames never pushed the chain).
+pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
+    var out: std.ArrayList(Value) = .empty;
+    var cur = frame_chain;
+    var steps: usize = 0;
+    while (cur) |f| : (cur = f.gc_link) {
+        if (steps > 256) break;
+        steps += 1;
+        if (callerThisValue(f)) |v| {
+            const dup = out.items.len > 0 and out.items[out.items.len - 1] == .Instance and
+                v == .Instance and ObjRef(InstanceData).ptrEq(out.items[out.items.len - 1].Instance, v.Instance);
+            if (!dup) try out.append(allocator, v);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// The nearest enclosing frame's declaring package, walking outward past
 /// frames without one (synthesized accessors / init thunks carry no
 /// package of their own; their lexical home is the calling frame's).
@@ -3027,13 +3048,19 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             const name = constStr(frame.module, gf.field) orelse
                 return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
             // Keep the executing function's receiver reachable as the
-            // enclosing `this` while the field/property is resolved.
+            // enclosing `this` while the field/property is resolved. Inside
+            // a lambda the receiver rides the closure's captured `this`
+            // slot rather than params[0] (`placeable.mainAxisSize` in a
+            // `repeat { }` body needs the enclosing item as the
+            // member-extension property's owner) — `callerThisValue`
+            // resolves both forms.
             var pushed_enclosing = false;
-            if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
-                const pi = frame.params.items[0].Instance;
-                const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
+            if (callerThisValue(frame)) |ct_v| {
+                var ct = ct_v;
+                const same = recv == .Instance and ct == .Instance and
+                    ObjRef(InstanceData).ptrEq(ct.Instance, recv.Instance);
                 if (!same) {
-                    pushEnclosingAccess(&frame.params.items[0]);
+                    pushEnclosingAccess(&ct);
                     pushed_enclosing = true;
                 }
             }
@@ -3251,7 +3278,13 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     }
                 }
             }
+            if (call.trailing_lambda) {
+                if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(true);
+            }
             const res = host.callFuncTyped(allocator, frame.module, eff_func, arg_values, names, ta.items, call.exact);
+            if (call.trailing_lambda) {
+                if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(false);
+            }
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |result| try frame.write(call.dst, result),
@@ -3459,12 +3492,20 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             }
             const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
             const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+            const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+                H.setTrailingMemberCall(true)
+            else
+                false;
+            const tl_touched = cm.trailing_lambda;
             const res = if (static_recv) |sname|
                 host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
             else if (declared_recv != null)
                 host.callMemberNamedDeclared(allocator, &recv, name_str, arg_values, names, declared_recv)
             else
                 host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
+            if (tl_touched) {
+                if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
+            }
             if (pushed_enclosing) popEnclosing();
             switch (try res) {
                 .ok => |rv| try frame.write(cm.dst, rv),
@@ -4134,6 +4175,13 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
     const name_str = constStr(frame.module, cmg.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });
+    const prev_tl = if (comptime @hasDecl(H, "setTrailingMemberCall"))
+        H.setTrailingMemberCall(cmg.trailing_lambda)
+    else
+        false;
+    defer if (comptime @hasDecl(H, "setTrailingMemberCall")) {
+        _ = H.setTrailingMemberCall(prev_tl);
+    };
     const arg_values = try readArgRun(allocator, frame, cmg.args, cmg.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
@@ -4650,11 +4698,21 @@ fn callerThisValue(frame: *const Frame) ?Value {
             return frame.params.items[i];
         }
     }
-    for (frame.func.capture_order, 0..) |n, i| {
-        if (std.mem.eql(u8, n, "this")) {
-            if (i < frame.captures.items.len and frame.captures.items[i] == .Instance) {
-                return frame.captures.items[i];
+    var idx = frame.func.this_cap_idx;
+    if (idx == -2) {
+        idx = -1;
+        for (frame.func.capture_order, 0..) |n, i| {
+            if (std.mem.eql(u8, n, "this")) {
+                idx = @intCast(i);
+                break;
             }
+        }
+        @constCast(frame.func).this_cap_idx = idx;
+    }
+    if (idx >= 0) {
+        const ui: usize = @intCast(idx);
+        if (ui < frame.captures.items.len and frame.captures.items[ui] == .Instance) {
+            return frame.captures.items[ui];
         }
     }
     return null;
