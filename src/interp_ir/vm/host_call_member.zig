@@ -1497,6 +1497,48 @@ fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
     return false;
 }
 
+/// Whether a candidate's declared parameter type names a TYPE VARIABLE in
+/// scope for it: one of the function's own type parameters, or (for an
+/// instance method, receiver in `params[0]`) a type parameter of the owning
+/// class. Such a parameter never names a nominal class, so argument
+/// adjudication must not read it as one — `ConcurrentMap<Key, Value>.put(
+/// key: Key, value: Value)` accepts any key even when an unrelated class
+/// named `Key` is registered. Bound enforcement is separate
+/// (`classTypeParamRefutes` at the member candidate walk).
+fn paramTypeIsTypeVar(self: *VmHost, f: *const Func, pn_raw: []const u8) bool {
+    return fidTypeVar(self, f.id, pn_raw);
+}
+
+/// `paramTypeIsTypeVar` keyed by `FuncId` (the shared applicability engine's
+/// `type_var` callback shape).
+fn fidTypeVar(self: *VmHost, fid: FuncId, pn_raw: []const u8) bool {
+    const pn = std.mem.trimEnd(u8, simpleName(pn_raw), "?");
+    if (typeParamOf(self, fid, pn)) return true;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    // Owning class by method-list scan (the lowered receiver param does not
+    // carry the owner's name). Only reached when a nominal adjudication is
+    // about to refute the candidate, so the scan is off the hot path.
+    for (mod.classes.items) |*c| {
+        for (c.methods) |m| {
+            if (m != fid) continue;
+            const bounds = mod.registry.class_type_param_bounds.get(c.name) orelse return false;
+            for (bounds) |b| {
+                if (std.mem.eql(u8, b.param, pn)) return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+/// `ApplicabilityScope.type_var`: wraps `fidTypeVar`.
+fn applicTypeVarCbM(ctx: *anyopaque, fid: FuncId, name: []const u8) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    return fidTypeVar(self, fid, name);
+}
+
 /// Generic-argument proof over the receiver's actual elements. Only
 /// builtin containers carry element knowledge; an empty container proves
 /// through the declared element head its creation site recorded (an
@@ -2598,14 +2640,17 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
                 if (!paramHasDefault(defaults, skip + k)) return null;
             }
             // Prefix args against prefix params; the rest against the vararg
-            // element type.
+            // element type. A param typed as an in-scope type variable is
+            // never adjudicated nominally.
             var i: usize = 0;
             while (i < args.len and i < vp) : (i += 1) {
-                if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return null;
+                if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
+                    !paramTypeIsTypeVar(self, &f, effective[i].ty.name)) return null;
             }
             var j: usize = vp;
             while (j < args.len) : (j += 1) {
-                if (argDefinitelyNotParamType(self, &effective[vp].ty, &args[j])) return null;
+                if (argDefinitelyNotParamType(self, &effective[vp].ty, &args[j]) and
+                    !paramTypeIsTypeVar(self, &f, effective[vp].ty.name)) return null;
             }
             return f;
         }
@@ -2626,10 +2671,13 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
             }
         }
         // By type: a definite argument-type mismatch must fall through so
-        // the hierarchy walk continues to the real target.
+        // the hierarchy walk continues to the real target. A param typed as
+        // an in-scope type variable (the function's own, or the owning
+        // class's) is never adjudicated nominally.
         var i: usize = 0;
         while (i < args.len and i < effective.len) : (i += 1) {
-            if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return null;
+            if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
+                !paramTypeIsTypeVar(self, &f, effective[i].ty.name)) return null;
         }
         return f;
     }
@@ -2651,6 +2699,7 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         .subtype = applicSubtypeCbM,
         .func_type = applicFuncTypeCbM,
         .identity_conflict = applicIdentityConflictCbM,
+        .type_var = applicTypeVarCbM,
     };
 
     var best: ?Func = null;
@@ -8918,6 +8967,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         .ext_is_subtype_name = applicExtSubtypeNameCb,
         .ext_owner_rank = applicExtOwnerRankCb,
         .ext_known_package = applicKnownPackageCb,
+        .type_var = applicTypeVarCbM,
     };
 
     const check_inv = trace.invariantsEnabled();

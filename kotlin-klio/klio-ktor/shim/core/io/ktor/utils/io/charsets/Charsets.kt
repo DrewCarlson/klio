@@ -1,69 +1,63 @@
+// klio `actual`s for the terminal codec expects of `io.ktor.utils.io.charsets`
+// (`object Charsets`, `findCharset`, `encodeImpl`, `encodeToByteArrayImpl`,
+// `CharsetDecoder.decode`). Upstream bottoms these out in iconv cinterop
+// (CharsetLinux.kt); klio codes UTF-8 and ISO-8859-1 in Kotlin. The class
+// surface (`Charset`/`CharsetEncoder`/`CharsetDecoder`) and the extension
+// layer are consumed from upstream `CharsetNative.kt` + `Encoding.kt`.
+
 package io.ktor.utils.io.charsets
 
-import kotlinx.io.Buffer
+import kotlinx.io.Sink
+import kotlinx.io.Source
+import kotlinx.io.readByteArray
 
-// klio actual for ktor's `expect abstract class Charset` / `CharsetEncoder` /
-// `CharsetDecoder` / `object Charsets` surface (io.ktor.utils.io.charsets).
-// The byte-level codec is supplied here as a platform actual: `encode`
-// returns a kotlinx.io `Source` (a `Buffer`) of the charset-encoded bytes,
-// matching upstream `CharsetEncoder.encode(...)`; decode goes through
-// `ByteArray.decodeToString()` at the call sites (Codecs), so the decoder
-// covers the charsets klio supports (UTF-8 / ISO-8859-1).
-public class Charset(public val name: String) {
-    public fun newEncoder(): CharsetEncoder = CharsetEncoder(this)
-    public fun newDecoder(): CharsetDecoder = CharsetDecoder(this)
-    override fun equals(other: Any?): Boolean = other is Charset && other.name == name
-    override fun hashCode(): Int = name.hashCode()
-    override fun toString(): String = name
+private class CharsetImpl(name: String) : Charset(name) {
+    override fun newEncoder(): CharsetEncoder = CharsetEncoderImpl(this)
+    override fun newDecoder(): CharsetDecoder = CharsetDecoderImpl(this)
 }
 
-public class CharsetEncoder(public val charset: Charset) {
-    public fun encode(
-        input: CharSequence,
-        fromIndex: Int = 0,
-        toIndex: Int = input.length
-    ): Buffer {
-        val buffer = Buffer()
-        buffer.write(encodeToByteArray(input, fromIndex, toIndex))
-        return buffer
-    }
+public actual object Charsets {
+    public actual val UTF_8: Charset = CharsetImpl("UTF-8")
+    public actual val ISO_8859_1: Charset = CharsetImpl("ISO-8859-1")
+}
 
-    public fun encodeToByteArray(
-        input: CharSequence,
-        fromIndex: Int = 0,
-        toIndex: Int = input.length
-    ): ByteArray {
-        val text = input.subSequence(fromIndex, toIndex).toString()
-        return when (charset.name.uppercase()) {
-            "ISO-8859-1", "LATIN1" -> ByteArray(text.length) { text[it].code.toByte() }
-            else -> text.encodeToByteArray()
-        }
+internal actual fun findCharset(name: String): Charset = when (name.uppercase()) {
+    "UTF-8", "UTF8" -> Charsets.UTF_8
+    "ISO-8859-1", "ISO_8859_1", "LATIN1" -> Charsets.ISO_8859_1
+    else -> throw IllegalArgumentException("Charset $name is not supported")
+}
+
+internal actual fun CharsetEncoder.encodeImpl(
+    input: CharSequence,
+    fromIndex: Int,
+    toIndex: Int,
+    dst: Sink
+): Int {
+    dst.write(encodeToByteArrayImpl(input, fromIndex, toIndex))
+    return toIndex - fromIndex
+}
+
+internal actual fun CharsetEncoder.encodeToByteArrayImpl(
+    input: CharSequence,
+    fromIndex: Int,
+    toIndex: Int
+): ByteArray {
+    val text = input.subSequence(fromIndex, toIndex).toString()
+    return when (charset) {
+        Charsets.ISO_8859_1 -> ByteArray(text.length) { text[it].code.toByte() }
+        else -> text.encodeToByteArray()
     }
 }
 
-public class CharsetDecoder(public val charset: Charset) {
-    public fun decode(bytes: ByteArray): String = when (charset.name.uppercase()) {
-        "ISO-8859-1", "LATIN1" -> buildString(bytes.size) {
+public actual fun CharsetDecoder.decode(input: Source, dst: Appendable, max: Int): Int {
+    val bytes = input.readByteArray()
+    val text = when (charset) {
+        Charsets.ISO_8859_1 -> buildString(bytes.size) {
             for (b in bytes) append((b.toInt() and 0xff).toChar())
         }
         else -> bytes.decodeToString()
     }
-
-    // Upstream `CharsetDecoder.decode(input: Source, max: Int)` shape used
-    // by `HttpResponse.bodyAsText` (the body arrives as a kotlinx.io Source).
-    public fun decode(input: kotlinx.io.Source): String = decode(input.readByteArray())
-}
-
-public object Charsets {
-    public val UTF_8: Charset = Charset("UTF-8")
-    public val ISO_8859_1: Charset = Charset("ISO-8859-1")
-    public fun forName(name: String): Charset = when (name.uppercase()) {
-        "UTF-8", "UTF8" -> UTF_8
-        "ISO-8859-1", "LATIN1" -> ISO_8859_1
-        else -> Charset(name)
-    }
-    public fun isSupported(name: String): Boolean = when (name.uppercase()) {
-        "UTF-8", "UTF8", "ISO-8859-1", "LATIN1" -> true
-        else -> false
-    }
+    val out = if (text.length > max) text.substring(0, max) else text
+    dst.append(out)
+    return out.length
 }

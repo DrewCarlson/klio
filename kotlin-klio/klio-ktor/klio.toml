@@ -32,8 +32,8 @@ include = [
     # `SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)`
     # factories, the read operations — the shape a response body is drained
     # with) and the async write side (the `ByteChannel` Slot state machine +
-    # the write operations). klio supplies the `locks` and `DEVELOPMENT_MODE`
-    # actuals under `shim/core`.
+    # the write operations). klio supplies the `locks` actuals under
+    # `shim/core`; `DEVELOPMENT_MODE` comes from the posix set below.
     "io/ktor/utils/io/ByteReadChannel.kt",
     "io/ktor/utils/io/ByteWriteChannel.kt",
     "io/ktor/utils/io/BufferedByteWriteChannel.kt",
@@ -45,6 +45,25 @@ include = [
     "io/ktor/utils/io/ByteReadChannelOperations.kt",
     "io/ktor/utils/io/ByteWriteChannelOperations.kt",
     "io/ktor/utils/io/locks/Synchronized.kt",
+    # Engine I/O dispatcher expect (the engine base's default dispatcher).
+    # klio supplies the `Unconfined` actual under `shim/core`.
+    "io/ktor/utils/io/IODispatcher.kt",
+    # Charsets: the expect surface + the encode/decode extension layer.
+    # The class actuals come from the posix set below; klio supplies only
+    # the terminal UTF-8/ISO-8859-1 codec actuals under `shim/core`.
+    "io/ktor/utils/io/charsets/Encoding.kt",
+    "io/ktor/utils/io/core/internal/CharArraySequence.kt",
+]
+
+# ktor-io posix actuals that are pure Kotlin (`DEVELOPMENT_MODE`, the
+# Charset/CharsetEncoder/CharsetDecoder class layer). The cinterop-bound
+# ones (locks, the iconv codec terminals, `ioDispatcher`) stay klio-side
+# actuals under `shim/core`.
+[[source]]
+root = "upstream/ktor-io/posix/src"
+include = [
+    "io/ktor/utils/io/ByteChannel.posix.kt",
+    "io/ktor/utils/io/charsets/CharsetNative.kt",
 ]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
@@ -63,7 +82,7 @@ include = [
     # `SilentSupervisor` etc. — the engine base's coroutine context builder.
     "io/ktor/util/CoroutinesUtils.kt",
     # PlatformUtils (platform detection / development-mode flag the client
-    # core reads). klio supplies the `platform` / `isDevelopmentMode` actuals.
+    # core reads). The posix actuals are consumed below.
     "io/ktor/util/PlatformUtils.kt",
     "io/ktor/util/collections/CollectionUtils.kt",
     "io/ktor/util/collections/ConcurrentMap.kt",
@@ -95,8 +114,11 @@ include = [
     "io/ktor/util/logging/KtorSimpleLogger.kt",
 ]
 
-# Platform `actual`s for the ktor-util reflect + pipeline `expect`s. The posix
-# variants are pure common Kotlin. (`DISABLE_SFG` is supplied klio-side.)
+# Platform `actual`s for the ktor-util `expect`s that are pure common Kotlin
+# on posix: reflect, pipeline, platform detection, `Set.unmodifiable`,
+# `ConcurrentMap` (over the klio locks actuals), and `Attributes` (over
+# `ConcurrentMap`). The cinterop-bound ones (`DISABLE_SFG`, GMTDate,
+# `KtorSimpleLogger`) stay klio-side actuals under `shim/core`.
 [[source]]
 root = "upstream/ktor-utils/posix/src"
 include = [
@@ -104,6 +126,10 @@ include = [
     "io/ktor/util/debug/IntellijIdeaDebugDetectorNative.kt",
     "io/ktor/util/pipeline/PipelineNative.kt",
     "io/ktor/util/pipeline/StackTraceRecoverNative.kt",
+    "io/ktor/util/AttributesNative.kt",
+    "io/ktor/util/CollectionsNative.kt",
+    "io/ktor/util/PlatformUtilsNative.kt",
+    "io/ktor/util/collections/ConcurrentMapNative.kt",
     # `Logger` actual interface + `LogLevel` enum (pure Kotlin; the cinterop-using
     # `KtorSimpleLoggerNative` is replaced by `shim/core/.../KtorSimpleLoggerKlio`).
     "io/ktor/util/logging/LoggerNative.kt",
@@ -311,11 +337,12 @@ default = []
 
 # ktor-io (`io.ktor.utils.io.*`): the channel layer (the fully-buffered
 # read side + the async `ByteChannel` Slot state machine and write side),
-# locks, and charsets. klio supplies the `locks` / `DEVELOPMENT_MODE` /
-# `ByteChannel` actuals under `shim/core`.
+# locks, and charsets. klio supplies the `locks` / `ioDispatcher` /
+# terminal-codec actuals under `shim/core`.
 [features.io]
 sources = [
     "upstream/ktor-io/common/src/",
+    "upstream/ktor-io/posix/src/",
     "shim/core/io/ktor/utils/io/",
 ]
 
@@ -332,14 +359,12 @@ sources = [
 requires = ["io"]
 
 # ktor-http (`io.ktor.http.*`): status codes, methods, headers, content
-# types, URLs, and the `OutgoingContent` body layer. `_hex` (response-body
-# hex decoding) is the klio-side helper for this module. Depends on
+# types, URLs, and the `OutgoingContent` body layer. Depends on
 # ktor-utils (and ktor-io through it).
 [features.http]
 sources = [
     "upstream/ktor-http/common/src/",
     "upstream/ktor-http/posix/src/",
-    "shim/core/io/ktor/_hex.kt",
 ]
 requires = ["utils"]
 
@@ -353,16 +378,14 @@ requires = ["utils"]
 
 # ktor-client-core: the real upstream client (the engine layer +
 # request/statement/call layers + default plugins + `HttpClient`), consumed
-# verbatim. klio supplies the platform pieces under `shim/client-upstream`
-# + the `shim/core` engine actual: the `KlioClientEngine` actual over the
-# host `__kktor_request` transport and the engine-less `HttpClient()` actual
-# bound to it. The nonJvm engine loader (the `engines` registry) is consumed
-# and usable, but klio's actual binds `KlioClient` directly. Depends on
-# ktor-http and ktor-events.
+# verbatim. klio supplies the platform pieces under `shim/client-upstream`:
+# the `KlioClientEngine` actual over the host `__kktor_request` transport
+# and the engine-less `HttpClient()` actual bound to it. The nonJvm engine
+# loader (the `engines` registry) is consumed and usable, but klio's actual
+# binds `KlioClient` directly. Depends on ktor-http and ktor-events.
 [features.client]
 sources = [
     "upstream/ktor-client/ktor-client-core/",
-    "shim/core/io/ktor/client/",
     "shim/client-upstream/",
 ]
 requires = ["http", "events"]

@@ -4993,8 +4993,20 @@ fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const 
         // versa) is a definite mismatch.
         if (p_builtin != null and e_builtin == null and b.module.classId(ehead) != null) return true;
         if (p_builtin == null and e_builtin != null and b.module.classId(phead) != null and
-            b.module.registry.class_type_param_bounds.get(phead) == null and
+            !classHasBoundedTypeParam(b, phead) and
             !typeNameIsParam(f, phead)) return true;
+    }
+    return false;
+}
+
+/// Whether the class named `phead` declares a type parameter with a real
+/// (non-`Any`) upper bound. The registry records every class type param
+/// (unbounded ones under an `Any` bound), so presence alone is not the
+/// signal this evidence check keys on.
+fn classHasBoundedTypeParam(b: *FuncBuilder, phead: []const u8) bool {
+    const bounds = b.module.registry.class_type_param_bounds.get(phead) orelse return false;
+    for (bounds) |bd| {
+        if (!std.mem.eql(u8, bd.bound, "Any")) return true;
     }
     return false;
 }
