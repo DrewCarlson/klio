@@ -6710,6 +6710,35 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // anon-object `trace(message: String)` declines a trailing-lambda
         // call so the inline `Logger.trace(() -> String)` extension binds.
         if (!anonMethodDisproven(self, hit, args)) {
+            // A MEMBER-EXTENSION override binds its extension receiver from
+            // the enclosing implicit receivers, never from the dispatch
+            // owner itself: `with(policy) { measure(...) }` inside a
+            // MeasureScope runs the anon policy's `MeasureScope.measure`
+            // with the scope as `this` and the policy in dispatch scope.
+            const ext_recv_ty: ?[]const u8 = blk: {
+                const hg = hit.module.borrow();
+                defer hg.deinit();
+                const hf = funcAt(hg.get(), hit.func) orelse break :blk null;
+                if (hf.kind != .member_extension) break :blk null;
+                if (hf.params.len == 0 or !std.mem.eql(u8, hf.params[0].name, "this")) break :blk null;
+                break :blk hf.params[0].ty.name;
+            };
+            if (ext_recv_ty) |rt| {
+                if (!receiverImplementsType(self, receiver, rt)) {
+                    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+                    defer allocator.free(entries);
+                    for (entries) |e| {
+                        if (e.v != .Instance) continue;
+                        if (!receiverImplementsType(self, &e.v, rt)) continue;
+                        ir.eval.pushEnclosing(receiver);
+                        defer ir.eval.popEnclosing();
+                        return try invokeAnonMethod(self, allocator, &e.v, hit, args, inst);
+                    }
+                    // No satisfying receiver in scope: decline so the walk
+                    // can try the next candidate.
+                    return null;
+                }
+            }
             return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
         }
     }
