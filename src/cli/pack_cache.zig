@@ -881,6 +881,33 @@ fn loadPackCandidate(
                     for (ast_bundle.files) |*f| allocator.free(f.rel_path);
                     allocator.free(ast_bundle.files);
                 }
+                // The frozen bundle's spans carry pack-build-local FileIds
+                // (dense from 0), which collide with the run SourceMap's ids
+                // (the user file, other packs' re-parsed sources). Rebase every
+                // file onto a fresh id from the shared map before lowering sees
+                // it, registering the real source text when the pack ships it
+                // so diagnostics render correctly.
+                const src_payload = reader.readSection(section_names.SOURCES, &err) catch null;
+                defer if (src_payload) |sp| sp.deinit(allocator);
+                var src_bundle: ?schema.SourceBundle = if (src_payload) |sp|
+                    schema.decode(schema.SourceBundle, allocator, sp.slice(), &err) catch null
+                else
+                    null;
+                defer if (src_bundle) |*sb| sb.deinit(allocator);
+                var src_by_path = std.StringHashMap([]const u8).init(allocator);
+                defer src_by_path.deinit();
+                if (src_bundle) |sb| {
+                    for (sb.files) |sf| src_by_path.put(sf.rel_path, sf.bytes) catch {};
+                }
+                const dbg = envVarPresent(allocator, "KLIO_AST_REBASE_TRACE");
+                for (ast_bundle.files) |*f| {
+                    const old_fid = f.kotlin_file.span.file;
+                    const src = src_by_path.get(f.rel_path) orelse "";
+                    if (source_map.add(f.rel_path, src) catch null) |new_fid| {
+                        rebaseFileSpans(&f.kotlin_file, old_fid, new_fid);
+                        if (dbg) io.printStderr(allocator, "[ast-rebase] {s}: {d} -> {d}\n", .{ f.rel_path, old_fid.int(), new_fid.int() });
+                    }
+                }
                 for (ast_bundle.files) |f| {
                     if (f.kotlin_file.package) |pkg| {
                         const path = joinIdentPath(allocator, pkg.path) catch continue;
@@ -933,6 +960,54 @@ fn readPackBindings(
         if (std.mem.startsWith(u8, entry.key_ptr.*, lib_prefix)) {
             try out_bindings.register(entry.key_ptr.*, entry.value_ptr.*);
         }
+    }
+}
+
+/// Rewrite every span in a frozen-AST `KotlinFile` from its pack-build-local
+/// FileId to the id the run's shared `SourceMap` assigned it. Spans that do
+/// not carry `old` (placeholder spans) are left alone.
+fn rebaseFileSpans(file: *KotlinFile, old: span.FileId, new: span.FileId) void {
+    if (old == new) return;
+    walkSpans(KotlinFile, file, old, new);
+}
+
+/// Recursive reflection walk over the AST mirroring the pack decoder's type
+/// coverage (structs, tagged unions, optionals, single pointers, slices):
+/// every reachable `span.Span` whose file id equals `old` is retargeted to
+/// `new`. The decoder freshly allocated the whole tree, so casting away
+/// const on pointer fields is sound.
+fn walkSpans(comptime T: type, value: *T, old: span.FileId, new: span.FileId) void {
+    if (comptime T == span.Span) {
+        if (value.file == old) value.file = new;
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime s.layout == .@"packed") return;
+            inline for (s.fields) |f| {
+                if (comptime !f.is_comptime) {
+                    walkSpans(f.type, &@field(value.*, f.name), old, new);
+                }
+            }
+        },
+        .optional => |o| {
+            if (value.*) |*inner| walkSpans(o.child, inner, old, new);
+        },
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.child == u8) return;
+                for (@constCast(value.*)) |*item| walkSpans(p.child, item, old, new);
+            },
+            .one => walkSpans(p.child, @constCast(value.*), old, new),
+            else => {},
+        },
+        .@"union" => |u| {
+            if (u.tag_type == null) return;
+            switch (value.*) {
+                inline else => |*payload| walkSpans(@TypeOf(payload.*), payload, old, new),
+            }
+        },
+        else => {},
     }
 }
 
@@ -2100,4 +2175,78 @@ test "packLibIdFromBasename strips the version suffix" {
     // Not the installed naming convention: no version part at all.
     try std.testing.expect(packLibIdFromBasename("noversion.klio-pack") == null);
     try std.testing.expect(packLibIdFromBasename("-1.0.0.klio-pack") == null);
+}
+
+test "rebaseFileSpans retargets every span in a parsed file" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const src =
+        \\package p.q
+        \\import kotlin.math.max
+        \\class C(val x: Int) {
+        \\    fun f(y: Int): Int = if (y > 0) x + y else max(x, -y)
+        \\}
+        \\fun top(): String = "s"
+    ;
+    const old = span.FileId.from(7);
+    var lx = try lexer.Lexer.init(aa, old, src);
+    const lexed = try lx.tokenize();
+    try std.testing.expect(!lexed.diagnostics.hasErrors());
+    const p = parser.Parser.new(aa, old, src, lexed.tokens);
+    var file = p.parseFile();
+    try std.testing.expect(!p.diagnostics.hasErrors());
+    try std.testing.expectEqual(old, file.span.file);
+
+    const fresh = span.FileId.from(401);
+    rebaseFileSpans(&file, old, fresh);
+
+    // Every reachable span now carries the fresh id.
+    var count: usize = 0;
+    countSpansWithFile(KotlinFile, &file, fresh, &count);
+    var stale: usize = 0;
+    countSpansWithFile(KotlinFile, &file, old, &stale);
+    try std.testing.expect(count > 10);
+    try std.testing.expectEqual(@as(usize, 0), stale);
+    try std.testing.expectEqual(fresh, file.span.file);
+    try std.testing.expectEqual(fresh, file.package.?.span.file);
+    try std.testing.expectEqual(fresh, file.imports[0].span.file);
+    try std.testing.expectEqual(fresh, file.decls[0].Class.span.file);
+}
+
+fn countSpansWithFile(comptime T: type, value: *T, want: span.FileId, count: *usize) void {
+    if (comptime T == span.Span) {
+        if (value.file == want) count.* += 1;
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime s.layout == .@"packed") return;
+            inline for (s.fields) |f| {
+                if (comptime !f.is_comptime) {
+                    countSpansWithFile(f.type, &@field(value.*, f.name), want, count);
+                }
+            }
+        },
+        .optional => |o| {
+            if (value.*) |*inner| countSpansWithFile(o.child, inner, want, count);
+        },
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.child == u8) return;
+                for (@constCast(value.*)) |*item| countSpansWithFile(p.child, item, want, count);
+            },
+            .one => countSpansWithFile(p.child, @constCast(value.*), want, count),
+            else => {},
+        },
+        .@"union" => |u| {
+            if (u.tag_type == null) return;
+            switch (value.*) {
+                inline else => |*payload| countSpansWithFile(@TypeOf(payload.*), payload, want, count),
+            }
+        },
+        else => {},
+    }
 }
