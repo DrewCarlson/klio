@@ -103,12 +103,21 @@ pub const ProgramImage = struct {
     top_level_props_ordered: []const NameFunc = &.{},
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
+    /// Property names having ANY custom getter (across all classes). Gates
+    /// the member-miss accessor probe (`state.value()`), which must never
+    /// pay a full property resolution for ordinary method-miss names.
+    getter_prop_names: std.StringHashMap(void),
     instance_prop_setters: PairFuncMap,
     /// Getter-backed body properties declared `private` (never virtual).
     instance_prop_private: PairFuncMap,
     parent_ctor_args: std.StringHashMap([]FuncId),
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
+    /// Property names that have at least one OWNER-QUALIFIED extension-prop
+    /// key (`"<Owner>\x00<recv>"`). The lexical-tower probe in
+    /// `resolveExtensionPropImpl` is gated on membership so the common
+    /// lookup never pays the frame-chain walk.
+    owner_keyed_ext_names: std.StringHashMap(void),
     /// Nullable-receiver extension-property getters by property name (unique
     /// pick or null for ambiguous) — the dispatch key for a null receiver.
     nullable_ext_props: std.StringHashMap(?FuncId),
@@ -286,11 +295,13 @@ pub const ProgramImage = struct {
             .top_level_prop_inits = std.StringHashMap(TopLevelPropInit).init(allocator),
             .body_prop_inits = PairFuncMap.init(allocator),
             .instance_prop_getters = PairFuncMap.init(allocator),
+            .getter_prop_names = std.StringHashMap(void).init(allocator),
             .instance_prop_setters = PairFuncMap.init(allocator),
             .instance_prop_private = PairFuncMap.init(allocator),
             .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
             .init_blocks = std.StringHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
+            .owner_keyed_ext_names = std.StringHashMap(void).init(allocator),
             .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
             .extension_prop_setters = PairFuncMap.init(allocator),
             .extension_prop_delegates = PairFuncMap.init(allocator),

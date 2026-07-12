@@ -297,6 +297,30 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
 }
 
 fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
+    // A receiver-typed callable invoked function-style with the receiver
+    // as its first argument (`content.item(itemScope, localIndex)` where
+    // `item: LazyItemScope.(Int) -> Unit`): one arg more than the
+    // declared params plus a `this` capture slot is that shape — bind
+    // args[0] as the receiver, not as the first parameter.
+    if (callee.* == .IrClosure and args.len >= 1) {
+        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            if (args.len == info.n_params + 1) {
+                var has_this = false;
+                for (info.capture_names) |n| {
+                    if (std.mem.eql(u8, n, "this")) {
+                        has_this = true;
+                        break;
+                    }
+                }
+                if (has_this) {
+                    return self.callValueWithThis(allocator, callee, &args[0], args[1..], &.{});
+                }
+                // No `this` slot: the lambda never reads its receiver —
+                // bind the declared params and drop the receiver arg.
+                return self.callValue(allocator, callee, args[1..]);
+            }
+        }
+    }
     return self.callValue(allocator, callee, args);
 }
 
@@ -313,11 +337,21 @@ fn getFieldRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name
 }
 
 fn callFuncRec(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
-    return self.callFunc(allocator, module, func, args);
+    // Forward the member call's trailing-lambda syntax bit to the
+    // function binder: every member-dispatch route funnels here, so the
+    // under-applied default-fill in `callFunc` binds the lambda to the
+    // LAST param exactly when the source used trailing syntax.
+    if (trailing_member_call) host_call_func.setTrailingLambdaCall(true);
+    const r = self.callFunc(allocator, module, func, args);
+    host_call_func.setTrailingLambdaCall(false);
+    return r;
 }
 
 fn callFuncNamedRec(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, names: []const ?[]const u8) Allocator.Error!EvalResult {
-    return self.callFuncNamed(allocator, module, func, args, names);
+    if (trailing_member_call) host_call_func.setTrailingLambdaCall(true);
+    const r = self.callFuncNamed(allocator, module, func, args, names);
+    host_call_func.setTrailingLambdaCall(false);
+    return r;
 }
 
 // -------------------------------------------------------------------------
@@ -3753,8 +3787,34 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             break :blk null;
         };
         if (field) |v| {
+            if (missTraceWant(name)) std.debug.print("[fnprop] own-field hit tag={s} callable={}\n", .{ @tagName(v), isCallable(&v) });
             if (isCallable(&v) or v == .Instance) {
                 return callValueRec(self, allocator, &v, args);
+            }
+        } else if (blk: {
+            // Accessor-backed property holding a callable (`state.value()`
+            // where `value` has a custom getter): probe the member-only
+            // property read — no global/outer tails, so a genuine miss
+            // stays a miss and the walk continues. Gated on the name having
+            // ANY custom getter in the program, so an ordinary method-miss
+            // name (`resumeWith` on every DeepRecursive iteration) never
+            // pays the property-resolution machinery.
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().getter_prop_names.contains(name);
+        }) {
+            const pr = try host_fields.getMemberField(self, allocator, receiver, name);
+            if (missTraceWant(name)) {
+                switch (pr) {
+                    .ok => |v| std.debug.print("[fnprop] getMemberField ok tag={s} callable={}\n", .{ @tagName(v), isCallable(&v) }),
+                    .err => |e| switch (e) {
+                        .Unsupported, .Type => |m| std.debug.print("[fnprop] getMemberField err: {s}\n", .{m}),
+                        else => std.debug.print("[fnprop] getMemberField err tag={s}\n", .{@tagName(e)}),
+                    },
+                }
+            }
+            if (pr == .ok and (isCallable(&pr.ok) or pr.ok == .Instance)) {
+                return callValueRec(self, allocator, &pr.ok, args);
             }
         }
     }
@@ -6709,21 +6769,27 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // Param-type disproof, mirroring the named-class member walk: an
         // anon-object `trace(message: String)` declines a trailing-lambda
         // call so the inline `Logger.trace(() -> String)` extension binds.
-        if (!anonMethodDisproven(self, hit, args)) {
+        // One module borrow serves both the param-type disproof and the
+        // member-extension receiver gate (this path is hot enough that a
+        // second borrow per anon hit showed up in DeepRecursive timing).
+        const hit_info: struct { disproven: bool, ext_recv_ty: ?[]const u8 } = blk: {
+            const hg = hit.module.borrow();
+            defer hg.deinit();
+            const hf = funcAt(hg.get(), hit.func) orelse break :blk .{ .disproven = false, .ext_recv_ty = null };
+            const dis = anonMethodDisprovenFn(self, &hf, args);
+            var rt: ?[]const u8 = null;
+            if (hf.kind == .member_extension and hf.params.len != 0 and std.mem.eql(u8, hf.params[0].name, "this")) {
+                rt = hf.params[0].ty.name;
+            }
+            break :blk .{ .disproven = dis, .ext_recv_ty = rt };
+        };
+        if (!hit_info.disproven) {
             // A MEMBER-EXTENSION override binds its extension receiver from
             // the enclosing implicit receivers, never from the dispatch
             // owner itself: `with(policy) { measure(...) }` inside a
             // MeasureScope runs the anon policy's `MeasureScope.measure`
             // with the scope as `this` and the policy in dispatch scope.
-            const ext_recv_ty: ?[]const u8 = blk: {
-                const hg = hit.module.borrow();
-                defer hg.deinit();
-                const hf = funcAt(hg.get(), hit.func) orelse break :blk null;
-                if (hf.kind != .member_extension) break :blk null;
-                if (hf.params.len == 0 or !std.mem.eql(u8, hf.params[0].name, "this")) break :blk null;
-                break :blk hf.params[0].ty.name;
-            };
-            if (ext_recv_ty) |rt| {
+            if (hit_info.ext_recv_ty) |rt| {
                 if (!receiverImplementsType(self, receiver, rt)) {
                     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
                     defer allocator.free(entries);
@@ -6732,7 +6798,7 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
                         if (!receiverImplementsType(self, &e.v, rt)) continue;
                         ir.eval.pushEnclosing(receiver);
                         defer ir.eval.popEnclosing();
-                        return try invokeAnonMethod(self, allocator, &e.v, hit, args, inst);
+                        return try invokeAnonMethodFrom(self, allocator, &e.v, receiver, hit, args, inst);
                     }
                     // No satisfying receiver in scope: decline so the walk
                     // can try the next candidate.
@@ -6752,6 +6818,10 @@ fn anonMethodDisproven(self: *VmHost, hit: AnonMethodEntry, args: []const Value)
     const mg = hit.module.borrow();
     defer mg.deinit();
     const f = funcAt(mg.get(), hit.func) orelse return false;
+    return anonMethodDisprovenFn(self, &f, args);
+}
+
+fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
     const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const effective = f.params[skip..];
     var i: usize = 0;
@@ -6787,6 +6857,14 @@ fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8,
 }
 
 fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, hit: AnonMethodEntry, args: []const Value, padding_inst: ?ObjRef(InstanceData)) Allocator.Error!EvalResult {
+    return invokeAnonMethodFrom(self, allocator, receiver, receiver, hit, args, padding_inst);
+}
+
+/// `invokeAnonMethod` with the CAPTURE SOURCE decoupled from the bound
+/// receiver: a member-extension override runs with the EXTENSION receiver
+/// as `this` (params[0]) while its captures still live on the anon OWNER
+/// instance (`capture_src`).
+fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Value, capture_src: *const Value, hit: AnonMethodEntry, args: []const Value, padding_inst: ?ObjRef(InstanceData)) Allocator.Error!EvalResult {
     const mg = hit.module.borrow();
     const module_rc = mg.get();
     defer mg.deinit();
@@ -6832,8 +6910,8 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
     // shape, so the instance slice reinterprets as `[]const NameValue`.
     comptime std.debug.assert(@sizeOf(InstanceData.Capture) == @sizeOf(NameValue));
     const inst_caps: []const InstanceData.Capture = blk: {
-        if (receiver.* != .Instance) break :blk &.{};
-        const g = receiver.Instance.borrow();
+        if (capture_src.* != .Instance) break :blk &.{};
+        const g = capture_src.Instance.borrow();
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
@@ -6882,10 +6960,33 @@ fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value,
 /// Build the `n_params`-length argument vector, filling positions past
 /// the provided args from default-arg thunks.
 fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
+    // Kotlin binds a trailing lambda to the LAST parameter. When the
+    // positional layout would leave a default-less last parameter empty
+    // while the last provided arg is callable, the call was the
+    // trailing-lambda form over defaulted middle params
+    // (`items(3) { … }` against `items(count, key = …, type = …,
+    // itemContent)`) — a straight positional fill would be a kotlinc
+    // compile error, so the shift never changes a legal layout.
+    var last_shift: ?Value = null;
+    var pos_len = provided.len;
+    if (provided.len > 0 and provided.len < n_params) {
+        const last_default: ?FuncId = if (defaults) |d| (if (n_params - 1 < d.len) d[n_params - 1] else null) else null;
+        const lastp = provided[provided.len - 1];
+        if (last_default == null and isCallable(&lastp)) {
+            last_shift = lastp;
+            pos_len -= 1;
+        }
+    }
     var call_args: std.ArrayList(Value) = .empty;
     var i: usize = 0;
     while (i < n_params) : (i += 1) {
-        if (i < provided.len) {
+        if (i + 1 == n_params) {
+            if (last_shift) |lv| {
+                try call_args.append(allocator, lv);
+                continue;
+            }
+        }
+        if (i < pos_len) {
             try call_args.append(allocator, provided[i]);
             continue;
         }
@@ -6912,6 +7013,20 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
         }
     }
     return .{ .ok = try call_args.toOwnedSlice(allocator) };
+}
+
+/// Trailing-lambda syntax bit of the member call currently dispatching
+/// (`recv.f(x) { … }` vs `recv.f(x, { … })`) — see `Inst.CallMember.
+/// trailing_lambda`. Saved/restored by the exec sites around each dispatch
+/// so nested member calls (walk probes running accessors) cannot clobber
+/// the outer call's bit. Read non-destructively by the under-applied
+/// trailing-lambda arm in `irMethodWalk`.
+threadlocal var trailing_member_call: bool = false;
+
+pub fn setTrailingMemberCall(on: bool) bool {
+    const prev = trailing_member_call;
+    trailing_member_call = on;
+    return prev;
 }
 
 const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
@@ -7198,7 +7313,9 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
         isFunctionTypeRefResolved(self, &f.params[f.params.len - 1].ty) and
         isCallable(&all[all.len - 1]) and (all.len - 1) < (f.params.len - 1))
     {
+        if (trailing_member_call) host_call_func.setTrailingLambdaCall(true);
         const r = try callFuncRec(self, allocator, mod, fid, all);
+        host_call_func.setTrailingLambdaCall(false);
         if (runtime.freeScratch()) allocator.free(all);
         return r;
     }
@@ -8707,6 +8824,18 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
         }
     }
     if (receiver.* == .Instance and receiverImplementsType(self, receiver, owner)) return receiver.*;
+    // The lexical receiver tower of the executing call stack: a getter
+    // reached through nested lambdas (`placeable.mainAxisSize` inside a
+    // `with(scope) { repeat { … } }` body) has its owner bound as an
+    // outer frame's `this`, never on the dynamic enclosing chain.
+    {
+        const lex = try ir.eval.frameThisChainAlloc(allocator);
+        defer allocator.free(lex);
+        for (lex) |v| {
+            if (v != .Instance) continue;
+            if (receiverImplementsType(self, &v, owner)) return v;
+        }
+    }
     // An `object`/companion owner is its own dispatch receiver: the
     // singleton is materializable from anywhere it can be imported.
     if (ownerIsObjectSingleton(self, owner)) {
@@ -10144,6 +10273,30 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             }
             walk = blk: {
                 const ig = o_inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().outer;
+            };
+        }
+    }
+    // `this@MeasureScope` where the label names an INTERFACE a candidate
+    // implements (an interface default method's labeled receiver, captured
+    // by a nested anon): the parent-class name chains above never list
+    // interfaces. A SECOND pass keeps the supertype-graph walk off the
+    // name-match fast path (`this@DeepRecursiveScopeImpl` resolves by name
+    // every `callRecursive`).
+    for (chain) |encl_v| {
+        if (encl_v != .Instance) continue;
+        var walk: ?Value = encl_v;
+        var outer_step: usize = 0;
+        while (walk) |wv| {
+            if (outer_step > 128) break;
+            outer_step += 1;
+            if (wv != .Instance) break;
+            if (receiverImplementsType(self, &wv, qualifier)) {
+                return .{ .ok = .{ .Instance = wv.Instance.clone() } };
+            }
+            walk = blk: {
+                const ig = wv.Instance.borrow();
                 defer ig.deinit();
                 break :blk ig.get().outer;
             };

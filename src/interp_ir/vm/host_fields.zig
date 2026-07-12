@@ -1898,6 +1898,36 @@ fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Err
     };
 }
 
+/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
+/// for every class on the lexical receiver tower — a PRIVATE member-ext
+/// property (`private val Placeable.mainAxisSize` in each lazy item type)
+/// shares its (receiver, name) pair across owners, and only the
+/// declaration whose owner is in scope is the one kotlinc bound.
+fn ownerKeyedExtProp(self: *VmHost, allocator: Allocator, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    _ = self;
+    const lex = ir.eval.frameThisChainAlloc(allocator) catch return null;
+    defer allocator.free(lex);
+    for (lex) |v| {
+        if (v != .Instance) continue;
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(allocator);
+        {
+            const g = v.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            names.append(allocator, cg.get().name) catch return null;
+            for (cg.get().supertype_names) |sn| names.append(allocator, sn) catch return null;
+        }
+        for (names.items) |owner| {
+            const okey = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ owner, recv_key }) catch return null;
+            defer allocator.free(okey);
+            if (lookupPairFunc(map, okey, name)) |fid| return fid;
+        }
+    }
+    return null;
+}
+
 fn resolveExtensionPropImpl(
     self: *VmHost,
     allocator: Allocator,
@@ -1956,6 +1986,9 @@ fn resolveExtensionPropImpl(
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
+        if (pg.get().owner_keyed_ext_names.contains(name)) {
+            if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+        }
         if (lookupPairFunc(Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
     }
     // An extension property on a supertype applies to a subtype receiver.
@@ -1980,6 +2013,9 @@ fn resolveExtensionPropImpl(
             {
                 const pg = self.prog.borrow();
                 defer pg.deinit();
+                if (pg.get().owner_keyed_ext_names.contains(name)) {
+                    if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), sup, name)) |fid| return fid;
+                }
                 if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
             }
             const def: ?ObjRef(ClassDef) = blk: {

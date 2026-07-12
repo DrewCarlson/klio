@@ -216,6 +216,7 @@ pub const BuiltModule = struct {
     /// `(class name, property name)` → `FuncId` for body properties
     /// with a custom getter.
     instance_prop_getters: PairFuncMap,
+    getter_prop_names: std.StringHashMap(void),
     /// Custom-setter `FuncIds`, keyed the same as getters.
     instance_prop_setters: PairFuncMap,
     /// Getter-backed body properties declared `private`, keyed the same as
@@ -231,6 +232,8 @@ pub const BuiltModule = struct {
     top_level_props: std.ArrayList(NameFunc),
     /// Top-level extension properties, keyed by `(receiver type, prop)`.
     extension_props: PairFuncMap,
+    /// Names having at least one owner-qualified key; see the Prog field.
+    owner_keyed_ext_names: std.StringHashMap(void),
     /// Getter FuncIds of extension properties declared on a NULLABLE receiver
     /// (`val RowColumnParentData?.weight`), keyed by property name — the only
     /// dispatch key available when the receiver evaluates to null. A name
@@ -279,12 +282,14 @@ pub const BuiltModule = struct {
         self.classes.deinit();
         self.body_prop_inits.deinit();
         self.instance_prop_getters.deinit();
+        self.getter_prop_names.deinit();
         self.instance_prop_setters.deinit();
         self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
         self.init_blocks.deinit();
         self.top_level_props.deinit(self.allocator);
         self.extension_props.deinit();
+        self.owner_keyed_ext_names.deinit();
         self.nullable_ext_props.deinit();
         self.extension_prop_setters.deinit();
         self.extension_prop_delegates.deinit();
@@ -319,12 +324,14 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .classes = ClassTable.init(allocator),
         .body_prop_inits = PairFuncMap.init(allocator),
         .instance_prop_getters = PairFuncMap.init(allocator),
+        .getter_prop_names = std.StringHashMap(void).init(allocator),
         .instance_prop_setters = PairFuncMap.init(allocator),
         .instance_prop_private = PairFuncMap.init(allocator),
         .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
         .init_blocks = std.StringHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
         .extension_props = PairFuncMap.init(allocator),
+        .owner_keyed_ext_names = std.StringHashMap(void).init(allocator),
         .nullable_ext_props = std.StringHashMap(?FuncId).init(allocator),
         .extension_prop_setters = PairFuncMap.init(allocator),
         .extension_prop_delegates = PairFuncMap.init(allocator),
@@ -2187,6 +2194,7 @@ fn buildModuleWithOverrides(
     // Body-property initialisers, getters, setters, ctor defaults.
     var body_prop_inits = if (seed) |*s| s.body_prop_inits else PairFuncMap.init(a);
     var instance_prop_getters = if (seed) |*s| s.instance_prop_getters else PairFuncMap.init(a);
+    var getter_prop_names = if (seed) |*s| s.getter_prop_names else std.StringHashMap(void).init(a);
     var instance_prop_setters = if (seed) |*s| s.instance_prop_setters else PairFuncMap.init(a);
     var instance_prop_private = if (seed) |*s| s.instance_prop_private else PairFuncMap.init(a);
     var delegated_body_props = if (seed) |*s| s.delegated_body_props else StrPairSet.init(a);
@@ -2307,6 +2315,7 @@ fn buildModuleWithOverrides(
                     },
                 };
                 try instance_prop_getters.put(.{ .a = c.name.name, .b = p.name.name }, fid);
+                try getter_prop_names.put(p.name.name, {});
                 const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
                 if (!std.mem.eql(u8, cfqn, c.name.name)) {
                     try instance_prop_getters.put(.{ .a = cfqn, .b = p.name.name }, fid);
@@ -2846,10 +2855,11 @@ fn buildModuleWithOverrides(
 
     // Top-level + companion/object extension properties.
     var extension_props = if (seed) |*s| s.extension_props else PairFuncMap.init(a);
+    var owner_keyed_ext_names = if (seed) |*s| s.owner_keyed_ext_names else std.StringHashMap(void).init(a);
     var nullable_ext_props = if (seed) |*s| s.nullable_ext_props else std.StringHashMap(?FuncId).init(a);
     var extension_prop_setters = if (seed) |*s| s.extension_prop_setters else PairFuncMap.init(a);
     var extension_prop_delegates = if (seed) |*s| s.extension_prop_delegates else PairFuncMap.init(a);
-    const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8 };
+    const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8, owner_type_params: []const ast.TypeParam = &.{} };
     var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
     defer ext_prop_decls.deinit(a);
     for (decls) |*d| {
@@ -2857,7 +2867,7 @@ fn buildModuleWithOverrides(
             .Property => |p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
             .Class => |*c| {
                 for (c.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = c.name.name });
+                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = c.name.name, .owner_type_params = c.type_params });
                 }
             },
             .Object => |*o| {
@@ -2896,6 +2906,16 @@ fn buildModuleWithOverrides(
                 recv_name = t;
             }
         }
+        // A member-extension property on the enclosing class's TYPE PARAMETER
+        // (`class LazyLayoutItemAnimator<T : LazyLayoutMeasuredItem> { private
+        // val T.hasAnimations }`) keys on the parameter's UPPER BOUND — every
+        // receiver it can dispatch on is a subtype of the bound, and the
+        // lookup walks the receiver's supertype chain by simple name.
+        for (epd.owner_type_params) |*tp| {
+            if (!std.mem.eql(u8, tp.name.name, recv_name)) continue;
+            recv_name = if (tp.upper_bound) |ub| ub.name.name else "Any";
+            break;
+        }
         // A `val X.Companion.foo` records `qualified_path = "X.Companion"`; key
         // it under that path so it never collides with a plain `val X.foo` type
         // extension (which applies to instances of `X`, not its companion).
@@ -2915,6 +2935,16 @@ fn buildModuleWithOverrides(
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
             };
             try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
+            // A PRIVATE member-extension property's (receiver, name) pair is
+            // not unique across classes (each lazy-layout item type declares
+            // `private val Placeable.mainAxisSize`); a second, owner-qualified
+            // key keeps every declaration reachable so dispatch can pick the
+            // one whose owner is on the lexical receiver tower.
+            if (epd.owner) |owner| {
+                const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
+                try extension_props.put(.{ .a = okey, .b = p.name.name }, fid);
+                try owner_keyed_ext_names.put(p.name.name, {});
+            }
             if (recv.nullable) {
                 const gop2 = try nullable_ext_props.getOrPut(p.name.name);
                 if (gop2.found_existing) {
@@ -2984,6 +3014,9 @@ fn buildModuleWithOverrides(
             };
             try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             if (epd.owner) |owner| {
+                const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
+                try extension_prop_setters.put(.{ .a = okey, .b = p.name.name }, fid);
+                try owner_keyed_ext_names.put(p.name.name, {});
                 try module.registry.member_ext_owner_class.put(fid, owner);
             }
         }
@@ -3088,12 +3121,14 @@ fn buildModuleWithOverrides(
         .classes = classes,
         .body_prop_inits = body_prop_inits,
         .instance_prop_getters = instance_prop_getters,
+        .getter_prop_names = getter_prop_names,
         .instance_prop_private = instance_prop_private,
         .instance_prop_setters = instance_prop_setters,
         .parent_ctor_args = parent_ctor_args,
         .init_blocks = init_blocks,
         .top_level_props = top_level_props,
         .extension_props = extension_props,
+        .owner_keyed_ext_names = owner_keyed_ext_names,
         .nullable_ext_props = nullable_ext_props,
         .extension_prop_delegates = extension_prop_delegates,
         .extension_prop_setters = extension_prop_setters,
@@ -3914,12 +3949,20 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
 
     try copyPairMap(&out.body_prop_inits, &base.body_prop_inits);
     try copyPairMap(&out.instance_prop_getters, &base.instance_prop_getters);
+    {
+        var it = base.getter_prop_names.keyIterator();
+        while (it.next()) |k| try out.getter_prop_names.put(k.*, {});
+    }
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
     try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
     try copyPairMap(&out.extension_props, &base.extension_props);
+    {
+        var it = base.owner_keyed_ext_names.keyIterator();
+        while (it.next()) |k| try out.owner_keyed_ext_names.put(k.*, {});
+    }
     {
         var it = base.nullable_ext_props.iterator();
         while (it.next()) |e| try out.nullable_ext_props.put(e.key_ptr.*, e.value_ptr.*);

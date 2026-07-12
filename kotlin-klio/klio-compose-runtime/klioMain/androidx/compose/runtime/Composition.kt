@@ -35,6 +35,20 @@ public interface Composition {
 }
 
 /**
+ * A [Composition] that can be reused for different content. klio recomposes a
+ * reused slot from scratch (the applier subtree is cleared and re-emitted), so
+ * reuse here carries the lifecycle contract, not the node-reuse optimization.
+ */
+public interface ReusableComposition : Composition {
+    /** Discard remembered state and set new content, reusing the host node. */
+    public fun setContentWithReuse(content: @Composable () -> Unit)
+
+    /** Forget all remembered slots but keep the composition usable for a
+     * later [setContent]. */
+    public fun deactivate()
+}
+
+/**
  * The parent of a composition: the [Recomposer] at the root, or a context from
  * [rememberCompositionContext] for a subcomposition. A composition created with a
  * context is reparented to the [recomposer] that drives it, so a subcomposition
@@ -160,7 +174,8 @@ public class Recomposer(
 internal class KlioComposition(
     private val parent: Recomposer,
     applier: Applier<*>? = null,
-) : Composition {
+    parentLocals: HashMap<CompositionLocal<*>, Any?>? = null,
+) : ReusableComposition {
     val composer: KlioComposer = KlioComposer()
     private val applier: Applier<*>? = applier
     private var content: (@Composable () -> Unit)? = null
@@ -168,6 +183,7 @@ internal class KlioComposition(
     private var writeObserverHandle: (() -> Unit)? = null
 
     init {
+        if (parentLocals != null) composer.baseLocals = parentLocals
         if (applier != null) {
             @Suppress("UNCHECKED_CAST")
             composer.applierNode = applier as Applier<Any?>
@@ -226,6 +242,23 @@ internal class KlioComposition(
         composeContent()
     }
 
+    override fun setContentWithReuse(content: @Composable () -> Unit) {
+        check(!disposed) { "setContent on a disposed Composition" }
+        composer.resetForReuse()
+        applier?.clear()
+        ensureWriteObserver()
+        this.content = content
+        composer.beginInitialPass()
+        composeContent()
+    }
+
+    override fun deactivate() {
+        if (disposed) return
+        composer.resetForReuse()
+        applier?.clear()
+        content = null
+    }
+
     override fun dispose() {
         if (disposed) return
         disposed = true
@@ -238,18 +271,27 @@ internal class KlioComposition(
     }
 }
 
-/** A subcomposition's context: reparents its child compositions to [rec]. */
-internal class KlioCompositionContext(private val rec: Recomposer) : CompositionContext() {
+/** A subcomposition's context: reparents its child compositions to [rec] and
+ * carries the parent composition's provider snapshot so the child's
+ * CompositionLocal reads see the parent's provided values. */
+internal class KlioCompositionContext(
+    private val rec: Recomposer,
+    internal val parentLocals: HashMap<CompositionLocal<*>, Any?>? = null,
+) : CompositionContext() {
     override val recomposer: Recomposer
         get() = rec
 }
 
 /** Create a logic-only composition (no node emission) driven by [parent]. */
 public fun Composition(parent: CompositionContext): Composition =
-    KlioComposition(parent.recomposer)
+    KlioComposition(parent.recomposer, null, (parent as? KlioCompositionContext)?.parentLocals)
 
 /** Create a composition that emits into [applier]'s node tree, driven by [parent]
  * (a Recomposer at the root, or a subcomposition context from
  * [rememberCompositionContext]). */
 public fun Composition(applier: Applier<*>, parent: CompositionContext): Composition =
-    KlioComposition(parent.recomposer, applier)
+    KlioComposition(parent.recomposer, applier, (parent as? KlioCompositionContext)?.parentLocals)
+
+/** Create a reusable composition emitting into [applier]'s node tree. */
+public fun ReusableComposition(applier: Applier<*>, parent: CompositionContext): ReusableComposition =
+    KlioComposition(parent.recomposer, applier, (parent as? KlioCompositionContext)?.parentLocals)

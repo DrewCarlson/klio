@@ -2229,15 +2229,29 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     for (defs) |*def| def.deinit();
 
     for (img.body_prop_inits) |entry| try out.body_prop_inits.put(.{ .a = entry.a, .b = entry.b }, entry.func);
-    for (img.instance_prop_getters) |entry| try out.instance_prop_getters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.instance_prop_getters) |entry| {
+        try out.instance_prop_getters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+        try out.getter_prop_names.put(entry.b, {});
+    }
     for (img.instance_prop_setters) |entry| try out.instance_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.instance_prop_private) |entry| try out.instance_prop_private.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.parent_ctor_args) |entry| try out.parent_ctor_args.put(entry.name, @constCast(entry.funcs));
     for (img.init_blocks) |entry| try out.init_blocks.put(entry.name, @constCast(entry.funcs));
     try out.top_level_props.appendSlice(a, img.top_level_props);
-    for (img.extension_props) |entry| try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.extension_props) |entry| {
+        try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+        // Owner-qualified keys carry a NUL separator; rebuild the gate set.
+        if (std.mem.indexOfScalar(u8, entry.a, 0) != null) {
+            try out.owner_keyed_ext_names.put(entry.b, {});
+        }
+    }
     for (img.nullable_ext_props) |entry| try out.nullable_ext_props.put(entry.name, entry.func);
-    for (img.extension_prop_setters) |entry| try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+    for (img.extension_prop_setters) |entry| {
+        try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
+        if (std.mem.indexOfScalar(u8, entry.a, 0) != null) {
+            try out.owner_keyed_ext_names.put(entry.b, {});
+        }
+    }
     for (img.extension_prop_delegates) |entry| try out.extension_prop_delegates.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     try out.object_names.appendSlice(a, img.object_names);
     for (img.companion_singletons) |kv| try out.companion_singletons.put(kv.k, kv.v);
