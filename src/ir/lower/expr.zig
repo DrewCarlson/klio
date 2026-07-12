@@ -6165,12 +6165,8 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 // called with no explicit receiver has no `this` to carry: the
                 // qualified FQN rewrite would load it as a receiverless global and
                 // miss. Only a plain top-level function (the `kotlin.math.max`
-                // shape this rewrite exists for) qualifies. For a RENAMED alias
-                // an FQN with several overloads stays eligible while any
-                // non-extension one exists; the PLAIN-import path keeps the
-                // original first-FQN-match read (a companion property's getter
-                // registering under the imported FQN must not turn the bare
-                // property read into a qualified self-call).
+                // shape this rewrite exists for) qualifies; an FQN with several
+                // overloads stays eligible while any non-extension one exists.
                 var any_nonext = false;
                 var any_fqn_match = false;
                 var any_inline = false;
@@ -6185,16 +6181,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                         }
                     }
                 }
-                const imp_is_extension = if (renamed)
-                    (any_fqn_match and !any_nonext)
-                else blk: {
-                    if (b.module.funcIdByFqn(alias_paths[0].fqn)) |ifid| {
-                        if (b.module.funcById(ifid)) |iff| {
-                            break :blk iff.params.len != 0 and std.mem.eql(u8, iff.params[0].name, "this");
-                        }
-                    }
-                    break :blk false;
-                };
+                const imp_is_extension = any_fqn_match and !any_nonext;
                 // An INLINE target stays with the splice machinery (which
                 // resolves aliases itself): rewriting `flow { ... }`
                 // (`unsafeFlow as flow` in every kotlinx flow operator) to a
