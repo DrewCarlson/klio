@@ -1003,6 +1003,20 @@ fn bodylessRedirectPop() void {
     if (bodyless_active_len > 0) bodyless_active_len -= 1;
 }
 
+/// An `expect` reached with no `actual` and no klio intrinsic behind it. Before
+/// this the call returned `Unit` and the program limped on with a wrong value —
+/// the failure mode `klio check --unimplemented` exists to catch statically, and
+/// by far the most confusing one klio can produce. Name the declaration and say
+/// what to run to list every other one in the same program.
+fn missingActual(allocator: Allocator, f: *const Func) EvalResult {
+    return .{ .err = typeErr(
+        allocator,
+        "`{s}` is an `expect` with no `actual` on this platform, and no klio intrinsic backs it. " ++
+            "Run `klio check --unimplemented <file>` to list every unimplemented declaration this program reaches.",
+        .{f.fqn},
+    ) };
+}
+
 pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_in: []const Value) Allocator.Error!EvalResult {
     const trailing_syntax = trailing_lambda_call;
     trailing_lambda_call = false;
@@ -1126,11 +1140,13 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                 const m = r.err.Unimplemented;
                 if (std.mem.indexOf(u8, m, "Vm::call_member") != null) {
                     if (runtime.freeScratch()) allocator.free(m);
+                    if (f.is_expect) return missingActual(allocator, f);
                     return .{ .ok = .Unit };
                 }
             }
             return r;
         }
+        if (f.is_expect) return missingActual(allocator, f);
         return .{ .ok = .Unit };
     }
 

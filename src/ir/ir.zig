@@ -882,6 +882,13 @@ pub const Func = struct {
     /// applies. Overload selection skips it while any normal sibling
     /// fits.
     low_priority: bool = false,
+    /// An `expect` declaration. Its `actual` may live outside the pack's source
+    /// set, in which case NOTHING serves the call — and a bodyless declaration
+    /// that nothing serves used to return `Unit` silently, which is the single
+    /// most confusing failure klio can produce (the call runs nothing and the
+    /// program limps on with a wrong value). Knowing the declaration is an
+    /// `expect` lets the runtime say so, and say what to run to list the rest.
+    is_expect: bool = false,
     /// Resolved fully-qualified candidate names for each source-level
     /// annotation on this function (e.g. `kotlin.test.Test`), so a test
     /// runner can discover `@Test`/`@Ignore`/etc. without re-parsing.
