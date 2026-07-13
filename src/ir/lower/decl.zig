@@ -1145,6 +1145,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             if (ft.receiver != null) {
                 try b.markReceiverLambdaParam(p.name.name);
                 if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);
+            } else {
+                try b.markPlainFnParam(p.name.name);
             }
             // A param typed as a contextual function type: a fully-positional
             // call `p(c.., a..)` splits its leading context args from the

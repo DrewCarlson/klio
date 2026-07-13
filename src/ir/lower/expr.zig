@@ -8327,8 +8327,19 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // member is still tried first at runtime, with the local as the fallback.
     const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
         !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
-    const local_callable = b.isLocalFn(name.name) or b.isParam(name.name) or
-        b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null;
+    // A parameter whose declared type is a function type with NO receiver can
+    // never serve an EXPLICIT-receiver call. Kotlin resolves `recv.name(args)` to
+    // a member or extension of `recv`; a local competes only when its type is an
+    // EXTENSION-function type (`Modifier.() -> Unit`, which is why `up.update()`
+    // binds a `Up.() -> Unit` param). A plain `(FocusState) -> Unit` is not that —
+    // and treating it as a candidate made `.onFocusChanged(onFocusChanged)` inside
+    // `textFieldFocusModifier` INVOKE the callback with itself as its argument
+    // instead of dispatching `Modifier.onFocusChanged`, recursing until the native
+    // stack blew (every `BasicTextField`).
+    const plain_fn_local = b.isPlainFnParam(name.name);
+    const local_callable = !plain_fn_local and
+        (b.isLocalFn(name.name) or b.isParam(name.name) or
+            b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
     if (local_callable) {
         const local_reg = blk: {
             if (anon_cap) {

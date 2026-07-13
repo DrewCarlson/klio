@@ -438,6 +438,8 @@ pub const FuncBuilder = struct {
     /// `a.compareTo(b) <op> 0` — the total order, unlike the IEEE
     /// primitive operators.
     generic_typed_params: StringSet,
+    /// See `markPlainFnParam`.
+    plain_fn_params: StringSet,
     /// See `markErasedRecvParam`.
     erased_recv_params: StringSet,
     /// Params whose declared type is a concrete NON-function type (not a
@@ -613,6 +615,7 @@ pub const FuncBuilder = struct {
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
+            .plain_fn_params = StringSet.init(allocator),
             .erased_recv_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
@@ -687,6 +690,7 @@ pub const FuncBuilder = struct {
         self.receiver_lambda_arity.deinit();
         self.context_fn_params.deinit();
         self.generic_typed_params.deinit();
+        self.plain_fn_params.deinit();
         self.erased_recv_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
@@ -1262,6 +1266,17 @@ pub const FuncBuilder = struct {
     }
     pub fn isLocalExtFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_ext_fns.contains(name);
+    }
+    /// A parameter whose declared type is a function type with NO receiver
+    /// (`(FocusState) -> Unit`). Such a value can never serve an EXPLICIT-receiver
+    /// call: Kotlin resolves `recv.name(args)` to a member or extension of `recv`,
+    /// and a local only competes when its type is an EXTENSION-function type
+    /// (`Modifier.() -> Unit`), which this is not.
+    pub fn markPlainFnParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.plain_fn_params.put(name, {});
+    }
+    pub fn isPlainFnParam(self: *const FuncBuilder, name: []const u8) bool {
+        return self.plain_fn_params.contains(name);
     }
     pub fn markReceiverLambdaParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.receiver_lambda_params.put(name, {});

@@ -38,6 +38,7 @@ fn rssLog() void {
 
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
+    try b.register("androidx.compose.foundation.__composeui_hostOs", hostOs);
     try b.register("klio.compose.ui.__composeui_skiaRender", skiaRender);
     try b.register("klio.compose.ui.__composeui_measureText", measureText);
     try b.register("klio.compose.ui.__composeui_winOpen", winOpen);
@@ -620,7 +621,23 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
-/// usable with the `androidx.compose.ui.graphics.__skia_c_*` draw intrinsics
+//// The host OS, as a lowercase name. foundation's `DesktopPlatform` needs it: the
+/// desktop key mapping is genuinely different per platform (macOS binds the text
+/// shortcuts to Meta, Linux and Windows to Ctrl), so defaulting would give the
+/// wrong bindings on a real macOS host. Upstream reads
+/// `System.getProperty("os.name")`, which klio has no JVM to serve.
+fn hostOs(ctx: *CallCtx) Error!EvalResult {
+    const name = switch (@import("builtin").os.tag) {
+        .linux => "linux",
+        .macos => "macos",
+        .windows => "windows",
+        else => "unknown",
+    };
+    const a = ctx.allocator;
+    return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, name)) });
+}
+
+// usable with the `androidx.compose.ui.graphics.__skia_c_*` draw intrinsics
 /// (the same surface type `__skia_surf_new` yields), or 0. The real ui engine's
 /// `KlioCanvas` draws frames directly onto it.
 fn winSurfaceOf(ctx: *CallCtx) Error!EvalResult {
@@ -1149,7 +1166,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 60), b.len());
+    try testing.expectEqual(@as(usize, 61), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {
