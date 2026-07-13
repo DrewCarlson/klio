@@ -42,6 +42,34 @@ parse/lower/serialize ms.
 | single-file dual gate (`commontest-sweep.py --filter X --eager both`) | **~16 s** | new tool |
 | `.zig-cache` growth | ~68 GB/day under heavy iteration | 152 GB found; no GC |
 
+## Measurements (2026-07-13, 32-core Linux, after the slab-thrash fix)
+
+The dominant cost was not the build or the harness: the slab allocator
+unmapped a slab the instant its last live cell freed, and the interpreted
+receiver chain holds exactly one live cell per frame — so every method call
+under the **arena profile** (which every in-process harness uses) mapped,
+threaded, and unmapped a 256 KB slab. Fixing that (one parked spare slab per
+size class) moved the gates far more than any parallelism work:
+
+| Gate | Before | After | Notes |
+| --- | --- | --- | --- |
+| `examples/jit_object_traversal_loop.kt`, arena + JIT | 3 min 04 s | **12.1 s** | sys time 2 m 23 s → 0.03 s |
+| e2e corpus, **both** JIT modes | ~20 min | **56 s** | one process; `zig build itest-e2e` runs both |
+| commontest dual sweep, ReleaseSafe harness | 33 min | **5 min 54 s** | `--jobs` now defaults to cores−2, not 6 |
+| one commontest child (StringTest), Debug harness | 50 s | — | **never sweep on Debug** (see below) |
+| same child, ReleaseSafe harness | **11.8 s** | — | 4.2× — matches the 2026-07-04 finding |
+
+Two standing traps this re-confirmed:
+
+- **Never run a full sweep against `klio-harness-Debug`.** It is 4–5× slower
+  per child; a full dual sweep on it is ~33 min versus ~6 min on ReleaseSafe.
+  Debug is for the *edit-repro loop* (fast rebuilds), never for a gate.
+- **The arena profile is what the harnesses run.** The shipped `klio` binary
+  defaults to the GC profile, so a perf bug that only bites the arena profile
+  is invisible from the CLI and shows up only as a slow (or hung) gate. When a
+  gate is inexplicably slow, reproduce it standalone with
+  `KLIO_RECLAIM=arena` before blaming the harness.
+
 ## The iteration playbook (use these, not the old habits)
 
 - **Edit-repro loop** (fixing one bug, running one program):
@@ -90,6 +118,15 @@ parse/lower/serialize ms.
 ## Log
 
 - 2026-07-04: plan created; directive recorded in session memory.
+- 2026-07-13: root-caused the gate's real cost to the slab allocator's
+  empty-slab thrash (an mmap + 16 K-cell threading pass + munmap per
+  interpreted method call under the arena profile); parked one spare slab per
+  size class. e2e both-JIT ~20 min → 56 s, and a JIT corpus program that
+  effectively hung the e2e gate now runs in 5.7 s in-process. Also raised
+  `commontest-sweep.py --jobs` to default to cores−2 (was a fixed 6), and gave
+  the e2e module test a `KLIO_E2E_SHARD=K/N` selector, a `KLIO_E2E_TRACE`
+  progress print, and an installable `zig build itest-e2e-bin` so the corpus
+  can be driven and bisected as a plain process.
 - 2026-07-04: measurements above; shipped `scripts/commontest-sweep.py`
   (filtered dual-eager sweeps, replaces session-local perfile/perfail),
   `scripts/gate.sh` (one full-gate entry point), `scripts/prune-zig-cache.sh`

@@ -40,6 +40,13 @@ ACTUALS = [
 CHILD_HOME = "/tmp/klio_itest_stdlibtest_home"
 
 
+def default_jobs():
+    """One child per core, less a couple for the driver and the OS. Each child is
+    a whole `klio test` process (its own stdlib load), so the sweep is
+    embarrassingly parallel and the old fixed 6 left most of a big box idle."""
+    return max(2, (os.cpu_count() or 4) - 2)
+
+
 def collect():
     allkt = []
     for dp, _, fns in os.walk(TEST_ROOT):
@@ -190,7 +197,7 @@ def main():
     ap.add_argument("--filter", default=None, help="substring match on target path")
     ap.add_argument("--passes", action="store_true", help="also print per-file pass counts")
     ap.add_argument("--eager", choices=["off", "on", "both"], default="off")
-    ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--jobs", type=int, default=default_jobs())
     ap.add_argument("--home", default=None, help="child HOME (pack install scratch)")
     args = ap.parse_args()
     if args.home:
