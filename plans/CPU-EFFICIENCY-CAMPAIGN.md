@@ -51,25 +51,40 @@ Ground truth comes from two measurements, not from the binary:
 Counter-intuitively the func JIT *halves* the stack: `KLIO_FUNC_JIT=0` drops the
 ceiling from 15.3k to 7.4k (34.7 KB/level interpreted vs 17.6 KB/level JIT'd).
 
-**Done:** outlined the trampoline's BULKY non-call sites (field write, subscript,
-value call, map get/set) out of `LoopTramp.call` — the frame that actually stays
-live across the recursion.
+### There are TWO recursion paths, and they need different fixes
 
-| | max depth | bytes/level | obj-traversal |
-| --- | --- | --- | --- |
-| before | 15,281 | 17,566 B | 1.510 s |
-| after | **17,062** (+11.6%) | **15,732 B** (-12%) | 1.528 s (+1.2%) |
+**Measure both.** A JIT'd function recurses through native code -> `LoopTramp.call`
+-> `callFunc`. A NOT-yet-hot function (or any function with the JIT off) recurses
+through `runFrameInner` -> `execInst`. They share almost no frames, so a fix for
+one can look worthless when measured on the other — which is exactly how the
+`execInst` work was nearly discarded.
 
-The three TINY hot sites (object move, null test, field read) stay INLINE — they
-fire once per JIT'd loop iteration, and outlining them too cost ~3% throughput for
-no extra depth. The outlined helper is tag-gated so a member/func site does not
-pay a call just to be told the site is not one of its kinds.
+Both are now fixed:
 
-**Remaining frames on the path** (Debug frame-walk, innermost first): `callFunc`
-8,864 B, `evalWithCapturesChained` 6,272 B, `composableEval` 5,408 B (paid on
-EVERY call, even non-composable), `maybeRunHotFunc` 2,944 B. Same treatment
-applies; each costs ~1% throughput for ~10% depth, so it is a real trade, not a
-free win.
+| | JIT on (default) | JIT off (interpreter) |
+| --- | --- | --- |
+| before | 15,437 frames — 17,389 B/level | 7,542 frames — **35,592 B/level** |
+| after | **17,117** (+10.9%) — 15,682 B | **18,796** (+149%) — **14,281 B** |
+
+Throughput: the default (JIT-on) path is neutral to slightly FASTER (-0.4% on
+object-traversal, -1.0% on showcase). The JIT-off path pays ~2%.
+
+- **`LoopTramp.call`** (the JIT path): its BULKY non-call sites (field write,
+  subscript, value call, map get/set) are outlined. The three TINY hot sites
+  (object move, null test, field read) stay INLINE — they fire once per JIT'd loop
+  iteration and outlining them cost ~3% throughput for no extra depth. The helper
+  is tag-gated so a member/func site does not pay a call to be told "not mine".
+- **`execInst`** (the interpreter path): all 30 substantial arms are outlined AND
+  `execInst` itself is `noinline`. The `noinline` is required, not cosmetic:
+  outlining the arms alone lets LLVM inline `execInst` into `runFrameInner`, so the
+  arm frame is ADDED rather than substituted and the ceiling gets WORSE (-15%).
+
+The 256 MB `INTERPRET_STACK_SIZE` could now be cut (10k cap x 15.7 KB = 157 MB),
+and worker threads (64 MB each) went from ~1.8k to ~4.5k recursion depth.
+
+**Remaining frames on the JIT path** (Debug frame-walk): `callFunc` 8,864 B,
+`evalWithCapturesChained` 6,272 B, `composableEval` 5,408 B (paid on EVERY call,
+even non-composable), `maybeRunHotFunc` 2,944 B. Same treatment applies.
 
 Tried and reverted (do not re-attempt):
 
