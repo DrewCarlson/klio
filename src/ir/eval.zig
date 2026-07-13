@@ -297,6 +297,13 @@ pub fn currentFuncName() ?[]const u8 {
     return if (frame_chain) |fr| fr.func.name else null;
 }
 
+/// The function the innermost active frame is executing. A bare-name field read
+/// consults it to learn whether the reader is a member-extension body, whose
+/// declaring class is an implicit receiver the read must prefer.
+pub fn currentFrameFunc() ?*const ir.Func {
+    return if (frame_chain) |fr| fr.func else null;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory

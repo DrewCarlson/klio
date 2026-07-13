@@ -1309,6 +1309,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // body — resolve as a global before failing. The member probe never
     // adopts a global: the walk's own terminal arm decides that tier.
     if (!member_probe) {
+        if (try memberExtOwnerRead(self, allocator, receiver, name)) |r| return r;
         {
             const gg = self.globals.borrow();
             defer gg.deinit();
@@ -2072,6 +2073,41 @@ fn resolveExtensionPropImpl(
 /// custom getter (with override rules), raw slot (lateinit / built-in
 /// delegate auto-unwrap), companion/parent walk, outer-chain, enum
 /// entries, nested classes, globals.
+/// A member of the DECLARING class of the member-extension the innermost frame is
+/// executing, read off the instance that made the extension visible.
+///
+/// `fun Dp.toPx(): Float = value * density` is declared inside `interface Density`:
+/// `this` is the `Dp`, and `density` is a member of the enclosing `Density`. That
+/// enclosing receiver is in scope for the body and OUTRANKS a top-level name, so
+/// both global fallbacks below consult it first. Without this, a `density` reachable
+/// as a global -- a lambda's captured parameter, materialised into the global env
+/// when the lambda runs as a real closure -- answered the read, and `Dp.toPx` inside
+/// `with(density) { size.toPx() }` multiplied by the Density OBJECT instead of its
+/// `density: Float`. The probe is member-only, so it cannot recurse back into the
+/// global tiers.
+fn memberExtOwnerRead(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
+    const f = ir.eval.currentFrameFunc() orelse return null;
+    if (f.kind != .member_extension) return null;
+    const owner = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().registry.member_ext_owner_class.get(f.id);
+    } orelse return null;
+    const inst = try vmhost.host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner) orelse return null;
+    if (inst == .Instance and receiver.* == .Instance and
+        ObjRef(InstanceData).ptrEq(inst.Instance, receiver.Instance)) return null;
+    switch (try getMemberField(self, allocator, &inst, name)) {
+        .ok => |v| return ok(v),
+        .err => |e| {
+            if (e == .Unimplemented) {
+                freeFieldMiss(allocator, e);
+                return null;
+            }
+            return errRes(e);
+        },
+    }
+}
+
 fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
@@ -2287,8 +2323,10 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         defer cg.deinit();
         if (cg.get().get(name)) |def| return ok(.{ .Class = def });
     }
-    // Top-level global / module-scoped fallback.
+    // Top-level global / module-scoped fallback. An implicit receiver outranks a
+    // top-level name, so the executing member-extension's declaring class goes first.
     if (!member_probe) {
+        if (try memberExtOwnerRead(self, allocator, receiver, name)) |r| return r;
         const gg = self.globals.borrow();
         defer gg.deinit();
         if (gg.get().lookup(name)) |v| return ok(v);
