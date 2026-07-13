@@ -478,6 +478,14 @@ pub const ProgramImage = struct {
             if (cand.int() == fid.int()) continue;
             const cf = module.funcById(cand) orelse continue;
             if (!cf.hasBody()) continue;
+            // An `actual` declares the same package as its `expect`, so only a
+            // same-package sibling can settle a bodyless decl. A same-named
+            // function in another package is an unrelated declaration: without
+            // this, a call to an `expect` klio does not implement silently ran a
+            // stranger's body (`material3.internal.getString` ran
+            // `foundation.text.getString`), and the caller never learned the
+            // expect was missing.
+            if (!std.mem.eql(u8, cf.package, f.package)) continue;
             try sibs.append(self.allocator, cand);
         }
         if (sibs.items.len != 0) {
@@ -1308,6 +1316,29 @@ fn pushLinkTestFuncParams(m: *Module, a: Allocator, name: []const u8, fqn: []con
     return id;
 }
 
+fn pushLinkTestFuncPkg(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, bodyless: bool) Allocator.Error!FuncId {
+    const id = m.nextFuncId();
+    const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
+    if (!bodyless) {
+        blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    }
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = name,
+        .fqn = fqn,
+        .package = package,
+        .params = &.{},
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = blocks,
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .is_expect = bodyless,
+    });
+    try m.func_index.append(a, .{ .name = name, .id = id });
+    return id;
+}
+
 fn pushLinkTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, bodyless: bool) Allocator.Error!FuncId {
     const id = m.nextFuncId();
     const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
@@ -1377,6 +1408,33 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     }
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+}
+
+test "a bodyless expect never links to a same-named function in another package" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    // An `actual` declares its `expect`'s package. A same-named function in a
+    // DIFFERENT package is an unrelated declaration: linking it would make a call
+    // to an unimplemented `expect` silently run a stranger's body.
+    const expect_fn = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", true);
+    const same_pkg = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", false);
+    _ = try pushLinkTestFuncPkg(&m, a, "getStr", "p2.getStr", "p2", false);
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    try prog.linkResolvedForms(&m);
+
+    const redirects = prog.resolvedRedirects(expect_fn);
+    for (redirects) |r| {
+        const g = m.funcById(r).?;
+        try testing.expectEqualStrings("p1", g.package);
+    }
+    try testing.expectEqual(same_pkg.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
 }
 
 test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, map native" {
