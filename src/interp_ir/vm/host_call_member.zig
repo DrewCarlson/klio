@@ -2194,12 +2194,18 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
         g.deinit();
     }
     var head: usize = 0;
-    const tn = simpleName(target);
+    // Compare SOURCE simple names on both sides. A nested class lifts to a
+    // flat `Outer$Name`, which is what a subclass records as its supertype,
+    // while a parameter declared `Outer.Name` lowers its head to the bare
+    // `Name` — so a raw simple-name compare never matches the two, and every
+    // instance of a lifted nested type failed to prove its own supertype
+    // (`Modifier.Node` against a `SuspendingPointerInputModifierNodeImpl`).
+    const tn = classDisplayName(target);
     while (head < queue.items.len) : (head += 1) {
         const e = queue.items[head];
         if (seen.contains(e.name)) continue;
         seen.put(e.name, {}) catch {};
-        if (std.mem.eql(u8, simpleName(e.name), tn)) return e.depth;
+        if (std.mem.eql(u8, classDisplayName(e.name), tn)) return e.depth;
         const cg = self.classes.borrow();
         const e_key = mangledClassKeyOf(self, e.name) orelse e.name;
         if (cg.get().get(e.name) orelse cg.get().get(e_key)) |d| {
