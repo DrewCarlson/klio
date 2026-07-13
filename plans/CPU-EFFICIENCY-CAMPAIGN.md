@@ -32,12 +32,44 @@ Fixed: `objcell.raceJitterEnabled` reserved a **16 KB** frame on EVERY call —
 `procEnvironHas`'s `[16384]u8` read buffer was inlined into a cached predicate
 that the objcell hot paths call constantly. The cold probe is `noinline` now.
 
-**NOT done, deliberately:** outlining `execInst`'s switch arms. It is the hottest
-code in the interpreter and the refactor is broad, and the only thing it buys is
-a deeper recursion ceiling or a smaller stack reservation — neither of which we
-need today (10k frames matches the JVM's own default). Revisit if we want to
-raise the recursion limit, cut the 256 MB reservation, or run many worker threads
-(each reserves 64 MB, so ~3k recursion depth per worker).
+### The recursion path is NOT what the symbol table suggests
+
+Ranking functions by their `sub %rsp` prologue is **misleading**: it ranks every
+comptime instantiation, including ones never on the hot path. `execInst` looks
+like the worst offender (26,720 B) and outlining its 30 arms changes the recursion
+ceiling by **nothing** — twice measured. Once a function is JIT'd (the default
+`fast` profile enables `jit_func`), the recursive call runs native code ->
+`LoopTramp.call` -> `callFunc`, and **`execInst`/`runFrameInner` are not on the
+path at all**. A frame-pointer walk at depth proves it; a stack probe in
+`runFrameInner` never even fires.
+
+Ground truth comes from two measurements, not from the binary:
+- `KLIO_STACK_PROBE` (a frame-pointer walk at a fixed eval depth) — the exact
+  frames and their sizes.
+- Bisecting the max recursion depth — 256 MB / depth = bytes per interpreted call.
+
+Counter-intuitively the func JIT *halves* the stack: `KLIO_FUNC_JIT=0` drops the
+ceiling from 15.3k to 7.4k (34.7 KB/level interpreted vs 17.6 KB/level JIT'd).
+
+**Done:** outlined the trampoline's BULKY non-call sites (field write, subscript,
+value call, map get/set) out of `LoopTramp.call` — the frame that actually stays
+live across the recursion.
+
+| | max depth | bytes/level | obj-traversal |
+| --- | --- | --- | --- |
+| before | 15,281 | 17,566 B | 1.510 s |
+| after | **17,062** (+11.6%) | **15,732 B** (-12%) | 1.528 s (+1.2%) |
+
+The three TINY hot sites (object move, null test, field read) stay INLINE — they
+fire once per JIT'd loop iteration, and outlining them too cost ~3% throughput for
+no extra depth. The outlined helper is tag-gated so a member/func site does not
+pay a call just to be told the site is not one of its kinds.
+
+**Remaining frames on the path** (Debug frame-walk, innermost first): `callFunc`
+8,864 B, `evalWithCapturesChained` 6,272 B, `composableEval` 5,408 B (paid on
+EVERY call, even non-composable), `maybeRunHotFunc` 2,944 B. Same treatment
+applies; each costs ~1% throughput for ~10% depth, so it is a real trade, not a
+free win.
 
 Tried and reverted (do not re-attempt):
 

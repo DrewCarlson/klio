@@ -1817,6 +1817,142 @@ fn LoopTramp(comptime H: type) type {
             pending_deopt_inst: u32 = 0,
         };
 
+        /// The trampoline's BULKY non-call sites (field write, subscript, value call,
+        /// map get/set). Zig does not reclaim block-scoped stack allocations
+        /// (ziglang/zig#23475), so their locals sat in `call`'s frame — and `call` is
+        /// the frame held LIVE across the interpreter's recursion (once a function is
+        /// JIT'd the recursive call runs native code -> this trampoline -> `callFunc`,
+        /// so `runFrameInner` is not even on the path). Outlining them lifted the
+        /// recursion ceiling ~13%.
+        ///
+        /// The three TINY hot sites (object move, null test, field read) deliberately
+        /// stay inline in `call`: they fire once per JIT'd loop iteration, and
+        /// outlining them too cost ~3% throughput for no extra depth.
+        noinline fn bulkySite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
+        if (site.is_field_set) {
+            const recv = lc.frame.regs.items[site.recv_reg];
+            if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
+            const v = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+            const g = recv.Instance.borrowMut();
+            if (site.field_idx < g.get().fields.items.len) {
+                const old = g.get().fields.items[site.field_idx].value;
+                g.get().fields.items[site.field_idx].value = v;
+                g.deinit();
+                old.release(lc.allocator);
+            } else {
+                g.deinit();
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
+            return 0;
+        }
+        // Object collection subscript: read element `recv[idx]` directly (no
+        // `get` dispatch) and write it into the register. Out-of-range or an
+        // unsupported container deopts; the interpreter re-runs the subscript
+        // (a side-effect-free read) and raises the proper exception on OOB.
+        if (site.is_obj_index) {
+            const recv = lc.frame.regs.items[site.recv_reg];
+            const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+            const idx: i64 = switch (idx_v) {
+                .Int => |x| x,
+                .Long => |x| x,
+                else => {
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                },
+            };
+            if (jit_loop.liveElementAt(recv, idx)) |v| {
+                v.retain();
+                lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT subscript" };
+                    return jit_loop.throwCode(site.block);
+                };
+                return 0;
+            }
+            lc.pending_deopt_inst = site.inst;
+            return jit_loop.deoptCode(site.block);
+        }
+        // Invoke a loop-invariant callable value; the result is discarded.
+        if (site.is_call_value) {
+            if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            const callee = lc.frame.regs.items[site.recv_reg];
+            var argbuf2: [3]Value = undefined;
+            var k2: usize = 0;
+            while (k2 < site.n_args) : (k2 += 1) {
+                const ar = @as(usize, site.args_reg) + k2;
+                argbuf2[k2] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
+            }
+            const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
+                lc.pending = .{ .Type = "out of memory in JIT value call" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (r) {
+                .ok => return 0,
+                .err => |e| {
+                    lc.pending = e;
+                    return jit_loop.throwCode(site.block);
+                },
+            }
+        }
+        // Map store `map[key] = value`; result discarded.
+        if (site.is_map_set) {
+            if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            const m = lc.frame.regs.items[site.recv_reg];
+            const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+            const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+            var names: [2]?[]const u8 = .{ null, null };
+            const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
+                lc.pending = .{ .Type = "out of memory in JIT map store" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (r) {
+                .ok => return 0,
+                .err => |e| {
+                    lc.pending = e;
+                    return jit_loop.throwCode(site.block);
+                },
+            }
+        }
+        // Map load `map[key]` -> nullable scalar (value slot + flag slot).
+        if (site.is_map_get) {
+            if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            const m = lc.frame.regs.items[site.recv_reg];
+            const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+            var names: [1]?[]const u8 = .{null};
+            const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
+                lc.pending = .{ .Type = "out of memory in JIT map load" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (r) {
+                .ok => |v| {
+                    if (v == .Null) {
+                        tctx.slots[site.dst_reg] = 0;
+                        tctx.slots[site.map_flag_slot] = 1;
+                    } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
+                        tctx.slots[site.dst_reg] = sv;
+                        tctx.slots[site.map_flag_slot] = 0;
+                    } else {
+                        // Value is not the cached scalar kind: deopt and re-read.
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    }
+                    return 0;
+                },
+                .err => |e| {
+                    lc.pending = e;
+                    return jit_loop.throwCode(site.block);
+                },
+            }
+        }
+            return null;
+        }
+
         fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
             const tctx: *jit_loop.TrampCtx = @ptrCast(@alignCast(ctx_opaque));
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
@@ -1877,126 +2013,12 @@ fn LoopTramp(comptime H: type) type {
             }
             // Scalar field store: write the value directly into the boxed receiver's
             // stored field (a plain stored property — no custom setter).
-            if (site.is_field_set) {
-                const recv = lc.frame.regs.items[site.recv_reg];
-                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
-                    lc.pending_deopt_inst = site.inst;
-                    return jit_loop.deoptCode(site.block);
-                }
-                const v = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
-                const g = recv.Instance.borrowMut();
-                if (site.field_idx < g.get().fields.items.len) {
-                    const old = g.get().fields.items[site.field_idx].value;
-                    g.get().fields.items[site.field_idx].value = v;
-                    g.deinit();
-                    old.release(lc.allocator);
-                } else {
-                    g.deinit();
-                    lc.pending_deopt_inst = site.inst;
-                    return jit_loop.deoptCode(site.block);
-                }
-                return 0;
-            }
-            // Object collection subscript: read element `recv[idx]` directly (no
-            // `get` dispatch) and write it into the register. Out-of-range or an
-            // unsupported container deopts; the interpreter re-runs the subscript
-            // (a side-effect-free read) and raises the proper exception on OOB.
-            if (site.is_obj_index) {
-                const recv = lc.frame.regs.items[site.recv_reg];
-                const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-                const idx: i64 = switch (idx_v) {
-                    .Int => |x| x,
-                    .Long => |x| x,
-                    else => {
-                        lc.pending_deopt_inst = site.inst;
-                        return jit_loop.deoptCode(site.block);
-                    },
-                };
-                if (jit_loop.liveElementAt(recv, idx)) |v| {
-                    v.retain();
-                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
-                        lc.pending = .{ .Type = "out of memory in JIT subscript" };
-                        return jit_loop.throwCode(site.block);
-                    };
-                    return 0;
-                }
-                lc.pending_deopt_inst = site.inst;
-                return jit_loop.deoptCode(site.block);
-            }
-            // Invoke a loop-invariant callable value; the result is discarded.
-            if (site.is_call_value) {
-                if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
-                if (site.span) |sp| lc.frame.cur_span = sp;
-                const callee = lc.frame.regs.items[site.recv_reg];
-                var argbuf2: [3]Value = undefined;
-                var k2: usize = 0;
-                while (k2 < site.n_args) : (k2 += 1) {
-                    const ar = @as(usize, site.args_reg) + k2;
-                    argbuf2[k2] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
-                }
-                const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
-                    lc.pending = .{ .Type = "out of memory in JIT value call" };
-                    return jit_loop.throwCode(site.block);
-                };
-                switch (r) {
-                    .ok => return 0,
-                    .err => |e| {
-                        lc.pending = e;
-                        return jit_loop.throwCode(site.block);
-                    },
-                }
-            }
-            // Map store `map[key] = value`; result discarded.
-            if (site.is_map_set) {
-                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
-                if (site.span) |sp| lc.frame.cur_span = sp;
-                const m = lc.frame.regs.items[site.recv_reg];
-                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-                const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
-                var names: [2]?[]const u8 = .{ null, null };
-                const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
-                    lc.pending = .{ .Type = "out of memory in JIT map store" };
-                    return jit_loop.throwCode(site.block);
-                };
-                switch (r) {
-                    .ok => return 0,
-                    .err => |e| {
-                        lc.pending = e;
-                        return jit_loop.throwCode(site.block);
-                    },
-                }
-            }
-            // Map load `map[key]` -> nullable scalar (value slot + flag slot).
-            if (site.is_map_get) {
-                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
-                if (site.span) |sp| lc.frame.cur_span = sp;
-                const m = lc.frame.regs.items[site.recv_reg];
-                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-                var names: [1]?[]const u8 = .{null};
-                const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
-                    lc.pending = .{ .Type = "out of memory in JIT map load" };
-                    return jit_loop.throwCode(site.block);
-                };
-                switch (r) {
-                    .ok => |v| {
-                        if (v == .Null) {
-                            tctx.slots[site.dst_reg] = 0;
-                            tctx.slots[site.map_flag_slot] = 1;
-                        } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
-                            tctx.slots[site.dst_reg] = sv;
-                            tctx.slots[site.map_flag_slot] = 0;
-                        } else {
-                            // Value is not the cached scalar kind: deopt and re-read.
-                            lc.pending_deopt_inst = site.inst;
-                            return jit_loop.deoptCode(site.block);
-                        }
-                        return 0;
-                    },
-                    .err => |e| {
-                        lc.pending = e;
-                        return jit_loop.throwCode(site.block);
-                    },
-                }
+            // Gate on the tag before CALLING the outlined helper: a member/func site
+            // must not pay a call just to be told the site is not one of these.
+            if (site.is_field_set or site.is_obj_index or site.is_call_value or
+                site.is_map_set or site.is_map_get)
+            {
+                if (bulkySite(tctx, lc, cl, site)) |code| return code;
             }
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
