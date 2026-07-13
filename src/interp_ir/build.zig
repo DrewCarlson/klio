@@ -2002,6 +2002,7 @@ fn buildModuleWithOverrides(
                 .capture_order = &.{},
                 .implicit_label = null,
                 .low_priority = ir.lower.decl.isLowPriorityOverload(f),
+                .is_expect = f.is_expect,
             });
             try module.func_index.append(a, .{ .name = f.name.name, .id = id });
             try module.recordFuncDeclSpan(a, f.name.span, id);

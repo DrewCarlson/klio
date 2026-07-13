@@ -478,6 +478,14 @@ pub const ProgramImage = struct {
             if (cand.int() == fid.int()) continue;
             const cf = module.funcById(cand) orelse continue;
             if (!cf.hasBody()) continue;
+            // An `actual` declares the same package as its `expect`, so only a
+            // same-package sibling can settle a bodyless decl. A same-named
+            // function in another package is an unrelated declaration: without
+            // this, a call to an `expect` klio does not implement silently ran a
+            // stranger's body (`material3.internal.getString` ran
+            // `foundation.text.getString`), and the caller never learned the
+            // expect was missing.
+            if (!std.mem.eql(u8, cf.package, f.package)) continue;
             try sibs.append(self.allocator, cand);
         }
         if (sibs.items.len != 0) {
@@ -629,17 +637,31 @@ pub const SpinMutex = runtime.SpinMutex;
 /// write through this so concurrent `println` is serialized; on
 /// completion the recorded calls replay into the caller's real sink.
 ///
-/// A thin handle over `ObjRef(RecordingSink)` — the same shared cell
-/// `ThreadTable` is built on. Every access takes the cell's reader/writer
-/// lock's exclusive `borrowMut`, serializing concurrent writes exactly as
-/// the prior hand-rolled mutex did.
+/// The program's output sink, shared by every thread. A thin handle over an
+/// `ObjRef` cell — the same shared cell `ThreadTable` is built on — so every
+/// write takes the cell's exclusive `borrowMut` and concurrent writes serialize.
+///
+/// Writes STREAM to the destination as they happen. A script runtime has to:
+/// `python x.py` and `node x.js` print as they go, and so must klio. Output
+/// withheld until exit is output a hanging, looping, or killed program never
+/// shows — and a long run would hold its entire output in memory besides.
+///
+/// The recording arm survives for the callers that attach no destination (the
+/// in-process harnesses that compare a whole run): with `dest` null the sink
+/// records, and `replayInto` drains it. `attach` flushes whatever was recorded
+/// before the destination was known — a top-level initializer runs before the
+/// run is handed its sink — and streams from then on.
 pub const SharedOutput = struct {
-    obj: ObjRef(runtime.RecordingSink),
+    obj: ObjRef(State),
+
+    pub const State = struct {
+        /// Where writes go. Null until `attach`: record instead.
+        dest: ?Output = null,
+        rec: runtime.RecordingSink,
+    };
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedOutput {
-        const obj = try ObjRef(runtime.RecordingSink).init(allocator, runtime.RecordingSink.init(allocator));
-        // Shared across every thread of the program from creation; all
-        // writes serialize through the cell's exclusive lock.
+        const obj = try ObjRef(State).init(allocator, .{ .rec = runtime.RecordingSink.init(allocator) });
         return .{ .obj = obj };
     }
 
@@ -651,23 +673,39 @@ pub const SharedOutput = struct {
         self.obj.deinit();
     }
 
+    /// Stream every write from here on straight to `out`, after flushing
+    /// anything recorded before the destination was known.
+    pub fn attach(self: SharedOutput, out: Output) void {
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const st = g.get();
+        st.rec.replayInto(out);
+        st.dest = out;
+    }
+
+    /// Drain the recording into `out`. A no-op once a destination is attached —
+    /// those writes already went straight there.
     pub fn replayInto(self: SharedOutput, out: Output) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().replayInto(out);
+        const st = g.get();
+        if (st.dest != null) return;
+        st.rec.replayInto(out);
     }
 
     fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
         const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().output().writeln(s);
+        const st = g.get();
+        if (st.dest) |d| d.writeln(s) else st.rec.output().writeln(s);
     }
     fn vtWrite(ctx: *anyopaque, s: []const u8) void {
         const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().output().write(s);
+        const st = g.get();
+        if (st.dest) |d| d.write(s) else st.rec.output().write(s);
     }
 
     const vtable: Output.VTable = .{ .writeln = vtWriteln, .write = vtWrite };
@@ -690,15 +728,6 @@ pub const ClosureInfo = struct {
     /// anon-method table or the run arena).
     module: ?*const ir.Module = null,
     n_params: usize,
-    /// The body's sole declared parameter is a parser-synthesized `it` that the
-    /// lowering could not drop (the callee lives in another pack, so its
-    /// signature was invisible), but the runtime binder saw the parameter's
-    /// declared type at the call and proved this is a `T.() -> R` receiver
-    /// lambda. Its EFFECTIVE value arity is therefore `n_params - 1`: the
-    /// invoke paths bind arg0 as the receiver, and the dead `it` slot pads to
-    /// Null. A valid program's receiver-lambda body cannot reference `it`
-    /// (kotlinc rejects it), so nothing observes the padding.
-    recv_lambda: bool = false,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,
     /// Live capture values. Stored behind a shared interior-mutable
@@ -823,17 +852,6 @@ pub const SharedClosures = struct {
         const list = g.get();
         if (id >= list.items.len) return null;
         return list.items[id];
-    }
-
-    /// Mark slot `id` a receiver lambda (see `ClosureInfo.recv_lambda`). Taken
-    /// under the spine's writer lock. Idempotent: the same lambda site is always
-    /// bound to the same parameter, so the mark is a stable property of the slot.
-    pub fn markRecvLambda(self: SharedClosures, id: usize) void {
-        const g = self.obj.borrowMut();
-        defer g.deinit();
-        const list = g.get();
-        if (id >= list.items.len) return;
-        list.items[id].recv_lambda = true;
     }
 
     /// In-place slot pointer for the stop-the-world GC mark/sweep only. The
@@ -1328,6 +1346,29 @@ fn pushLinkTestFuncParams(m: *Module, a: Allocator, name: []const u8, fqn: []con
     return id;
 }
 
+fn pushLinkTestFuncPkg(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, bodyless: bool) Allocator.Error!FuncId {
+    const id = m.nextFuncId();
+    const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
+    if (!bodyless) {
+        blocks[0] = .{ .id = ir.BlockId.from(0), .insts = &.{}, .terminator = .{ .Return = null } };
+    }
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = name,
+        .fqn = fqn,
+        .package = package,
+        .params = &.{},
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = blocks,
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .is_expect = bodyless,
+    });
+    try m.func_index.append(a, .{ .name = name, .id = id });
+    return id;
+}
+
 fn pushLinkTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, bodyless: bool) Allocator.Error!FuncId {
     const id = m.nextFuncId();
     const blocks = try a.alloc(ir.Block, if (bodyless) 0 else 1);
@@ -1397,6 +1438,33 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     }
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+}
+
+test "a bodyless expect never links to a same-named function in another package" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    // An `actual` declares its `expect`'s package. A same-named function in a
+    // DIFFERENT package is an unrelated declaration: linking it would make a call
+    // to an unimplemented `expect` silently run a stranger's body.
+    const expect_fn = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", true);
+    const same_pkg = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", false);
+    _ = try pushLinkTestFuncPkg(&m, a, "getStr", "p2.getStr", "p2", false);
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    try prog.linkResolvedForms(&m);
+
+    const redirects = prog.resolvedRedirects(expect_fn);
+    for (redirects) |r| {
+        const g = m.funcById(r).?;
+        try testing.expectEqualStrings("p1", g.package);
+    }
+    try testing.expectEqual(same_pkg.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
 }
 
 test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, map native" {

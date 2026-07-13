@@ -2144,16 +2144,6 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             f.is_suspend = true;
         }
     }
-    // The parser-synthesized `it` survived because the expected arity was
-    // UNKNOWN (a cross-pack callee is absent from this module's name index).
-    // Record that, so the runtime binder — which does see the parameter's
-    // declared type at the call — can repair a receiver lambda that kept an
-    // `it` it should never have had.
-    if (lam.implicit_it and !suppress_it and expected_arity == -1) {
-        if (b.module.funcByIdMut(body_func)) |f| {
-            f.implicit_it = true;
-        }
-    }
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
 
@@ -2348,8 +2338,45 @@ fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count
     return false;
 }
 
+/// The class MEMBER that hosts a trailing lambda for a bare call, reached
+/// owner-scoped through `member_method_fids`. `Module.func_name_index` indexes
+/// only TOP-LEVEL functions, so a bare call to a member (`onDrawWithContent { … }`
+/// inside a `CacheDrawScope` extension) could not reach its signature at lower
+/// time: the trailing lambda's expected arity came back unknown and a
+/// `T.() -> R` receiver lambda kept the parser's synthetic `it`, which then
+/// swallowed the receiver at invocation.
+///
+/// The candidate classes are the enclosing owner and the declared extension
+/// receiver, each walked up its supertype chain — the member may be declared on
+/// a supertype of the receiver we are lowering against.
+fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
+    var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
+    if (b.recvTy()) |rt| roots[1] = rsplitLast(rt, '.');
+    for (roots) |root_opt| {
+        const root = root_opt orelse continue;
+        // The class itself, then its transitive supertype names (nearest first).
+        const supers: []const []const u8 = b.module.registry.class_super_names.get(root) orelse &.{};
+        var i: usize = 0;
+        while (i < 1 + supers.len) : (i += 1) {
+            const cls = if (i == 0) root else supers[i - 1];
+            const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ cls, name, user_arg_count }) catch return null;
+            defer b.allocator.free(key);
+            const fid = b.module.registry.member_method_fids.get(key) orelse continue;
+            const f = b.module.funcById(fid) orelse continue;
+            if (f.params.len == 0) continue;
+            const last = f.params[f.params.len - 1];
+            if (last.is_vararg) continue;
+            // Only a function-typed last parameter hosts a trailing lambda.
+            if (fnTypeArityAlias(b, last.ty) == null) continue;
+            return fid;
+        }
+    }
+    return null;
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
-    const list = b.module.func_name_index.get(name) orelse return null;
+    const list = b.module.func_name_index.get(name) orelse
+        return memberHostingTrailingLambda(b, name, user_arg_count);
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
@@ -2377,7 +2404,8 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         }
         return fid;
     }
-    return null;
+    // No top-level function serves the name at this arity: it may be a member.
+    return memberHostingTrailingLambda(b, name, user_arg_count);
 }
 
 /// Whether any argument in the call is passed by name.

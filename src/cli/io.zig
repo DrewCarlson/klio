@@ -11,15 +11,36 @@ const std = @import("std");
 const runtime = @import("runtime");
 const Output = runtime.Output;
 
+/// One process-wide `Io` for stdio. Program output streams through here once per
+/// `println`, so building (and tearing down) a `std.Io.Threaded` per call — as
+/// this did — put a thread-pool init on every line a script prints.
+var stdio_mutex: runtime.SpinMutex = .{};
+var stdio_threaded: ?std.Io.Threaded = null;
+
+fn stdioIo() std.Io {
+    if (stdio_threaded == null) stdio_threaded = .init(std.heap.page_allocator, .{});
+    return stdio_threaded.?.io();
+}
+
 fn writeFile(file: std.Io.File, data: []const u8) void {
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const tio = threaded.io();
-    file.writeStreamingAll(tio, data) catch {};
+    stdio_mutex.lock();
+    defer stdio_mutex.unlock();
+    file.writeStreamingAll(stdioIo(), data) catch {};
 }
 
 pub fn writeStdout(s: []const u8) void {
     writeFile(std.Io.File.stdout(), s);
+}
+
+/// `s` followed by a newline, in ONE write: a line is the unit a reader expects
+/// to see whole, and splitting it doubled the syscalls.
+pub fn writeStdoutLine(s: []const u8) void {
+    stdio_mutex.lock();
+    defer stdio_mutex.unlock();
+    const io = stdioIo();
+    const f = std.Io.File.stdout();
+    f.writeStreamingAll(io, s) catch {};
+    f.writeStreamingAll(io, "\n") catch {};
 }
 
 pub fn writeStderr(s: []const u8) void {
@@ -102,8 +123,7 @@ pub fn printStderr(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anyty
 pub const StdoutSink = struct {
     fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
         _ = ctx;
-        writeStdout(s);
-        writeStdout("\n");
+        writeStdoutLine(s);
     }
     fn vtWrite(ctx: *anyopaque, s: []const u8) void {
         _ = ctx;

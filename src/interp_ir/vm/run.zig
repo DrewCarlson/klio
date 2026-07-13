@@ -355,6 +355,10 @@ pub fn gcRegisterVm(vm: *const Vm) void {
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     gcRegisterVm(self);
+    // Stream program output from here on: a run that hangs, loops, or is killed
+    // must still show what it printed. `replayInto` below is then a no-op,
+    // except for a caller that attaches nothing (the capture harnesses).
+    self.out_sink.attach(out);
     // Close the permanent generation: everything minted up to here (the stdlib
     // image, the program's class/IR graph, the empty global/class tables) is
     // immortal and reference-stable; cells minted from here on are nursery and
@@ -642,10 +646,10 @@ pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocat
 }
 
 /// Prepare the Vm, run `body` (which invokes entry points via the call
-/// helpers above), then drain workers and replay buffered output into `out`.
-/// Returns a startup `VmError` if preparation failed (in which case `body`
-/// does not run). The shared output sink mirrors the `main` run path: writes
-/// during `body` accumulate and are replayed in order on completion.
+/// helpers above), then drain workers. Returns a startup `VmError` if
+/// preparation failed (in which case `body` does not run). The shared output
+/// sink mirrors the `main` run path: writes during `body` stream to `out` as
+/// they happen.
 pub fn vmRunCalls(
     self: *Vm,
     out: Output,
@@ -654,6 +658,7 @@ pub fn vmRunCalls(
     comptime body: fn (Ctx, *Vm) Allocator.Error!void,
 ) Allocator.Error!?VmError {
     gcRegisterVm(self);
+    self.out_sink.attach(out);
     runtime.gc.alloc_perm = false;
     runtime.gc.program_started = true;
     vmhost.coroutines.gcThreadEnter();
