@@ -76,6 +76,7 @@ Run any program with:
 | `dsl_dotted_head.kt`          | Dotted-head resolution inside receiver lambdas: a package-qualified head (`kotlin.math.*`) flattens to a global while a receiver-member dotted access walks `this`. |
 | `vararg_spread.kt`            | `vararg` and the spread operator.                           |
 | `deep_call_chain.kt`         | A 40-deep method-call chain (`sb.append(x).append(x)…`) — a type-checker regression guard: re-typing the receiver at each level was O(2^depth). |
+| `ctor_trailing_lambda.kt`   | Kotlin binds a trailing lambda to the LAST parameter whatever gap the named arguments leave: `Panel("p", n = 11) { … }` fills `content` and defaults `flag`. A constructor must agree with a function here — the constructor's named binder used to drop the block into the first free slot and shift everything after it. |
 | `ctor_vs_factory.kt`         | A class with a same-named factory that fills a default parameter — a single-arg call (`Packed(3f)`) must pick the factory, not the value-class constructor. |
 | `ctor_default_companion.kt`  | A primary-constructor default value reading a companion-object member (`cap = DefaultCap`, like androidx `Stroke`) resolves against the companion, not a null `this`; a default reading a previous parameter resolves by name. |
 | `qualified_object.kt`        | A package-qualified reference to an `object` (`demo.Config`) resolves to the one singleton — identical to the bare name, with writes visible through both — not a separate class classifier. |

@@ -1120,9 +1120,44 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         var reordered = try allocator.alloc(?Value, n);
         defer allocator.free(reordered);
         for (reordered) |*slot| slot.* = null;
+        // Kotlin binds a TRAILING LAMBDA to the LAST parameter, whatever gap the
+        // named arguments leave in between: `B("b", n = 11) { }` against
+        // `B(label, flag = …, n = …, content)` puts the block in `content` and
+        // defaults `flag`. The plain positional walk below would instead drop it
+        // into the first free slot (`flag`) and shift everything after it — the
+        // named function path already handles this (`padArgsWithDefaults`), the
+        // constructor path did not.
+        const trailing_slot: ?usize = blk: {
+            if (n == 0 or args.len == 0) break :blk null;
+            const last = args.len - 1;
+            if (arg_names[last] != null) break :blk null;
+            if (!isCallableArg(&args[last])) break :blk null;
+            // The last parameter must be the function-typed one, and must not
+            // already be claimed by name.
+            for (arg_names) |an| {
+                if (an) |nm| {
+                    if (std.mem.eql(u8, nm, primary_names.items[n - 1])) break :blk null;
+                }
+            }
+            // Read the last parameter's LOWERED type off the IR class: the
+            // `ClassDef` is not always reachable by name from every build path,
+            // and the IR class is the same table `primary_names` came from.
+            const mg2 = self.module.borrow();
+            defer mg2.deinit();
+            const irc = mg2.get().classes.items[class.int()];
+            if (n - 1 >= irc.primary_params.len) break :blk null;
+            if (!std.mem.startsWith(u8, irc.primary_params[n - 1].ty.name, "Function")) break :blk null;
+            break :blk n - 1;
+        };
         var next_pos: usize = 0;
         var overflow = false;
         for (args, 0..) |v, i| {
+            if (trailing_slot) |ts| {
+                if (i == args.len - 1) {
+                    reordered[ts] = v;
+                    continue;
+                }
+            }
             if (arg_names[i]) |nm| {
                 for (primary_names.items, 0..) |p, idx| {
                     if (std.mem.eql(u8, p, nm)) {
@@ -1145,6 +1180,17 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
             for (reordered, 0..) |slot, idx| {
                 if (slot != null) continue;
                 const has_default = blk: {
+                    // The IR class is the authority: `ClassDef` is not reachable
+                    // by name from every build path (it is null under the parity
+                    // harness), and treating that as "no default" made a
+                    // satisfiable named call fall through to the positional
+                    // fallback, which scrambled the binding.
+                    {
+                        const mg2 = self.module.borrow();
+                        defer mg2.deinit();
+                        const irc = mg2.get().classes.items[class.int()];
+                        if (idx < irc.primary_params.len and irc.primary_params[idx].has_default) break :blk true;
+                    }
                     if (class_def) |d| {
                         const dg = d.borrow();
                         defer dg.deinit();

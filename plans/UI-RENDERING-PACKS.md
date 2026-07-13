@@ -129,9 +129,19 @@ in a live window is also open (material-ripple is vendored).
 
 ### 3. Known interpreter roots still open
 
-- **`@Composable` trailing CONSTRUCTOR lambda** misbinds the constructor's other
-  arguments (plain lambdas are fine). `KlioComposeScene` works around it with
-  `setContent`.
+- **~~`@Composable` trailing CONSTRUCTOR lambda misbinds the other arguments~~ — FIXED.**
+  The note misattributed it: nothing to do with `@Composable`, and plain lambdas were
+  equally broken. A CONSTRUCTOR call combining a named argument that skips a defaulted
+  parameter with a trailing lambda (`Panel("p", n = 11) { … }`) dropped the block into the
+  first free slot (`flag`) and shifted everything after it. Kotlin binds a trailing lambda
+  to the LAST parameter whatever gap the names leave — the named FUNCTION path already did
+  this, the constructor path did not. Two supporting bugs fell out: the constructor binder
+  asked `ClassDef` whether a skipped parameter has a default, but `ClassDef` is not
+  reachable by name from every build path (it is null under the parity harness), so a
+  satisfiable named call fell through to the positional fallback. Both the default check
+  and the parameter type now come off the IR class. Locked by
+  `examples/ctor_trailing_lambda.kt`. `KlioComposeScene` can drop its `setContent`
+  workaround.
 - **PUBLIC cross-package top-level name collisions** — `internal` ones now lift mangled
   with a package-scoped rename channel; the public case waits on the symbol index and
   import channels resolving renamed classifiers (resolution-unification).
