@@ -289,52 +289,58 @@ inapplicable against a `Modifier.Node`, so the member walk missed and the pointe
 died. `instanceSubtypeDistance` now compares through `classDisplayName`, the same
 lift-mangle strip `applicability`'s evidence head already applies.
 
-**OPEN — a reified `T` the splice fails to substitute resolves through a GLOBAL.**
-`realclick` no longer crashes, but the FIRST pointer event is always dropped (every
-later one lands: 4 clicks -> 3). `fclick` had the same off-by-one, masked because it
-clicked twice and only asserted a non-zero count.
+**FIXED — a reified inline splice had no receiver evidence from a class member.**
+`realclick` rendered but every FIRST pointer event was dropped (4 clicks -> 3;
+`fclick` had the same off-by-one, masked because it clicked twice and only
+asserted a non-zero count).
 
 Chain: `HitPathTracker.Node.buildCache` calls
 `modifierNode.dispatchForKind(Nodes.PointerInput) { coordinates = it.layoutCoordinates }`.
-That yields nothing, so `coordinates` stays null, `buildCache` reports "not hit", and
-`dispatchChanges` dispatches to no one. Inside `dispatchForKind` the walk turns on
-`node is T` -- and for the SAME `ClickableNode` object at the SAME call site it answers
-false on the first event and true on every one after.
+`dispatchForKind` walks the node chain on `node is T`, and for the SAME
+`ClickableNode` at the SAME call site it answered false on the first event and
+true on every one after. The cause: 70 `is` checks ran against the LITERAL type
+name `T`. When an inline reified function is SPLICED, lowering substitutes `T`
+with the real class; when it is NOT, the body lowers standalone with the bare
+name, and `host_classes.instanceOf` resolves it through a PROCESS-GLOBAL keyed
+by `T` -- written and restored by unrelated calls, so the answer is
+order-dependent (unbound it accepts any non-null value; stale it tests against
+whatever class another splice left behind).
 
-The root: 70 `is` checks run against the LITERAL type name `T`. The reified
-substitution never happened for them, and `host_classes.instanceOf` then resolves the
-bare name through a PROCESS-GLOBAL keyed by `T` (`lookupGlobal(self, "T")`). That
-global is written and restored by unrelated calls, so the answer is order-dependent:
-unbound it means "true for any non-null", stale it tests against whatever class some
-other splice left behind. `ClickableNode is PointerInputModifierNode` is only reached
-when the substitution DID happen (27 such walks, all correct).
+The splice bailed because receiver-type inference for an inline call consulted
+only locals and parameters. `modifierNode` is a primary-ctor `val`, so the call
+had NO receiver type, and `dispatchForKind`'s two overloads can only be told
+apart by the receiver -- no declaration was found, the splice fell back to a
+plain member dispatch, and the reified argument died with it. Unspliced, the
+node's coordinates were never read, it reported itself "not hit", and the event
+dispatched to no one.
 
-Why the substitution is missing here: the reified splice gate (`src/ir/lower/expr.zig`,
-the `callee.* == .Member` gate feeding `inline_call.argsBindAllReified`) opens for the
-2-arg `dispatchForKind` at this site (`owner=Node$f603 nargs=2 bindAll=true`), but the
-2-arg overload's body is `= dispatchForKind(kind, false, block)` -- a BARE call on the
-implicit receiver, whose `is T` lives in the 3-arg overload. No nested lowering for
-that bare call is observed under `Node$f603` (unlike `NodeCoordinator` /
-`LayoutNodeDrawScope`, which do splice it), so the outer splice appears to decline
-after the gate opens and the call falls back to a runtime dispatch of the standalone
-3-arg body, where `T` is never bound.
+`inferReceiverType` now falls back to `ownerMemberDeclType`, which searches the
+enclosing class and its supertypes for a primary-constructor `val` or a body
+property. Clicks land on the first press: the interactive scenes report 2 of 2.
+Guarded by `examples/reified_inline_property_receiver.kt`, which without the fix
+lets a `Square` answer to a `Kind<Circle>`.
 
-Next step: find why the member splice declines for the `Node$f603` (file-private
-lifted) owner after `argsBindAllReified` returns true. The durable fix is to stop
-resolving a reified type parameter through a global at all: `Inst.Call` already carries
-`type_args` and `host_call_func` binds them for the duration of a call, but
-`Inst.CallMember` has no `type_args` field, so an unspliced member call to a reified
-inline function has no way to pass `T`.
+The process-global that `is T` falls back to is still unsound in principle (an
+unspliced reified call has no way to carry its type argument: `Inst.Call` has a
+`type_args` field, `Inst.CallMember` does not). No live call reaches it now, so
+it is a latent hazard rather than an active bug.
 
-**OPEN — an imported bodyless `expect` loses to an unimported same-named function.**
-`TimePicker.kt` imports `androidx.compose.material3.internal.getString` (an `expect`
-with no actual in klio). Linking foundation's skiko `ContextMenuStrings` actual added
-an `androidx.compose.foundation.text.getString`, and the resolver then reported the
-material3 call UNRESOLVED, naming foundation's as the only candidate: the imported
-bodyless declaration was not ranked at all. A module carrying resolve diags cannot be
-baked (`moduleToImage` refuses), so material3 silently fell back to re-lowering from
-source on every run. The strings actual is unlinked for now (klio's `ContextMenuArea`
-is content-only, so nothing calls it) -- the resolver is the bug. Suspect
-`resolveBareCallIndexed`: a bodyless candidate is rankable only when
-`stubDeclArity` has it, so check whether `decl_user_arity` survives the pack merge's
-FuncId remap.
+**FIXED — an `actual` superseded every same-named `expect` in the program.**
+Kotlin requires an `actual` to declare its `expect`'s package, but the supersede
+pass matched the pair by SIMPLE NAME. Linking foundation's
+`androidx.compose.foundation.text.getString` actual therefore deleted
+`androidx.compose.material3.internal.getString`'s unrelated expect from the
+symbol table; material3's own callers import that expect by name, so the only
+candidate left was foundation's, in a package they do not import, and every
+material3 scene failed to lower with an unresolved reference. The actual set is
+keyed by FQN now.
+
+Second root on the same call: the runtime overload re-pick (`pickOverload`)
+ranks the candidates lowering could not tell apart from the argument shapes; it
+is not a second scope resolution. A bodyless target has no signature to score,
+so any body-bearing namesake anywhere in the program outranked it by default and
+the call silently ran a stranger's body instead of reporting the missing actual.
+A candidate outside a bodyless target's package is no longer considered.
+
+The context-menu strings actual is linked again -- it had been unlinked to dodge
+the first root. Both shapes are pinned in `src/itests/resolve_ambiguity.zig`.
