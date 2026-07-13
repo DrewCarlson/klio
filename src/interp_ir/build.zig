@@ -1361,7 +1361,17 @@ fn buildModuleWithOverrides(
     defer actual_prop_names.deinit();
     for (all_decls.items) |*d| {
         switch (d.*) {
-            .Function => |*f| if (f.is_actual) try actual_func_names.put(f.name.name, {}),
+            // An `actual` supersedes the `expect` it implements, which Kotlin
+            // requires to share its package: key the function set by FQN, not
+            // by simple name. Keyed by name, ANY actual killed EVERY same-named
+            // expect in the program — `foundation.text.getString`'s actual
+            // dropped `material3.internal.getString`'s unrelated expect, and
+            // material3's own calls then saw no candidate but foundation's, in
+            // a package they do not import.
+            .Function => |*f| if (f.is_actual) {
+                const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+                try actual_func_names.put(fqn, {});
+            },
             .Class => |*c| if (c.is_actual) try actual_class_names_set.put(c.name.name, {}),
             .Object => |*o| if (o.is_actual) try actual_object_names_set.put(o.name.name, {}),
             .Property => |p| if (p.is_actual) try actual_prop_names.put(p.name.name, {}),
@@ -3699,8 +3709,11 @@ fn retainDecl(
             // one complete declaration table and never needs to know the
             // body is native.
             if (!f.is_expect) return true;
-            if (actual_func_names.contains(f.name.name)) return false;
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+            // Superseded only by an `actual` in its OWN package (see the set's
+            // construction): a same-named actual elsewhere implements a
+            // different declaration.
+            if (actual_func_names.contains(fqn)) return false;
             // Expect-with-implementation drops remain — the next no-holes
             // slice. Retaining them requires the link to bind each header
             // under its LOWERED fqn, and the registry's member-form

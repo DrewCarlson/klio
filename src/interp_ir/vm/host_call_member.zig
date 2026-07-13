@@ -2194,12 +2194,18 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
         g.deinit();
     }
     var head: usize = 0;
-    const tn = simpleName(target);
+    // Compare SOURCE simple names on both sides. A nested class lifts to a
+    // flat `Outer$Name`, which is what a subclass records as its supertype,
+    // while a parameter declared `Outer.Name` lowers its head to the bare
+    // `Name` — so a raw simple-name compare never matches the two, and every
+    // instance of a lifted nested type failed to prove its own supertype
+    // (`Modifier.Node` against a `SuspendingPointerInputModifierNodeImpl`).
+    const tn = classDisplayName(target);
     while (head < queue.items.len) : (head += 1) {
         const e = queue.items[head];
         if (seen.contains(e.name)) continue;
         seen.put(e.name, {}) catch {};
-        if (std.mem.eql(u8, simpleName(e.name), tn)) return e.depth;
+        if (std.mem.eql(u8, classDisplayName(e.name), tn)) return e.depth;
         const cg = self.classes.borrow();
         const e_key = mangledClassKeyOf(self, e.name) orelse e.name;
         if (cg.get().get(e.name) orelse cg.get().get(e_key)) |d| {
@@ -3406,11 +3412,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // iterator is mutable only when the source list is.
         return .{ .ok = .{ .Iterator = .{
             .items = receiver.List.items.clone(),
-            .pos = try ObjRef(usize).init(allocator, start), .last_ret = try ObjRef(i64).init(allocator, -1),
+            .cursor = try newCursor(allocator, start, cap.exp_mod),
             .prim = null,
             .mod_count = cap.mod_count,
-            .exp_mod = cap.exp_mod,
-            .mutable = receiver.List.mutable and receiver.List.backing == null and
+                        .mutable = receiver.List.mutable and receiver.List.backing == null and
                 !stdlib.implementations.collections.modCountFrozen(receiver.List.mod_count),
         } } };
     }
@@ -3675,6 +3680,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (args.len == 0 and receiver.* == .IrClosure) {
             if (try kfunctionReflection(self, allocator, receiver, name)) |r| return r;
         }
+        if (try samMemberExtOnCallable(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // PropertyRef invocation.
@@ -3955,6 +3961,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // the extension fallback has no candidate — the stored lambda
         // serves the call with the receiver bound as its `this`.
         if (try enclosingSamMemberExtDispatch(self, allocator, receiver, name, args)) |r| return r;
+        // The same shape with the lambda UNWRAPPED: `with(measurePolicy) { measure(…) }`
+        // where the policy is the trailing lambda of `Layout(modifier, content) { … }`.
+        // No SAM instance was built, so the receiver tower carries the raw closure and
+        // the arm above (which looks for `__sam_target__`) has nothing to find.
+        if (try enclosingSamLambdaDispatch(self, allocator, receiver, name, args)) |r| return r;
         // An enclosing anonymous-object instance whose site declares a
         // MEMBER-EXTENSION override accepting this receiver
         // (`with(verticalArrangement) { measureScope.arrange(...) }` where
@@ -4058,7 +4069,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             // pays the property-resolution machinery.
             const pg = self.prog.borrow();
             defer pg.deinit();
-            break :blk pg.get().getter_prop_names.contains(name);
+            break :blk pg.get().getter_prop_names.contains(name) and
+                receiverPropCanHoldCallable(self, receiver, name);
         }) {
             const pr = try host_fields.getMemberField(self, allocator, receiver, name);
             if (missTraceWant(name)) {
@@ -4690,14 +4702,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // map modification); only a genuinely read-only list snapshots.
             if (l.mutable and !stdlib.implementations.collections.modCountFrozen(l.mod_count)) {
                 const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
             // source (the map) fails the iterator fast.
             const items = try cloneItemsList(allocator, l.items);
             const cap = try captureModCount(allocator, l.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
         },
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
@@ -4708,13 +4720,13 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // genuinely read-only set yields a read-only iterator.
             if (s.mutable and !stdlib.implementations.collections.modCountFrozen(s.mod_count)) {
                 const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
             const items = try cloneItemsList(allocator, s.items);
             const cap = try captureModCount(allocator, s.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
         },
         .Map => |m| {
             const g = m.entries.borrow();
@@ -4739,14 +4751,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             }
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = live } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = live } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = arr.prim } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = arr.prim } } };
         },
         .String => |s| {
             const g = s.borrow();
@@ -4754,7 +4766,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             var items: std.ArrayList(Value) = .empty;
             const view = std.unicode.Utf8View.init(g.get().bytes) catch {
                 for (g.get().bytes) |b| try items.append(allocator, .{ .Char = b });
-                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
+                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = null } } };
             };
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
@@ -4766,7 +4778,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                     try items.append(allocator, .{ .Char = @intCast(0xDC00 + (v2 & 0x3FF)) });
                 }
             }
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = null } } };
         },
         else => return null,
     }
@@ -5200,6 +5212,65 @@ fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver:
     return null;
 }
 
+threadlocal var sam_ext_memo_name: ?[]const u8 = null;
+threadlocal var sam_ext_memo_ty: ?[]const u8 = null;
+
+/// The extension-receiver type of `name` when some `fun interface` declares it as
+/// its abstract member-EXTENSION method, else null. `fun interface MeasurePolicy`
+/// declares `fun MeasureScope.measure(measurables, constraints)`, so `measure`
+/// answers `MeasureScope`.
+fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
+    if (sam_ext_memo_name) |n| {
+        if (std.mem.eql(u8, n, name)) return sam_ext_memo_ty;
+    }
+    var found: ?[]const u8 = null;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        var it = mg.get().registry.iface_member_ext_recv.iterator();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.key_ptr.b, name)) continue;
+            // Only a FUN interface can be served by a lambda. An ordinary
+            // interface's abstract member extension (`Density.toPx`) never is, and
+            // matching one would hand the call to whatever same-arity lambda happens
+            // to sit on the receiver tower -- every no-arg `toPx()` would find some
+            // `() -> Unit` content lambda.
+            if (!classIsFunInterface(self, e.key_ptr.a)) continue;
+            found = e.value_ptr.*;
+            break;
+        }
+    }
+    sam_ext_memo_name = name;
+    sam_ext_memo_ty = found;
+    return found;
+}
+
+/// Dispatch `name(args)` where the dispatch receiver is a LAMBDA that was SAM-converted
+/// to a fun interface whose abstract method is a member extension.
+///
+/// `with(measurePolicy) { measure(measurables, constraints) }` is the shape: when the
+/// policy came from `Layout(modifier, content) { measurables, constraints -> … }` the
+/// receiver is the lambda itself, and the lambda IS the method body. Without this arm
+/// the callable had no member of that name, and the walk fell through to a
+/// same-named member extension on an unrelated class -- every SAM-lambda layout ran
+/// `BasicText`'s private `EmptyMeasurePolicy`, which sizes to the incoming
+/// constraints, so a text field measured itself to the unbounded scroll height.
+///
+/// The extension receiver comes off the enclosing tower: the innermost `this` that
+/// implements the interface method's declared receiver type (the coordinator, a
+/// `MeasureScope`).
+fn samMemberExtOnCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const recv_ty = samAbstractExtRecvType(self, name) orelse return null;
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        if (!receiverImplementsType(self, &e.v, recv_ty)) continue;
+        var this_v = e.v;
+        return try host_call_value.callValueWithThis(self, allocator, receiver, &this_v, args, &.{});
+    }
+    return null;
+}
+
 /// Dispatch `receiver.name(args)` through an enclosing SAM instance whose
 /// fun interface declares `name` as an abstract member extension accepting
 /// this receiver: the stored lambda runs with the receiver bound as `this`.
@@ -5222,6 +5293,39 @@ fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: 
         const recv_ty = samMemberExtRecvType(self, cls_name, name) orelse continue;
         if (!receiverImplementsType(self, receiver, recv_ty)) continue;
         return try host_call_value.callValueWithThis(self, allocator, &target.?, receiver, args, &.{});
+    }
+    return null;
+}
+
+/// Dispatch `receiver.name(args)` through a LAMBDA on the enclosing receiver tower
+/// that stands in for a fun interface whose abstract member extension is `name`.
+///
+/// `with(measurePolicy) { measure(measurables, constraints) }`: the policy came from
+/// `Layout(modifier, content) { measurables, constraints -> … }` and is still a raw
+/// closure, so it carries no `__sam_target__` for the SAM-instance arm to find. The
+/// closure IS the method body, and the call's receiver (a `MeasureScope`) is the
+/// extension receiver the abstract slot declares.
+///
+/// Without this the walk fell through to the by-name extension fallback, which
+/// answered with a same-named member extension on an unrelated class -- every
+/// SAM-lambda layout ran `BasicText`'s `EmptyMeasurePolicy`, sizing itself to the
+/// incoming constraints.
+fn enclosingSamLambdaDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const recv_ty = samAbstractExtRecvType(self, name) orelse return null;
+    if (!receiverImplementsType(self, receiver, recv_ty)) return null;
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        const arity: usize = switch (e.v) {
+            .IrClosure => |c| blk: {
+                const info = self.closures.get(@intCast(c.id)) orelse continue;
+                break :blk info.n_params;
+            },
+            else => continue,
+        };
+        if (arity != args.len) continue;
+        var callee = e.v;
+        return try host_call_value.callValueWithThis(self, allocator, &callee, receiver, args, &.{});
     }
     return null;
 }
@@ -6105,35 +6209,40 @@ fn mapEntriesCounter(entries: runtime.MapEntries) u64 {
     return cg.get().*;
 }
 
-const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: ?ObjRef(u64) };
+const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: u64 };
 
-/// Capture a list's `mod_count` (shared) plus the current value (the iterator's
-/// expectation), so the iterator can fail-fast. Both null for a read-only / un-
-/// counted source.
+/// Capture a list's `mod_count` (shared) plus its current value (the iterator's
+/// expectation), so the iterator can fail-fast. `mod_count` is null for a
+/// read-only / un-counted source, which makes the expectation meaningless.
 fn captureModCount(allocator: Allocator, src: ?ObjRef(u64)) Allocator.Error!ModCapture {
-    const mc = src orelse return .{ .mod_count = null, .exp_mod = null };
+    _ = allocator;
+    const mc = src orelse return .{ .mod_count = null, .exp_mod = 0 };
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
-    return .{ .mod_count = mc.clone(), .exp_mod = try ObjRef(u64).init(allocator, cur) };
+    return .{ .mod_count = mc.clone(), .exp_mod = cur };
+}
+
+/// A fresh cursor box for an iterator starting at `start`.
+fn newCursor(allocator: Allocator, start: usize, exp_mod: u64) Allocator.Error!ObjRef(runtime.IterCursor) {
+    return ObjRef(runtime.IterCursor).init(allocator, .{ .pos = start, .last_ret = -1, .exp_mod = exp_mod });
 }
 
 /// `ConcurrentModificationException` when the source mutated structurally since
 /// the iterator captured it (`null` when consistent or uncounted).
 fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResult {
     const mc = it.mod_count orelse return null;
-    const em = it.exp_mod orelse return null;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
     const exp = blk: {
-        const g = em.borrow();
+        const g = it.cursor.borrow();
         defer g.deinit();
-        break :blk g.get().*;
+        break :blk g.get().exp_mod;
     };
     if (cur != exp) return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
     return null;
@@ -6143,15 +6252,14 @@ fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResu
 /// next `next`/`hasNext` does not flag its own change as concurrent.
 fn iteratorResyncMod(it: anytype) void {
     const mc = it.mod_count orelse return;
-    const em = it.exp_mod orelse return;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
-    const g = em.borrowMut();
+    const g = it.cursor.borrowMut();
     defer g.deinit();
-    g.get().* = cur;
+    g.get().exp_mod = cur;
 }
 
 /// The iterator's own `add`/`remove` is a structural change of the backing list
@@ -6167,33 +6275,24 @@ fn iteratorOwnStructuralMod(it: anytype) void {
 }
 
 fn iteratorSetLast(it: anytype, idx: i64) void {
-    if (it.last_ret) |cell| {
-        const g = cell.borrowMut();
-        g.get().* = idx;
-        g.deinit();
-    }
+    const g = it.cursor.borrowMut();
+    defer g.deinit();
+    g.get().last_ret = idx;
 }
 
-/// Index the last `next()`/`previous()` returned, or -1 (also for
-/// iterators created before the cell existed).
+/// Index the last `next()`/`previous()` returned, or -1 when none.
 fn iteratorLastRet(it: anytype) i64 {
-    if (it.last_ret) |cell| {
-        const g = cell.borrow();
-        defer g.deinit();
-        return g.get().*;
-    }
-    const pg = it.pos.borrow();
-    defer pg.deinit();
-    const p = pg.get().*;
-    return @as(i64, @intCast(p)) - 1;
+    const g = it.cursor.borrow();
+    defer g.deinit();
+    return g.get().last_ret;
 }
 
 fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const it = receiver.Iterator;
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const ig = it.items.borrow();
         const len = ig.get().items.len;
@@ -6202,8 +6301,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
     if (isIteratorNext(name) and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const ig = it.items.borrow();
         if (p >= ig.get().items.len) {
@@ -6223,32 +6322,32 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // handing it to the register that will own the iteration result.
         if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p + 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
         return .{ .ok = v };
     }
     // `ListIterator` navigation over the same `items`/`pos` cursor.
     if (std.mem.eql(u8, name, "hasPrevious") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = boolVal(pg.get().* > 0) };
+        return .{ .ok = boolVal(pg.get().pos > 0) };
     }
     if (std.mem.eql(u8, name, "nextIndex") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = Value.newInt(@intCast(pg.get().*)) };
+        return .{ .ok = Value.newInt(@intCast(pg.get().pos)) };
     }
     if (std.mem.eql(u8, name, "previousIndex") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = Value.newInt(@as(i64, @intCast(pg.get().*)) - 1) };
+        return .{ .ok = Value.newInt(@as(i64, @intCast(pg.get().pos)) - 1) };
     }
     if (std.mem.eql(u8, name, "previous") and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         if (p == 0) {
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator at start") };
@@ -6257,8 +6356,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const v = ig.get().items[p - 1];
         if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p - 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p - 1;
         pmg.deinit();
         iteratorSetLast(it, @as(i64, @intCast(p)) - 1);
         return .{ .ok = v };
@@ -6296,8 +6395,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const g = it.items.borrowMut();
         defer g.deinit();
@@ -6305,8 +6404,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (runtime.reclaimEnabled()) nv.retain();
         const idx = if (p <= g.get().items.len) p else g.get().items.len;
         try g.get().insert(allocator, idx, nv);
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p + 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, -1);
         iteratorOwnStructuralMod(it);
@@ -6322,8 +6421,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const li = iteratorLastRet(it);
         if (li < 0) {
@@ -6358,8 +6457,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             // BEFORE it (remove-after-next); after previous() the cursor
             // already sits at the removed index.
             if (lu < p) {
-                const pmg = it.pos.borrowMut();
-                pmg.get().* = p - 1;
+                const pmg = it.cursor.borrowMut();
+                pmg.get().pos = p - 1;
                 pmg.deinit();
             }
             iteratorSetLast(it, -1);
@@ -8338,11 +8437,48 @@ fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owne
         }
     }
     if (visible_owners.contains(owner)) return true;
+    // An interface implementation is not an importable extension. `private object
+    // EmptyMeasurePolicy : MeasurePolicy { override fun MeasureScope.measure(…) }`
+    // declares an interface method body, reachable only with the object as the
+    // dispatch receiver -- never by name from an unrelated site. Letting the
+    // singleton hatch below hand it out made EVERY `with(policy) { measure(…) }`
+    // run `BasicText`'s policy, which sizes to the incoming constraints: a text
+    // field then measured itself to the unbounded scroll height.
+    if (implementsSupertypeMemberExt(self, mod, owner, fid)) return false;
     // A member extension declared in an `object`/companion is callable
     // wherever the singleton is importable (`import C.Companion.f`): its
     // dispatch receiver is the singleton itself, which is always
     // materializable, so the enclosing-`this` chain need not carry it.
     return ownerIsObjectSingleton(self, owner);
+}
+
+/// Whether `owner`'s member extension `fid` implements a same-named member
+/// extension declared by one of `owner`'s supertypes -- i.e. it is an interface
+/// method body, not an importable extension. `object EmptyMeasurePolicy :
+/// MeasurePolicy` overriding `MeasureScope.measure` is the shape: the only way to
+/// reach it is with the object as the dispatch receiver.
+///
+/// Read off the supertypes rather than an `override` modifier: the lowering does
+/// not carry the modifier this far, and a supertype declaration is what `override`
+/// means anyway.
+fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []const u8, fid: FuncId) bool {
+    const f = funcAt(mod, fid) orelse return false;
+    const sups: []const []const u8 = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        const d = g.get().get(owner) orelse break :blk &.{};
+        const dg = d.borrow();
+        defer dg.deinit();
+        break :blk dg.get().supertype_names;
+    };
+    // The supertype's declaration is ABSTRACT: it carries no body and lowers no
+    // func, so it cannot be found among the interface's methods. `iface_member_ext_recv`
+    // is where an abstract member EXTENSION is recorded -- keyed by (interface, name),
+    // which is exactly the question here.
+    for (sups) |sup| {
+        if (mod.registry.iface_member_ext_recv.get(.{ .a = sup, .b = f.name }) != null) return true;
+    }
+    return false;
 }
 
 /// Whether a member-extension owner class is a registered `object` /
@@ -10528,6 +10664,107 @@ fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []const u
     return sups[0];
 }
 
+/// Whether the RECEIVER's own accessor-backed property `name` could hold a callable.
+///
+/// `getter_prop_names` is keyed by NAME alone, so ANY class with a getter-backed
+/// property of that name arms the probe for EVERY receiver. That is how
+/// `TextRange.min` -- `val min: Int get() = min(start, end)`, where the call is the
+/// imported `kotlin.math.min` -- ended up reading itself: the member method missed,
+/// the probe read the property, and the property's getter called `min` again,
+/// forever.
+///
+/// The receiver's own getter decides. A declared function type can hold a callable;
+/// a scalar or a registered concrete class cannot. A type parameter or a typealias
+/// (`typealias Handler = () -> Unit`) names no registered class, so it stays
+/// permissive -- either can be a function at runtime.
+fn receiverPropCanHoldCallable(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    if (receiver.* != .Instance) return true;
+    var cur: ?[]const u8 = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    var step: usize = 0;
+    while (cur) |cn| {
+        if (step > 64) return true;
+        step += 1;
+        const fid: ?FuncId = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().instance_prop_getters.get(.{ .a = cn, .b = name });
+        };
+        if (fid) |f| {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const func = mg.get().funcById(f) orelse return true;
+            const rt = func.return_ty;
+            if (isFunctionTypeRefResolved(self, &rt)) return true;
+            if (isScalarKindName(rt.name)) return false;
+            const known = blk: {
+                const g = self.classes.borrow();
+                defer g.deinit();
+                break :blk g.get().get(rt.name) != null;
+            };
+            if (known and !classIsFunInterface(self, rt.name)) return false;
+            return true;
+        }
+        cur = firstSupertypeName(self, self.allocator, cn);
+    }
+    return true;
+}
+
+/// Whether `class_name` names a registered `fun interface` (one abstract method,
+/// so a lambda SAM-converts to it).
+fn classIsFunInterface(self: *VmHost, class_name: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return false;
+    const dg = d.borrow();
+    defer dg.deinit();
+    return dg.get().is_fun_interface;
+}
+
+/// Whether `class_name` names a registered interface.
+fn classIsInterface(self: *VmHost, class_name: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return false;
+    const dg = d.borrow();
+    defer dg.deinit();
+    return dg.get().is_interface;
+}
+
+/// `class_name`'s supertypes with the superclass ahead of the interfaces.
+///
+/// A supertype list keeps source order, and Kotlin does not require the
+/// superclass to come first: `class FocusRequesterNode : FocusRequesterModifierNode,
+/// Modifier.Node()` names the interface first. `super.onAttach()` there means
+/// `Modifier.Node`'s, so a search that follows the list as written walks into the
+/// interface and never reaches the class that actually declares the method.
+/// Names are class-table-owned (program-lifetime); the returned slice is the
+/// caller's.
+fn supertypesClassFirst(self: *VmHost, allocator: Allocator, class_name: []const u8) Allocator.Error![]const []const u8 {
+    const sups: []const []const u8 = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        const d = g.get().get(class_name) orelse break :blk &.{};
+        const dg = d.borrow();
+        defer dg.deinit();
+        break :blk dg.get().supertype_names;
+    };
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (sups) |s| {
+        if (!classIsInterface(self, s)) try out.append(allocator, s);
+    }
+    for (sups) |s| {
+        if (classIsInterface(self, s)) try out.append(allocator, s);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Whether `q` is one of `class_name`'s registered supertypes.
 fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
     const g = self.classes.borrow();
@@ -10558,18 +10795,23 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     // Find the parent class of owner_class — `super.method()` walks one
     // step up the inheritance chain. With `super<Q>`, dispatch on Q
     // directly; with `super@Q`, dispatch on Q's own parent.
-    var parent_name: ?[]const u8 = null;
+    var pending: std.ArrayList([]const u8) = .empty;
+    defer pending.deinit(allocator);
     if (qualifier) |q| {
         if (ownerHasSupertype(self, owner_class, q)) {
             // `q` is the const-pool super qualifier (program-lifetime); borrow it.
-            parent_name = q;
+            try pending.append(allocator, q);
         } else {
-            parent_name = firstSupertypeName(self, allocator, q);
+            const sups = try supertypesClassFirst(self, allocator, q);
+            defer allocator.free(sups);
+            try pending.appendSlice(allocator, sups);
         }
     } else {
-        parent_name = firstSupertypeName(self, allocator, owner_class);
+        const sups = try supertypesClassFirst(self, allocator, owner_class);
+        defer allocator.free(sups);
+        try pending.appendSlice(allocator, sups);
     }
-    const start = parent_name orelse {
+    if (pending.items.len == 0) {
         const owner_fqn: []const u8 = blk: {
             const g = self.classes.borrow();
             defer g.deinit();
@@ -10579,18 +10821,21 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             break :blk dg.get().fqn;
         };
         return .{ .err = try typeErr(allocator, "super.{s}: owner_class `{s}` (table entry `{s}`) has no parent", .{ name, owner_class, owner_fqn }) };
-    };
+    }
+    var visited: std.StringHashMap(void) = .init(allocator);
+    defer visited.deinit();
 
-    // Walk the supertype chain starting at `start` and dispatch the first
-    // class on the chain that declares the method. Falling through to
+    // Search the supertypes, superclass before interfaces at every level, and
+    // dispatch the first one that declares the method. Falling through to
     // call_member would re-enter virtual dispatch on the original
     // receiver and recurse forever for overriding methods.
-    var current: ?[]const u8 = start;
     var step: usize = 0;
-    while (current) |cname| {
+    while (pending.items.len != 0) {
         if (step > 128) break;
         step += 1;
-        current = null;
+        const cname = pending.orderedRemove(0);
+        if (visited.contains(cname)) continue;
+        try visited.put(cname, {});
         // First, an IR class method named `name` on this class.
         {
             const mg = self.module.borrow();
@@ -10653,8 +10898,10 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 mg.deinit();
             }
         }
-        // Step to the next non-interface supertype.
-        current = firstSupertypeName(self, allocator, cname);
+        // Not here: continue through this class's own supertypes.
+        const sups = try supertypesClassFirst(self, allocator, cname);
+        defer allocator.free(sups);
+        try pending.appendSlice(allocator, sups);
     }
 
     // `super.<prop>` where the base property has no custom getter (a stored
