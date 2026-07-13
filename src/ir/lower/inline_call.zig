@@ -98,10 +98,68 @@ pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocato
             const name = p.segments[0].name;
             if (b.localDeclType(name)) |t| return t;
             if (b.localInitExpr(name)) |e| return inferReceiverType(b, e);
-            return null;
+            // A bare name that is not a local is a member of the enclosing
+            // class, whose declared type is receiver evidence just as a
+            // local's is. Without it a reified inline extension called on a
+            // property receiver had NO receiver type, so its declaration was
+            // never found and the splice bailed to a plain member dispatch —
+            // where the reified `T` has nothing to bind to
+            // (`modifierNode.dispatchForKind(Nodes.PointerInput) { … }` inside
+            // `HitPathTracker.Node`).
+            return ownerMemberDeclType(b, name);
         },
         else => return null,
     }
+}
+
+/// The declared type head of member `name` on the enclosing class, searching
+/// the class and then its transitive supertypes: a primary-constructor `val`
+/// (`class Node(val modifierNode: Modifier.Node)`) or a body property. Null
+/// when no enclosing class declares the name.
+fn ownerMemberDeclType(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
+    const owner = b.ownerClass() orelse return null;
+    var seen: [16][]const u8 = undefined;
+    var n_seen: usize = 0;
+    var queue: [16][]const u8 = undefined;
+    var head: usize = 0;
+    var tail: usize = 0;
+    queue[tail] = owner;
+    tail += 1;
+    while (head < tail) {
+        const cur = queue[head];
+        head += 1;
+        var dup = false;
+        for (seen[0..n_seen]) |s| {
+            if (std.mem.eql(u8, s, cur)) dup = true;
+        }
+        if (dup) continue;
+        if (n_seen < seen.len) {
+            seen[n_seen] = cur;
+            n_seen += 1;
+        }
+        if (b.module.classId(cur)) |cid| {
+            if (@intFromEnum(cid) < b.module.classes.items.len) {
+                const c = &b.module.classes.items[@intFromEnum(cid)];
+                for (c.primary_params) |*pp| {
+                    if (std.mem.eql(u8, pp.name, name) and pp.ty.name.len != 0) return pp.ty.name;
+                }
+            }
+        }
+        if (inline_state.memberPropAst(cur, name)) |prop| {
+            if (prop.ty) |*t| {
+                if (t.name.name.len != 0) return t.name.name;
+            }
+        }
+        if (b.module.registry.class_super_names.get(cur)) |sups| {
+            for (sups) |s| {
+                if (tail < queue.len) {
+                    queue[tail] = s;
+                    tail += 1;
+                }
+            }
+        }
+    }
+    return null;
 }
 
 fn allAsciiUppercase(s: []const u8) bool {
@@ -767,7 +825,6 @@ pub fn tryInlineCallWithTypeArgs(
     // resolves here by receiver/shape narrowing: the inline target must
     // be a receiver extension, never a same-named top-level overload.
     var f: *const ast.Function = undefined;
-    if (inline_state.runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[ticwta] {s} target={} this_arg={} nta={d}\n", .{ fname, target != null, this_arg != null, type_args.len });
     if (target) |t| {
         f = t;
     } else {
