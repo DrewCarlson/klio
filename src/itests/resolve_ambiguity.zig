@@ -504,27 +504,25 @@ test "a cross-package bare call without an import is an unresolved reference" {
 
 // An `actual` implements the `expect` that shares its package. Matching the
 // pair by SIMPLE NAME let any actual supersede every same-named expect in the
-// program, whatever package it lived in — the expect vanished from the symbol
-// table and its own callers, which import it by name, found only the stranger.
+// program, whatever package it lived in: `p2`'s actual deleted `p1`'s expect
+// from the symbol table, and `p1`'s importers — who name it explicitly — were
+// left with no candidate but `p2`'s, in a package they do not import. The
+// expect survives now, so the call binds it and reports the missing actual.
 test "an actual supersedes only the expect in its own package" {
-    try expectFilesOutput(
+    try expectFilesErrContains(
         "expect_actual_pkg",
         &.{
             \\package p1
             \\
             \\expect fun greet(n: Int): String
             ,
-            \\package p1
+            \\package p2
             \\
-            \\actual fun greet(n: Int): String = "p1-actual-$n"
+            \\expect fun greet(n: Int): String
             ,
             \\package p2
             \\
             \\actual fun greet(n: Int): String = "p2-actual-$n"
-            ,
-            \\package p2
-            \\
-            \\expect fun greet(n: Int): String
             ,
             \\package app
             \\
@@ -534,7 +532,7 @@ test "an actual supersedes only the expect in its own package" {
             \\    println(greet(7))
             \\}
         },
-        "p1-actual-7\n",
+        "`p1.greet` is an `expect` with no `actual`",
     );
 }
 
