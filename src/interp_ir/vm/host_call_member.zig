@@ -304,14 +304,7 @@ fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args:
     // args[0] as the receiver, not as the first parameter.
     if (callee.* == .IrClosure and args.len >= 1) {
         if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
-            // A `recv_lambda` closure carries a dead synthetic `it` the lowering
-            // could not drop (its callee lived in another pack), so its DECLARED
-            // value arity is one less than its parameter count. Use the declared
-            // arity here, or a receiver passed positionally gets swallowed by the
-            // stray `it` (`getOrBuildCachedDrawBlock(this).block(this)` for a
-            // `ContentDrawScope.() -> Unit` field).
-            const eff_params = if (info.recv_lambda and info.n_params > 0) info.n_params - 1 else info.n_params;
-            if (args.len == eff_params + 1) {
+            if (args.len == info.n_params + 1) {
                 var has_this = false;
                 for (info.capture_names) |n| {
                     if (std.mem.eql(u8, n, "this")) {
@@ -3176,18 +3169,7 @@ fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value
         break :blk v;
     };
     defer field_val.release(allocator);
-    // The lambda's DECLARED value arity. A `recv_lambda` closure carries a dead
-    // synthetic `it` the lowering could not drop (its callee lived in another
-    // pack), so its declared arity is one less than its parameter count.
-    const arity = blk: {
-        const n = callableFieldArity(self, &field_val) orelse return null;
-        if (field_val == .IrClosure) {
-            if (self.closures.get(@intCast(field_val.IrClosure.id))) |ci| {
-                if (ci.recv_lambda and n > 0) break :blk n - 1;
-            }
-        }
-        break :blk n;
-    };
+    const arity = callableFieldArity(self, &field_val) orelse return null;
     // The call supplies the lambda's receiver POSITIONALLY — one arg more than
     // the lambda declares (`getOrBuildCachedDrawBlock(this).block(this)` for a
     // `ContentDrawScope.() -> Unit` field). Split arg0 off as the receiver here
@@ -7619,21 +7601,6 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
-
-    // The callee's declared parameter types are the authority on whether a
-    // lambda argument is a `T.() -> R` receiver lambda. Align the user args with
-    // the declared params: a receiver-formed member carries `this` in slot 0, so
-    // its user params start at 1. Misaligning here would pair a lambda with the
-    // WRONG parameter's type and mismark it.
-    {
-        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        if (f.params.len >= off) {
-            for (f.params[off..], 0..) |*p, i| {
-                if (i >= args.len) break;
-                host_call_func.markRecvLambdaArg(self, mod, &p.ty, &args[i]);
-            }
-        }
-    }
 
     // Non-final vararg (a vararg before trailing defaulted / named-only params):
     // the prepend + trailing-collapse path cannot bind it — the vararg must

@@ -188,50 +188,6 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// that narrow kind and every element fits. The literal-typed list is
 /// the only way such a value reaches the param under Kotlin's static
 /// typing, so the retag is faithful.
-/// The value-parameter count a lowered function-type head declares, and whether
-/// it carries an extension receiver. The lowered encoding is
-/// `Function{N}` with args `[#suspend?] [receiver?] params… ret [#markers]`, so
-/// a receiver is present exactly when the arg list holds one more entry than the
-/// `N` value params plus the return type.
-fn recvFnTypeArity(ty: *const TypeRef) ?usize {
-    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
-    const digits = ty.name["Function".len..];
-    if (digits.len == 0) return null;
-    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
-    var hi: usize = ty.args.len;
-    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
-    // A SUSPEND function type carries its continuation as an extra positional
-    // argument at invocation, so the closure's declared param count already
-    // lines the receiver up with the invoke paths' `n_params + 1` split.
-    // Re-deriving the arity would double-count and strand the receiver (the
-    // `channelFlow`/`buffer` producer blocks lost their `ProducerScope`, so a
-    // bare `send` had no receiver at all).
-    const lo: usize = 0;
-    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) return null;
-    const remaining = hi - lo; // [receiver?] params(n) ret(1)
-    if (remaining != n + 2) return null; // no receiver slot
-    return n;
-}
-
-/// A lambda that kept a parser-synthesized `it` because the lowering could not
-/// see its callee (a cross-pack member: `onDrawWithContent { … }` on a
-/// `CacheDrawScope` from another pack), yet is being bound HERE to a parameter
-/// whose declared type is a `T.() -> R` receiver function. The declared type is
-/// the authority Kotlin uses, so mark the closure: its effective value arity is
-/// one less than its declared params, and the invoke paths bind arg0 as the
-/// receiver instead of feeding it to the dead `it`.
-pub fn markRecvLambdaArg(self: *VmHost, module: *const Module, param_ty: *const TypeRef, arg: *const Value) void {
-    if (arg.* != .IrClosure) return;
-    const arity = recvFnTypeArity(param_ty) orelse return;
-    const info = self.closures.get(@intCast(arg.IrClosure.id)) orelse return;
-    if (info.recv_lambda) return;
-    if (info.n_params != arity + 1) return;
-    const m = info.module orelse module;
-    const bf = m.funcById(info.body_func) orelse return;
-    if (!bf.implicit_it) return;
-    self.closures.markRecvLambda(@intCast(arg.IrClosure.id));
-}
-
 fn narrowIntListArg(param_ty: *const TypeRef, arg: *const Value) void {
     if (arg.* != .List) return;
     const pn = param_ty.name;
@@ -1062,7 +1018,6 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     for (f.params, 0..) |*p, i| {
         if (i >= args_in.len) break;
         narrowIntListArg(&p.ty, &args_in[i]);
-        markRecvLambdaArg(self, module, &p.ty, &args_in[i]);
     }
 
     linkAuditCheck(self, module, func, f, args_in);

@@ -876,14 +876,6 @@ pub const Func = struct {
     /// to the receiver this lambda was invoked with. `null` for ordinary
     /// functions and for lambdas not in argument position.
     implicit_label: ?[]const u8 = null,
-    /// This lambda body's sole parameter is the parser-synthesized `it`, kept
-    /// because the lowering could not see the callee's signature. A callee in
-    /// ANOTHER pack is absent from this module's name index, so the trailing
-    /// lambda's expected arity is unknown and the `it` survives even for a
-    /// `T.() -> R` receiver lambda. The runtime binder repairs it: at the call
-    /// it CAN see the parameter's declared type, so it marks such a closure a
-    /// receiver lambda (see `ClosureInfo.recv_lambda`).
-    implicit_it: bool = false,
     /// Marked `@kotlin.internal.LowPriorityInOverloadResolution` or
     /// `@Deprecated(level = DeprecationLevel.ERROR)`. Such a function is
     /// only a valid overload-resolution target when no ordinary candidate
