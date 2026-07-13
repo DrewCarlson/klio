@@ -985,6 +985,45 @@ pub fn setTrailingLambdaCall(on: bool) void {
 threadlocal var bodyless_active: [32]struct { fid: u32, ident: u64 } = undefined;
 threadlocal var bodyless_active_len: usize = 0;
 
+/// Whether `class_name` is a registered `fun interface`, so a lambda SAM-converts
+/// to it and stands in for its single abstract method.
+fn ownerIsFunInterface(self: *VmHost, class_name: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return false;
+    const dg = d.borrow();
+    defer dg.deinit();
+    return dg.get().is_fun_interface;
+}
+
+/// Serve a bodyless member-extension of a `fun interface` from the SAM lambda on
+/// the enclosing receiver tower: the innermost callable of the right arity runs
+/// with `args_in[0]` -- the extension receiver -- bound as its `this`.
+///
+/// The lambda is only a candidate because the abstract slot it fills belongs to a
+/// fun interface: nothing else can put a callable in a dispatch-receiver position
+/// for a member extension.
+fn samLambdaOnTower(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, f: *const ir.Func, args_in: []const Value) Allocator.Error!?EvalResult {
+    if (f.kind != .member_extension) return null;
+    const owner = module.registry.member_ext_owner_class.get(func) orelse return null;
+    if (!ownerIsFunInterface(self, owner)) return null;
+    const want = args_in.len - 1;
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        const arity: usize = switch (e.v) {
+            .IrClosure => |c| blk: {
+                const info = self.closures.get(@intCast(c.id)) orelse continue;
+                break :blk info.n_params;
+            },
+            else => continue,
+        };
+        if (arity != want) continue;
+        return try @import("host_call_value.zig").callValueWithThis(self, allocator, &e.v, &args_in[0], args_in[1..], &.{});
+    }
+    return null;
+}
+
 fn bodylessRedirectActive(func: FuncId, ident: u64) bool {
     for (bodyless_active[0..bodyless_active_len]) |e| {
         if (e.fid == func.int() and e.ident == ident) return true;
@@ -1060,6 +1099,22 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             @memset(no_names, null);
             return callFuncNamed(self, allocator, module, func, args_in, no_names);
         }
+    }
+
+    // The abstract member-extension of a `fun interface`, called with a LAMBDA
+    // in the dispatch-receiver position (`with(measurePolicy) { measure(…) }`
+    // where the policy came from `Layout(modifier, content) { measurables,
+    // constraints -> … }`). The lambda IS the method body.
+    //
+    // Only the EXTENSION receiver rides in `args_in[0]` (the `MeasureScope`), so
+    // the sibling redirect below -- which settles a bodyless decl by arity alone
+    // -- cannot see the dispatch receiver at all and picks whichever same-named
+    // implementation was declared first. Every SAM-lambda layout ran `BasicText`'s
+    // private `EmptyMeasurePolicy`, which sizes to the incoming constraints, so a
+    // text field measured itself to the unbounded scroll height of its own scroll
+    // modifier. The lambda on the enclosing receiver tower is the answer.
+    if (!f.hasBody() and args_in.len != 0) {
+        if (try samLambdaOnTower(self, allocator, module, func, f, args_in)) |r| return r;
     }
 
     // Bodyless `expect` / header-only decl: the link step settled its

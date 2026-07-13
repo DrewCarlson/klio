@@ -274,6 +274,7 @@ fn unwrapCellRead(r: EvalResult) EvalResult {
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
 }
 

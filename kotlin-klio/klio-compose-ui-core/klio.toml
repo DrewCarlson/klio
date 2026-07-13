@@ -255,6 +255,18 @@ include = [
     "androidx/compose/ui/ZIndexModifier.kt",
 ]
 
+# skikoMain: the upstream non-JVM actuals that are already java-free. Autofill has
+# no platform behind it off Android, so upstream's own skiko actuals answer null,
+# which is exactly what klio can serve. A text field reaches these on every
+# semantics pass (`FillableData.createFromText`).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/ui/ui/src/skikoMain/kotlin"
+include = [
+    "androidx/compose/ui/autofill/ContentDataType.skiko.kt",
+    "androidx/compose/ui/autofill/ContentType.skiko.kt",
+    "androidx/compose/ui/autofill/FillableData.skiko.kt",
+]
+
 # klioMain: platform-primitive actuals (atomics, sync, refs, identity hash).
 [[source]]
 root = "klioMain"
