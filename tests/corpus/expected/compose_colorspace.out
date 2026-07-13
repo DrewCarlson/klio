@@ -1,0 +1,6 @@
+xyz roundtrip=true
+red lab a>0=true
+p3 roundtrip=true
+composite=1.0,0.49803922,0.49803922
+lerp has both=true
+luminance=1.0 0.0

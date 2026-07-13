@@ -422,10 +422,13 @@ After changing the interpreter, rebuild every pack you have installed
 
 ## Deferred / open
 
-- **Colorspace conversion** (`convert`/`compositeOver`) — deferred (advanced path;
-  construction + luminance work). Real blocker is a companion-function-body
-  overload-dispatch gap in the `Connectors`/`adapt`/`isSrgb` chain, not minimally
-  reproducible yet. Details in the `compose-graphics-color-vendored` memory.
+- **Colorspace conversion — DONE** (2026-07-13): `convert` across
+  sRGB/CieXyz/CieLab/Oklab/DisplayP3/AdobeRgb (roundtrips exact), the
+  Oklab-backed `lerp`, `compositeOver`, and `luminance` all work; the
+  companion-function-body overload gap was cured by the intervening
+  dispatch fixes (type-var applicability + named-binder work). Locked by
+  `examples/compose_colorspace.kt` (corpus-baked; ui-graphics is in the
+  e2e source-pack set).
 - **macOS window hardening (remaining):** display-change / backing-scale on monitor
   move (`viewDidChangeBackingProperties`); input completeness (modifiers, key repeat,
   scroll, right-click, IME); color-space tagging (sRGB/P3 vs DeviceRGB).
