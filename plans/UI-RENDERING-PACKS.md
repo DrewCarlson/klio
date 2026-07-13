@@ -256,26 +256,31 @@ first-supertype walk, the name-keyed property-invoke probe re-entering its own
 getter (`TextRange.min`), and a SAM-lambda measure policy dispatching to an
 unrelated class's `measure`. What is still open, in the order a text field hits it:
 
-**`fontScale` mis-binds in the paragraph-intrinsics path.** `resolvedFontSizePx`
-does `with(density) { size.toPx() }` → `TextUnit.toPx` → `FontScaling.toDp` →
-`Dp(value * fontScale)`, and `times` fails on the `Float` because `fontScale` is
-not a number there. `toPx` binds correctly in isolation and through
-`MaterialTheme { Text }`, so the density reaching `MultiParagraphIntrinsics` (via
-`mapEachParagraphStyle` → `ParagraphIntrinsics`) is the suspect. Repro: a
-`BasicTextField` in `renderComposeToPng`.
+**FIXED — `fontScale`/`density` mis-bind (18fced76).** A member-extension's declaring
+class is an implicit receiver of its body and now outranks the global tier in both
+field-read ladders. `BasicTextField` composes, attaches, measures, and lays out text.
 
-**An imported bodyless `expect` loses to an unimported same-named function.**
-`TimePicker.kt` imports `androidx.compose.material3.internal.getString` (an
-`expect` with no actual in klio). Linking foundation's skiko `ContextMenuStrings`
-actual added an `androidx.compose.foundation.text.getString`, and the resolver then
-reported the material3 call UNRESOLVED, naming foundation's as the only candidate:
-the imported bodyless declaration was not ranked at all. A module carrying resolve
-diags cannot be baked (`moduleToImage` refuses), so material3 silently fell back to
-re-lowering from source on every run. The strings actual is unlinked for now (klio's
-`ContextMenuArea` is content-only, so nothing calls it) -- the resolver is the bug.
+**OPEN — a bare `with(x) { … }` in a class body binds the wrong `with`.**
+`MultiParagraph.getCursorRect` does `with(paragraphInfoList[i]) { … }`, and the
+lowering binds compose-animation's `KeyframeEntity.with` (a MEMBER extension declared
+inside `KeyframesSpecConfig`, lifted with `fqn="with"` and NO package). Because
+`needs_this` is true for an extension, `emitCall` routes it through `emitExtBareCall`,
+which emits a hard `CallMember` on the enclosing class -- `Vm::call_member 'with' on
+MultiParagraph`. Two things are wrong and both are worth fixing:
+  - The candidate should not be reachable: a member extension is callable only from
+    inside its declaring class (the runtime already enforces exactly this in
+    `memberExtVisible`), and its lost package defeats the scope-tier gate that would
+    otherwise exclude it.
+  - The pick does NOT come from `phaseBLadder` (never called for this site) nor from
+    the index (which skips extensions) nor from `cast_pick` (no `as` in the args) --
+    find the fourth path. `KLIO_RESOLVE_AUDIT=1` prints only an `inline name=with
+    outcome=deferred reason=no_candidates` line for it, so start at the inline-splice
+    resolver.
 
-**`realclick` broke on a pack rebuild, not on a source change.** After rebuilding
-every pack with the current binary, `hitTestResult.hitInMinimumTouchTarget(...)`
-misses on `HitTestResult`. It reproduces with all interpreter changes stashed, so
-it is a latent defect that the previously-installed (older) `ui-core` pack was
-hiding. Rebuild the packs before trusting a compose scene.
+**OPEN — `realclick`: `HitTestResult.hitInMinimumTouchTarget` is not in the module.**
+Both overloads miss (`[extfb] fids=0`, total member miss) while sibling members of the
+same class -- including the equally `inline fun hit` -- dispatch fine. Reproduces with
+the pre-session binary (698bf8d3) once the ui-core pack is rebuilt, so it is a latent
+lowering defect that the stale installed pack had been hiding, NOT a regression from
+this work. Next step: dump the lowered method list of `HitTestResult` and find why
+these two are dropped.
