@@ -1336,7 +1336,18 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
 /// are lowered, keeping the symbol index's low-priority filter
 /// order-independent over forward references.
 pub fn isLowPriorityOverload(f: *const ast.Function) bool {
-    for (f.annotations) |*ann| {
+    return annotationsAreLowPriority(f.annotations);
+}
+
+/// `@LowPriorityInOverloadResolution`, or `@Deprecated(level = ERROR|HIDDEN)` —
+/// none is a source-level candidate in kotlinc (HIDDEN hides the declaration
+/// entirely; it exists only for binary compatibility). Takes the annotation list
+/// directly so a SECONDARY CONSTRUCTOR can be judged by the same rule as a
+/// function: `KeyboardOptions`' hidden binary-compat constructor was winning
+/// `KeyboardOptions()` over the primary, because the constructor picker had no
+/// notion of a hidden overload at all.
+pub fn annotationsAreLowPriority(annotations: []const ast.Annotation) bool {
+    for (annotations) |*ann| {
         const leaf: []const u8 = if (ann.path.len != 0) ann.path[ann.path.len - 1].name else "";
         if (std.mem.eql(u8, leaf, "LowPriorityInOverloadResolution")) {
             return true;

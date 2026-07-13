@@ -284,19 +284,29 @@ fn isCallableArg(v: *const Value) bool {
 }
 
 fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
-    var best: ?root.build.SecondaryCtorEntry = null;
-    var best_score: i32 = -1;
-    for (entries) |e| {
-        if (e.param_count != args.len) continue;
-        const score = scoreCtorHeads(self, e.param_type_heads, args) orelse continue;
-        // Reached only when no parameter disqualified this candidate: it is a
-        // genuine arity+type match, so it is eligible as the fallback too.
-        if (score > best_score) {
-            best_score = score;
-            best = e;
+    // Two passes. A `@Deprecated(level = HIDDEN)` constructor is not a
+    // source-level candidate in kotlinc at all — it exists only for binary
+    // compatibility — so it must never beat an ordinary one. It stays reachable
+    // as a LAST resort (a class whose only secondary constructor is hidden).
+    var pass: usize = 0;
+    while (pass < 2) : (pass += 1) {
+        const want_low = pass == 1;
+        var best: ?root.build.SecondaryCtorEntry = null;
+        var best_score: i32 = -1;
+        for (entries) |e| {
+            if (e.low_priority != want_low) continue;
+            if (e.param_count != args.len) continue;
+            const score = scoreCtorHeads(self, e.param_type_heads, args) orelse continue;
+            // Reached only when no parameter disqualified this candidate: it is a
+            // genuine arity+type match, so it is eligible as the fallback too.
+            if (score > best_score) {
+                best_score = score;
+                best = e;
+            }
         }
+        if (best != null) return best;
     }
-    return best;
+    return null;
 }
 
 fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
@@ -1747,6 +1757,12 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     if (chosen == null) {
         for (entries) |e| {
+            // A hidden binary-compat constructor must not swallow an
+            // under-applied call the PRIMARY constructor serves:
+            // `KeyboardOptions()` was picking the hidden
+            // `constructor(autoCorrect: Boolean = Default.autoCorrectOrDefault, …)`
+            // over the primary, and then evaluating its default expressions.
+            if (e.low_priority) continue;
             if (e.param_count > args.len) {
                 var all_default = true;
                 var idx = args.len;
