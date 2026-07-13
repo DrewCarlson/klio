@@ -151,6 +151,16 @@ internal class GroupNode(@JvmField val key: Long, @JvmField val parent: GroupNod
     /** State objects read while this group last executed (its subscriptions). */
     @JvmField val reads: HashSet<Any> = HashSet()
 
+    /** CompositionLocals this group consumed on its last run, mapped to the value
+     * it saw. A skippable group whose args are unchanged must still re-run when a
+     * local it reads is now provided a different value (e.g. a theme switch). */
+    @JvmField val consumedLocals: HashMap<CompositionLocal<*>, Any?> = HashMap()
+
+    /** If this group is a CompositionLocal provider, the values it provided last
+     * pass — so a changed provided value forces its subtree to recompose (its
+     * skippable descendants would otherwise not see the new local). */
+    @JvmField var lastProvided: HashMap<CompositionLocal<*>, Any?>? = null
+
     /** True once this group has executed at least once. */
     @JvmField var composed: Boolean = false
 
@@ -179,6 +189,12 @@ internal class KlioComposer : Composer {
     private val stateToGroups = HashMap<Any, HashSet<GroupNode>>()  // state -> subscribed groups
     private val invalidated = HashSet<GroupNode>()                  // groups awaiting recompose
     private var runSet: HashSet<GroupNode>? = null                  // null => run everything (initial pass)
+
+    // While > 0, skippable groups are forced to run: set by a provider whose
+    // provided CompositionLocal value changed this pass, so its subtree (which
+    // may read the local without an arg change) re-composes with the new value.
+    private var localForce = 0
+    private val forceStack = ArrayList<Boolean>()  // per open provider: did it force?
 
     // Node emission. `applierNode` is the composition's applier (null for a
     // logic-only composition). `emitStack` tracks, per open applier node, the
@@ -337,12 +353,14 @@ internal class KlioComposer : Composer {
         val g = current()
         val rs = runSet
         // Run when fresh, when the whole tree runs (initial pass), when on the
-        // invalidated path, or when the arguments changed since last pass.
-        val should = !g.composed || rs == null || rs.contains(g) || g.lastArgsHash != argsHash
+        // invalidated path, when the arguments changed since last pass, or when a
+        // CompositionLocal it consumes now provides a different value.
+        val should = localForce > 0 || !g.composed || rs == null || rs.contains(g) || g.lastArgsHash != argsHash || localsChanged(g)
         if (should) {
-            // The group is (re)running: drop its stale subscriptions; they
-            // re-accumulate as the body re-reads state this pass.
+            // The group is (re)running: drop its stale subscriptions + consumed
+            // locals; both re-accumulate as the body re-reads state this pass.
             clearReads(g)
+            g.consumedLocals.clear()
             g.composed = true
             g.lastArgsHash = argsHash
         } else {
@@ -520,7 +538,25 @@ internal class KlioComposer : Composer {
             if (pv.isDefault && isLocalProvided(pv.compositionLocal)) continue
             layer[pv.compositionLocal] = pv.value
         }
+        // A changed provided value forces this provider's subtree to run, so
+        // descendants that read the local (but whose own args are unchanged)
+        // pick up the new value instead of being skipped.
+        val g = current()
+        val changed = providersDiffer(g.lastProvided, layer)
+        g.lastProvided = layer
+        forceStack.add(changed)
+        if (changed) localForce += 1
         localsStack.add(layer)
+    }
+
+    /** True if [new] provides a different value for any local than [old] did. */
+    private fun providersDiffer(old: HashMap<CompositionLocal<*>, Any?>?, new: HashMap<CompositionLocal<*>, Any?>): Boolean {
+        if (old == null) return true
+        if (old.size != new.size) return true
+        for ((local, value) in new) {
+            if (!old.containsKey(local) || old[local] != value) return true
+        }
+        return false
     }
 
     private fun isLocalProvided(local: CompositionLocal<*>): Boolean {
@@ -535,9 +571,17 @@ internal class KlioComposer : Composer {
 
     override fun endProviders() {
         if (localsStack.isNotEmpty()) localsStack.removeAt(localsStack.size - 1)
+        if (forceStack.isNotEmpty() && forceStack.removeAt(forceStack.size - 1)) localForce -= 1
     }
 
     override fun consume(local: CompositionLocal<*>): Any? {
+        val value = resolveLocal(local)
+        current().consumedLocals[local] = value
+        return value
+    }
+
+    /** The nearest provided value for [local] (no read recording). */
+    private fun resolveLocal(local: CompositionLocal<*>): Any? {
         var i = localsStack.size - 1
         while (i >= 0) {
             val layer = localsStack[i]
@@ -547,6 +591,16 @@ internal class KlioComposer : Composer {
         val base = baseLocals
         if (base != null && base.containsKey(local)) return base[local]
         return local.defaultFactory()
+    }
+
+    /** True if any CompositionLocal [g] consumed last run is now provided a
+     * different value — a skippable group must re-run to pick it up. */
+    private fun localsChanged(g: GroupNode): Boolean {
+        if (g.consumedLocals.isEmpty()) return false
+        for ((local, recorded) in g.consumedLocals) {
+            if (resolveLocal(local) != recorded) return true
+        }
+        return false
     }
 
     override val currentCompositionLocalMap: CompositionLocalMap

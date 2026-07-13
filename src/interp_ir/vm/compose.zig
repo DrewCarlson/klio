@@ -118,7 +118,32 @@ pub fn callSiteKey() u64 {
 fn argValueHash(v: *const Value) u64 {
     return switch (v.*) {
         .Null, .Unit => 0,
-        .Bool, .Char, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .String, .Pair, .Triple, .List, .Map, .Set, .Array, .Range, .MapEntry => @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
+        // Kotlin's `Set`/`Map` hashCode is the *sum* of element/entry hashes, so
+        // `setOf()` and `setOf(0)` both hash to 0 — using that as the @Composable
+        // "changed" signal wrongly skips recomposition when a set toggles an
+        // element whose hash the sum absorbs (element 0, or any element added to
+        // an empty set). Fold size + each element structurally instead so a
+        // content change is reflected.
+        .Set => |s| blk: {
+            const g = s.items.borrow();
+            defer g.deinit();
+            var h: u64 = 0xcbf29ce484222325 ^ 0x5e7;
+            h = (h ^ @as(u64, g.get().items.len)) *% 1099511628211;
+            for (g.get().items) |*e| h = (h ^ argValueHash(e)) *% 1099511628211;
+            break :blk h;
+        },
+        .Map => |m| blk: {
+            const g = m.entries.borrow();
+            defer g.deinit();
+            var h: u64 = 0xcbf29ce484222325 ^ 0x3a9;
+            h = (h ^ @as(u64, g.get().pairs.items.len)) *% 1099511628211;
+            for (g.get().pairs.items) |*p| {
+                h = (h ^ argValueHash(&p.key)) *% 1099511628211;
+                h = (h ^ argValueHash(&p.value)) *% 1099511628211;
+            }
+            break :blk h;
+        },
+        .Bool, .Char, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .String, .Pair, .Triple, .List, .Array, .Range, .MapEntry => @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
         else => if (v.lockIdentity()) |id| @as(u64, id) else @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
     };
 }
