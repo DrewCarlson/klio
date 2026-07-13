@@ -284,3 +284,16 @@ the pre-session binary (698bf8d3) once the ui-core pack is rebuilt, so it is a l
 lowering defect that the stale installed pack had been hiding, NOT a regression from
 this work. Next step: dump the lowered method list of `HitTestResult` and find why
 these two are dropped.
+
+**OPEN — an imported bodyless `expect` loses to an unimported same-named function.**
+`TimePicker.kt` imports `androidx.compose.material3.internal.getString` (an `expect`
+with no actual in klio). Linking foundation's skiko `ContextMenuStrings` actual added
+an `androidx.compose.foundation.text.getString`, and the resolver then reported the
+material3 call UNRESOLVED, naming foundation's as the only candidate: the imported
+bodyless declaration was not ranked at all. A module carrying resolve diags cannot be
+baked (`moduleToImage` refuses), so material3 silently fell back to re-lowering from
+source on every run. The strings actual is unlinked for now (klio's `ContextMenuArea`
+is content-only, so nothing calls it) -- the resolver is the bug. Suspect
+`resolveBareCallIndexed`: a bodyless candidate is rankable only when
+`stubDeclArity` has it, so check whether `decl_user_arity` survives the pack merge's
+FuncId remap.
