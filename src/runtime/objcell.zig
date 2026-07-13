@@ -252,15 +252,25 @@ fn procEnvironHas(comptime name: []const u8) bool {
 /// var is set. Diagnostic-only; never enabled in the shipped suite.
 var race_jitter_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
 
+/// The one-shot environment probe, kept OUT of `raceJitterEnabled`. Zig does not
+/// reclaim block-scoped stack allocations (ziglang/zig#23475), so
+/// `procEnvironHas`'s read buffer would sit in `raceJitterEnabled`'s prologue --
+/// a 16 KB frame reserved on EVERY call, just to read a cached atomic, on a
+/// predicate the objcell hot paths call constantly. `noinline` gives the cold
+/// path its own frame, which the return then reclaims.
+noinline fn raceJitterProbe() bool {
+    const on = procEnvironHas("KLIO_RACE_JITTER");
+    race_jitter_state.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
 fn raceJitterEnabled() bool {
     switch (race_jitter_state.load(.monotonic)) {
         1 => return false,
         2 => return true,
         else => {},
     }
-    const on = procEnvironHas("KLIO_RACE_JITTER");
-    race_jitter_state.store(if (on) 2 else 1, .monotonic);
-    return on;
+    return raceJitterProbe();
 }
 
 inline fn raceJitter() void {

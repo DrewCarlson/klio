@@ -4,6 +4,55 @@ Goal: drive klio interpreter throughput up the same way the memory campaign drov
 RSS down — measure, attribute to a hot path, root-cause, fix, re-verify. No
 symptom hiding; match Kotlin semantics exactly.
 
+## Native stack frames (ziglang/zig#23475) — measured 2026-07-13
+
+Zig does not reclaim block-scoped stack allocations: a function's frame is the
+SUM of every block's locals, not the max. That hits the interpreter hard because
+its hot functions are giant switches and they RECURSE.
+
+Frames in the ReleaseFast binary:
+
+| frame | function |
+| --- | --- |
+| 26,720 B | `eval.execInst` (per-instruction dispatcher) |
+| 18,376 B | `host_call_member.callMemberInnerStatic` |
+| 16,584 B | `Value.isRuntimeType` |
+| 14,136 B | `host_instances.buildObject` |
+
+**Measured cost: ~21 KB of native stack per interpreted call.** With
+`KLIO_MAX_EVAL_DEPTH` lifted, the native stack faults between 8k and 16k Kotlin
+frames on the 256 MB `INTERPRET_STACK_SIZE`. The default depth cap (10000) is
+therefore *calibrated to the frame size* — that is why the stack is 256 MB.
+
+**It costs stack DEPTH, not throughput.** Reserving stack is one `sub %rsp`, and
+pages are only touched where written: shrinking a hot predicate's frame from
+16 KB to 0 moved the object-traversal benchmark 1.532s → 1.521s, i.e. not at all.
+
+Fixed: `objcell.raceJitterEnabled` reserved a **16 KB** frame on EVERY call —
+`procEnvironHas`'s `[16384]u8` read buffer was inlined into a cached predicate
+that the objcell hot paths call constantly. The cold probe is `noinline` now.
+
+**NOT done, deliberately:** outlining `execInst`'s switch arms. It is the hottest
+code in the interpreter and the refactor is broad, and the only thing it buys is
+a deeper recursion ceiling or a smaller stack reservation — neither of which we
+need today (10k frames matches the JVM's own default). Revisit if we want to
+raise the recursion limit, cut the 256 MB reservation, or run many worker threads
+(each reserves 64 MB, so ~3k recursion depth per worker).
+
+Tried and reverted (do not re-attempt):
+
+- `matchesAny(name, comptime candidates)` to fold the 49 `&.{…}` literals into
+  `.rodata`. Does NOT shrink `isRuntimeType`: the 16 KB is the accumulation of
+  many small per-arm temporaries, not the literals.
+- A pointer-keyed fast path over `field_read_cache` (ClassDef cell address +
+  interned name address, instead of hashing the class FQN and the field name).
+  Motivated by ~18% of a method-call profile sitting in `mum`/`eqlBytes` and the
+  hashmap internals. It is SLOWER (1.509s → 1.537s on the object-traversal
+  benchmark): reading the class address needs an extra instance borrow, whose
+  refcount traffic costs more than the string hash it saves. The `mum` samples
+  are therefore NOT coming from the field-read memo — find the real source before
+  optimizing a hash away.
+
 ## Completed
 
 - **Value.release ungated under GC (systemic O(n²)) — FIXED.** `release` was not
