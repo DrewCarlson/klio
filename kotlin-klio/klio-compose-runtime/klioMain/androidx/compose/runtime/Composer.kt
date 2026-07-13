@@ -273,6 +273,20 @@ internal class KlioComposer : Composer {
     val hasInvalidations: Boolean
         get() = invalidated.isNotEmpty()
 
+    /**
+     * A handle on the group being composed, which can invalidate itself later.
+     * This is what `currentRecomposeScope` hands out: upstream keys a
+     * RecomposeScope to a slot-table group, and klio's positional [GroupNode] IS
+     * that group, so invalidating the scope is simply marking that node for the
+     * next pass — the same set [invalidate] marks on a state write.
+     */
+    fun currentRecomposeScope(): RecomposeScope = GroupRecomposeScope(this, current())
+
+    /** Mark [g] for recomposition (see [currentRecomposeScope]). */
+    internal fun invalidateGroup(g: GroupNode) {
+        invalidated.add(g)
+    }
+
     /** Record that the current group read [state] (called by the read observer). */
     fun subscribeRead(state: Any) {
         val g = current()

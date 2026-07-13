@@ -99,6 +99,29 @@ ui,ui_click,ui_lazy,ui_material,ui_text,ui_window,ui_input,ui_png}.kt`, `mosaic_
 
 ## Remaining work
 
+### 0. Find the missing actuals with the TOOL, not by running the program
+
+`klio check --unimplemented <program.kt>` loads the program with every pack it
+imports and the embedded stdlib, walks all declarations, and lists every `expect`
+function/property with neither a Kotlin `actual` nor a registered klio intrinsic.
+It is the static analogue of the silent-`Unit` runtime failure.
+
+**Use it before touching anything.** Discovering these one at a time by running the
+program costs a pack rebuild + a run per name, and each run only ever reveals the
+NEXT one. One invocation gives the whole backlog:
+
+    klio check --unimplemented probe.kt
+
+For a `BasicTextField` probe today: **127 unimplemented actuals, 51 of them under
+`androidx.compose.foundation.text*`** — key mapping, cursor/selection drawing,
+magnifier, clipboard, code-point helpers, context menu, drag-and-drop. That is the
+real shape of the text/selection work, and it batches into a few klioMain files.
+
+Caveat: the check only sees `expect`/`actual`. A klio-authored runtime API that is
+simply ABSENT is a different gap and will not appear (e.g. `currentRecomposeScope`,
+which the compose runtime declares next to the compiler-coupled `RecomposeScopeImpl`
+the pack cannot carry — klio supplies its own).
+
 ### 1. foundation API sweep (in progress)
 
 The foundation surface is only partly exercised. Known state:
@@ -109,13 +132,14 @@ The foundation surface is only partly exercised. Known state:
 | `Modifier.border` | DONE, pixel-verified |
 | `BasicText` / `LazyColumn` / `verticalScroll` | DONE, pixel-verified |
 | `Modifier.clickable`, `pointerInput` | DONE (synthetic click) |
-| **`Image` / `painter`** | **BROKEN — stack overflow (>10001 frames). Next up.** |
+| `Image` / `painter` | DONE, pixel-verified |
+| `Canvas` composable | DONE, pixel-verified (rect + circle) |
+| `LazyRow` | DONE (windowed: composes 10 of 20) |
+| `BasicTextField` | Composes past `KeyboardOptions`, the text-input adapter and `currentRecomposeScope`; now blocked on the ~51 missing `foundation.text*` actuals (see §0) |
+| Gesture detectors (`detectTapGestures`) | BROKEN — the tap does not fire (`Modifier.clickable` does). Not an actuals gap. |
 | `Modifier.scrollable` interaction (fling, `ScrollState` drag) | untested |
-| Gesture detectors (`detectTapGestures`, `detectDragGestures`, transform) | untested |
-| `BasicTextField` (real text input through the engine) | untested |
-| Selection (`SelectionContainer`, text selection handles) | untested |
-| `LazyRow` / `LazyVerticalGrid` / staggered grid | untested |
-| `Canvas` composable | untested |
+| Selection (`SelectionContainer`, text selection handles) | untested — needs the selection actuals |
+| `LazyVerticalGrid` / staggered grid | untested |
 
 Work: drive each with a pixel/engine-fact probe, root-cause what fails, add an
 example, keep the corpus green.

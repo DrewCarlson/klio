@@ -298,3 +298,34 @@ public fun <T, E : Applier<*>> ReusableComposeNode(
     content()
     c.endNode()
 }
+
+/**
+ * Represents a recomposable section of the composition. Invalidating it schedules
+ * that section for recomposition.
+ *
+ * klio-authored: upstream declares this next to the compiler-coupled
+ * `RecomposeScopeImpl`, which the pack cannot carry, but the concept maps exactly
+ * onto klio's positional group nodes.
+ */
+public interface RecomposeScope {
+    /** Request that the composer recompose this scope. */
+    public fun invalidate()
+}
+
+internal class GroupRecomposeScope(
+    private val composer: KlioComposer,
+    private val group: GroupNode,
+) : RecomposeScope {
+    override fun invalidate() {
+        composer.invalidateGroup(group)
+    }
+}
+
+/**
+ * An object that can invalidate the composition at this point, forcing the
+ * enclosing section to recompose. `BasicTextField` holds one so it can redraw
+ * when its own state changes outside the snapshot system.
+ */
+public val currentRecomposeScope: RecomposeScope
+    @Composable
+    get() = (requireComposer() as KlioComposer).currentRecomposeScope()
