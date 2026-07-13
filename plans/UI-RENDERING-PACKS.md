@@ -145,14 +145,24 @@ in a live window is also open (material-ripple is vendored).
 - **PUBLIC cross-package top-level name collisions** — `internal` ones now lift mangled
   with a package-scoped rename channel; the public case waits on the symbol index and
   import channels resolving renamed classifiers (resolution-unification).
-- **Cross-pack signatures are invisible to the lowering.** A callee in another pack is
-  absent from the lowering module's name index, so a trailing lambda's expected arity is
-  unknown and a `T.() -> R` receiver lambda keeps a synthetic `it`. The runtime binder
-  now repairs this from the parameter's declared type (`ClosureInfo.recv_lambda`), but
-  the repair is a patch over a structural gap — the lowering should be able to see its
-  dependencies' signatures. Note the repair deliberately excludes SUSPEND function types
-  (they carry the continuation as an extra positional arg, so their arity already lines
-  up).
+- **Class MEMBERS are absent from the lowering's name index.** (This was previously
+  recorded here as "cross-pack signatures are invisible to the lowering" — that
+  diagnosis was wrong. Packs are fine: the base and the user program are ONE module.)
+  `Module.func_name_index` is built only from top-level `Function` declarations, so a
+  bare call to a class member cannot reach its signature at lower time. Consequence:
+  `overloadHostingTrailingLambda` misses, the trailing lambda's expected arity is
+  unknown, and a `T.() -> R` receiver lambda keeps a synthetic `it`
+  (`onDrawWithContent { … }` on a `CacheDrawScope`). The runtime binder repairs this from
+  the parameter's declared type at the call (`ClosureInfo.recv_lambda`), deliberately
+  excluding SUSPEND function types — they carry the continuation as an extra positional
+  argument, so their arity already lines up.
+
+  The fix is to let the bare-call arity path consult the receiver/owner class's members.
+  `registry.member_method_fids` already exists for exactly this ("reach a SIBLING member
+  method's lowered signature at lower time, when members are absent from the simple-name
+  indexes"), but it is keyed `{class}\x00{name}\x00{arity}` and owner-scoped, so it needs
+  a hierarchy walk (the member may be declared on a supertype) and care over whether the
+  arity counts the leading `this`. Until then the runtime repair carries it.
 - **~~The registry misses pack classes~~ — FIXED.** An EXTENDING build (a user program on
   top of a baked stdlib+packs base) carries only the user's declarations in `decls`, so a
   registry table registered from `decls` alone left every pack class out — `recv_fn_props`
