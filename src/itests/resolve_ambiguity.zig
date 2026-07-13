@@ -501,3 +501,69 @@ test "a cross-package bare call without an import is an unresolved reference" {
     ;
     try expectFilesOutput("xpkg_imported_ok", &.{ liba, libb, caller_imp }, "liba.f\n");
 }
+
+// An `actual` implements the `expect` that shares its package. Matching the
+// pair by SIMPLE NAME let any actual supersede every same-named expect in the
+// program, whatever package it lived in — the expect vanished from the symbol
+// table and its own callers, which import it by name, found only the stranger.
+test "an actual supersedes only the expect in its own package" {
+    try expectFilesOutput(
+        "expect_actual_pkg",
+        &.{
+            \\package p1
+            \\
+            \\expect fun greet(n: Int): String
+            ,
+            \\package p1
+            \\
+            \\actual fun greet(n: Int): String = "p1-actual-$n"
+            ,
+            \\package p2
+            \\
+            \\actual fun greet(n: Int): String = "p2-actual-$n"
+            ,
+            \\package p2
+            \\
+            \\expect fun greet(n: Int): String
+            ,
+            \\package app
+            \\
+            \\import p1.greet
+            \\
+            \\fun main() {
+            \\    println(greet(7))
+            \\}
+        },
+        "p1-actual-7\n",
+    );
+}
+
+// The runtime overload re-pick ranks the candidates lowering could not tell
+// apart from argument shapes; it is not a second scope resolution. A BODYLESS
+// target (an `expect` with no `actual` here) has no signature to score, so
+// every body-bearing namesake in the program used to outrank it and the call
+// silently ran an unrelated package's function instead of reporting the
+// missing actual.
+test "an unimplemented expect reports itself, not a same-named function elsewhere" {
+    try expectFilesErrContains(
+        "expect_no_actual",
+        &.{
+            \\package p1
+            \\
+            \\expect fun render(n: Int): String
+            ,
+            \\package p2
+            \\
+            \\fun render(n: Int): String = "p2-$n"
+            ,
+            \\package app
+            \\
+            \\import p1.render
+            \\
+            \\fun main() {
+            \\    println(render(3))
+            \\}
+        },
+        "`p1.render` is an `expect` with no `actual`",
+    );
+}

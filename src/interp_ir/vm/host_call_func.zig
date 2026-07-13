@@ -855,6 +855,25 @@ fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     };
 }
 
+/// Whether `cand` is outside the baked target's overload set because it is
+/// declared in a different package, and the target — having no body — cannot
+/// score against it.
+///
+/// The re-pick ranks the candidates the lowering could not tell apart from the
+/// argument SHAPES alone; it is not a second scope resolution. Lowering already
+/// settled scope (an explicit import outranks the caller's own package, which
+/// outranks a star/default import), so a same-simple-name function in another
+/// package is not an overload of the committed target at all. That normally does
+/// no harm, because the target scores too and defends its own binding — but a
+/// BODYLESS target (an `expect` with no `actual` here, a header stub) has no
+/// signature to score, so any body-bearing namesake anywhere in the program won
+/// by default: `import p1.getStr` silently ran `p2.getStr`.
+fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId) bool {
+    if (f.hasBody()) return false;
+    const cf = funcAt(module, cand) orelse return false;
+    return !std.mem.eql(u8, cf.package, f.package);
+}
+
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
     const name = f.name;
@@ -901,6 +920,7 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
     }
     for (candidates) |cand| {
         if (cand.int() == func.int()) continue;
+        if (crossPackageNonCandidate(module, f, cand)) continue;
         const total = positionalPoints(self, module, cand, shapes, scope) orelse continue;
         const is_low = if (funcAt(module, cand)) |cf| cf.low_priority else false;
         if (is_low) {
