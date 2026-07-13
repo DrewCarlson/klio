@@ -1,0 +1,4 @@
+ctor: label=panel flag=false n=11 body=body
+fun : panel flag=false n=11 body=body
+ctor: label=full flag=true n=7 body=b2
+ctor: label=bare flag=false n=3 body=b3

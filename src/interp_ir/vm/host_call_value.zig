@@ -1031,6 +1031,13 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 // both strand a captured receiver-lambda's bare-member
                 // resolution and flatten an `EvalError.Suspended` into a
                 // "suspended outside a driver" runtime error.
+                // One arg MORE than the declared params, on a closure that has a
+                // genuine `this` capture (checked above): arg0 is the extension
+                // receiver. This holds at zero params too — a `R.() -> T` field
+                // invoked as `holder.block(r)` (Kotlin's `Function1<R, T>` form,
+                // e.g. `getOrBuildCachedDrawBlock(this).block(this)`) supplies
+                // its receiver positionally, and the value-call path
+                // (`callValueRec`) already splits it that way.
                 const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
                 var body_args: []const Value = if (explicit_receiver) args[1..] else args;

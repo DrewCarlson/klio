@@ -690,6 +690,15 @@ pub const ClosureInfo = struct {
     /// anon-method table or the run arena).
     module: ?*const ir.Module = null,
     n_params: usize,
+    /// The body's sole declared parameter is a parser-synthesized `it` that the
+    /// lowering could not drop (the callee lives in another pack, so its
+    /// signature was invisible), but the runtime binder saw the parameter's
+    /// declared type at the call and proved this is a `T.() -> R` receiver
+    /// lambda. Its EFFECTIVE value arity is therefore `n_params - 1`: the
+    /// invoke paths bind arg0 as the receiver, and the dead `it` slot pads to
+    /// Null. A valid program's receiver-lambda body cannot reference `it`
+    /// (kotlinc rejects it), so nothing observes the padding.
+    recv_lambda: bool = false,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,
     /// Live capture values. Stored behind a shared interior-mutable
@@ -814,6 +823,17 @@ pub const SharedClosures = struct {
         const list = g.get();
         if (id >= list.items.len) return null;
         return list.items[id];
+    }
+
+    /// Mark slot `id` a receiver lambda (see `ClosureInfo.recv_lambda`). Taken
+    /// under the spine's writer lock. Idempotent: the same lambda site is always
+    /// bound to the same parameter, so the mark is a stable property of the slot.
+    pub fn markRecvLambda(self: SharedClosures, id: usize) void {
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const list = g.get();
+        if (id >= list.items.len) return;
+        list.items[id].recv_lambda = true;
     }
 
     /// In-place slot pointer for the stop-the-world GC mark/sweep only. The

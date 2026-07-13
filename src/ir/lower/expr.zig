@@ -2037,6 +2037,18 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+    // Last resort: typeck's own answer for this lambda, keyed by its body span.
+    // The AST-side sources above all need the callee's signature, which a
+    // CROSS-PACK member call does not have — the callee is absent from the
+    // lowering module's name index (`onDrawWithContent { … }` on a
+    // `CacheDrawScope` declared in another pack). Typeck resolved the expected
+    // type across packs, so it knows the value arity even when the lowering
+    // cannot see the declaration.
+    if (expected_arity == -1) {
+        if (b.module.eagerParamShapeOf(lam.body.span)) |shape| {
+            expected_arity = @intCast(shape.arity);
+        }
+    }
     // A zero-`->` lambda gets its implicit `it` only when its own
     // functional type takes exactly one parameter. A `() -> R` and a
     // `T.() -> R` receiver lambda both encode arity 0, so the
@@ -2130,6 +2142,16 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.pending_suspend_lambda = false;
         if (b.module.funcByIdMut(body_func)) |f| {
             f.is_suspend = true;
+        }
+    }
+    // The parser-synthesized `it` survived because the expected arity was
+    // UNKNOWN (a cross-pack callee is absent from this module's name index).
+    // Record that, so the runtime binder — which does see the parameter's
+    // declared type at the call — can repair a receiver lambda that kept an
+    // `it` it should never have had.
+    if (lam.implicit_it and !suppress_it and expected_arity == -1) {
+        if (b.module.funcByIdMut(body_func)) |f| {
+            f.implicit_it = true;
         }
     }
     const captures = try b.allocator.alloc(Reg, captured_names.len);
@@ -8307,6 +8329,12 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
         const dst = b.allocReg();
         orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
+        // A receiver whose static type is an unbounded type parameter declares
+        // no members, so the runtime class must not be consulted at all: the
+        // in-scope callable is the only candidate Kotlin ever had.
+        const recv_erased = receiver.* == .Path and
+            receiver.Path.segments.len == 1 and
+            b.isErasedRecvParam(receiver.Path.segments[0].name);
         try b.push(.{ .CallMemberOrValue = .{
             .dst = dst,
             .receiver = recv,
@@ -8315,6 +8343,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
+            .recv_erased = recv_erased,
         } });
         return dst;
     }

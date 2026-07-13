@@ -284,19 +284,29 @@ fn isCallableArg(v: *const Value) bool {
 }
 
 fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
-    var best: ?root.build.SecondaryCtorEntry = null;
-    var best_score: i32 = -1;
-    for (entries) |e| {
-        if (e.param_count != args.len) continue;
-        const score = scoreCtorHeads(self, e.param_type_heads, args) orelse continue;
-        // Reached only when no parameter disqualified this candidate: it is a
-        // genuine arity+type match, so it is eligible as the fallback too.
-        if (score > best_score) {
-            best_score = score;
-            best = e;
+    // Two passes. A `@Deprecated(level = HIDDEN)` constructor is not a
+    // source-level candidate in kotlinc at all — it exists only for binary
+    // compatibility — so it must never beat an ordinary one. It stays reachable
+    // as a LAST resort (a class whose only secondary constructor is hidden).
+    var pass: usize = 0;
+    while (pass < 2) : (pass += 1) {
+        const want_low = pass == 1;
+        var best: ?root.build.SecondaryCtorEntry = null;
+        var best_score: i32 = -1;
+        for (entries) |e| {
+            if (e.low_priority != want_low) continue;
+            if (e.param_count != args.len) continue;
+            const score = scoreCtorHeads(self, e.param_type_heads, args) orelse continue;
+            // Reached only when no parameter disqualified this candidate: it is a
+            // genuine arity+type match, so it is eligible as the fallback too.
+            if (score > best_score) {
+                best_score = score;
+                best = e;
+            }
         }
+        if (best != null) return best;
     }
-    return best;
+    return null;
 }
 
 fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
@@ -1120,9 +1130,44 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
         var reordered = try allocator.alloc(?Value, n);
         defer allocator.free(reordered);
         for (reordered) |*slot| slot.* = null;
+        // Kotlin binds a TRAILING LAMBDA to the LAST parameter, whatever gap the
+        // named arguments leave in between: `B("b", n = 11) { }` against
+        // `B(label, flag = …, n = …, content)` puts the block in `content` and
+        // defaults `flag`. The plain positional walk below would instead drop it
+        // into the first free slot (`flag`) and shift everything after it — the
+        // named function path already handles this (`padArgsWithDefaults`), the
+        // constructor path did not.
+        const trailing_slot: ?usize = blk: {
+            if (n == 0 or args.len == 0) break :blk null;
+            const last = args.len - 1;
+            if (arg_names[last] != null) break :blk null;
+            if (!isCallableArg(&args[last])) break :blk null;
+            // The last parameter must be the function-typed one, and must not
+            // already be claimed by name.
+            for (arg_names) |an| {
+                if (an) |nm| {
+                    if (std.mem.eql(u8, nm, primary_names.items[n - 1])) break :blk null;
+                }
+            }
+            // Read the last parameter's LOWERED type off the IR class: the
+            // `ClassDef` is not always reachable by name from every build path,
+            // and the IR class is the same table `primary_names` came from.
+            const mg2 = self.module.borrow();
+            defer mg2.deinit();
+            const irc = mg2.get().classes.items[class.int()];
+            if (n - 1 >= irc.primary_params.len) break :blk null;
+            if (!std.mem.startsWith(u8, irc.primary_params[n - 1].ty.name, "Function")) break :blk null;
+            break :blk n - 1;
+        };
         var next_pos: usize = 0;
         var overflow = false;
         for (args, 0..) |v, i| {
+            if (trailing_slot) |ts| {
+                if (i == args.len - 1) {
+                    reordered[ts] = v;
+                    continue;
+                }
+            }
             if (arg_names[i]) |nm| {
                 for (primary_names.items, 0..) |p, idx| {
                     if (std.mem.eql(u8, p, nm)) {
@@ -1145,6 +1190,17 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
             for (reordered, 0..) |slot, idx| {
                 if (slot != null) continue;
                 const has_default = blk: {
+                    // The IR class is the authority: `ClassDef` is not reachable
+                    // by name from every build path (it is null under the parity
+                    // harness), and treating that as "no default" made a
+                    // satisfiable named call fall through to the positional
+                    // fallback, which scrambled the binding.
+                    {
+                        const mg2 = self.module.borrow();
+                        defer mg2.deinit();
+                        const irc = mg2.get().classes.items[class.int()];
+                        if (idx < irc.primary_params.len and irc.primary_params[idx].has_default) break :blk true;
+                    }
                     if (class_def) |d| {
                         const dg = d.borrow();
                         defer dg.deinit();
@@ -1701,6 +1757,12 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
     if (chosen == null) {
         for (entries) |e| {
+            // A hidden binary-compat constructor must not swallow an
+            // under-applied call the PRIMARY constructor serves:
+            // `KeyboardOptions()` was picking the hidden
+            // `constructor(autoCorrect: Boolean = Default.autoCorrectOrDefault, …)`
+            // over the primary, and then evaluating its default expressions.
+            if (e.low_priority) continue;
             if (e.param_count > args.len) {
                 var all_default = true;
                 var idx = args.len;

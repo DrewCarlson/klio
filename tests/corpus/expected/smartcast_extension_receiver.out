@@ -1,0 +1,5 @@
+null,empty,short:hi,long:12,pos:7,nonpos:-3,?
+str(true,false)
+str(false,true)
+list(true)
+other

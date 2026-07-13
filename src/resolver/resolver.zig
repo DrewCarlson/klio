@@ -127,6 +127,10 @@ pub const Resolution = struct {
     /// Map from name-use site (`Span` of the referenced identifier) to the
     /// symbol it resolves to.
     uses: std.AutoHashMap(Span, SymbolId),
+    /// Declaration spans referenced by at least one name-use site. This
+    /// reverse index answers declaration-use questions without scanning the
+    /// full use map.
+    referenced_decls: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
 
     pub fn symbol(self: *const Resolution, id: SymbolId) *const Symbol {
@@ -197,6 +201,7 @@ pub fn resolve(allocator: std.mem.Allocator, file: *const KotlinFile) !Resolutio
         .scopes = r.scopes,
         .symbols = r.symbols,
         .uses = r.uses,
+        .referenced_decls = r.referenced_decls,
         .diagnostics = r.diagnostics,
     };
 }
@@ -270,6 +275,7 @@ pub fn resolveModuleWithNatives(
         .scopes = r.scopes,
         .symbols = r.symbols,
         .uses = r.uses,
+        .referenced_decls = r.referenced_decls,
         .diagnostics = r.diagnostics,
     };
 }
@@ -305,6 +311,7 @@ const Resolver = struct {
     scopes: std.ArrayList(Scope),
     symbols: std.ArrayList(Symbol),
     uses: std.AutoHashMap(Span, SymbolId),
+    referenced_decls: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
     /// Dotted package name from the file's `package` header, if any.
     /// Overwritten per file.
@@ -321,6 +328,7 @@ const Resolver = struct {
             .scopes = .empty,
             .symbols = .empty,
             .uses = std.AutoHashMap(Span, SymbolId).init(allocator),
+            .referenced_decls = std.AutoHashMap(Span, void).init(allocator),
             .diagnostics = DiagnosticSink.init(),
             .file_package = null,
             .fn_sig_keys = SigKeyMap.init(allocator),
@@ -1067,6 +1075,9 @@ const Resolver = struct {
     fn resolveNameUse(self: *Resolver, scope: ScopeId, name: []const u8, sp: Span) !void {
         if (self.lookup(scope, name)) |sym| {
             try self.uses.put(sp, sym);
+            if (self.symbols.items[sym.int()].decl_span) |decl_span| {
+                try self.referenced_decls.put(decl_span, {});
+            }
         } else if (self.isInsideClassBody(scope)) {
             // Inside a class / object body the name may be an inherited
             // member or a dynamic `this`-receiver lookup; defer to the

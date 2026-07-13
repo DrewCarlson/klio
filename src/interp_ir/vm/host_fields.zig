@@ -2430,9 +2430,21 @@ fn resolveInstanceGetter(
             // cannot shadow a subclass's own stored field (ktor:
             // HttpClientEngine's private `closed` getter vs
             // HttpClientEngineBase's field-backed atomic `closed`).
+            // A private property never participates in INHERITANCE: a base or
+            // interface private getter must not shadow a subclass's own stored
+            // field (ktor: HttpClientEngine's private `closed` getter vs
+            // HttpClientEngineBase's field-backed atomic `closed`). But that
+            // reasoning is about SUPERTYPES. On the receiver's OWN class the
+            // getter is simply its declaration, and skipping it left a private
+            // custom getter unreachable through an EXPLICIT receiver even from
+            // inside the class that declares it (`o.orDefault` for a
+            // `private val orDefault get() = …` — which is how `KeyboardOptions`
+            // reads `Default.autoCorrectOrDefault`). `head == 0` is the receiver's
+            // own class; everything after it is inherited.
+            const inherited = head != 0;
             const private_here = lookupPairFunc(pg.get().instance_prop_private, cn, name) != null;
             pg.deinit();
-            if (hit != null and !private_here) {
+            if (hit != null and !(private_here and inherited)) {
                 found = hit.?;
                 break;
             }

@@ -202,6 +202,10 @@ pub const SecondaryCtorEntry = struct {
     default_arg_thunks: []?FuncId,
     /// Optional body block lowered as a 1-arg fn taking `this`.
     body: ?FuncId,
+    /// `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`.
+    /// kotlinc does not offer such a constructor to source at all — HIDDEN exists
+    /// only for binary compatibility — so it must never win over an ordinary one.
+    low_priority: bool = false,
 };
 
 /// Result of building an IR module from a single Kotlin file.
@@ -2780,6 +2784,7 @@ fn buildModuleWithOverrides(
                 .delegation_arg_thunks = arg_fids,
                 .default_arg_thunks = default_arg_thunks,
                 .body = body_fid,
+                .low_priority = ir.lower.decl.annotationsAreLowPriority(sc.annotations),
             };
         }
         try secondary_ctors.put(c.name.name, entries);

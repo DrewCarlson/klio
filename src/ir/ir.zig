@@ -291,6 +291,15 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId = &.{},
+        /// The receiver's STATIC type is an unbounded type parameter, so it
+        /// declares no members: Kotlin compiles the body once against the
+        /// bound (`Any?`), and a call like `receiver.block()` inside
+        /// `fun <T, R> with(receiver: T, block: T.() -> R)` can only bind the
+        /// in-scope callable. Without this the receiver's RUNTIME class gets
+        /// consulted, and a same-named member on it hijacks the parameter --
+        /// `with(node) { ... }` on a node that happens to own a `block` field
+        /// ran that field instead of `with`'s own block.
+        recv_erased: bool = false,
     },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
@@ -867,6 +876,14 @@ pub const Func = struct {
     /// to the receiver this lambda was invoked with. `null` for ordinary
     /// functions and for lambdas not in argument position.
     implicit_label: ?[]const u8 = null,
+    /// This lambda body's sole parameter is the parser-synthesized `it`, kept
+    /// because the lowering could not see the callee's signature. A callee in
+    /// ANOTHER pack is absent from this module's name index, so the trailing
+    /// lambda's expected arity is unknown and the `it` survives even for a
+    /// `T.() -> R` receiver lambda. The runtime binder repairs it: at the call
+    /// it CAN see the parameter's declared type, so it marks such a closure a
+    /// receiver lambda (see `ClosureInfo.recv_lambda`).
+    implicit_it: bool = false,
     /// Marked `@kotlin.internal.LowPriorityInOverloadResolution` or
     /// `@Deprecated(level = DeprecationLevel.ERROR)`. Such a function is
     /// only a valid overload-resolution target when no ordinary candidate
