@@ -247,3 +247,35 @@ per-frame display-list serialize/parse round-trip. Idle CPU (~0.3%) and the resi
   then clear `~/.klio/cache/*.klio-image`. A stale image misresolves.
 - **The interim klio-authored ui-core** (`klio.compose.ui`) still exists and documents
   the shapes the real engine needs. It is retired as the real API lands.
+
+## Open roots (found chasing BasicTextField)
+
+`BasicTextField` no longer overflows the stack: it composes, attaches, measures,
+and reaches text layout. Three roots are fixed (see the commit): the `super.`
+first-supertype walk, the name-keyed property-invoke probe re-entering its own
+getter (`TextRange.min`), and a SAM-lambda measure policy dispatching to an
+unrelated class's `measure`. What is still open, in the order a text field hits it:
+
+**`fontScale` mis-binds in the paragraph-intrinsics path.** `resolvedFontSizePx`
+does `with(density) { size.toPx() }` → `TextUnit.toPx` → `FontScaling.toDp` →
+`Dp(value * fontScale)`, and `times` fails on the `Float` because `fontScale` is
+not a number there. `toPx` binds correctly in isolation and through
+`MaterialTheme { Text }`, so the density reaching `MultiParagraphIntrinsics` (via
+`mapEachParagraphStyle` → `ParagraphIntrinsics`) is the suspect. Repro: a
+`BasicTextField` in `renderComposeToPng`.
+
+**An imported bodyless `expect` loses to an unimported same-named function.**
+`TimePicker.kt` imports `androidx.compose.material3.internal.getString` (an
+`expect` with no actual in klio). Linking foundation's skiko `ContextMenuStrings`
+actual added an `androidx.compose.foundation.text.getString`, and the resolver then
+reported the material3 call UNRESOLVED, naming foundation's as the only candidate:
+the imported bodyless declaration was not ranked at all. A module carrying resolve
+diags cannot be baked (`moduleToImage` refuses), so material3 silently fell back to
+re-lowering from source on every run. The strings actual is unlinked for now (klio's
+`ContextMenuArea` is content-only, so nothing calls it) -- the resolver is the bug.
+
+**`realclick` broke on a pack rebuild, not on a source change.** After rebuilding
+every pack with the current binary, `hitTestResult.hitInMinimumTouchTarget(...)`
+misses on `HitTestResult`. It reproduces with all interpreter changes stashed, so
+it is a latent defect that the previously-installed (older) `ui-core` pack was
+hiding. Rebuild the packs before trusting a compose scene.
