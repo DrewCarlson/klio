@@ -13,6 +13,20 @@ const jit = @import("ir").jit_loop;
 const EXAMPLES = "examples";
 const EXPECTED = "tests/corpus/expected";
 
+/// `KLIO_E2E_SHARD=K/N` runs only the programs whose name hashes into
+/// shard K of N, so the gate fans the corpus across parallel processes.
+fn shardSkip(stem: []const u8) bool {
+    const spec = std.c.getenv("KLIO_E2E_SHARD") orelse return false;
+    const s = std.mem.span(spec);
+    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return false;
+    const k = std.fmt.parseInt(u64, s[0..slash], 10) catch return false;
+    const n = std.fmt.parseInt(u64, s[slash + 1 ..], 10) catch return false;
+    if (n == 0) return false;
+    var h = std.hash.Wyhash.init(0);
+    h.update(stem);
+    return (h.final() % n) != k;
+}
+
 fn runCorpus(jit_on: bool) !void {
     jit.setEnabledForTest(jit_on);
     defer jit.setEnabledForTest(false);
@@ -54,6 +68,8 @@ fn runCorpus(jit_on: bool) !void {
         if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
             if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
         }
+        if (shardSkip(stem)) continue;
+        if (std.c.getenv("KLIO_E2E_TRACE") != null) std.debug.print("e2e RUN {s} (jit={})\n", .{ stem, jit_on });
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
@@ -90,7 +106,7 @@ test "e2e corpus matches expected output (jit on)" {
     try runCorpus(true);
 }
 
-test "e2e corpus matches expected output" {
+test "e2e corpus matches expected output (jit off)" {
     // Stable arena for the file list + io (lives for the whole test).
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer list_arena.deinit();
@@ -128,6 +144,7 @@ test "e2e corpus matches expected output" {
         if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
             if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
         }
+        if (shardSkip(stem)) continue;
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {

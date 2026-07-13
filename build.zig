@@ -685,6 +685,17 @@ pub fn build(b: *std.Build) void {
                 b.fmt("Run the {s} module test", .{m.name}),
             );
             one.dependOn(&run_t.step);
+            // Installable form for process-parallel gating: the fast gate
+            // fans shards of the corpus across CPUs as plain processes
+            // (KLIO_E2E_SHARD=K/N + --test-filter), which one serial
+            // in-build run step cannot.
+            const bin_inst = b.addInstallArtifact(t, .{ .dest_sub_path = b.fmt("itest-{s}", .{m.name}) });
+            const bin_one = b.step(
+                b.fmt("itest-{s}-bin", .{m.name}),
+                b.fmt("Install the {s} module test binary (+ data deps)", .{m.name}),
+            );
+            bin_one.dependOn(&bin_inst.step);
+            bin_one.dependOn(&base_images_install.step);
         } else {
             test_step.dependOn(&run_t.step);
         }

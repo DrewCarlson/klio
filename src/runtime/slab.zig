@@ -83,8 +83,16 @@ const ClassState = struct {
     lock: SpinLock = .{},
     /// Slabs of this class that have at least one free cell. A slab with zero
     /// free cells is unlinked (found again on free via the pointer mask); a slab
-    /// with every cell free is unlinked and unmapped.
+    /// with every cell free is unlinked and either parked in `spare` or unmapped.
     partial: ?*SlabHeader = null,
+    /// One fully-free slab kept mapped and threaded, reused by the next
+    /// allocation of this class instead of mapping a fresh one. Unmapping a slab
+    /// the instant its last cell frees thrashes any workload that holds a single
+    /// live cell of a class across a call — the interpreted receiver chain is
+    /// exactly that, so a method-call loop paid an mmap, a 16K-cell threading
+    /// pass, and an munmap PER CALL. Parking one empty slab makes that
+    /// alloc/free pair hit the free list. Bounded: at most one SLAB per class.
+    spare: ?*SlabHeader = null,
 };
 
 const SpinLock = struct {
@@ -349,16 +357,26 @@ inline fn slabOf(ptr: [*]u8) *SlabHeader {
     return @ptrFromInt(@intFromPtr(ptr) & ~(SLAB - 1));
 }
 
+/// The class's next allocation frontier: the parked spare (already mapped and
+/// threaded) before a freshly mapped slab. Caller holds the class lock.
+fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
+    const s = if (cs.spare) |sp| blk: {
+        cs.spare = null;
+        break :blk sp;
+    } else newSlab(ci) orelse return null;
+    s.prev = null;
+    s.next = cs.partial;
+    if (cs.partial) |p| p.prev = s;
+    cs.partial = s;
+    return s;
+}
+
 fn allocSmall(len: usize) ?[*]u8 {
     const ci = classIndex(len);
     const cs = &class_states[ci];
     cs.lock.lock();
     defer cs.lock.unlock();
-    var slab = cs.partial orelse blk: {
-        const s = newSlab(ci) orelse return null;
-        cs.partial = s;
-        break :blk s;
-    };
+    var slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
     // The head may have had its free cells decommitted into dormant pages by a
     // reclaim pass. Re-commit one (reusing that slab) before mapping fresh memory
     // — this is what keeps the reclaim from growing the address space unboundedly.
@@ -368,15 +386,11 @@ fn allocSmall(len: usize) ?[*]u8 {
             continue;
         }
         // Truly exhausted (no free cells, nothing dormant): drop and take the next
-        // partial slab, mapping a fresh one only when none remain.
+        // partial slab, reusing the parked spare (or mapping fresh) when none remain.
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
-        slab = cs.partial orelse blk: {
-            const s = newSlab(ci) orelse return null;
-            cs.partial = s;
-            break :blk s;
-        };
+        slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
     }
     const cell = slab.free_head.?;
     slab.free_head = cell.next;
@@ -418,11 +432,19 @@ fn freeSmall(ptr: [*]u8) void {
         cs.partial = slab;
     }
     if (slab.free_count + slab.dormant_cells == slab.total) {
-        // No live cells remain (the rest are free or dormant): unlink and return
-        // the whole slab — `munmap` reclaims the dormant pages too.
+        // No live cells remain (the rest are free or dormant): unlink it.
         if (slab.prev) |p| p.next = slab.next else cs.partial = slab.next;
         if (slab.next) |n| n.prev = slab.prev;
-        unmapRaw(@ptrCast(slab), SLAB);
+        slab.prev = null;
+        slab.next = null;
+        // Park it as the class's spare when there is none, so the next
+        // allocation reuses this mapped, already-threaded slab. Otherwise return
+        // the whole span — `munmap` reclaims the dormant pages too.
+        if (cs.spare == null and slab.dormant_pages == 0) {
+            cs.spare = slab;
+        } else {
+            unmapRaw(@ptrCast(slab), SLAB);
+        }
     }
 }
 
@@ -589,6 +611,13 @@ pub fn reclaimDormant() void {
     for (&class_states, 0..) |*cs, ci| {
         cs.lock.lock();
         defer cs.lock.unlock();
+        // A spare parked by `freeSmall` holds no live cells; a reclaim pass is
+        // exactly when to hand its span back, so the alloc/free thrash guard
+        // never becomes a permanent per-class 256K tax.
+        if (cs.spare) |sp| {
+            cs.spare = null;
+            unmapRaw(@ptrCast(sp), SLAB);
+        }
         // Skip the partial head: it is the active allocation frontier, so
         // decommitting it would just be undone by the next allocation. Reclaimed
         // slabs stay linked — their dormant capacity is revived on demand by
