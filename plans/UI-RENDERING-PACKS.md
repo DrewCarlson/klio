@@ -143,10 +143,13 @@ in a live window is also open (material-ripple is vendored).
   dependencies' signatures. Note the repair deliberately excludes SUSPEND function types
   (they carry the continuation as an extra positional arg, so their arity already lines
   up).
-- **The registry is not merged across modules.** `Module.registry` (recv_fn_props,
-  class_super_names, …) holds only the OWN module's entries, so any runtime lookup keyed
-  through `self.module.registry` silently misses every pack class. Anything relying on it
-  for pack types must instead derive from the `ClassDef` or the declared type at the call.
+- **~~The registry misses pack classes~~ — FIXED.** An EXTENDING build (a user program on
+  top of a baked stdlib+packs base) carries only the user's declarations in `decls`, so a
+  registry table registered from `decls` alone left every pack class out — `recv_fn_props`
+  came back EMPTY for a compose program and every receiver-fn-property lookup silently
+  missed. It now registers from `file_classes` (base + user), the universe the sibling
+  tables already use: 0 → 140 entries for a compose program. Any NEW registry table must
+  register from `file_classes`, not `decls`, or it will be silently empty for packs.
 
 ### 4. Platform / backend
 

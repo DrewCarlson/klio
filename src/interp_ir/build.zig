@@ -2068,26 +2068,35 @@ fn buildModuleWithOverrides(
     // now-visible global.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
-    // Receiver-function-typed property flags, recorded BEFORE any body
+    // Receiver-function-typed property heads, recorded BEFORE any body
     // lowering: method bodies (and their lambdas) consult the registry
-    // while they lower, so the flags must exist first.
-    for (decls) |*d| {
-        if (d.* != .Class) continue;
-        const c = &d.Class;
-        for (c.primary_params) |*pp| {
-            if (pp.ty.function) |ft| {
-                if (ft.receiver) |rt| {
-                    try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = pp.name.name }, rt.name.name);
+    // while they lower, so the entries must exist first.
+    //
+    // Walk `file_classes`, not `decls`: an EXTENDING build (a user program on
+    // top of a baked stdlib+packs base) only carries the user's declarations in
+    // `decls`, so registering from those alone left every PACK class out — the
+    // map came back empty for a compose program and every receiver-fn-property
+    // lookup silently missed. `file_classes` is the base's classes plus the
+    // user's, which is the universe the sibling registry tables already use.
+    {
+        var fc_it = file_classes.iterator();
+        while (fc_it.next()) |e| {
+            const c = e.value_ptr.get();
+            for (c.primary_params) |*pp| {
+                if (pp.ty.function) |ft| {
+                    if (ft.receiver) |rt| {
+                        try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = pp.name.name }, rt.name.name);
+                    }
                 }
             }
-        }
-        for (c.members) |*m| {
-            if (m.* != .Property) continue;
-            const p = m.Property;
-            if (p.ty) |pt| {
-                if (pt.function) |ft| {
-                    if (ft.receiver) |rt| {
-                        try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = p.name.name }, rt.name.name);
+            for (c.members) |*m| {
+                if (m.* != .Property) continue;
+                const p = m.Property;
+                if (p.ty) |pt| {
+                    if (pt.function) |ft| {
+                        if (ft.receiver) |rt| {
+                            try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = p.name.name }, rt.name.name);
+                        }
                     }
                 }
             }
