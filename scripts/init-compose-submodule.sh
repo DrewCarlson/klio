@@ -33,6 +33,7 @@ sparse_ui=(
   "compose/animation/animation-core/src/commonMain"
   "compose/foundation/foundation-layout/src/commonMain"
   "compose/foundation/foundation/src/commonMain"
+  "compose/foundation/foundation/src/skikoMain"
   "compose/material3/material3/src/commonMain"
   "compose/material/material-ripple/src/commonMain"
   "compose/material/material-ripple/src/nonAndroidMain"

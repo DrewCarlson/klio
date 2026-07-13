@@ -117,6 +117,17 @@ For a `BasicTextField` probe today: **127 unimplemented actuals, 51 of them unde
 magnifier, clipboard, code-point helpers, context menu, drag-and-drop. That is the
 real shape of the text/selection work, and it batches into a few klioMain files.
 
+**Where the actuals come from.** Upstream ships them: `skikoMain` (pure Kotlin, safe
+to LINK — the pack already does this for ui-text) and `desktopMain`. Desktop
+Compose is skiko + desktop, so the text-field cursor/draw/pointer modifiers and the
+key mapping live in `desktopMain`.
+
+`desktopMain` must be **copied, not linked**: as a source set it depends on JVM APIs
+(java.awt clipboard, Swing context menus) that klio cannot satisfy, so pointing the
+pack at it would bake in a dependency we cannot honour. The java-free subset is
+vendored into `klioMain` (22 files, provenance header on each); the one JVM-coupled
+text file (`ContextMenu.desktop.kt`) and five stragglers behind it are klio-authored.
+
 Caveat: the check only sees `expect`/`actual`. A klio-authored runtime API that is
 simply ABSENT is a different gap and will not appear (e.g. `currentRecomposeScope`,
 which the compose runtime declares next to the compiler-coupled `RecomposeScopeImpl`
@@ -135,7 +146,7 @@ The foundation surface is only partly exercised. Known state:
 | `Image` / `painter` | DONE, pixel-verified |
 | `Canvas` composable | DONE, pixel-verified (rect + circle) |
 | `LazyRow` | DONE (windowed: composes 10 of 20) |
-| `BasicTextField` | Composes past `KeyboardOptions`, the text-input adapter and `currentRecomposeScope`; now blocked on the ~51 missing `foundation.text*` actuals (see §0) |
+| `BasicTextField` | **All 51 `foundation.text*` actuals now supplied** (127 unimplemented → 76). Still stack-overflows in deep native recursion — a real bug now, not a gap. Next up. |
 | Gesture detectors (`detectTapGestures`) | BROKEN — the tap does not fire (`Modifier.clickable` does). Not an actuals gap. |
 | `Modifier.scrollable` interaction (fling, `ScrollState` drag) | untested |
 | Selection (`SelectionContainer`, text selection handles) | untested — needs the selection actuals |
