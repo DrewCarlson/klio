@@ -290,9 +290,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const join = try b.allocBlock();
             const dst = b.allocReg();
             b.terminate(.{ .Branch = .{ .cond = cond_r, .t = t_block, .f = f_block } });
-            // Then arm.
+            // Then arm. An `if (x is T)` guard smart-casts `x` to `T` for the
+            // arm, and extension resolution is static — see `narrowIsCheck`.
             b.switchTo(t_block);
+            const narrowed = try narrowIsCheck(b, f.cond);
             const t_val = try lowerExpr(b, f.then_branch);
+            if (narrowed) |n| b.restoreLocal(n);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
@@ -5591,6 +5594,20 @@ fn lowerValueInvocation(
         if (b.isNonFnParam(name0) and b.module.funcId(name0) != null) {
             return null;
         }
+        // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
+        // call it cannot accept. The lambda binds the callee's last parameter,
+        // so a param whose own last parameter is not a function type is not
+        // this call's target: inside
+        // `Flow<T>.map(crossinline transform: suspend (T) -> R)` the body's
+        // `transform { value -> … }` is the `Flow.transform` OPERATOR, and only
+        // the inner `transform(value)` is the parameter. Binding the parameter
+        // there passed the operator's own lambda in as the emitted value, so
+        // `map`'s caller saw a closure where its element belonged.
+        if (b.isPlainFnParam(name0) and !b.fnParamTakesTrailingLambda(name0) and
+            lastArgIsLambda(args) and b.module.funcId(name0) != null)
+        {
+            return null;
+        }
         var callee_reg = reg;
         if (b.isBoxed(name0)) {
             const c = b.allocReg();
@@ -5762,6 +5779,22 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// Declared-type head of a single-segment Path argument naming a local /
 /// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
 /// for the shared scorer's declared-type evidence. Null for anything else.
+/// An `if (x is T)` condition over a bare name smart-casts `x` to `T` for the
+/// then-arm. Kotlin resolves extensions against the STATIC type, and lowering
+/// hands the receiver's declared head to the extension filter, so without the
+/// narrowing the declared head (`Any?`) refutes every `CharSequence` extension
+/// and `x.isEmpty()` misses. A negated check narrows nothing here (its
+/// information is on the else path).
+fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
+    if (cond.* != .IsCheck) return null;
+    const ck = cond.IsCheck;
+    if (ck.negated) return null;
+    if (ck.expr.* != .Path or ck.expr.Path.segments.len != 1) return null;
+    const head = loweredCheckTypeName(b, &ck.ty);
+    if (head.len == 0) return null;
+    return try b.narrowLocal(ck.expr.Path.segments[0].name, head);
+}
+
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
     // NOT feed evidence yet: typeck's permissive inference can hand back
@@ -6415,6 +6448,7 @@ fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.
         .recv_ty = b.recvTy(),
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
+        .owner_class = b.ownerClass(),
     };
 }
 
@@ -8327,8 +8361,19 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // member is still tried first at runtime, with the local as the fallback.
     const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
         !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
-    const local_callable = b.isLocalFn(name.name) or b.isParam(name.name) or
-        b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null;
+    // A parameter whose declared type is a function type with NO receiver can
+    // never serve an EXPLICIT-receiver call. Kotlin resolves `recv.name(args)` to
+    // a member or extension of `recv`; a local competes only when its type is an
+    // EXTENSION-function type (`Modifier.() -> Unit`, which is why `up.update()`
+    // binds a `Up.() -> Unit` param). A plain `(FocusState) -> Unit` is not that —
+    // and treating it as a candidate made `.onFocusChanged(onFocusChanged)` inside
+    // `textFieldFocusModifier` INVOKE the callback with itself as its argument
+    // instead of dispatching `Modifier.onFocusChanged`, recursing until the native
+    // stack blew (every `BasicTextField`).
+    const plain_fn_local = b.isPlainFnParam(name.name);
+    const local_callable = !plain_fn_local and
+        (b.isLocalFn(name.name) or b.isParam(name.name) or
+            b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
     if (local_callable) {
         const local_reg = blk: {
             if (anon_cap) {

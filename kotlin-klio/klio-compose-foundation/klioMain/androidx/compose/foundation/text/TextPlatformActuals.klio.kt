@@ -16,8 +16,19 @@ import androidx.compose.ui.text.AnnotatedString
  * cannot carry.
  */
 
-/** The undo manager coalesces edits by wall-clock gap. */
-internal actual fun timeNowMillis(): Long = kotlin.time.Clock.System.now().toEpochMilliseconds()
+/**
+ * The undo manager coalesces edits by the GAP between them, so it needs a
+ * monotonically increasing millisecond clock, not a wall clock — and klio exposes
+ * no wall clock (`androidx.compose.ui.currentTimeMillis` takes the same approach).
+ * A counter advancing one frame per read gives positive, ordered deltas and is
+ * deterministic, which the headless render tier needs.
+ */
+private var undoClockMillis: Long = 0L
+
+internal actual fun timeNowMillis(): Long {
+    undoClockMillis += 16L
+    return undoClockMillis
+}
 
 /**
  * Append a Unicode code point. Kotlin's `StringBuilder` takes `Char`s, so a
