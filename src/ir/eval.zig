@@ -3588,7 +3588,15 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
             // invoking the local.
             const fb_misfit = fb_invocable and
                 (host.callableAcceptsCall(&fb, &recv, user_args, names) orelse true) == false;
-            if (fb_invocable and !fb_misfit and !host.hostHasMember(&recv, name_str)) {
+            // A receiver whose STATIC type is an unbounded type parameter has no
+            // members to shadow the local: Kotlin compiles the body once against
+            // the bound (`Any?`), so `receiver.block()` inside
+            // `fun <T, R> with(receiver: T, block: T.() -> R)` always binds the
+            // `block` PARAMETER. Consulting the runtime class instead let a
+            // same-named member hijack it — `with(node) { … }` on a node owning a
+            // `block` field ran that field and skipped the whole with-body.
+            const members_visible = !cmv.recv_erased and host.hostHasMember(&recv, name_str);
+            if (fb_invocable and !fb_misfit and !members_visible) {
                 orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
                 if (fb == .Class) {
                     // Constructors take no receiver: `65.f()` with

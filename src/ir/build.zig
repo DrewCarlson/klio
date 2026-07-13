@@ -438,6 +438,8 @@ pub const FuncBuilder = struct {
     /// `a.compareTo(b) <op> 0` — the total order, unlike the IEEE
     /// primitive operators.
     generic_typed_params: StringSet,
+    /// See `markErasedRecvParam`.
+    erased_recv_params: StringSet,
     /// Params whose declared type is a concrete NON-function type (not a
     /// function type, not a bare generic type-parameter). Such a param does
     /// NOT shadow a same-named top-level function for a *call*: kotlinc
@@ -611,6 +613,7 @@ pub const FuncBuilder = struct {
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
+            .erased_recv_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
             .reified_type_names = std.StringHashMap([]const u8).init(allocator),
@@ -684,6 +687,7 @@ pub const FuncBuilder = struct {
         self.receiver_lambda_arity.deinit();
         self.context_fn_params.deinit();
         self.generic_typed_params.deinit();
+        self.erased_recv_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
         self.reified_type_names.deinit();
@@ -1328,6 +1332,14 @@ pub const FuncBuilder = struct {
     }
     pub fn isGenericTypedParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.generic_typed_params.contains(name);
+    }
+    /// A parameter whose declared type is an UNBOUNDED type parameter of the
+    /// enclosing function: its static type declares no members at all.
+    pub fn markErasedRecvParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.erased_recv_params.put(name, {});
+    }
+    pub fn isErasedRecvParam(self: *const FuncBuilder, name: []const u8) bool {
+        return self.erased_recv_params.contains(name);
     }
     pub fn markNonFnParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.non_fn_params.put(name, {});

@@ -2240,6 +2240,16 @@ pub fn checkLambdaShaped(
             if (f.receiver_head) |h| {
                 self.lambda_recv_heads.put(body.span, h) catch {};
             }
+            // The lambda's OWN expected shape, keyed by its body span. The
+            // lowering falls back to this when it cannot see the callee's
+            // signature — a cross-pack member call (`onDrawWithContent { … }`
+            // on a `CacheDrawScope` from another pack) leaves the callee out of
+            // the lowering module's name index entirely, so without this the
+            // lambda keeps a synthetic `it` and its receiver never binds.
+            self.lambda_param_shapes.put(body.span, .{
+                .has_receiver = f.receiver_head != null,
+                .arity = @intCast(f.params.len),
+            }) catch {};
             // Function-typed params the AST leaves unannotated: record
             // their declared shape keyed by the param ident's span.
             for (params, 0..) |p2, i| {

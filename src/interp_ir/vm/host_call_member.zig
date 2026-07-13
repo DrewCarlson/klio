@@ -304,7 +304,14 @@ fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args:
     // args[0] as the receiver, not as the first parameter.
     if (callee.* == .IrClosure and args.len >= 1) {
         if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
-            if (args.len == info.n_params + 1) {
+            // A `recv_lambda` closure carries a dead synthetic `it` the lowering
+            // could not drop (its callee lived in another pack), so its DECLARED
+            // value arity is one less than its parameter count. Use the declared
+            // arity here, or a receiver passed positionally gets swallowed by the
+            // stray `it` (`getOrBuildCachedDrawBlock(this).block(this)` for a
+            // `ContentDrawScope.() -> Unit` field).
+            const eff_params = if (info.recv_lambda and info.n_params > 0) info.n_params - 1 else info.n_params;
+            if (args.len == eff_params + 1) {
                 var has_this = false;
                 for (info.capture_names) |n| {
                     if (std.mem.eql(u8, n, "this")) {
@@ -3161,15 +3168,6 @@ fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance) return null;
     const head = recvFnPropHeadOf(self, receiver, name) orelse return null;
-    // This arm serves the EXPLICIT-receiver shape (`x.handler()`), where
-    // Kotlin's property-invoke applies only through receivers static
-    // scope provides — here that is the receiver itself. A field whose
-    // declared receiver type the owner cannot satisfy does not apply;
-    // decline WITHOUT scanning the dynamic chain, so `receiver.block()`
-    // inside `kotlin.with` reaches with's own `block` PARAM instead of a
-    // same-named field on the with-subject (the bare-name arms in
-    // `callMemberInnerStatic` do consult the implicit-receiver chain).
-    if (head.len != 0 and !receiverImplementsHead(self, receiver, head)) return null;
     const field_val: Value = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
@@ -3178,7 +3176,36 @@ fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value
         break :blk v;
     };
     defer field_val.release(allocator);
-    if (callableFieldArity(self, &field_val) == null) return null;
+    // The lambda's DECLARED value arity. A `recv_lambda` closure carries a dead
+    // synthetic `it` the lowering could not drop (its callee lived in another
+    // pack), so its declared arity is one less than its parameter count.
+    const arity = blk: {
+        const n = callableFieldArity(self, &field_val) orelse return null;
+        if (field_val == .IrClosure) {
+            if (self.closures.get(@intCast(field_val.IrClosure.id))) |ci| {
+                if (ci.recv_lambda and n > 0) break :blk n - 1;
+            }
+        }
+        break :blk n;
+    };
+    // The call supplies the lambda's receiver POSITIONALLY — one arg more than
+    // the lambda declares (`getOrBuildCachedDrawBlock(this).block(this)` for a
+    // `ContentDrawScope.() -> Unit` field). Split arg0 off as the receiver here
+    // rather than leaning on the invoke path's arity heuristic: the owner need
+    // not satisfy the head at all, and a stray `it` must not swallow the
+    // receiver.
+    if (args.len == arity + 1) {
+        return try host_call_value.callValueWithThis(self, allocator, &field_val, &args[0], args[1..], &.{});
+    }
+    {
+        // Receiver-bound form (`scope.handler()`): the lambda's receiver can
+        // only be the owner, so a field whose declared receiver type the owner
+        // cannot satisfy does not apply here. Decline WITHOUT scanning the
+        // dynamic chain, so `receiver.block()` inside a generic function reaches
+        // the in-scope callable rather than a same-named field on the runtime
+        // receiver.
+        if (head.len != 0 and !receiverImplementsHead(self, receiver, head)) return null;
+    }
     return try host_call_value.callValueWithThis(self, allocator, &field_val, receiver, args, &.{});
 }
 
@@ -7593,6 +7620,21 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
 
+    // The callee's declared parameter types are the authority on whether a
+    // lambda argument is a `T.() -> R` receiver lambda. Align the user args with
+    // the declared params: a receiver-formed member carries `this` in slot 0, so
+    // its user params start at 1. Misaligning here would pair a lambda with the
+    // WRONG parameter's type and mismark it.
+    {
+        const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (f.params.len >= off) {
+            for (f.params[off..], 0..) |*p, i| {
+                if (i >= args.len) break;
+                host_call_func.markRecvLambdaArg(self, mod, &p.ty, &args[i]);
+            }
+        }
+    }
+
     // Non-final vararg (a vararg before trailing defaulted / named-only params):
     // the prepend + trailing-collapse path cannot bind it — the vararg must
     // consume the mid-list positional args at its own position while the
@@ -10071,6 +10113,44 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
 /// an argument that only weakly matches (or is a wrong-but-not-disproven type
 /// like a `Color` against a `Brush` parameter) contributes less, so the closer
 /// overload wins. Used to break ties among same-named overloads of one class.
+/// How many of `f`'s declared parameters the call leaves UNBOUND — the ones a
+/// default (or an empty vararg) has to fill. Kotlin's specificity rule ranks a
+/// candidate that needs no default-filling above one that does, which is what
+/// separates two overloads whose parameter lists are otherwise a subset/superset
+/// pair: `DrawScope.drawImage(…, blendMode)` and
+/// `DrawScope.drawImage(…, blendMode, filterQuality)` both accept the same nine
+/// named arguments, and the concrete one delegates BY NAME to the abstract one —
+/// so picking the superset re-selected the caller itself and recursed forever.
+fn unboundParamCount(f: *const Func, args: []const Value, arg_names: ?[]const ?[]const u8) usize {
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const effective = f.params[skip..];
+    var bound = [_]bool{false} ** 64;
+    if (effective.len > bound.len) return 0;
+    var positional: usize = 0;
+    for (args, 0..) |_, i| {
+        const supplied_name: ?[]const u8 = if (arg_names) |ns| (if (i < ns.len) ns[i] else null) else null;
+        if (supplied_name) |nm| {
+            for (effective, 0..) |*p, k| {
+                if (!bound[k] and std.mem.eql(u8, p.name, nm)) {
+                    bound[k] = true;
+                    break;
+                }
+            }
+        } else {
+            while (positional < effective.len and bound[positional]) positional += 1;
+            if (positional < effective.len) {
+                bound[positional] = true;
+                positional += 1;
+            }
+        }
+    }
+    var n: usize = 0;
+    for (effective, 0..) |*p, k| {
+        if (!bound[k] and !p.is_vararg) n += 1;
+    }
+    return n;
+}
+
 fn scoreNamedMemberCandidate(self: *VmHost, f: *const Func, args: []const Value, arg_names: ?[]const ?[]const u8) i32 {
     const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const effective = f.params[skip..];
@@ -10116,6 +10196,34 @@ fn lastParamIsFunctionShaped(self: *VmHost, p: *const ir.Param) bool {
     return std.mem.startsWith(u8, last_ty, "Function") or
         std.mem.indexOf(u8, last_ty, "->") != null or
         (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
+}
+
+/// Member invocations the named walk currently has on the stack, as
+/// (FuncId, receiver identity) pairs. An interface DEFAULT method whose body
+/// delegates BY NAME to a sibling overload must not re-select ITSELF: klio's
+/// class method table omits abstract members, so the walk sees only the default
+/// and re-binds it, defaulting the parameter the sibling does not declare and
+/// recursing forever (`DrawScope.drawImage(…, filterQuality)` delegating to the
+/// abstract `drawImage(…, blendMode)` — every `Image` composable hung). Skipping
+/// the in-flight frame lets the ladder continue to the class-delegate forward,
+/// which is where the real override lives (`LayoutNodeDrawScope : DrawScope by
+/// canvasDrawScope`). Bounded; overflow simply disables the guard for the excess.
+threadlocal var walk_active: [64]struct { fid: u32, ident: usize } = undefined;
+threadlocal var walk_active_len: usize = 0;
+
+fn receiverIdent(v: *const Value) usize {
+    return switch (v.*) {
+        .Instance => |i| @intFromPtr(i.cell),
+        else => 0,
+    };
+}
+
+fn walkActive(fid: FuncId, ident: usize) bool {
+    if (ident == 0) return false;
+    for (walk_active[0..walk_active_len]) |e| {
+        if (e.fid == fid.int() and e.ident == ident) return true;
+    }
+    return false;
 }
 
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
@@ -10178,6 +10286,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 // taking the first would bind the wrong one and scramble the
                 // trailing defaulted parameters.
                 var best_score: i32 = std.math.minInt(i32);
+                var best_unbound: usize = std.math.maxInt(usize);
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
@@ -10201,11 +10310,23 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                             // needs a matching param, a typed arg must
                             // not definitely mismatch), or Kotlin
                             // resolution moves on to the next tier.
+                            // Already executing this exact method on this exact
+                            // receiver: re-selecting it is the self-delegation
+                            // loop described on `walk_active`. Decline, so the
+                            // ladder reaches the class-delegate forward.
+                            if (walkActive(fid, receiverIdent(receiver))) continue;
                             if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
                                 const sc = scoreNamedMemberCandidate(self, &f, args, arg_names);
-                                if (method_fid == null or sc > best_score) {
+                                // Argument types decide first; a tie goes to the
+                                // MORE SPECIFIC signature — the one leaving fewer
+                                // parameters for defaults to fill.
+                                const ub = unboundParamCount(&f, args, arg_names);
+                                if (method_fid == null or sc > best_score or
+                                    (sc == best_score and ub < best_unbound))
+                                {
                                     method_fid = fid;
                                     best_score = sc;
+                                    best_unbound = ub;
                                 }
                             }
                         }
@@ -10254,7 +10375,14 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
         }
         const mg = self.module.borrow();
         const mod = mg.get();
+        const ident = receiverIdent(receiver);
+        const pushed = ident != 0 and walk_active_len < walk_active.len;
+        if (pushed) {
+            walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
+            walk_active_len += 1;
+        }
         const r = try callFuncNamedRec(self, allocator, mod, fid, all, names);
+        if (pushed) walk_active_len -= 1;
         mg.deinit();
         return r;
     }

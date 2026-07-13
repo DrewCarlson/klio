@@ -1164,11 +1164,29 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         var tp_names = StringSet.init(a);
         defer tp_names.deinit();
         for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
+        // Type parameters with NO upper bound (inline or `where`): a value of
+        // such a type has the members of `Any?`, i.e. none worth dispatching.
+        var tp_unbounded = StringSet.init(a);
+        defer tp_unbounded.deinit();
+        for (f.type_params) |*tp| {
+            if (tp.upper_bound != null) continue;
+            var bounded = false;
+            for (f.where_bounds) |*wb| {
+                if (std.mem.eql(u8, wb.name.name, tp.name.name)) {
+                    bounded = true;
+                    break;
+                }
+            }
+            if (!bounded) try tp_unbounded.put(tp.name.name, {});
+        }
         b.setSelfDeclSpan(f.name.span);
         b.setHasOwnTypeParams(f.type_params.len != 0);
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
                 try b.markGenericTypedParam(p.name.name);
+            }
+            if (p.ty.function == null and tp_unbounded.contains(p.ty.name.name)) {
+                try b.markErasedRecvParam(p.name.name);
             }
             // A concrete non-function param type (not a function type, not a
             // bare generic type-parameter): such a param does not shadow a
