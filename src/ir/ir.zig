@@ -3800,8 +3800,13 @@ pub const ModuleRegistry = struct {
     /// type (`suspend Scope.() -> Unit`): a bare invocation of the stored
     /// value inside a receiver context binds the implicit `this` as the
     /// lambda's receiver (`_deprecatedPointerInputHandler!!()` inside the
-    /// pointer-input node runs the handler on the node's scope).
-    recv_fn_props: StrPairSet,
+    /// pointer-input node runs the handler on the node's scope). The value
+    /// is the DECLARED receiver type's simple head (`Scope`), so dispatch
+    /// binds the innermost implicit receiver of that type — the owning
+    /// instance when it implements the head, an enclosing receiver
+    /// otherwise (`block()` inside `with(cacheDrawScope) { … }` where
+    /// `block: CacheDrawScope.() -> DrawResult` lives on the node).
+    recv_fn_props: StrPairMap([]const u8),
     /// `(class simple name, property name)` → the property's DECLARED
     /// type head, with a class type-parameter name substituted by its
     /// bound's head (`data: T` in `IterableTests<T : Iterable<String>>`
@@ -3928,7 +3933,7 @@ pub const ModuleRegistry = struct {
             .class_member_names = std.StringHashMap(void).init(allocator),
             .class_super_names = std.StringHashMap([]const []const u8).init(allocator),
             .delegated_body_props = StrPairSet.init(allocator),
-            .recv_fn_props = StrPairSet.init(allocator),
+            .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),

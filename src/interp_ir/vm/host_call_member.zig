@@ -315,9 +315,16 @@ fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args:
                 if (has_this) {
                     return self.callValueWithThis(allocator, callee, &args[0], args[1..], &.{});
                 }
-                // No `this` slot: the lambda never reads its receiver —
-                // bind the declared params and drop the receiver arg.
-                return self.callValue(allocator, callee, args[1..]);
+                // No `this` slot: the lambda never READS its receiver —
+                // bind the declared params without it. The receiver still
+                // scopes the body's dispatch (a member-extension declared
+                // on its class resolves through it), so it rides along as
+                // the innermost subject, exactly like the value-call path.
+                const pushed = args[0] == .Instance or args[0] == .Null;
+                if (pushed) pushAccessEnclosingSubject(self, &args[0]);
+                const r = self.callValue(allocator, callee, args[1..]);
+                if (pushed) popAccessEnclosing(self);
+                return r;
             }
         }
     }
@@ -2488,6 +2495,39 @@ fn isArrayRelatedIface(pn: []const u8) bool {
     return false;
 }
 
+/// The Kotlin type name of a scalar runtime value's kind, or null for
+/// non-scalars. Used to compare a scalar argument against a value class's
+/// underlying representation.
+fn scalarKindName(arg: *const Value) ?[]const u8 {
+    return switch (arg.*) {
+        .Bool => "Boolean",
+        .Char => "Char",
+        .Byte => "Byte",
+        .Short => "Short",
+        .Int => "Int",
+        .Long => "Long",
+        .Float => "Float",
+        .Double => "Double",
+        .UByte => "UByte",
+        .UShort => "UShort",
+        .UInt => "UInt",
+        .ULong => "ULong",
+        .String => "String",
+        else => null,
+    };
+}
+
+fn isScalarKindName(n: []const u8) bool {
+    const set = [_][]const u8{
+        "Boolean", "Char",  "Byte",   "Short", "Int",    "Long",  "Float",
+        "Double",  "UByte", "UShort", "UInt",  "ULong",  "String",
+    };
+    for (set) |s| {
+        if (std.mem.eql(u8, n, s)) return true;
+    }
+    return false;
+}
+
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
@@ -2585,6 +2625,58 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
         // (`Iterable`/`Collection`/`Sequence`, which back `Array.first()` and
         // friends) and any array-named param — those stay non-definite.
         .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
+        // A SCALAR against a known user class: definite — except a VALUE
+        // class whose underlying representation has the SAME kind, since
+        // value-class instances circulate unboxed (a Long could be an `Sz`
+        // over Long, but an Int could not). Without the definite arm, a
+        // private `Sz.compareTo` member-extension shadows the Int
+        // intrinsic inside its OWN body and the dispatch loops.
+        .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong, .String => {
+            // The scalar may satisfy the param NOMINALLY (a String is a
+            // CharSequence/Comparable, an Int is a Number): non-definite.
+            if (arg.isRuntimeType(pn)) return false;
+            // A param naming a DIFFERENT scalar kind stays non-definite
+            // too: kotlinc widens integer literals at the call site
+            // (`fromEpochMilliseconds(0)` binds the Long param), which
+            // the runtime tag cannot see.
+            if (isScalarKindName(pn)) return false;
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            const def = cg.get().get(pn) orelse cg.get().get(orig) orelse return false;
+            var dg = def.borrow();
+            if (!dg.get().is_value) {
+                dg.deinit();
+                return true;
+            }
+            // Chase the value class's underlying declared type (through
+            // nested value classes) to a scalar kind name; an unknown or
+            // generic underlying stays a candidate.
+            var hops: u8 = 0;
+            while (hops < 4) : (hops += 1) {
+                const params = dg.get().primary_params;
+                if (params.len == 0) {
+                    dg.deinit();
+                    return false;
+                }
+                const dt_raw = params[0].declared_type orelse {
+                    dg.deinit();
+                    return false;
+                };
+                const dt = std.mem.trimEnd(u8, simpleName(dt_raw), "?");
+                dg.deinit();
+                if (scalarKindName(arg)) |kn| {
+                    if (isScalarKindName(dt)) return !std.mem.eql(u8, dt, kn);
+                }
+                const inner = cg.get().get(dt) orelse return false;
+                dg = inner.borrow();
+                if (!dg.get().is_value) {
+                    dg.deinit();
+                    return false;
+                }
+            }
+            dg.deinit();
+            return false;
+        },
         else => return false,
     };
     var start: []const u8 = undefined;
@@ -3018,32 +3110,66 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// a callable field whose arity matches the call and the class also has a
 /// same-named vararg method, invoke the field: the property is the intended
 /// target for this argument shape.
+/// The declared receiver-type head of a RECEIVER-function-typed property
+/// `name` on the receiver's class (or a superclass), or null when the
+/// property is not receiver-fn-typed.
+fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]const u8 {
+    if (receiver.* != .Instance) return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const reg = &mg.get().registry;
+    var cur: ?[]const u8 = blk2: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk2 cg.get().name;
+    };
+    var hops: usize = 0;
+    while (cur) |cn| : (hops += 1) {
+        if (hops > 32) break;
+        if (reg.recv_fn_props.get(.{ .a = cn, .b = name })) |h| return h;
+        const chain = reg.class_super_names.get(cn) orelse break;
+        if (chain.len == 0) break;
+        var sn = chain[0];
+        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        cur = sn;
+    }
+    return null;
+}
+
+/// The receiver a stored receiver-typed lambda binds at invocation: the
+/// owning instance when it implements the declared head
+/// (`scope.handler()` with `handler: Scope.() -> Unit`), else the
+/// innermost implicit receiver that does. Null when none is in scope —
+/// the property does not apply to this call and the walk must continue
+/// (`receiver.block()` inside `kotlin.with` must reach with's own `block`
+/// PARAM when the receiver carries a same-named receiver-typed field it
+/// cannot satisfy, or the whole `with(node) { … }` body is silently
+/// replaced by the field's lambda).
+fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value, head: []const u8) Allocator.Error!?Value {
+    if (head.len == 0 or receiverImplementsHead(self, receiver, head)) return receiver.*;
+    const chain = try enclosingThisChain(self, allocator);
+    defer allocator.free(chain);
+    for (chain) |c| {
+        if (c != .Instance) continue;
+        if (receiverImplementsHead(self, &c, head)) return c;
+    }
+    return null;
+}
+
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance) return null;
-    const flagged = blk: {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        const reg = &mg.get().registry;
-        var cur: ?[]const u8 = blk2: {
-            const g = receiver.Instance.borrow();
-            defer g.deinit();
-            const cg = g.get().class.borrow();
-            defer cg.deinit();
-            break :blk2 cg.get().name;
-        };
-        var hops: usize = 0;
-        while (cur) |cn| : (hops += 1) {
-            if (hops > 32) break;
-            if (reg.recv_fn_props.get(.{ .a = cn, .b = name }) != null) break :blk true;
-            const chain = reg.class_super_names.get(cn) orelse break;
-            if (chain.len == 0) break;
-            var sn = chain[0];
-            if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
-            cur = sn;
-        }
-        break :blk false;
-    };
-    if (!flagged) return null;
+    const head = recvFnPropHeadOf(self, receiver, name) orelse return null;
+    // This arm serves the EXPLICIT-receiver shape (`x.handler()`), where
+    // Kotlin's property-invoke applies only through receivers static
+    // scope provides — here that is the receiver itself. A field whose
+    // declared receiver type the owner cannot satisfy does not apply;
+    // decline WITHOUT scanning the dynamic chain, so `receiver.block()`
+    // inside `kotlin.with` reaches with's own `block` PARAM instead of a
+    // same-named field on the with-subject (the bare-name arms in
+    // `callMemberInnerStatic` do consult the implicit-receiver chain).
+    if (head.len != 0 and !receiverImplementsHead(self, receiver, head)) return null;
     const field_val: Value = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
@@ -3902,7 +4028,16 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (field) |v| {
             if (missTraceWant(name)) std.debug.print("[fnprop] own-field hit tag={s} callable={}\n", .{ @tagName(v), isCallable(&v) });
             if (isCallable(&v) or v == .Instance) {
-                return callValueRec(self, allocator, &v, args);
+                // A RECEIVER-function-typed property binds an implicit
+                // receiver of its declared head at invocation; with none
+                // in scope the property does not apply — skip the arm.
+                if (recvFnPropHeadOf(self, receiver, name)) |head| {
+                    if (try recvFnReceiverFor(self, allocator, receiver, head)) |rv| {
+                        return try host_call_value.callValueWithThis(self, allocator, &v, &rv, args, &.{});
+                    }
+                } else {
+                    return callValueRec(self, allocator, &v, args);
+                }
             }
         } else if (blk: {
             // Accessor-backed property holding a callable (`state.value()`
@@ -4089,7 +4224,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         };
         if (field) |f| {
             switch (f) {
-                .Function, .IrClosure, .Class => return callValueRec(self, allocator, &f, args),
+                .Function, .IrClosure, .Class => {
+                    // Same receiver-fn-typed applicability gate as the
+                    // by-name arm above.
+                    if (recvFnPropHeadOf(self, receiver, name)) |head| {
+                        if (try recvFnReceiverFor(self, allocator, receiver, head)) |rv| {
+                            return try host_call_value.callValueWithThis(self, allocator, &f, &rv, args, &.{});
+                        }
+                    } else {
+                        return callValueRec(self, allocator, &f, args);
+                    }
+                },
                 else => {},
             }
         }
@@ -8172,9 +8317,9 @@ pub fn boundRefFile(callee: *const Value) ?ir.FileId {
 fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
-    if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
         if (funcAt(mod, fid)) |f| {
-            if (std.mem.eql(u8, f.name, "arrange")) {
+            if (std.mem.eql(u8, f.name, want) or std.mem.eql(u8, want, "1")) {
                 std.debug.print("[mev] fid={d} owner={s} vis={}\n", .{ fid.int(), owner, visible_owners.contains(owner) });
                 var it = visible_owners.keyIterator();
                 std.debug.print("[mev] set:", .{});

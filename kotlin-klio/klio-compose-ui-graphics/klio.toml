@@ -38,6 +38,11 @@ include = [
     "androidx/compose/ui/graphics/PathEffect.kt",
     "androidx/compose/ui/graphics/ImageBitmap.kt",
     "androidx/compose/ui/graphics/PixelMap.kt",
+    # Painter abstraction + the concrete painters foundation's Image uses.
+    "androidx/compose/ui/graphics/painter/Painter.kt",
+    "androidx/compose/ui/graphics/painter/BitmapPainter.kt",
+    "androidx/compose/ui/graphics/painter/BrushPainter.kt",
+    "androidx/compose/ui/graphics/painter/ColorPainter.kt",
     # The Canvas surface (klioMain supplies the actual over the Skia shim).
     "androidx/compose/ui/graphics/Canvas.kt",
     "androidx/compose/ui/graphics/Vertices.kt",
