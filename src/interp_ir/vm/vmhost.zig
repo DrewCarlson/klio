@@ -283,6 +283,7 @@ pub const VmHost = struct {
     // every `ir.eval.evalWith(VmHost, ...)` call site.
     pub const callValue = host_call_value.callValue;
     pub const callValueNamed = host_call_value.callValueNamed;
+    pub const callValueNamedRecvCtx = host_call_value.callValueNamedRecvCtx;
     pub const closureParamsDisproven = host_call_value.closureParamsDisproven;
     pub const callValueNamedTyped = host_call_value.callValueNamedTyped;
     pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;

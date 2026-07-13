@@ -671,6 +671,41 @@ pub fn callValueNamedTyped(self: *VmHost, allocator: Allocator, callee: *const V
     return callValueNamed(self, allocator, callee, args, arg_names);
 }
 
+/// `callValueNamed` with the call site's member-fallback receiver as
+/// dispatch context: a receiver-typed closure with no `this` capture
+/// invoked bare (`block()` for an `R.() -> T` field/local inside a
+/// spliced scope function) rides the receiver along as its innermost
+/// subject so the body's member-extension dispatch sees it. The exact
+/// arity and missing `this` slot guarantee no positional or capture
+/// binding changes; every other callee shape dispatches as before.
+pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    if (callee.* == .IrClosure and recv.* == .Instance) {
+        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            var has_this = false;
+            for (info.capture_names) |n| {
+                if (std.mem.eql(u8, n, "this")) {
+                    has_this = true;
+                    break;
+                }
+            }
+            if (!has_this and args.len == info.n_params) {
+                if (runtime.getenvSlice("KLIO_CVNRC") != null) {
+                    const tn = blk: {
+                        const g = recv.Instance.borrow();
+                        defer g.deinit();
+                        const cg = g.get().class.borrow();
+                        defer cg.deinit();
+                        break :blk cg.get().name;
+                    };
+                    std.debug.print("[cvnrc] id={d} recv={s}\n", .{ callee.IrClosure.id, tn });
+                }
+                return callValueWithThis(self, allocator, callee, recv, args, arg_names);
+            }
+        }
+    }
+    return callValueNamed(self, allocator, callee, args, arg_names);
+}
+
 pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     // A Class callee constructed with named arguments (e.g. a local class
     // `Box(bb = true)` that skips a defaulted parameter) must reorder + default-

@@ -3693,7 +3693,15 @@ fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const 
                     const name_str = constStr(frame.module, cvm.name) orelse "?";
                     orAudit("CallValueOrMember", name_str, "value", -1, null);
                 }
-                switch (try host.callValueNamed(allocator, &callee_v, arg_values, names)) {
+                // The member-fallback receiver is also the call site's
+                // innermost implicit receiver; a receiver-typed closure
+                // invoked bare binds it as dispatch context.
+                const recv_ctx = frame.read(cvm.this_recv);
+                const r = if (comptime @hasDecl(H, "callValueNamedRecvCtx"))
+                    try host.callValueNamedRecvCtx(allocator, &callee_v, &recv_ctx, arg_values, names)
+                else
+                    try host.callValueNamed(allocator, &callee_v, arg_values, names);
+                switch (r) {
                     .ok => |rv| try frame.write(cvm.dst, rv),
                     .err => |e| return raiseStep(frame, e),
                 }

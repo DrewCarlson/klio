@@ -2076,8 +2076,8 @@ fn buildModuleWithOverrides(
         const c = &d.Class;
         for (c.primary_params) |*pp| {
             if (pp.ty.function) |ft| {
-                if (ft.receiver != null) {
-                    try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = pp.name.name }, {});
+                if (ft.receiver) |rt| {
+                    try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = pp.name.name }, rt.name.name);
                 }
             }
         }
@@ -2086,8 +2086,8 @@ fn buildModuleWithOverrides(
             const p = m.Property;
             if (p.ty) |pt| {
                 if (pt.function) |ft| {
-                    if (ft.receiver != null) {
-                        try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = p.name.name }, {});
+                    if (ft.receiver) |rt| {
+                        try module.registry.recv_fn_props.put(.{ .a = c.name.name, .b = p.name.name }, rt.name.name);
                     }
                 }
             }
