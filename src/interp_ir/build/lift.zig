@@ -129,6 +129,54 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
             if (r.value) |v| try walkField(allocator, v, prop, mode);
         },
         .Throw => |t| try walkField(allocator, t.value, prop, mode),
+        // `field` is an ordinary binding inside the accessor, so a nested scope
+        // captures it like any other. The walk stopped at the flat forms, so a
+        // `field` inside a lambda / loop / when / try survived as a bare name
+        // and read an unresolved global — `get() = synchronized(lock) { field }`
+        // is how kotlinx-coroutines-test guards its scheduler clock.
+        .Lambda => |*l| {
+            for (l.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
+        },
+        .AnonFun => |af| {
+            if (af.body) |body| switch (body.*) {
+                .Block => |*blk| for (blk.stmts) |*st| try walkFieldStmt(allocator, st, prop, mode),
+                .Expr => |*ex| try walkField(allocator, @constCast(ex), prop, mode),
+            };
+        },
+        .While => |w| {
+            try walkField(allocator, w.cond, prop, mode);
+            try walkField(allocator, w.body, prop, mode);
+        },
+        .DoWhile => |dw| {
+            if (dw.body) |body| try walkField(allocator, body, prop, mode);
+            try walkField(allocator, dw.cond, prop, mode);
+        },
+        .For => |f| {
+            try walkField(allocator, f.iter, prop, mode);
+            try walkField(allocator, f.body, prop, mode);
+        },
+        .Labeled => |l| try walkField(allocator, l.expr, prop, mode),
+        .Try => |*t| {
+            for (t.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
+            for (t.catches) |*c| {
+                for (c.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
+            }
+            if (t.finally) |*fin| {
+                for (fin.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
+            }
+        },
+        .When => |*w| {
+            if (w.subject) |subj| try walkField(allocator, subj, prop, mode);
+            for (w.branches) |*br| {
+                for (br.patterns) |*pat| switch (pat.kind) {
+                    .Value => |*pe| try walkField(allocator, @constCast(pe), prop, mode),
+                    .InRange => |*pe| try walkField(allocator, @constCast(pe), prop, mode),
+                    .NotInRange => |*pe| try walkField(allocator, @constCast(pe), prop, mode),
+                    else => {},
+                };
+                try walkField(allocator, &br.body, prop, mode);
+            }
+        },
         else => {},
     }
 }

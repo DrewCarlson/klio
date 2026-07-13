@@ -1,0 +1,44 @@
+// Vendored from compose-multiplatform-core desktopMain (v1.11.1),
+// androidx/compose/foundation/text/TextFieldKeyInput.desktop.kt.
+//
+// COPIED, not linked: the desktop source set as a whole depends on JVM APIs
+// (java.awt clipboard, Swing context menus), which klio cannot satisfy — so the
+// pack must not point at it. These files are the java-free subset, vendored so we
+// own them and can adapt them to klio's platform surface.
+/*
+ * Copyright 2021 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package androidx.compose.foundation.text
+
+import androidx.compose.foundation.InternalFoundationApi
+import androidx.compose.ui.awt.awtEventOrNull
+import androidx.compose.ui.input.key.KeyEvent
+
+private fun Char.isPrintable(): Boolean {
+    val block = Character.UnicodeBlock.of(this)
+    return (!Character.isISOControl(this)) &&
+        this != java.awt.event.KeyEvent.CHAR_UNDEFINED &&
+        block != null &&
+        block != Character.UnicodeBlock.SPECIALS
+}
+
+// This API was never supposed to be public, but currently there are some external usages of it,
+// so it cannot be removed from the public right now.
+// However, starting with 1.9 it's marked as NOT a public-stable API with compatibility guarantees.
+@InternalFoundationApi
+actual val KeyEvent.isTypedEvent: Boolean
+    get() = awtEventOrNull?.id == java.awt.event.KeyEvent.KEY_TYPED &&
+        awtEventOrNull?.keyChar?.isPrintable() == true

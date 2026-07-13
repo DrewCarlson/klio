@@ -28,15 +28,31 @@ sparse_ui=(
   "compose/ui/ui-graphics/src/commonMain"
   "compose/runtime/runtime-saveable/src/commonMain"
   "compose/ui/ui/src/commonMain"
+  "compose/ui/ui/src/skikoMain"
+  "compose/ui/ui/src/desktopMain"
   "compose/ui/ui-text/src/commonMain"
   "compose/ui/ui-text/src/skikoMain"
   "compose/animation/animation-core/src/commonMain"
+  "compose/animation/animation/src/commonMain"
   "compose/foundation/foundation-layout/src/commonMain"
   "compose/foundation/foundation/src/commonMain"
+  "compose/foundation/foundation/src/skikoMain"
+  "compose/foundation/foundation/src/desktopMain"
   "compose/material3/material3/src/commonMain"
   "compose/material/material-ripple/src/commonMain"
   "compose/material/material-ripple/src/nonAndroidMain"
   "graphics/graphics-shapes/src/commonMain"
+  # The upstream compose-runtime conformance suite and the mock View/Applier
+  # harness it composes against (`compositionTest { … }`). Run by
+  # `zig build itest-compose_runtime_commontest` -- these are the tests that
+  # say whether klio's implicit-composer hook actually implements Compose.
+  "compose/runtime/runtime-test-utils/src/commonMain"
+  "compose/runtime/runtime/src/commonTest"
+  "compose/runtime/runtime/src/nonEmulatorCommonTest"
+  # nonAndroidMain: the platform actuals for the snapshot state objects
+  # (SnapshotStateList/Set, the primitive Snapshot*State factories) that klio
+  # ships to run the real MVCC snapshot core.
+  "compose/runtime/runtime/src/nonAndroidMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
