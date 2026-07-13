@@ -260,30 +260,71 @@ unrelated class's `measure`. What is still open, in the order a text field hits 
 class is an implicit receiver of its body and now outranks the global tier in both
 field-read ladders. `BasicTextField` composes, attaches, measures, and lays out text.
 
-**OPEN — a bare `with(x) { … }` in a class body binds the wrong `with`.**
-`MultiParagraph.getCursorRect` does `with(paragraphInfoList[i]) { … }`, and the
-lowering binds compose-animation's `KeyframeEntity.with` (a MEMBER extension declared
-inside `KeyframesSpecConfig`, lifted with `fqn="with"` and NO package). Because
-`needs_this` is true for an extension, `emitCall` routes it through `emitExtBareCall`,
-which emits a hard `CallMember` on the enclosing class -- `Vm::call_member 'with' on
-MultiParagraph`. Two things are wrong and both are worth fixing:
-  - The candidate should not be reachable: a member extension is callable only from
-    inside its declaring class (the runtime already enforces exactly this in
-    `memberExtVisible`), and its lost package defeats the scope-tier gate that would
-    otherwise exclude it.
-  - The pick does NOT come from `phaseBLadder` (never called for this site) nor from
-    the index (which skips extensions) nor from `cast_pick` (no `as` in the args) --
-    find the fourth path. `KLIO_RESOLVE_AUDIT=1` prints only an `inline name=with
-    outcome=deferred reason=no_candidates` line for it, so start at the inline-splice
-    resolver.
+**FIXED — a bare call could bind a member extension of an unrelated class.**
+A member extension (`fun A.f()` declared inside class B) needs two receivers: B to
+dispatch on and A as the extension receiver. A bare call carries one implicit `this`,
+so it can only bind such a candidate from inside B or a subclass, or when B is an
+object. Bare-call resolution never checked that. When the applicability ladder could
+not rank a candidate (a shipped function whose body is not lowered yet exposes no
+signature view), the pick fell to the declared-arity fallback, whose user-over-shipped
+preference in `funcId` ranked any non-shipped namesake first. compose-animation
+declares `KeyframeEntity.with` inside `KeyframesSpecConfig` with an EMPTY package, so a
+bare `with(x) { … }` in `MultiParagraph` bound it over `kotlin.with`, and being an
+extension the call emitted a hard `CallMember` on the enclosing class.
+`Module.memberExtOutOfScope` now gates the candidate on the caller's enclosing class
+(carried on `ResolveCtx.owner_class`), mirroring the runtime's `memberExtVisible`. The
+applicability ladder, the declared-arity fallback and the receiver rebind all skip an
+out-of-scope member extension. BasicTextField composes, measures and paints its text.
 
-**OPEN — `realclick`: `HitTestResult.hitInMinimumTouchTarget` is not in the module.**
-Both overloads miss (`[extfb] fids=0`, total member miss) while sibling members of the
-same class -- including the equally `inline fun hit` -- dispatch fine. Reproduces with
-the pre-session binary (698bf8d3) once the ui-core pack is rebuilt, so it is a latent
-lowering defect that the stale installed pack had been hiding, NOT a regression from
-this work. Next step: dump the lowered method list of `HitTestResult` and find why
-these two are dropped.
+**FIXED — a lifted nested class could not prove its own supertype in member dispatch.**
+The earlier reading ("both overloads are missing from the module") was wrong: both are
+lowered and present on the class. The runtime subtype walk compared raw simple names,
+but a nested class lifts to a flat `Outer$Name` and that mangled form is what a
+subclass records as its supertype, while a parameter declared `Outer.Name` lowers its
+type head to the bare `Name`. The two never compared equal, so no instance of a lifted
+nested type could prove it was one. Harmless for a lone candidate (whose check only
+needs the absence of a disproof) and fatal for an overload set (whose scorer needs
+positive proof per argument): both `hitInMinimumTouchTarget` overloads scored
+inapplicable against a `Modifier.Node`, so the member walk missed and the pointer path
+died. `instanceSubtypeDistance` now compares through `classDisplayName`, the same
+lift-mangle strip `applicability`'s evidence head already applies.
+
+**OPEN — a reified `T` the splice fails to substitute resolves through a GLOBAL.**
+`realclick` no longer crashes, but the FIRST pointer event is always dropped (every
+later one lands: 4 clicks -> 3). `fclick` had the same off-by-one, masked because it
+clicked twice and only asserted a non-zero count.
+
+Chain: `HitPathTracker.Node.buildCache` calls
+`modifierNode.dispatchForKind(Nodes.PointerInput) { coordinates = it.layoutCoordinates }`.
+That yields nothing, so `coordinates` stays null, `buildCache` reports "not hit", and
+`dispatchChanges` dispatches to no one. Inside `dispatchForKind` the walk turns on
+`node is T` -- and for the SAME `ClickableNode` object at the SAME call site it answers
+false on the first event and true on every one after.
+
+The root: 70 `is` checks run against the LITERAL type name `T`. The reified
+substitution never happened for them, and `host_classes.instanceOf` then resolves the
+bare name through a PROCESS-GLOBAL keyed by `T` (`lookupGlobal(self, "T")`). That
+global is written and restored by unrelated calls, so the answer is order-dependent:
+unbound it means "true for any non-null", stale it tests against whatever class some
+other splice left behind. `ClickableNode is PointerInputModifierNode` is only reached
+when the substitution DID happen (27 such walks, all correct).
+
+Why the substitution is missing here: the reified splice gate (`src/ir/lower/expr.zig`,
+the `callee.* == .Member` gate feeding `inline_call.argsBindAllReified`) opens for the
+2-arg `dispatchForKind` at this site (`owner=Node$f603 nargs=2 bindAll=true`), but the
+2-arg overload's body is `= dispatchForKind(kind, false, block)` -- a BARE call on the
+implicit receiver, whose `is T` lives in the 3-arg overload. No nested lowering for
+that bare call is observed under `Node$f603` (unlike `NodeCoordinator` /
+`LayoutNodeDrawScope`, which do splice it), so the outer splice appears to decline
+after the gate opens and the call falls back to a runtime dispatch of the standalone
+3-arg body, where `T` is never bound.
+
+Next step: find why the member splice declines for the `Node$f603` (file-private
+lifted) owner after `argsBindAllReified` returns true. The durable fix is to stop
+resolving a reified type parameter through a global at all: `Inst.Call` already carries
+`type_args` and `host_call_func` binds them for the duration of a call, but
+`Inst.CallMember` has no `type_args` field, so an unspliced member call to a reified
+inline function has no way to pass `T`.
 
 **OPEN — an imported bodyless `expect` loses to an unimported same-named function.**
 `TimePicker.kt` imports `androidx.compose.material3.internal.getString` (an `expect`
