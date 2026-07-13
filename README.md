@@ -16,9 +16,26 @@ experimental; the claim is held up by continuous verification against
 ## Quick start
 
 ```sh
-zig build
+zig build                                  # dev build (Debug — fast to compile, slow to run)
 ./zig-out/bin/klio run examples/showcase.kt
 ```
+
+**Build an optimized binary to actually run programs with:**
+
+```sh
+zig build -Doptimize=ReleaseFast
+```
+
+`zig build` follows the Zig convention and defaults to **Debug**, which keeps the
+edit-compile loop fast but leaves the interpreter roughly 8x slower and the binary
+3x larger. The difference is not subtle — measured on this repo:
+
+| | binary | startup | 2M method calls | peak RSS |
+| --- | --- | --- | --- | --- |
+| `zig build` (Debug) | 158 MB | 0.21 s | 12.3 s | 49 MB |
+| `zig build -Doptimize=ReleaseFast` | **54 MB** | **0.03 s** | **1.5 s** | **35 MB** |
+
+Ship (and benchmark) the ReleaseFast binary. Use Debug only to iterate.
 
 A first program:
 

@@ -183,10 +183,25 @@ in a live window is also open (material-ripple is vendored).
 
 ### 5. Perf backlog (impact order)
 
-Slim custom Skia build (the +112 MB is Skia's fixed working set, not klio) → lazy stdlib
-load (baseline ~38 MB) → shrink the evaluator per-call frame → drop the per-frame
-display-list serialize/parse round-trip. Zero-code lever: ship ReleaseFast. Idle CPU
-(~0.3%) and the resize "leak" (proven bounded/GC-managed) need no action.
+**Done:**
+
+- **The profiler's sample tables no longer sit in every binary.** Three
+  `[4M]usize` statics (32 MB each) were declared `= undefined`; a Debug build fills an
+  `undefined` global with a poison pattern, so they could not live in `.bss` and became
+  96 MB of real file bytes — the bulk of a **525 MB** `klio`. They are `mmap`ed by
+  `maybeStart` now, so a run without `KLIO_PROF` pays nothing: **525 MB → 158 MB** Debug.
+- **The optimize mode is documented** (README). `zig build` follows the Zig convention and
+  defaults to Debug; `-Doptimize=ReleaseFast` is ~8× faster and 3× smaller. Measured:
+
+  | | binary | startup | 2M method calls | peak RSS |
+  | --- | --- | --- | --- | --- |
+  | Debug | 158 MB | 0.21 s | 12.3 s | 49 MB |
+  | ReleaseFast | **54 MB** | **0.03 s** | **1.5 s** | **35 MB** |
+
+**Open:** slim custom Skia build (the +112 MB is Skia's fixed working set, not klio) →
+lazy stdlib load (baseline ~35 MB) → shrink the evaluator per-call frame → drop the
+per-frame display-list serialize/parse round-trip. Idle CPU (~0.3%) and the resize "leak"
+(proven bounded/GC-managed) need no action.
 
 ---
 
