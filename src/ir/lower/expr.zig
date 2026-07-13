@@ -6415,6 +6415,7 @@ fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.
         .recv_ty = b.recvTy(),
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
+        .owner_class = b.ownerClass(),
     };
 }
 

@@ -1897,6 +1897,36 @@ pub const Module = struct {
         return first_user orelse first_body orelse first orelse first_lp;
     }
 
+    /// `funcId`'s order-based pick restricted to the candidates a BARE call
+    /// at a site enclosed by `ctx_owner` can actually bind: a member
+    /// extension out of that scope is not a candidate at all
+    /// (`memberExtOutOfScope`). Without the restriction the user-over-shipped
+    /// preference hands a bare `with(x) { … }` an unrelated class's
+    /// `KeyframeEntity.with` ahead of `kotlin.with`.
+    fn funcIdForBareCall(self: *const Module, name: []const u8, ctx_owner: ?[]const u8) ?FuncId {
+        const candidates = self.funcsBySimpleName(name);
+        var first: ?FuncId = null;
+        var first_user: ?FuncId = null;
+        var first_body: ?FuncId = null;
+        var first_lp: ?FuncId = null;
+        for (candidates) |id| {
+            if (self.memberExtOutOfScope(id, ctx_owner)) continue;
+            if (self.funcById(id)) |f| {
+                if (f.low_priority) {
+                    if (first_lp == null) first_lp = id;
+                    continue;
+                }
+            }
+            if (first == null) first = id;
+            if (self.funcById(id)) |f| {
+                if (first_body == null and f.hasBody()) first_body = id;
+                if (first_user != null) continue;
+                if (!isShippedPackage(f.package)) first_user = id;
+            }
+        }
+        return first_user orelse first_body orelse first orelse first_lp;
+    }
+
     /// Whether any top-level function with this simple name exists.
     /// Pure existence — no order-based pick — for callers that only
     /// gate on the name being callable. Answers over the name index,
@@ -2641,6 +2671,11 @@ pub const Module = struct {
         /// false … }` framed the block, and a park inside it lost the
         /// enclosing frame the labeled return targets).
         nonlocal_return_lambda: bool = false,
+        /// The class whose body lexically encloses the call, when there is
+        /// one. Scopes the member-extension candidates: only a call inside
+        /// the declaring class (or a subclass) has that class as an implicit
+        /// dispatch receiver, so only there is one bindable by a bare call.
+        owner_class: ?[]const u8 = null,
     };
 
     fn funcIsInline(self: *const Module, id: FuncId) bool {
@@ -2651,6 +2686,28 @@ pub const Module = struct {
     fn isNonExtFid(self: *const Module, id: FuncId) bool {
         const f = self.funcById(id) orelse return true;
         return !funcHasImplicitThis(f);
+    }
+
+    /// Whether a member-extension candidate is out of scope for a BARE call
+    /// whose enclosing class is `ctx_owner`. A member extension (`fun A.f()`
+    /// declared in the body of class B) needs two receivers: B to dispatch on
+    /// and A as the extension receiver. A bare call carries one implicit
+    /// `this`, so it can only bind such a candidate from inside B (or a
+    /// subclass), where B's receiver is implicit — or when B is an object,
+    /// whose single instance is always reachable. Everywhere else the
+    /// candidate does not exist: `with(x) { … }` in `MultiParagraph` is
+    /// `kotlin.with`, never `KeyframesSpecConfig`'s `KeyframeEntity.with`.
+    /// The runtime applies the same gate in `memberExtVisible`; without it
+    /// here, lowering commits to a target the runtime would have rejected.
+    fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const u8) bool {
+        const f = self.funcById(id) orelse return false;
+        if (f.kind != .member_extension) return false;
+        const owner = self.registry.member_ext_owner_class.get(id) orelse return false;
+        for (self.registry.object_names.items) |o| {
+            if (std.mem.eql(u8, o, owner)) return false;
+        }
+        const start = ctx_owner orelse return true;
+        return !self.classIsOrExtends(start, owner);
     }
 
     /// Body-bearing, last-param-not-vararg, user arity == want — the body-side
@@ -2741,7 +2798,7 @@ pub const Module = struct {
         return false;
     }
 
-    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId) ?FuncId {
+    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId, ctx_owner: ?[]const u8) ?FuncId {
         const scope = applicability.ApplicabilityScope{
             .ctx = @constCast(@ptrCast(self)),
             .ext_is_subtype_name = evidenceSubtypeCb,
@@ -2762,6 +2819,7 @@ pub const Module = struct {
         for (self.funcsBySimpleName(name)) |id| {
             const f = self.funcById(id) orelse continue;
             if (f.low_priority) continue;
+            if (self.memberExtOutOfScope(id, ctx_owner)) continue;
             if (f.params.len != 0 and f.params[f.params.len - 1].is_vararg) continue;
             const sv = self.sigViewForApplicability(id) orelse continue;
             const sc = applicability.applicable(&sv, args, scope) orelse continue;
@@ -2841,7 +2899,7 @@ pub const Module = struct {
         return applicability.applicable(&sv, args, .{}) != null;
     }
 
-    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape) ?FuncId {
+    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
         // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
         // overload is not a source-level candidate (kotlinc hides it; it exists
         // only for binary compatibility). The index and `phaseBLadder` already
@@ -2851,7 +2909,7 @@ pub const Module = struct {
         // statically binds it, and a hidden form that delegates to the real
         // overload by name self-recurses.
         const fallback = blk: {
-            const f = self.funcId(name) orelse break :blk null;
+            const f = self.funcIdForBareCall(name, ctx_owner) orelse break :blk null;
             if (self.funcById(f)) |ff| if (ff.low_priority) break :blk null;
             break :blk f;
         };
@@ -2868,6 +2926,7 @@ pub const Module = struct {
                 for (self.funcsBySimpleName(name)) |cid| {
                     if (self.funcById(cid)) |cf| if (cf.low_priority) continue;
                     if (self.isNonExtFid(cid)) continue;
+                    if (self.memberExtOutOfScope(cid, ctx_owner)) continue;
                     if (self.declArityOf(cid) != want_u32) continue;
                     if (!self.declSigCompatible(cid, args)) continue;
                     const ct = self.bareCallTierOf(cid, name, caller_pkg, caller_file) orelse continue;
@@ -2882,6 +2941,7 @@ pub const Module = struct {
         }
         for (self.funcsBySimpleName(name)) |fid| {
             if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+            if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
             if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         if (want > 0) {
@@ -2985,9 +3045,9 @@ pub const Module = struct {
         // overload; otherwise the applicable() ladder ranks the body candidates,
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
-        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file);
+        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file, ctx.owner_class);
         if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
-            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args);
+            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args, ctx.owner_class);
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
@@ -2998,6 +3058,7 @@ pub const Module = struct {
                     heur_recv_matched = true;
                 } else {
                     for (self.funcsBySimpleName(name)) |cid| {
+                        if (self.memberExtOutOfScope(cid, ctx.owner_class)) continue;
                         if (self.arityMatchFid(cid, args.len) and self.matchesRecvFid(cid, recv)) {
                             // Receiver preference never overrides argument
                             // applicability: a candidate one of the args'
@@ -4424,6 +4485,43 @@ fn freeTestModule(m: *Module, a: Allocator) void {
         a.free(f.blocks);
     }
     m.deinit(a);
+}
+
+test "a bare call never binds a member extension of an unrelated class" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // `kotlin.with(receiver, block)` and, in another library, the member
+    // extension `KeyframeEntity.with(easing)` declared inside
+    // `KeyframesSpecConfig`. Both are header stubs with no declared-arity
+    // record, so the applicability ladder ranks neither and the pick falls to
+    // the declared-arity fallback -- whose user-over-shipped preference used
+    // to hand a bare `with(x) { … }` the member extension.
+    const std_with = try pushTestFuncOpts(&m, a, "with", "kotlin.with", "kotlin", 2, .{ .stub = true });
+    const member_with = try pushTestFuncOpts(&m, a, "with", "with", "", 1, .{ .stub = true, .extension = true });
+    m.funcs.items[member_with.int()].kind = .member_extension;
+    try m.registry.member_ext_owner_class.put(member_with, "KeyframesSpecConfig");
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{ .{}, .{} };
+    // A caller inside an unrelated class has no `KeyframesSpecConfig`
+    // receiver, so the member extension is not a candidate: `kotlin.with`.
+    const res = try m.resolveCall(a, "with", "androidx.compose.ui.text", FileId.from(0), &args, true, .{
+        .in_receiver_context = true,
+        .owner_class = "MultiParagraph",
+    });
+    defer a.free(res.candidate_set);
+    try testing.expect(res.target != null);
+    try testing.expectEqual(std_with.int(), res.target.?.int());
+
+    // Inside the declaring class the member extension IS in scope.
+    const own = try m.resolveCall(a, "with", "androidx.compose.animation.core", FileId.from(0), &args, true, .{
+        .in_receiver_context = true,
+        .owner_class = "KeyframesSpecConfig",
+    });
+    defer a.free(own.candidate_set);
+    try testing.expect(own.target != null);
+    try testing.expectEqual(member_with.int(), own.target.?.int());
 }
 
 test "symbol index prefers the caller's own package" {
