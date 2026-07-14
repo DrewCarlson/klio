@@ -43,6 +43,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.runtime.__compose_nextStateId", nextStateId);
     try b.register("androidx.compose.runtime.__compose_monotonicNanos", monotonicNanos);
     try b.register("androidx.compose.runtime.__compose_logError", logError);
+    try b.register("androidx.compose.runtime.__compose_currentThreadId", currentThreadId);
     // The real androidx.compose.ui engine needs the same identity hash for its
     // node/coordinator caches; expose it under the ui package's own symbol.
     try b.register("androidx.compose.ui.internal.__composeui_identityHashCode", identityHashCode);
@@ -96,6 +97,13 @@ fn monotonicNanos(ctx: *CallCtx) Error!EvalResult {
 
 /// `__compose_logError(message: String, error: Throwable?): Unit` — Compose's
 /// internal error sink. Writes to stderr so it never pollutes program stdout.
+/// `__compose_currentThreadId(): Long` — the calling OS thread's id. The snapshot
+/// core keys its per-thread state on this.
+fn currentThreadId(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newLong(@bitCast(@as(u64, std.Thread.getCurrentId()))));
+}
+
 fn logError(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len >= 1) {
         if (ctx.args[0] == .String) {
