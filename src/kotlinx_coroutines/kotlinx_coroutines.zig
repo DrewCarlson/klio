@@ -407,6 +407,36 @@ fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
     _ = ctx.host.invokeCallable(&helper, &args, ctx.out) catch return;
 }
 
+/// `__kxco_chanBindHandle(slot, handle)` — store the DisposableHandle of the
+/// cancelling handler armed for the waiter parked on `slot`. A normal delivery
+/// disposes it (`dropWatcher`), so no handler is left on the coroutine's Job for
+/// a waiter that no longer exists. A handle bound AFTER the value was already
+/// delivered is disposed immediately.
+fn channelBindHandle(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len < 2) return .{ .ok = .Unit };
+    const slot: i64 = switch (ctx.args[0]) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .ok = .Unit },
+    };
+    const handle = ctx.args[1];
+    const already_delivered = blk: {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.chan_delivered.fetchRemove(slot) != null) break :blk true;
+        handle.retain();
+        if (coro_reg.chan_watchers.fetchPut(regAllocator(), slot, handle) catch null) |old| {
+            old.value.release(regAllocator());
+        }
+        break :blk false;
+    };
+    if (already_delivered) {
+        var recv = handle;
+        _ = ctx.host.invokeMethod(&recv, "dispose", &.{}, ctx.out) catch {};
+    }
+    return .{ .ok = .Unit };
+}
+
 /// `__kxco_chanBindWatcher(slot, cont)` — store the cancellation-watcher
 /// continuation for the waiter parked on `slot`, so a normal value delivery
 /// can resume (complete) the watcher child. If the waiter was ALREADY
@@ -461,8 +491,9 @@ fn dropWatcher(ctx: *CallCtx, slot: i64) void {
     if (cont) |c| {
         defer c.release(regAllocator());
         var recv = c;
-        const ok_unit = makeSuccessResult(ctx.allocator, .Unit) catch return;
-        _ = ctx.host.invokeMethod(&recv, "resumeWith", &.{ok_unit}, ctx.out) catch {};
+        // The entry is the cancelling handler's DisposableHandle: the waiter got
+        // its value, so the handler has nothing left to cancel.
+        _ = ctx.host.invokeMethod(&recv, "dispose", &.{}, ctx.out) catch {};
     }
 }
 
@@ -1737,6 +1768,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanBindWatcher", .f = channelBindWatcher },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanBindHandle", .f = channelBindHandle },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddReceiver", .f = channelSelectAddReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveReceiver", .f = channelSelectRemoveReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddSender", .f = channelSelectAddSender },

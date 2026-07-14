@@ -4509,6 +4509,93 @@ fn delegateMember(self: *VmHost, allocator: Allocator, d: ObjRef(DelegateKind), 
     return null;
 }
 
+/// The declared parameter names of `name` on the receiver's class (or a
+/// supertype), from the Kotlin declaration the pack ships. A pack-installed
+/// host binding carries no parameter names of its own, so this is what a
+/// named-argument call is matched against.
+fn classMethodParamNames(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?[][]const u8 {
+    if (receiver.* != .Instance) return null;
+    var cname: []const u8 = "";
+    var cfqn: []const u8 = "";
+    {
+        const ig = receiver.Instance.borrow();
+        defer ig.deinit();
+        const cg = ig.get().class.borrow();
+        defer cg.deinit();
+        cname = cg.get().name;
+        cfqn = cg.get().fqn;
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const cid = mod.classIdByFqn(cfqn) orelse mod.classId(cname) orelse return null;
+    if (cid.int() >= mod.classes.items.len) return null;
+    const cls = &mod.classes.items[cid.int()];
+    for (cls.methods) |fid| {
+        const f = mod.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, f.name, name) and !std.mem.eql(u8, simpleName(f.name), name)) continue;
+        // A member's leading `this` parameter is the receiver, not an argument.
+        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const out = try allocator.alloc([]const u8, f.params.len - skip);
+        for (f.params[skip..], out) |pd, *o| o.* = pd.name;
+        return out;
+    }
+    return null;
+}
+
+/// A named-argument call into a pack-installed host binding. The binding takes
+/// its arguments positionally, so the names are matched against the Kotlin
+/// declaration's parameters and the call is re-issued in declaration order.
+/// Without this the call fell through to the Kotlin body the pack ships, which
+/// for atomicfu is a stub that the host binding is meant to shadow — so
+/// `compareAndSet(expect = false, update = true)` always answered `false` while
+/// `compareAndSet(false, true)` worked.
+fn instanceBindingNamedProbe(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+) Allocator.Error!?EvalResult {
+    if (receiver.* != .Instance) return null;
+    const params = (try classMethodParamNames(self, allocator, receiver, name)) orelse return null;
+    defer if (runtime.freeScratch()) allocator.free(params);
+    if (args.len > params.len) return null;
+
+    const slots = try allocator.alloc(?Value, params.len);
+    defer if (runtime.freeScratch()) allocator.free(slots);
+    for (slots) |*s| s.* = null;
+    var next_positional: usize = 0;
+    for (args, 0..) |a, i| {
+        const supplied: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        if (supplied) |an| {
+            var placed = false;
+            for (params, 0..) |pn, pos| {
+                if (!std.mem.eql(u8, pn, an)) continue;
+                if (slots[pos] != null) return null;
+                slots[pos] = a;
+                placed = true;
+                break;
+            }
+            if (!placed) return null;
+        } else {
+            while (next_positional < slots.len and slots[next_positional] != null) next_positional += 1;
+            if (next_positional >= slots.len) return null;
+            slots[next_positional] = a;
+            next_positional += 1;
+        }
+    }
+    // Every parameter must be supplied: a host binding has no default thunks.
+    var filled: std.ArrayList(Value) = .empty;
+    defer filled.deinit(allocator);
+    for (slots) |s| {
+        const v = s orelse return null;
+        try filled.append(allocator, v);
+    }
+    return instanceBindingProbe(self, allocator, receiver, name, filled.items);
+}
+
 fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var cls_fqn: []const u8 = undefined;
@@ -9796,6 +9883,10 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Stdlib intrinsic dispatch with named args.
     if (any_named) {
         if (try stdlibNamedDispatch(self, allocator, receiver, name, args, arg_names)) |r| return r;
+        // Pack-installed host bindings take their arguments positionally; a
+        // named call reaches them only after being put back in declaration
+        // order.
+        if (try instanceBindingNamedProbe(self, allocator, receiver, name, args, arg_names)) |r| return r;
     }
 
     // User extension / member fn with named args.

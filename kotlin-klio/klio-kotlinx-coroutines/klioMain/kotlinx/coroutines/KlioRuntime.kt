@@ -35,29 +35,35 @@ internal fun __kxco_chanCancelWaiter(channel: Any?, slot: Long, cause: Throwable
 // `runBlocking` would never complete).
 internal fun __kxco_chanBindWatcher(slot: Long, cont: CancellableContinuation<Unit>) {}
 
+// Host intrinsic: remember the cancelling-handler handle for the waiter parked
+// on `slot`, so a normal delivery disposes it instead of leaving a handler
+// registered on the coroutine's Job for a waiter that no longer exists.
+internal fun __kxco_chanBindHandle(slot: Long, handle: DisposableHandle) {}
+
 // Make a native channel `send`/`receive`/iterator park cancellation-aware.
-// A native park bypasses `suspendCancellableCoroutine`, so the host calls
-// this as the coroutine parks. The parking coroutine's own `Job` is the
-// `scope`; launch a child that parks in a `suspendCancellableCoroutine`.
-// When the parent Job is cancelled (`Job.cancel`, `cancelAndJoin`, or
-// `withTimeout` expiry) the child is cancelled with it through structured
-// concurrency, firing the continuation's `invokeOnCancellation`, which calls
-// `__kxco_chanCancelWaiter(channel, slot, cause)` to remove the waiter and
-// resume its slot with `Result.failure(cause)` — a throw at the suspension
-// point, so the user's `finally` runs and the join completes. This reuses
-// the proven `suspendCancellableCoroutine` cancellation path (a plain
-// `Job.invokeOnCompletion(onCancelling = true)` handler does not currently
-// fire in klio, but a `CancellableContinuation.invokeOnCancellation` does).
-// A normal value delivery resumes the watcher (via `__kxco_chanBindWatcher`)
-// so the child completes and does not outlive the suspension.
+// A native park bypasses `suspendCancellableCoroutine`, so the host calls this
+// as the coroutine parks: register a cancelling handler on the parking
+// coroutine's own Job. When the Job is cancelled (`Job.cancel`,
+// `cancelAndJoin`, `withTimeout` expiry) the handler calls
+// `__kxco_chanCancelWaiter(channel, slot, cause)`, which removes the waiter and
+// resumes its slot with `Result.failure(cause)` — a throw at the suspension
+// point, so the user's `finally` runs and the join completes.
+//
+// This used to launch a CHILD coroutine that parked in a
+// `suspendCancellableCoroutine`, because a cancelling Job handler did not fire
+// in klio. It does now. The child was worse than roundabout: it was completed
+// only by kotlinx DISPATCHING its cancellation, and when the coroutine being
+// cancelled is the one draining that dispatcher (a test's work runner), nothing
+// ran the child's cancellation — it stayed parked, and a Job cannot complete
+// while a child is alive, so `cancelAndJoin` never returned.
+@OptIn(InternalCoroutinesApi::class)
 internal fun __kxco_chanArmCancel(scope: Any?, channel: Any?, slot: Long) {
     val cs = scope as? CoroutineScope ?: return
-    cs.launch {
-        suspendCancellableCoroutine<Unit> { cont ->
-            cont.invokeOnCancellation { cause -> __kxco_chanCancelWaiter(channel, slot, cause) }
-            __kxco_chanBindWatcher(slot, cont)
-        }
+    val job = cs.coroutineContext[Job] ?: return
+    val handle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        if (cause != null) __kxco_chanCancelWaiter(channel, slot, cause)
     }
+    __kxco_chanBindHandle(slot, handle)
 }
 
 // `runBlocking` — the blocking bridge between regular and suspending
