@@ -323,6 +323,7 @@ pub const VmHost = struct {
     pub const plainStoredFieldIndex = host_fields.plainStoredFieldIndex;
     pub const plainStoredScalarFieldNN = host_fields.plainStoredScalarFieldNN;
     pub const setField = host_fields.setField;
+    pub const setFieldFrom = host_fields.setFieldFrom;
     pub const instanceOf = host_classes.instanceOf;
     pub const ctxStackLen = host_context.ctxStackLen;
     pub const ctxPush = host_context.ctxPush;

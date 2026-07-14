@@ -353,6 +353,15 @@ pub const FuncBuilder = struct {
     /// `null` for plain functions and class methods.
     recv_ty: ?[]const u8 = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// The receiver-type name in scope as the implicit `this` at this
+    /// lambda body's construction site, carried across the lambda boundary
+    /// (a plain `() -> R` block captures the enclosing `this`, and a
+    /// receiver `T.() -> R` block rebinds it to `T`). `recv_ty` is only the
+    /// current declaration's own extension receiver and is null inside any
+    /// lambda; this fills that gap so bare-call overload disambiguation by
+    /// receiver still fires inside nested lambdas. Distinct from `recv_ty`
+    /// so the two never conflate a decl receiver with a captured one.
+    enclosing_recv_ty: ?[]const u8 = null,
     /// See `callTrailingLambda`.
     cur_call_trailing: bool = false,
     /// Names declared on the owning class (methods, body
@@ -583,6 +592,12 @@ pub const FuncBuilder = struct {
 
     /// See `setHasOwnTypeParams`.
     has_own_type_params: bool = false,
+    /// Names of NON-reified type parameters in scope (this function's own plus
+    /// the enclosing class's). A cast `x as T` to such a name is UNCHECKED in
+    /// Kotlin (erased to the bound), so it must not be checked against a
+    /// same-named concrete class. Reified type params are excluded — they are
+    /// resolved by the reified splice, which substitutes the concrete type.
+    type_param_names: StringSet,
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
@@ -600,6 +615,7 @@ pub const FuncBuilder = struct {
             .broad_coll_locals = StringSet.init(allocator),
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
+            .type_param_names = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .enclosing_members = StringSet.init(allocator),
@@ -661,6 +677,7 @@ pub const FuncBuilder = struct {
         self.broad_coll_locals.deinit();
         self.object_init_locals.deinit();
         self.own_members.deinit();
+        self.type_param_names.deinit();
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
         self.private_method_fids.deinit();
@@ -1030,6 +1047,17 @@ pub const FuncBuilder = struct {
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
     }
+    /// The receiver type in scope as the implicit `this` at this body's
+    /// site: the declaration's own extension receiver, else the receiver
+    /// carried across a lambda boundary. Used by bare-call disambiguation
+    /// so a receiver-lambda argument's arity is recorded correctly even
+    /// when the call sits inside a nested `() -> R` block.
+    pub fn enclosingRecvTy(self: *const FuncBuilder) ?[]const u8 {
+        return self.recv_ty orelse self.enclosing_recv_ty;
+    }
+    pub fn setEnclosingRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
+        self.enclosing_recv_ty = name;
+    }
     /// Whether the Call expression currently being lowered supplied its
     /// final argument as a TRAILING lambda (`f(x) { … }`). Set by
     /// `lowerCall` from the parser's syntax bit; consumed by the call
@@ -1274,6 +1302,15 @@ pub const FuncBuilder = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.allocator, ov);
     }
+    /// Every local-function declaration seen for `name`, in decl order —
+    /// including a lone one. A call site checks these for APPLICABILITY: a
+    /// local fun shadows an outer same-named function only for calls it can
+    /// actually take.
+    pub fn localFnDecls(self: *const FuncBuilder, name: []const u8) ?[]const LocalFnOverload {
+        const list = self.local_fn_overloads.getPtr(name) orelse return null;
+        if (list.items.len == 0) return null;
+        return list.items;
+    }
     /// All same-named declarations seen for `name`, in decl order; null
     /// unless the name was declared at least twice (a single decl never
     /// needs selection, so it is not registered).
@@ -1389,6 +1426,15 @@ pub const FuncBuilder = struct {
     }
     pub fn hasOwnTypeParams(self: *const FuncBuilder) bool {
         return self.has_own_type_params;
+    }
+    /// Record a NON-reified type-parameter name in scope (own or enclosing
+    /// class). A cast to it is unchecked/erased.
+    pub fn addTypeParamName(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.type_param_names.put(name, {});
+    }
+    /// Whether `name` is a non-reified type parameter in scope.
+    pub fn isTypeParam(self: *const FuncBuilder, name: []const u8) bool {
+        return self.type_param_names.contains(name);
     }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});

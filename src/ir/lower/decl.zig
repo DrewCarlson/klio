@@ -1189,6 +1189,17 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
         b.setSelfDeclSpan(f.name.span);
         b.setHasOwnTypeParams(f.type_params.len != 0);
+        // Non-reified type parameters in scope: this function's own (a reified
+        // one is resolved by the reified splice) plus the enclosing class's
+        // (never reified in Kotlin). A cast to such a name is unchecked/erased.
+        for (f.type_params) |*tp| {
+            if (!tp.is_reified) try b.addTypeParamName(tp.name.name);
+        }
+        if (owner_class) |owner| {
+            if (module.registry.class_type_param_bounds.get(owner)) |bounds| {
+                for (bounds) |bnd| try b.addTypeParamName(bnd.param);
+            }
+        }
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
                 try b.markGenericTypedParam(p.name.name);

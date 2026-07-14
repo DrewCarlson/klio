@@ -445,6 +445,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .As => |cast| {
             const s = try lowerExpr(b, cast.expr);
+            // A cast to a NON-reified type parameter (`x as T`) is erased: the
+            // JVM `checkcast` targets the bound and passes any value (including
+            // null), so it is a runtime no-op — a genuine mismatch surfaces
+            // only when the value is later used as `T`. Return the value as-is,
+            // so a type parameter named like a concrete class (`class
+            // ScopeMap<Key, Scope>` alongside a test's `class Scope`) is not
+            // checked against that class and a nullable instantiation does not
+            // throw. Reified type params are excluded (the reified splice
+            // substitutes the concrete type before this point).
+            if (b.isTypeParam(cast.ty.name.name)) return s;
             const dst = b.allocReg();
             try b.push(.{ .Cast = .{
                 .dst = dst,
@@ -1156,6 +1166,16 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const segments = expr.Path.segments;
     const span0 = expr.Path.span;
 
+    // `var x by D` reads THROUGH the delegate: `D.getValue(null, ::x)` at every
+    // read, not once at the declaration. A `MutableState` delegate hands back the
+    // state's current value that way — and, in a composition, records the read on
+    // the snapshot, which is what makes a later write invalidate the group that
+    // read it. Reading a value cached at the declaration recorded no read at all,
+    // so `var name by mutableStateOf(…)` never recomposed.
+    if (segments.len == 1) {
+        if (try lowerDelegateRead(b, segments[0].name)) |r| return r;
+    }
+
     // File-private top-level property rename: a bare reference from the
     // declaring file resolves to the per-file mangled global. Locals,
     // captures, and own members keep shadowing it (Kotlin scope order).
@@ -1710,6 +1730,9 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
         return dst;
     }
+    // `"… $x …"` where `x` is a `var x by D` local reads THROUGH the delegate,
+    // exactly as a bare `x` does.
+    if (try lowerDelegateRead(b, ident.name)) |r| return r;
     if (b.resolve(ident.name)) |r| return r;
     if (b.knowsOuter(ident.name)) {
         const idx = try b.recordCapture(ident.name);
@@ -2110,6 +2133,21 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    // The implicit label this lambda carries (`runTest { … }` → "runTest").
+    // The body binds `this@<label>` to its receiver.
+    b.module.pending_lambda_this_label = b.pending_lambda_label;
+    // The receiver type in scope at the body's site: a receiver lambda
+    // (`T.() -> R`) rebinds the implicit `this` to `T`, otherwise a plain
+    // block captures the enclosing `this`. Carried into the body so a bare
+    // call there can still disambiguate a receiver-lambda argument's arity.
+    b.module.pending_lambda_enclosing_recv = blk: {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                if (ft.receiver) |r| break :blk r.name.name;
+            }
+        }
+        break :blk b.enclosingRecvTy();
+    };
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -2380,6 +2418,16 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse
         return memberHostingTrailingLambda(b, name, user_arg_count);
+    // With several same-named overloads that all host a trailing lambda
+    // (`SnapshotStateList.withCurrent(block: T.() -> R)` and
+    // `StateRecord.withCurrent(block: (r: T) -> R)`), declaration order is not
+    // evidence: the block's arity differs per overload (0 vs 1), and picking
+    // the wrong one records the wrong arity, so a receiver-lambda argument
+    // keeps a spurious `it` and its bare member reads fall through to globals.
+    // Prefer the overload whose leading `this` matches the enclosing receiver
+    // type; only fall back to declaration order when none matches.
+    const recv_simple: ?[]const u8 = if (b.enclosingRecvTy()) |r| simpleTypeHead(r) else null;
+    var fallback: ?FuncId = null;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
@@ -2405,8 +2453,15 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
             }
             if (!gap_defaulted) continue;
         }
-        return fid;
+        // Receiver match wins outright; otherwise remember the first valid
+        // candidate as the declaration-order fallback.
+        if (recv_simple) |rs| {
+            if (off == 1 and std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), rs))
+                return fid;
+        }
+        if (fallback == null) fallback = fid;
     }
+    if (fallback) |fid| return fid;
     // No top-level function serves the name at this arity: it may be a member.
     return memberHostingTrailingLambda(b, name, user_arg_count);
 }
@@ -3107,16 +3162,24 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // With overloads, `funcId` is a heuristic that may name the wrong one,
         // whose arity would wrongly drop a needed `it`.
         const unambiguous = if (b.module.func_name_index.get(cnm)) |ids| ids.items.len == 1 else false;
-        if (unambiguous) {
-            if (b.module.funcId(cnm)) |fid| {
-                if (b.module.funcById(fid)) |f| {
-                    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                    if (try argFnArities(b, f, args, ast_arg_names, recv_off)) |ar| {
-                        defer b.allocator.free(ar);
-                        for (args, 0..) |*a, i| {
-                            if ((a.* == .Lambda or a.* == .AnonFun) and i < ar.len and ar[i] >= 0) {
-                                b.recordLambdaArgArity(a.span(), ar[i]);
-                            }
+        const chosen: ?FuncId = if (unambiguous)
+            b.module.funcId(cnm)
+        else
+            // Ambiguous name (`withCurrent` has a `SnapshotStateList.() ->` and a
+            // `StateRecord.() ->` overload): disambiguate by the enclosing
+            // receiver type so a receiver-lambda argument's arity (0) is still
+            // recorded and its `it` dropped — otherwise its bare member reads
+            // fall through to globals.
+            disambiguateByReceiver(b, cnm);
+        if (chosen) |fid| {
+            if (b.module.funcById(fid)) |f| {
+                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                const arr = try argFnArities(b, f, args, ast_arg_names, recv_off);
+                if (arr) |ar| {
+                    defer b.allocator.free(ar);
+                    for (args, 0..) |*a, i| {
+                        if ((a.* == .Lambda or a.* == .AnonFun) and i < ar.len and ar[i] >= 0) {
+                            b.recordLambdaArgArity(a.span(), ar[i]);
                         }
                     }
                 }
@@ -3795,6 +3858,48 @@ fn lowerCallWithWritebackPath(
                 .exact = false,
             } });
         } else if (b.resolve(segments[0].name) == null and
+            !b.hasOwnMember(segments[0].name) and
+            !calleeRecvFnFlag(b, callee) and
+            (b.capturesThisSlot() or b.resolve("this") != null))
+        {
+            // A bare call that is a member of an IMPLICIT receiver — a receiver
+            // lambda's receiver (`compose { … }` inside a
+            // `CompositionTestScope.() -> Unit` block) whose trailing lambda
+            // mutates an outer var, routing the call through this writeback
+            // path. The name is neither a top-level function (bound_id null) nor
+            // an enclosing-class own-member, so probe the implicit receiver at
+            // runtime: `CallMemberOrGlobal` tries each implicit receiver
+            // innermost-first, then globals. Without this the callee loaded as
+            // an unresolved global.
+            const nmc = try b.module.internConst(b.allocator, .{ .String = segments[0].name });
+            if (b.resolve("this")) |this_reg| {
+                orEmitAudit(b, "writeback_member_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = 0,
+                    .name = nmc,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                    .recv = this_reg,
+                    .static_recv = try cmgStaticRecv(b),
+                } });
+            } else {
+                const this_idx = try b.recordCapture("this");
+                orEmitAudit(b, "writeback_member_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = this_idx,
+                    .name = nmc,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                    .static_recv = try cmgStaticRecv(b),
+                } });
+            }
+        } else if (b.resolve(segments[0].name) == null and
             b.hasOwnMember(segments[0].name) and b.resolve("this") != null)
         {
             // A member of the enclosing class — e.g. an inherited inline fn
@@ -4467,12 +4572,24 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // reachable both in the declaring scope and as a capture. Calls
         // no fact separates keep the plain last-decl binding below.
         const bare = callee.Path.segments[0].name;
+        var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
             if (selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
                 if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
             }
         }
-        if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
+        if (b.localFnDecls(bare)) |decls| {
+            local_fn_inapplicable = !anyLocalFnOverloadApplicable(decls, args, ast_arg_names);
+        }
+        // A local function shadows an outer one by NAME, but only among
+        // candidates that can take the call. A local `fun validate()` does
+        // not hide the top-level `validate(block: () -> Unit)` from
+        // `validate { … }`; invoking the local as a value made it call
+        // itself for ever. With no applicable local, resolution continues
+        // outward to the top-level / member candidates below.
+        if (!local_fn_inapplicable) {
+            if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
+        }
     }
 
     // Whether a single-segment class-name call resolves to the constructor.
@@ -5367,6 +5484,35 @@ fn headCompatible(h: []const u8, d_raw: []const u8) bool {
 /// parameter. Returns the unique survivor's mangled binding, or null
 /// when no signature fact separates the candidates (the caller keeps
 /// the plain last-decl binding).
+/// Can any same-named local-function declaration take this call at all
+/// (arity, varargs, defaults, argument names)? When none can, the local
+/// name does not shadow the outer candidates.
+fn anyLocalFnOverloadApplicable(
+    ovs: []const build.LocalFnOverload,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) bool {
+    outer: for (ovs) |*ov| {
+        if (args.len < ov.n_required and !ov.has_vararg) continue;
+        if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
+        for (args, 0..) |_, i| {
+            const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            if (supplied) |nm| {
+                var found = false;
+                for (ov.param_names) |pn| {
+                    if (std.mem.eql(u8, pn, nm)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) continue :outer;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 fn selectLocalFnOverload(
     b: *const FuncBuilder,
     ovs: []const build.LocalFnOverload,
@@ -6067,6 +6213,66 @@ fn anyFunctionParam(params: []const ir.Param) bool {
 
 /// Path-callee bare-name → Call ladder. Returns null when no top-level fn /
 /// the class path should handle it instead.
+/// The read side of a `var x by D` local: dispatch `D.getValue(null, ::x)` when
+/// the hidden delegate binding is reachable here — bound in this scope, or
+/// captured from an enclosing one. Null when `x` is not a mutable delegated
+/// local (a plain local, or a `val x by lazy`, whose eager-once value stands).
+fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
+    var namebuf: [512]u8 = undefined;
+    const dname_stack = std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{name}) catch return null;
+    const in_scope = b.resolve(dname_stack) != null;
+    const outer = b.knowsOuter(dname_stack);
+    if (!in_scope and !outer) return null;
+    const dname = try b.allocator.dupe(u8, dname_stack);
+    const delegate = if (in_scope) b.resolve(dname).? else try resolveCapture(b, dname);
+    const null_arg = try b.emitConst(.Null);
+    const prop_ref = b.allocReg();
+    const pname = try b.module.internConst(b.allocator, .{ .String = name });
+    try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
+    const args_start = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
+    _ = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = Reg.from(args_start.int() + 1), .src = prop_ref } });
+    const dst = b.allocReg();
+    const getter = try b.module.internConst(b.allocator, .{ .String = "getValue" });
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = delegate,
+        .name = getter,
+        .args = args_start,
+        .n_args = 2,
+        .arg_names = &.{},
+    } });
+    return dst;
+}
+
+/// Among the same-named EXTENSION overloads of `name`, the one whose leading
+/// `this` receiver type matches the enclosing extension's receiver type. Lets an
+/// ambiguous bare call inside an extension body resolve its arity/receiver-lambda
+/// shape. Null when no enclosing receiver type is known or no single overload
+/// matches.
+fn disambiguateByReceiver(b: *FuncBuilder, name: []const u8) ?FuncId {
+    const recv = b.enclosingRecvTy() orelse return null;
+    const recv_simple = simpleTypeHead(recv);
+    const ids = b.module.func_name_index.get(name) orelse return null;
+    var match: ?FuncId = null;
+    for (ids.items) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), recv_simple)) continue;
+        if (match != null) return null;
+        match = fid;
+    }
+    return match;
+}
+
+fn simpleTypeHead(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.indexOfScalar(u8, n, '<')) |lt| n = n[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| n = n[dot + 1 ..];
+    return n;
+}
+
 fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -6112,8 +6318,16 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     }
 
     // A captured outer that also names a top-level fn: route through value.
+    // Unless the outer is a local FUNCTION that cannot take this call — a
+    // local `fun validate()` does not shadow the top-level `validate(block)`
+    // for `validate { … }`, and routing through the captured self-cell made
+    // the local call itself.
+    const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
+        anyLocalFnOverloadApplicable(decls, args, ast_arg_names)
+    else
+        true;
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
-        b.module.funcId(name0) != null;
+        b.module.funcId(name0) != null and local_fn_takes_call;
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
         // Only a captured local *extension* function or a receiver-lambda param
