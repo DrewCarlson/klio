@@ -415,14 +415,17 @@ What it says is still broken, in rough order of leverage:
   `CompositionTests.simple`, `CompositionLocalTests`). Conformance 204/46, 11
   classes still capped.
 
-- **Open, next: a recomposition livelock on a `by mutableStateOf` delegate.**
-  `CompositionTests.simpleChanges` (`var name by mutableStateOf("Bob")`, write,
-  `expectChanges()`) hangs, while the same test written against a model class
-  (`person.name = …`) passes. The write reaches the recomposer -- the loop wakes
-  -- so the suspect is an invalidation that re-arms on every recomposition
-  (nothing ever settles, so the clock never leaves the current instant). Reduce
-  it with the delegate and a single `expectChanges`; that shape gates most of the
-  11 capped classes.
+- **FIXED: a `var x by D` local read a value cached at its declaration.** The
+  composition never touched the state object, so it recorded no snapshot read and
+  a later write invalidated nothing. A mutable delegated local now dispatches
+  `getValue` at every read site, bare or interpolated. `CompositionTests`
+  `simpleChanges` passes; conformance 219/46, ratchet 200.
+
+- **Open, next: `CompositionTests.testSeveralArbitraryMoves` hangs.** It composes
+  a `mutableStateListOf` with `key(item) { … }` and shuffles the list ten times,
+  so it exercises keyed-group MOVEMENT -- the part of the composer klio
+  reimplements positionally. Nine classes still cap out; this shape is the next
+  one to reduce.
 
 - Open: `coroutines_commontest` sits at 212 (was 233). The regressions are
   hand-off shapes that now livelock or hang: `SharedFlowTest` (rendezvous
