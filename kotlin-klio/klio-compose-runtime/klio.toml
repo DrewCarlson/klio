@@ -55,9 +55,27 @@ include = [
     "androidx/compose/runtime/internal/Atomic.kt",
     "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
     "androidx/compose/runtime/platform/Synchronization.kt",
+    # Standalone engine data structures, consumed straight from upstream: they
+    # depend only on the stdlib + androidx.collection, so they run here exactly
+    # as they do on the JVM — and their own upstream tests exercise them.
+    "androidx/compose/runtime/snapshots/SnapshotIdSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotWeakSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotDoubleIndexHeap.kt",
+    "androidx/compose/runtime/collection/ScopeMap.kt",
+    "androidx/compose/runtime/collection/MultiValueMap.kt",
     # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
     # uses pervasively. Standalone (stdlib only), consumed straight from upstream.
     "androidx/compose/runtime/collection/MutableVector.kt",
+]
+
+# The bundled persistent immutable collections
+# (androidx.compose.runtime.external.kotlinx.collections.immutable): a pure
+# stdlib library the snapshot state objects are built on. Its own source root so
+# every file ships without an include list.
+[[source]]
+root = "upstream/compose/runtime/runtime/src/commonMain/kotlin"
+include = [
+    "androidx/compose/runtime/external/kotlinx/collections/immutable/",
 ]
 
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state

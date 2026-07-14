@@ -8294,10 +8294,16 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
     // builds them all; the storage outlives the loop below.
     var bufs: [8][128]u8 = undefined;
     var probes: [8][]const u8 = undefined;
+    // Which probes name a MEMBER of the receiver's type (keyed by the type's
+    // FQN) rather than one of the stdlib's package-level EXTENSIONS. Kotlin
+    // resolves a member before any extension, so a user extension shadows the
+    // extension probes and never the member ones.
+    var probe_is_member: [8]bool = @splat(false);
     var n: usize = 0;
     const type_probe = probeFqn(&bufs[0], type_fqn, name);
     if (args.len == 0) {
         probes[0] = type_probe;
+        probe_is_member[0] = true;
         probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
         probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
         probes[3] = probeFqn(&bufs[3], "kotlin.ranges", name);
@@ -8308,6 +8314,7 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         probes[1] = probeFqn(&bufs[1], "kotlin.collections", name);
         probes[2] = probeFqn(&bufs[2], "kotlin.text", name);
         probes[3] = probeFqn(&bufs[3], type_fqn, name);
+        probe_is_member[3] = true;
         probes[4] = probeFqn(&bufs[4], "kotlin", name);
         n = 5;
     }
@@ -8334,14 +8341,19 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
             }
         }
         var k: usize = n;
-        while (k > at) : (k -= 1) probes[k] = probes[k - 1];
+        while (k > at) : (k -= 1) {
+            probes[k] = probes[k - 1];
+            probe_is_member[k] = probe_is_member[k - 1];
+        }
         probes[at] = sib_probe;
+        probe_is_member[at] = true;
         n += 1;
     }
     // Throwable family probe.
     if (receiver.* == .Instance) {
         if (instanceIsThrowable(self, allocator, receiver.Instance)) {
             probes[n] = probeFqn(&bufs[6], "kotlin.Throwable", name);
+            probe_is_member[n] = true;
             n += 1;
         }
     }
@@ -8372,10 +8384,15 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
 
     if (!member_shadows_stdlib and !user_member_ext_shadows and !range_in_range and
         pack_ext_shadow != .shadows and
-        !stdlib.isToplevelFunction(name) and
-        !(try userToplevelExtShadows(self, allocator, receiver, name, args)))
+        !stdlib.isToplevelFunction(name))
     {
-        for (probes[0..n]) |probe| {
+        // A user extension shadows the stdlib's EXTENSIONS — but never its
+        // MEMBERS. Kotlin resolves a member first, so `fun Long.toInt(): Int`
+        // does not capture `7L.toInt()`; the member does, and the extension's
+        // own `this.toInt()` reaches it (rather than calling itself for ever).
+        const user_ext_shadows = try userToplevelExtShadows(self, allocator, receiver, name, args);
+        for (probes[0..n], probe_is_member[0..n]) |probe, is_member| {
+            if (user_ext_shadows and !is_member) continue;
             if (lookupIntrinsic(self, probe)) |func| {
                 if (effective_cache_key) |key| memberCachePut(self, key, func, probe);
                 return try dispatchWithReceiver(self, allocator, probe, func, receiver, args);

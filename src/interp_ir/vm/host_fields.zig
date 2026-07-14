@@ -273,6 +273,27 @@ fn unwrapCellRead(r: EvalResult) EvalResult {
 /// name it does not own and shadow a real member of a receiver further
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
+/// Does class `cn` declare property `name` as a STORED member — a body
+/// `val`/`var` or a constructor-parameter property — as opposed to a custom
+/// accessor? Such a declaration overrides an inherited accessor-based property,
+/// so the setter walk must store the field directly rather than fall through to
+/// a supertype's custom setter (`override var x = 0` shadowing `open var x
+/// set(...)`).
+fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) bool {
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    const def = cg.get().get(cn) orelse return false;
+    const dg = def.borrow();
+    defer dg.deinit();
+    for (dg.get().body_properties) |p| {
+        if (std.mem.eql(u8, p.name, name)) return true;
+    }
+    for (dg.get().primary_params) |p| {
+        if (p.property != null and std.mem.eql(u8, p.name, name)) return true;
+    }
+    return false;
+}
+
 /// A discarded dispatch-miss message from a probe. Host miss messages are
 /// `allocPrint`-built with a `Vm::` prefix; static literals never carry one.
 fn freeMissErr(allocator: Allocator, e: EvalError) void {
@@ -444,6 +465,22 @@ fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
     if (e == .Unimplemented and std.mem.indexOf(u8, e.Unimplemented, "Vm::get_field") != null) {
         allocator.free(e.Unimplemented);
     }
+}
+
+/// The properties a builtin receiver declares as MEMBERS (as opposed to the
+/// stdlib's extension properties, such as `indices` / `lastIndex`, which a user
+/// extension may legitimately shadow).
+fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
+    return switch (receiver.*) {
+        .Array => std.mem.eql(u8, name, "size"),
+        .List, .Set => std.mem.eql(u8, name, "size"),
+        .Map => std.mem.eql(u8, name, "size") or
+            std.mem.eql(u8, name, "keys") or
+            std.mem.eql(u8, name, "values") or
+            std.mem.eql(u8, name, "entries"),
+        .String => std.mem.eql(u8, name, "length"),
+        else => false,
+    };
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
@@ -645,6 +682,30 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     g2.deinit();
                     if (owned) |v| return ok(v);
                 }
+                // The shadow cell is keyed by its DECLARING class. When the read
+                // comes from an inner scope whose sgetter `owner` is NOT that
+                // class (an anon object / lambda captured inside it, e.g.
+                // `iterator { parent... }` in `MutableSetWrapper`'s anon iterator,
+                // where `parent` shadows `SetWrapper.parent`), the owner-mangled
+                // `rest` misses. The captured receiver's OWN class supplies the
+                // right key.
+                const rcn = className(receiver.Instance);
+                if (!std.mem.eql(u8, rcn, owner)) {
+                    if (std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ rcn, prop }) catch null) |rk| {
+                        defer allocator.free(rk);
+                        const rc_shadow = blk: {
+                            const mg2 = self.module.borrow();
+                            defer mg2.deinit();
+                            break :blk mg2.get().registry.private_shadow_props.getKey(rk) != null;
+                        };
+                        if (rc_shadow) {
+                            const g2 = receiver.Instance.borrow();
+                            const owned = g2.get().get(rk);
+                            g2.deinit();
+                            if (owned) |v| return ok(v);
+                        }
+                    }
+                }
             }
             if (receiver.* == .Instance) {
                 var cur: ?[]const u8 = className(receiver.Instance);
@@ -702,6 +763,41 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (fid.int() < mptr.funcCount()) {
                         return evalGetter(self, allocator, fid, receiver.*);
                     }
+                }
+            }
+            // During an implicit-receiver probe an owner-qualified sgetter
+            // names the lexically enclosing `owner`'s member. A candidate that
+            // neither IS `owner` nor extends it — a `with`/`coroutineScope { … }`
+            // scope receiver whose runtime class merely declares a same-named
+            // field (e.g. `JobSupport._state` under a `CoroutineScope` receiver
+            // in a lambda enclosed by another class) — does not own that member.
+            // Reading its plain field would let a foreign, often private, field
+            // shadow the enclosing owner's property, so report a probe miss and
+            // let the walk continue to the enclosing `owner`. The transitive
+            // `classIsOrExtends` is used because `isRuntimeType` misses deep
+            // supertype chains for the coroutines classes.
+            if (member_probe and receiver.* == .Instance) {
+                const rcn = className(receiver.Instance);
+                const owns = std.mem.eql(u8, rcn, owner) or blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk mg.get().classIsOrExtends(rcn, owner);
+                };
+                // Skip only for a genuine shadow conflict: `owner` (the lexical
+                // class the bare name was written in) must itself declare `prop`.
+                // When it does not — `prop` comes from an OUTER class read via a
+                // `with` subject, e.g. `objectArgs` on the `Operations` subject
+                // inside a `WriteScope` method — the subject legitimately
+                // provides it and the read must proceed.
+                const owner_declares = blk: {
+                    const pg = self.prog.borrow();
+                    defer pg.deinit();
+                    break :blk lookupPairFunc(pg.get().body_prop_inits, owner, prop) != null or
+                        lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
+                        lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
+                };
+                if (!owns and owner_declares) {
+                    return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ prop, rcn }) });
                 }
             }
             return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
@@ -916,6 +1012,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // property. Skip the extension lookup when the receiver's class
     // hierarchy declares a member getter for this name.
     const member_getter_shadows = blk: {
+        // A BUILTIN receiver's own member property outranks a same-named
+        // extension property too — `LongArray.size` is a member, so
+        // `val LongArray.size get() = this.size` does not capture `a.size`
+        // (and therefore does not call itself for ever).
+        if (builtinMemberProperty(receiver, name)) break :blk true;
         if (receiver.* != .Instance) break :blk false;
         var cur: ?[]const u8 = className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;
@@ -3040,6 +3141,13 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         if (rpkg.len == 0 or fp.len == 0 or std.mem.eql(u8, fp, rpkg)) break :blk f;
                     }
                 }
+                // The receiver's OWN class declaring the property as stored
+                // (a field-backed `override var x = 0`) shadows any inherited
+                // accessor: store the field directly, never reach a supertype's
+                // custom setter.
+                if (classDeclaresStoredProp(self, class_name, real_name)) break :blk null;
+                const rf2 = classFqnOf(inst);
+                if (!std.mem.eql(u8, rf2, class_name) and classDeclaresStoredProp(self, rf2, real_name)) break :blk null;
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 if (mg.get().registry.class_super_names.get(class_name)) |chain| {
@@ -3048,6 +3156,11 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
                         pg.deinit();
                         if (hit) |f| break :blk f;
+                        // A stored override shadows any further-up accessor: an
+                        // `override var x = 0` on a middle class overrides a base
+                        // `open var x set(...)`, so a write stores the field
+                        // rather than reaching the base's custom setter.
+                        if (classDeclaresStoredProp(self, cn, real_name)) break :blk null;
                     }
                 }
                 break :blk null;
@@ -3112,13 +3225,43 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
         {
+            // A stored `override val/var` keeps its own backing cell under the
+            // owner-mangled key (JVM semantics); the read path resolves the
+            // nearest such cell in the runtime chain. A plain write must target
+            // that SAME cell — writing the base's plain `real_name` cell would
+            // leave the override read (which addresses the mangled cell) stale.
+            // `super.x = v` still targets the base's plain cell (super_owner
+            // set), so keep the plain name then.
+            const store_name: []const u8 = if (super_owner != null) real_name else blk: {
+                const any_cell = pglobal: {
+                    const pg = self.module.borrow();
+                    defer pg.deinit();
+                    break :pglobal pg.get().registry.override_cell_props.count() != 0;
+                };
+                if (!any_cell) break :blk real_name;
+                var cur3: ?[]const u8 = className(inst);
+                var hops3: u8 = 0;
+                while (cur3) |cn3| : (hops3 += 1) {
+                    if (hops3 > 16) break;
+                    var kb3: [256]u8 = undefined;
+                    const probe3 = std.fmt.bufPrint(&kb3, "{s}\x1f{s}", .{ cn3, real_name }) catch break;
+                    const key = kblk: {
+                        const pg = self.module.borrow();
+                        defer pg.deinit();
+                        break :kblk pg.get().registry.override_cell_props.getKey(probe3);
+                    };
+                    if (key) |k| break :blk k;
+                    cur3 = firstSupertype(self, cn3);
+                }
+                break :blk real_name;
+            };
             // A boxed capture (an anon-object method writing a captured
             // outer `var` held in its capture env as a shared Cell) takes
             // the write THROUGH the cell so the outer scope observes it.
             const existing: ?Value = blk: {
                 const g = inst.borrow();
                 defer g.deinit();
-                break :blk g.get().get(real_name);
+                break :blk g.get().get(store_name);
             };
             if (existing) |ev| {
                 if (ev == .Cell) {
@@ -3139,7 +3282,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             value.retain();
             const g = inst.borrowMut();
             defer g.deinit();
-            try g.get().define(allocator, real_name, value);
+            try g.get().define(allocator, store_name, value);
         }
         return .{ .ok = {} };
     }

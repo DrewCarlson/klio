@@ -90,10 +90,13 @@ Run any program with:
 | `backing_field_in_nested_scope.kt` | The accessor's `field` binding is visible inside a nested scope (lambda, `when`, loop, `try`), not just the flat accessor body. |
 | `yield_dispatches_to_the_pump.kt` | `yield()` reschedules through the coroutine's DISPATCHER (a queued child runs before it resumes), and a property reference works as a `compareValuesBy` key selector. |
 | `super_property_setter.kt` | `super.prop = value` reaches the superclass accessor, so an overriding setter that writes through `super` does not re-enter itself. |
+| `stored_override_of_accessor.kt` | A field-backed `override var` overrides an inherited accessor property, so a write stores the field and never reaches the base's custom setter. |
 | `local_fun_arity_shadowing.kt` | A local function shadows an outer one by name only for calls it can take: `validate { … }` inside a no-arg local `validate()` resolves outward. |
 | `labeled_this_in_object_literal.kt` | Inside an object literal written in a receiver lambda, `this@build` names the lambda's receiver, and a bare name the object does not own resolves against it. |
 | `delegated_var_reads_through.kt` | A `var x by D` local reads through the delegate on every read (including inside a string template and a lambda), rather than caching the value at the declaration. |
 | `atomic_named_compare_and_set.kt` | A named-argument call into a host-backed library member (`compareAndSet(expect = …, update = …)`) binds exactly as the positional form does. |
+| `member_wins_over_extension.kt` | A member wins over a same-named extension, including on builtin types, so an extension that forwards to `this.<member>()` reaches the member instead of itself. |
+| `scalar_typealias_overload.kt` | A scalar typealias (`= Long`) is transparent for overload resolution, so a Long argument matches an aliased parameter even against a zero-arg overload of the same name. |
 | `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
 | `const_val_inline.kt`         | Top-level `const val`s inline at reference sites (compile-time constants, incl. unary minus). |
 | `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized forms `@Ann ((name: T) -> Unit)?` / `(@Ann (() -> Unit))?` / `@Ann ((T) -> Unit)` and annotated setter parameters. |
