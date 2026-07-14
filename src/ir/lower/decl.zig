@@ -1147,6 +1147,12 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);
             } else {
                 try b.markPlainFnParam(p.name.name);
+                // A trailing lambda binds the callee's LAST parameter, so a
+                // function-typed param can only be a trailing-lambda call's
+                // target when its own last parameter is a function type.
+                if (ft.params.len != 0 and ft.params[ft.params.len - 1].function != null) {
+                    try b.markFnParamTakesTrailingLambda(p.name.name);
+                }
             }
             // A param typed as a contextual function type: a fully-positional
             // call `p(c.., a..)` splits its leading context args from the

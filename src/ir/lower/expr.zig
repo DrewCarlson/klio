@@ -5594,6 +5594,20 @@ fn lowerValueInvocation(
         if (b.isNonFnParam(name0) and b.module.funcId(name0) != null) {
             return null;
         }
+        // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
+        // call it cannot accept. The lambda binds the callee's last parameter,
+        // so a param whose own last parameter is not a function type is not
+        // this call's target: inside
+        // `Flow<T>.map(crossinline transform: suspend (T) -> R)` the body's
+        // `transform { value -> … }` is the `Flow.transform` OPERATOR, and only
+        // the inner `transform(value)` is the parameter. Binding the parameter
+        // there passed the operator's own lambda in as the emitted value, so
+        // `map`'s caller saw a closure where its element belonged.
+        if (b.isPlainFnParam(name0) and !b.fnParamTakesTrailingLambda(name0) and
+            lastArgIsLambda(args) and b.module.funcId(name0) != null)
+        {
+            return null;
+        }
         var callee_reg = reg;
         if (b.isBoxed(name0)) {
             const c = b.allocReg();
