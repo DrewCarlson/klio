@@ -359,8 +359,8 @@ own test suite (`CompositionTests`, `RestartTests`, `MovableContentTests`,
 View/Applier harness. It is the conformance signal for the implicit-composer
 hook: the same tests androidx runs against the Compose compiler plugin.
 
-**143 pass across 46 test classes; 16 classes do not complete inside the
-per-child cap.** Ratcheted at 140 -- raise it as fixes land, never lower it.
+**203 pass across 46 test classes; 8 classes do not complete inside the
+per-child cap.** Ratcheted at 180 -- raise it as fixes land, never lower it.
 
 The suite immediately paid for itself: `field` inside a nested scope
 (`get() = synchronized(lock) { field }`, how kotlinx-coroutines-test guards its
@@ -376,11 +376,32 @@ What it says is still broken, in rough order of leverage:
   see them at all (`unresolved global SnapshotIdSet`, and a bare mention then
   reads as a member of the test class). This alone accounts for ~30 failures
   across four classes and is not composer logic; it is pack visibility.
-- **16 classes hang** rather than fail, all of them the ones that drive a real
-  composition through `runTest` (`CompositionTests`, `MovableContentTests`,
-  `PausableCompositionTests`, the SlotTable suites). They fail fast before the
-  `field` fix and hang after it, so they now get far enough to enter the
-  recomposer/test-scheduler loop and never leave it. This is the core-composer
-  signal worth chasing next.
+- **A continuation resume is asynchronous, and the test scheduler needs it to be
+  synchronous.** This is now the single blocker for every composer test that
+  advances the clock. `KlioContinuation.resumeWith` (`__klio_co_resume`) queues
+  the parked activation on the pump instead of running it, so the coroutine's
+  next step happens on a later pump turn. Kotlin runs that step on the caller's
+  stack -- dispatch is decided ABOVE it, by the continuation's interceptor -- so
+  a test scheduler that fires a frame inside `advanceTimeBy` observes the
+  coroutine still parked. Reduced to
+  `runTest { launch { delay(16); … }; advanceTimeBy(1000) }`: the delayed body
+  runs only after `advanceTimeBy` returns.
+
+  A first attempt at resuming inline (take the parked entry from the owning
+  interceptor, `resumeRaw` it on the current stack, re-park on re-suspension)
+  makes that repro pass and leaves plain `runBlocking` / `launch` / `async` /
+  `coroutineScope` intact, but it drops `coroutines_commontest` from 233 to 44
+  with `Vm::call_value on kotlin.Nothing` -- resuming an activation while
+  another one is mid-flight corrupts state the evaluator holds per thread.
+  Reverted. The fix is to make a nested resume re-entrancy-safe (save/restore
+  the evaluator's per-thread activation state around `resumeRaw`, deliver a
+  throw from the resumed activation to the owning pump rather than swallowing
+  it, and re-park into the OWNING interceptor rather than the top one), not to
+  keep queueing the step.
+
+- With that fixed, the recomposer already paces off the frame clock in its own
+  context (`runRecomposeAndApplyChanges` parks on `parentClock.withFrameNanos`
+  when the context carries one), and `Recomposer` carries `changeCount` /
+  `cancel()` / `join()`, which the mock harness drives.
 - `BroadcastFrameClockTest` reads `isUnconfinedLoopActive` off `Unit` -- the
   unconfined event loop, already a known open item.
