@@ -33,6 +33,7 @@ sparse_ui=(
   "compose/ui/ui-text/src/commonMain"
   "compose/ui/ui-text/src/skikoMain"
   "compose/animation/animation-core/src/commonMain"
+  "compose/animation/animation/src/commonMain"
   "compose/foundation/foundation-layout/src/commonMain"
   "compose/foundation/foundation/src/commonMain"
   "compose/foundation/foundation/src/skikoMain"
