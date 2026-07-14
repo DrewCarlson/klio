@@ -157,6 +157,12 @@ pub const Inst = union(enum) {
         receiver: Reg,
         field: ConstId,
         value: Reg,
+        /// `super.prop = v`: the class whose body wrote it. The setter search
+        /// then STARTS at that class's supertypes — an overriding setter whose
+        /// body writes `super.prop` must reach the base accessor, not itself
+        /// (`ViewApplier.current`'s setter does exactly that, and re-entering it
+        /// recursed until the stack died). Null for an ordinary write.
+        super_owner: ?ConstId = null,
     },
     /// Compound-assign to a property: `recv.field <op>= value`. The
     /// evaluator reads the current field value and, when that value
@@ -1032,6 +1038,12 @@ pub const Module = struct {
     /// lambda-body path and consumed there to emit the context-load
     /// prologue. Not serialized.
     pending_ctx: ?PendingCtx = null,
+    /// Lowering-only scratch: the implicit label of the argument lambda whose
+    /// body is about to lower (`runTest { … }` → "runTest"). The body binds
+    /// `this@<label>` to its receiver so a reference from a nested scope — an
+    /// anonymous object's accessor, a further lambda — reaches THAT receiver
+    /// instead of the innermost `this`. Not serialized.
+    pending_lambda_this_label: ?[]const u8 = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.

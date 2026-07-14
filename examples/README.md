@@ -89,6 +89,9 @@ Run any program with:
 | `fn_param_name_shadows_operator.kt` | A function-typed parameter does not shadow a same-named function for a trailing-lambda call it cannot accept (`Flow.map`'s `crossinline transform` vs the `transform` operator). |
 | `backing_field_in_nested_scope.kt` | The accessor's `field` binding is visible inside a nested scope (lambda, `when`, loop, `try`), not just the flat accessor body. |
 | `yield_dispatches_to_the_pump.kt` | `yield()` reschedules through the coroutine's DISPATCHER (a queued child runs before it resumes), and a property reference works as a `compareValuesBy` key selector. |
+| `super_property_setter.kt` | `super.prop = value` reaches the superclass accessor, so an overriding setter that writes through `super` does not re-enter itself. |
+| `local_fun_arity_shadowing.kt` | A local function shadows an outer one by name only for calls it can take: `validate { … }` inside a no-arg local `validate()` resolves outward. |
+| `labeled_this_in_object_literal.kt` | Inside an object literal written in a receiver lambda, `this@build` names the lambda's receiver, and a bare name the object does not own resolves against it. |
 | `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
 | `const_val_inline.kt`         | Top-level `const val`s inline at reference sites (compile-time constants, incl. unary minus). |
 | `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized forms `@Ann ((name: T) -> Unit)?` / `(@Ann (() -> Unit))?` / `@Ann ((T) -> Unit)` and annotated setter parameters. |

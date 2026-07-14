@@ -1790,6 +1790,7 @@ fn runFrame(
     // unbounded recursion into a catchable `StackOverflowError` before the
     // native stack faults.
     if (eval_depth >= maxEvalDepth()) {
+        dumpFrameChainForDiag();
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
     eval_depth += 1;
@@ -3311,7 +3312,8 @@ noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Fram
         const v = frame.read(sf.value);
         const name = constStr(frame.module, sf.field) orelse
             return raiseStep(frame, .{ .Type = "SetField: name not a string const" });
-        switch (try host.setField(allocator, &recv, name, v)) {
+        const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(frame.module, c) else null;
+        switch (try host.setFieldFrom(allocator, &recv, name, v, super_owner)) {
             .ok => {},
             .err => |e| return raiseStep(frame, e),
         }
@@ -6320,6 +6322,13 @@ pub const NullHost = struct {
                 return errResult(.{ .Type = msg });
             },
         }
+    }
+
+    /// The bare-IR host has no class table, so a `super.prop = v` write has
+    /// nothing to walk past: store the field.
+    pub fn setFieldFrom(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value, super_owner: ?[]const u8) Allocator.Error!UnitResult {
+        _ = super_owner;
+        return setField(self, allocator, receiver, name, value);
     }
 
     pub fn setField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {

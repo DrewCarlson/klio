@@ -17,6 +17,7 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 
@@ -69,6 +70,9 @@ public class Recomposer(
 
     private val effectJob: Job = Job()
 
+    /** Completed by [close] — what [join] waits on. */
+    private val shutdown: CompletableJob = Job()
+
     /** The upstream frame clock effects await via withFrameNanos; the loop fans a
      * frame to its awaiters each pass. A new awaiter wakes the loop. */
     internal val frameClock: BroadcastFrameClock = BroadcastFrameClock { notifyWorkAvailable() }
@@ -92,6 +96,14 @@ public class Recomposer(
     // async loop receives it and recomposes.
     private val workChannel: Channel<Unit> = Channel(Channel.CONFLATED)
     private var closed: Boolean = false
+
+    /**
+     * How many change sets this recomposer has applied. One recomposition of one
+     * composition is one change. A test advances the clock and compares the count
+     * before and after to tell "something recomposed" from "nothing did".
+     */
+    public var changeCount: Long = 0L
+        private set
 
     internal fun registerComposition(composition: KlioComposition) {
         composition.attachRecomposer(this)
@@ -135,7 +147,10 @@ public class Recomposer(
     /** Recompose every registered composition that has pending invalidations (synchronous). */
     public fun recompose() {
         for (c in compositions.toList()) {
-            if (c.hasInvalidations) c.recompose()
+            if (c.hasInvalidations) {
+                c.recompose()
+                changeCount++
+            }
         }
     }
 
@@ -146,19 +161,43 @@ public class Recomposer(
      * composition, fans a frame to frame-clock awaiters, and recomposes.
      */
     public suspend fun runRecomposeAndApplyChanges() {
+        // Recomposition is paced by the frame clock in the recomposer's OWN
+        // context when it has one — that is the contract upstream keeps, and it
+        // is how a host drives Compose: a test's `TestMonotonicFrameClock`
+        // advances virtual time, a window's clock ticks with the display. The
+        // loop used to pace itself off an internal counter, so a caller
+        // advancing its own clock never made a frame happen and the recomposer
+        // stayed dirty for ever ("still recomposing after advancing").
+        //
+        // The internal `frameClock` remains the one COMPOSITIONS await through
+        // `withFrameNanos`; a frame is fanned to it inside the parent's frame.
+        // With no parent clock (a plain `Recomposer()` driven synchronously) the
+        // loop keeps its own monotonic counter.
+        val parentClock = effectContext[MonotonicFrameClock]
         while (!closed) {
-            if (!hasPendingWork) {
-                try {
-                    workChannel.receive()
-                } catch (e: Throwable) {
-                    break // channel closed → stop the loop
+            if (parentClock != null) {
+                // A host clock paces the loop: park on ITS frame, so the host —
+                // a test scheduler advancing virtual time, a window ticking with
+                // the display — decides when a frame happens. Waiting on the work
+                // channel instead would park the loop off the host's scheduler
+                // entirely: the wake never runs, and a composition invalidated by
+                // a state write stays dirty however far the host advances.
+                parentClock.withFrameNanos { nanos ->
+                    frameClock.sendFrame(nanos)
+                    recompose()
                 }
+            } else {
+                if (!hasPendingWork) {
+                    try {
+                        workChannel.receive()
+                    } catch (e: Throwable) {
+                        break // channel closed → stop the loop
+                    }
+                }
+                frameClock.sendFrame(frameNanos)
+                frameNanos += 16_666_666L // ~60fps, monotonic + deterministic
+                recompose()
             }
-            // Fan a frame to withFrameNanos awaiters (animations, produceState
-            // pacing), then recompose any invalidated content.
-            frameClock.sendFrame(frameNanos)
-            frameNanos += 16_666_666L // ~60fps, monotonic + deterministic
-            recompose()
         }
     }
 
@@ -168,6 +207,17 @@ public class Recomposer(
         closed = true
         workChannel.close()
         effectJob.cancel()
+        shutdown.complete()
+    }
+
+    /** Stop recomposing and cancel every effect this recomposer launched. */
+    public fun cancel() {
+        close()
+    }
+
+    /** Suspend until this recomposer has finished shutting down. */
+    public suspend fun join() {
+        shutdown.join()
     }
 }
 

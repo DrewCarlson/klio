@@ -2110,6 +2110,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    // The implicit label this lambda carries (`runTest { … }` → "runTest").
+    // The body binds `this@<label>` to its receiver.
+    b.module.pending_lambda_this_label = b.pending_lambda_label;
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -4467,12 +4470,24 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // reachable both in the declaring scope and as a capture. Calls
         // no fact separates keep the plain last-decl binding below.
         const bare = callee.Path.segments[0].name;
+        var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
             if (selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
                 if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
             }
         }
-        if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
+        if (b.localFnDecls(bare)) |decls| {
+            local_fn_inapplicable = !anyLocalFnOverloadApplicable(decls, args, ast_arg_names);
+        }
+        // A local function shadows an outer one by NAME, but only among
+        // candidates that can take the call. A local `fun validate()` does
+        // not hide the top-level `validate(block: () -> Unit)` from
+        // `validate { … }`; invoking the local as a value made it call
+        // itself for ever. With no applicable local, resolution continues
+        // outward to the top-level / member candidates below.
+        if (!local_fn_inapplicable) {
+            if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
+        }
     }
 
     // Whether a single-segment class-name call resolves to the constructor.
@@ -5367,6 +5382,35 @@ fn headCompatible(h: []const u8, d_raw: []const u8) bool {
 /// parameter. Returns the unique survivor's mangled binding, or null
 /// when no signature fact separates the candidates (the caller keeps
 /// the plain last-decl binding).
+/// Can any same-named local-function declaration take this call at all
+/// (arity, varargs, defaults, argument names)? When none can, the local
+/// name does not shadow the outer candidates.
+fn anyLocalFnOverloadApplicable(
+    ovs: []const build.LocalFnOverload,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) bool {
+    outer: for (ovs) |*ov| {
+        if (args.len < ov.n_required and !ov.has_vararg) continue;
+        if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
+        for (args, 0..) |_, i| {
+            const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            if (supplied) |nm| {
+                var found = false;
+                for (ov.param_names) |pn| {
+                    if (std.mem.eql(u8, pn, nm)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) continue :outer;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 fn selectLocalFnOverload(
     b: *const FuncBuilder,
     ovs: []const build.LocalFnOverload,
@@ -6112,8 +6156,16 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     }
 
     // A captured outer that also names a top-level fn: route through value.
+    // Unless the outer is a local FUNCTION that cannot take this call — a
+    // local `fun validate()` does not shadow the top-level `validate(block)`
+    // for `validate { … }`, and routing through the captured self-cell made
+    // the local call itself.
+    const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
+        anyLocalFnOverloadApplicable(decls, args, ast_arg_names)
+    else
+        true;
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
-        b.module.funcId(name0) != null;
+        b.module.funcId(name0) != null and local_fn_takes_call;
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
         // Only a captured local *extension* function or a receiver-lambda param

@@ -108,6 +108,17 @@ fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
 
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
+    // A captured-and-written local is BOXED into a shared cell at its binding
+    // site, so a function-typed one arrives here as the cell, not the closure.
+    // `block(i)` on such a binding calls what the cell holds.
+    if (callee.* == .Cell) {
+        const cg = callee.Cell.borrow();
+        const inner = cg.get().*;
+        inner.retain();
+        cg.deinit();
+        defer inner.release(allocator);
+        return callValue(self, allocator, &inner, args);
+    }
     if (callee.* == .Intrinsic) {
         return dispatchIntrinsic(self, callee.Intrinsic.fqn, callee.Intrinsic.func, args);
     }

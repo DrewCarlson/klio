@@ -859,6 +859,15 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
         .Member => |m| {
             const recv = try lowerReceiver(b, m.receiver);
             const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+            // `super.prop = v` lowers to a SetField on `this` (super is not a
+            // value), so the setter search would find the OVERRIDING setter and
+            // re-enter it. Carry the writing class so the runtime starts the
+            // search at its supertypes, the same way a `super.prop` read does.
+            const super_owner: ?ir.ConstId = blk: {
+                if (m.receiver.* != .Super) break :blk null;
+                const oc = b.ownerClass() orelse break :blk null;
+                break :blk try b.module.internConst(b.allocator, .{ .String = oc });
+            };
             if (m.safe) {
                 // `a?.b = v` stores only when the receiver is non-null
                 // (dropping the store entirely lost `parent?.count++`
@@ -886,6 +895,7 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 .receiver = recv,
                 .field = field,
                 .value = combined,
+                .super_owner = super_owner,
             } });
         },
         .Index => |idx| {

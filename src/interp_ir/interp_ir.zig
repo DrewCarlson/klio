@@ -658,6 +658,10 @@ pub const SharedOutput = struct {
         /// Where writes go. Null until `attach`: record instead.
         dest: ?Output = null,
         rec: runtime.RecordingSink,
+
+        pub fn deinit(self: *State) void {
+            self.rec.deinit();
+        }
     };
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedOutput {
@@ -1638,7 +1642,7 @@ test "shared output clone shares one inner sink" {
     defer shared.deinit();
     const other = shared.clone();
     defer other.deinit();
-    try testing.expect(ObjRef(runtime.RecordingSink).ptrEq(shared.obj, other.obj));
+    try testing.expect(ObjRef(SharedOutput.State).ptrEq(shared.obj, other.obj));
 
     shared.output().writeln("a");
     other.output().writeln("b");

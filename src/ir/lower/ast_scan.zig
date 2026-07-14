@@ -741,3 +741,127 @@ test "names assigned in lambdas catches postfix increment target" {
     try namesAssignedInLambdas(&stmts, &out);
     try testing.expect(out.contains("count"));
 }
+
+/// Does anything inside these statements read `this@<label>` — at any depth,
+/// including nested lambdas and an anonymous object's member bodies and
+/// property accessors? An argument lambda's implicit label (`runTest { … }`)
+/// names its receiver, so the body must bind that receiver under the label
+/// for the reference to reach it rather than the innermost `this`.
+pub fn referencesQualifiedThis(stmts: []const Stmt, label: []const u8) bool {
+    for (stmts) |*s| if (qthisStmt(s, label)) return true;
+    return false;
+}
+
+fn qthisStmt(s: *const Stmt, label: []const u8) bool {
+    return switch (s.*) {
+        .Expr => |*e| qthisExpr(e, label),
+        .Assign => |a| qthisExpr(&a.target, label) or qthisExpr(&a.value, label),
+        .DestructuringDecl => |d| qthisExpr(&d.init, label),
+        .Decl => |d| qthisDecl(&d, label),
+    };
+}
+
+fn qthisBody(body: ?ast.FunctionBody, label: []const u8) bool {
+    const fb = body orelse return false;
+    return switch (fb) {
+        .Block => |blk| referencesQualifiedThis(blk.stmts, label),
+        .Expr => |ex| qthisExpr(&ex, label),
+    };
+}
+
+fn qthisDecl(d: *const ast.Decl, label: []const u8) bool {
+    return switch (d.*) {
+        .Function => |f| qthisBody(f.body, label),
+        .Property => |p| blk: {
+            if (p.init) |*e| if (qthisExpr(e, label)) break :blk true;
+            if (p.getter) |g| if (qthisBody(g.body, label)) break :blk true;
+            if (p.setter) |st| if (qthisBody(st.body, label)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn qthisExpr(e: *const Expr, label: []const u8) bool {
+    return switch (e.*) {
+        .This => |t| t.qualifier != null and std.mem.eql(u8, t.qualifier.?.name, label),
+        .Member => |m| qthisExpr(m.receiver, label),
+        .MemberRef => |m| qthisExpr(m.receiver, label),
+        .Call => |c| blk: {
+            if (qthisExpr(c.callee, label)) break :blk true;
+            for (c.args) |*a| if (qthisExpr(a, label)) break :blk true;
+            break :blk false;
+        },
+        .Index => |idx| blk: {
+            if (qthisExpr(idx.receiver, label)) break :blk true;
+            for (idx.args) |*a| if (qthisExpr(a, label)) break :blk true;
+            break :blk false;
+        },
+        .Binary => |bin| qthisExpr(bin.lhs, label) or qthisExpr(bin.rhs, label),
+        .Unary => |u| qthisExpr(u.expr, label),
+        .Postfix => |u| qthisExpr(u.expr, label),
+        .Spread => |u| qthisExpr(u.expr, label),
+        .Throw => |u| qthisExpr(u.value, label),
+        .Labeled => |u| qthisExpr(u.expr, label),
+        .As => |u| qthisExpr(u.expr, label),
+        .IsCheck => |u| qthisExpr(u.expr, label),
+        .Return => |r| if (r.value) |v| qthisExpr(v, label) else false,
+        .If => |f| blk: {
+            if (qthisExpr(f.cond, label)) break :blk true;
+            if (qthisExpr(f.then_branch, label)) break :blk true;
+            if (f.else_branch) |els| if (qthisExpr(els, label)) break :blk true;
+            break :blk false;
+        },
+        .While => |w| qthisExpr(w.cond, label) or qthisExpr(w.body, label),
+        .DoWhile => |w| blk: {
+            if (w.body) |bd| if (qthisExpr(bd, label)) break :blk true;
+            break :blk qthisExpr(w.cond, label);
+        },
+        .For => |f| qthisExpr(f.iter, label) or qthisExpr(f.body, label),
+        .Block => |b| referencesQualifiedThis(b.stmts, label),
+        .Lambda => |l| referencesQualifiedThis(l.body.stmts, label),
+        .AnonFun => |af| blk: {
+            const fb = af.body orelse break :blk false;
+            break :blk switch (fb.*) {
+                .Block => |b| referencesQualifiedThis(b.stmts, label),
+                .Expr => |ex| qthisExpr(&ex, label),
+            };
+        },
+        .When => |w| blk: {
+            if (w.subject) |s| if (qthisExpr(s, label)) break :blk true;
+            for (w.branches) |*br| {
+                if (qthisExpr(&br.body, label)) break :blk true;
+                for (br.patterns) |*pat| switch (pat.kind) {
+                    .Value, .InRange, .NotInRange => |v| if (qthisExpr(&v, label)) break :blk true,
+                    else => {},
+                };
+            }
+            break :blk false;
+        },
+        .Try => |t| blk: {
+            if (referencesQualifiedThis(t.body.stmts, label)) break :blk true;
+            for (t.catches) |*c| if (referencesQualifiedThis(c.body.stmts, label)) break :blk true;
+            if (t.finally) |fb| if (referencesQualifiedThis(fb.stmts, label)) break :blk true;
+            break :blk false;
+        },
+        .StringTemplate => |st| blk: {
+            for (st.parts) |*p| switch (p.*) {
+                .Interp => |ex| if (qthisExpr(ex, label)) break :blk true,
+                else => {},
+            };
+            break :blk false;
+        },
+        .ObjectExpr => |o| blk: {
+            for (o.supertype_args) |sa| if (sa) |args| {
+                for (args) |*a| if (qthisExpr(a, label)) break :blk true;
+            };
+            for (o.supertype_delegates) |sd| if (sd) |d| {
+                if (qthisExpr(&d, label)) break :blk true;
+            };
+            for (o.members) |*d| if (qthisDecl(d, label)) break :blk true;
+            for (o.init_blocks) |*ib| if (referencesQualifiedThis(ib.stmts, label)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}

@@ -250,7 +250,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false));
+    return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false)));
 }
 
 /// A boxed capture (an anon-object method's captured outer `var` stored
@@ -273,9 +273,70 @@ fn unwrapCellRead(r: EvalResult) EvalResult {
 /// name it does not own and shadow a real member of a receiver further
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
-pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+/// A discarded dispatch-miss message from a probe. Host miss messages are
+/// `allocPrint`-built with a `Vm::` prefix; static literals never carry one.
+fn freeMissErr(allocator: Allocator, e: EvalError) void {
+    if (!runtime.freeScratch()) return;
+    if (e != .Unimplemented) return;
+    if (std.mem.startsWith(u8, e.Unimplemented, "Vm::")) allocator.free(e.Unimplemented);
+}
 
+/// Depth bound for the lexical-receiver fallback below: an object literal
+/// written inside another one chains, but a capture cycle must not.
+threadlocal var anon_recv_depth: usize = 0;
+
+pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
+}
+
+/// Kotlin's implicit receivers stack. A bare name inside an object literal's
+/// member that the object does not own resolves against the receivers in scope
+/// where the literal was WRITTEN — `testScheduler`, read inside an
+/// `object : CompositionTestScope { … }` written in a `runTest { }` lambda, is
+/// that lambda's `TestScope`. The literal closed over those receivers as its
+/// `this` / `this@…` captures, so probe them on a miss. Only a dispatch MISS
+/// reaches here, so a name that already resolves keeps its path.
+fn lexicalReceiverFallback(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    r: EvalResult,
+) Allocator.Error!EvalResult {
+    if (r == .ok) return r;
+    const e = r.err;
+    if (e != .Unimplemented) return r;
+    if (receiver.* != .Instance) return r;
+    if (anon_recv_depth >= 8) return r;
+    const caps: []const InstanceData.Capture = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().anon_captures;
+    };
+    if (caps.len == 0) return r;
+    anon_recv_depth += 1;
+    defer anon_recv_depth -= 1;
+    for (caps) |c| {
+        // Only the LABELLED receivers: the plain `this` capture is the object's
+        // `outer` link, already on the normal lookup path.
+        if (!std.mem.startsWith(u8, c.name, "this@")) continue;
+        if (c.value == .Null or c.value == .Unit) continue;
+        switch (try getField(self, allocator, &c.value, name)) {
+            .ok => |v| {
+                freeMissErr(allocator, e);
+                return .{ .ok = v };
+            },
+            .err => |e2| {
+                if (e2 == .Unimplemented) {
+                    freeMissErr(allocator, e2);
+                } else {
+                    freeMissErr(allocator, e);
+                    return .{ .err = e2 };
+                }
+            },
+        }
+    }
+    return r;
 }
 
 /// For the loop JIT: the index of `name` in the receiver's instance field list,
@@ -2772,7 +2833,39 @@ fn instanceDeclaresProperty(self: *VmHost, receiver: *const Value, name: []const
     return false;
 }
 
+/// The class a `super.prop = v` write was made from, for the duration of that
+/// write. The setter search then starts at that class's SUPERTYPES: an
+/// overriding setter whose body writes `super.prop` must reach the base
+/// accessor, never itself.
+threadlocal var super_write_owner: ?[]const u8 = null;
+
 pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
+    return setFieldInner(self, allocator, receiver, name, value);
+}
+
+pub fn setFieldFrom(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    value: Value,
+    super_owner: ?[]const u8,
+) Allocator.Error!UnitResult {
+    if (super_owner == null) return setFieldInner(self, allocator, receiver, name, value);
+    const prev = super_write_owner;
+    super_write_owner = super_owner;
+    defer super_write_owner = prev;
+    return setFieldInner(self, allocator, receiver, name, value);
+}
+
+fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
+    // CONSUME the marker: it belongs to this write only. Writes made inside the
+    // base setter we are about to reach are ordinary ones.
+    const super_owner: ?[]const u8 = blk: {
+        const o = super_write_owner;
+        super_write_owner = null;
+        break :blk o;
+    };
     // Companion forwarding for writes: `Foo.count = 1` routes to the
     // companion singleton instance's field.
     if (receiver.* == .Class) {
@@ -2900,6 +2993,24 @@ pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
             // `measuredSize` setter was skipped and the write hit the backing
             // field directly, its side effects lost).
             const setter_fid: ?FuncId = blk: {
+                // `super.prop = v`: the writing class's own setter is exactly the
+                // one being overridden, so start the search at its SUPERTYPES. A
+                // base whose property is field-backed has no setter at all, and
+                // the store below writes the field — which is what `super.prop = v`
+                // means.
+                if (super_owner) |owner| {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    if (mg.get().registry.class_super_names.get(owner)) |chain| {
+                        for (chain) |cn| {
+                            const pg = self.prog.borrow();
+                            const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
+                            pg.deinit();
+                            if (hit) |f| break :blk f;
+                        }
+                    }
+                    break :blk null;
+                }
                 // FQN key first: distinct packs' same-simple-named classes
                 // keep distinct FQN keys even when the shared SIMPLE-name
                 // slot clobbers (kotlinx-coroutines-test's private `class

@@ -323,6 +323,27 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_ctx = null;
         try decl.emitContextParamLoads(&b, pc.params, pc.type_params);
     }
+    // An argument lambda's implicit label names ITS receiver
+    // (`runTest { … }` → `this@runTest`). Bind the label to the receiver the
+    // invoke fills in, so a reference from a nested scope — an anonymous
+    // object's accessor, a further lambda — captures this one rather than
+    // resolving to the innermost `this` (the anon instance).
+    const this_label = module.pending_lambda_this_label;
+    module.pending_lambda_this_label = null;
+    if (is_lambda and this_label != null and
+        ast_scan.referencesQualifiedThis(body.stmts, this_label.?))
+    {
+        const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{this_label.?});
+        if (b.resolve(label) == null) {
+            const this_reg: ?Reg = if (b.resolve("this")) |r| r else blk: {
+                const idx = try b.recordCapture("this");
+                const dst = b.allocReg();
+                try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+                break :blk dst;
+            };
+            if (this_reg) |tr| try b.bind(label, tr);
+        }
+    }
     // A lambda parameter (including the implicit `it`) statically typed as a
     // broad collection (`Iterable`/`Collection`) yields a `List` from `+`/`-`
     // even over a runtime `Set`; record it so the operator lowering coerces it.

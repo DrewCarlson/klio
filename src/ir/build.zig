@@ -1274,6 +1274,15 @@ pub const FuncBuilder = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.allocator, ov);
     }
+    /// Every local-function declaration seen for `name`, in decl order —
+    /// including a lone one. A call site checks these for APPLICABILITY: a
+    /// local fun shadows an outer same-named function only for calls it can
+    /// actually take.
+    pub fn localFnDecls(self: *const FuncBuilder, name: []const u8) ?[]const LocalFnOverload {
+        const list = self.local_fn_overloads.getPtr(name) orelse return null;
+        if (list.items.len == 0) return null;
+        return list.items;
+    }
     /// All same-named declarations seen for `name`, in decl order; null
     /// unless the name was declared at least twice (a single decl never
     /// needs selection, so it is not registered).
