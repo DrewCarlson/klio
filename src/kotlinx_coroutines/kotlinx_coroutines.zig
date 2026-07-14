@@ -1419,6 +1419,15 @@ fn closedSendExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
 
 /// `yield()` — cooperative reschedule: park with a zero-ms wakeup so
 /// every other ready coroutine runs before this one continues.
+///
+/// NOT bound as `kotlinx.coroutines.yield` (see the registry below). That
+/// reschedules on klio's own pump, which is not the coroutine's DISPATCHER: a
+/// `yield()` inside `runTest` resumed straight from the pump without ever
+/// draining the `TestCoroutineScheduler` queue, so the yielding body ran on
+/// ahead of the tasks it was yielding TO. Upstream's `yield()` dispatches
+/// through the `ContinuationInterceptor`, which is right for every dispatcher
+/// including klio's own; it is the one that runs now. Kept for the suspension
+/// shape it documents and the test below.
 fn yieldNow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
     return .{ .err = .{ .Suspend = 0 } };
@@ -1718,7 +1727,6 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollSend", .f = channelSelectPollSend },
     .{ .fqn = "kotlinx.coroutines.__kxco_rbPump", .f = rbPump },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_reportUncaught", .f = reportUncaught },
-    .{ .fqn = "kotlinx.coroutines.yield", .f = yieldNow },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.cancel", .f = channelClose },
     .{ .fqn = "kotlinx.coroutines.channels.Channel", .f = channelCreate },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.send", .f = channelSend },
