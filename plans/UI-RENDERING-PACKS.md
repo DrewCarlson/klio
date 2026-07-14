@@ -387,17 +387,28 @@ What it says is still broken, in rough order of leverage:
   `runTest { launch { delay(16); … }; advanceTimeBy(1000) }`: the delayed body
   runs only after `advanceTimeBy` returns.
 
-  A first attempt at resuming inline (take the parked entry from the owning
-  interceptor, `resumeRaw` it on the current stack, re-park on re-suspension)
-  makes that repro pass and leaves plain `runBlocking` / `launch` / `async` /
-  `coroutineScope` intact, but it drops `coroutines_commontest` from 233 to 44
-  with `Vm::call_value on kotlin.Nothing` -- resuming an activation while
-  another one is mid-flight corrupts state the evaluator holds per thread.
-  Reverted. The fix is to make a nested resume re-entrancy-safe (save/restore
-  the evaluator's per-thread activation state around `resumeRaw`, deliver a
-  throw from the resumed activation to the owning pump rather than swallowing
-  it, and re-park into the OWNING interceptor rather than the top one), not to
-  keep queueing the step.
+  Resuming inline is NOT the fix on its own, and the experiment says why. With
+  every `Continuation.resumeWith` run on the caller's stack, the reduced repro
+  passes and plain `runBlocking` / `launch` / `async` / `coroutineScope` /
+  `awaitAll` all still work -- but `coroutines_commontest` drops 233 -> 44 and
+  ordering inverts: under `runTest`, an `async { }` body runs BEFORE the code
+  that follows the `async` call. That is the tell. klio's builders do not
+  dispatch through the context's `ContinuationInterceptor` at all: a coroutine's
+  first step and every later step are queued on klio's own pump, and the pump
+  queue is what makes them "later". The dispatcher in the context is consulted
+  for `delay` (`scheduleResumeAfterDelay`) but not for the steps themselves, so
+  under a `StandardTestDispatcher` the virtual clock never owns the ordering --
+  which is exactly why `advanceTimeBy` does not recompose.
+
+  The fix is therefore to route a coroutine's steps through its
+  `ContinuationInterceptor` (`Continuation.intercepted()` -> the dispatcher's
+  `dispatch`), so klio's own dispatchers keep using the pump queue while a
+  `TestDispatcher` puts the step in the test scheduler's event heap, and an
+  undispatched resume (`resumeUndispatched`, what `TestDispatcher.processEvent`
+  calls) runs on the caller's stack. Nested resume must also be made
+  re-entrancy-safe on that path (the 233 -> 44 run showed
+  `Vm::call_value on kotlin.Nothing` from resuming an activation while another
+  is mid-flight).
 
 - With that fixed, the recomposer already paces off the frame clock in its own
   context (`runRecomposeAndApplyChanges` parks on `parentClock.withFrameNanos`
