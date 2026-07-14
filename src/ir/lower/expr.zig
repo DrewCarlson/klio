@@ -1156,6 +1156,16 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const segments = expr.Path.segments;
     const span0 = expr.Path.span;
 
+    // `var x by D` reads THROUGH the delegate: `D.getValue(null, ::x)` at every
+    // read, not once at the declaration. A `MutableState` delegate hands back the
+    // state's current value that way — and, in a composition, records the read on
+    // the snapshot, which is what makes a later write invalidate the group that
+    // read it. Reading a value cached at the declaration recorded no read at all,
+    // so `var name by mutableStateOf(…)` never recomposed.
+    if (segments.len == 1) {
+        if (try lowerDelegateRead(b, segments[0].name)) |r| return r;
+    }
+
     // File-private top-level property rename: a bare reference from the
     // declaring file resolves to the per-file mangled global. Locals,
     // captures, and own members keep shadowing it (Kotlin scope order).
@@ -1710,6 +1720,9 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
         return dst;
     }
+    // `"… $x …"` where `x` is a `var x by D` local reads THROUGH the delegate,
+    // exactly as a bare `x` does.
+    if (try lowerDelegateRead(b, ident.name)) |r| return r;
     if (b.resolve(ident.name)) |r| return r;
     if (b.knowsOuter(ident.name)) {
         const idx = try b.recordCapture(ident.name);
@@ -6111,6 +6124,39 @@ fn anyFunctionParam(params: []const ir.Param) bool {
 
 /// Path-callee bare-name → Call ladder. Returns null when no top-level fn /
 /// the class path should handle it instead.
+/// The read side of a `var x by D` local: dispatch `D.getValue(null, ::x)` when
+/// the hidden delegate binding is reachable here — bound in this scope, or
+/// captured from an enclosing one. Null when `x` is not a mutable delegated
+/// local (a plain local, or a `val x by lazy`, whose eager-once value stands).
+fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
+    var namebuf: [512]u8 = undefined;
+    const dname_stack = std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{name}) catch return null;
+    const in_scope = b.resolve(dname_stack) != null;
+    const outer = b.knowsOuter(dname_stack);
+    if (!in_scope and !outer) return null;
+    const dname = try b.allocator.dupe(u8, dname_stack);
+    const delegate = if (in_scope) b.resolve(dname).? else try resolveCapture(b, dname);
+    const null_arg = try b.emitConst(.Null);
+    const prop_ref = b.allocReg();
+    const pname = try b.module.internConst(b.allocator, .{ .String = name });
+    try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
+    const args_start = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
+    _ = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = Reg.from(args_start.int() + 1), .src = prop_ref } });
+    const dst = b.allocReg();
+    const getter = try b.module.internConst(b.allocator, .{ .String = "getValue" });
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = delegate,
+        .name = getter,
+        .args = args_start,
+        .n_args = 2,
+        .arg_names = &.{},
+    } });
+    return dst;
+}
+
 fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
