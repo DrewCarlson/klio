@@ -446,6 +446,22 @@ fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
     }
 }
 
+/// The properties a builtin receiver declares as MEMBERS (as opposed to the
+/// stdlib's extension properties, such as `indices` / `lastIndex`, which a user
+/// extension may legitimately shadow).
+fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
+    return switch (receiver.*) {
+        .Array => std.mem.eql(u8, name, "size"),
+        .List, .Set => std.mem.eql(u8, name, "size"),
+        .Map => std.mem.eql(u8, name, "size") or
+            std.mem.eql(u8, name, "keys") or
+            std.mem.eql(u8, name, "values") or
+            std.mem.eql(u8, name, "entries"),
+        .String => std.mem.eql(u8, name, "length"),
+        else => false,
+    };
+}
+
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
     // Field-read memo, consulted before the whole ladder: entries exist
     // ONLY for (class, name) pairs that previously fell through every
@@ -916,6 +932,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // property. Skip the extension lookup when the receiver's class
     // hierarchy declares a member getter for this name.
     const member_getter_shadows = blk: {
+        // A BUILTIN receiver's own member property outranks a same-named
+        // extension property too — `LongArray.size` is a member, so
+        // `val LongArray.size get() = this.size` does not capture `a.size`
+        // (and therefore does not call itself for ever).
+        if (builtinMemberProperty(receiver, name)) break :blk true;
         if (receiver.* != .Instance) break :blk false;
         var cur: ?[]const u8 = className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;

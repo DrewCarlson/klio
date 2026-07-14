@@ -55,6 +55,12 @@ include = [
     "androidx/compose/runtime/internal/Atomic.kt",
     "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
     "androidx/compose/runtime/platform/Synchronization.kt",
+    # Standalone engine data structures, consumed straight from upstream: they
+    # depend only on the stdlib + androidx.collection, so they run here exactly
+    # as they do on the JVM — and their own upstream tests exercise them.
+    "androidx/compose/runtime/snapshots/SnapshotIdSet.kt",
+    "androidx/compose/runtime/collection/ScopeMap.kt",
+    "androidx/compose/runtime/collection/MultiValueMap.kt",
     # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
     # uses pervasively. Standalone (stdlib only), consumed straight from upstream.
     "androidx/compose/runtime/collection/MutableVector.kt",

@@ -23,11 +23,11 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of upstream Compose runtime test cases that must pass. A
-/// ratchet: bump it as core-composer fixes land, never down. 238 pass when the
+/// ratchet: bump it as core-composer fixes land, never down. 268 pass when the
 /// suite runs alone; under a full `test-all` the machine is saturated and more
 /// children hit the per-child cap, so the ratchet leaves real headroom rather
 /// than tracking the best-case number.
-const BASELINE: usize = 220;
+const BASELINE: usize = 250;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 /// The mock View/Applier harness the tests compose against, plus the two test

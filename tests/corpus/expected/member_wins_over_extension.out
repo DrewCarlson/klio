@@ -1,0 +1,3 @@
+member toInt = 7
+extension = long 7
+member size = 3
