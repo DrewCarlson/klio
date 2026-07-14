@@ -320,10 +320,15 @@ property. Clicks land on the first press: the interactive scenes report 2 of 2.
 Guarded by `examples/reified_inline_property_receiver.kt`, which without the fix
 lets a `Square` answer to a `Kind<Circle>`.
 
-The process-global that `is T` falls back to is still unsound in principle (an
-unspliced reified call has no way to carry its type argument: `Inst.Call` has a
-`type_args` field, `Inst.CallMember` does not). No live call reaches it now, so
-it is a latent hazard rather than an active bug.
+The process-global that `is T` falls back to is still unsound in principle: an
+unspliced reified call has no way to carry its type argument (`Inst.Call` has a
+`type_args` field, `Inst.CallMember` does not). It was NOT merely latent -- every
+reified `Json` call reached it and died with `unresolved global T`, because
+`Json` is a companion-object NAME and receiver-type inference did not recognise
+one, so the splice declined. Receiver evidence now covers locals, parameters,
+class members, and type names, which is every form these call sites use. The
+global remains the fallback of last resort; carrying type arguments on
+`CallMember` would retire it.
 
 **FIXED — an `actual` superseded every same-named `expect` in the program.**
 Kotlin requires an `actual` to declare its `expect`'s package, but the supersede
