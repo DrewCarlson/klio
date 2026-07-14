@@ -637,17 +637,31 @@ pub const SpinMutex = runtime.SpinMutex;
 /// write through this so concurrent `println` is serialized; on
 /// completion the recorded calls replay into the caller's real sink.
 ///
-/// A thin handle over `ObjRef(RecordingSink)` — the same shared cell
-/// `ThreadTable` is built on. Every access takes the cell's reader/writer
-/// lock's exclusive `borrowMut`, serializing concurrent writes exactly as
-/// the prior hand-rolled mutex did.
+/// The program's output sink, shared by every thread. A thin handle over an
+/// `ObjRef` cell — the same shared cell `ThreadTable` is built on — so every
+/// write takes the cell's exclusive `borrowMut` and concurrent writes serialize.
+///
+/// Writes STREAM to the destination as they happen. A script runtime has to:
+/// `python x.py` and `node x.js` print as they go, and so must klio. Output
+/// withheld until exit is output a hanging, looping, or killed program never
+/// shows — and a long run would hold its entire output in memory besides.
+///
+/// The recording arm survives for the callers that attach no destination (the
+/// in-process harnesses that compare a whole run): with `dest` null the sink
+/// records, and `replayInto` drains it. `attach` flushes whatever was recorded
+/// before the destination was known — a top-level initializer runs before the
+/// run is handed its sink — and streams from then on.
 pub const SharedOutput = struct {
-    obj: ObjRef(runtime.RecordingSink),
+    obj: ObjRef(State),
+
+    pub const State = struct {
+        /// Where writes go. Null until `attach`: record instead.
+        dest: ?Output = null,
+        rec: runtime.RecordingSink,
+    };
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedOutput {
-        const obj = try ObjRef(runtime.RecordingSink).init(allocator, runtime.RecordingSink.init(allocator));
-        // Shared across every thread of the program from creation; all
-        // writes serialize through the cell's exclusive lock.
+        const obj = try ObjRef(State).init(allocator, .{ .rec = runtime.RecordingSink.init(allocator) });
         return .{ .obj = obj };
     }
 
@@ -659,23 +673,39 @@ pub const SharedOutput = struct {
         self.obj.deinit();
     }
 
+    /// Stream every write from here on straight to `out`, after flushing
+    /// anything recorded before the destination was known.
+    pub fn attach(self: SharedOutput, out: Output) void {
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const st = g.get();
+        st.rec.replayInto(out);
+        st.dest = out;
+    }
+
+    /// Drain the recording into `out`. A no-op once a destination is attached —
+    /// those writes already went straight there.
     pub fn replayInto(self: SharedOutput, out: Output) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().replayInto(out);
+        const st = g.get();
+        if (st.dest != null) return;
+        st.rec.replayInto(out);
     }
 
     fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
         const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().output().writeln(s);
+        const st = g.get();
+        if (st.dest) |d| d.writeln(s) else st.rec.output().writeln(s);
     }
     fn vtWrite(ctx: *anyopaque, s: []const u8) void {
         const self: SharedOutput = .{ .obj = .{ .cell = @ptrCast(@alignCast(ctx)) } };
         const g = self.obj.borrowMut();
         defer g.deinit();
-        g.get().output().write(s);
+        const st = g.get();
+        if (st.dest) |d| d.write(s) else st.rec.output().write(s);
     }
 
     const vtable: Output.VTable = .{ .writeln = vtWriteln, .write = vtWrite };
