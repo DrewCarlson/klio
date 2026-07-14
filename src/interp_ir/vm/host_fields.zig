@@ -273,6 +273,27 @@ fn unwrapCellRead(r: EvalResult) EvalResult {
 /// name it does not own and shadow a real member of a receiver further
 /// out; the walk's own terminal arm decides the global fallback, and
 /// companions ride the walk as their own candidates.
+/// Does class `cn` declare property `name` as a STORED member — a body
+/// `val`/`var` or a constructor-parameter property — as opposed to a custom
+/// accessor? Such a declaration overrides an inherited accessor-based property,
+/// so the setter walk must store the field directly rather than fall through to
+/// a supertype's custom setter (`override var x = 0` shadowing `open var x
+/// set(...)`).
+fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) bool {
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    const def = cg.get().get(cn) orelse return false;
+    const dg = def.borrow();
+    defer dg.deinit();
+    for (dg.get().body_properties) |p| {
+        if (std.mem.eql(u8, p.name, name)) return true;
+    }
+    for (dg.get().primary_params) |p| {
+        if (p.property != null and std.mem.eql(u8, p.name, name)) return true;
+    }
+    return false;
+}
+
 /// A discarded dispatch-miss message from a probe. Host miss messages are
 /// `allocPrint`-built with a `Vm::` prefix; static literals never carry one.
 fn freeMissErr(allocator: Allocator, e: EvalError) void {
@@ -3061,6 +3082,13 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         if (rpkg.len == 0 or fp.len == 0 or std.mem.eql(u8, fp, rpkg)) break :blk f;
                     }
                 }
+                // The receiver's OWN class declaring the property as stored
+                // (a field-backed `override var x = 0`) shadows any inherited
+                // accessor: store the field directly, never reach a supertype's
+                // custom setter.
+                if (classDeclaresStoredProp(self, class_name, real_name)) break :blk null;
+                const rf2 = classFqnOf(inst);
+                if (!std.mem.eql(u8, rf2, class_name) and classDeclaresStoredProp(self, rf2, real_name)) break :blk null;
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 if (mg.get().registry.class_super_names.get(class_name)) |chain| {
@@ -3069,6 +3097,11 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
                         pg.deinit();
                         if (hit) |f| break :blk f;
+                        // A stored override shadows any further-up accessor: an
+                        // `override var x = 0` on a middle class overrides a base
+                        // `open var x set(...)`, so a write stores the field
+                        // rather than reaching the base's custom setter.
+                        if (classDeclaresStoredProp(self, cn, real_name)) break :blk null;
                     }
                 }
                 break :blk null;
