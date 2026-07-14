@@ -376,16 +376,15 @@ What it says is still broken, in rough order of leverage:
   see them at all (`unresolved global SnapshotIdSet`, and a bare mention then
   reads as a member of the test class). This alone accounts for ~30 failures
   across four classes and is not composer logic; it is pack visibility.
-- **A continuation resume is asynchronous, and the test scheduler needs it to be
-  synchronous.** This is now the single blocker for every composer test that
-  advances the clock. `KlioContinuation.resumeWith` (`__klio_co_resume`) queues
-  the parked activation on the pump instead of running it, so the coroutine's
-  next step happens on a later pump turn. Kotlin runs that step on the caller's
-  stack -- dispatch is decided ABOVE it, by the continuation's interceptor -- so
-  a test scheduler that fires a frame inside `advanceTimeBy` observes the
-  coroutine still parked. Reduced to
+- **FIXED: a continuation resume used to be asynchronous.** It was the blocker
+  for every composer test that advances the clock. `KlioContinuation.resumeWith`
+  (`__klio_co_resume`) queued the parked activation on the pump instead of
+  running it, so the coroutine's next step happened on a later pump turn. Kotlin
+  runs that step on the caller's stack -- dispatch is decided ABOVE it, by the
+  continuation's interceptor -- so a test scheduler that fired a frame inside
+  `advanceTimeBy` observed the coroutine still parked. Reduced to
   `runTest { launch { delay(16); … }; advanceTimeBy(1000) }`: the delayed body
-  runs only after `advanceTimeBy` returns.
+  ran only after `advanceTimeBy` returned.
 
   Resuming inline is NOT the fix on its own, and the experiment says why. With
   every `Continuation.resumeWith` run on the caller's stack, the reduced repro
@@ -400,15 +399,37 @@ What it says is still broken, in rough order of leverage:
   under a `StandardTestDispatcher` the virtual clock never owns the ordering --
   which is exactly why `advanceTimeBy` does not recompose.
 
-  The fix is therefore to route a coroutine's steps through its
-  `ContinuationInterceptor` (`Continuation.intercepted()` -> the dispatcher's
-  `dispatch`), so klio's own dispatchers keep using the pump queue while a
-  `TestDispatcher` puts the step in the test scheduler's event heap, and an
-  undispatched resume (`resumeUndispatched`, what `TestDispatcher.processEvent`
-  calls) runs on the caller's stack. Nested resume must also be made
-  re-entrancy-safe on that path (the 233 -> 44 run showed
-  `Vm::call_value on kotlin.Nothing` from resuming an activation while another
-  is mid-flight).
+  Landed: a Kotlin `Continuation.resumeWith` now runs the activation on the
+  caller's stack (`coroutineResumeContinuation` -> `coroutineResumeInline`),
+  re-parks it into the pump that OWNS it, hands that pump any failure it raised,
+  and restores the active-scope stack it ran on. klio's NATIVE suspensions (a
+  channel waiter) pass through no interceptor, so for them the pump queue IS the
+  dispatch and they keep it. The chain a step causes is bounded
+  (`INLINE_CHAIN_BUDGET`): a rendezvous hand-off resumes its peer with no
+  suspension in between, and following that inline for ever never returns to the
+  caller. `KLIO_NO_INLINE_RESUME` restores the old queue-everything behaviour for
+  bisecting.
+
+  With it the composer tests run for real -- a composition, a state write, a
+  clock advance and revalidation all pass (5 of 6 `RestartTests`,
+  `CompositionTests.simple`, `CompositionLocalTests`). Conformance 204/46, 11
+  classes still capped.
+
+- **Open, next: a recomposition livelock on a `by mutableStateOf` delegate.**
+  `CompositionTests.simpleChanges` (`var name by mutableStateOf("Bob")`, write,
+  `expectChanges()`) hangs, while the same test written against a model class
+  (`person.name = …`) passes. The write reaches the recomposer -- the loop wakes
+  -- so the suspect is an invalidation that re-arms on every recomposition
+  (nothing ever settles, so the clock never leaves the current instant). Reduce
+  it with the delegate and a single `expectChanges`; that shape gates most of the
+  11 capped classes.
+
+- Open: `coroutines_commontest` sits at 212 (was 233). The regressions are
+  hand-off shapes that now livelock or hang: `SharedFlowTest` (rendezvous
+  emit/collect), `FlatMapMergeTest`, `CancelledParentAttachTest`,
+  `JobTest.testChildrenWithIncompleteState`. Same root as the chain budget above
+  -- klio resumes a rendezvous peer without going through its dispatcher, so the
+  pair can hand off for ever without the scheduler ever advancing time.
 
 - With that fixed, the recomposer already paces off the frame clock in its own
   context (`runRecomposeAndApplyChanges` parks on `parentClock.withFrameNanos`
