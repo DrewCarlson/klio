@@ -427,12 +427,23 @@ What it says is still broken, in rough order of leverage:
   reimplements positionally. Nine classes still cap out; this shape is the next
   one to reduce.
 
-- Open: `coroutines_commontest` sits at 212 (was 233). The regressions are
-  hand-off shapes that now livelock or hang: `SharedFlowTest` (rendezvous
-  emit/collect), `FlatMapMergeTest`, `CancelledParentAttachTest`,
-  `JobTest.testChildrenWithIncompleteState`. Same root as the chain budget above
-  -- klio resumes a rendezvous peer without going through its dispatcher, so the
-  pair can hand off for ever without the scheduler ever advancing time.
+- Open: `coroutines_commontest` sits at 219 (was 233 before the resume change,
+  213 before the per-turn budget). What is left is ONE shape -- a test whose
+  teardown hangs, so the file is killed and its passes are lost. Reduced to a
+  20-second repro:
+
+      runTest { try { withContext(Job()) { cancel(); withTimeout(Long.MAX_VALUE) { } } } catch (_) {} }
+
+  The body completes; `runTest`'s teardown then `cancelAndJoin`s its work runner
+  and never returns. At the hang the pump holds a coroutine parked in a
+  `suspendCancellableCoroutine` nested three lambdas deep -- the shape of the
+  channel cancel-WATCHER child (`__kxco_chanArmCancel`) -- and `KLIO_CHAN_DIAG`
+  shows the queued run arming that watcher and firing it, while the inline run
+  never arms one at all. So the parked child is reached through a different path
+  in inline mode and nothing completes it, and the work runner's Job cannot
+  finish while a child is alive. Fixing it should recover `CoroutineScopeTest`
+  (5), `SharedFlowTest` (6), `CancelledParentAttachTest` (1) and
+  `FlatMapMerge*` (2): all of them pass their tests and then hang at teardown.
 
 - With that fixed, the recomposer already paces off the frame clock in its own
   context (`runRecomposeAndApplyChanges` parks on `parentClock.withFrameNanos`

@@ -1799,7 +1799,7 @@ fn pumpLoop(
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 var k: usize = 0;
-                while (k < st.frames.items.len and k < 5) : (k += 1) {
+                while (k < st.frames.items.len and k < 9) : (k += 1) {
                     const snap = st.frames.items[k];
                     const m: *const ir.Module = snap.module orelse mg.get();
                     const f = m.funcById(snap.func);

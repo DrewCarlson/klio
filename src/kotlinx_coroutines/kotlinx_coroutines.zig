@@ -394,7 +394,13 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
 /// `resumeWaiterNormal`) so the child does not outlive the suspension. This
 /// reuses the proven `suspendCancellableCoroutine` cancellation path.
 fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
-    const scope = ctx.host.activeCoroScope() orelse return;
+    const scope = ctx.host.activeCoroScope() orelse {
+        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+            std.debug.print("[chan] arm slot={d}: NO ACTIVE SCOPE\n", .{slot});
+        return;
+    };
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        std.debug.print("[chan] arm slot={d} scope={s}\n", .{ slot, scope.typeFqn() });
     if (scope != .Instance) return;
     const helper = ctx.host.lookupGlobalFunc("__kxco_chanArmCancel") orelse return;
     const args = [_]Value{ scope, chan, .{ .Long = slot } };
@@ -477,6 +483,8 @@ fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Alloc
 /// cancel landed) is no longer in any queue, so the resume is skipped — no
 /// double-resume.
 fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        std.debug.print("[chan] cancelWaiter fired\n", .{});
     if (ctx.args.len < 2) return .{ .ok = .Unit };
     const recv = ctx.args[0];
     const slot: i64 = switch (ctx.args[1]) {
