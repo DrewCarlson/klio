@@ -106,7 +106,19 @@ pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocato
             // where the reified `T` has nothing to bind to
             // (`modifierNode.dispatchForKind(Nodes.PointerInput) { … }` inside
             // `HitPathTracker.Node`).
-            return ownerMemberDeclType(b, name);
+            if (ownerMemberDeclType(b, name)) |t| return t;
+            // A bare name that is neither a local nor a member names a TYPE:
+            // an `object`, or a class reached through its companion
+            // (`Json.decodeFromString<User>(s)` — the receiver is
+            // `Json.Default`, a `Json`). The name IS the receiver's type head,
+            // and it is the only evidence that can separate an extension
+            // overload set spread over several receivers
+            // (`Json.decodeFromString` next to `StringFormat.decodeFromString`).
+            // Without it the splice declined and the reified `T` reached the
+            // runtime unbound, where `T::class` reads an unresolved global.
+            if (b.resolve(name) == null and !b.knowsOuter(name) and
+                b.module.classId(name) != null) return name;
+            return null;
         },
         else => return null,
     }
