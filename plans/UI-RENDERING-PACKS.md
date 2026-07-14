@@ -427,34 +427,29 @@ What it says is still broken, in rough order of leverage:
   reimplements positionally. Nine classes still cap out; this shape is the next
   one to reduce.
 
-- Open: `coroutines_commontest` sits at 219 (was 233 before the resume change,
-  213 before the per-turn budget). What is left is ONE shape -- a test whose
-  teardown hangs, so the file is killed and its passes are lost. Reduced to a
-  20-second repro:
+- **FIXED: a named-argument call did not reach a host-backed member.** A pack
+  ships Kotlin declarations whose bodies are stubs and lets a host binding shadow
+  them; the named path matched names only against the stdlib intrinsic table, so
+  `compareAndSet(expect = false, update = true)` fell through to the stub and
+  answered `false` while the positional form worked. kotlinx guards its cancelling
+  handlers with exactly that CAS, so `Job.invokeOnCompletion(onCancelling = true)`
+  never fired -- which is why the channel park needed a watcher CHILD coroutine,
+  and why that child deadlocked teardown. The named path now re-issues the call in
+  declaration order, cancelling handlers fire, and a native park arms a plain Job
+  handler instead of a child. `coroutines_commontest` 219 -> 237 (past the 233 it
+  scored before any of this); `compose_runtime_commontest` 219 -> 238 with 2
+  classes capping instead of 9.
 
-      runTest { try { withContext(Job()) { cancel(); withTimeout(Long.MAX_VALUE) { } } } catch (_) {} }
+- Open: `CompositionTests` now SEGFAULTS instead of capping -- a native stack
+  overflow deep in member dispatch, after `testRememberFiveParameters`. That is
+  the next thing to chase on the compose side.
 
-  The body completes; `runTest`'s teardown then `cancelAndJoin`s its work runner
-  and never returns. At the hang the pump holds a coroutine parked in a
-  `suspendCancellableCoroutine` nested three lambdas deep -- the shape of the
-  channel cancel-WATCHER child (`__kxco_chanArmCancel`) -- and `KLIO_CHAN_DIAG`
-  shows what happens (`[chan] arm / bindWatcher / dropWatcher / cancelWaiter`):
-
-    queued:  arm slot=A, bindWatcher A, cancelWaiter A            -> watcher dies
-    inline:  arm A, bind A, drop A, arm B, bind B, cancelWaiter B -> watcher B PARKED
-
-  The work runner receives once more under inline resume, so its cancellation
-  lands on a channel park. `channelCancelWaiter` fires from the watcher's
-  `invokeOnCancellation`, removes the waiter and resumes it -- but the WATCHER
-  child itself is only resumed by kotlinx dispatching its cancellation, and that
-  dispatch is an event on the TestDispatcher, whose queue is drained by the very
-  work runner being cancelled. Nothing drains it, the watcher stays parked, the
-  work runner's Job cannot complete with a live child, and `cancelAndJoin` never
-  returns. The fix is to make the watcher's completion not depend on the
-  dispatcher it is being torn down with: complete it natively when the waiter it
-  guards is cancelled or delivered. Fixing it should recover `CoroutineScopeTest`
-  (5), `SharedFlowTest` (6), `CancelledParentAttachTest` (1) and
-  `FlatMapMerge*` (2): all of them pass their tests and then hang at teardown.
+- Open: one starvation shape is left in the coroutine suite. `SharedFlowTest`
+  `testCancellingSubscriberAndEmitterWithNoBuffer` runs ten rounds of a rendezvous
+  hand-off (`while (isActive) flow.emit(…)` against a collector); the first round
+  completes, the second never resumes its awaiter while the hand-off spins.
+  Reduced in the scratch repro `PP4.kt`: klio resumes the rendezvous peer without
+  a dispatcher hop, so the pair can hold the pump for arbitrarily long.
 
 - With that fixed, the recomposer already paces off the frame clock in its own
   context (`runRecomposeAndApplyChanges` parks on `parentClock.withFrameNanos`
