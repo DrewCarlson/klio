@@ -59,6 +59,8 @@ include = [
     # depend only on the stdlib + androidx.collection, so they run here exactly
     # as they do on the JVM — and their own upstream tests exercise them.
     "androidx/compose/runtime/snapshots/SnapshotIdSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotWeakSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotDoubleIndexHeap.kt",
     "androidx/compose/runtime/collection/ScopeMap.kt",
     "androidx/compose/runtime/collection/MultiValueMap.kt",
     # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
