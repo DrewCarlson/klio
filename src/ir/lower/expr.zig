@@ -290,9 +290,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const join = try b.allocBlock();
             const dst = b.allocReg();
             b.terminate(.{ .Branch = .{ .cond = cond_r, .t = t_block, .f = f_block } });
-            // Then arm.
+            // Then arm. An `if (x is T)` guard smart-casts `x` to `T` for the
+            // arm, and extension resolution is static — see `narrowIsCheck`.
             b.switchTo(t_block);
+            const narrowed = try narrowIsCheck(b, f.cond);
             const t_val = try lowerExpr(b, f.then_branch);
+            if (narrowed) |n| b.restoreLocal(n);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
@@ -5762,6 +5765,22 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// Declared-type head of a single-segment Path argument naming a local /
 /// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
 /// for the shared scorer's declared-type evidence. Null for anything else.
+/// An `if (x is T)` condition over a bare name smart-casts `x` to `T` for the
+/// then-arm. Kotlin resolves extensions against the STATIC type, and lowering
+/// hands the receiver's declared head to the extension filter, so without the
+/// narrowing the declared head (`Any?`) refutes every `CharSequence` extension
+/// and `x.isEmpty()` misses. A negated check narrows nothing here (its
+/// information is on the else path).
+fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
+    if (cond.* != .IsCheck) return null;
+    const ck = cond.IsCheck;
+    if (ck.negated) return null;
+    if (ck.expr.* != .Path or ck.expr.Path.segments.len != 1) return null;
+    const head = loweredCheckTypeName(b, &ck.ty);
+    if (head.len == 0) return null;
+    return try b.narrowLocal(ck.expr.Path.segments[0].name, head);
+}
+
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
     // NOT feed evidence yet: typeck's permissive inference can hand back

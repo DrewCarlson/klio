@@ -207,7 +207,9 @@ pub fn lowerWhenWithSubjectReg(
             .f = next_blk,
         } });
         b.switchTo(body_blk);
+        const narrowed = try narrowSubjectForBranch(b, subject, &branch);
         const v = try lowerExpr(b, &branch.body);
+        if (narrowed) |n| b.restoreLocal(n);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         b.terminate(.{ .Goto = join });
         b.switchTo(next_blk);
@@ -217,6 +219,28 @@ pub fn lowerWhenWithSubjectReg(
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
     return result;
+}
+
+/// A single `is T` pattern over a bare-name subject smart-casts that name to
+/// `T` for the branch body. Kotlin resolves extensions against the STATIC type,
+/// and lowering hands the receiver's declared head to the extension filter, so
+/// without the narrowing `when (any) { is String -> any.isEmpty() }` refutes
+/// `CharSequence.isEmpty` on the declared `Any?` and the call misses entirely.
+/// A multi-pattern branch (`is A, is B ->`) narrows to no single type, and a
+/// non-name subject has no binding to narrow.
+fn narrowSubjectForBranch(
+    b: *FuncBuilder,
+    subject: ?*const Expr,
+    branch: *const ast.WhenBranch,
+) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
+    const subj = subject orelse return null;
+    if (subj.* != .Path or subj.Path.segments.len != 1) return null;
+    if (branch.patterns.len != 1) return null;
+    const p = &branch.patterns[0];
+    if (p.kind != .IsType) return null;
+    const head = expr_lower.loweredCheckTypeName(b, &p.kind.IsType);
+    if (head.len == 0) return null;
+    return try b.narrowLocal(subj.Path.segments[0].name, head);
 }
 
 /// Lower one `when` pattern of a subject-bound branch into a Boolean

@@ -440,6 +440,8 @@ pub const FuncBuilder = struct {
     generic_typed_params: StringSet,
     /// See `markPlainFnParam`.
     plain_fn_params: StringSet,
+    /// See `markFnParamTakesTrailingLambda`.
+    fn_params_take_lambda: StringSet,
     /// See `markErasedRecvParam`.
     erased_recv_params: StringSet,
     /// Params whose declared type is a concrete NON-function type (not a
@@ -616,6 +618,7 @@ pub const FuncBuilder = struct {
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
             .plain_fn_params = StringSet.init(allocator),
+            .fn_params_take_lambda = StringSet.init(allocator),
             .erased_recv_params = StringSet.init(allocator),
             .non_fn_params = StringSet.init(allocator),
             .reified_type_binds = StringRegMap.init(allocator),
@@ -691,6 +694,7 @@ pub const FuncBuilder = struct {
         self.context_fn_params.deinit();
         self.generic_typed_params.deinit();
         self.plain_fn_params.deinit();
+        self.fn_params_take_lambda.deinit();
         self.erased_recv_params.deinit();
         self.non_fn_params.deinit();
         self.reified_type_binds.deinit();
@@ -1206,6 +1210,41 @@ pub const FuncBuilder = struct {
         try self.local_init_exprs.put(name, e);
         _ = self.local_decl_types.remove(name);
     }
+    /// A smart cast narrows the SUBJECT's static type for the guarded branch,
+    /// and Kotlin resolves extensions against the static type: inside
+    /// `when (any) { is String -> … }` the call `any.isEmpty()` binds
+    /// `CharSequence.isEmpty`, which the declared `Any?` head would refute.
+    /// Narrow the local for the branch body and restore it on the way out.
+    pub const NarrowedLocal = struct {
+        name: []const u8,
+        prev_ty: ?[]const u8,
+        prev_nullable: bool,
+    };
+
+    pub fn narrowLocal(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!NarrowedLocal {
+        const saved: NarrowedLocal = .{
+            .name = name,
+            .prev_ty = self.local_decl_types.get(name),
+            .prev_nullable = self.local_decl_nullable.contains(name),
+        };
+        try self.local_decl_types.put(name, ty);
+        _ = self.local_decl_nullable.remove(name);
+        return saved;
+    }
+
+    pub fn restoreLocal(self: *FuncBuilder, saved: NarrowedLocal) void {
+        if (saved.prev_ty) |t| {
+            self.local_decl_types.put(saved.name, t) catch {};
+        } else {
+            _ = self.local_decl_types.remove(saved.name);
+        }
+        if (saved.prev_nullable) {
+            self.local_decl_nullable.put(saved.name, {}) catch {};
+        } else {
+            _ = self.local_decl_nullable.remove(saved.name);
+        }
+    }
+
     pub fn localDeclType(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
         return self.local_decl_types.get(name);
     }
@@ -1277,6 +1316,15 @@ pub const FuncBuilder = struct {
     }
     pub fn isPlainFnParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.plain_fn_params.contains(name);
+    }
+    /// A function-typed param whose OWN last parameter is itself function-typed,
+    /// i.e. one a trailing-lambda call could actually bind to. Consulted where a
+    /// same-named top-level function competes with the param for a bare call.
+    pub fn markFnParamTakesTrailingLambda(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.fn_params_take_lambda.put(name, {});
+    }
+    pub fn fnParamTakesTrailingLambda(self: *const FuncBuilder, name: []const u8) bool {
+        return self.fn_params_take_lambda.contains(name);
     }
     pub fn markReceiverLambdaParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.receiver_lambda_params.put(name, {});
