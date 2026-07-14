@@ -211,6 +211,17 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 40 },
+    // The upstream Compose runtime's own test suite (CompositionTests,
+    // RestartTests, MovableContentTests, the snapshot suites) run through a
+    // child `klio test` against the installed compose-runtime pack. The
+    // conformance signal for the implicit-composer hook.
+    .{ .name = "compose_runtime_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
