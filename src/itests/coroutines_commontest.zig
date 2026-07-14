@@ -15,6 +15,8 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
             .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
         },
-        .baseline = 0,
+        // 233 pass when the suite runs alone (was 118 before `yield` reached its
+        // dispatcher); the ratchet leaves headroom for the loaded `test-all`.
+        .baseline = 200,
     });
 }

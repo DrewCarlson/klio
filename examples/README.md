@@ -88,6 +88,7 @@ Run any program with:
 | `smartcast_extension_receiver.kt` | Smart casts narrow the receiver's STATIC type, so an extension resolves against the narrowed type (`is String` -> `CharSequence.isEmpty`), in both the `when`-subject and `if (x is T)` forms. |
 | `fn_param_name_shadows_operator.kt` | A function-typed parameter does not shadow a same-named function for a trailing-lambda call it cannot accept (`Flow.map`'s `crossinline transform` vs the `transform` operator). |
 | `backing_field_in_nested_scope.kt` | The accessor's `field` binding is visible inside a nested scope (lambda, `when`, loop, `try`), not just the flat accessor body. |
+| `yield_dispatches_to_the_pump.kt` | `yield()` reschedules through the coroutine's DISPATCHER (a queued child runs before it resumes), and a property reference works as a `compareValuesBy` key selector. |
 | `reified_generic_arg.kt`      | A reified type parameter inferred from a generic-class argument's type args (`kind: NodeKind<T>` bound from `Nodes.Draw`), so `is T` in the spliced body checks the real class. |
 | `const_val_inline.kt`         | Top-level `const val`s inline at reference sites (compile-time constants, incl. unary minus). |
 | `function_type_named_params.kt` | Named parameters inside function types, incl. the annotated parenthesized forms `@Ann ((name: T) -> Unit)?` / `(@Ann (() -> Unit))?` / `@Ann ((T) -> Unit)` and annotated setter parameters. |
