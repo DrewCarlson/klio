@@ -423,6 +423,8 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const already_delivered = blk: {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
+        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+            std.debug.print("[chan] bindWatcher slot={d}\n", .{slot});
         if (coro_reg.chan_delivered.fetchRemove(slot) != null) break :blk true;
         cont.retain();
         if (coro_reg.chan_watchers.fetchPut(regAllocator(), slot, cont) catch null) |old| {
@@ -446,6 +448,8 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// record the slot as delivered so it completes immediately on bind. Runs
 /// outside `coro_reg_mutex` (the resume drives Kotlin).
 fn dropWatcher(ctx: *CallCtx, slot: i64) void {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        std.debug.print("[chan] dropWatcher slot={d}\n", .{slot});
     const cont: ?Value = blk: {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -483,9 +487,15 @@ fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Alloc
 /// cancel landed) is no longer in any queue, so the resume is skipped — no
 /// double-resume.
 fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
-        std.debug.print("[chan] cancelWaiter fired\n", .{});
     if (ctx.args.len < 2) return .{ .ok = .Unit };
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null) {
+        const sl: i64 = switch (ctx.args[1]) {
+            .Long => |l| l,
+            .Int => |i| @as(i64, i),
+            else => -1,
+        };
+        std.debug.print("[chan] cancelWaiter slot={d}\n", .{sl});
+    }
     const recv = ctx.args[0];
     const slot: i64 = switch (ctx.args[1]) {
         .Long => |l| l,
