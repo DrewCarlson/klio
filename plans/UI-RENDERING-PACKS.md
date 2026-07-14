@@ -349,3 +349,38 @@ A candidate outside a bodyless target's package is no longer considered.
 
 The context-menu strings actual is linked again -- it had been unlinked to dodge
 the first root. Both shapes are pinned in `src/itests/resolve_ambiguity.zig`.
+
+## Compose runtime conformance
+
+`zig build itest-compose_runtime_commontest` runs the upstream Compose runtime's
+own test suite (`CompositionTests`, `RestartTests`, `MovableContentTests`,
+`EffectsTests`, `CompositionLocalTests`, the `snapshots/` suites) through
+`klio test` against the installed pack, composed against upstream's mock
+View/Applier harness. It is the conformance signal for the implicit-composer
+hook: the same tests androidx runs against the Compose compiler plugin.
+
+**143 pass across 46 test classes; 16 classes do not complete inside the
+per-child cap.** Ratcheted at 140 -- raise it as fixes land, never lower it.
+
+The suite immediately paid for itself: `field` inside a nested scope
+(`get() = synchronized(lock) { field }`, how kotlinx-coroutines-test guards its
+scheduler clock) was never rewritten onto the backing slot and read an
+unresolved global, which failed every test that reaches `TestCoroutineScheduler`
+-- most of the suite. Fixed.
+
+What it says is still broken, in rough order of leverage:
+
+- **A pack does not export its `internal` declarations.** `SnapshotIdSet`,
+  `ScopeMap`, `BitVector` and `MultiValueMap` are `internal` in the compose
+  runtime, and their own tests -- same package, separate module here -- cannot
+  see them at all (`unresolved global SnapshotIdSet`, and a bare mention then
+  reads as a member of the test class). This alone accounts for ~30 failures
+  across four classes and is not composer logic; it is pack visibility.
+- **16 classes hang** rather than fail, all of them the ones that drive a real
+  composition through `runTest` (`CompositionTests`, `MovableContentTests`,
+  `PausableCompositionTests`, the SlotTable suites). They fail fast before the
+  `field` fix and hang after it, so they now get far enough to enter the
+  recomposer/test-scheduler loop and never leave it. This is the core-composer
+  signal worth chasing next.
+- `BroadcastFrameClockTest` reads `isUnconfinedLoopActive` off `Unit` -- the
+  unconfined event loop, already a known open item.
