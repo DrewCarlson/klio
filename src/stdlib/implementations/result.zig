@@ -301,7 +301,7 @@ pub fn coro_resume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const ok = ctx.args.len > 1 and ctx.args[1] == .Bool and ctx.args[1].Bool;
     const payload = if (ctx.args.len > 2) ctx.args[2] else Value.Null;
     const result = try makeResult(ctx.allocator, ok, payload);
-    ctx.host.coroutineResumeExternal(slot, result, ctx.out);
+    ctx.host.coroutineResumeContinuation(slot, result, ctx.out);
     return .{ .ok = Value.Unit };
 }
 

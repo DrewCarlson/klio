@@ -98,6 +98,12 @@ pub const IntrinsicHost = struct {
         lookup_global_func: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
+        /// A Kotlin `Continuation.resumeWith`: the coroutine's own step, which
+        /// runs on the caller's stack. Distinct from `coroutine_resume_external`
+        /// (a klio-native suspension's resume, which the pump queue defers —
+        /// klio's native parks pass through no interceptor, so the queue is
+        /// their dispatch).
+        coroutine_resume_continuation: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
         /// Post a dispatcher runnable onto the shared worker pool
         /// (`Dispatchers.Default` / `Dispatchers.IO`). `null` => default
         /// (run the block inline on the calling thread).
@@ -220,6 +226,14 @@ pub const IntrinsicHost = struct {
             f(self.ctx, slot, value, out);
         } else {
             self.coroutineResumeSlotValue(slot, value);
+        }
+    }
+
+    pub fn coroutineResumeContinuation(self: IntrinsicHost, slot: i64, value: Value, out: Output) void {
+        if (self.vtable.coroutine_resume_continuation) |f| {
+            f(self.ctx, slot, value, out);
+        } else {
+            self.coroutineResumeExternal(slot, value, out);
         }
     }
 

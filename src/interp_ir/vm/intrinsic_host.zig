@@ -142,7 +142,14 @@ fn runtimeErrorFromEval(e: EvalError) RuntimeError {
     return switch (e) {
         .Throw => |v| .{ .Thrown = v },
         .NonLocalReturn => |v| .{ .Return = v },
-        .Suspended => .{ .Type = "coroutine suspended outside a driver" },
+        .Suspended => blk: {
+            // ALWAYS a defect: a suspension crossed a boundary that cannot
+            // park it, so the activation is dropped and its coroutine's Job
+            // never completes — an indefinite hang for every joiner. Loud by
+            // design; the message names the phase for triage.
+            std.debug.print("[SUSPEND-LOST] coroutine suspended across a non-suspending boundary; activation dropped\n", .{});
+            break :blk .{ .Type = "coroutine suspended across a non-suspending boundary" };
+        },
         .Unsupported => |s| .{ .Type = s },
         .Type => |s| .{ .Type = s },
         .Unbound => |s| .{ .Unbound = s },
@@ -357,6 +364,10 @@ pub fn activeCoroScope(self: *VmIntrinsicHost) ?Value {
 
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
     coroutines.coroutineResumeExternal(self, slot, value, out) catch {};
+}
+
+pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
+    coroutines.coroutineResumeContinuation(self, slot, value, out) catch {};
 }
 
 pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error!?RuntimeError {

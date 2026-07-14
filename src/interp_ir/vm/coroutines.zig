@@ -676,6 +676,14 @@ pub const CooperativeInterceptor = struct {
     /// token → value the activation should observe as the result of its
     /// suspending call when resumed. Absent ⇒ resume with `Unit`.
     token_resume_value: std.AutoHashMap(u64, Value),
+    /// This pump's root activation while it is parked; an inline resume never
+    /// steals it (the pump publishes the root's value and stops on it).
+    root_tok: ?u64 = null,
+    /// A failure raised by an activation this pump owns that ran INLINE (on a
+    /// resumer's stack, outside the drive loop). The loop cannot see it there,
+    /// so it is left here and raised on the next turn, exactly as if the loop
+    /// had run the activation itself.
+    pending_err: ?EvalError = null,
     allocator: Allocator,
 
     /// Fresh interceptor honoring this thread's time mode. Under `Virtual`
@@ -842,6 +850,20 @@ pub const CooperativeInterceptor = struct {
             return true;
         }
         return false;
+    }
+
+    /// Claim the activation parked on `slot` for an INLINE resume: take the
+    /// parked entry and unbind the slot, without queueing it. Null when this
+    /// pump does not hold the slot, when the token is not actually parked
+    /// (already queued or running — unbinding then would drop the resume), or
+    /// when it is this pump's own root, whose completion the pump owns.
+    pub fn claimSlotForInline(self: *CooperativeInterceptor, slot: i64) ?ParkedEntry {
+        const tok = self.slot_to_token.get(slot) orelse return null;
+        if (self.root_tok != null and self.root_tok.? == tok) return null;
+        const entry = self.parked.fetchRemove(tok) orelse return null;
+        _ = self.slot_to_token.remove(slot);
+        unregisterSlot(slot);
+        return entry.value;
     }
 
     /// Take the pending resume value for `token`, if one was set by
@@ -1579,10 +1601,18 @@ fn errIsThrow(e: *const RuntimeError) bool {
 /// dup'd slices are now owned by the copied value).
 fn park(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!u64 {
     const top = coroTop() orelse return error.OutOfMemory; // "park outside runBlocking"
+    return parkInto(top, allocator, st, scope_base);
+}
+
+/// Park into a SPECIFIC pump. An activation resumed inline runs on whatever
+/// stack resumed it, which may sit under a nested pump; it still belongs to the
+/// pump it was parked in, and must go back there — `coroTop()` would hand it to
+/// a pump that is about to exit.
+fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!u64 {
     const value = st.*;
     allocator.destroy(st);
     const delta = captureScopeDelta(scope_base);
-    return top.interceptSuspend(value, delta);
+    return pump.interceptSuspend(value, delta);
 }
 
 /// Layer 2 — the default interceptor's dispatch loop (`drive_run_blocking`).
@@ -1743,7 +1773,42 @@ fn pumpLoop(
 ) Allocator.Error!?RuntimeEvalResult {
     const a = self.allocator;
     var idle_rounds: usize = 0;
+    var diag_loops: usize = 0;
     while (true) {
+        diag_loops += 1;
+        if (coroTop()) |top| {
+            top.root_tok = root_token.*;
+            // A failure from an activation of this pump that ran inline on a
+            // resumer's stack: raise it here, where the loop's own failures
+            // are raised.
+            if (top.pending_err) |pe| {
+                top.pending_err = null;
+                try pumpExit(self, out, persist);
+                return .{ .err = mapDriverErr(a, pe) };
+            }
+        }
+        if (pumpDiagEnabled() and diag_loops % 2000 == 0) {
+            const t = coroTop().?;
+            std.debug.print("[PUMP] loop {d}: ready={d} launched={d} parked={d} root={?}\n", .{ diag_loops, t.ready.items.len, t.launched.items.len, t.parked.count(), root_token.* });
+            var sit = t.slot_to_token.iterator();
+            while (sit.next()) |e| std.debug.print("[PUMP]   slot {d} -> tok {d}\n", .{ e.key_ptr.*, e.value_ptr.* });
+            var it = t.parked.iterator();
+            while (it.next()) |e| {
+                std.debug.print("[PUMP]   parked tok={d} wake={d}:", .{ e.key_ptr.*, e.value_ptr.wake_at });
+                const st = &e.value_ptr.state;
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                var k: usize = 0;
+                while (k < st.frames.items.len and k < 9) : (k += 1) {
+                    const snap = st.frames.items[k];
+                    const m: *const ir.Module = snap.module orelse mg.get();
+                    const f = m.funcById(snap.func);
+                    const nm = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "?";
+                    std.debug.print(" {s}", .{nm});
+                }
+                std.debug.print("\n", .{});
+            }
+        }
         // 0. Daemon abandonment: a pool task's pump still running at the
         //    run boundary stops pumping and exits through the protocol.
         if (runtime.shouldAbandon()) {
@@ -1813,6 +1878,8 @@ fn pumpLoop(
         }
 
         // 2. Resume a ready coroutine, if any.
+        inline_turn_resumes = 0;
+        persist_inline_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
@@ -2174,6 +2241,216 @@ pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value)
     coroutineResumeExternal(self, slot, value, self.out_sink.output()) catch {};
 }
 
+/// Name of the innermost function in a parked activation — diagnostics only.
+fn parkedFuncName(self: *VmIntrinsicHost, st: *const SuspendState) []const u8 {
+    if (st.frames.items.len == 0) return "<empty>";
+    const snap = st.frames.items[0];
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m: *const ir.Module = snap.module orelse mg.get();
+    const f = m.funcById(snap.func) orelse return "<unknown>";
+    return if (f.fqn.len != 0) f.fqn else f.name;
+}
+
+/// Escape hatch: queue every continuation resume on the pump instead of running
+/// it on the caller's stack (the pre-dispatch-aware behaviour). Diagnostics only.
+fn inlineResumeEnabled() bool {
+    return runtime.getenvSlice("KLIO_NO_INLINE_RESUME") == null;
+}
+
+/// Cached `KLIO_COMPOSE_PLUGIN` gate for the persisted inline-resume path.
+/// That path (`resumePersistedOnTop`) exists solely so the Compose recomposer,
+/// parked inside a `withContext`/`coroutineScope` frame, can wake and settle
+/// synchronously while a test-scheduler advance is in progress. Outside the
+/// compose plugin it stands down: the coroutine suites never set the flag, so
+/// they keep their pre-existing deferral (a persisted resume queues rather than
+/// running inline) and cannot be driven into an unbounded re-dispatch during
+/// `advanceUntilIdle`.
+var g_persist_resume_gate: ?bool = null;
+fn persistResumeGateEnabled() bool {
+    if (g_persist_resume_gate) |v| return v;
+    const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
+        v.len != 0 and !std.mem.eql(u8, v, "0")
+    else
+        false;
+    g_persist_resume_gate = on;
+    return on;
+}
+
+/// Resume the activation parked on `slot` on the current stack. Returns false
+/// when no pump on this thread holds the slot, or it is a pump's own root.
+/// A resume that arrived while another one was already running inline on this
+/// thread. Kotlin's unconfined event loop does the same thing: the coroutine
+/// step still runs before control leaves the resumer, but on the OUTERMOST
+/// inline resume's stack rather than nested inside the current one. Without
+/// this a rendezvous hand-off (a `SharedFlow` emitter and its collector
+/// resuming each other) recurses natively until the stack dies.
+threadlocal var inline_depth: usize = 0;
+
+/// Inline resumes performed since the pump last ran an activation. An activation
+/// that never suspends (`while (isActive) flow.emit(…)`) would otherwise resume
+/// its peer inline for ever: the peer re-arms as a waiter, the next emit finds it
+/// ready, and the emitter never parks — so the pump never turns, the scheduler
+/// never runs, and virtual time never advances. Past the budget its resumes go
+/// back on the queue, which restores the back-pressure that makes it park.
+threadlocal var inline_turn_resumes: usize = 0;
+
+/// How deep one resume may chase the resumes it causes before the rest go back
+/// on the pump queue. Deep enough for a recomposition's chain, far short of an
+/// unbounded hand-off loop.
+const INLINE_CHAIN_BUDGET: usize = 32;
+
+/// How many resumes one pump turn may run inline. Far above what driving a frame
+/// of recomposition needs, far below a hand-off loop's appetite.
+const INLINE_TURN_BUDGET: usize = 2048;
+
+/// How many PERSISTED resumes one synchronous scheduler advance may run inline
+/// (`resumePersistedOnTop`). Driving a recomposition frame to quiescence needs
+/// only a handful (recomposer wake, frame launch, frame fire, recompose); a
+/// `while (isActive) yield()` body re-dispatching every turn is deferred once
+/// past this, so `advanceUntilIdle` goes idle instead of spinning. Reset when
+/// the pump actually turns (it does not during an advance).
+const PERSIST_INLINE_BUDGET: usize = 64;
+
+/// Persisted resumes run inline since the pump last turned. Distinct from
+/// `inline_turn_resumes` so the tight per-advance cap does not also throttle the
+/// established live-pump inline path (`resumeInlineOnce`).
+threadlocal var persist_inline_resumes: usize = 0;
+
+pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!bool {
+    if (!inlineResumeEnabled()) return false;
+    if (!slotParkedHere(slot)) return false;
+    // A resume RAISED BY a step already running inline may itself run inline —
+    // a composition recomposing inside a frame resumes several coroutines in a
+    // chain, and every one of them owes its work to the caller that advanced the
+    // clock. But the chain must be BOUNDED: a rendezvous hand-off (a `SharedFlow`
+    // emitter and its collector resume each other with no suspension in between)
+    // never ends, and following it inline means control never returns to the
+    // caller and virtual time never advances. Past the budget the remaining steps
+    // go back on the pump queue, which is where they ran before.
+    if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
+    if (inline_turn_resumes >= INLINE_TURN_BUDGET) return false;
+    inline_turn_resumes += 1;
+    inline_depth += 1;
+    defer inline_depth -= 1;
+    return resumeInlineOnce(self, slot, value, out);
+}
+
+/// Is `slot` held by a pump on this thread and parked (not this pump's root)?
+fn slotParkedHere(slot: i64) bool {
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const drv = &coro_stack.items[i];
+        const tok = drv.slot_to_token.get(slot) orelse continue;
+        if (drv.root_tok != null and drv.root_tok.? == tok) return false;
+        return drv.parked.contains(tok);
+    }
+    return false;
+}
+
+fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!bool {
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        var entry = coro_stack.items[i].claimSlotForInline(slot) orelse continue;
+        const a = self.allocator;
+        if (pumpDiagEnabled())
+            std.debug.print("[PUMP] resumeInline slot={d} fn={s}\n", .{ slot, parkedFuncName(self, &entry.state) });
+        const scope_base = activeScopeDepth();
+        restoreScopeDelta(entry.scope_delta);
+        coroStackAllocator().free(entry.scope_delta);
+        switch (try intrinsic_host.resumeRaw(self, &entry.state, value, out)) {
+            .ok => {},
+            .err => |e| switch (e) {
+                // `park` captures the activation's scope delta off the live
+                // stack, so it must run before the truncation below.
+                .Suspended => |st| {
+                    _ = try parkInto(&coro_stack.items[i], a, st, scope_base);
+                },
+                // A cancelled child's throw dies with it, as in the drive loop.
+                // Every other failure belongs to the pump that owns this
+                // activation: leave it there rather than dropping it, or the
+                // coroutine simply never completes and its awaiters hang.
+                .Throw => |v| {
+                    if (!root.isCancellationException(&v)) {
+                        coro_stack.items[i].pending_err = e;
+                    }
+                },
+                else => {
+                    coro_stack.items[i].pending_err = e;
+                },
+            },
+        }
+        // The resumed activation ran on THIS stack: anything it left on the
+        // active-scope stack would be read as the HOST activation's coroutine
+        // scope by the next `coroutineContext`. The pump resumes on a clean
+        // stack and never has to care; an inline resume restores what it found.
+        if (active_scope_stack.items.len > scope_base)
+            active_scope_stack.shrinkRetainingCapacity(scope_base);
+        return true;
+    }
+    return false;
+}
+
+/// A Kotlin `Continuation.resumeWith` — the coroutine's own state-machine step.
+/// Kotlin runs it on the caller's stack; whether a resume is DISPATCHED at all
+/// was decided above this, by the continuation's interceptor. Only a step this
+/// thread's pumps do not own falls back to the queue / mailbox route.
+///
+/// klio's NATIVE suspensions (a channel waiter) do not pass through an
+/// interceptor at all, so for them the pump queue IS the dispatch: they keep
+/// using `coroutineResumeExternal` and run on a later pump turn.
+pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
+    if (try coroutineResumeInline(self, slot, value, out)) return;
+    return coroutineResumeExternal(self, slot, value, out);
+}
+
+/// Resume a persisted coroutine (its owning drive already exited) on THIS
+/// thread's existing live pump, on the caller's stack — one step, re-parking
+/// into the same pump. Gated on the Compose lowering plugin
+/// (`persistResumeGateEnabled`): when a snapshot apply resumes the recomposer
+/// while the runBlocking pump `coroTop` is blocked in an `advanceTimeBy`,
+/// adopting the resume onto the pump's ready queue would defer it until the
+/// advance returns — the recomposer would never reach the `withFrameNanos`
+/// that schedules its frame, so a state change never settles. Running it on the
+/// existing pump (not a fresh one) keeps its later suspension owned by a live
+/// pump, so the next resume takes the ordinary inline path. Off outside the
+/// compose plugin, so the coroutine suites keep their pre-existing deferral.
+/// Bounded: `inline_depth` caps nested resumes; `persist_inline_resumes` caps
+/// the total inline resumes since the pump last turned, so a re-dispatching
+/// body cannot spin unbounded.
+fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value: Value, out: Output) Allocator.Error!bool {
+    if (!inlineResumeEnabled()) return false;
+    if (!persistResumeGateEnabled()) return false;
+    if (coroTop() == null) return false;
+    if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
+    if (persist_inline_resumes >= PERSIST_INLINE_BUDGET) return false;
+    persist_inline_resumes += 1;
+    inline_depth += 1;
+    defer inline_depth -= 1;
+    const a = self.allocator;
+    // Restore the coroutine's own scope for the step, then shrink back so a
+    // re-park's `finally` pop (skipped over the suspension) is re-captured and
+    // the caller's scope stack is left exactly as found.
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    var state = pe.state;
+    const scope_base = activeScopeDepth();
+    restoreScopeDelta(pe.scope_delta);
+    coroStackAllocator().free(pe.scope_delta);
+    switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
+        .ok => {},
+        // A re-suspension re-parks onto the existing live pump (`park` targets
+        // `coroTop`), so it stays inline-resumable.
+        .err => |e| switch (e) {
+            .Suspended => |st| _ = try park(a, st, scope_base),
+            else => {},
+        },
+    }
+    return true;
+}
+
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
     if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} tid={d}\n", .{ slot, std.Thread.getCurrentId() });
     // A live cooperative driver on THIS thread still holding the slot?
@@ -2207,6 +2484,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             // Mailbox closed: the owner just exited and persisted its
             // parked coroutines strictly before closing.
             if (PersistedParked.take(slot)) |pe| {
+                if (try resumePersistedOnTop(self, pe, value, out)) return;
                 if (coroTop()) |top| {
                     try top.adoptPersisted(pe.state, pe.scope_delta, value);
                 } else {
@@ -2227,6 +2505,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
         // under a fresh pump — the cross-pump resume that lets a
         // coroutine continue on a different OS thread.
         if (PersistedParked.take(slot)) |pe| {
+            if (try resumePersistedOnTop(self, pe, value, out)) return;
             if (coroTop()) |top| {
                 try top.adoptPersisted(pe.state, pe.scope_delta, value);
                 return;

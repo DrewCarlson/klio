@@ -394,7 +394,13 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
 /// `resumeWaiterNormal`) so the child does not outlive the suspension. This
 /// reuses the proven `suspendCancellableCoroutine` cancellation path.
 fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
-    const scope = ctx.host.activeCoroScope() orelse return;
+    const scope = ctx.host.activeCoroScope() orelse {
+        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+            std.debug.print("[chan] arm slot={d}: NO ACTIVE SCOPE\n", .{slot});
+        return;
+    };
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        std.debug.print("[chan] arm slot={d} scope={s}\n", .{ slot, scope.typeFqn() });
     if (scope != .Instance) return;
     const helper = ctx.host.lookupGlobalFunc("__kxco_chanArmCancel") orelse return;
     const args = [_]Value{ scope, chan, .{ .Long = slot } };
@@ -417,6 +423,8 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const already_delivered = blk: {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
+        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+            std.debug.print("[chan] bindWatcher slot={d}\n", .{slot});
         if (coro_reg.chan_delivered.fetchRemove(slot) != null) break :blk true;
         cont.retain();
         if (coro_reg.chan_watchers.fetchPut(regAllocator(), slot, cont) catch null) |old| {
@@ -440,6 +448,8 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// record the slot as delivered so it completes immediately on bind. Runs
 /// outside `coro_reg_mutex` (the resume drives Kotlin).
 fn dropWatcher(ctx: *CallCtx, slot: i64) void {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        std.debug.print("[chan] dropWatcher slot={d}\n", .{slot});
     const cont: ?Value = blk: {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -478,6 +488,14 @@ fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Alloc
 /// double-resume.
 fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return .{ .ok = .Unit };
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null) {
+        const sl: i64 = switch (ctx.args[1]) {
+            .Long => |l| l,
+            .Int => |i| @as(i64, i),
+            else => -1,
+        };
+        std.debug.print("[chan] cancelWaiter slot={d}\n", .{sl});
+    }
     const recv = ctx.args[0];
     const slot: i64 = switch (ctx.args[1]) {
         .Long => |l| l,
