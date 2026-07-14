@@ -1790,9 +1790,11 @@ fn pumpLoop(
         if (pumpDiagEnabled() and diag_loops % 2000 == 0) {
             const t = coroTop().?;
             std.debug.print("[PUMP] loop {d}: ready={d} launched={d} parked={d} root={?}\n", .{ diag_loops, t.ready.items.len, t.launched.items.len, t.parked.count(), root_token.* });
+            var sit = t.slot_to_token.iterator();
+            while (sit.next()) |e| std.debug.print("[PUMP]   slot {d} -> tok {d}\n", .{ e.key_ptr.*, e.value_ptr.* });
             var it = t.parked.iterator();
             while (it.next()) |e| {
-                std.debug.print("[PUMP]   parked tok={d}:", .{e.key_ptr.*});
+                std.debug.print("[PUMP]   parked tok={d} wake={d}:", .{ e.key_ptr.*, e.value_ptr.wake_at });
                 const st = &e.value_ptr.state;
                 const mg = self.module.borrow();
                 defer mg.deinit();
@@ -1876,6 +1878,7 @@ fn pumpLoop(
         }
 
         // 2. Resume a ready coroutine, if any.
+        inline_turn_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
@@ -2264,10 +2267,22 @@ fn inlineResumeEnabled() bool {
 /// resuming each other) recurses natively until the stack dies.
 threadlocal var inline_depth: usize = 0;
 
+/// Inline resumes performed since the pump last ran an activation. An activation
+/// that never suspends (`while (isActive) flow.emit(…)`) would otherwise resume
+/// its peer inline for ever: the peer re-arms as a waiter, the next emit finds it
+/// ready, and the emitter never parks — so the pump never turns, the scheduler
+/// never runs, and virtual time never advances. Past the budget its resumes go
+/// back on the queue, which restores the back-pressure that makes it park.
+threadlocal var inline_turn_resumes: usize = 0;
+
 /// How deep one resume may chase the resumes it causes before the rest go back
 /// on the pump queue. Deep enough for a recomposition's chain, far short of an
 /// unbounded hand-off loop.
 const INLINE_CHAIN_BUDGET: usize = 32;
+
+/// How many resumes one pump turn may run inline. Far above what driving a frame
+/// of recomposition needs, far below a hand-off loop's appetite.
+const INLINE_TURN_BUDGET: usize = 2048;
 
 pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!bool {
     if (!inlineResumeEnabled()) return false;
@@ -2281,6 +2296,8 @@ pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, ou
     // caller and virtual time never advances. Past the budget the remaining steps
     // go back on the pump queue, which is where they ran before.
     if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
+    if (inline_turn_resumes >= INLINE_TURN_BUDGET) return false;
+    inline_turn_resumes += 1;
     inline_depth += 1;
     defer inline_depth -= 1;
     return resumeInlineOnce(self, slot, value, out);
