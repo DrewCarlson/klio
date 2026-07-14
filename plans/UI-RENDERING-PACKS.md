@@ -352,6 +352,45 @@ the first root. Both shapes are pinned in `src/itests/resolve_ambiguity.zig`.
 
 ## Compose runtime conformance
 
+### The snapshot-core port (DE-RISKED, next big lever)
+
+The largest remaining cluster of compose failures — SnapshotTests (66),
+SnapshotStateMapTests (57), SnapshotStateListTests, SnapshotStateSetTests,
+DerivedSnapshotStateTests (12), SnapshotStateObserverTestsCommon (30),
+SnapshotFlowTests (8), and the state half of CompositionAndDerivedStateTests —
+fails because klio ships a ~55-line Snapshot SHIM instead of upstream's MVCC
+snapshot core. That is ~200 tests.
+
+**Proven feasible.** Dropping upstream's real `snapshots/Snapshot.kt` (2540 lines)
++ `internal/SnapshotThreadLocal.kt` + `snapshots/tooling/SnapshotObserver.kt` into
+klioMain, with a `__compose_currentThreadId` host intrinsic, parses, lowers, and
+RUNS: `Snapshot.takeMutableSnapshot()` drives through `currentSnapshot` →
+`SnapshotThreadLocal` → the global-snapshot advance machinery. It surfaced (and we
+fixed) a real interpreter bug on the way — a field-backed `override var` not
+shadowing an inherited accessor's setter (`GlobalSnapshot.writeCount`). The
+experiment was reverted so the shim stays until the port is done atomically.
+
+**What the full port needs:**
+1. Ship upstream `snapshots/Snapshot.kt`, `internal/SnapshotThreadLocal.kt`,
+   `snapshots/tooling/SnapshotObserver.kt`, `Preconditions.kt` (already shipped),
+   `internal/Thread.kt` actuals (shipped), a `verboseTrace` tooling stub, and the
+   `__compose_currentThreadId` intrinsic (shipped).
+2. Replace klio's state objects with upstream's `StateObjectImpl`,
+   `SnapshotMutableState`, `SnapshotStateList/Map/Set`, `DerivedState`,
+   `SnapshotMutationPolicy`, so `mutableStateOf`/`mutableStateListOf`/... return
+   real `StateObject`s backed by the MVCC records. These COLLIDE with klio's
+   current `SnapshotState.kt` / `SnapshotStateCollections.kt` / `DerivedState.kt`,
+   so it is an atomic swap.
+3. Rewire klio's composer read/write tracking (`StateObservation`) onto the real
+   snapshot observers: the composer runs composition inside
+   `Snapshot.observe(readObserver) { }` and recomposition invalidation subscribes
+   via `Snapshot.registerApplyObserver`; a state write in a composition then
+   flows through `sendApplyNotifications()` (which the mock harness already calls)
+   to invalidate the reading group. This is the coupled part and the only real
+   risk to the ~260 composition tests currently passing.
+
+
+
 `zig build itest-compose_runtime_commontest` runs the upstream Compose runtime's
 own test suite (`CompositionTests`, `RestartTests`, `MovableContentTests`,
 `EffectsTests`, `CompositionLocalTests`, the `snapshots/` suites) through
