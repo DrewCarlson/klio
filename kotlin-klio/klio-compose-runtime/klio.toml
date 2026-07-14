@@ -68,6 +68,16 @@ include = [
     "androidx/compose/runtime/collection/MutableVector.kt",
 ]
 
+# The bundled persistent immutable collections
+# (androidx.compose.runtime.external.kotlinx.collections.immutable): a pure
+# stdlib library the snapshot state objects are built on. Its own source root so
+# every file ships without an include list.
+[[source]]
+root = "upstream/compose/runtime/runtime/src/commonMain/kotlin"
+include = [
+    "androidx/compose/runtime/external/kotlinx/collections/immutable/",
+]
+
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state
 # engine reimplemented in plain Kotlin, plus actuals for the platform/atomic
 # `expect`s and the host-intrinsic entrypoints (backed by src/compose_runtime).
