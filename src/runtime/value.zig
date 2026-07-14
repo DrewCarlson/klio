@@ -1014,6 +1014,20 @@ pub const SeqIterState = struct {
 
 pub const SeqIterStateRef = ObjRef(SeqIterState);
 
+/// The advancing state of a `Value.Iterator`, held behind one shared handle so
+/// it survives the by-value copies a `Value` undergoes.
+pub const IterCursor = struct {
+    /// Index of the next element to yield.
+    pos: usize = 0,
+    /// Index of the element the LAST `next()`/`previous()` returned (the
+    /// ListIterator set/remove target), or -1 when none — before the first
+    /// move, and after `add`/`remove`.
+    last_ret: i64 = -1,
+    /// The source's `mod_count` as captured when the iterator was created.
+    /// Meaningful only when the iterator carries a `mod_count` handle.
+    exp_mod: u64 = 0,
+};
+
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
@@ -1429,19 +1443,19 @@ pub const Value = union(enum) {
     /// `kotlin.collections.Iterator<T>` and primitive specializations.
     Iterator: struct {
         items: ValueList,
-        pos: ObjRef(usize),
-        /// Index of the element the LAST `next()`/`previous()` returned
-        /// (the ListIterator set/remove target), or -1 when none —
-        /// before the first move, and after `add`/`remove`.
-        last_ret: ?ObjRef(i64) = null,
+        /// The iterator's own advancing state. A `Value` is copied by value, so
+        /// anything a `next()`/`remove()` must persist across those copies has
+        /// to sit behind a shared handle — but ONE handle for all of it, not one
+        /// each: `?ObjRef` costs two words (Zig's null-pointer optimization does
+        /// not reach through the wrapper struct), and three of them pushed every
+        /// `Value` in the program from 64 to 80 bytes.
+        cursor: ObjRef(IterCursor),
         prim: ?PrimitiveArrayKind,
-        /// The source collection's `mod_count` (shared handle) and the value
-        /// this iterator captured at creation. `next`/`hasNext` throw
-        /// `ConcurrentModificationException` when they differ; the iterator's
-        /// own `add`/`remove` resync `exp_mod`. Both null when the source had
-        /// no `mod_count`.
+        /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
+        /// throw `ConcurrentModificationException` when it no longer matches the
+        /// `exp_mod` the cursor captured; the iterator's own `add`/`remove`
+        /// resync it. Null when the source had no `mod_count`.
         mod_count: ?ObjRef(u64) = null,
-        exp_mod: ?ObjRef(u64) = null,
         /// True only when the iterator shares a *mutable* collection's backing,
         /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
         /// the source. A snapshot iterator over a read-only collection (or an
@@ -1551,10 +1565,8 @@ pub const Value = union(enum) {
             .Map => |x| visitor.visit(x.entries),
             .Iterator => |x| {
                 visitor.visit(x.items);
-                visitor.visit(x.pos);
-                if (x.last_ret) |lr| visitor.visit(lr);
+                visitor.visit(x.cursor);
                 if (x.mod_count) |mc| visitor.visit(mc);
-                if (x.exp_mod) |em| visitor.visit(em);
             },
             .RangeIter => |x| {
                 visitor.visit(x.cur);
@@ -1703,10 +1715,8 @@ pub const Value = union(enum) {
             },
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
-                x.pos.deinit();
-                if (x.last_ret) |lr| lr.deinit();
+                x.cursor.deinit();
                 if (x.mod_count) |mc| mc.deinit();
-                if (x.exp_mod) |em| em.deinit();
             },
             .RangeIter => |x| {
                 x.cur.deinit();

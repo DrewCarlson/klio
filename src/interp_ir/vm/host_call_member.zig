@@ -3412,11 +3412,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // iterator is mutable only when the source list is.
         return .{ .ok = .{ .Iterator = .{
             .items = receiver.List.items.clone(),
-            .pos = try ObjRef(usize).init(allocator, start), .last_ret = try ObjRef(i64).init(allocator, -1),
+            .cursor = try newCursor(allocator, start, cap.exp_mod),
             .prim = null,
             .mod_count = cap.mod_count,
-            .exp_mod = cap.exp_mod,
-            .mutable = receiver.List.mutable and receiver.List.backing == null and
+                        .mutable = receiver.List.mutable and receiver.List.backing == null and
                 !stdlib.implementations.collections.modCountFrozen(receiver.List.mod_count),
         } } };
     }
@@ -4703,14 +4702,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // map modification); only a genuinely read-only list snapshots.
             if (l.mutable and !stdlib.implementations.collections.modCountFrozen(l.mod_count)) {
                 const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
             // source (the map) fails the iterator fast.
             const items = try cloneItemsList(allocator, l.items);
             const cap = try captureModCount(allocator, l.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
         },
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
@@ -4721,13 +4720,13 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // genuinely read-only set yields a read-only iterator.
             if (s.mutable and !stdlib.implementations.collections.modCountFrozen(s.mod_count)) {
                 const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = true } } };
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
             const items = try cloneItemsList(allocator, s.items);
             const cap = try captureModCount(allocator, s.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
         },
         .Map => |m| {
             const g = m.entries.borrow();
@@ -4752,14 +4751,14 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             }
             g.deinit();
             const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null, .mod_count = cap.mod_count, .exp_mod = cap.exp_mod, .mutable = live } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = live } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = arr.prim } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = arr.prim } } };
         },
         .String => |s| {
             const g = s.borrow();
@@ -4767,7 +4766,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             var items: std.ArrayList(Value) = .empty;
             const view = std.unicode.Utf8View.init(g.get().bytes) catch {
                 for (g.get().bytes) |b| try items.append(allocator, .{ .Char = b });
-                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
+                return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = null } } };
             };
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
@@ -4779,7 +4778,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                     try items.append(allocator, .{ .Char = @intCast(0xDC00 + (v2 & 0x3FF)) });
                 }
             }
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .pos = try ObjRef(usize).init(allocator, 0), .last_ret = try ObjRef(i64).init(allocator, -1), .prim = null } } };
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, 0), .prim = null } } };
         },
         else => return null,
     }
@@ -6210,35 +6209,40 @@ fn mapEntriesCounter(entries: runtime.MapEntries) u64 {
     return cg.get().*;
 }
 
-const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: ?ObjRef(u64) };
+const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: u64 };
 
-/// Capture a list's `mod_count` (shared) plus the current value (the iterator's
-/// expectation), so the iterator can fail-fast. Both null for a read-only / un-
-/// counted source.
+/// Capture a list's `mod_count` (shared) plus its current value (the iterator's
+/// expectation), so the iterator can fail-fast. `mod_count` is null for a
+/// read-only / un-counted source, which makes the expectation meaningless.
 fn captureModCount(allocator: Allocator, src: ?ObjRef(u64)) Allocator.Error!ModCapture {
-    const mc = src orelse return .{ .mod_count = null, .exp_mod = null };
+    _ = allocator;
+    const mc = src orelse return .{ .mod_count = null, .exp_mod = 0 };
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
-    return .{ .mod_count = mc.clone(), .exp_mod = try ObjRef(u64).init(allocator, cur) };
+    return .{ .mod_count = mc.clone(), .exp_mod = cur };
+}
+
+/// A fresh cursor box for an iterator starting at `start`.
+fn newCursor(allocator: Allocator, start: usize, exp_mod: u64) Allocator.Error!ObjRef(runtime.IterCursor) {
+    return ObjRef(runtime.IterCursor).init(allocator, .{ .pos = start, .last_ret = -1, .exp_mod = exp_mod });
 }
 
 /// `ConcurrentModificationException` when the source mutated structurally since
 /// the iterator captured it (`null` when consistent or uncounted).
 fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResult {
     const mc = it.mod_count orelse return null;
-    const em = it.exp_mod orelse return null;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
     const exp = blk: {
-        const g = em.borrow();
+        const g = it.cursor.borrow();
         defer g.deinit();
-        break :blk g.get().*;
+        break :blk g.get().exp_mod;
     };
     if (cur != exp) return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
     return null;
@@ -6248,15 +6252,14 @@ fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResu
 /// next `next`/`hasNext` does not flag its own change as concurrent.
 fn iteratorResyncMod(it: anytype) void {
     const mc = it.mod_count orelse return;
-    const em = it.exp_mod orelse return;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
         break :blk g.get().*;
     };
-    const g = em.borrowMut();
+    const g = it.cursor.borrowMut();
     defer g.deinit();
-    g.get().* = cur;
+    g.get().exp_mod = cur;
 }
 
 /// The iterator's own `add`/`remove` is a structural change of the backing list
@@ -6272,33 +6275,24 @@ fn iteratorOwnStructuralMod(it: anytype) void {
 }
 
 fn iteratorSetLast(it: anytype, idx: i64) void {
-    if (it.last_ret) |cell| {
-        const g = cell.borrowMut();
-        g.get().* = idx;
-        g.deinit();
-    }
+    const g = it.cursor.borrowMut();
+    defer g.deinit();
+    g.get().last_ret = idx;
 }
 
-/// Index the last `next()`/`previous()` returned, or -1 (also for
-/// iterators created before the cell existed).
+/// Index the last `next()`/`previous()` returned, or -1 when none.
 fn iteratorLastRet(it: anytype) i64 {
-    if (it.last_ret) |cell| {
-        const g = cell.borrow();
-        defer g.deinit();
-        return g.get().*;
-    }
-    const pg = it.pos.borrow();
-    defer pg.deinit();
-    const p = pg.get().*;
-    return @as(i64, @intCast(p)) - 1;
+    const g = it.cursor.borrow();
+    defer g.deinit();
+    return g.get().last_ret;
 }
 
 fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     _ = self;
     const it = receiver.Iterator;
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const ig = it.items.borrow();
         const len = ig.get().items.len;
@@ -6307,8 +6301,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     }
     if (isIteratorNext(name) and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const ig = it.items.borrow();
         if (p >= ig.get().items.len) {
@@ -6328,32 +6322,32 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // handing it to the register that will own the iteration result.
         if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p + 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
         return .{ .ok = v };
     }
     // `ListIterator` navigation over the same `items`/`pos` cursor.
     if (std.mem.eql(u8, name, "hasPrevious") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = boolVal(pg.get().* > 0) };
+        return .{ .ok = boolVal(pg.get().pos > 0) };
     }
     if (std.mem.eql(u8, name, "nextIndex") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = Value.newInt(@intCast(pg.get().*)) };
+        return .{ .ok = Value.newInt(@intCast(pg.get().pos)) };
     }
     if (std.mem.eql(u8, name, "previousIndex") and args.len == 0) {
-        const pg = it.pos.borrow();
+        const pg = it.cursor.borrow();
         defer pg.deinit();
-        return .{ .ok = Value.newInt(@as(i64, @intCast(pg.get().*)) - 1) };
+        return .{ .ok = Value.newInt(@as(i64, @intCast(pg.get().pos)) - 1) };
     }
     if (std.mem.eql(u8, name, "previous") and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         if (p == 0) {
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator at start") };
@@ -6362,8 +6356,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         const v = ig.get().items[p - 1];
         if (runtime.reclaimEnabled()) v.retain();
         ig.deinit();
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p - 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p - 1;
         pmg.deinit();
         iteratorSetLast(it, @as(i64, @intCast(p)) - 1);
         return .{ .ok = v };
@@ -6401,8 +6395,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const g = it.items.borrowMut();
         defer g.deinit();
@@ -6410,8 +6404,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         if (runtime.reclaimEnabled()) nv.retain();
         const idx = if (p <= g.get().items.len) p else g.get().items.len;
         try g.get().insert(allocator, idx, nv);
-        const pmg = it.pos.borrowMut();
-        pmg.get().* = p + 1;
+        const pmg = it.cursor.borrowMut();
+        pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, -1);
         iteratorOwnStructuralMod(it);
@@ -6427,8 +6421,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // never advances) still falls through to UnsupportedOperationException.
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!it.mutable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-        const pg = it.pos.borrow();
-        const p = pg.get().*;
+        const pg = it.cursor.borrow();
+        const p = pg.get().pos;
         pg.deinit();
         const li = iteratorLastRet(it);
         if (li < 0) {
@@ -6463,8 +6457,8 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             // BEFORE it (remove-after-next); after previous() the cursor
             // already sits at the removed index.
             if (lu < p) {
-                const pmg = it.pos.borrowMut();
-                pmg.get().* = p - 1;
+                const pmg = it.cursor.borrowMut();
+                pmg.get().pos = p - 1;
                 pmg.deinit();
             }
             iteratorSetLast(it, -1);

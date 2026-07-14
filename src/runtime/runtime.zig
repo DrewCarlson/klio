@@ -102,6 +102,7 @@ pub const MergedSource = value_mod.MergedSource;
 pub const FROZEN_MOD_BIT = value_mod.FROZEN_MOD_BIT;
 pub const SeqIterState = value_mod.SeqIterState;
 pub const SeqIterStateRef = value_mod.SeqIterStateRef;
+pub const IterCursor = value_mod.IterCursor;
 pub const RegexData = value_mod.RegexData;
 pub const MatchData = value_mod.MatchData;
 pub const MatchGroupData = value_mod.MatchGroupData;
