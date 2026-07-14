@@ -472,6 +472,9 @@ fn ivLookupGlobalFunc(ctx: *anyopaque, name: []const u8) ?Value {
 fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
     intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
 }
+fn ivCoroutineResumeContinuation(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
+    intrinsic_host.coroutineResumeContinuation(ip(ctx), slot, value, out);
+}
 fn ivCoroutineDrainToIdle(ctx: *anyopaque, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineDrainToIdle(ip(ctx), out);
 }
@@ -525,6 +528,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .lookup_global_func = ivLookupGlobalFunc,
     .coroutine_resume_external = ivCoroutineResumeExternal,
     .coroutine_dispatch_pooled = ivCoroutineDispatchPooled,
+    .coroutine_resume_continuation = ivCoroutineResumeContinuation,
     .coroutine_drain_to_idle = ivCoroutineDrainToIdle,
     .spawn_os_thread = ivSpawnOsThread,
     .join_os_thread = ivJoinOsThread,

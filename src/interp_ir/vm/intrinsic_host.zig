@@ -359,6 +359,10 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
     coroutines.coroutineResumeExternal(self, slot, value, out) catch {};
 }
 
+pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
+    coroutines.coroutineResumeContinuation(self, slot, value, out) catch {};
+}
+
 pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error!?RuntimeError {
     return coroutines.coroutineDrainToIdle(self, out);
 }

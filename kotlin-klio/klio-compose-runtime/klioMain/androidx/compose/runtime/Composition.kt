@@ -17,6 +17,7 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -92,9 +93,12 @@ public class Recomposer(
             else effectContext + frameClock + Dispatchers.Unconfined + effectJob,
         )
 
-    // Conflated wake channel: a write-observer invalidation sends a unit; the
-    // async loop receives it and recomposes.
-    private val workChannel: Channel<Unit> = Channel(Channel.CONFLATED)
+    // Wake signal for the async loop: a write-observer invalidation completes it
+    // and the loop takes the next frame. A CompletableDeferred (not a channel)
+    // because its resume goes through the waiter's dispatcher — under a test
+    // dispatcher that means the wake is an event on the test scheduler, so a
+    // host advancing virtual time actually delivers it.
+    private var workSignal: CompletableDeferred<Unit>? = null
     private var closed: Boolean = false
 
     /**
@@ -116,7 +120,27 @@ public class Recomposer(
 
     /** Wake the async recomposition loop (called when a composition is invalidated). */
     internal fun notifyWorkAvailable() {
-        if (!closed) workChannel.trySend(Unit)
+        if (closed) return
+        workSignal?.complete(Unit)
+    }
+
+    /** Suspend until a composition is invalidated (or the recomposer closes). */
+    private suspend fun awaitWorkAvailable() {
+        if (closed || hasPendingWork) return
+        val signal = CompletableDeferred<Unit>()
+        workSignal = signal
+        // Re-check after publishing: an invalidation between the check above and
+        // the publish would otherwise be missed and the loop would sleep on work
+        // that already exists.
+        if (closed || hasPendingWork) {
+            workSignal = null
+            return
+        }
+        try {
+            signal.await()
+        } finally {
+            workSignal = null
+        }
     }
 
     /** True if any registered composition has pending invalidations, or a
@@ -175,25 +199,23 @@ public class Recomposer(
         // loop keeps its own monotonic counter.
         val parentClock = effectContext[MonotonicFrameClock]
         while (!closed) {
+            // Idle until something needs recomposing, THEN take a frame. Taking a
+            // frame unconditionally would pull one per clock tick — 16ms of
+            // virtual time each, hundreds of empty frames for every second a test
+            // advances.
+            awaitWorkAvailable()
+            if (closed) break
             if (parentClock != null) {
-                // A host clock paces the loop: park on ITS frame, so the host —
-                // a test scheduler advancing virtual time, a window ticking with
-                // the display — decides when a frame happens. Waiting on the work
-                // channel instead would park the loop off the host's scheduler
-                // entirely: the wake never runs, and a composition invalidated by
-                // a state write stays dirty however far the host advances.
+                // A host clock paces the loop: the frame happens when the HOST
+                // says — a test scheduler advancing virtual time, a window ticking
+                // with the display. The internal clock is fanned inside that
+                // frame, so compositions awaiting `withFrameNanos` see the host's
+                // frame time.
                 parentClock.withFrameNanos { nanos ->
                     frameClock.sendFrame(nanos)
                     recompose()
                 }
             } else {
-                if (!hasPendingWork) {
-                    try {
-                        workChannel.receive()
-                    } catch (e: Throwable) {
-                        break // channel closed → stop the loop
-                    }
-                }
                 frameClock.sendFrame(frameNanos)
                 frameNanos += 16_666_666L // ~60fps, monotonic + deterministic
                 recompose()
@@ -205,7 +227,7 @@ public class Recomposer(
     public fun close() {
         if (closed) return
         closed = true
-        workChannel.close()
+        workSignal?.complete(Unit)
         effectJob.cancel()
         shutdown.complete()
     }
