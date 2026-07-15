@@ -592,6 +592,12 @@ pub const FuncBuilder = struct {
 
     /// See `setHasOwnTypeParams`.
     has_own_type_params: bool = false,
+    /// Names of NON-reified type parameters in scope (this function's own plus
+    /// the enclosing class's). A cast `x as T` to such a name is UNCHECKED in
+    /// Kotlin (erased to the bound), so it must not be checked against a
+    /// same-named concrete class. Reified type params are excluded — they are
+    /// resolved by the reified splice, which substitutes the concrete type.
+    type_param_names: StringSet,
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
@@ -609,6 +615,7 @@ pub const FuncBuilder = struct {
             .broad_coll_locals = StringSet.init(allocator),
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
+            .type_param_names = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .enclosing_members = StringSet.init(allocator),
@@ -670,6 +677,7 @@ pub const FuncBuilder = struct {
         self.broad_coll_locals.deinit();
         self.object_init_locals.deinit();
         self.own_members.deinit();
+        self.type_param_names.deinit();
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
         self.private_method_fids.deinit();
@@ -1418,6 +1426,15 @@ pub const FuncBuilder = struct {
     }
     pub fn hasOwnTypeParams(self: *const FuncBuilder) bool {
         return self.has_own_type_params;
+    }
+    /// Record a NON-reified type-parameter name in scope (own or enclosing
+    /// class). A cast to it is unchecked/erased.
+    pub fn addTypeParamName(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.type_param_names.put(name, {});
+    }
+    /// Whether `name` is a non-reified type parameter in scope.
+    pub fn isTypeParam(self: *const FuncBuilder, name: []const u8) bool {
+        return self.type_param_names.contains(name);
     }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});

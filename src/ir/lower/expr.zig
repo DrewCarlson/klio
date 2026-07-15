@@ -445,6 +445,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .As => |cast| {
             const s = try lowerExpr(b, cast.expr);
+            // A cast to a NON-reified type parameter (`x as T`) is erased: the
+            // JVM `checkcast` targets the bound and passes any value (including
+            // null), so it is a runtime no-op — a genuine mismatch surfaces
+            // only when the value is later used as `T`. Return the value as-is,
+            // so a type parameter named like a concrete class (`class
+            // ScopeMap<Key, Scope>` alongside a test's `class Scope`) is not
+            // checked against that class and a nullable instantiation does not
+            // throw. Reified type params are excluded (the reified splice
+            // substitutes the concrete type before this point).
+            if (b.isTypeParam(cast.ty.name.name)) return s;
             const dst = b.allocReg();
             try b.push(.{ .Cast = .{
                 .dst = dst,
