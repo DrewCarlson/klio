@@ -1,47 +1,31 @@
-// Single-threaded state-observation hub — klio's replacement for the MVCC
-// snapshot machinery's read/apply observers.
-//
-// Upstream Compose routes state reads/writes through per-thread snapshots with
-// versioned `StateRecord`s. klio's synchronous composition model needs only the
-// observer edges that drive recomposition: while composing, the composer pushes
-// a read observer that records which state objects a recompose scope touched; a
-// state write notifies registered write observers (the recomposer), which
-// invalidate the scopes that read the written state. No versioning, no atomics,
-// no thread-locals.
+// Bridge from the composer's read/write-observation interface onto the real MVCC
+// snapshot core. The composer runs composition inside `observe(readObserver)` to
+// learn which state objects a group read, and registers a write observer that
+// invalidates the groups that read a state when it changes. Both edges are the
+// real snapshot observers now that klio ships upstream's Snapshot core and the
+// StateObject-backed state objects.
 
 package androidx.compose.runtime
 
+import androidx.compose.runtime.snapshots.Snapshot
+
 internal object StateObservation {
-    private val readObservers = ArrayList<(Any) -> Unit>()
-    private val writeObservers = ArrayList<(Any) -> Unit>()
+    /** Run [block] observing every state read inside it (the composer records the
+     * reading group). Backed by the real snapshot read observer. */
+    fun <R> observe(readObserver: (Any) -> Unit, block: () -> R): R =
+        Snapshot.observe(readObserver = readObserver, block = block)
 
-    /** Record that [state] was read, notifying the innermost active observer. */
-    fun notifyRead(state: Any) {
-        val n = readObservers.size
-        if (n == 0) return
-        readObservers[n - 1].invoke(state)
-    }
-
-    /** Run [block] with [readObserver] active for every state read inside it. */
-    fun <R> observe(readObserver: (Any) -> Unit, block: () -> R): R {
-        readObservers.add(readObserver)
-        try {
-            return block()
-        } finally {
-            readObservers.removeAt(readObservers.size - 1)
-        }
-    }
-
-    /** Register a write observer; returns a handle that unregisters it. */
+    /** Register a write observer, returning a handle that unregisters it. Fires
+     * on a committed apply (the recomposer invalidates the reading groups) and on
+     * a direct global write. */
     fun registerWriteObserver(observer: (Any) -> Unit): () -> Unit {
-        writeObservers.add(observer)
-        return { writeObservers.remove(observer) }
-    }
-
-    /** Notify every registered write observer that [state] changed. */
-    fun notifyWrite(state: Any) {
-        if (writeObservers.isEmpty()) return
-        val active = writeObservers.toList()
-        for (o in active) o(state)
+        val apply = Snapshot.registerApplyObserver { changed, _ ->
+            for (state in changed) observer(state)
+        }
+        val global = Snapshot.registerGlobalWriteObserver(observer)
+        return {
+            apply.dispose()
+            global.dispose()
+        }
     }
 }

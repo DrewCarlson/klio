@@ -116,16 +116,6 @@ public fun <T> remember(vararg keys: Any?, calculation: () -> T): T {
 }
 
 /**
- * Remember a [MutableState] holding [newValue], updating it every composition.
- * Lets a long-lived lambda or effect read the latest value without restarting.
- */
-public fun <T> rememberUpdatedState(newValue: T): State<T> {
-    val state = remember { mutableStateOf(newValue) }
-    state.value = newValue
-    return state
-}
-
-/**
  * Give [block] a group identity derived from [keys] rather than its call site, so
  * its `remember`/state follows the key across reorders. Used per list item:
  * `for (item in items) key(item.id) { Row(item) }`. Implemented as a movable

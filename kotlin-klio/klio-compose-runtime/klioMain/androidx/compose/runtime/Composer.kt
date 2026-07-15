@@ -238,7 +238,7 @@ internal class KlioComposer : Composer {
         stack.add(root)
     }
 
-    private fun current(): GroupNode = stack[stack.size - 1]
+    private fun currentGroupNode(): GroupNode = stack[stack.size - 1]
 
     /** Begin the initial composition pass (every group executes). */
     fun beginInitialPass() {
@@ -296,7 +296,7 @@ internal class KlioComposer : Composer {
      * that group, so invalidating the scope is simply marking that node for the
      * next pass — the same set [invalidate] marks on a state write.
      */
-    fun currentRecomposeScope(): RecomposeScope = GroupRecomposeScope(this, current())
+    fun currentRecomposeScope(): RecomposeScope = GroupRecomposeScope(this, currentGroupNode())
 
     /** Mark [g] for recomposition (see [currentRecomposeScope]). */
     internal fun invalidateGroup(g: GroupNode) {
@@ -305,7 +305,7 @@ internal class KlioComposer : Composer {
 
     /** Record that the current group read [state] (called by the read observer). */
     fun subscribeRead(state: Any) {
-        val g = current()
+        val g = currentGroupNode()
         if (g.reads.add(state)) {
             var set = stateToGroups[state]
             if (set == null) {
@@ -330,7 +330,7 @@ internal class KlioComposer : Composer {
     }
 
     override fun startGroup(key: Long) {
-        val parent = current()
+        val parent = currentGroupNode()
         val occ = parent.childOccurrences[key] ?: 0
         parent.childOccurrences[key] = occ + 1
         val cid = key * 1000003L + occ.toLong()
@@ -350,7 +350,7 @@ internal class KlioComposer : Composer {
     }
 
     override fun shouldRunGroup(argsHash: Long): Boolean {
-        val g = current()
+        val g = currentGroupNode()
         val rs = runSet
         // Run when fresh, when the whole tree runs (initial pass), when on the
         // invalidated path, when the arguments changed since last pass, or when a
@@ -378,16 +378,16 @@ internal class KlioComposer : Composer {
     }
 
     override fun setGroupReturn(value: Any?) {
-        current().returnValue = value
+        currentGroupNode().returnValue = value
     }
 
     override fun groupReturn(): Any? {
-        val v = current().returnValue
+        val v = currentGroupNode().returnValue
         return if (v === Composer.Empty) Unit else v
     }
 
     override fun endGroup() {
-        val g = current()
+        val g = currentGroupNode()
         // Record the node-groups this group contributed to its enclosing applier
         // node this pass (the emit-order slice since startGroup) — replayed if the
         // group is skipped next time.
@@ -430,7 +430,7 @@ internal class KlioComposer : Composer {
 
     override fun startNode() {
         startGroup(nodeGroupKey)
-        insertingStack.add(current().node === NoNode)
+        insertingStack.add(currentGroupNode().node === NoNode)
     }
 
     override fun startReusableNode() {
@@ -438,7 +438,7 @@ internal class KlioComposer : Composer {
     }
 
     override fun createNode(factory: () -> Any?) {
-        val g = current()
+        val g = currentGroupNode()
         val node = factory()
         g.node = node
         emitStack[emitStack.size - 1].newOrder.add(g)
@@ -447,7 +447,7 @@ internal class KlioComposer : Composer {
     }
 
     override fun useNode() {
-        val g = current()
+        val g = currentGroupNode()
         emitStack[emitStack.size - 1].newOrder.add(g)
         applierNode!!.down(g.node)
         emitStack.add(EmitContext(g))
@@ -541,7 +541,7 @@ internal class KlioComposer : Composer {
         // A changed provided value forces this provider's subtree to run, so
         // descendants that read the local (but whose own args are unchanged)
         // pick up the new value instead of being skipped.
-        val g = current()
+        val g = currentGroupNode()
         val changed = providersDiffer(g.lastProvided, layer)
         g.lastProvided = layer
         forceStack.add(changed)
@@ -576,7 +576,7 @@ internal class KlioComposer : Composer {
 
     override fun consume(local: CompositionLocal<*>): Any? {
         val value = resolveLocal(local)
-        current().consumedLocals[local] = value
+        currentGroupNode().consumedLocals[local] = value
         return value
     }
 
@@ -616,7 +616,7 @@ internal class KlioComposer : Composer {
     override val compositeKeyHashCode: Long
         get() {
             var hash = 0L
-            var g: GroupNode? = if (stack.isEmpty()) root else current()
+            var g: GroupNode? = if (stack.isEmpty()) root else currentGroupNode()
             while (g != null) {
                 hash = hash * 31L + g.key
                 g = g.parent
@@ -703,7 +703,7 @@ internal class KlioComposer : Composer {
     }
 
     override fun rememberedValue(): Any? {
-        val g = current()
+        val g = currentGroupNode()
         val v: Any?
         if (g.slotCursor < g.slots.size) {
             v = g.slots[g.slotCursor]
@@ -716,13 +716,13 @@ internal class KlioComposer : Composer {
     }
 
     override fun updateRememberedValue(value: Any?) {
-        val g = current()
+        val g = currentGroupNode()
         val idx = g.slotCursor - 1
         if (idx >= 0 && idx < g.slots.size) g.slots[idx] = value
     }
 
     override fun changed(value: Any?): Boolean {
-        val g = current()
+        val g = currentGroupNode()
         val idx = g.slotCursor
         val prev: Any?
         if (idx < g.slots.size) {

@@ -27,7 +27,7 @@ const runtime = @import("runtime");
 /// suite runs alone; under a full `test-all` the machine is saturated and more
 /// children hit the per-child cap, so the ratchet leaves real headroom rather
 /// than tracking the best-case number.
-const BASELINE: usize = 270;
+const BASELINE: usize = 295;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 /// The mock View/Applier harness the tests compose against, plus the two test
