@@ -141,6 +141,35 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-15: **Engine ships and runs.** A sibling pack
+  `kotlin-klio/klio-compose-runtime-engine/` curates the `androidx.compose.runtime`
+  id to include the real upstream gapbuffer engine (Composer / GapComposer /
+  Recomposer / Composition / SlotTable / changelist / RememberManager) and drops
+  the klioMain composer reimplementations, keeping only the platform actuals +
+  klio-specific annotation/host-bridge providers. It references the original
+  pack's sources by relative path, so the shipped implicit-composer pack is
+  untouched and `main` stays green. Installed into an isolated home, the real
+  gapbuffer `SlotTable` runs: **128 / 138 upstream `SlotTableTests` pass**, all
+  previously unreachable (0). Verify with:
+  `HOME=/tmp/klio_engine_home klio test <SlotTableTests.kt> --filter=SlotTableTests`.
+  Dep packs prebuilt into that home; the engine pack builds with
+  `klio pack build kotlin-klio/klio-compose-runtime-engine`.
+  - Two interpreter bugs surfaced + root-fixed (commit 51ab249c): a trailing-lambda
+    call `name(args) { block }` bound a scalar-last namesake in both the
+    closure-writeback and inline-splice lowering paths; both now require the bound
+    overload's last parameter to host the lambda.
+  - Remaining 10 `SlotTableTests` failures root-caused, not yet fixed: the test
+    DSL's `SlotWriter.group(key) { … }` is an `internal inline` extension; a call
+    nested inside another inline-spliced `group { … }` block loses the SlotWriter
+    enclosing-receiver context, so it cannot statically resolve/splice the inline
+    extension and emits a dynamic call. The runtime extension walk then fails to
+    dispatch the inline-only `SlotWriter.group` and falls through to the global
+    namesake `androidx.collection.group`, whose bit math runs `and` on the lambda
+    (`and on kotlin.Function`). Fix path: thread the enclosing receiver type into
+    nested inline-lambda-block lowering (so the nested call splices the inline
+    extension), and/or make the runtime ext walk dispatch inline extensions.
+    Lower priority than the pass (specific to this DSL's `group` collision).
+
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
   commit 8128489c). Self-contained AST transform (ast+span deps only): injects
