@@ -1910,16 +1910,30 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (label == null) {
         if (b.inlineActiveReturn()) |ar| {
             if (r) |rr| try b.push(.{ .Move = .{ .dst = ar.reg, .src = rr } });
-            // Replay every active `finally { … }` block inline before exiting.
-            const pending = try b.activeFinallys();
-            defer b.allocator.free(pending);
-            if (pending.len != 0) {
+            // Replay the `finally { … }` blocks pushed *inside* this inline
+            // frame before jumping to its join. Finallys from an enclosing
+            // inline frame belong to that frame's own return and must not run
+            // here: `composing { try { return snap.enter(block) } finally { apply } }`
+            // inlines `enter { try { return block() } finally { restore } }`, so
+            // at `return block()` the stack holds [apply, restore]; replaying
+            // both would apply the snapshot twice.
+            const base = @min(ar.finally_base, b.finally_stack.items.len);
+            // The try-region bodies whose finally we replay here: their
+            // runtime `TryFrame`s must be popped when we jump to the join,
+            // because the jump bypasses the finally sentinel that would pop
+            // them. Captured before the replay swaps the stack.
+            const pop_bodies = try b.finallyBodiesFrom(base);
+            if (b.finally_stack.items.len > base) {
                 const prior = try b.swapFinallyStack(&.{});
                 defer b.allocator.free(prior);
-                var idx: usize = 0;
-                while (idx < pending.len) : (idx += 1) {
-                    const blk = &pending[pending.len - 1 - idx];
-                    const outer = try b.allocator.dupe(ast.Block, prior[0 .. prior.len - (idx + 1)]);
+                var idx: usize = prior.len;
+                while (idx > base) {
+                    idx -= 1;
+                    const blk = &prior[idx];
+                    // While replaying this finally, the finallys strictly
+                    // outside it (including the enclosing frame's base) stay
+                    // active so a `return` within the finally still unwinds.
+                    const outer = try b.allocator.dupe(ast.Block, prior[0..idx]);
                     const dropped = try b.swapFinallyStack(outer);
                     b.allocator.free(dropped);
                     _ = try lowerBlock(b, blk);
@@ -1927,6 +1941,11 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const restore = try b.allocator.dupe(ast.Block, prior);
                 const dropped2 = try b.swapFinallyStack(restore);
                 b.allocator.free(dropped2);
+            }
+            if (pop_bodies.len != 0) {
+                b.setPopOnExit(b.cur, pop_bodies);
+            } else {
+                b.allocator.free(pop_bodies);
             }
             b.terminate(.{ .Goto = ar.join });
             const dead = try b.allocBlock();
@@ -2006,7 +2025,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     b.attachCatches(cur_id, catch_handlers, finally_entry);
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
-    if (t.finally) |blk| try b.pushFinally(blk);
+    if (t.finally) |blk| try b.pushFinally(blk, cur_id);
     const body_val = try lowerBlock(b, &t.body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (finally_entry) |fin| {

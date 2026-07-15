@@ -793,6 +793,15 @@ pub const Block = struct {
     /// iterations for a long-lived frame like DeepRecursive's
     /// runCallLoop).
     catch_done_for: ?BlockId = null,
+    /// Try-region body-entry ids whose `TryFrame` this block pops when it
+    /// exits via `Goto`. Set on the block that carries an inline `return`'s
+    /// jump-to-join: the return replays its enclosing finallys inline and
+    /// jumps straight to the inline join, bypassing the finally sentinel
+    /// that would otherwise pop those frames — so without this the frames
+    /// linger and a LATER plain return in the same runtime frame re-runs
+    /// the finally (a spliced `try { return … } finally { … }` applied its
+    /// snapshot twice).
+    pop_on_exit: []const BlockId = &.{},
 };
 
 /// A function body in IR form.

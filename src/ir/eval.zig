@@ -2415,6 +2415,17 @@ fn runFrameInner(
                 _ = try_stack.orderedRemove(p);
             }
         }
+        // An inline `return` that replayed its enclosing finallys inline and
+        // is jumping to its join bypasses the finally sentinel, so pop the
+        // try-region frames it just unwound (`Block.pop_on_exit`) here — else
+        // they linger and a later plain return re-enters the finally.
+        if (term == .Goto) {
+            for (block.pop_on_exit) |body| {
+                if (rpositionByBody(try_stack.items, body)) |p| {
+                    _ = try_stack.orderedRemove(p);
+                }
+            }
+        }
         // Finally exit with a pending return: replay the return through
         // any outer finally, otherwise complete it. The key pinned in
         // `pending_return` is the *done sentinel* — the synthesized exit
