@@ -161,21 +161,29 @@ implicit-composer default) while the real-engine + pass path is brought up.
   Composition now runs `setContent -> composeInitial -> doCompose (GapComposer) ->
   runRecomposeAndApplyChanges -> drain/executeAndFlushAllPendingOperations ->
   SlotTable.write -> guardChanges/trackAbandonedValues`.
-  - **Next blocker: MVCC snapshot lifecycle.** The surfaced `Check failed` is a
-    CASCADE (runTest `TestScope.leave()`'s `check(entered && !finished)`, TestScope.kt:240,
-    fails only because an earlier error was collected). The ROOT, via
-    `KLIO_THROW_TRACE=1`: `IllegalStateException "Snapshot is not open: snapshotId=4,
-    disposed=true, applied=true"` (also id 10) at Snapshot.kt:2058 `validateOpen`
-    (from 842/1419 `takeNestedSnapshot`/1638), thrown inside a coroutine `<lambda>`
-    (empty captured chain -> continuation-resume), collected and re-raised at test
-    end by `kotlinx.coroutines.test.throwAll`. A disposed+applied snapshot is
-    validated as open during the recomposer's advance/apply/dispose cycle
-    (CompositionTest.kt:55 withContext). Likely a `threadSnapshot`
-    (SnapshotThreadLocal) restore across suspend, or `openSnapshots` (SnapshotIdSet)
-    / `snapshotId` (Long) tracking on dispose. This is the snapshot-core subsystem.
-    Diagnose with `KLIO_THROW_TRACE=1` (the root), NOT the Check-failed cascade.
-    Task #44. (Verify whether the composition already renders "Hello!" before this
-    teardown-phase error -- may be very close.)
+  - **MAJOR: the composition RENDERS "Hello!"; one blocker remains -- a snapshot
+    double-apply.** `KLIO_SNAP_TRACE` proves CompositionTests.simple composes
+    successfully on the engine+plugin: `Text` runs, `applyChanges` +
+    `insertTopDown`/`insertBottomUp` build the mock View tree. The surfaced
+    `Check failed` is a CASCADE (runTest `TestScope.leave()` `check(entered &&
+    !finished)`, TestScope.kt:240) of the real root, and the real root is itself a
+    cascade of a snapshot error: `Recomposer.composing()`'s inlined `finally {
+    applyAndCheck(snapshot) }` (Recomposer.kt:1461) runs TWICE on the SAME
+    MutableSnapshot -- 1st call `applied=false` (applies+disposes it), 2nd call
+    `applied=true disposed=true` -> `apply()` -> `validateOpen` throws "Snapshot is
+    not open: snapshotId=4". `takeMutableSnapshot` runs ONCE, so it is a double-run
+    of the inlined finally, not two snapshots. Structure: `composing` (inline;
+    `try { return snapshot.enter(block) } finally { applyAndCheck }`, `enter` also
+    inline with its own try/finally) called at Recomposer.kt:1178 inside an OUTER
+    `try{}catch(Throwable){...return}` (1177), in the suspend recomposer coroutine;
+    the two applyAndCheck straddle an `applyChanges` phase (a later resume). 8+
+    minimal repros (scratchpad snap/snap2/cofin/inlfin/loopfin/tryfin/tryfin2/
+    tryfin3.kt) of nested-inline-try/finally + return + outer try/catch +
+    coroutine/launch/delay ALL give count=1 -- the double-run needs the full
+    recomposer suspend+composition context. Likely a klio coroutine-continuation +
+    inlined-try/finally control-flow bug (a finally re-executing on a resume/return
+    path). Diagnose with `KLIO_SNAP_TRACE` (trace applyAndCheck's snapshot arg state
+    in evalWithCapturesIn), NOT the Check-failed cascade. Task #44.
   - Regression-safe: stdlib_commontest 2298; compose_runtime_commontest 445, 0
     incomplete (fixes 2+3 re-validation running as of this entry).
 
