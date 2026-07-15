@@ -134,6 +134,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.parent_ctor_args = built.parent_ctor_args;
         built.parent_ctor_args = std.StringHashMap([]FuncId).init(allocator);
 
+        prog.parent_ctor_arg_names.deinit();
+        prog.parent_ctor_arg_names = built.parent_ctor_arg_names;
+        built.parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator);
+
         prog.init_blocks.deinit();
         prog.init_blocks = built.init_blocks;
         built.init_blocks = std.StringHashMap([]FuncId).init(allocator);

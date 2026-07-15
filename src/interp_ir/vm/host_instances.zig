@@ -315,6 +315,24 @@ fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]con
     return g.get().parent_ctor_args.get(sideTableKey(fqn, name));
 }
 
+/// The argument labels for the super-constructor call in `class`'s primary
+/// delegation (`: Base(objects = 2)`), parallel to `parentCtorArgThunks`.
+/// `null` when the call was fully positional.
+fn parentCtorArgNames(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const ?[]const u8 {
+    const g = self.prog.borrow();
+    defer g.deinit();
+    return g.get().parent_ctor_arg_names.get(sideTableKey(fqn, name));
+}
+
+/// The index of `param_name` in `pp`, or null if none matches. Used to bind
+/// a named super-constructor argument to the base parameter of that name.
+fn paramIndexByName(pp: []const runtime.ClassParamDef, param_name: []const u8) ?usize {
+    for (pp, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, param_name)) return i;
+    }
+    return null;
+}
+
 /// The `this` slot for a primary-ctor default-arg thunk: an INNER class's
 /// default expressions evaluate with the enclosing instance as the lexical
 /// receiver (`val maxIndex: Int = size` inside `inner class ... ` reads the
@@ -794,7 +812,7 @@ fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Va
 const UnitOrErr = union(enum) { ok: void, err: EvalError };
 
 /// Dispatch the parent's matching secondary-ctor chain on the same leaf.
-fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, class_name: []const u8, args: []const Value) Allocator.Error!UnitOrErr {
+fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, class_name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!UnitOrErr {
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
@@ -820,12 +838,21 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
             const dg = def.borrow();
             const pp = dg.get().primary_params;
             var k: usize = 0;
-            while (k < pp.len and k < args.len) : (k += 1) {
-                if (pp[k].property == null) continue;
-                if (hasNonNullField(leaf.Instance, pp[k].name)) continue;
+            while (k < args.len) : (k += 1) {
+                // A named super-constructor argument (`: Base(objects = 2)`)
+                // binds to the base parameter of that name, not by position;
+                // an unnamed argument keeps its positional slot.
+                const target: usize =
+                    if (arg_names) |names|
+                        (if (k < names.len) (if (names[k]) |nm| (paramIndexByName(pp, nm) orelse k) else k) else k)
+                    else
+                        k;
+                if (target >= pp.len) continue;
+                if (pp[target].property == null) continue;
+                if (hasNonNullField(leaf.Instance, pp[target].name)) continue;
                 const g = leaf.Instance.borrowMut();
-                retainField(g.get(), self.allocator, pp[k].name);
-                try pushField(g.get(), self.allocator, pp[k].name, args[k]);
+                retainField(g.get(), self.allocator, pp[target].name);
+                try pushField(g.get(), self.allocator, pp[target].name, args[k]);
                 g.deinit();
             }
             dg.deinit();
@@ -847,7 +874,10 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         }
         const pref = firstNonInterfaceSuper(self, def) orelse return .{ .ok = {} };
         if (std.mem.eql(u8, pref.name, class_name)) return .{ .ok = {} };
-        return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items);
+        // The labels of this class's super-constructor call apply to the
+        // parent's parameters, so thread them into the parent's frame.
+        const parent_names = parentCtorArgNames(self, class_fqn, class_name);
+        return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items, parent_names);
     };
 
     var next_args: std.ArrayList(Value) = .empty;
@@ -865,7 +895,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         }
     }
     if (entry.is_this) {
-        switch (try runSuperCtorChain(self, leaf, class_fqn, class_name, next_args.items)) {
+        switch (try runSuperCtorChain(self, leaf, class_fqn, class_name, next_args.items, null)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -886,7 +916,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
             def.deinit();
         }
         if (parent_name) |p| {
-            switch (try runSuperCtorChain(self, leaf, parent_fqn, p, next_args.items)) {
+            switch (try runSuperCtorChain(self, leaf, parent_fqn, p, next_args.items, null)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -1904,6 +1934,9 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
 
     if (parent_def) |pdef| {
         const pname = classDefName(pdef);
+        // The labels of this class's super-constructor call apply to the
+        // parent's parameters, so a named argument binds by parameter name.
+        const cur_names = parentCtorArgNames(self, classDefFqn(class_def), class_name);
         ctorGuardPush(class_name);
         const leaf_res = try newInstance(self, allocator, class, &.{}, outer_hint);
         ctorGuardPop();
@@ -1917,16 +1950,22 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
             const pg = pdef.borrow();
             const pp = pg.get().primary_params;
             var k: usize = 0;
-            while (k < pp.len and k < target_args.len) : (k += 1) {
-                if (pp[k].property != null) {
-                    retainField(inst, allocator, pp[k].name);
-                    try pushField(inst, allocator, pp[k].name, target_args[k]);
+            while (k < target_args.len) : (k += 1) {
+                const target: usize =
+                    if (cur_names) |names|
+                        (if (k < names.len) (if (names[k]) |nm| (paramIndexByName(pp, nm) orelse k) else k) else k)
+                    else
+                        k;
+                if (target >= pp.len) continue;
+                if (pp[target].property != null) {
+                    retainField(inst, allocator, pp[target].name);
+                    try pushField(inst, allocator, pp[target].name, target_args[k]);
                 }
             }
             pg.deinit();
             g.deinit();
         }
-        switch (try runSuperCtorChain(self, &leaf, classDefFqn(pdef), pname, target_args)) {
+        switch (try runSuperCtorChain(self, &leaf, classDefFqn(pdef), pname, target_args, cur_names)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -2150,6 +2189,106 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
     }
 
     return materializeInstance(self, allocator, class_def, ir_name, effective.items, outer_hint);
+}
+
+/// Reorder a named super-constructor call's arguments (`: Base(objects = 2)`)
+/// into the parent's declared parameter order. `arg_names[k]`, when non-null,
+/// names the base parameter argument `k` binds to; unnamed arguments keep
+/// their position. Gaps opened by named binding are filled with the
+/// parameter default so the downstream positional field-binding is correct.
+/// No-op when nothing is named. `args` is rewritten in place to length
+/// `n_primary`.
+fn reorderNamedSuperArgs(
+    self: *VmHost,
+    allocator: Allocator,
+    parent_def: ObjRef(ClassDef),
+    fqn: ?[]const u8,
+    name: []const u8,
+    arg_names: ?[]const ?[]const u8,
+    args: *std.ArrayList(Value),
+    outer_hint: ?*const Value,
+) Allocator.Error!UnitOrErr {
+    const names = arg_names orelse return .{ .ok = {} };
+    var any_named = false;
+    for (names) |n| {
+        if (n != null) {
+            any_named = true;
+            break;
+        }
+    }
+    if (!any_named) return .{ .ok = {} };
+    const n_primary = classDefPrimaryParamCount(parent_def);
+    if (n_primary == 0) return .{ .ok = {} };
+
+    var ordered = try allocator.alloc(?Value, n_primary);
+    defer allocator.free(ordered);
+    for (ordered) |*o| o.* = null;
+    for (args.items, 0..) |v, k| {
+        var target = k;
+        if (k < names.len) {
+            if (names[k]) |nm| {
+                const dg = parent_def.borrow();
+                if (paramIndexByName(dg.get().primary_params, nm)) |ti| target = ti;
+                dg.deinit();
+            }
+        }
+        if (target < n_primary) ordered[target] = v;
+    }
+
+    const default_thunks = primaryDefaultThunks(self, fqn, name);
+    var filled: std.ArrayList(Value) = .empty;
+    errdefer filled.deinit(allocator);
+    var i: usize = 0;
+    while (i < n_primary) : (i += 1) {
+        if (ordered[i]) |v| {
+            try filled.append(allocator, v);
+            continue;
+        }
+        var dflt_expr: ?*const ast.Expr = null;
+        {
+            const dg = parent_def.borrow();
+            defer dg.deinit();
+            if (i < dg.get().primary_params.len) {
+                if (dg.get().primary_params[i].default) |ff| dflt_expr = ff.get();
+            }
+        }
+        var v: Value = .Null;
+        if (dflt_expr) |de| {
+            if (try defaultValueForPrimary(allocator, de)) |lv| {
+                v = lv;
+            } else if (try pathConstDefault(self, de)) |lv| {
+                v = lv;
+            } else if (default_thunks) |slots| {
+                if (i < slots.len) {
+                    if (slots[i]) |dfid| {
+                        const fr = try funcAt(self, dfid, "parent primary ctor default");
+                        switch (fr) {
+                            .err => {},
+                            .ok => |func| {
+                                var thunk_args: std.ArrayList(Value) = .empty;
+                                defer thunk_args.deinit(allocator);
+                                try thunk_args.append(allocator, ctorThunkThisSlot(parent_def, outer_hint));
+                                try thunk_args.appendSlice(allocator, filled.items);
+                                while (thunk_args.items.len < n_primary + 1) {
+                                    try thunk_args.append(allocator, .Null);
+                                }
+                                switch (try evalThunk(self, func, thunk_args.items)) {
+                                    .ok => |rv| v = rv,
+                                    .err => |e| return .{ .err = e },
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        try filled.append(allocator, v);
+    }
+
+    args.clearRetainingCapacity();
+    try args.appendSlice(allocator, filled.items);
+    filled.deinit(allocator);
+    return .{ .ok = {} };
 }
 
 /// Pad a parent class's super-delegation args with the defaults for any
@@ -2529,6 +2668,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             if (parent_def) |d| d.deinit();
             parent_args.deinit(allocator);
             break;
+        }
+        // Reorder any named super-constructor arguments into the parent's
+        // parameter order before the positional field-binding below reads
+        // them (`: Base(objects = 2)` must set `objects`, not the first slot).
+        if (parent_def) |d| {
+            switch (try reorderNamedSuperArgs(self, allocator, d, pref.fqn, pname, parentCtorArgNames(self, cur_fqn, cur_class), &parent_args, outer_hint)) {
+                .ok => {},
+                .err => |e| {
+                    d.deinit();
+                    parent_args.deinit(allocator);
+                    return .{ .err = e };
+                },
+            }
+            d.deinit();
         }
         // Fill any trailing primary-ctor params the subclass omitted from
         // its `super(...)` delegation with the parent's defaults.
