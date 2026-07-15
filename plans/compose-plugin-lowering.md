@@ -141,6 +141,40 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-15: **Three more interpreter fixes: composition now RENDERS fully and
+  runs into the coroutines test-harness teardown.** On the engine + plugin path
+  (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
+  --filter=CompositionTests.simple`), each fix cleared the next blocker:
+  1. **`composing()` finally double-apply** (commit c29e6855) — a spliced inline
+     `try { return snap.enter(block) } finally { applyAndCheck }` applied its
+     `MutableSnapshot` twice ("Snapshot is not open"). Two defects: the inline
+     return replayed an ENCLOSING inline frame's finallys (fixed with
+     `InlineReturn.finally_base`), and the inline-return `Goto join` left the
+     finally structure's runtime `TryFrame` on the stack for a later plain return
+     to re-enter (fixed with `Block.pop_on_exit`). Repro scratchpad tryfin9.kt.
+  2. **Named super-constructor argument bound by position** (commit 774475e8) —
+     `object UpdateNode : Operation(objects = 2)` set `ints` (first base param)
+     and left `objects` default, so the changelist `Operations` buffer reserved
+     no object slots and a node update read a stale slot (a GapAnchor) as its
+     value. The parser now keeps the arg label (`supertype_arg_names`), lowered
+     into `parent_ctor_arg_names`, and construction binds a named super-arg to the
+     base param of that name (filling default gaps). Repro scratchpad
+     objsuper.kt/objsuper2.kt.
+  3. **Getter's suspend-lambda lost its receiver** — `val children: Sequence<Int>
+     get() = sequence { … this@JobSupport … }`: `evalGetter` ran the getter body
+     with the receiver only as a param, never publishing it on the lexical
+     receiver chain the way a member call does, so a nested `sequence {}` /
+     `iterator {}` AstLambda captured an empty chain (`this@Class` unbound / a
+     member read as a global). `evalGetter` now `pushEnclosing`es the receiver.
+     Repro scratchpad seqthis*.kt.
+  Regression-clean each time (stdlib 2298; coroutines 234 vs 220 baseline;
+  compose_runtime 445 vs 400). CompositionTests.simple now composes "Hello!"
+  through the real GapComposer and fails only in `runTest`'s teardown:
+  `UncompletedCoroutinesError` -> `check(false)` (a coroutine — likely the
+  Recomposer await loop — is not completed/cancelled at test end);
+  simpleChanges hits `Vm::call_member compareTo on ChildHandleNode`. Both are
+  coroutines-test-harness lifecycle blockers, not composition bugs (task #46).
+
 - 2026-07-15: **Four interpreter fixes drove CompositionTests.simple deep into the
   real composer.** In order, each fix advanced to the next blocker on the engine +
   plugin path (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
