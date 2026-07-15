@@ -4733,6 +4733,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
     if (try lowerCompanionShortcut(b, callee, args, ast_arg_names)) |r| return r;
 
+    // Package-qualified constructor call (`app.sub.Widget()`): the dotted
+    // callee names a class, so construct it — before the function-FQN and
+    // member-fallback paths, which would otherwise read the package head as a
+    // field of the implicit receiver (`get_field app on this`).
+    if (callee.* == .Member) {
+        if (try lowerFqnCtorCall(b, expr)) |r| return r;
+    }
     // Package-qualified call to a user / pack top-level function.
     if (callee.* == .Member) {
         if (try lowerFqnFlattenCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
@@ -8435,6 +8442,37 @@ fn lowerCompanionShortcut(
         }
     }
     return null;
+}
+
+/// Package-qualified constructor call: the dotted callee (`app.sub.Widget()`)
+/// names a class by its fully-qualified name. Rewrite it to a bare constructor
+/// call on the class's simple name so the ordinary class-name path constructs
+/// it — otherwise the member fallback reads the package head as a field of the
+/// implicit receiver. Only fires when the head is genuinely a package (not a
+/// local/captured/enclosing-member in scope) and the FQN names a class.
+fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+    const callee = expr.Call.callee;
+    const fqn = (try collectDottedFqn(b.allocator, callee)) orelse return null;
+    defer b.allocator.free(fqn);
+    const tail = rsplitLast(fqn, '.');
+    if (std.mem.eql(u8, tail, fqn)) return null; // not dotted
+    if (b.module.classIdByFqn(fqn) == null) return null; // FQN is not a class
+    const head = firstSegment(fqn);
+    // The head must be a real package the reference qualifies through, not a
+    // name that resolves in scope (which would be a member/local access).
+    if (!headIsPackage(b, head)) return null;
+    if (b.resolve(head) != null or b.knowsOuter(head) or b.hasEnclosingMember(head)) return null;
+    if (b.module.classId(head) != null) return null; // head names a class: nested-class path handles it
+    // Rewrite the callee to the class's simple name and re-lower as a bare
+    // constructor call.
+    const segs = try b.allocator.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = tail, .span = exprSpan(callee) };
+    const new_callee = try b.allocator.create(Expr);
+    new_callee.* = Expr{ .Path = .{ .segments = segs, .span = exprSpan(callee) } };
+    var new_call = expr.Call;
+    new_call.callee = new_callee;
+    const rewritten = Expr{ .Call = new_call };
+    return try lowerCallGeneral(b, &rewritten);
 }
 
 /// Package-qualified call to a user / pack top-level function (FQN flatten).

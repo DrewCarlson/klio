@@ -84,6 +84,7 @@ Run any program with:
 | `vararg_nonfinal.kt`         | `vararg` before a trailing defaulted parameter, called positionally (top-level, inline, member). |
 | `class_factory_overload.kt`  | Same-name factory function vs constructor, disambiguated by argument type and arity. |
 | `trailing_lambda_overload_writeback.kt` | A trailing-lambda call whose block mutates a captured variable still binds the lambda-hosting overload (a receiver extension), not a same-named top-level function whose last parameter is a scalar — the pattern behind `SlotWriter.group(key) { ... }`. |
+| `qualified_constructor_call.kt` | A fully-qualified constructor call (`demo.app.Widget(...)`) from inside a class method resolves the package-qualified class, not a field access on the implicit receiver — the pattern behind the engine's `androidx.compose.runtime.composer.gapbuffer.SlotTable()`. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
 | `reified_inline_property_receiver.kt` | A reified inline extension spliced on a CLASS PROPERTY receiver, so `is T` tests the real class (the receiver type comes from the enclosing class's members, not just locals/params). |
 | `smartcast_extension_receiver.kt` | Smart casts narrow the receiver's STATIC type, so an extension resolves against the narrowed type (`is String` -> `CharSequence.isEmpty`), in both the `when`-subject and `if (x is T)` forms. |
