@@ -5965,6 +5965,20 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                         return ok(.{ .Bool = if (neg) !eq else eq });
                     }
                 }
+                // Mixed-width SIGNED integer equality compares by numeric value:
+                // Kotlin promotes `1 == 1L`. This also reconciles a value whose
+                // Long type came from a widened Int literal against a real Long
+                // (`const val X: LongAlias = -1` vs a Long `-1`). Boxed `Any`
+                // equality is EXCLUDED: `(1 as Any) != (1L as Any)` in Kotlin,
+                // so those keep the tag-sensitive structural comparison.
+                if (op == .Eq or op == .NotEq) {
+                    if (asSignedI64(&lc)) |ls| {
+                        if (asSignedI64(&rc)) |rs| {
+                            const eq = ls == rs;
+                            return ok(.{ .Bool = if (op == .NotEq) !eq else eq });
+                        }
+                    }
+                }
             }
             const eq = if (op == .BoxedEq or op == .BoxedNotEq)
                 Value.structuralEqBoxed(&lc, &rc)
