@@ -255,6 +255,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_enclosing_recv = null;
         b.setEnclosingRecvTy(rt);
     }
+    // Enclosing non-reified type params, so an `x as T` cast in this body is
+    // erased (see FuncBuilder.type_param_names).
+    if (module.pending_lambda_type_params) |tps| {
+        module.pending_lambda_type_params = null;
+        for (tps) |tp| try b.addTypeParamName(tp);
+    }
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that
     // declares it: a private getter (`closed`) reads the right field, and

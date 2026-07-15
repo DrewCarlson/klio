@@ -25,11 +25,13 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of upstream Compose runtime test cases that must pass. A
-/// ratchet: bump it as core-composer fixes land, never down. 268 pass when the
-/// suite runs alone; under a full `test-all` the machine is saturated and more
-/// children hit the per-child cap, so the ratchet leaves real headroom rather
-/// than tracking the best-case number.
-const BASELINE: usize = 295;
+/// ratchet: bump it as core-composer fixes land, never down. Static-receiver-
+/// directed member dispatch (the `is_override` visibility filter) unblocked the
+/// persistent-map `getOrElse`/`get<T>` recursion that broke the snapshot/state
+/// cluster: the suite jumps to ~441 passing standalone. Under a full `test-all`
+/// the machine is saturated and more children hit the per-child cap, so the
+/// ratchet leaves real headroom rather than tracking the best-case number.
+const BASELINE: usize = 400;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 /// The mock View/Applier harness the tests compose against, plus the two test

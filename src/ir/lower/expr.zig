@@ -133,8 +133,21 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // same-named top-level class owns the bare `class_id`. Falling
         // through to `lowerExpr` applies the rewrite in the `Path` arm.
         const aliased = scopeTypeRename(b, n, segments[0].span.file.int()) != null;
+        // A class whose bare simple name is unregistered because it
+        // collision-mangled (two `internal` classes named `TrieNode` in
+        // different packages) is still pinned by the file's named import:
+        // resolve `import …immutableMap.TrieNode` through its FQN. Without
+        // this the receiver of `TrieNode.EMPTY` in an importing file falls to
+        // a member access on the implicit receiver (`get_field TrieNode on
+        // Companion`).
+        const imported_cid: ?ir.ClassId = if (!aliased and b.module.classId(n) == null) blk: {
+            for (b.module.importAliasPathsIn(segments[0].span.file, n)) |p| {
+                if (b.module.classIdByFqn(p.fqn)) |cid| break :blk cid;
+            }
+            break :blk null;
+        } else null;
         if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and
-            b.module.classId(n) != null and !enclosingMemberShadowsClass(b, n))
+            (b.module.classId(n) != null or imported_cid != null) and !enclosingMemberShadowsClass(b, n))
         {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = n });
@@ -149,6 +162,7 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // from an unimported package (`kotlin.math.E` at the shipped
             // tier) must not outrank a user classifier named `E`.
             const cls_pick: ?ir.ClassId = blk: {
+                if (imported_cid) |cid| break :blk cid;
                 if (isTopLevelProp(n)) {
                     const pt = b.module.topLevelPropRefTier(n, b.self_package, segments[0].span.file) orelse 255;
                     const ct = b.module.classRefTier(n, b.self_package, segments[0].span.file) orelse 255;
@@ -156,7 +170,11 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
                 break :blk b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
             };
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
+            // A collision-mangled import target has no name-published singleton
+            // to fall back on (`TrieNode` is registered only under its mangled
+            // simple name), so load the class value by id directly — the
+            // subsequent `.EMPTY` reads its companion off that value.
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick, .ctor_ref = imported_cid != null } });
             return dst;
         }
     }
@@ -2148,6 +2166,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         break :blk b.enclosingRecvTy();
     };
+    // Carry the enclosing non-reified type-parameter names so an `x as T`
+    // cast inside the lambda body is still erased.
+    b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -3770,6 +3791,27 @@ fn lowerCallWithWritebackPath(
                 }
             }
         }
+        // A trailing-lambda call must bind an overload whose last parameter is
+        // function-typed. The bare-call index can pick a same-named sibling
+        // (`group(metadata: LongArray, offset: Int)`) that cannot host the
+        // lambda; when the trailing lambda mutates an outer var the call routes
+        // through this writeback path instead of the general one, so apply the
+        // same trailing-lambda-hosting preference here — otherwise a static
+        // `Call` binds the wrong overload and the lambda lands on a scalar
+        // parameter. Only override when the current pick genuinely cannot host
+        // the lambda, to leave a correct index resolution untouched.
+        if (lastArgIsLambda(args)) {
+            const cur_hosts = if (bound_id) |bid| blk: {
+                const f = b.module.funcById(bid) orelse break :blk false;
+                if (f.params.len == 0) break :blk false;
+                const last = f.params[f.params.len - 1];
+                break :blk !last.is_vararg and fnTypeArityAlias(b, last.ty) != null;
+            } else false;
+            if (!cur_hosts) {
+                if (overloadHostingTrailingLambda(b, segments[0].name, args.len)) |fid|
+                    bound_id = fid;
+            }
+        }
         if (bound_id) |bid| {
             _ = try recordOutOfScopeCall(b, segments[0].name, segments[0].span, bid, ires);
         }
@@ -4709,6 +4751,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
     if (try lowerCompanionShortcut(b, callee, args, ast_arg_names)) |r| return r;
 
+    // Package-qualified constructor call (`app.sub.Widget()`): the dotted
+    // callee names a class, so construct it — before the function-FQN and
+    // member-fallback paths, which would otherwise read the package head as a
+    // field of the implicit receiver (`get_field app on this`).
+    if (callee.* == .Member) {
+        if (try lowerFqnCtorCall(b, expr)) |r| return r;
+    }
     // Package-qualified call to a user / pack top-level function.
     if (callee.* == .Member) {
         if (try lowerFqnFlattenCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
@@ -5010,7 +5059,20 @@ fn inlineTargetForBareCall(
                     }
                 }
             }
-            break :blk inline_state.inlineAstById(fid.int());
+            const idx_pick = inline_state.inlineAstById(fid.int());
+            // A trailing-lambda call cannot bind a candidate whose last
+            // parameter is not function-typed: the lambda would land on a
+            // scalar parameter (`group(metadata: LongArray, offset: Int)`
+            // absorbing `group(200) { … }`). When the index resolves such a
+            // namesake for a trailing-lambda call, decline the inline splice so
+            // the ordinary path resolves the lambda-hosting overload (the
+            // receiver extension) instead.
+            if (shape.last_is_lambda) {
+                if (idx_pick) |ip| {
+                    if (!astLastParamHostsLambda(ip)) break :blk null;
+                }
+            }
+            break :blk idx_pick;
         },
         // The index declined; the shape-narrowed pick stands in — but a
         // plain (receiverless) inline fn is only a legal target when its
@@ -5389,6 +5451,16 @@ fn inlineResolveAudit(
 /// declared arity differing from the call's (a trailing-lambda gap the
 /// candidate's fn-typed last parameter absorbs is exact enough). The
 /// AST-side mirror of `heurPickInexact`.
+/// Whether `f`'s last parameter is function-typed, so it can host a trailing
+/// lambda argument. A candidate that fails this cannot be the target of a
+/// `name(args) { … }` call — the block would bind a scalar parameter.
+fn astLastParamHostsLambda(f: *const ast.Function) bool {
+    if (f.params.len == 0) return false;
+    const last = f.params[f.params.len - 1];
+    if (last.is_vararg) return false;
+    return last.ty.function != null;
+}
+
 fn astPickInexact(f: *const ast.Function, want: usize, last_is_lambda: bool) bool {
     for (f.params) |p| {
         if (p.is_vararg) return true;
@@ -8388,6 +8460,37 @@ fn lowerCompanionShortcut(
         }
     }
     return null;
+}
+
+/// Package-qualified constructor call: the dotted callee (`app.sub.Widget()`)
+/// names a class by its fully-qualified name. Rewrite it to a bare constructor
+/// call on the class's simple name so the ordinary class-name path constructs
+/// it — otherwise the member fallback reads the package head as a field of the
+/// implicit receiver. Only fires when the head is genuinely a package (not a
+/// local/captured/enclosing-member in scope) and the FQN names a class.
+fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+    const callee = expr.Call.callee;
+    const fqn = (try collectDottedFqn(b.allocator, callee)) orelse return null;
+    defer b.allocator.free(fqn);
+    const tail = rsplitLast(fqn, '.');
+    if (std.mem.eql(u8, tail, fqn)) return null; // not dotted
+    if (b.module.classIdByFqn(fqn) == null) return null; // FQN is not a class
+    const head = firstSegment(fqn);
+    // The head must be a real package the reference qualifies through, not a
+    // name that resolves in scope (which would be a member/local access).
+    if (!headIsPackage(b, head)) return null;
+    if (b.resolve(head) != null or b.knowsOuter(head) or b.hasEnclosingMember(head)) return null;
+    if (b.module.classId(head) != null) return null; // head names a class: nested-class path handles it
+    // Rewrite the callee to the class's simple name and re-lower as a bare
+    // constructor call.
+    const segs = try b.allocator.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = tail, .span = exprSpan(callee) };
+    const new_callee = try b.allocator.create(Expr);
+    new_callee.* = Expr{ .Path = .{ .segments = segs, .span = exprSpan(callee) } };
+    var new_call = expr.Call;
+    new_call.callee = new_callee;
+    const rewritten = Expr{ .Call = new_call };
+    return try lowerCallGeneral(b, &rewritten);
 }
 
 /// Package-qualified call to a user / pack top-level function (FQN flatten).
