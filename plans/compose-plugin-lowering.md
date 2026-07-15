@@ -202,15 +202,23 @@ implicit-composer default) while the real-engine + pass path is brought up.
     erases to `Any` (commit a1400f17); the tooling engine files ship.
   - **MILESTONE: composition RUNS through the real GapComposer + SlotTable.**
     `compose { Text("Hello!") }` now lowers, resolves, and executes through the
-    real engine — no unresolved references — and reaches an internal engine
-    invariant: `IllegalStateException: Check failed` (a `checkPrecondition` /
-    `runtimeCheck` in the composer, i.e. the emitted group structure does not yet
-    match the SlotTable's expectations). This is the Phase-2 entry point: the
-    pass emits the restartable-group skeleton (startRestartGroup / endRestartGroup)
-    but not the full group discipline the composer asserts — `$dirty`/skipping,
-    `skipToGroupEnd`, `sourceInformation`, and correct child-group nesting for the
-    content lambda and each `Text`. Getting the group structure exactly ABI-correct
-    is the next work; then the SlotTable-family + CompositionTests become reachable.
+    real engine — no unresolved references. The current failure is NOT the group
+    structure (an earlier guess); traced with `KLIO_THROW_STACK` + `KLIO_INIT_DEBUG`
+    to a top-level INIT failure, surfaced during `Recomposer(coroutineContext)`
+    setup and cascading to secondary failures (`TestScope.leave()`'s
+    `check(entered && !finished)`, re-raised by `joinBlocking` → the reported
+    `IllegalStateException: Check failed`).
+  - **Next blocker (precise):** `PersistentCompositionLocalHashMap$Companion` init
+    fails with `Vm::get_field TrieNode on …PersistentCompositionLocalHashMap.Companion`.
+    Its companion does `PersistentCompositionLocalHashMap(node = TrieNode.EMPTY as …)`
+    where `TrieNode` is an IMPORTED class (`…immutableMap.TrieNode`), but inside the
+    baked pack's companion init klio reads `TrieNode` as a field of the Companion
+    instead of resolving the import. Source-mode repros of the same shape resolve
+    correctly, so this is a BAKED-PACK import-resolution issue (cf. the open
+    `klio-imported-companion-val-baking-bug`) — an imported class name in a baked
+    companion initializer falls through to a member access on `this`. Fix that,
+    then the next composition failures surface, then eventually the group-structure
+    ABI (`$dirty`/skipping/`skipToGroupEnd`) for CompositionTests + SlotTable-family.
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
