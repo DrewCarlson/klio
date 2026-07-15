@@ -40,7 +40,7 @@ const mod_list = [_]Mod{
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
-    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability" }, .tested = true },
+    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass" }, .tested = true },
     .{ .name = "stdlib_pack", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "stdlib_gen", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "kotlinx_atomicfu", .deps = &.{ "runtime", "stdlib" }, .tested = true },

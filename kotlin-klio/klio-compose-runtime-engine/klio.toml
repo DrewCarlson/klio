@@ -1,0 +1,204 @@
+[library]
+# androidx.compose.runtime — the Compose Multiplatform runtime. A pack is
+# selected when a user import prefix-matches its id, so importing any
+# `androidx.compose.runtime.*` symbol pulls this pack in.
+id = "androidx.compose.runtime"
+version = "1.11.1"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+# Upstream androidx.compose.runtime commonMain, consumed straight from the
+# in-pack git submodule (compose-multiplatform-core v1.11.1). `include` curates
+# exactly the files klio can lex + parse and that do not depend on the compiler
+# plugin: the public annotations / contracts. The compiler-coupled engine
+# (Composer / SlotTable / Recomposer), the MVCC snapshot core, and the
+# platform/atomic `expect`s are supplied instead by the klioMain layer below
+# (klio has no compiler plugin; the interpreter threads an implicit composer +
+# positional group keys, and `currentComposer` resolves to it).
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/runtime/runtime/src/commonMain/kotlin"
+include = [
+    # Marker + opt-in annotations (pure declarations).
+    "androidx/compose/runtime/Composable.kt",
+    "androidx/compose/runtime/ComposableTarget.kt",
+    "androidx/compose/runtime/ComposableTargetMarker.kt",
+    "androidx/compose/runtime/ComposableInferredTarget.kt",
+    "androidx/compose/runtime/ComposableOpenTarget.kt",
+    "androidx/compose/runtime/ComposeCompilerApi.kt",
+    "androidx/compose/runtime/DisallowComposableCalls.kt",
+    "androidx/compose/runtime/DontMemoize.kt",
+    "androidx/compose/runtime/ExplicitGroupsComposable.kt",
+    "androidx/compose/runtime/NonRestartableComposable.kt",
+    "androidx/compose/runtime/NonSkippableComposable.kt",
+    "androidx/compose/runtime/ReadOnlyComposable.kt",
+    "androidx/compose/runtime/NoLiveLiterals.kt",
+    "androidx/compose/runtime/InternalComposeApi.kt",
+    "androidx/compose/runtime/ExperimentalComposeApi.kt",
+    "androidx/compose/runtime/ExperimentalComposeRuntimeApi.kt",
+    "androidx/compose/runtime/InternalComposeTracingApi.kt",
+    "androidx/compose/runtime/ComposeRuntimeFlags.kt",
+    "androidx/compose/runtime/ComposeVersion.kt",
+    "androidx/compose/runtime/internal/FunctionKeyMeta.kt",
+    "androidx/compose/runtime/internal/StabilityInferred.kt",
+    # Pure public interface: a remembered value implementing it gets
+    # onRemembered/onForgotten lifecycle callbacks (wired by the klioMain engine).
+    "androidx/compose/runtime/RememberObserver.kt",
+    # Frame clock: the MonotonicFrameClock contract + BroadcastFrameClock driver
+    # + its AwaiterQueue store, consumed straight from upstream. The platform
+    # `synchronized` + atomic `expect`s these pull in are satisfied by the
+    # klioMain actuals below (platform/Synchronization.kt, internal/Atomic.kt).
+    "androidx/compose/runtime/MonotonicFrameClock.kt",
+    "androidx/compose/runtime/BroadcastFrameClock.kt",
+    "androidx/compose/runtime/CancellationHandle.kt",
+    "androidx/compose/runtime/internal/AwaiterQueue.kt",
+    "androidx/compose/runtime/internal/Atomic.kt",
+    "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/runtime/platform/Synchronization.kt",
+    # Standalone engine data structures, consumed straight from upstream: they
+    # depend only on the stdlib + androidx.collection, so they run here exactly
+    # as they do on the JVM — and their own upstream tests exercise them.
+    "androidx/compose/runtime/snapshots/SnapshotIdSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotWeakSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotDoubleIndexHeap.kt",
+    # The real MVCC snapshot core + the StateObject-backed state objects,
+    # replacing klio's shims. Platform actuals for the expects (SnapshotId,
+    # SnapshotStateList/Set, the primitive Snapshot*State factories, thread id)
+    # come from the nonAndroidMain source root below + klioMain.
+    "androidx/compose/runtime/snapshots/Snapshot.kt",
+    "androidx/compose/runtime/snapshots/SnapshotId.kt",
+    "androidx/compose/runtime/snapshots/StateObjectImpl.kt",
+    "androidx/compose/runtime/snapshots/StateFactoryMarker.kt",
+    "androidx/compose/runtime/snapshots/AutoboxingStateValueProperty.kt",
+    "androidx/compose/runtime/snapshots/ListUtils.kt",
+    "androidx/compose/runtime/snapshots/SnapshotMutableState.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateList.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateMap.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateObserver.kt",
+    "androidx/compose/runtime/snapshots/SnapshotContextElement.kt",
+    "androidx/compose/runtime/snapshots/tooling/SnapshotObserver.kt",
+    "androidx/compose/runtime/internal/SnapshotThreadLocal.kt",
+    "androidx/compose/runtime/internal/Thread.kt",
+    "androidx/compose/runtime/internal/IntRef.kt",
+    "androidx/compose/runtime/SnapshotState.kt",
+    "androidx/compose/runtime/SnapshotMutationPolicy.kt",
+    "androidx/compose/runtime/DerivedState.kt",
+    "androidx/compose/runtime/SnapshotIntState.kt",
+    "androidx/compose/runtime/SnapshotLongState.kt",
+    "androidx/compose/runtime/SnapshotFloatState.kt",
+    "androidx/compose/runtime/SnapshotDoubleState.kt",
+    "androidx/compose/runtime/collection/ScopeMap.kt",
+    "androidx/compose/runtime/collection/MultiValueMap.kt",
+    "androidx/compose/runtime/collection/ScatterSetWrapper.kt",
+    # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
+    # uses pervasively. Standalone (stdlib only), consumed straight from upstream.
+    "androidx/compose/runtime/collection/MutableVector.kt",
+    # --- upstream gap engine (variant) ---
+    "androidx/compose/runtime/Anchor.kt",
+    "androidx/compose/runtime/Applier.kt",
+    "androidx/compose/runtime/BitwiseOperators.kt",
+    "androidx/compose/runtime/CheckResult.kt",
+    "androidx/compose/runtime/Composables.kt",
+    "androidx/compose/runtime/ComposeNodeLifecycleCallback.kt",
+    "androidx/compose/runtime/Composer.kt",
+    "androidx/compose/runtime/CompositeKeyHashCode.kt",
+    "androidx/compose/runtime/CompositionContext.kt",
+    "androidx/compose/runtime/Composition.kt",
+    "androidx/compose/runtime/CompositionLocal.kt",
+    "androidx/compose/runtime/CompositionLocalMap.kt",
+    "androidx/compose/runtime/Effects.kt",
+    "androidx/compose/runtime/GapComposer.kt",
+    "androidx/compose/runtime/HostDefaultKey.kt",
+    "androidx/compose/runtime/HostDefaultProvider.kt",
+    "androidx/compose/runtime/JoinedKey.kt",
+    "androidx/compose/runtime/Latch.kt",
+    "androidx/compose/runtime/MovableContent.kt",
+    "androidx/compose/runtime/NextFrameEndCallbackQueue.kt",
+    "androidx/compose/runtime/OpaqueKey.kt",
+    "androidx/compose/runtime/PausableComposition.kt",
+    "androidx/compose/runtime/PausableMonotonicFrameClock.kt",
+    "androidx/compose/runtime/Preconditions.kt",
+    "androidx/compose/runtime/ProduceState.kt",
+    "androidx/compose/runtime/Recomposer.kt",
+    "androidx/compose/runtime/RecomposeScopeImpl.kt",
+    "androidx/compose/runtime/SnapshotFlow.kt",
+    "androidx/compose/runtime/SnapshotStateExtensions.kt",
+    "androidx/compose/runtime/Stack.kt",
+    "androidx/compose/runtime/TestOnly.kt",
+    "androidx/compose/runtime/ValueHolders.kt",
+    "androidx/compose/runtime/internal/ComposableLambda.kt",
+    "androidx/compose/runtime/internal/PersistentCompositionLocalMap.kt",
+    "androidx/compose/runtime/internal/RememberEventDispatcher.kt",
+    "androidx/compose/runtime/internal/Trace.kt",
+    "androidx/compose/runtime/internal/Utils.kt",
+    "androidx/compose/runtime/internal/PlatformOptimizedCancellationException.kt",
+    "androidx/compose/runtime/collection/Extensions.kt",
+    "androidx/compose/runtime/composer/DebugStringFormattable.kt",
+    "androidx/compose/runtime/composer/GroupInfo.kt",
+    "androidx/compose/runtime/composer/GroupKind.kt",
+    "androidx/compose/runtime/composer/GroupSourceInformation.kt",
+    "androidx/compose/runtime/composer/RememberManager.kt",
+    "androidx/compose/runtime/composer/gapbuffer/SlotTable.kt",
+    "androidx/compose/runtime/composer/gapbuffer/GapAnchor.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/ChangeList.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/ComposerChangeListWriter.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/FixupList.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/Operation.kt",
+    "androidx/compose/runtime/composer/gapbuffer/changelist/Operations.kt",
+]
+
+# The bundled persistent immutable collections
+# (androidx.compose.runtime.external.kotlinx.collections.immutable): a pure
+# stdlib library the snapshot state objects are built on. Its own source root so
+# every file ships without an include list.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/runtime/runtime/src/commonMain/kotlin"
+include = [
+    "androidx/compose/runtime/external/kotlinx/collections/immutable/",
+]
+
+# nonAndroidMain: the platform actuals for the snapshot state objects.
+[[source]]
+root = "../klio-compose-runtime/upstream/compose/runtime/runtime/src/nonAndroidMain/kotlin"
+include = [
+    "androidx/compose/runtime/snapshots/SnapshotStateList.nonAndroid.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateSet.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotIntState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotLongState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotFloatState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotDoubleState.nonAndroid.kt",
+]
+
+# klio-supplied layer: the composer / composition / recomposer / snapshot-state
+# engine reimplemented in plain Kotlin, plus actuals for the platform/atomic
+# `expect`s and the host-intrinsic entrypoints (backed by src/compose_runtime).
+[[source]]
+root = "../klio-compose-runtime/klioMain"
+# Engine variant: only platform actuals + klio-specific annotations/host
+# bridges kept; composer/composition/effects/tooling supplied by upstream.
+include = [
+    "androidx/compose/runtime/collection/ArrayUtils.kt",
+    "androidx/compose/runtime/internal/Atomic.kt",
+    "androidx/compose/runtime/internal/Thread.kt",
+    "androidx/compose/runtime/internal/WeakReference.kt",
+    "androidx/compose/runtime/internal/JvmDefaultWithCompatibility.kt",
+    "androidx/compose/runtime/platform/Synchronization.kt",
+    "androidx/compose/runtime/snapshots/SnapshotContextElementActual.kt",
+    "androidx/compose/runtime/snapshots/SnapshotIdActuals.kt",
+    "androidx/compose/runtime/HostIntrinsics.kt",
+    "androidx/compose/runtime/Stability.kt",
+    "androidx/compose/runtime/StateObservation.kt",
+]
+[[deps]]
+id = "stdlib"
+# The coroutine-backed effects (rememberCoroutineScope / LaunchedEffect /
+# produceState) build on the kotlinx.coroutines pack.
+[[deps]]
+id = "kotlinx.coroutines"
+# The compose runtime's common code (frame clock, AwaiterQueue, snapshot
+# system, collections) is built on androidx.collection.
+[[deps]]
+id = "androidx.collection"
