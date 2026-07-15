@@ -163,6 +163,64 @@ const B = struct {
 /// integration supplies this from resolution; unit tests supply a fixed set.
 pub const ComposableOracle = *const fn (ctx: *anyopaque, callee_name: []const u8) bool;
 
+/// A name-set oracle: a call is composable when its callee's simple name is a
+/// declared `@Composable` function. This is the integration oracle (the plugin
+/// resolves precisely by symbol; a simple-name set covers the compose API, whose
+/// composable functions are consistently named — `Text`, `Column`, `Linear`).
+pub const NameSetOracle = struct {
+    names: *const std.StringHashMap(void),
+
+    fn isComposableCall(ctx: *anyopaque, callee_name: []const u8) bool {
+        const self: *const NameSetOracle = @ptrCast(@alignCast(ctx));
+        return self.names.contains(callee_name);
+    }
+};
+
+/// Collect the simple names of every `@Composable` function declared across a
+/// decl slice (top level + class/object members). The result feeds the
+/// integration oracle. Caller owns the returned map.
+pub fn collectComposableNames(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectInto(&set, decls);
+    return set;
+}
+
+fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (isComposable(f.annotations)) try set.put(f.name.name, {});
+        },
+        .Class => |*c| try collectInto(set, c.members),
+        .Object => |*o| try collectInto(set, o.members),
+        else => {},
+    };
+}
+
+/// Transform every `@Composable` top-level function in `decls` in place,
+/// threading the composer per the plugin ABI. `composable_names` is the oracle
+/// set (built with `collectComposableNames`, optionally extended with names from
+/// a baked base). Class/object members and composable lambdas are handled by a
+/// later phase.
+pub fn transformDecls(
+    a: std.mem.Allocator,
+    decls: []ast.Decl,
+    composable_names: *const std.StringHashMap(void),
+) std.mem.Allocator.Error!void {
+    var oracle = NameSetOracle{ .names = composable_names };
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (!isComposable(f.annotations)) continue;
+            if (f.body == null) continue;
+            const nf = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, &oracle);
+            f.* = nf;
+        },
+        else => {},
+    };
+}
+
 /// The Phase-1 transform. Returns a NEW `Function` (the input is not mutated);
 /// all fresh nodes are arena-allocated. `oracle`/`oracle_ctx` classify callees.
 pub fn transformComposableFunction(

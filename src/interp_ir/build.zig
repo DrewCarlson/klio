@@ -15,6 +15,7 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const FF = runtime.forest.ForestField;
 const ast = @import("ast");
+const compose_pass = @import("compose_pass");
 const span = @import("span");
 const stdlib = @import("stdlib");
 
@@ -434,6 +435,21 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         try decls.appendSlice(allocator, f.decls);
         try imports.appendSlice(allocator, f.imports);
+    }
+
+    // `@Composable` lowering plugin (KLIO_COMPOSE_PLUGIN): rewrite composable
+    // functions to thread the composer per the Compose plugin ABI, so upstream's
+    // real Composer/SlotTable runs. Off by default — the implicit-composer
+    // runtime hook stays the shipped path and `main` is unaffected. The oracle
+    // spans this module's decls plus the baked base (pack composables the user
+    // calls, e.g. `Text`).
+    if (composePluginEnabled()) {
+        var names = try compose_pass.collectComposableNames(allocator, decls.items);
+        defer names.deinit();
+        if (base) |bsp| try composeBaseNames(&names, bsp);
+        if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null)
+            std.debug.print("[compose-pass] enabled, {d} composable names, {d} decls\n", .{ names.count(), decls.items.len });
+        try compose_pass.transformDecls(allocator, decls.items, &names);
     }
 
     // Kotlin gives same-named top-level properties distinct storage per
@@ -3921,6 +3937,29 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
     prune.stripDeadBodies(@constCast(base.lifted_decls));
 
     return base;
+}
+
+/// Whether the `@Composable` lowering plugin is enabled (KLIO_COMPOSE_PLUGIN).
+/// Any non-empty value other than "0" turns it on. Default off: the
+/// implicit-composer runtime hook stays the shipped path.
+fn composePluginEnabled() bool {
+    const v = runtime.getenvSlice("KLIO_COMPOSE_PLUGIN") orelse return false;
+    return v.len != 0 and !std.mem.eql(u8, v, "0");
+}
+
+/// Add the simple names of every `@Composable` function in the baked base
+/// (pack composables the user calls) to the plugin oracle set.
+fn composeBaseNames(names: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseNameDecl(names, d);
+}
+
+fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| if (compose_pass.isComposable(f.annotations)) try names.put(f.name.name, {}),
+        .Class => |*c| for (c.members) |*m| try composeBaseNameDecl(names, m),
+        .Object => |*o| for (o.members) |*m| try composeBaseNameDecl(names, m),
+        else => {},
+    }
 }
 
 fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl) Allocator.Error!void {
