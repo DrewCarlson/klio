@@ -912,15 +912,21 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                                 if (icls != null and std.mem.eql(u8, icls.?, f)) return v;
                             }
                         }
-                        const collided = simple_bound != null;
-                        if (collided) {
-                            const rr = ensureObjectSingletonById(self, cid) catch return null;
-                            return switch (rr) {
-                                .ok => |maybe| if (maybe) |v| (if (v == .Instance) v else null) else null,
-                                .err => null,
-                            };
-                        }
-                        return null;
+                        // First-access construction driven by the authoritative
+                        // id. The caller committed an exact object class id, so
+                        // build it directly rather than deferring to the
+                        // name-keyed path — which cannot construct a
+                        // collision-mangled object (two packages share the
+                        // simple name `Operation.InsertSlotsWithFixups`, so the
+                        // bare name is ambiguous / mangled out of the flat
+                        // index). `ensureObjectSingletonById` shares the same
+                        // init gate (`claimObjectInit`), so this stays
+                        // once-only; `simple_bound` is irrelevant now.
+                        const rr = ensureObjectSingletonById(self, cid) catch return null;
+                        return switch (rr) {
+                            .ok => |maybe| if (maybe) |v| (if (v == .Instance) v else null) else null,
+                            .err => null,
+                        };
                     }
                     const published: ?Value = blk: {
                         const gg = self.globals.borrow();

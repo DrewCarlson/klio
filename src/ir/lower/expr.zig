@@ -140,9 +140,13 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // this the receiver of `TrieNode.EMPTY` in an importing file falls to
         // a member access on the implicit receiver (`get_field TrieNode on
         // Companion`).
+        var imported_fqn: ?[]const u8 = null;
         const imported_cid: ?ir.ClassId = if (!aliased and b.module.classId(n) == null) blk: {
             for (b.module.importAliasPathsIn(segments[0].span.file, n)) |p| {
-                if (b.module.classIdByFqn(p.fqn)) |cid| break :blk cid;
+                if (b.module.classIdByFqn(p.fqn)) |cid| {
+                    imported_fqn = p.fqn;
+                    break :blk cid;
+                }
             }
             break :blk null;
         } else null;
@@ -150,7 +154,12 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             (b.module.classId(n) != null or imported_cid != null) and !enclosingMemberShadowsClass(b, n))
         {
             const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = n });
+            // A collision-mangled import has no name-published singleton under
+            // its bare simple name; key the load on the FQN so the name-keyed
+            // fallback (used when the singleton is not yet published) drives
+            // the object/companion init by its fully-qualified name instead of
+            // missing on the bare simple name.
+            const nm = try b.module.internConst(b.allocator, .{ .String = imported_fqn orelse n });
             // The index-resolved class rides as the exact identity so a
             // same-simple-name class/object from an invisible package
             // cannot swap in at runtime (a nested `State` inside the
@@ -1378,7 +1387,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // expression position), so the read decides at runtime with the
         // index-resolved class riding as the exact global arm; the
         // companion sentinel passes a member value through unchanged.
-        if (b.module.classId(name0) != null and
+        // The flat `classId` is null when a same-simple-name class in another
+        // package forced collision-mangling (both `gapbuffer` and `linkbuffer`
+        // `InsertSlotsWithFixups` leave the simple name out of the index). An
+        // explicit `import pkg.Outer.Name` in THIS file still names exactly one
+        // of them, so treat the bare name as that class reference rather than
+        // letting it fall to a by-name global read that binds first-registered.
+        if ((b.module.classId(name0) != null or
+            b.module.classIdExactImport(name0, segments[0].span.file) != null) and
             (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
         {
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -1575,6 +1591,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // must live for the module's lifetime — let the module allocator
         // own it rather than freeing it here.
         const fqn = try joinSegments(b.allocator, segments);
+        // Ride the exact class id of the longest FQN prefix that names a class
+        // so the runtime binds that declaration rather than re-resolving the
+        // tail by simple name (two packages with a same-simple-name
+        // `Operation.Ins` would otherwise both bind the first-registered one).
+        if (try emitFqnWithClassPrefix(b, fqn)) |r| return r;
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
@@ -1672,6 +1693,22 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
     var start = ci;
     while (start > 0 and b.module.classId(segs[start - 1]) != null) start -= 1;
 
+    // Keep the leading package segments when the class named by the import's
+    // FQN is NOT the one its simple name resolves to in the flat class index
+    // — either the simple name was collision-mangled out (two packages declare
+    // a same-simple-name nested member, gapbuffer vs linkbuffer `Operation`)
+    // or it resolves to a different, first-registered declaration. Dropping the
+    // package would bind that wrong one; the full `pkg.Outer.Member` path
+    // resolves the exact declaration the import named.
+    if (start > 0) {
+        const fqn_parts = segs[0 .. ci + 1];
+        const fqn = std.mem.join(b.allocator, ".", fqn_parts) catch return null;
+        if (b.module.classIdByFqn(fqn)) |fqn_cid| {
+            const simple_cid = b.module.classId(segs[ci]);
+            if (simple_cid == null or simple_cid.?.int() != fqn_cid.int()) start = 0;
+        }
+    }
+
     const last = segs.len - 1;
     var out = b.allocator.alloc([]const u8, segs.len - start) catch return null;
     var n: usize = 0;
@@ -1679,7 +1716,7 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
     while (j < segs.len) : (j += 1) {
         // Drop an intermediate `Companion` hop — `X.member` resolves the
         // companion member — but keep a nested classifier (`Outer.State`).
-        if (j != start and j != last and std.mem.eql(u8, segs[j], "Companion")) continue;
+        if (j != last and std.mem.eql(u8, segs[j], "Companion")) continue;
         out[n] = segs[j];
         n += 1;
     }
@@ -1858,6 +1895,7 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.module.classId(head) == null and
             (head_is_real_pkg or b.resolve("this") == null))
         {
+            if (try emitFqnWithClassPrefix(b, fqn)) |r| return r;
             const dst = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = fqn });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
@@ -7887,6 +7925,13 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
             }
         }
     }
+    // An explicit `import pkg.Outer.Name` in THIS file is unambiguous and
+    // outranks both the scope-tier index and the receiver-scope decline:
+    // when two files each import a different same-simple-name class (the
+    // gapbuffer vs linkbuffer `InsertSlotsWithFixups`), the flat index would
+    // hand every reference the first-registered one. Bind the file's own
+    // import instead.
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
     // A receiver context whose owner chain is unknown here (a super-arg /
     // default-value thunk, a lambda) may still see a NESTED classifier the
     // flat index cannot rank; committing the package-scope pick would
@@ -9111,6 +9156,53 @@ fn rsplitLast(s: []const u8, sep: u8) []const u8 {
 fn firstSegment(s: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, s, '.')) |i| return s[0..i];
     return s;
+}
+
+/// Emit a dotted `pkg.Outer.Inner.member…` reference by binding the LONGEST
+/// prefix that names a class to its EXACT id, then reading each remaining
+/// segment as a field. Riding the class id keeps a same-simple-name class in
+/// another package from swapping in at runtime (the `gapbuffer` vs
+/// `linkbuffer` `Operation.Ins` collision), which a plain name-keyed global
+/// load cannot do. Returns null when no prefix names a class — the caller
+/// falls back to the name-keyed load.
+fn emitFqnWithClassPrefix(b: *FuncBuilder, fqn: []const u8) Allocator.Error!?Reg {
+    var end = fqn.len;
+    while (true) {
+        if (b.module.classIdByFqn(fqn[0..end])) |cid| {
+            // Ride the exact id ONLY when the prefix's simple name is
+            // genuinely ambiguous — collision-mangled out of the flat index
+            // (null) or resolving to a DIFFERENT first-registered class.
+            // When the simple name resolves to this very class the name-keyed
+            // load is already correct AND preferable: an id load returns a
+            // class's companion (or misses a same-named factory function),
+            // so overriding an unambiguous `kotlinx.coroutines.Job` would
+            // hand back `Job.Key` instead of the Job factory.
+            const prefix = fqn[0..end];
+            const simple = if (std.mem.lastIndexOfScalar(u8, prefix, '.')) |d| prefix[d + 1 ..] else prefix;
+            const simple_cid = b.module.classId(simple);
+            if (simple_cid != null and simple_cid.?.int() == cid.int()) return null;
+            // The id table resolves an `object` prefix straight to its
+            // singleton; a plain class prefix loads its class value, off which
+            // each remaining segment reads its nested classifier / member.
+            var cur = b.allocReg();
+            const n = try b.module.internConst(b.allocator, .{ .String = fqn[0..end] });
+            try b.push(.{ .LoadGlobal = .{ .dst = cur, .name = n, .class = cid } });
+            var rest = fqn[end..];
+            while (rest.len > 0) {
+                rest = rest[1..]; // skip '.'
+                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+                const next = b.allocReg();
+                const field = try b.module.internConst(b.allocator, .{ .String = rest[0..dot] });
+                try b.push(.{ .GetField = .{ .dst = next, .receiver = cur, .field = field } });
+                cur = next;
+                rest = rest[dot..];
+            }
+            return cur;
+        }
+        const dot = std.mem.lastIndexOfScalar(u8, fqn[0..end], '.') orelse break;
+        end = dot;
+    }
+    return null;
 }
 
 /// Join `segments[*].name` with `.`. The caller owns the returned slice.
