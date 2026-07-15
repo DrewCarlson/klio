@@ -3848,6 +3848,48 @@ fn lowerCallWithWritebackPath(
                 .exact = false,
             } });
         } else if (b.resolve(segments[0].name) == null and
+            !b.hasOwnMember(segments[0].name) and
+            !calleeRecvFnFlag(b, callee) and
+            (b.capturesThisSlot() or b.resolve("this") != null))
+        {
+            // A bare call that is a member of an IMPLICIT receiver — a receiver
+            // lambda's receiver (`compose { … }` inside a
+            // `CompositionTestScope.() -> Unit` block) whose trailing lambda
+            // mutates an outer var, routing the call through this writeback
+            // path. The name is neither a top-level function (bound_id null) nor
+            // an enclosing-class own-member, so probe the implicit receiver at
+            // runtime: `CallMemberOrGlobal` tries each implicit receiver
+            // innermost-first, then globals. Without this the callee loaded as
+            // an unresolved global.
+            const nmc = try b.module.internConst(b.allocator, .{ .String = segments[0].name });
+            if (b.resolve("this")) |this_reg| {
+                orEmitAudit(b, "writeback_member_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = 0,
+                    .name = nmc,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                    .recv = this_reg,
+                    .static_recv = try cmgStaticRecv(b),
+                } });
+            } else {
+                const this_idx = try b.recordCapture("this");
+                orEmitAudit(b, "writeback_member_call", "CallMemberOrGlobal", segments[0].name);
+                try b.push(.{ .CallMemberOrGlobal = .{
+                    .dst = dst,
+                    .this_idx = this_idx,
+                    .name = nmc,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = args_start,
+                    .n_args = n_args,
+                    .arg_names = arg_names,
+                    .static_recv = try cmgStaticRecv(b),
+                } });
+            }
+        } else if (b.resolve(segments[0].name) == null and
             b.hasOwnMember(segments[0].name) and b.resolve("this") != null)
         {
             // A member of the enclosing class — e.g. an inherited inline fn
