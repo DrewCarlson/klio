@@ -7708,6 +7708,40 @@ fn ancestorClosureFqns(self: *VmHost, allocator: Allocator, start_cid: ir.ClassI
     }
 }
 
+/// Whether the static receiver type `start_cid` (or one of its supertypes)
+/// declares a method named `name` with exactly `tvc` OWN type parameters. A
+/// generic same-name method a runtime subtype introduces is a legitimate
+/// OVERRIDE only when the static type's own scope declares a generic member of
+/// the same shape; otherwise it is a subtype-only overload (it may even carry
+/// the `override` modifier for a DIFFERENT interface not visible from the static
+/// type — `PersistentCompositionLocalHashMap.get<T>` overrides `CompositionLocalMap`,
+/// not `Map`), and must not shadow the statically-bound member.
+fn closureHasGenericMethod(self: *VmHost, allocator: Allocator, start_cid: ir.ClassId, name: []const u8, tvc: usize) Allocator.Error!bool {
+    var queue: std.ArrayList(ir.ClassId) = .empty;
+    defer queue.deinit(allocator);
+    var seen: std.StringHashMap(void) = .init(allocator);
+    defer seen.deinit();
+    try queue.append(allocator, start_cid);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cid = queue.items[head];
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (@intFromEnum(cid) >= mod.classes.items.len) continue;
+        const irc = mod.classes.items[@intFromEnum(cid)];
+        if (seen.contains(irc.fqn)) continue;
+        try seen.put(irc.fqn, {});
+        for (irc.methods) |fid| {
+            if (funcAt(mod, fid)) |f| {
+                if (std.mem.eql(u8, f.name, name) and funcTypeParamCount(self, fid) == tvc) return true;
+            }
+        }
+        for (irc.supertypes) |sid| try queue.append(allocator, sid);
+    }
+    return false;
+}
+
 fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
     // When the call carries a static receiver type (an implicit-`this` /
@@ -7721,10 +7755,12 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
     var static_up: std.StringHashMap(void) = .init(allocator);
     defer static_up.deinit();
     var static_up_ready = false;
+    var static_cid: ir.ClassId = undefined;
     if (static_recv) |sr| {
         const want = std.mem.trimEnd(u8, simpleName(sr), "?");
         if (try findClassInHierarchy(self, allocator, receiver, want)) |s_cid| {
             try ancestorClosureFqns(self, allocator, s_cid, &static_up);
+            static_cid = s_cid;
             static_up_ready = true;
         }
     }
@@ -7819,18 +7855,21 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             // scan, exactly as the generated bridge does).
                             if (classTypeParamRefutes(self, mod, cur_name, &f, args)) continue;
                             // A static-receiver-directed call is resolved in the
-                            // static type's member scope. A candidate declared on
-                            // a proper descendant of that type (not in its
-                            // ancestor closure) that introduces its OWN type
-                            // parameters and does not override a visible member is
-                            // a subtype-only overload (a generic `get<T>` shadowing
-                            // `Map.get`), out of scope, and must not shadow the
-                            // statically-bound member. The generic-shape guard
-                            // keeps the filter to exactly that pattern so an
-                            // effective override that lost its `is_override` flag
-                            // (a synthesized delegate/accessor) is never excluded.
-                            if (static_up_ready and !static_up.contains(irc.fqn) and
-                                !f.is_override and funcTypeParamCount(self, f.id) > 0) continue;
+                            // static type's member scope. A candidate declared on a
+                            // proper descendant of that type (not in its ancestor
+                            // closure) that introduces its OWN type parameters is a
+                            // subtype-only generic overload UNLESS the static type's
+                            // own scope declares a generic member of the same shape
+                            // for it to override. `PersistentCompositionLocalHashMap
+                            // .get<T>` carries `override` (of `CompositionLocalMap`,
+                            // a subtype of `Map`) yet is out of `Map`'s scope, so an
+                            // `is_override` test is not enough — the closure check is.
+                            // A plain non-generic member (a synthesized delegate or
+                            // accessor) is left untouched by the generic-shape guard.
+                            if (static_up_ready and !static_up.contains(irc.fqn)) {
+                                const tvc = funcTypeParamCount(self, f.id);
+                                if (tvc > 0 and !(try closureHasGenericMethod(self, allocator, static_cid, name, tvc))) continue;
+                            }
                             try candidates.append(allocator, f);
                         }
                     }
