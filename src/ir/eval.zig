@@ -5762,7 +5762,7 @@ fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
 }
 
 /// Kotlin's defined numeric conversions and operator semantics.
-fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!EvalResult {
+pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!EvalResult {
     // Kotlin promotes `Byte`/`Short` to `Int` in arithmetic and
     // comparison. Widen and re-dispatch.
     if ((promoteByteShort(l) != null or promoteByteShort(r) != null) and op != .StringConcat) {

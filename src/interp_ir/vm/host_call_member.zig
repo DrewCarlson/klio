@@ -97,6 +97,30 @@ fn boolVal(b: bool) Value {
     return .{ .Bool = b };
 }
 
+/// Whether a value is a primitive number (integer or floating tag).
+fn isNumericValue(v: *const Value) bool {
+    return switch (v.*) {
+        .Int, .Long, .Short, .Byte, .Double, .Float, .UInt, .ULong, .UShort, .UByte => true,
+        else => false,
+    };
+}
+
+/// The binary operator a numeric type's named operator member maps to
+/// (`x.rem(y)` → `%`), or null when the name is not such a member.
+fn numericOpMethod(name: []const u8) ?ir.BinOp {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "plus")) return .Add;
+    if (eql(u8, name, "minus")) return .Sub;
+    if (eql(u8, name, "times")) return .Mul;
+    if (eql(u8, name, "div")) return .Div;
+    if (eql(u8, name, "rem")) return .Mod;
+    // `mod` is NOT mapped to `%`: Kotlin's `mod` differs from `rem` for
+    // negative operands (mod matches the divisor's sign), so it must keep the
+    // stdlib implementation. Bitwise/shift members (and/or/xor/shl/shr/ushr)
+    // likewise fall through — `applyBinop` implements only arithmetic.
+    return null;
+}
+
 /// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
 fn simpleName(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
@@ -4420,6 +4444,25 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         missTraceMaybe(name);
         return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
     }
+    // Last resort for a primitive number whose named arithmetic operator
+    // member (`x.rem(y)`, `x.div(y)`, `x.unaryMinus()`) did not otherwise
+    // resolve — upstream Compose calls `slot.rem(SLOTS_PER_INT)` directly.
+    // Placed at the miss tail so it never preempts the stdlib operator
+    // dispatch (which handles overflow, `mod` vs `rem`, bitwise, etc.).
+    if (isNumericValue(receiver)) {
+        if (args.len == 1) {
+            if (numericOpMethod(name)) |op| {
+                return ir.eval.applyBinop(allocator, op, receiver, &args[0]);
+            }
+        } else if (args.len == 0) {
+            if (std.mem.eql(u8, name, "unaryMinus")) {
+                const zero = Value.newInt(0);
+                return ir.eval.applyBinop(allocator, .Sub, &zero, receiver);
+            }
+            if (std.mem.eql(u8, name, "unaryPlus")) return .{ .ok = receiver.* };
+        }
+    }
+
     missTraceMaybe(name);
     if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
