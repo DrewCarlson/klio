@@ -2142,12 +2142,13 @@ pub const Module = struct {
     /// cross-package property (ktor: `import ...server...ContentNegotiation`
     /// must not read the client package's same-named top-level val).
     pub fn classIdExactImport(self: *const Module, name: []const u8, caller_file: FileId) ?ClassId {
-        for (self.class_index.items) |entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
-            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
-            for (self.importAliasPathsIn(caller_file, name)) |p| {
-                if (std.mem.eql(u8, p.fqn, c.fqn)) return entry.id;
-            }
+        // Resolve the imported FQN directly rather than requiring a
+        // `class_index` entry whose SIMPLE name is `name`: a collision-mangled
+        // class (`import a.Widget` where a same-named `b.Widget` mangled both
+        // to `Widget$fN`) is registered only under its mangled name, so the
+        // simple-name scan misses it — but its FQN still resolves.
+        for (self.importAliasPathsIn(caller_file, name)) |p| {
+            if (self.classIdByFqn(p.fqn)) |cid| return cid;
         }
         return null;
     }

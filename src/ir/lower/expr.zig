@@ -4698,7 +4698,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // the class visible from the caller's package and imports, so a
     // cross-package simple-name collision constructs the right class.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file)) |class_id| {
+        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
+            b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file)) |class_id|
+        {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
@@ -4762,6 +4764,11 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.resolve(callee.Path.segments[0].name) == null and
         !b.knowsOuter(callee.Path.segments[0].name) and
         b.module.classId(callee.Path.segments[0].name) == null and
+        // A collision-mangled class reached only through an explicit import
+        // (`import a.Widget` with a same-named `b.Widget`) is registered under
+        // its mangled name, so `classId` misses — but it is a real class ctor,
+        // not an unresolved bare call.
+        b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file) == null and
         (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
