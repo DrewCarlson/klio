@@ -233,13 +233,29 @@ implicit-composer default) while the real-engine + pass path is brought up.
     executes). This is a general member-overload-dispatch bug: inside an inlined
     extension typed against `Map<out K, V>`, a call to `get(key)` re-resolves on the
     RUNTIME subtype and picks its same-named generic `get<T>` override rather than
-    the `Map.get(K): V?` the extension was compiled against. Fix: resolve member
-    calls in an inlined extension body against the extension's DECLARED receiver
-    type (thread the static receiver type through the inline splice), so an
-    interface method the caller bound is not shadowed by a subtype's same-named
-    generic overload. Then the next composition failures surface. Reproduce with
-    `KLIO_MAX_EVAL_DEPTH=1500 KLIO_MISS_TRACE=1 klio test <ROOTS>
-    --filter=CompositionTests.simple` (shows the `read → get → getOrElse` cycle).
+    the `Map.get(K): V?` the extension was compiled against.
+    - **The fix is at LOWERING, not runtime (verified 2026-07-15).** `getOrElse` is
+      inlined; its `this.get(key)` re-resolves on the CONCRETE receiver type
+      (PersistentCompositionLocalHashMap → generic `get<T>`) instead of the inline
+      function's DECLARED receiver `Map<out K, V>` (→ `Map.get(K): V?`), and commits
+      `get<T>` as the target. At runtime the call is a COMMITTED
+      `callMemberInnerStatic`/`invokeMethodFuncId` on that FuncId — it never
+      re-dispatches — so a runtime-scorer change does NOT help (attempted widening
+      `resolveInstanceMethod` to collect inherited same-name methods when the pick
+      is generic — correct in isolation, `pickMethodOverload` DOES prefer the
+      non-generic exact match when both are in one class — but off the committed
+      path, reverted). Real fix: the inline splice must resolve member calls in the
+      body against the inline fn's declared param/receiver types (already RECORDED
+      via `bindSpliceParamTy`, ~inline_call.zig:1285), so `this.get` binds `Map.get`
+      and virtual-dispatches to `PersistentHashMap.get` (the trie); the unrelated
+      `get<T>` never enters. Delicate (member resolution is the hot path) — validate
+      against full `test-all`.
+    - NOTE: fixing this only advances to the NEXT composition bug; the group
+      discipline (`$dirty`/skipping/`sourceInformation`/child-group nesting) is still
+      required for CompositionTests to pass — this remains multi-session. Reproduce
+      the recursion: `KLIO_MAX_EVAL_DEPTH=1500 KLIO_MISS_TRACE=1 klio test <ROOTS>
+      --filter=CompositionTests.simple`. Source repro shape in scratchpad
+      `getor2.kt` (uses delegation; reproduce true inheritance for exactness).
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
