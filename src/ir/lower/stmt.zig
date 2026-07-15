@@ -111,14 +111,19 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // delegate would need a true read-through dispatch
         // and is tracked separately).
         const delegate = try lowerExpr(b, de);
-        // A `var x by D` needs write-through: keep the delegate under a hidden
-        // binding (`x$klio_delegate`) so `x = v` can dispatch
-        // `D.setValue(null, ::x, v)` — see storeCombinedToTarget, which detects it
-        // by name (in scope directly, or captured as an outer inside a closure).
-        // Bound as an immutable val — the delegate reference itself does not
-        // change — so a nested lambda captures it by value. Reads of `x` still use
-        // the eager-once getValue cache below.
-        if (p.mutable) {
+        // Keep the delegate under a hidden binding (`x$klio_delegate`) for BOTH
+        // `val` and `var`. Kotlin dispatches `getValue` on every read (and
+        // `setValue` on every write), so a read of `x` goes through
+        // `lowerDelegateRead` -> `D.getValue(null, ::x)`, not the eager-once
+        // cache below. A `val x by derivedStateOf { … }` (or any State-backed
+        // `val`) must re-read the delegate: its value changes over time and is
+        // never written, so a cached decl-time value would stay stale. A
+        // `lazy { … }` delegate still caches internally, so read-through only
+        // costs a method call. Bound as an immutable val — the delegate
+        // reference itself does not change — so a nested lambda captures it by
+        // value; `var` additionally uses it for setValue write-through (see
+        // storeCombinedToTarget).
+        {
             const dname = try std.fmt.allocPrint(b.allocator, "{s}$klio_delegate", .{p.name.name});
             try b.bind(dname, delegate);
         }
