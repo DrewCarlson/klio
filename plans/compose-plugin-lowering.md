@@ -141,7 +141,27 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
-- 2026-07-15: research + de-risk complete, approach validated. Building the
-  pluggable lowering-pass registry (flag-gated so main stays green) as the
-  foundation. Then bring up the gap engine + the @Composable transform behind
-  the flag.
+- 2026-07-15: research + de-risk complete, approach validated.
+- 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
+  commit 8128489c). Self-contained AST transform (ast+span deps only): injects
+  `$composer`/`$changed` params, brackets the body with
+  `startRestartGroup`/`endRestartGroup?.updateScope`, threads `$composer` into
+  @Composable calls via a resolver oracle, derives positional keys from spans.
+  Unit-tested; NOT yet wired into the pipeline or run against the real engine.
+
+### Next steps (in order)
+
+1. **Pipeline wiring**: run the pass over resolved decls before lowering, with a
+   real composability oracle (from the resolver's symbol table). Gate behind a
+   flag (`KLIO_COMPOSE_PLUGIN`) so the current implicit-composer path stays the
+   default and main stays green.
+2. **Engine swap (Phase 1 completion)**: add the upstream gap engine to a compose
+   pack variant (behind the flag), remove/repackage klioMain's composer, resolve
+   lower/run gaps (the linkbuffer dead-ref in Composition.kt; SlotTable bit
+   correctness). Target: `Linear { Text("x") }` renders through the REAL
+   GapComposer + SlotTable + ViewApplier; SlotTableTests (~284, no pass needed)
+   go green from shipping the engine alone.
+3. **Phase 2** ($changed skipping), **Phase 3** (remember→cache, lambda
+   memoization), **Phase 4** (movable content, defaults, ReadOnly/NonRestartable).
+4. Flip the flag to default once the real engine passes more than the implicit
+   composer; retire klioMain composer + the runtime hook.
