@@ -23,6 +23,7 @@ const mod_list = [_]Mod{
     .{ .name = "span", .tested = true },
     .{ .name = "diagnostics", .deps = &.{"span"}, .tested = true },
     .{ .name = "ast", .deps = &.{"span"}, .tested = true },
+    .{ .name = "compose_pass", .deps = &.{ "ast", "span" }, .src = "src/compose_pass/compose_pass.zig", .tested = true },
     .{ .name = "runtime", .deps = &.{ "ast", "span" }, .tested = true },
     .{ .name = "types", .deps = &.{ "ast", "diagnostics", "span" }, .tested = true },
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
