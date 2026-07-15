@@ -61,8 +61,36 @@ include = [
     "androidx/compose/runtime/snapshots/SnapshotIdSet.kt",
     "androidx/compose/runtime/snapshots/SnapshotWeakSet.kt",
     "androidx/compose/runtime/snapshots/SnapshotDoubleIndexHeap.kt",
+    # The real MVCC snapshot core + the StateObject-backed state objects,
+    # replacing klio's shims. Platform actuals for the expects (SnapshotId,
+    # SnapshotStateList/Set, the primitive Snapshot*State factories, thread id)
+    # come from the nonAndroidMain source root below + klioMain.
+    "androidx/compose/runtime/snapshots/Snapshot.kt",
+    "androidx/compose/runtime/snapshots/SnapshotId.kt",
+    "androidx/compose/runtime/snapshots/StateObjectImpl.kt",
+    "androidx/compose/runtime/snapshots/StateFactoryMarker.kt",
+    "androidx/compose/runtime/snapshots/AutoboxingStateValueProperty.kt",
+    "androidx/compose/runtime/snapshots/ListUtils.kt",
+    "androidx/compose/runtime/snapshots/SnapshotMutableState.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateList.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateMap.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateSet.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateObserver.kt",
+    "androidx/compose/runtime/snapshots/SnapshotContextElement.kt",
+    "androidx/compose/runtime/snapshots/tooling/SnapshotObserver.kt",
+    "androidx/compose/runtime/internal/SnapshotThreadLocal.kt",
+    "androidx/compose/runtime/internal/Thread.kt",
+    "androidx/compose/runtime/internal/IntRef.kt",
+    "androidx/compose/runtime/SnapshotState.kt",
+    "androidx/compose/runtime/SnapshotMutationPolicy.kt",
+    "androidx/compose/runtime/DerivedState.kt",
+    "androidx/compose/runtime/SnapshotIntState.kt",
+    "androidx/compose/runtime/SnapshotLongState.kt",
+    "androidx/compose/runtime/SnapshotFloatState.kt",
+    "androidx/compose/runtime/SnapshotDoubleState.kt",
     "androidx/compose/runtime/collection/ScopeMap.kt",
     "androidx/compose/runtime/collection/MultiValueMap.kt",
+    "androidx/compose/runtime/collection/ScatterSetWrapper.kt",
     # MutableVector: the growable array the ui engine (LayoutNode, measure/layout)
     # uses pervasively. Standalone (stdlib only), consumed straight from upstream.
     "androidx/compose/runtime/collection/MutableVector.kt",
@@ -76,6 +104,19 @@ include = [
 root = "upstream/compose/runtime/runtime/src/commonMain/kotlin"
 include = [
     "androidx/compose/runtime/external/kotlinx/collections/immutable/",
+]
+
+# nonAndroidMain: the platform actuals for the snapshot state objects.
+[[source]]
+root = "upstream/compose/runtime/runtime/src/nonAndroidMain/kotlin"
+include = [
+    "androidx/compose/runtime/snapshots/SnapshotStateList.nonAndroid.kt",
+    "androidx/compose/runtime/snapshots/SnapshotStateSet.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotIntState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotLongState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotFloatState.nonAndroid.kt",
+    "androidx/compose/runtime/SnapshotDoubleState.nonAndroid.kt",
 ]
 
 # klio-supplied layer: the composer / composition / recomposer / snapshot-state
