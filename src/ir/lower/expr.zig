@@ -133,8 +133,21 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // same-named top-level class owns the bare `class_id`. Falling
         // through to `lowerExpr` applies the rewrite in the `Path` arm.
         const aliased = scopeTypeRename(b, n, segments[0].span.file.int()) != null;
+        // A class whose bare simple name is unregistered because it
+        // collision-mangled (two `internal` classes named `TrieNode` in
+        // different packages) is still pinned by the file's named import:
+        // resolve `import …immutableMap.TrieNode` through its FQN. Without
+        // this the receiver of `TrieNode.EMPTY` in an importing file falls to
+        // a member access on the implicit receiver (`get_field TrieNode on
+        // Companion`).
+        const imported_cid: ?ir.ClassId = if (!aliased and b.module.classId(n) == null) blk: {
+            for (b.module.importAliasPathsIn(segments[0].span.file, n)) |p| {
+                if (b.module.classIdByFqn(p.fqn)) |cid| break :blk cid;
+            }
+            break :blk null;
+        } else null;
         if (!aliased and b.resolve(n) == null and !b.knowsOuter(n) and
-            b.module.classId(n) != null and !enclosingMemberShadowsClass(b, n))
+            (b.module.classId(n) != null or imported_cid != null) and !enclosingMemberShadowsClass(b, n))
         {
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = n });
@@ -149,6 +162,7 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // from an unimported package (`kotlin.math.E` at the shipped
             // tier) must not outrank a user classifier named `E`.
             const cls_pick: ?ir.ClassId = blk: {
+                if (imported_cid) |cid| break :blk cid;
                 if (isTopLevelProp(n)) {
                     const pt = b.module.topLevelPropRefTier(n, b.self_package, segments[0].span.file) orelse 255;
                     const ct = b.module.classRefTier(n, b.self_package, segments[0].span.file) orelse 255;
@@ -156,7 +170,11 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
                 break :blk b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
             };
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick } });
+            // A collision-mangled import target has no name-published singleton
+            // to fall back on (`TrieNode` is registered only under its mangled
+            // simple name), so load the class value by id directly — the
+            // subsequent `.EMPTY` reads its companion off that value.
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick, .ctor_ref = imported_cid != null } });
             return dst;
         }
     }
