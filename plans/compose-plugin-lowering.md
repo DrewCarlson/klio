@@ -152,13 +152,21 @@ implicit-composer default) while the real-engine + pass path is brought up.
     `getOrElse(key) { key.defaultValueHolder }.readValue(this)` — `get` returns
     null (correct), so the default lambda `{ key.defaultValueHolder }` runs, but
     `CompositionLocal.defaultValueHolder` evaluates to Unit instead of its
-    `LazyValueHolder(defaultFactory)`. `defaultValueHolder` is an `internal open
-    val` with an initializer (CompositionLocal.kt:60), overridden only in
-    `ComputedProvidableCompositionLocal` (:308). A simple open-val-with-initializer
-    repro (`scratchpad/openval.kt`) does NOT reproduce — the failure is specific to
-    the compose `LazyValueHolder` / `by lazy` path and/or the `key as
-    CompositionLocal<Any?>` cast receiver. Distinct from the dispatch fix; next to
-    investigate.
+    `LazyValueHolder(defaultFactory)` (an `internal class ... { private val current
+    by lazy(valueProducer); readValue() = current }`, ValueHolders.kt:45).
+    `defaultValueHolder` is an `internal open val` with an initializer
+    (CompositionLocal.kt:60), overridden only in `ComputedProvidableCompositionLocal`
+    (:308). CONFIRMED NOT caused by the dispatch fix: `get(key)` correctly binds the
+    inherited `PersistentHashMap.get(K): V?` trie lookup (the subtype's `override fun
+    <T> get = read(key)` is excluded from `Map`'s scope), and every isolated repro of
+    the mechanisms PASSES — open-val-with-initializer, a 3-level sealed hierarchy with
+    an abstract intermediate + `as` cast, `by lazy`-in-constructor holder, and the
+    missing-key `getOrElse` default-lambda path (scratchpad openval.kt / openval3.kt /
+    lazyh.kt / miss.kt). The failure is specific to the live engine context (the
+    composer's initial static-local map + framework `staticCompositionLocalOf`
+    defaults), so the NEXT step is to instrument the real engine run to see exactly
+    where the `Unit` originates (get result vs the default lambda's `defaultValueHolder`
+    access) rather than more blind repros. Distinct pre-existing bug newly reachable.
   - Regression-safe: stdlib_commontest 2298 (baseline 2150);
     compose_runtime_commontest 295 -> 441 passing (the old implicit-composer pack;
     baseline raised to 400).
