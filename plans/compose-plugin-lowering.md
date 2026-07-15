@@ -222,16 +222,24 @@ implicit-composer default) while the real-engine + pass path is brought up.
     "Hello!") }` now resolves fully and runs `Composition.setContent` →
     `Recomposer.composeInitial` → `Composition.composeContent` →
     `GapComposer.doCompose` → `startRoot`/`startGroup`/`start` — the real engine's
-    initial-composition path. It then recurses (native stack overflow) in the
-    group / recompose-scope machinery: the pass emits only the Phase-1 restart-group
-    skeleton (`startRestartGroup` + `endRestartGroup()?.updateScope { self(args, c,
-    $changed or 1) }`), without the `$dirty`/skipping discipline, correct
-    `sourceInformation`, or the child-group nesting the composer's group protocol
-    asserts, so the composer re-enters. **This is the Phase-2 group-structure ABI
-    work** — the last major front before CompositionTests + the SlotTable-family
-    go green. Reproduce with: `KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
-    --filter=CompositionTests.simple` against the engine home; `KLIO_MAX_EVAL_DEPTH`
-    + `KLIO_ERR_TRACE` show the recursing composer frames.
+    initial-composition path.
+  - **Next blocker (precise, root-caused — NOT the group ABI):** an infinite
+    recursion in `CompositionLocalMap.read`. `read(key)` is
+    `getOrElse(key) { key.defaultValueHolder }.readValue(this)`; the `getOrElse` is
+    the stdlib `Map<K,V>.getOrElse` extension, whose internal `get(key)` must bind
+    `Map.get(key: K): V?` (the immutable-map trie lookup). klio instead binds the
+    subtype's `override fun <T> get(key: CompositionLocal<T>): T = read(key)`, so
+    `read → getOrElse → get → read` loops (no `@Composable` runs; the content never
+    executes). This is a general member-overload-dispatch bug: inside an inlined
+    extension typed against `Map<out K, V>`, a call to `get(key)` re-resolves on the
+    RUNTIME subtype and picks its same-named generic `get<T>` override rather than
+    the `Map.get(K): V?` the extension was compiled against. Fix: resolve member
+    calls in an inlined extension body against the extension's DECLARED receiver
+    type (thread the static receiver type through the inline splice), so an
+    interface method the caller bound is not shadowed by a subtype's same-named
+    generic overload. Then the next composition failures surface. Reproduce with
+    `KLIO_MAX_EVAL_DEPTH=1500 KLIO_MISS_TRACE=1 klio test <ROOTS>
+    --filter=CompositionTests.simple` (shows the `read → get → getOrElse` cycle).
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
