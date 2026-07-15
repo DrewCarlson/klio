@@ -1240,8 +1240,18 @@ pub fn tryInlineCallWithTypeArgs(
                 // same path `Nested(args)` construction takes) so a reified
                 // `<PrivateNested>` binds its class instead of an unresolved
                 // global of the source name.
-                const resolved_name = reifiedQualifiedName(b, a) orelse
-                    (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                //
+                // A FUNCTION-TYPE argument (`mutableVectorOf<() -> Unit>()`) has
+                // the synthetic name `<function>`, which is not a global — and
+                // Kotlin erases function types under reification anyway (a
+                // reified `() -> Unit` reifies as `Function0`, not a distinct
+                // class). Bind it to `Any` so the reified use (array creation,
+                // membership) resolves rather than loading an unresolved global.
+                const resolved_name = if (a.function != null)
+                    "Any"
+                else
+                    reifiedQualifiedName(b, a) orelse
+                        (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor
