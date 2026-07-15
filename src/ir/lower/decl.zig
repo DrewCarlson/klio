@@ -1122,6 +1122,28 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         if (b.resolve("this")) |this_reg| {
             const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
             try b.bind(label, this_reg);
+            // A method also answers to `this@<OwnerClass>`: the class-name
+            // label names the class's dispatch receiver, NOT a nested lambda's
+            // own receiver even when that receiver happens to be the same
+            // class. Binding it here makes `this@Owner` inside such a lambda
+            // capture the enclosing method's `this` (Kotlin labels the lambda
+            // receiver by the callee function name, e.g. `this@edit`), rather
+            // than falling to the runtime walk that matches the lambda
+            // receiver first. `source.edit { this@Owner.field = v }` inside an
+            // `Owner` method must write the enclosing `Owner`, not `source`.
+            // Only for a plain method: its `this` param IS the owner class
+            // instance. A member EXTENSION (`fun D.foo()` in class C) binds its
+            // extension receiver `D` as `this`, so `this@C` is a different
+            // (dispatch) receiver the runtime walk resolves — binding the
+            // extension receiver under `this@C` would be wrong.
+            if (f.receiver_type == null) {
+                if (owner_class) |oc| {
+                    if (!std.mem.eql(u8, oc, f.name.name)) {
+                        const clabel = try std.fmt.allocPrint(a, "this@{s}", .{oc});
+                        try b.bind(clabel, this_reg);
+                    }
+                }
+            }
         }
     }
     try emitContextParamLoads(&b, f.context_params, f.type_params);
