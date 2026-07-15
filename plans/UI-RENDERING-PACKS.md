@@ -389,6 +389,38 @@ experiment was reverted so the shim stays until the port is done atomically.
    to invalidate the reading group. This is the coupled part and the only real
    risk to the ~260 composition tests currently passing.
 
+**Attempted end-to-end (2026-07-15), reverted at a net regression.** The whole
+port was wired up and RUNS: the persistent immutable collections
+(`external.kotlinx.collections.immutable`, 44 files) ship and run; the real
+Snapshot core + StateObjectImpl + SnapshotMutableState + SnapshotStateList/Map/Set
++ the primitive `Snapshot*State` families load; `mutableStateOf` produces a real
+MVCC state (verified: a write inside `takeMutableSnapshot()` is invisible outside
+until `apply()`); the `StateObservation` bridge (`Snapshot.observe` +
+`registerApplyObserver`/`registerGlobalWriteObserver`) keeps the composer working,
+and composition tests pass through it. But the full compose suite went 277 -> 252:
+the state-object swap broke more composition paths than the snapshot tests it
+unblocked (SnapshotTests 0 -> 8, SnapshotStateMap 2 -> 11, and CompositionTests no
+longer segfaults). Reverted to keep the green baseline; the WIP patch is saved in
+the session scratchpad (`port-wip/port.diff`).
+
+Interpreter bugs the port surfaced and needs fixed BEFORE it is net-positive:
+- **`current()` name collision** — klio's composer had a private `current()` that
+  collided with the newly-shipped `internal fun <T: StateRecord> current(r)`;
+  renamed klio's to `currentGroupNode()` (its own engine code). A bare 0-arg
+  member call should never bind a 1-arg cross-package top-level function; the
+  isolated repro works, so the real trigger is pack-context-specific.
+- **`create cands=0`** (gates ~40 snapshot tests) — a bare `create(SnapshotIdMax)`
+  inside `T.newOverwritableRecordLocked` (an extension on `T : StateRecord`) does
+  not resolve to the record's inherited/overridden `create(SnapshotId)` member;
+  klio reports `unresolved global create` with `this` present as an Instance.
+  NOT reproducible in isolation despite matching the shape (extension receiver +
+  non-inline `sync{}` lambda + concrete class overriding both `create()` and
+  `create(SnapshotId)` + a `@Deprecated(HIDDEN)` `create(Int)` sibling). Needs
+  in-context instrumentation of the member walk for the record class.
+- Plus: "snapshot not disposed" assertions, read-only-snapshot handling, and
+  several `unresolved global`/`Vm::set_field` tails. A long tail of real
+  interpreter roots — the port is a multi-session effort, not a single push.
+
 
 
 `zig build itest-compose_runtime_commontest` runs the upstream Compose runtime's

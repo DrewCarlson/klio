@@ -49,6 +49,10 @@ sparse_ui=(
   "compose/runtime/runtime-test-utils/src/commonMain"
   "compose/runtime/runtime/src/commonTest"
   "compose/runtime/runtime/src/nonEmulatorCommonTest"
+  # nonAndroidMain: the platform actuals for the snapshot state objects
+  # (SnapshotStateList/Set, the primitive Snapshot*State factories) that klio
+  # ships to run the real MVCC snapshot core.
+  "compose/runtime/runtime/src/nonAndroidMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
