@@ -186,20 +186,31 @@ implicit-composer default) while the real-engine + pass path is brought up.
     `androidx…gapbuffer.SlotTable()` → fixed by `lowerFqnCtorCall` (commit
     88750dba); (3) `composeStackTraceMode` unresolved → fixed by shipping the
     upstream `tooling/` engine files and dropping the klioMain tooling stubs.
-  - **Current blocker: the @Composable lambda transform.** `compose { Text(…) }`'s
-    content lambda is `@Composable () -> Unit`; the pass does not yet transform
-    composable lambdas, so the content is never threaded (`unresolved global
-    <function>`). Design: (a) build a "composable-lambda sink" set — functions
-    with a `@Composable`-typed function parameter (`param.ty.function != null and
-    isComposable(param.ty.annotations)`); (b) in the walker, when a call's arg
-    binds such a parameter (trailing-lambda case first), rewrite the lambda to
-    `{ $composer, $changed -> threaded-body }` (append the two params, thread the
-    body); (c) author the `internal expect fun invokeComposable(composer,
-    composable)` actual in klioMain to invoke `composable(composer, 1)`, so the
-    engine's `setContent` drives the transformed content with the composer. Then
-    Phase 2 ($changed skipping), Phase 3 (remember→cache is already reachable via
-    the currentComposer substitution; composable-lambda memoization remains),
-    Phase 4 (movable content, defaults).
+  - **@Composable lambda transform LANDED** (commit d1014cee). A
+    "composable-lambda sink" set names functions with a `@Composable`-typed
+    parameter; a lambda bound to one is rewritten to `{ …, $composer, $changed ->
+    threaded-body }`. A header-less `{ … }` (only the synthetic `it`) has no real
+    params, so the pair REPLACES `it`. The walker visits every function body so a
+    `compose { … }` passed from non-composable context is transformed (a `thread`
+    flag threads only inside composable scopes). An `invokeComposable` actual
+    (engineMain) invokes the lowered content as `Function2<Composer,Int,Unit>
+    (composer, 1)`. Validated end to end: `render { Text("x") }` composes and
+    prints through the real-composer ABI.
+  - Two more interpreter bugs surfaced + fixed driving the real
+    `CompositionTests.simple`: a reified function-type argument
+    (`mutableVectorOf<() -> Unit>()`) loaded the synthetic `<function>` global →
+    erases to `Any` (commit a1400f17); the tooling engine files ship.
+  - **MILESTONE: composition RUNS through the real GapComposer + SlotTable.**
+    `compose { Text("Hello!") }` now lowers, resolves, and executes through the
+    real engine — no unresolved references — and reaches an internal engine
+    invariant: `IllegalStateException: Check failed` (a `checkPrecondition` /
+    `runtimeCheck` in the composer, i.e. the emitted group structure does not yet
+    match the SlotTable's expectations). This is the Phase-2 entry point: the
+    pass emits the restartable-group skeleton (startRestartGroup / endRestartGroup)
+    but not the full group discipline the composer asserts — `$dirty`/skipping,
+    `skipToGroupEnd`, `sourceInformation`, and correct child-group nesting for the
+    content lambda and each `Text`. Getting the group structure exactly ABI-correct
+    is the next work; then the SlotTable-family + CompositionTests become reachable.
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
