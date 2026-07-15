@@ -141,6 +141,28 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-15: **`CompositionLocalMap.read` recursion FIXED (commit 9381b430);
+  real engine now advances past it.** Static-receiver-directed member dispatch
+  landed (see the "RESOLVED" note below). On the real engine + plugin
+  (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
+  --filter=CompositionTests.simple`), the read→getOrElse→get<T>→read recursion is
+  gone: `get(key)` on the empty persistent map now correctly returns null, the
+  `getOrElse` default lambda runs, and composition proceeds to the NEXT blocker.
+  - **New blocker: `Vm::call_member readValue on kotlin.Unit`.** `read`'s
+    `getOrElse(key) { key.defaultValueHolder }.readValue(this)` — `get` returns
+    null (correct), so the default lambda `{ key.defaultValueHolder }` runs, but
+    `CompositionLocal.defaultValueHolder` evaluates to Unit instead of its
+    `LazyValueHolder(defaultFactory)`. `defaultValueHolder` is an `internal open
+    val` with an initializer (CompositionLocal.kt:60), overridden only in
+    `ComputedProvidableCompositionLocal` (:308). A simple open-val-with-initializer
+    repro (`scratchpad/openval.kt`) does NOT reproduce — the failure is specific to
+    the compose `LazyValueHolder` / `by lazy` path and/or the `key as
+    CompositionLocal<Any?>` cast receiver. Distinct from the dispatch fix; next to
+    investigate.
+  - Regression-safe: stdlib_commontest 2298 (baseline 2150);
+    compose_runtime_commontest 295 -> 441 passing (the old implicit-composer pack;
+    baseline raised to 400).
+
 - 2026-07-15: **Engine ships and runs.** A sibling pack
   `kotlin-klio/klio-compose-runtime-engine/` curates the `androidx.compose.runtime`
   id to include the real upstream gapbuffer engine (Composer / GapComposer /
