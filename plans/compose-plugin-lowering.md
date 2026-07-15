@@ -208,17 +208,30 @@ implicit-composer default) while the real-engine + pass path is brought up.
     setup and cascading to secondary failures (`TestScope.leave()`'s
     `check(entered && !finished)`, re-raised by `joinBlocking` → the reported
     `IllegalStateException: Check failed`).
-  - **Next blocker (precise):** `PersistentCompositionLocalHashMap$Companion` init
-    fails with `Vm::get_field TrieNode on …PersistentCompositionLocalHashMap.Companion`.
-    Its companion does `PersistentCompositionLocalHashMap(node = TrieNode.EMPTY as …)`
-    where `TrieNode` is an IMPORTED class (`…immutableMap.TrieNode`), but inside the
-    baked pack's companion init klio reads `TrieNode` as a field of the Companion
-    instead of resolving the import. Source-mode repros of the same shape resolve
-    correctly, so this is a BAKED-PACK import-resolution issue (cf. the open
-    `klio-imported-companion-val-baking-bug`) — an imported class name in a baked
-    companion initializer falls through to a member access on `this`. Fix that,
-    then the next composition failures surface, then eventually the group-structure
-    ABI (`$dirty`/skipping/`skipToGroupEnd`) for CompositionTests + SlotTable-family.
+  - Drove `CompositionTests.simple` through several more root fixes (all committed):
+    the `TrieNode.EMPTY` companion init (two `internal` same-simple-name classes
+    across packages collision-mangle, so the bare name misses and the receiver
+    fell to a member access — now resolved through the file's import FQN, commit
+    32c4e94d; +3 on coroutines as a bonus); the `CompositeKeyHashCode` actual
+    (Long-backed rol/xor arithmetic, engineMain); the `Trace.nonAndroid` actual;
+    the `CompositionErrorContext`/`ComposeToolingFlags` tooling files a curation
+    edit had dropped; and — critically — **disabling the implicit-composer hook
+    (`composableEval`) when `KLIO_COMPOSE_PLUGIN` is set** (it was re-bracketing
+    every pass-threaded composable call and recursing without bound).
+  - **STATE: composition executes through the real composer.** `compose { Text(
+    "Hello!") }` now resolves fully and runs `Composition.setContent` →
+    `Recomposer.composeInitial` → `Composition.composeContent` →
+    `GapComposer.doCompose` → `startRoot`/`startGroup`/`start` — the real engine's
+    initial-composition path. It then recurses (native stack overflow) in the
+    group / recompose-scope machinery: the pass emits only the Phase-1 restart-group
+    skeleton (`startRestartGroup` + `endRestartGroup()?.updateScope { self(args, c,
+    $changed or 1) }`), without the `$dirty`/skipping discipline, correct
+    `sourceInformation`, or the child-group nesting the composer's group protocol
+    asserts, so the composer re-enters. **This is the Phase-2 group-structure ABI
+    work** — the last major front before CompositionTests + the SlotTable-family
+    go green. Reproduce with: `KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
+    --filter=CompositionTests.simple` against the engine home; `KLIO_MAX_EVAL_DEPTH`
+    + `KLIO_ERR_TRACE` show the recursing composer frames.
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
