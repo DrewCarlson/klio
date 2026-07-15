@@ -1337,6 +1337,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     func.is_suspend = f.is_suspend;
     func.low_priority = isLowPriorityOverload(f);
     func.is_expect = f.is_expect;
+    func.is_override = f.is_override;
     // A leading `this` injected via `implicit_params` is a synthesized
     // dispatch/extension receiver, distinguishing it from a user param
     // that merely spells its name `this`.

@@ -3213,7 +3213,7 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
 
     // Only intervene when a same-named vararg method would otherwise shadow
     // the field; a plain function property keeps its ordinary dispatch.
-    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse return null;
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args, null)) orelse return null;
     const is_vararg = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -3863,7 +3863,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // IR class + supertype method walk.
     if (receiver.* == .Instance) {
-        if (try irMethodWalk(self, allocator, receiver, name, args)) |r| return r;
+        if (try irMethodWalk(self, allocator, receiver, name, args, static_recv)) |r| return r;
     }
 
     // Generic Any.toString / equals / hashCode fallback for Instances.
@@ -7560,7 +7560,7 @@ const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
 /// is also what runs — its (override-invariant, for a scalar) return type is sound.
 pub fn resolveMemberFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
     if (receiver.* != .Instance) return null;
-    const rm = resolveInstanceMethod(self, allocator, receiver, name, args) catch return null;
+    const rm = resolveInstanceMethod(self, allocator, receiver, name, args, null) catch return null;
     return if (rm) |m| m.fid else null;
 }
 
@@ -7614,8 +7614,120 @@ fn callableArgPrefersFunctionExtension(self: *VmHost, mod: *const Module, name: 
     return false;
 }
 
-fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?ResolvedMethod {
+/// The count of a function's OWN (method-level) type parameters. A subtype's
+/// same-name overload that introduces its own type parameters (`get<T>(Key<T>)`
+/// shadowing `Map.get(K)`) is the shape the static-receiver visibility filter
+/// targets; a plain non-generic member is left alone.
+fn funcTypeParamCount(self: *VmHost, fid: FuncId) usize {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const tps = mg.get().registry.func_type_params.get(fid) orelse return 0;
+    return tps.items.len;
+}
+
+/// The IR class id in `receiver`'s runtime hierarchy whose simple name matches
+/// the static receiver-type head `want`, or null when the static type is not a
+/// nominal class in the hierarchy.
+fn findClassInHierarchy(self: *VmHost, allocator: Allocator, receiver: *const Value, want: []const u8) Allocator.Error!?ir.ClassId {
+    if (receiver.* != .Instance) return null;
+    var recv_fqn: []const u8 = undefined;
+    var class_name: []const u8 = undefined;
+    {
+        const g = receiver.Instance.borrow();
+        const cg = g.get().class.borrow();
+        class_name = cg.get().name;
+        recv_fqn = cg.get().fqn;
+        cg.deinit();
+        g.deinit();
+    }
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    var queue: std.ArrayList(WalkItem) = .empty;
+    defer queue.deinit(allocator);
+    var seen: std.StringHashMap(void) = .init(allocator);
+    defer seen.deinit();
+    const start_cid: ?ir.ClassId = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classIdByFqn(recv_fqn);
+    };
+    try queue.append(allocator, .{ .cid = start_cid, .name = class_name });
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const item = queue.items[head];
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        var ir_class: ?ir.Class = null;
+        var cid_of: ?ir.ClassId = item.cid;
+        if (item.cid) |cid| {
+            if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
+        }
+        if (ir_class == null) {
+            for (mod.classes.items, 0..) |c, i| {
+                if (std.mem.eql(u8, c.name, item.name)) {
+                    ir_class = c;
+                    cid_of = @enumFromInt(i);
+                    break;
+                }
+            }
+        }
+        const irc = ir_class orelse continue;
+        if (seen.contains(irc.fqn)) continue;
+        try seen.put(irc.fqn, {});
+        if (std.mem.eql(u8, simpleName(irc.name), want) or std.mem.eql(u8, simpleName(irc.fqn), want))
+            return cid_of;
+        for (irc.supertypes) |sid| {
+            if (@intFromEnum(sid) < mod.classes.items.len) {
+                try queue.append(allocator, .{ .cid = sid, .name = mod.classes.items[@intFromEnum(sid)].name });
+            }
+        }
+    }
+    return null;
+}
+
+/// The set of class FQNs at or ABOVE `start_cid` in the class hierarchy: the
+/// static receiver type and every supertype it inherits from. A member declared
+/// on one of these is visible from the static receiver type; a member declared
+/// on any OTHER class in the runtime receiver's hierarchy is a proper-descendant
+/// member, invisible from the static type unless it overrides a visible one.
+fn ancestorClosureFqns(self: *VmHost, allocator: Allocator, start_cid: ir.ClassId, out: *std.StringHashMap(void)) Allocator.Error!void {
+    var queue: std.ArrayList(ir.ClassId) = .empty;
+    defer queue.deinit(allocator);
+    try queue.append(allocator, start_cid);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cid = queue.items[head];
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (@intFromEnum(cid) >= mod.classes.items.len) continue;
+        const irc = mod.classes.items[@intFromEnum(cid)];
+        if (out.contains(irc.fqn)) continue;
+        try out.put(irc.fqn, {});
+        for (irc.supertypes) |sid| try queue.append(allocator, sid);
+    }
+}
+
+fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?ResolvedMethod {
     const inst = receiver.Instance;
+    // When the call carries a static receiver type (an implicit-`this` /
+    // inline-spliced own-member call), Kotlin resolves it against that static
+    // type's member scope. A candidate a runtime subtype introduces that is NOT
+    // an override of a member visible from the static type is out of scope and
+    // must not shadow the statically-bound member. Compute the static type's
+    // ancestor closure so the walk can exclude such proper-descendant, non-
+    // override candidates. `Map.getOrElse`'s inlined `get(key)` binds `Map.get`,
+    // never a `CLMap: MapBase` receiver's own `get<T>(Key<T>)` (which self-recurses).
+    var static_up: std.StringHashMap(void) = .init(allocator);
+    defer static_up.deinit();
+    var static_up_ready = false;
+    if (static_recv) |sr| {
+        const want = std.mem.trimEnd(u8, simpleName(sr), "?");
+        if (try findClassInHierarchy(self, allocator, receiver, want)) |s_cid| {
+            try ancestorClosureFqns(self, allocator, s_cid, &static_up);
+            static_up_ready = true;
+        }
+    }
     var class_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
     {
@@ -7706,6 +7818,19 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             // EnumEntries answers -1 through AbstractList's
                             // scan, exactly as the generated bridge does).
                             if (classTypeParamRefutes(self, mod, cur_name, &f, args)) continue;
+                            // A static-receiver-directed call is resolved in the
+                            // static type's member scope. A candidate declared on
+                            // a proper descendant of that type (not in its
+                            // ancestor closure) that introduces its OWN type
+                            // parameters and does not override a visible member is
+                            // a subtype-only overload (a generic `get<T>` shadowing
+                            // `Map.get`), out of scope, and must not shadow the
+                            // statically-bound member. The generic-shape guard
+                            // keeps the filter to exactly that pattern so an
+                            // effective override that lost its `is_override` flag
+                            // (a synthesized delegate/accessor) is never excluded.
+                            if (static_up_ready and !static_up.contains(irc.fqn) and
+                                !f.is_override and funcTypeParamCount(self, f.id) > 0) continue;
                             try candidates.append(allocator, f);
                         }
                     }
@@ -7976,7 +8101,7 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     };
 }
 
-fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
     // Inline cache: memoize the (class, method-name, arg-type-signature) →
     // FuncId resolution. The signature captures the argument primitive types the
     // overload pick depends on, so a hit returns the same target the full walk
@@ -7985,14 +8110,18 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // cached; a call that declines to an extension is never stored. The fast
     // path at `callMemberInnerStatic`'s entry consults this same cache before the
     // probe ladder, so a repeat call skips the binding/builtin probes too.
-    const key = instanceMethodKey(receiver, name, args);
+    //
+    // A `static_recv`-directed call bypasses the cache: the resolution then
+    // depends on the static receiver type, which the (class, name, args) key
+    // does not capture, so a cached entry from an ordinary call would be wrong.
+    const key = if (static_recv == null) instanceMethodKey(receiver, name, args) else null;
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
             return try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args);
         }
     }
-    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args)) orelse {
+    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args, static_recv)) orelse {
         // Cache the miss: a member-accessed field (`obj.field`) re-runs this
         // walk every read otherwise. Only a proven, key-stable miss is stored.
         if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);

@@ -900,6 +900,11 @@ pub const Func = struct {
     /// program limps on with a wrong value). Knowing the declaration is an
     /// `expect` lets the runtime say so, and say what to run to list the rest.
     is_expect: bool = false,
+    /// Carries the source `override` modifier. Dispatch of a call resolved
+    /// against a STATIC receiver type (an implicit-`this` / inline-spliced
+    /// own-member call) must exclude a runtime subtype's same-name overload
+    /// that is NOT an override — it is out of the static type's member scope.
+    is_override: bool = false,
     /// Resolved fully-qualified candidate names for each source-level
     /// annotation on this function (e.g. `kotlin.test.Test`), so a test
     /// runner can discover `@Test`/`@Ignore`/etc. without re-parsing.

@@ -223,90 +223,54 @@ implicit-composer default) while the real-engine + pass path is brought up.
     `Recomposer.composeInitial` → `Composition.composeContent` →
     `GapComposer.doCompose` → `startRoot`/`startGroup`/`start` — the real engine's
     initial-composition path.
-  - **Next blocker (precise, root-caused — NOT the group ABI):** an infinite
-    recursion in `CompositionLocalMap.read`. `read(key)` is
-    `getOrElse(key) { key.defaultValueHolder }.readValue(this)`; the `getOrElse` is
-    the stdlib `Map<K,V>.getOrElse` extension, whose internal `get(key)` must bind
-    `Map.get(key: K): V?` (the immutable-map trie lookup). klio instead binds the
-    subtype's `override fun <T> get(key: CompositionLocal<T>): T = read(key)`, so
-    `read → getOrElse → get → read` loops (no `@Composable` runs; the content never
-    executes). This is a general member-overload-dispatch bug: inside an inlined
-    extension typed against `Map<out K, V>`, a call to `get(key)` re-resolves on the
-    RUNTIME subtype and picks its same-named generic `get<T>` override rather than
-    the `Map.get(K): V?` the extension was compiled against.
-    - **EXHAUSTIVE root-cause (2026-07-15) — the fix needs STATIC-TYPE threading,
-      two parts.** Faithful repro `getor2.kt`/`inh.kt`: a class extending a
-      Map-implementing base (concrete `override fun get(key: K): V?`) plus an extra
-      `fun <T> get(key: Foo<T>): T`, with a `Map.getOrElse` extension call. Proven,
-      with reverted experiments:
-      1. The `get` inside `getOrElse` is a DYN member call (resolveInstanceMethod
-         fires each iteration) — NOT a committed static target.
-      2. Widening `resolveInstanceMethod` to also collect the inherited `get(K): V?`
-         works (both become candidates), but `pickMethodOverload` still picks
-         `get<T>` — and NOT by a breakable tie: `get<T>`'s param `Foo<T>` is
-         genuinely MORE specific than the inherited `get(K)`'s type-var `K` (K is
-         the base class's type parameter), so it scores strictly higher. A
-         non-generic-prefers tiebreak therefore does nothing (verified).
-      3. The `get` call reaches the dispatch with `static_recv=null` /
-         `declared_recv=null` — no static-type info at all.
-      Conclusion: runtime scoring alone CANNOT pick `get(K)`; the only reason
-      Kotlin does is the STATIC bind to `Map.get` from `getOrElse`'s `Map<out K,V>`
-      receiver. Real fix (two parts): (a) LOWERING must emit member calls inside an
-      extension/inline body carrying the body's DECLARED receiver type (`Map`) as
-      `static_recv`; (b) the dispatch must, when `static_recv` names an interface
-      the receiver implements, prefer the method that OVERRIDES that interface's
-      member (`get(K): V?`) over an unrelated same-name generic addition (`get<T>`).
-      Both touch hot paths — design carefully, validate against full `test-all`.
-    - **DEEPEST conclusion (2026-07-15): klio lacks static-type-directed member
-      dispatch.** `static_recv` IS already threaded end-to-end through
-      `callMemberInnerStatic`/`callMemberNamedInner`, but it drives only the
-      EXTENSION fallback (`extensionFnFallback`, host_call_member.zig:8997);
-      `resolveInstanceMethod` (the instance-method overload selection that picks
-      `get<T>`) ignores it. So even emitting `static_recv="Map"` for the call does
-      not help until `resolveInstanceMethod` is made static-type-aware. The correct
-      model (what Kotlin does): when a call carries a static receiver type `S`,
-      resolve the member against `S`'s member set (`Map.get(key: K): V?`), then
-      VIRTUAL-DISPATCH that to the receiver's override — `PersistentHashMap.get`
-      (the trie) — never considering the subtype's unrelated same-name `get<T>`.
-      Implementing that is a real feature (static-typed member resolution +
-      override lookup by signature), not a tweak. This is the root capability gap
-      behind the composition recursion; scope it as its own focused change with
-      full-suite validation.
-    - **Full scope of the fix (confirmed).** Three coupled changes + a rebuild:
-      (1) the LOWERING of a bare member call on an extension receiver (`get(key)`
-      inside `Map.getOrElse`) must emit `static_recv = recvTy` (currently emits
-      null — verified the `get` call reaches dispatch with `static_recv=null`);
-      (2) because `getOrElse` is a BAKED stdlib function (lowered at stdlib-bake
-      time, so its `get` IR is frozen in the pack), the stdlib pack must be REBUILT
-      after (1); (3) `resolveInstanceMethod` must consume `static_recv` — resolve
-      `get` against the `static_recv` type's members and virtual-dispatch to the
-      override, excluding the subtype's unrelated generic `get<T>`. Then full
-      `test-all`. Repro for iteration: `inh.kt` in scratchpad (fast, no engine
-      needed) — a class extending a Map-implementing base with a concrete
-      `get(K): V?` plus `fun <T> get(key: Foo<T>): T`, calling `getOrElse`.
-    - **The earlier "fix is at LOWERING, not runtime" note (superseded by the
-      above two-part finding):** `getOrElse` is
-      inlined; its `this.get(key)` re-resolves on the CONCRETE receiver type
-      (PersistentCompositionLocalHashMap → generic `get<T>`) instead of the inline
-      function's DECLARED receiver `Map<out K, V>` (→ `Map.get(K): V?`), and commits
-      `get<T>` as the target. At runtime the call is a COMMITTED
-      `callMemberInnerStatic`/`invokeMethodFuncId` on that FuncId — it never
-      re-dispatches — so a runtime-scorer change does NOT help (attempted widening
-      `resolveInstanceMethod` to collect inherited same-name methods when the pick
-      is generic — correct in isolation, `pickMethodOverload` DOES prefer the
-      non-generic exact match when both are in one class — but off the committed
-      path, reverted). Real fix: the inline splice must resolve member calls in the
-      body against the inline fn's declared param/receiver types (already RECORDED
-      via `bindSpliceParamTy`, ~inline_call.zig:1285), so `this.get` binds `Map.get`
-      and virtual-dispatches to `PersistentHashMap.get` (the trie); the unrelated
-      `get<T>` never enters. Delicate (member resolution is the hot path) — validate
-      against full `test-all`.
+  - **RESOLVED (2026-07-15): `CompositionLocalMap.read` recursion fixed via
+    static-type-directed member dispatch.** `read(key)` (an extension on
+    `PersistentCompositionLocalMap`, distinct name from `get`) is
+    `getOrElse(key) { key.defaultValueHolder }.readValue(this)`; the inlined
+    `Map.getOrElse`'s `get(key)` must bind `Map.get(key: K): V?`, but klio bound the
+    runtime subtype's unrelated generic `override fun <T> get(key: CompositionLocal<T>)`,
+    so `read → getOrElse → get<T> → read` looped. The real cause: an implicit-`this` /
+    inline-spliced own-member call resolved against a STATIC receiver type `S` was
+    not restricted to `S`'s member scope, so a subtype-introduced same-name overload
+    could shadow the statically-bound member.
+    - **Fix (committed).** `static_recv` already reaches dispatch for these calls via
+      the `CallMemberOrGlobal` path (`execCallMemberOrGlobal` computes the static
+      receiver head as `hint` from `cmg.static_recv` or the extension-receiver
+      frame, threaded through `callMemberStrictExt` → `callMemberInnerStatic` →
+      `irMethodWalk`). What was missing was `resolveInstanceMethod` CONSUMING it. Now:
+      (a) IR `Func` carries `is_override` (added in `ir.zig`, propagated from the AST
+      `FunDecl` in `decl.zig`; serialized automatically via `encodeValue(ir.Func)`);
+      (b) `resolveInstanceMethod` takes `static_recv`, and when set finds the static
+      type `S` in the receiver's hierarchy (`findClassInHierarchy`) and computes its
+      ancestor closure (`ancestorClosureFqns`); a candidate declared on a class NOT
+      in that closure (a proper descendant of `S`) that is NOT an override is out of
+      `S`'s member scope and is excluded. This is builtin-independent — it does NOT
+      need to locate the builtin `Map.get` (which is not an IR method); the
+      `is_override` flag alone distinguishes the real override (`MapBase.get(K): V?`,
+      kept) from the subtype's unrelated `get<T>` (excluded). The instance-method
+      cache is bypassed when `static_recv` is set (its `(class, name, args)` key does
+      not capture the static type; sound because static-recv calls never write the
+      cache and `static_recv=null` reads see only unfiltered results).
+    - **Corrections to the earlier open analysis above.** No lowering change was
+      needed for the `get` call and no stdlib rebuild for it (the OrGlobal path
+      already carried `static_recv`); and the discriminator is `is_override`, not
+      finding/locating the builtin `Map.get` or a param-profile match. The
+      "resolveInstanceMethod ignores static_recv" diagnosis was correct and is what
+      the fix addresses.
+    - **Validated** on faithful scratchpad repros (`inh.kt` prints `hello`,
+      `inh2.kt` prints `42`; `norec.kt`/`deleg.kt`/`edge.kt` — deepest-override,
+      non-override-inherited, and generic-override cases — all unaffected). A
+      SELF-NAME variant (`edge2.kt`/`edge3.kt`, where `get<T>` itself is named `get`
+      and calls `getOrElse`) still recurses via a DIFFERENT path — the self-name
+      `committed_ext` short-circuit in `execCallMemberOrGlobal` binds back to the
+      enclosing function, bypassing the walk/filter — but that is NOT the compose
+      pattern (compose's `read` extension is differently named) and is a separate
+      pre-existing issue.
     - NOTE: fixing this only advances to the NEXT composition bug; the group
       discipline (`$dirty`/skipping/`sourceInformation`/child-group nesting) is still
-      required for CompositionTests to pass — this remains multi-session. Reproduce
-      the recursion: `KLIO_MAX_EVAL_DEPTH=1500 KLIO_MISS_TRACE=1 klio test <ROOTS>
-      --filter=CompositionTests.simple`. Source repro shape in scratchpad
-      `getor2.kt` (uses delegation; reproduce true inheritance for exactness).
+      required for CompositionTests to pass. Reproduce the (now-fixed) recursion path:
+      `KLIO_MAX_EVAL_DEPTH=1500 KLIO_MISS_TRACE=1 klio test <ROOTS>
+      --filter=CompositionTests.simple`.
 
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
