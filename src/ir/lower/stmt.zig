@@ -957,11 +957,19 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     while (it.next()) |k| : (i += 1) captured_names[i] = k.*;
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
+    // Bind the class name to its registered `.Class` value so a `C(args)` call
+    // in scope constructs the local class. Kotlin: a local class shadows a
+    // same-named top-level function; without the binding the call resolved the
+    // function and passed the constructor args to it. The binding also flows
+    // into nested lambdas / local functions through the normal capture path.
+    const dst = b.allocReg();
     try b.push(.{ .RegisterClass = .{
         .class = FF(ast.Class).fromPtr(c),
         .captured_names = captured_names,
         .captures = captures,
+        .dst = dst,
     } });
+    try b.bind(c.name.name, dst);
     return null;
 }
 

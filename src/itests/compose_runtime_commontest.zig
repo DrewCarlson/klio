@@ -14,7 +14,9 @@
 //! per-file split would break. Isolation is by `--filter=<Class>` instead: one
 //! child per test class, so one hanging class cannot take the rest down. Every
 //! upstream test file declares a class named after the file. The pass count is a
-//! ratchet -- raise `BASELINE` as fixes land, never lower it.
+//! ratchet -- raise `BASELINE` as fixes land, never lower it. Observed pass
+//! count is 419 when the suite runs alone; the floor below leaves headroom
+//! for the saturated `test-all` case where more children hit the per-child cap.
 //!
 //! Passes are counted from per-test `PASSED` lines rather than the summary, so a
 //! file killed at the per-child cap still contributes what it proved.

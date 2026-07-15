@@ -4103,6 +4103,18 @@ noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, frame: 
             .ok => {},
             .err => |e| return raiseStep(frame, e),
         }
+        // Bind the declaration name to the registered class value so a call
+        // to the local class in scope constructs it (shadowing a same-named
+        // top-level function). Only hosts that model a class table produce a
+        // value; others leave the slot at its default.
+        if (rc.dst) |d| {
+            if (@hasDecl(H, "localClassValue")) {
+                switch (try host.localClassValue(allocator, rc.class.get().name.name)) {
+                    .ok => |maybe| if (maybe) |v| try frame.write(d, v),
+                    .err => |e| return raiseStep(frame, e),
+                }
+            }
+        }
     return .cont;
 }
 

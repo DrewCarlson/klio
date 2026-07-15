@@ -33,6 +33,7 @@ const NameValue = root.NameValue;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const ClassDef = runtime.ClassDef;
+const MaybeValueResult = ir.eval.MaybeValueResult;
 const TypeRef = ir.TypeRef;
 const UnitResult = ir.eval.UnitResult;
 
@@ -721,6 +722,20 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
         }
     }
     return .ok;
+}
+
+/// The `.Class` value for a local class just registered under `name`, so the
+/// declaration site can bind the name to it (a local class shadows a same-named
+/// top-level function for a constructor call). Null if no such class table
+/// entry exists.
+pub fn localClassValue(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
+    _ = allocator;
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    if (cg.get().get(name)) |def| {
+        return .{ .ok = .{ .Class = def.clone() } };
+    }
+    return .{ .ok = null };
 }
 
 fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, captures: []const Value) Allocator.Error![]NameValue {

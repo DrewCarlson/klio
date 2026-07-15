@@ -515,6 +515,11 @@ pub const Inst = union(enum) {
         /// function's locals.
         captured_names: [][]const u8,
         captures: []Reg,
+        /// When set, receives the registered class as a `.Class` value so
+        /// the declaration name can bind to it. A subsequent `C(args)` in
+        /// scope then constructs the local class rather than resolving a
+        /// same-named top-level function (Kotlin: a local class shadows it).
+        dst: ?Reg = null,
     },
     /// Build an anonymous-object instance from an `object { … }` /
     /// `object : Parent(args) { … }` AST node. The host synthesises a
