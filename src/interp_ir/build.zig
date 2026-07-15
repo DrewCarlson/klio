@@ -446,10 +446,15 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     if (composePluginEnabled()) {
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
-        if (base) |bsp| try composeBaseNames(&names, bsp);
+        var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
+        defer sinks.deinit();
+        if (base) |bsp| {
+            try composeBaseNames(&names, bsp);
+            try composeBaseSinks(&sinks, bsp);
+        }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null)
-            std.debug.print("[compose-pass] enabled, {d} composable names, {d} decls\n", .{ names.count(), decls.items.len });
-        try compose_pass.transformDecls(allocator, decls.items, &names);
+            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
+        try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
     // Kotlin gives same-named top-level properties distinct storage per
@@ -3958,6 +3963,26 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
         .Function => |*f| if (compose_pass.isComposable(f.annotations)) try names.put(f.name.name, {}),
         .Class => |*c| for (c.members) |*m| try composeBaseNameDecl(names, m),
         .Object => |*o| for (o.members) |*m| try composeBaseNameDecl(names, m),
+        else => {},
+    }
+}
+
+/// Add the names of baked-base functions with a `@Composable`-typed lambda
+/// parameter (composable-lambda sinks the user's composable calls pass into).
+fn composeBaseSinks(sinks: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseSinkDecl(sinks, d);
+}
+
+fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| for (f.params) |*p| {
+            if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
+                try sinks.put(f.name.name, {});
+                break;
+            }
+        },
+        .Class => |*c| for (c.members) |*m| try composeBaseSinkDecl(sinks, m),
+        .Object => |*o| for (o.members) |*m| try composeBaseSinkDecl(sinks, m),
         else => {},
     }
 }
