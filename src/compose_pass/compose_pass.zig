@@ -38,6 +38,8 @@ const Block = ast.Block;
 const FunctionBody = ast.FunctionBody;
 const Decl = ast.Decl;
 
+const dbg_lambda = false;
+
 /// Synthetic name of the injected composer parameter.
 pub const composer_param = "$composer";
 /// Synthetic name of the injected changed-flags parameter.
@@ -200,6 +202,38 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
     };
 }
 
+/// Whether a parameter's type is a `@Composable`-annotated function type — a
+/// sink a lambda argument is transformed for.
+fn isComposableLambdaParam(p: *const Param) bool {
+    return p.ty.function != null and isComposable(p.ty.annotations);
+}
+
+/// Collect the simple names of functions (and constructors) that declare a
+/// `@Composable`-typed lambda parameter, so a lambda bound to one is itself
+/// transformed. Caller owns the returned map.
+pub fn collectComposableLambdaSinks(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectSinksInto(&set, decls);
+    return set;
+}
+
+fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            for (f.params) |*p| if (isComposableLambdaParam(p)) {
+                try set.put(f.name.name, {});
+                break;
+            };
+        },
+        .Class => |*c| try collectSinksInto(set, c.members),
+        .Object => |*o| try collectSinksInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Transform every `@Composable` top-level function in `decls` in place,
 /// threading the composer per the plugin ABI. `composable_names` is the oracle
 /// set (built with `collectComposableNames`, optionally extended with names from
@@ -209,26 +243,54 @@ pub fn transformDecls(
     a: std.mem.Allocator,
     decls: []ast.Decl,
     composable_names: *const std.StringHashMap(void),
+    lambda_sinks: *const std.StringHashMap(void),
 ) std.mem.Allocator.Error!void {
     var oracle = NameSetOracle{ .names = composable_names };
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            if (!isComposable(f.annotations)) continue;
-            if (f.body == null) continue;
-            const nf = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, &oracle);
-            f.* = nf;
-        },
-        else => {},
-    };
+    for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks);
 }
 
-/// The Phase-1 transform. Returns a NEW `Function` (the input is not mutated);
-/// all fresh nodes are arena-allocated. `oracle`/`oracle_ctx` classify callees.
+fn transformDecl(
+    a: std.mem.Allocator,
+    d: *ast.Decl,
+    oracle: *NameSetOracle,
+    sinks: *const std.StringHashMap(void),
+) std.mem.Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| {
+            if (f.body == null) return;
+            if (isComposable(f.annotations)) {
+                f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks);
+            } else {
+                // Not composable: still walk the body so a `compose { … }` /
+                // `setContent { … }` composable-lambda argument is transformed.
+                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
+                if (f.body) |*fb| switch (fb.*) {
+                    .Block => |*blk| try w.walkBlock(blk),
+                    .Expr => |*e| try w.walkExpr(e),
+                };
+            }
+        },
+        .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks),
+        .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks),
+        .Property => |p| {
+            var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = p.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
+            if (p.init) |*ini| try w.walkExpr(ini);
+            if (p.delegate) |del| try w.walkExpr(del);
+        },
+        else => {},
+    }
+}
+
+/// The composable-function transform. Returns a NEW `Function` (the input is not
+/// mutated); all fresh nodes are arena-allocated. `oracle`/`oracle_ctx` classify
+/// callees; `sinks` names functions with a `@Composable`-typed lambda parameter,
+/// so a lambda bound to one is itself transformed (null = no lambda transform).
 pub fn transformComposableFunction(
     a: std.mem.Allocator,
     f: *const Function,
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
+    sinks: ?*const std.StringHashMap(void),
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
 
@@ -258,7 +320,7 @@ pub fn transformComposableFunction(
     ) });
     // Threaded body: walk in place, replacing `currentComposer` with the
     // threaded `$composer` and threading each @Composable call.
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx };
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks };
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
         try out.append(a, s.*);
@@ -280,6 +342,13 @@ const Walker = struct {
     b: B,
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
+    sinks: ?*const std.StringHashMap(void) = null,
+    /// Whether the current scope is composable — a composable function body or a
+    /// composable lambda body. Only there are @Composable calls threaded and
+    /// `currentComposer` substituted. A non-composable body is still walked (to
+    /// transform composable-lambda-sink arguments a `compose { … }` passes down),
+    /// but its own calls are left alone.
+    thread: bool = true,
 
     fn walkBlock(w: *Walker, blk: *Block) std.mem.Allocator.Error!void {
         for (blk.stmts) |*s| try w.walkStmt(s);
@@ -314,16 +383,35 @@ const Walker = struct {
     fn walkExpr(w: *Walker, e: *Expr) std.mem.Allocator.Error!void {
         // `currentComposer` (bare or trailing member segment) IS the threaded
         // composer inside a composable body.
-        if (isCurrentComposer(e)) {
+        if (w.thread and isCurrentComposer(e)) {
             e.* = w.b.pathExpr(composer_param);
             return;
         }
         switch (e.*) {
             .Call => |*c| {
                 try w.walkExpr(c.callee);
-                for (c.args) |*arg| try w.walkExpr(arg);
-                if (calleeSimpleName(c.callee)) |name| {
-                    if (w.oracle(w.oracle_ctx, name)) try w.threadCall(c);
+                const name = calleeSimpleName(c.callee);
+                // A trailing lambda bound to a `@Composable`-typed parameter
+                // becomes a `{ …, $composer, $changed -> … }` lambda (the plugin
+                // lowers composable lambdas to FunctionN<…, Composer, Int, …>);
+                // the engine invokes it with the composer. It is transformed in
+                // place of the generic lambda-body recursion, so its body is
+                // threaded once against its own `$composer` — not the enclosing
+                // one — and no argument is threaded twice.
+                const sink_last = c.args.len != 0 and
+                    c.args[c.args.len - 1] == .Lambda and
+                    name != null and w.sinks != null and w.sinks.?.contains(name.?);
+                for (c.args, 0..) |*arg, i| {
+                    if (sink_last and i == c.args.len - 1) {
+                        try w.transformComposableLambda(&arg.Lambda);
+                    } else {
+                        try w.walkExpr(arg);
+                    }
+                }
+                if (w.thread) {
+                    if (name) |nm| {
+                        if (w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
+                    }
                 }
             },
             .Member => |*m| try w.walkExpr(m.receiver),
@@ -387,6 +475,38 @@ const Walker = struct {
             },
             else => {},
         }
+    }
+
+    /// Rewrite a `@Composable` lambda to `{ …orig, $composer, $changed -> … }`
+    /// and thread its body. The plugin lowers a `@Composable (P…) -> R` to a
+    /// `FunctionN<P…, Composer, Int, R>`; the engine's `invokeComposable` /
+    /// composer invoke it with the composer and a changed flag.
+    fn transformComposableLambda(w: *Walker, lam: anytype) std.mem.Allocator.Error!void {
+        if (dbg_lambda) std.debug.print("[compose-pass] transform composable lambda ({d} params)\n", .{lam.params.len});
+        // Idempotence: a lambda already carrying a trailing `$composer` param
+        // (a shared node reached twice) is left alone.
+        if (lam.params.len >= 2 and std.mem.eql(u8, lam.params[lam.params.len - 1].name, changed_param))
+            return;
+        // A lambda with only the synthetic `it` (a header-less `{ … }` bound to a
+        // `() -> R` sink) has no real parameters: the composer/changed pair
+        // replaces `it`, not follows it. A header-declared lambda keeps its
+        // explicit parameters and gains the pair after them.
+        const n: usize = if (lam.implicit_it) 0 else lam.params.len;
+        const new_params = try w.a.alloc(Ident, n + 2);
+        if (n != 0) @memcpy(new_params[0..n], lam.params[0..n]);
+        new_params[n] = w.b.ident(composer_param);
+        new_params[n + 1] = w.b.ident(changed_param);
+        const new_tys = try w.a.alloc(?TypeRef, n + 2);
+        for (new_tys, 0..) |*t, i| t.* = if (i < n and i < lam.param_tys.len) lam.param_tys[i] else null;
+        lam.params = new_params;
+        lam.param_tys = new_tys;
+        lam.implicit_it = false;
+        // The lambda body IS composable: thread it (and substitute
+        // currentComposer) even when the enclosing scope was not.
+        const saved = w.thread;
+        w.thread = true;
+        try w.walkBlock(&lam.body);
+        w.thread = saved;
     }
 
     /// Append `($composer, childChanged)` to a resolved @Composable call.
@@ -509,6 +629,71 @@ fn allComposable(_: *anyopaque, _: []const u8) bool {
     return true;
 }
 
+test "a composable-lambda-sink argument is transformed to (…, composer, changed)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    // Body: Column { Text("hi") }  — Column is a lambda sink, Text is composable.
+    var text_segs = [_]Ident{dummyIdent("Text")};
+    var text_callee = Expr{ .Path = .{ .segments = &text_segs, .span = gsp } };
+    var str_parts = [_]ast.StringPart{.{ .Text = "hi" }};
+    var text_args = [_]Expr{.{ .StringTemplate = .{ .parts = &str_parts, .span = gsp } }};
+    var text_names = [_]?[]const u8{null};
+    var lam_body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &text_callee,
+        .args = &text_args,
+        .arg_names = &text_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } } }};
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var col_args = [_]Expr{.{ .Lambda = .{
+        .params = &lam_params,
+        .param_tys = &lam_ptys,
+        .body = .{ .stmts = &lam_body_stmts, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } }};
+    var col_segs = [_]Ident{dummyIdent("Column")};
+    var col_callee = Expr{ .Path = .{ .segments = &col_segs, .span = gsp } };
+    var col_names = [_]?[]const u8{null};
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &col_callee,
+        .args = &col_args,
+        .arg_names = &col_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+
+    var sinks = std.StringHashMap(void).init(a);
+    try sinks.put("Column", {});
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks);
+    // stmts: startRestartGroup, Column{…}, endRestartGroup
+    const col = out.body.?.Block.stmts[1].Expr.Call;
+    // Column is composable too (allComposable) → gains its own (composer, changed).
+    const lam = col.args[0].Lambda;
+    // The sink lambda had only the synthetic `it`; it is replaced by
+    // ($composer, $changed), not appended after.
+    try testing.expectEqual(@as(usize, 2), lam.params.len);
+    try testing.expectEqualStrings(composer_param, lam.params[0].name);
+    try testing.expectEqualStrings(changed_param, lam.params[1].name);
+    try testing.expect(!lam.implicit_it);
+    // Its body's Text call was threaded ($composer, 0).
+    const inner = lam.body.stmts[0].Expr.Call;
+    try testing.expectEqual(@as(usize, 3), inner.args.len);
+    try testing.expectEqualStrings(composer_param, inner.args[1].Path.segments[0].name);
+}
+
 fn noneComposable(_: *anyopaque, _: []const u8) bool {
     return false;
 }
@@ -585,7 +770,7 @@ test "walker replaces currentComposer with the threaded composer inside a nested
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, allComposable, &ctx);
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, null);
     const stmts = out.body.?.Block.stmts;
     // startRestartGroup + Emit(...) + endRestartGroup
     const emit = stmts[1].Expr.Call;
@@ -640,7 +825,7 @@ test "transform injects composer/changed params and brackets the body" {
     const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &app, allComposable, &ctx);
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null);
 
     // Signature gained the two synthetic params.
     try testing.expectEqual(@as(usize, 3), out.params.len);
@@ -688,7 +873,7 @@ test "non-composable callees are not threaded" {
     var noparams: [0]Param = .{};
     const fnp = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx);
+    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null);
     const stmts = out.body.?.Block.stmts;
     // println keeps 0 args (not threaded).
     try testing.expectEqual(@as(usize, 0), stmts[1].Expr.Call.args.len);

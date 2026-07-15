@@ -201,6 +201,11 @@ include = [
     "androidx/compose/runtime/Stability.kt",
     "androidx/compose/runtime/StateObservation.kt",
 ]
+# Engine-only actuals for upstream expects the implicit-composer pack does
+# not ship (invokeComposable). Not referenced by the original pack.
+[[source]]
+root = "engineMain"
+
 [[deps]]
 id = "stdlib"
 # The coroutine-backed effects (rememberCoroutineScope / LaunchedEffect /

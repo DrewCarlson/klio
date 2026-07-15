@@ -170,6 +170,37 @@ implicit-composer default) while the real-engine + pass path is brought up.
     extension), and/or make the runtime ext walk dispatch inline extensions.
     Lower priority than the pass (specific to this DSL's `group` collision).
 
+- 2026-07-15: **Pass wired + made recursive; composition bring-up underway.**
+  The pass runs as a pre-lowering AST transform over every module's decls behind
+  `KLIO_COMPOSE_PLUGIN` (base/pack decls flow through `buildModuleFilesInner` via
+  `buildStdlibBase`, so pack composables transform too; the flag is folded into
+  the base image cache key). The body threading is now a full recursive in-place
+  walker: it replaces `currentComposer` with the threaded `$composer` and threads
+  `($composer, childChanged)` into every @Composable call through control flow,
+  nested calls, string interpolations, and lambda bodies.
+  - Running `CompositionTests.simple` (`compose { Text("Hello!") }`) through the
+    real engine (isolated home + `KLIO_COMPOSE_PLUGIN=1`) drove out, in order:
+    (1) `currentComposer` unresolved in Composables.kt's `remember`/`cache` →
+    fixed by the currentComposer→$composer substitution; (2) `get_field androidx
+    on CompositionImpl` from `Composition.createSlotStorage`'s fully-qualified
+    `androidx…gapbuffer.SlotTable()` → fixed by `lowerFqnCtorCall` (commit
+    88750dba); (3) `composeStackTraceMode` unresolved → fixed by shipping the
+    upstream `tooling/` engine files and dropping the klioMain tooling stubs.
+  - **Current blocker: the @Composable lambda transform.** `compose { Text(…) }`'s
+    content lambda is `@Composable () -> Unit`; the pass does not yet transform
+    composable lambdas, so the content is never threaded (`unresolved global
+    <function>`). Design: (a) build a "composable-lambda sink" set — functions
+    with a `@Composable`-typed function parameter (`param.ty.function != null and
+    isComposable(param.ty.annotations)`); (b) in the walker, when a call's arg
+    binds such a parameter (trailing-lambda case first), rewrite the lambda to
+    `{ $composer, $changed -> threaded-body }` (append the two params, thread the
+    body); (c) author the `internal expect fun invokeComposable(composer,
+    composable)` actual in klioMain to invoke `composable(composer, 1)`, so the
+    engine's `setContent` drives the transformed content with the composer. Then
+    Phase 2 ($changed skipping), Phase 3 (remember→cache is already reachable via
+    the currentComposer substitution; composable-lambda memoization remains),
+    Phase 4 (movable content, defaults).
+
 - 2026-07-15: research + de-risk complete, approach validated.
 - 2026-07-15: **Phase-1 of the pass LANDED** (`src/compose_pass/compose_pass.zig`,
   commit 8128489c). Self-contained AST transform (ast+span deps only): injects
