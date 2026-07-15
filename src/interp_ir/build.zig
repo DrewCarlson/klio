@@ -231,6 +231,11 @@ pub const BuiltModule = struct {
     instance_prop_private: PairFuncMap,
     /// Parent-ctor argument thunks per class.
     parent_ctor_args: std.StringHashMap([]FuncId),
+    /// Argument labels parallel to `parent_ctor_args`, when the super-ctor
+    /// call named any argument (`: Base(objects = 2)`); absent when all
+    /// arguments are positional. Used to bind a named super-ctor argument
+    /// to the base parameter of that name.
+    parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`.
     init_blocks: std.StringHashMap([]FuncId),
     /// Top-level property initialisers, in declaration order.
@@ -291,6 +296,7 @@ pub const BuiltModule = struct {
         self.instance_prop_setters.deinit();
         self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
+        self.parent_ctor_arg_names.deinit();
         self.init_blocks.deinit();
         self.top_level_props.deinit(self.allocator);
         self.extension_props.deinit();
@@ -333,6 +339,7 @@ fn emptyBuilt(allocator: Allocator, module: ObjRef(Module), main: ?FuncId) Built
         .instance_prop_setters = PairFuncMap.init(allocator),
         .instance_prop_private = PairFuncMap.init(allocator),
         .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
+        .parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator),
         .init_blocks = std.StringHashMap([]FuncId).init(allocator),
         .top_level_props = .empty,
         .extension_props = PairFuncMap.init(allocator),
@@ -2610,17 +2617,24 @@ fn buildModuleWithOverrides(
 
     // Parent-ctor argument thunks.
     var parent_ctor_args = if (seed) |*s| s.parent_ctor_args else std.StringHashMap([]FuncId).init(a);
+    var parent_ctor_arg_names = if (seed) |*s| s.parent_ctor_arg_names else std.StringHashMap([]const ?[]const u8).init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
         var first_parent_args: ?[]const ast.Expr = null;
-        for (c.supertype_args) |sa| {
+        var first_idx: usize = 0;
+        for (c.supertype_args, 0..) |sa, si| {
             if (sa) |args| {
                 first_parent_args = args;
+                first_idx = si;
                 break;
             }
         }
         const parent_args = first_parent_args orelse continue;
+        // The argument labels for the same supertype (`: Base(objects = 2)`),
+        // parallel to `parent_args`; empty/`null` where all positional.
+        const parent_names: ?[]const ?[]const u8 =
+            if (first_idx < c.supertype_arg_names.len) c.supertype_arg_names[first_idx] else null;
         var param_refs: std.ArrayList([]const u8) = .empty;
         defer param_refs.deinit(a);
         for (c.primary_params) |*p| try param_refs.append(a, p.name.name);
@@ -2638,6 +2652,22 @@ fn buildModuleWithOverrides(
         try parent_ctor_args.put(c.name.name, fids);
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         if (!std.mem.eql(u8, cfqn, c.name.name)) try parent_ctor_args.put(cfqn, fids);
+        // Record labels only when at least one argument is named — a fully
+        // positional call keeps the empty default and binds by position.
+        if (parent_names) |names| {
+            var any_named = false;
+            for (names) |n| {
+                if (n != null) {
+                    any_named = true;
+                    break;
+                }
+            }
+            if (any_named) {
+                const dup = try a.dupe(?[]const u8, names);
+                try parent_ctor_arg_names.put(c.name.name, dup);
+                if (!std.mem.eql(u8, cfqn, c.name.name)) try parent_ctor_arg_names.put(cfqn, dup);
+            }
+        }
     }
 
     // Init blocks as 1-arg thunks taking `this` plus ctor params.
@@ -3205,6 +3235,7 @@ fn buildModuleWithOverrides(
         .instance_prop_private = instance_prop_private,
         .instance_prop_setters = instance_prop_setters,
         .parent_ctor_args = parent_ctor_args,
+        .parent_ctor_arg_names = parent_ctor_arg_names,
         .init_blocks = init_blocks,
         .top_level_props = top_level_props,
         .extension_props = extension_props,

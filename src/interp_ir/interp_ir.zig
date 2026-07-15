@@ -111,6 +111,10 @@ pub const ProgramImage = struct {
     /// Getter-backed body properties declared `private` (never virtual).
     instance_prop_private: PairFuncMap,
     parent_ctor_args: std.StringHashMap([]FuncId),
+    /// Argument labels parallel to `parent_ctor_args` when a super-ctor call
+    /// named any argument; used to bind those arguments to the base
+    /// parameters of matching name rather than by position.
+    parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
     /// Property names that have at least one OWNER-QUALIFIED extension-prop
@@ -299,6 +303,7 @@ pub const ProgramImage = struct {
             .instance_prop_setters = PairFuncMap.init(allocator),
             .instance_prop_private = PairFuncMap.init(allocator),
             .parent_ctor_args = std.StringHashMap([]FuncId).init(allocator),
+            .parent_ctor_arg_names = std.StringHashMap([]const ?[]const u8).init(allocator),
             .init_blocks = std.StringHashMap([]FuncId).init(allocator),
             .extension_props = PairFuncMap.init(allocator),
             .owner_keyed_ext_names = std.StringHashMap(void).init(allocator),
@@ -336,6 +341,7 @@ pub const ProgramImage = struct {
         self.instance_prop_setters.deinit();
         self.instance_prop_private.deinit();
         self.parent_ctor_args.deinit();
+        self.parent_ctor_arg_names.deinit();
         self.init_blocks.deinit();
         self.extension_props.deinit();
         self.nullable_ext_props.deinit();

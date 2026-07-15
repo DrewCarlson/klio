@@ -554,6 +554,7 @@ pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) All
         .init_block_positions = o.init_block_positions,
         .supertypes = o.supertypes,
         .supertype_args = o.supertype_args,
+        .supertype_arg_names = o.supertype_arg_names,
         .supertype_delegates = delegates,
         .is_data = o.is_data,
         .is_companion = false,

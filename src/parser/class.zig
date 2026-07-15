@@ -38,6 +38,7 @@ const Visibility = ast.Visibility;
 pub const SupertypeList = struct {
     types: []TypeRef,
     args: []?[]Expr,
+    arg_names: []const ?[]const ?[]const u8,
     delegates: []?Expr,
 };
 
@@ -148,6 +149,7 @@ pub fn parseClass(
         .init_block_positions = init_block_positions,
         .supertypes = sup.types,
         .supertype_args = sup.args,
+        .supertype_arg_names = sup.arg_names,
         .supertype_delegates = sup.delegates,
         .is_data = mods.is_data,
         .is_companion = mods.is_companion,
@@ -434,6 +436,7 @@ pub fn parseCompanionObjectAsClass(
         .init_block_positions = cb.init_block_positions,
         .supertypes = sup.types,
         .supertype_args = sup.args,
+        .supertype_arg_names = sup.arg_names,
         .supertype_delegates = sup.delegates,
         .is_data = false,
         .is_companion = true,
@@ -467,13 +470,14 @@ pub fn parseObject(
 ) ?ObjectDecl {
     const kw = support.bump(p); // `object`
     const name = support.parseIdent(p, "object name") orelse return null;
-    const sup = parseOptionalSupertypes(p);
+    const sup = parseOptionalSupertypesFull(p);
     const cb = parseClassBody(p);
     const end = p.tokens[p.pos -| 1].span;
     return ObjectDecl{
         .name = name,
         .supertypes = sup.types,
         .supertype_args = sup.args,
+        .supertype_arg_names = sup.arg_names,
         .members = cb.members,
         .init_blocks = cb.init_blocks,
         .init_block_positions = cb.init_block_positions,
@@ -493,6 +497,7 @@ pub fn parseOptionalSupertypes(p: *Parser) struct { types: []TypeRef, args: []?[
 pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
     var type_list: std.ArrayList(TypeRef) = .empty;
     var args_list: std.ArrayList(?[]Expr) = .empty;
+    var names_list: std.ArrayList(?[]const ?[]const u8) = .empty;
     var delegates: std.ArrayList(?Expr) = .empty;
     const save = p.pos;
     support.skipNl(p);
@@ -501,6 +506,7 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
         return .{
             .types = ownedTypes(p, &type_list),
             .args = ownedArgsList(p, &args_list),
+            .arg_names = names_list.toOwnedSlice(p.allocator) catch @panic("OOM"),
             .delegates = ownedDelegates(p, &delegates),
         };
     }
@@ -513,23 +519,27 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
         if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
             _ = support.bump(p);
             var args: std.ArrayList(Expr) = .empty;
+            var arg_names: std.ArrayList(?[]const u8) = .empty;
             while (true) {
                 support.skipNl(p);
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
+                var this_name: ?[]const u8 = null;
                 if (std.meta.activeTag(support.peekKind(p).*) == .Ident) {
                     const arg_save = p.pos;
-                    _ = support.parseIdent(p, "arg label");
+                    const label = support.parseIdent(p, "arg label");
                     if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
                         _ = support.bump(p);
                         support.skipNl(p);
+                        if (label) |l| this_name = l.name;
                     } else {
                         p.pos = arg_save;
                     }
                 }
                 const a = expr.parseExpr(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
+                arg_names.append(p.allocator, this_name) catch @panic("OOM");
                 support.skipNl(p);
                 if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
                     _ = support.bump(p);
@@ -539,6 +549,7 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
             }
             _ = support.expect(p, .RParen, "`)`");
             args_list.append(p.allocator, args.toOwnedSlice(p.allocator) catch @panic("OOM")) catch @panic("OOM");
+            names_list.append(p.allocator, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM")) catch @panic("OOM");
             delegates.append(p.allocator, null) catch @panic("OOM");
         } else if (eqlOpt(support.peekIdentText(p), "by")) {
             _ = support.bump(p);
@@ -548,9 +559,11 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
             const de = expr.parseExpr(p);
             p.suppress_trailing_lambda = prev;
             args_list.append(p.allocator, null) catch @panic("OOM");
+            names_list.append(p.allocator, null) catch @panic("OOM");
             delegates.append(p.allocator, de) catch @panic("OOM");
         } else {
             args_list.append(p.allocator, null) catch @panic("OOM");
+            names_list.append(p.allocator, null) catch @panic("OOM");
             delegates.append(p.allocator, null) catch @panic("OOM");
         }
         // A comma continues the supertype list and may sit on the next line,
@@ -568,6 +581,7 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
     return .{
         .types = ownedTypes(p, &type_list),
         .args = ownedArgsList(p, &args_list),
+        .arg_names = names_list.toOwnedSlice(p.allocator) catch @panic("OOM"),
         .delegates = ownedDelegates(p, &delegates),
     };
 }

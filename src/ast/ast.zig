@@ -416,6 +416,13 @@ pub const Class = struct {
     /// (interface-style supertype reference); `Some(vec)` means it was a
     /// super-constructor call, including the empty-arg form `: Bar()`.
     supertype_args: []?[]Expr,
+    /// Parallel to each `supertype_args` list: the argument label for each
+    /// super-constructor argument (`: Bar(objects = 2)` -> `"objects"`),
+    /// or `null` for a positional argument. Empty (the default) means no
+    /// labels were captured, so every argument binds positionally. Used to
+    /// bind a named super-constructor argument to the base parameter of
+    /// that name rather than by position.
+    supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
     /// For each entry in `supertypes`, the delegate expression from
     /// `: I by expr`. `None` for plain supertype references and for
     /// constructor-call supertypes (`: Bar(...)`); `Some(expr)` records
@@ -542,6 +549,11 @@ pub const ObjectDecl = struct {
     /// Foo(arg1, arg2)`). Slot per supertype; `None` when no `(args)` was
     /// written (interface or default-ctor base).
     supertype_args: []?[]Expr,
+    /// Parallel to `supertype_args`: argument labels for a named
+    /// super-constructor call (`object O : Foo(objects = 2)`), `null` per
+    /// positional argument. Empty default = all positional. See the
+    /// matching field on the class declaration.
+    supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
     /// `data object Foo { … }` — auto-generates `toString` returning the
     /// simple class name. Distinct from `data class`: no `copy` / no
     /// `componentN`, and user-declared `equals`/`hashCode` overrides are
@@ -908,6 +920,7 @@ pub const Expr = union(enum) {
     ObjectExpr: struct {
         supertypes: []TypeRef,
         supertype_args: []?[]Expr,
+        supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
         supertype_delegates: []?Expr,
         members: []Decl,
         /// `init { … }` blocks in declaration order, run at construction

@@ -181,6 +181,7 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                 return Expr{ .ObjectExpr = .{
                     .supertypes = st.types,
                     .supertype_args = st.args,
+                    .supertype_arg_names = st.arg_names,
                     .supertype_delegates = st.delegates,
                     .members = body.members,
                     .init_blocks = body.init_blocks,
