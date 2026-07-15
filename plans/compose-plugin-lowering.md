@@ -161,12 +161,21 @@ implicit-composer default) while the real-engine + pass path is brought up.
   Composition now runs `setContent -> composeInitial -> doCompose (GapComposer) ->
   runRecomposeAndApplyChanges -> drain/executeAndFlushAllPendingOperations ->
   SlotTable.write -> guardChanges/trackAbandonedValues`.
-  - **Next blocker: `kotlin.IllegalStateException: Check failed`** during changelist
-    drain / SlotTable write. A bare `check(...)` fails; likely Composition.kt
-    guardChanges (1280) / trackAbandonedValues (1446) / checkPrecondition (1461) or a
-    SlotWriter/GapComposer invariant. A noisy top-level-init cluster (EmptyIntFloatMap
-    / EmptyFloatIntMap) also appears in the trace; disentangle. Get the INNERMOST
-    frame of the Check-failed chain (not the init-noise chains) to pinpoint. Task #44.
+  - **Next blocker: MVCC snapshot lifecycle.** The surfaced `Check failed` is a
+    CASCADE (runTest `TestScope.leave()`'s `check(entered && !finished)`, TestScope.kt:240,
+    fails only because an earlier error was collected). The ROOT, via
+    `KLIO_THROW_TRACE=1`: `IllegalStateException "Snapshot is not open: snapshotId=4,
+    disposed=true, applied=true"` (also id 10) at Snapshot.kt:2058 `validateOpen`
+    (from 842/1419 `takeNestedSnapshot`/1638), thrown inside a coroutine `<lambda>`
+    (empty captured chain -> continuation-resume), collected and re-raised at test
+    end by `kotlinx.coroutines.test.throwAll`. A disposed+applied snapshot is
+    validated as open during the recomposer's advance/apply/dispose cycle
+    (CompositionTest.kt:55 withContext). Likely a `threadSnapshot`
+    (SnapshotThreadLocal) restore across suspend, or `openSnapshots` (SnapshotIdSet)
+    / `snapshotId` (Long) tracking on dispose. This is the snapshot-core subsystem.
+    Diagnose with `KLIO_THROW_TRACE=1` (the root), NOT the Check-failed cascade.
+    Task #44. (Verify whether the composition already renders "Hello!" before this
+    teardown-phase error -- may be very close.)
   - Regression-safe: stdlib_commontest 2298; compose_runtime_commontest 445, 0
     incomplete (fixes 2+3 re-validation running as of this entry).
 
