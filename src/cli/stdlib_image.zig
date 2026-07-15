@@ -158,6 +158,15 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
 
     var hasher = std.crypto.hash.Blake3.init(.{});
 
+    // The @Composable lowering plugin (KLIO_COMPOSE_PLUGIN) rewrites base/pack
+    // composables at bake time, so a flag-on base is a different artifact than a
+    // flag-off one. Fold the flag into the key or a flag-on run reuses a
+    // flag-off cached image (untransformed pack composables).
+    if (getEnvVar(gpa, "KLIO_COMPOSE_PLUGIN")) |v| {
+        defer gpa.free(v);
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) hasher.update("compose_plugin:1;");
+    }
+
     var override_hashed = false;
     if (getEnvVar(gpa, "KLIO_STDLIB_PACK")) |override_path| {
         defer gpa.free(override_path);
