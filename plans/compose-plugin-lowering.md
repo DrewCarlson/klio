@@ -141,35 +141,43 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
-- 2026-07-15: **`CompositionLocalMap.read` recursion FIXED (commit 9381b430);
-  real engine now advances past it.** Static-receiver-directed member dispatch
-  landed (see the "RESOLVED" note below). On the real engine + plugin
+- 2026-07-15: **`CompositionLocalMap.read` recursion FULLY FIXED; real engine
+  advances two bugs deep.** Static-receiver-directed member dispatch landed in two
+  commits. 9381b430 used an `is_override` proxy: correct for the shim (its `get<T>`
+  is non-override) but WRONG for the real engine, where
+  `PersistentCompositionLocalHashMap.get<T>` carries `override` (of
+  `CompositionLocalMap`, itself a subtype of `Map`), so `!is_override` KEPT it and
+  the recursion was only MASKED (it died at a downstream readValue-on-Unit), not
+  fixed. 5db52d09 has the correct rule (`closureHasGenericMethod`): a generic
+  same-name candidate on a proper descendant of the static type S is excluded
+  UNLESS S's own ancestor closure declares a generic member of the same shape for
+  it to override. `get<T>` (tvc=1, `Map` has no generic `get`) is now excluded so
+  `get(key)` binds the inherited `PersistentHashMap.get(K): V?` trie lookup
+  (returns null, default lambda runs, `readValue` succeeds); a legitimate generic
+  override reached through a supertype static type (edge.kt `IntBox.map` over
+  `Box<T>.map`) is kept. On the real engine + plugin
   (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
-  --filter=CompositionTests.simple`), the read→getOrElse→get<T>→read recursion is
-  gone: `get(key)` on the empty persistent map now correctly returns null, the
-  `getOrElse` default lambda runs, and composition proceeds to the NEXT blocker.
-  - **New blocker: `Vm::call_member readValue on kotlin.Unit`.** `read`'s
-    `getOrElse(key) { key.defaultValueHolder }.readValue(this)` — `get` returns
-    null (correct), so the default lambda `{ key.defaultValueHolder }` runs, but
-    `CompositionLocal.defaultValueHolder` evaluates to Unit instead of its
-    `LazyValueHolder(defaultFactory)` (an `internal class ... { private val current
-    by lazy(valueProducer); readValue() = current }`, ValueHolders.kt:45).
-    `defaultValueHolder` is an `internal open val` with an initializer
-    (CompositionLocal.kt:60), overridden only in `ComputedProvidableCompositionLocal`
-    (:308). CONFIRMED NOT caused by the dispatch fix: `get(key)` correctly binds the
-    inherited `PersistentHashMap.get(K): V?` trie lookup (the subtype's `override fun
-    <T> get = read(key)` is excluded from `Map`'s scope), and every isolated repro of
-    the mechanisms PASSES — open-val-with-initializer, a 3-level sealed hierarchy with
-    an abstract intermediate + `as` cast, `by lazy`-in-constructor holder, and the
-    missing-key `getOrElse` default-lambda path (scratchpad openval.kt / openval3.kt /
-    lazyh.kt / miss.kt). The failure is specific to the live engine context (the
-    composer's initial static-local map + framework `staticCompositionLocalOf`
-    defaults), so the NEXT step is to instrument the real engine run to see exactly
-    where the `Unit` originates (get result vs the default lambda's `defaultValueHolder`
-    access) rather than more blind repros. Distinct pre-existing bug newly reachable.
-  - Regression-safe: stdlib_commontest 2298 (baseline 2150);
-    compose_runtime_commontest 295 -> 441 passing (the old implicit-composer pack;
-    baseline raised to 400).
+  --filter=CompositionTests.simple`), CompositionTests.simple clears BOTH the
+  recursion and the readValue-on-Unit that masked it.
+  - **New blocker: `unresolved global parent`.** Localized via
+    `KLIO_MISS_TRACE=parent`: the read lowers to a scope-qualified getter
+    `$sgetter$$anon$7\u{1f}parent` inside a `<lambda>` (host_fields.zig:663). The
+    `$sgetter` runtime resolution walks the RECEIVER's ($anon$7, an anonymous
+    object) own class hierarchy for a `parent` prop-getter and misses — but `parent`
+    is `CompositionImpl`'s `@get:TestOnly val parent` (upstream Composition.kt:484),
+    the ENCLOSING class, reached in `createComposer` (:638/:650 `parentContext =
+    parent`) via an anon object in the composer setup. So the sgetter must fall back
+    to the captured enclosing receiver when the runtime class misses (or lowering
+    must qualify with the enclosing owner, not the anon). Simple repros do NOT
+    reproduce (openval/getann/pinit/cc/anonprop.kt all pass — `@get:` ctor property,
+    named-arg `parent = parent`, prop-init lambda, if/else expr-body createComposer,
+    and an anon object reading an enclosing `parent`), so it needs live-engine work
+    on the specific `$anon$7` capture chain (source at file 103 offset 42728). A
+    separate noisy cluster of top-level property-init failures
+    (`__init_prop_FloatIntMap_values` / `EmptyFloatIntMap`) also shows up.
+  - Regression-safe: stdlib_commontest 2298 (baseline 2150); compose_runtime_commontest
+    295 -> 445 passing, 0 incomplete (the old implicit-composer pack; baseline raised
+    to 400).
 
 - 2026-07-15: **Engine ships and runs.** A sibling pack
   `kotlin-klio/klio-compose-runtime-engine/` curates the `androidx.compose.runtime`
