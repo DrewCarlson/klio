@@ -141,6 +141,35 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-15: **Four interpreter fixes drove CompositionTests.simple deep into the
+  real composer.** In order, each fix advanced to the next blocker on the engine +
+  plugin path (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>
+  --filter=CompositionTests.simple`):
+  1. **CompositionLocalMap.read recursion** — static-receiver-directed dispatch
+     (commit 5db52d09; `closureHasGenericMethod` — the correct rule; 9381b430's
+     `is_override` proxy only masked it). Detail in the entry below.
+  2. **Anon-object over-applied dispatch** (commit f6e1e07a) — `object : Iterable`
+     whose 0-arg `override fun iterator()` answered the stdlib `iterator { block }`
+     builder and self-recursed. `anonMethodDisprovenFn` now disproves an
+     over-applied wrong-arity member. Repro scratchpad it3/it4/it5/it6.kt.
+  3. **Private-shadow property read from an inner scope** (commit 1c435bc3) —
+     `unresolved global parent`: a `$sgetter$$anon$N\x1fparent` keyed the shadow
+     cell off the anon `owner` instead of the receiver's class. Root: androidx
+     collection `ScatterSet`'s `SetWrapper`/`MutableSetWrapper` (both `private val
+     parent`) reached iterating a ScatterSet. host_fields.zig now tries the
+     receiver-class-mangled shadow key. Repro scratchpad msw2.kt.
+  Composition now runs `setContent -> composeInitial -> doCompose (GapComposer) ->
+  runRecomposeAndApplyChanges -> drain/executeAndFlushAllPendingOperations ->
+  SlotTable.write -> guardChanges/trackAbandonedValues`.
+  - **Next blocker: `kotlin.IllegalStateException: Check failed`** during changelist
+    drain / SlotTable write. A bare `check(...)` fails; likely Composition.kt
+    guardChanges (1280) / trackAbandonedValues (1446) / checkPrecondition (1461) or a
+    SlotWriter/GapComposer invariant. A noisy top-level-init cluster (EmptyIntFloatMap
+    / EmptyFloatIntMap) also appears in the trace; disentangle. Get the INNERMOST
+    frame of the Check-failed chain (not the init-noise chains) to pinpoint. Task #44.
+  - Regression-safe: stdlib_commontest 2298; compose_runtime_commontest 445, 0
+    incomplete (fixes 2+3 re-validation running as of this entry).
+
 - 2026-07-15: **`CompositionLocalMap.read` recursion FULLY FIXED; real engine
   advances two bugs deep.** Static-receiver-directed member dispatch landed in two
   commits. 9381b430 used an `is_override` proxy: correct for the shim (its `get<T>`
