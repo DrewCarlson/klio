@@ -682,6 +682,30 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     g2.deinit();
                     if (owned) |v| return ok(v);
                 }
+                // The shadow cell is keyed by its DECLARING class. When the read
+                // comes from an inner scope whose sgetter `owner` is NOT that
+                // class (an anon object / lambda captured inside it, e.g.
+                // `iterator { parent... }` in `MutableSetWrapper`'s anon iterator,
+                // where `parent` shadows `SetWrapper.parent`), the owner-mangled
+                // `rest` misses. The captured receiver's OWN class supplies the
+                // right key.
+                const rcn = className(receiver.Instance);
+                if (!std.mem.eql(u8, rcn, owner)) {
+                    if (std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ rcn, prop }) catch null) |rk| {
+                        defer allocator.free(rk);
+                        const rc_shadow = blk: {
+                            const mg2 = self.module.borrow();
+                            defer mg2.deinit();
+                            break :blk mg2.get().registry.private_shadow_props.getKey(rk) != null;
+                        };
+                        if (rc_shadow) {
+                            const g2 = receiver.Instance.borrow();
+                            const owned = g2.get().get(rk);
+                            g2.deinit();
+                            if (owned) |v| return ok(v);
+                        }
+                    }
+                }
             }
             if (receiver.* == .Instance) {
                 var cur: ?[]const u8 = className(receiver.Instance);
