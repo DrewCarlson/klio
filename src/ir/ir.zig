@@ -1055,6 +1055,11 @@ pub const Module = struct {
     /// receiver-lambda argument's arity by the enclosing receiver. Not
     /// serialized.
     pending_lambda_enclosing_recv: ?[]const u8 = null,
+    /// Non-reified type-parameter names in scope at the lambda body about to
+    /// lower, carried into that body so an `x as T` cast inside the lambda is
+    /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
+    /// generic class). Not serialized.
+    pending_lambda_type_params: ?[]const []const u8 = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.

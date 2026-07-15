@@ -2148,6 +2148,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         break :blk b.enclosingRecvTy();
     };
+    // Carry the enclosing non-reified type-parameter names so an `x as T`
+    // cast inside the lambda body is still erased.
+    b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,

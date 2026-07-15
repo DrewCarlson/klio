@@ -1436,6 +1436,17 @@ pub const FuncBuilder = struct {
     pub fn isTypeParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.type_param_names.contains(name);
     }
+    /// The non-reified type-parameter names in scope, as a freshly allocated
+    /// slice (module allocator). Null when there are none. Used to carry them
+    /// into a lambda body.
+    pub fn typeParamNamesSlice(self: *const FuncBuilder) Allocator.Error!?[]const []const u8 {
+        if (self.type_param_names.count() == 0) return null;
+        var out = try self.allocator.alloc([]const u8, self.type_param_names.count());
+        var it = self.type_param_names.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        return out;
+    }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});
     }
