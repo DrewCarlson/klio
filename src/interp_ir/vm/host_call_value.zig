@@ -1250,13 +1250,32 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
     var cell_list: std.ArrayList(Value) = .empty;
     try cell_list.appendSlice(allocator, captures);
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
+    var chain = try ir.eval.captureChainAlloc(allocator);
+    // A closure that captures `this` but whose creation-time chain is empty
+    // (a `sequence { … }` / `iterator { … }` AstLambda created in a property
+    // getter — the accessor frame binds its receiver only as a parameter, not
+    // on the lexical receiver chain a member call publishes) would resolve
+    // `this@Class` against nothing. Seed the captured `this` as the chain's
+    // receiver so the enclosing receiver survives into the coroutine body.
+    // Method/lambda closures already carry a chain receiver and are untouched.
+    if (chain.len == 0) {
+        for (captured_names, 0..) |cn, i| {
+            if (std.mem.eql(u8, cn, "this") and i < captures.len and captures[i] == .Instance) {
+                const seeded = try allocator.alloc(ir.eval.EnclosingEntry, 1);
+                seeded[0] = .{ .v = captures[i], .kind = .receiver };
+                allocator.free(chain);
+                chain = seeded;
+                break;
+            }
+        }
+    }
     const id = try self.closures.push(.{
         .body_func = fid,
         .module = if (module == self.module.asPtr()) null else module,
         .n_params = params.len,
         .capture_names = try allocator.dupe([]const u8, captured_names),
         .captures = cell,
-        .chain = try ir.eval.captureChainAlloc(allocator),
+        .chain = chain,
     });
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
     const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
