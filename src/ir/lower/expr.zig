@@ -3773,6 +3773,27 @@ fn lowerCallWithWritebackPath(
                 }
             }
         }
+        // A trailing-lambda call must bind an overload whose last parameter is
+        // function-typed. The bare-call index can pick a same-named sibling
+        // (`group(metadata: LongArray, offset: Int)`) that cannot host the
+        // lambda; when the trailing lambda mutates an outer var the call routes
+        // through this writeback path instead of the general one, so apply the
+        // same trailing-lambda-hosting preference here — otherwise a static
+        // `Call` binds the wrong overload and the lambda lands on a scalar
+        // parameter. Only override when the current pick genuinely cannot host
+        // the lambda, to leave a correct index resolution untouched.
+        if (lastArgIsLambda(args)) {
+            const cur_hosts = if (bound_id) |bid| blk: {
+                const f = b.module.funcById(bid) orelse break :blk false;
+                if (f.params.len == 0) break :blk false;
+                const last = f.params[f.params.len - 1];
+                break :blk !last.is_vararg and fnTypeArityAlias(b, last.ty) != null;
+            } else false;
+            if (!cur_hosts) {
+                if (overloadHostingTrailingLambda(b, segments[0].name, args.len)) |fid|
+                    bound_id = fid;
+            }
+        }
         if (bound_id) |bid| {
             _ = try recordOutOfScopeCall(b, segments[0].name, segments[0].span, bid, ires);
         }
@@ -5013,7 +5034,20 @@ fn inlineTargetForBareCall(
                     }
                 }
             }
-            break :blk inline_state.inlineAstById(fid.int());
+            const idx_pick = inline_state.inlineAstById(fid.int());
+            // A trailing-lambda call cannot bind a candidate whose last
+            // parameter is not function-typed: the lambda would land on a
+            // scalar parameter (`group(metadata: LongArray, offset: Int)`
+            // absorbing `group(200) { … }`). When the index resolves such a
+            // namesake for a trailing-lambda call, decline the inline splice so
+            // the ordinary path resolves the lambda-hosting overload (the
+            // receiver extension) instead.
+            if (shape.last_is_lambda) {
+                if (idx_pick) |ip| {
+                    if (!astLastParamHostsLambda(ip)) break :blk null;
+                }
+            }
+            break :blk idx_pick;
         },
         // The index declined; the shape-narrowed pick stands in — but a
         // plain (receiverless) inline fn is only a legal target when its
@@ -5392,6 +5426,16 @@ fn inlineResolveAudit(
 /// declared arity differing from the call's (a trailing-lambda gap the
 /// candidate's fn-typed last parameter absorbs is exact enough). The
 /// AST-side mirror of `heurPickInexact`.
+/// Whether `f`'s last parameter is function-typed, so it can host a trailing
+/// lambda argument. A candidate that fails this cannot be the target of a
+/// `name(args) { … }` call — the block would bind a scalar parameter.
+fn astLastParamHostsLambda(f: *const ast.Function) bool {
+    if (f.params.len == 0) return false;
+    const last = f.params[f.params.len - 1];
+    if (last.is_vararg) return false;
+    return last.ty.function != null;
+}
+
 fn astPickInexact(f: *const ast.Function, want: usize, last_is_lambda: bool) bool {
     for (f.params) |p| {
         if (p.is_vararg) return true;
