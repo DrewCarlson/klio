@@ -234,7 +234,31 @@ implicit-composer default) while the real-engine + pass path is brought up.
     extension typed against `Map<out K, V>`, a call to `get(key)` re-resolves on the
     RUNTIME subtype and picks its same-named generic `get<T>` override rather than
     the `Map.get(K): V?` the extension was compiled against.
-    - **The fix is at LOWERING, not runtime (verified 2026-07-15).** `getOrElse` is
+    - **EXHAUSTIVE root-cause (2026-07-15) — the fix needs STATIC-TYPE threading,
+      two parts.** Faithful repro `getor2.kt`/`inh.kt`: a class extending a
+      Map-implementing base (concrete `override fun get(key: K): V?`) plus an extra
+      `fun <T> get(key: Foo<T>): T`, with a `Map.getOrElse` extension call. Proven,
+      with reverted experiments:
+      1. The `get` inside `getOrElse` is a DYN member call (resolveInstanceMethod
+         fires each iteration) — NOT a committed static target.
+      2. Widening `resolveInstanceMethod` to also collect the inherited `get(K): V?`
+         works (both become candidates), but `pickMethodOverload` still picks
+         `get<T>` — and NOT by a breakable tie: `get<T>`'s param `Foo<T>` is
+         genuinely MORE specific than the inherited `get(K)`'s type-var `K` (K is
+         the base class's type parameter), so it scores strictly higher. A
+         non-generic-prefers tiebreak therefore does nothing (verified).
+      3. The `get` call reaches the dispatch with `static_recv=null` /
+         `declared_recv=null` — no static-type info at all.
+      Conclusion: runtime scoring alone CANNOT pick `get(K)`; the only reason
+      Kotlin does is the STATIC bind to `Map.get` from `getOrElse`'s `Map<out K,V>`
+      receiver. Real fix (two parts): (a) LOWERING must emit member calls inside an
+      extension/inline body carrying the body's DECLARED receiver type (`Map`) as
+      `static_recv`; (b) the dispatch must, when `static_recv` names an interface
+      the receiver implements, prefer the method that OVERRIDES that interface's
+      member (`get(K): V?`) over an unrelated same-name generic addition (`get<T>`).
+      Both touch hot paths — design carefully, validate against full `test-all`.
+    - **The earlier "fix is at LOWERING, not runtime" note (superseded by the
+      above two-part finding):** `getOrElse` is
       inlined; its `this.get(key)` re-resolves on the CONCRETE receiver type
       (PersistentCompositionLocalHashMap → generic `get<T>`) instead of the inline
       function's DECLARED receiver `Map<out K, V>` (→ `Map.get(K): V?`), and commits
