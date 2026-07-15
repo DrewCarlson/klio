@@ -3122,7 +3122,18 @@ fn buildModuleWithOverrides(
     for (module.funcs.items[base_funcs_len..]) |*f| {
         for (f.params) |*p| {
             const resolved = module.registry.type_aliases.get(p.ty.name) orelse continue;
-            if (std.mem.startsWith(u8, resolved, "Function")) p.ty.name = resolved;
+            // A function-typed alias becomes its `Function{N}` tag (trailing-lambda
+            // alignment); a SCALAR alias (`typealias SnapshotId = Long`) becomes its
+            // primitive target so overload applicability matches a scalar argument
+            // against it (a `Long` arg fits a `SnapshotId` param, since the alias is
+            // transparent). Without this the strict multi-candidate scorer sees an
+            // opaque `SnapshotId` param and rejects the Long, so a class with two
+            // same-named overloads (one taking the alias) resolves to none.
+            if (std.mem.startsWith(u8, resolved, "Function")) {
+                p.ty.name = resolved;
+            } else if (@import("vm/overload_match.zig").builtinParamKind(resolved) != null) {
+                p.ty.name = resolved;
+            }
         }
     }
 
