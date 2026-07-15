@@ -7344,6 +7344,14 @@ fn anonMethodDisproven(self: *VmHost, hit: AnonMethodEntry, args: []const Value)
 fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
     const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const effective = f.params[skip..];
+    // Over-application: more args than the method declares and no trailing
+    // vararg to absorb them cannot bind. Without this, `lookupAnonMethod`'s
+    // arity-agnostic fallback answers a call with the wrong-arity member --
+    // an `object : Iterable` whose 0-arg `override fun iterator()` would answer
+    // the stdlib `iterator { block }` builder call and self-recurse forever.
+    // Mirrors the named-class `pickMethodOverload` over-supply guard.
+    if (args.len > effective.len and
+        (effective.len == 0 or !effective[effective.len - 1].is_vararg)) return true;
     var i: usize = 0;
     while (i < args.len and i < effective.len) : (i += 1) {
         if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return true;
