@@ -246,6 +246,15 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     b.setBodySpan(body.span);
     b.it_suppressed = suppress_it;
     b.it_suppressed_span = it_span;
+    // The receiver type in scope at this body's construction site (the
+    // enclosing `this`, or this receiver lambda's own receiver), stashed by
+    // `lowerLambda`. Carried so a bare call in this body can disambiguate a
+    // receiver-lambda argument's arity even though `recv_ty` (the decl's own
+    // extension receiver) is null inside a lambda.
+    if (module.pending_lambda_enclosing_recv) |rt| {
+        module.pending_lambda_enclosing_recv = null;
+        b.setEnclosingRecvTy(rt);
+    }
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that
     // declares it: a private getter (`closed`) reads the right field, and

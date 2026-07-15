@@ -353,6 +353,15 @@ pub const FuncBuilder = struct {
     /// `null` for plain functions and class methods.
     recv_ty: ?[]const u8 = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// The receiver-type name in scope as the implicit `this` at this
+    /// lambda body's construction site, carried across the lambda boundary
+    /// (a plain `() -> R` block captures the enclosing `this`, and a
+    /// receiver `T.() -> R` block rebinds it to `T`). `recv_ty` is only the
+    /// current declaration's own extension receiver and is null inside any
+    /// lambda; this fills that gap so bare-call overload disambiguation by
+    /// receiver still fires inside nested lambdas. Distinct from `recv_ty`
+    /// so the two never conflate a decl receiver with a captured one.
+    enclosing_recv_ty: ?[]const u8 = null,
     /// See `callTrailingLambda`.
     cur_call_trailing: bool = false,
     /// Names declared on the owning class (methods, body
@@ -1029,6 +1038,17 @@ pub const FuncBuilder = struct {
     }
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
+    }
+    /// The receiver type in scope as the implicit `this` at this body's
+    /// site: the declaration's own extension receiver, else the receiver
+    /// carried across a lambda boundary. Used by bare-call disambiguation
+    /// so a receiver-lambda argument's arity is recorded correctly even
+    /// when the call sits inside a nested `() -> R` block.
+    pub fn enclosingRecvTy(self: *const FuncBuilder) ?[]const u8 {
+        return self.recv_ty orelse self.enclosing_recv_ty;
+    }
+    pub fn setEnclosingRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
+        self.enclosing_recv_ty = name;
     }
     /// Whether the Call expression currently being lowered supplied its
     /// final argument as a TRAILING lambda (`f(x) { … }`). Set by

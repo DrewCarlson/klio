@@ -1044,6 +1044,12 @@ pub const Module = struct {
     /// anonymous object's accessor, a further lambda — reaches THAT receiver
     /// instead of the innermost `this`. Not serialized.
     pending_lambda_this_label: ?[]const u8 = null,
+    /// The receiver type in scope at the site of the lambda body about to
+    /// lower, carried into that body's builder as `enclosing_recv_ty` so a
+    /// bare call inside a nested `() -> R` block can still disambiguate a
+    /// receiver-lambda argument's arity by the enclosing receiver. Not
+    /// serialized.
+    pending_lambda_enclosing_recv: ?[]const u8 = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.

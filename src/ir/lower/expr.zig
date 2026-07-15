@@ -2126,6 +2126,18 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // The implicit label this lambda carries (`runTest { … }` → "runTest").
     // The body binds `this@<label>` to its receiver.
     b.module.pending_lambda_this_label = b.pending_lambda_label;
+    // The receiver type in scope at the body's site: a receiver lambda
+    // (`T.() -> R`) rebinds the implicit `this` to `T`, otherwise a plain
+    // block captures the enclosing `this`. Carried into the body so a bare
+    // call there can still disambiguate a receiver-lambda argument's arity.
+    b.module.pending_lambda_enclosing_recv = blk: {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                if (ft.receiver) |r| break :blk r.name.name;
+            }
+        }
+        break :blk b.enclosingRecvTy();
+    };
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -2396,6 +2408,16 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const list = b.module.func_name_index.get(name) orelse
         return memberHostingTrailingLambda(b, name, user_arg_count);
+    // With several same-named overloads that all host a trailing lambda
+    // (`SnapshotStateList.withCurrent(block: T.() -> R)` and
+    // `StateRecord.withCurrent(block: (r: T) -> R)`), declaration order is not
+    // evidence: the block's arity differs per overload (0 vs 1), and picking
+    // the wrong one records the wrong arity, so a receiver-lambda argument
+    // keeps a spurious `it` and its bare member reads fall through to globals.
+    // Prefer the overload whose leading `this` matches the enclosing receiver
+    // type; only fall back to declaration order when none matches.
+    const recv_simple: ?[]const u8 = if (b.enclosingRecvTy()) |r| simpleTypeHead(r) else null;
+    var fallback: ?FuncId = null;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
@@ -2421,8 +2443,15 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
             }
             if (!gap_defaulted) continue;
         }
-        return fid;
+        // Receiver match wins outright; otherwise remember the first valid
+        // candidate as the declaration-order fallback.
+        if (recv_simple) |rs| {
+            if (off == 1 and std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), rs))
+                return fid;
+        }
+        if (fallback == null) fallback = fid;
     }
+    if (fallback) |fid| return fid;
     // No top-level function serves the name at this arity: it may be a member.
     return memberHostingTrailingLambda(b, name, user_arg_count);
 }
@@ -3123,16 +3152,24 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // With overloads, `funcId` is a heuristic that may name the wrong one,
         // whose arity would wrongly drop a needed `it`.
         const unambiguous = if (b.module.func_name_index.get(cnm)) |ids| ids.items.len == 1 else false;
-        if (unambiguous) {
-            if (b.module.funcId(cnm)) |fid| {
-                if (b.module.funcById(fid)) |f| {
-                    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                    if (try argFnArities(b, f, args, ast_arg_names, recv_off)) |ar| {
-                        defer b.allocator.free(ar);
-                        for (args, 0..) |*a, i| {
-                            if ((a.* == .Lambda or a.* == .AnonFun) and i < ar.len and ar[i] >= 0) {
-                                b.recordLambdaArgArity(a.span(), ar[i]);
-                            }
+        const chosen: ?FuncId = if (unambiguous)
+            b.module.funcId(cnm)
+        else
+            // Ambiguous name (`withCurrent` has a `SnapshotStateList.() ->` and a
+            // `StateRecord.() ->` overload): disambiguate by the enclosing
+            // receiver type so a receiver-lambda argument's arity (0) is still
+            // recorded and its `it` dropped — otherwise its bare member reads
+            // fall through to globals.
+            disambiguateByReceiver(b, cnm);
+        if (chosen) |fid| {
+            if (b.module.funcById(fid)) |f| {
+                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                const arr = try argFnArities(b, f, args, ast_arg_names, recv_off);
+                if (arr) |ar| {
+                    defer b.allocator.free(ar);
+                    for (args, 0..) |*a, i| {
+                        if ((a.* == .Lambda or a.* == .AnonFun) and i < ar.len and ar[i] >= 0) {
+                            b.recordLambdaArgArity(a.span(), ar[i]);
                         }
                     }
                 }
@@ -6155,6 +6192,33 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
         .arg_names = &.{},
     } });
     return dst;
+}
+
+/// Among the same-named EXTENSION overloads of `name`, the one whose leading
+/// `this` receiver type matches the enclosing extension's receiver type. Lets an
+/// ambiguous bare call inside an extension body resolve its arity/receiver-lambda
+/// shape. Null when no enclosing receiver type is known or no single overload
+/// matches.
+fn disambiguateByReceiver(b: *FuncBuilder, name: []const u8) ?FuncId {
+    const recv = b.enclosingRecvTy() orelse return null;
+    const recv_simple = simpleTypeHead(recv);
+    const ids = b.module.func_name_index.get(name) orelse return null;
+    var match: ?FuncId = null;
+    for (ids.items) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), recv_simple)) continue;
+        if (match != null) return null;
+        match = fid;
+    }
+    return match;
+}
+
+fn simpleTypeHead(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.indexOfScalar(u8, n, '<')) |lt| n = n[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| n = n[dot + 1 ..];
+    return n;
 }
 
 fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
