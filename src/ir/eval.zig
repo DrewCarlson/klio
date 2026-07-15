@@ -2550,6 +2550,7 @@ fn runFrameInner(
                 if (envVarSet("KLIO_THROW_TRACE")) {
                     const s = displayThrow(allocator, &exc) catch "";
                     std.debug.print("[throw-trace] from fn {s} (fqn={s}): {s}\n", .{ frame.func.name, frame.func.fqn, s });
+                    if (envVarSet("KLIO_THROW_STACK")) dumpFrameChainForDiagAlways();
                 }
                 // Walk the try stack for a matching handler.
                 var routed = false;
