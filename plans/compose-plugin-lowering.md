@@ -257,6 +257,21 @@ implicit-composer default) while the real-engine + pass path is brought up.
       the receiver implements, prefer the method that OVERRIDES that interface's
       member (`get(K): V?`) over an unrelated same-name generic addition (`get<T>`).
       Both touch hot paths — design carefully, validate against full `test-all`.
+    - **DEEPEST conclusion (2026-07-15): klio lacks static-type-directed member
+      dispatch.** `static_recv` IS already threaded end-to-end through
+      `callMemberInnerStatic`/`callMemberNamedInner`, but it drives only the
+      EXTENSION fallback (`extensionFnFallback`, host_call_member.zig:8997);
+      `resolveInstanceMethod` (the instance-method overload selection that picks
+      `get<T>`) ignores it. So even emitting `static_recv="Map"` for the call does
+      not help until `resolveInstanceMethod` is made static-type-aware. The correct
+      model (what Kotlin does): when a call carries a static receiver type `S`,
+      resolve the member against `S`'s member set (`Map.get(key: K): V?`), then
+      VIRTUAL-DISPATCH that to the receiver's override — `PersistentHashMap.get`
+      (the trie) — never considering the subtype's unrelated same-name `get<T>`.
+      Implementing that is a real feature (static-typed member resolution +
+      override lookup by signature), not a tweak. This is the root capability gap
+      behind the composition recursion; scope it as its own focused change with
+      full-suite validation.
     - **The earlier "fix is at LOWERING, not runtime" note (superseded by the
       above two-part finding):** `getOrElse` is
       inlined; its `this.get(key)` re-resolves on the CONCRETE receiver type
