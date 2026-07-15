@@ -3166,13 +3166,43 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
         {
+            // A stored `override val/var` keeps its own backing cell under the
+            // owner-mangled key (JVM semantics); the read path resolves the
+            // nearest such cell in the runtime chain. A plain write must target
+            // that SAME cell — writing the base's plain `real_name` cell would
+            // leave the override read (which addresses the mangled cell) stale.
+            // `super.x = v` still targets the base's plain cell (super_owner
+            // set), so keep the plain name then.
+            const store_name: []const u8 = if (super_owner != null) real_name else blk: {
+                const any_cell = pglobal: {
+                    const pg = self.module.borrow();
+                    defer pg.deinit();
+                    break :pglobal pg.get().registry.override_cell_props.count() != 0;
+                };
+                if (!any_cell) break :blk real_name;
+                var cur3: ?[]const u8 = className(inst);
+                var hops3: u8 = 0;
+                while (cur3) |cn3| : (hops3 += 1) {
+                    if (hops3 > 16) break;
+                    var kb3: [256]u8 = undefined;
+                    const probe3 = std.fmt.bufPrint(&kb3, "{s}\x1f{s}", .{ cn3, real_name }) catch break;
+                    const key = kblk: {
+                        const pg = self.module.borrow();
+                        defer pg.deinit();
+                        break :kblk pg.get().registry.override_cell_props.getKey(probe3);
+                    };
+                    if (key) |k| break :blk k;
+                    cur3 = firstSupertype(self, cn3);
+                }
+                break :blk real_name;
+            };
             // A boxed capture (an anon-object method writing a captured
             // outer `var` held in its capture env as a shared Cell) takes
             // the write THROUGH the cell so the outer scope observes it.
             const existing: ?Value = blk: {
                 const g = inst.borrow();
                 defer g.deinit();
-                break :blk g.get().get(real_name);
+                break :blk g.get().get(store_name);
             };
             if (existing) |ev| {
                 if (ev == .Cell) {
@@ -3193,7 +3223,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             value.retain();
             const g = inst.borrowMut();
             defer g.deinit();
-            try g.get().define(allocator, real_name, value);
+            try g.get().define(allocator, store_name, value);
         }
         return .{ .ok = {} };
     }
