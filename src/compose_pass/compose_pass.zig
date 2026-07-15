@@ -36,6 +36,7 @@ const TypeRef = ast.TypeRef;
 const Function = ast.Function;
 const Block = ast.Block;
 const FunctionBody = ast.FunctionBody;
+const Decl = ast.Decl;
 
 /// Synthetic name of the injected composer parameter.
 pub const composer_param = "$composer";
@@ -255,9 +256,12 @@ pub fn transformComposableFunction(
         "startRestartGroup",
         b.slice1(b.intLit(positionalKey(f.span))),
     ) });
-    // Threaded body.
+    // Threaded body: walk in place, replacing `currentComposer` with the
+    // threaded `$composer` and threading each @Composable call.
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx };
     for (orig_stmts) |*s| {
-        try out.append(a, try threadStmt(a, b, s, oracle, oracle_ctx));
+        try w.walkStmt(@constCast(s));
+        try out.append(a, s.*);
     }
     // `$composer.endRestartGroup()?.updateScope { c, f -> App(args, c, $changed or 1) }`
     try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f) });
@@ -266,52 +270,146 @@ pub fn transformComposableFunction(
     return withBody(f, params, .{ .Block = new_body });
 }
 
-/// Rewrite one statement, threading the composer into any @Composable call.
-fn threadStmt(
+/// Recursive in-place body transformer. Within a `@Composable` function body it
+/// (1) replaces every `currentComposer` read with the threaded `$composer`
+/// parameter — the role the plugin's `$composer` substitution plays — and (2)
+/// appends `($composer, childChanged)` to every `@Composable` call. It descends
+/// through control flow, nested calls, string interpolations, and lambda bodies.
+const Walker = struct {
     a: std.mem.Allocator,
     b: B,
-    s: *const Stmt,
     oracle: ComposableOracle,
-    ctx: *anyopaque,
-) std.mem.Allocator.Error!Stmt {
-    return switch (s.*) {
-        .Expr => |e| .{ .Expr = try threadExpr(a, b, &e, oracle, ctx) },
-        else => s.*,
-    };
-}
+    oracle_ctx: *anyopaque,
 
-/// Thread the composer into a @Composable call. Non-call / non-composable
-/// expressions pass through unchanged (deeper nesting is Phase-2 work).
-fn threadExpr(
-    a: std.mem.Allocator,
-    b: B,
-    e: *const Expr,
-    oracle: ComposableOracle,
-    ctx: *anyopaque,
-) std.mem.Allocator.Error!Expr {
-    switch (e.*) {
-        .Call => |c| {
-            const name = calleeSimpleName(c.callee) orelse return e.*;
-            if (!oracle(ctx, name)) return e.*;
-            // Append `$composer` and a child `$changed` (0 in Phase 1).
-            var new_args = try a.alloc(Expr, c.args.len + 2);
-            @memcpy(new_args[0..c.args.len], c.args);
-            new_args[c.args.len] = b.pathExpr(composer_param);
-            new_args[c.args.len + 1] = b.intLit(0);
-            const new_names = try a.alloc(?[]const u8, new_args.len);
-            for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
-            return .{ .Call = .{
-                .callee = c.callee,
-                .args = new_args,
-                .arg_names = new_names,
-                .type_args = c.type_args,
-                .is_infix = false,
-                .has_trailing_lambda = false,
-                .span = c.span,
-            } };
-        },
-        else => return e.*,
+    fn walkBlock(w: *Walker, blk: *Block) std.mem.Allocator.Error!void {
+        for (blk.stmts) |*s| try w.walkStmt(s);
     }
+
+    fn walkStmt(w: *Walker, s: *Stmt) std.mem.Allocator.Error!void {
+        switch (s.*) {
+            .Expr => |*e| try w.walkExpr(e),
+            .Assign => |*asg| {
+                try w.walkExpr(&asg.target);
+                try w.walkExpr(&asg.value);
+            },
+            .DestructuringDecl => |*d| try w.walkExpr(&d.init),
+            .Decl => |*d| try w.walkDecl(d),
+        }
+    }
+
+    fn walkDecl(w: *Walker, d: *Decl) std.mem.Allocator.Error!void {
+        switch (d.*) {
+            .Property => |p| {
+                if (p.init) |*ini| try w.walkExpr(ini);
+                if (p.delegate) |del| try w.walkExpr(del);
+            },
+            .Function => |*f| if (f.body) |*fb| switch (fb.*) {
+                .Block => |*blk| try w.walkBlock(blk),
+                .Expr => |*e| try w.walkExpr(e),
+            },
+            else => {},
+        }
+    }
+
+    fn walkExpr(w: *Walker, e: *Expr) std.mem.Allocator.Error!void {
+        // `currentComposer` (bare or trailing member segment) IS the threaded
+        // composer inside a composable body.
+        if (isCurrentComposer(e)) {
+            e.* = w.b.pathExpr(composer_param);
+            return;
+        }
+        switch (e.*) {
+            .Call => |*c| {
+                try w.walkExpr(c.callee);
+                for (c.args) |*arg| try w.walkExpr(arg);
+                if (calleeSimpleName(c.callee)) |name| {
+                    if (w.oracle(w.oracle_ctx, name)) try w.threadCall(c);
+                }
+            },
+            .Member => |*m| try w.walkExpr(m.receiver),
+            .Index => |*ix| {
+                try w.walkExpr(ix.receiver);
+                for (ix.args) |*arg| try w.walkExpr(arg);
+            },
+            .Binary => |*bn| {
+                try w.walkExpr(bn.lhs);
+                try w.walkExpr(bn.rhs);
+            },
+            .Unary => |*u| try w.walkExpr(u.expr),
+            .Postfix => |*p| try w.walkExpr(p.expr),
+            .If => |*f| {
+                try w.walkExpr(f.cond);
+                try w.walkExpr(f.then_branch);
+                if (f.else_branch) |eb| try w.walkExpr(eb);
+            },
+            .While => |*wl| {
+                try w.walkExpr(wl.cond);
+                try w.walkExpr(wl.body);
+            },
+            .DoWhile => |*dw| {
+                if (dw.body) |bd| try w.walkExpr(bd);
+                try w.walkExpr(dw.cond);
+            },
+            .For => |*fr| {
+                try w.walkExpr(fr.iter);
+                try w.walkExpr(fr.body);
+            },
+            .Return => |*r| if (r.value) |v| try w.walkExpr(v),
+            .Throw => |*t| try w.walkExpr(t.value),
+            .Labeled => |*l| try w.walkExpr(l.expr),
+            .Block => |*blk| try w.walkBlock(blk),
+            .Try => |*t| {
+                try w.walkBlock(&t.body);
+                for (t.catches) |*ca| try w.walkBlock(&ca.body);
+                if (t.finally) |*fin| try w.walkBlock(fin);
+            },
+            .When => |*wh| {
+                if (wh.subject) |sub| try w.walkExpr(sub);
+                for (wh.branches) |*br| {
+                    for (br.patterns) |*pat| switch (pat.kind) {
+                        .Value => |*ve| try w.walkExpr(ve),
+                        .InRange => |*ve| try w.walkExpr(ve),
+                        else => {},
+                    };
+                    try w.walkExpr(&br.body);
+                }
+            },
+            .IsCheck => |*ic| try w.walkExpr(ic.expr),
+            .As => |*as| try w.walkExpr(as.expr),
+            .StringTemplate => |*st| for (st.parts) |*part| switch (part.*) {
+                .Interp => |ie| try w.walkExpr(ie),
+                else => {},
+            },
+            .Lambda => |*lam| try w.walkBlock(&lam.body),
+            .AnonFun => |*af| if (af.body) |ab| switch (ab.*) {
+                .Block => |*blk| try w.walkBlock(blk),
+                .Expr => |*ex| try w.walkExpr(ex),
+            },
+            else => {},
+        }
+    }
+
+    /// Append `($composer, childChanged)` to a resolved @Composable call.
+    fn threadCall(w: *Walker, c: anytype) std.mem.Allocator.Error!void {
+        var new_args = try w.a.alloc(Expr, c.args.len + 2);
+        @memcpy(new_args[0..c.args.len], c.args);
+        new_args[c.args.len] = w.b.pathExpr(composer_param);
+        new_args[c.args.len + 1] = w.b.intLit(0);
+        const new_names = try w.a.alloc(?[]const u8, new_args.len);
+        for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
+        c.args = new_args;
+        c.arg_names = new_names;
+        c.has_trailing_lambda = false;
+    }
+};
+
+/// Whether `e` denotes `currentComposer` — a bare path or a trailing member
+/// segment of that name.
+fn isCurrentComposer(e: *const Expr) bool {
+    return switch (e.*) {
+        .Path => |p| p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "currentComposer"),
+        else => false,
+    };
 }
 
 /// `$composer.endRestartGroup()?.updateScope { c, f -> Self(origArgs, c, $changed or 1) }`
@@ -460,6 +558,43 @@ test "isComposable detects the annotation" {
     const pf = emptyFn("plain", &noargs, null, false);
     try testing.expect(isComposable(cf.annotations));
     try testing.expect(!isComposable(pf.annotations));
+}
+
+test "walker replaces currentComposer with the threaded composer inside a nested call" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    // @Composable fun Host() { Emit(currentComposer) }
+    var cc_segs = [_]Ident{dummyIdent("currentComposer")};
+    var emit_segs = [_]Ident{dummyIdent("Emit")};
+    var emit_callee = Expr{ .Path = .{ .segments = &emit_segs, .span = gsp } };
+    var emit_args = [_]Expr{.{ .Path = .{ .segments = &cc_segs, .span = gsp } }};
+    var emit_names = [_]?[]const u8{null};
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &emit_callee,
+        .args = &emit_args,
+        .arg_names = &emit_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx);
+    const stmts = out.body.?.Block.stmts;
+    // startRestartGroup + Emit(...) + endRestartGroup
+    const emit = stmts[1].Expr.Call;
+    // Emit gained ($composer, 0); its first arg — originally currentComposer —
+    // is now the threaded $composer.
+    try testing.expectEqual(@as(usize, 3), emit.args.len);
+    try testing.expectEqualStrings(composer_param, emit.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings(composer_param, emit.args[1].Path.segments[0].name);
+    try testing.expectEqual(@as(i64, 0), emit.args[2].IntLit.value);
 }
 
 test "positionalKey is stable per span and fits Int" {
