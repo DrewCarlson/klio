@@ -272,6 +272,18 @@ implicit-composer default) while the real-engine + pass path is brought up.
       override lookup by signature), not a tweak. This is the root capability gap
       behind the composition recursion; scope it as its own focused change with
       full-suite validation.
+    - **Full scope of the fix (confirmed).** Three coupled changes + a rebuild:
+      (1) the LOWERING of a bare member call on an extension receiver (`get(key)`
+      inside `Map.getOrElse`) must emit `static_recv = recvTy` (currently emits
+      null — verified the `get` call reaches dispatch with `static_recv=null`);
+      (2) because `getOrElse` is a BAKED stdlib function (lowered at stdlib-bake
+      time, so its `get` IR is frozen in the pack), the stdlib pack must be REBUILT
+      after (1); (3) `resolveInstanceMethod` must consume `static_recv` — resolve
+      `get` against the `static_recv` type's members and virtual-dispatch to the
+      override, excluding the subtype's unrelated generic `get<T>`. Then full
+      `test-all`. Repro for iteration: `inh.kt` in scratchpad (fast, no engine
+      needed) — a class extending a Map-implementing base with a concrete
+      `get(K): V?` plus `fun <T> get(key: Foo<T>): T`, calling `getOrElse`.
     - **The earlier "fix is at LOWERING, not runtime" note (superseded by the
       above two-part finding):** `getOrElse` is
       inlined; its `this.get(key)` re-resolves on the CONCRETE receiver type
