@@ -8493,23 +8493,34 @@ fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
     defer b.allocator.free(fqn);
     const tail = rsplitLast(fqn, '.');
     if (std.mem.eql(u8, tail, fqn)) return null; // not dotted
-    if (b.module.classIdByFqn(fqn) == null) return null; // FQN is not a class
+    const cid = b.module.classIdByFqn(fqn) orelse return null; // FQN is not a class
     const head = firstSegment(fqn);
     // The head must be a real package the reference qualifies through, not a
     // name that resolves in scope (which would be a member/local access).
     if (!headIsPackage(b, head)) return null;
     if (b.resolve(head) != null or b.knowsOuter(head) or b.hasEnclosingMember(head)) return null;
     if (b.module.classId(head) != null) return null; // head names a class: nested-class path handles it
-    // Rewrite the callee to the class's simple name and re-lower as a bare
-    // constructor call.
-    const segs = try b.allocator.alloc(ast.Ident, 1);
-    segs[0] = .{ .name = tail, .span = exprSpan(callee) };
-    const new_callee = try b.allocator.create(Expr);
-    new_callee.* = Expr{ .Path = .{ .segments = segs, .span = exprSpan(callee) } };
-    var new_call = expr.Call;
-    new_call.callee = new_callee;
-    const rewritten = Expr{ .Call = new_call };
-    return try lowerCallGeneral(b, &rewritten);
+    // Construct the EXACT class the FQN names. Rewriting to the bare simple
+    // name and re-lowering would re-resolve it by simple name and pick the
+    // first same-named class from another package (`gapbuffer.SlotTable` vs
+    // `linkbuffer.SlotTable`) — the package qualifier must decide.
+    const args = expr.Call.args;
+    const ast_arg_names = expr.Call.arg_names;
+    const ctor_arity = try ctorArgFnArities(b, cid, args, ast_arg_names);
+    defer if (ctor_arity) |ca| b.allocator.free(ca);
+    const run = try lowerArgRunFull(b, args, ctor_arity, null);
+    const realigned = try ctorRealignedArgNames(b, cid, args, ast_arg_names);
+    defer if (realigned) |r| b.allocator.free(r);
+    const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .NewInstance = .{
+        .dst = dst,
+        .class = cid,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+    } });
+    return dst;
 }
 
 /// Package-qualified call to a user / pack top-level function (FQN flatten).
