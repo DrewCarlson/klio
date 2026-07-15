@@ -147,6 +147,15 @@ include = [
     "androidx/compose/runtime/composer/gapbuffer/changelist/OperationArgContainer.kt",
     "androidx/compose/runtime/composer/gapbuffer/changelist/Operation.kt",
     "androidx/compose/runtime/composer/gapbuffer/changelist/Operations.kt",
+    # --- upstream tooling ---
+    "androidx/compose/runtime/tooling/ComposeStackTrace.kt",
+    "androidx/compose/runtime/tooling/ComposeStackTraceBuilder.kt",
+    "androidx/compose/runtime/tooling/ComposeToolingApi.kt",
+    "androidx/compose/runtime/tooling/CompositionData.kt",
+    "androidx/compose/runtime/tooling/CompositionObserver.kt",
+    "androidx/compose/runtime/tooling/IdentifiableRecomposeScope.kt",
+    "androidx/compose/runtime/tooling/InspectionTables.kt",
+    "androidx/compose/runtime/tooling/SourceInformation.kt",
 ]
 
 # The bundled persistent immutable collections
