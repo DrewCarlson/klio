@@ -2415,6 +2415,17 @@ fn runFrameInner(
                 _ = try_stack.orderedRemove(p);
             }
         }
+        // An inline `return` that replayed its enclosing finallys inline and
+        // is jumping to its join bypasses the finally sentinel, so pop the
+        // try-region frames it just unwound (`Block.pop_on_exit`) here — else
+        // they linger and a later plain return re-enters the finally.
+        if (term == .Goto) {
+            for (block.pop_on_exit) |body| {
+                if (rpositionByBody(try_stack.items, body)) |p| {
+                    _ = try_stack.orderedRemove(p);
+                }
+            }
+        }
         // Finally exit with a pending return: replay the return through
         // any outer finally, otherwise complete it. The key pinned in
         // `pending_return` is the *done sentinel* — the synthesized exit
@@ -5751,7 +5762,7 @@ fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
 }
 
 /// Kotlin's defined numeric conversions and operator semantics.
-fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!EvalResult {
+pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!EvalResult {
     // Kotlin promotes `Byte`/`Short` to `Int` in arithmetic and
     // comparison. Widen and re-dispatch.
     if ((promoteByteShort(l) != null or promoteByteShort(r) != null) and op != .StringConcat) {
@@ -5952,6 +5963,20 @@ fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value)
                         const eq = lu == ru;
                         const neg = op == .NotEq or op == .BoxedNotEq;
                         return ok(.{ .Bool = if (neg) !eq else eq });
+                    }
+                }
+                // Mixed-width SIGNED integer equality compares by numeric value:
+                // Kotlin promotes `1 == 1L`. This also reconciles a value whose
+                // Long type came from a widened Int literal against a real Long
+                // (`const val X: LongAlias = -1` vs a Long `-1`). Boxed `Any`
+                // equality is EXCLUDED: `(1 as Any) != (1L as Any)` in Kotlin,
+                // so those keep the tag-sensitive structural comparison.
+                if (op == .Eq or op == .NotEq) {
+                    if (asSignedI64(&lc)) |ls| {
+                        if (asSignedI64(&rc)) |rs| {
+                            const eq = ls == rs;
+                            return ok(.{ .Bool = if (op == .NotEq) !eq else eq });
+                        }
                     }
                 }
             }

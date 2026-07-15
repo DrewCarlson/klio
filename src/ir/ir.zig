@@ -793,6 +793,15 @@ pub const Block = struct {
     /// iterations for a long-lived frame like DeepRecursive's
     /// runCallLoop).
     catch_done_for: ?BlockId = null,
+    /// Try-region body-entry ids whose `TryFrame` this block pops when it
+    /// exits via `Goto`. Set on the block that carries an inline `return`'s
+    /// jump-to-join: the return replays its enclosing finallys inline and
+    /// jumps straight to the inline join, bypassing the finally sentinel
+    /// that would otherwise pop those frames — so without this the frames
+    /// linger and a LATER plain return in the same runtime frame re-runs
+    /// the finally (a spliced `try { return … } finally { … }` applied its
+    /// snapshot twice).
+    pop_on_exit: []const BlockId = &.{},
 };
 
 /// A function body in IR form.
@@ -2133,12 +2142,13 @@ pub const Module = struct {
     /// cross-package property (ktor: `import ...server...ContentNegotiation`
     /// must not read the client package's same-named top-level val).
     pub fn classIdExactImport(self: *const Module, name: []const u8, caller_file: FileId) ?ClassId {
-        for (self.class_index.items) |entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
-            const c = idGet(Class, self.classes.items, entry.id.int()) orelse continue;
-            for (self.importAliasPathsIn(caller_file, name)) |p| {
-                if (std.mem.eql(u8, p.fqn, c.fqn)) return entry.id;
-            }
+        // Resolve the imported FQN directly rather than requiring a
+        // `class_index` entry whose SIMPLE name is `name`: a collision-mangled
+        // class (`import a.Widget` where a same-named `b.Widget` mangled both
+        // to `Widget$fN`) is registered only under its mangled name, so the
+        // simple-name scan misses it — but its FQN still resolves.
+        for (self.importAliasPathsIn(caller_file, name)) |p| {
+            if (self.classIdByFqn(p.fqn)) |cid| return cid;
         }
         return null;
     }

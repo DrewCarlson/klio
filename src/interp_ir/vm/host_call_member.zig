@@ -97,6 +97,30 @@ fn boolVal(b: bool) Value {
     return .{ .Bool = b };
 }
 
+/// Whether a value is a primitive number (integer or floating tag).
+fn isNumericValue(v: *const Value) bool {
+    return switch (v.*) {
+        .Int, .Long, .Short, .Byte, .Double, .Float, .UInt, .ULong, .UShort, .UByte => true,
+        else => false,
+    };
+}
+
+/// The binary operator a numeric type's named operator member maps to
+/// (`x.rem(y)` → `%`), or null when the name is not such a member.
+fn numericOpMethod(name: []const u8) ?ir.BinOp {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "plus")) return .Add;
+    if (eql(u8, name, "minus")) return .Sub;
+    if (eql(u8, name, "times")) return .Mul;
+    if (eql(u8, name, "div")) return .Div;
+    if (eql(u8, name, "rem")) return .Mod;
+    // `mod` is NOT mapped to `%`: Kotlin's `mod` differs from `rem` for
+    // negative operands (mod matches the divisor's sign), so it must keep the
+    // stdlib implementation. Bitwise/shift members (and/or/xor/shl/shr/ushr)
+    // likewise fall through — `applyBinop` implements only arithmetic.
+    return null;
+}
+
 /// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
 fn simpleName(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
@@ -1663,6 +1687,21 @@ fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8)
 fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
+    // Expand typealiases: a member extension declared on `TestResult`
+    // (= Unit) must accept a Unit receiver. The registry stores the
+    // target's simple head, so expansion iterates on heads; the bound
+    // guards a self-referential entry.
+    var alias_fuel: u8 = 4;
+    while (alias_fuel > 0) : (alias_fuel -= 1) {
+        const target: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(pn);
+        };
+        const t = target orelse break;
+        if (std.mem.eql(u8, t, pn)) break;
+        pn = std.mem.trimEnd(u8, simpleName(t), "?");
+    }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (std.mem.startsWith(u8, pn, "Function")) return true;
     if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
@@ -3251,8 +3290,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // decisions are a pure function of (class, name) — stable across calls — so
     // consulting the cache here is identical to letting them decline again, just
     // without the per-call FQN building, supertype walk, and ~35 type checks.
+    // The key folds `static_recv` in, so a statically-directed call is cached
+    // apart from the unscoped one (see `instanceMethodKeyScoped`). It matches
+    // `irMethodWalk`'s key exactly — that walk populates the entries served
+    // here. `declared_recv` is not folded: a user instance method's resolution
+    // never depends on it (it only directs the extension fallback, which the
+    // ext-cache probe below guards separately).
     if (receiver.* == .Instance) {
-        if (instanceMethodKey(receiver, name, args)) |k| {
+        if (instanceMethodKeyScoped(receiver, name, args, static_recv, null)) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
@@ -4420,6 +4465,25 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         missTraceMaybe(name);
         return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
     }
+    // Last resort for a primitive number whose named arithmetic operator
+    // member (`x.rem(y)`, `x.div(y)`, `x.unaryMinus()`) did not otherwise
+    // resolve — upstream Compose calls `slot.rem(SLOTS_PER_INT)` directly.
+    // Placed at the miss tail so it never preempts the stdlib operator
+    // dispatch (which handles overflow, `mod` vs `rem`, bitwise, etc.).
+    if (isNumericValue(receiver)) {
+        if (args.len == 1) {
+            if (numericOpMethod(name)) |op| {
+                return ir.eval.applyBinop(allocator, op, receiver, &args[0]);
+            }
+        } else if (args.len == 0) {
+            if (std.mem.eql(u8, name, "unaryMinus")) {
+                const zero = Value.newInt(0);
+                return ir.eval.applyBinop(allocator, .Sub, &zero, receiver);
+            }
+            if (std.mem.eql(u8, name, "unaryPlus")) return .{ .ok = receiver.* };
+        }
+    }
+
     missTraceMaybe(name);
     if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
@@ -8067,6 +8131,15 @@ fn methodArgSig(args: []const Value) ?u64 {
             .Short => 5, .Byte => 6,   .Char => 7,    .Bool => 8,
             .UInt => 9,  .ULong => 10, .UShort => 11, .UByte => 12,
             .Instance => 13,
+            // A `String` is always `kotlin.String` and a `Unit` always
+            // `kotlin.Unit`: their runtime shape fully fixes the type the
+            // overload walk sees, so folding a stable tag is sound and keeps
+            // the common String-argument calls (pervasive on the coroutine
+            // resume path) on the inline-cache fast path. `Null` stays
+            // uncacheable — it matches any nullable parameter, so its
+            // resolution is not a pure function of the value shape.
+            .String => 14,
+            .Unit => 15,
             else => return null,
         };
         h.update((&tag)[0..1]);
@@ -8084,8 +8157,28 @@ fn methodArgSig(args: []const Value) ?u64 {
 }
 
 fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
+    return instanceMethodKeyScoped(receiver, name, args, null, null);
+}
+
+/// Scope-aware cache key. A `static_recv`/`declared_recv`-directed call
+/// resolves in the STATIC type's scope, not the runtime class's, so its
+/// resolution must never be conflated with the unscoped one — `Map.getOrElse`'s
+/// inlined `get` must not be served a cached subtype `get<T>` (which
+/// self-recurses), nor vice versa. Folding the scope names into `sig` keeps
+/// both resolutions cached under distinct keys; resolution is a pure function
+/// of (class, name, arg-sig, scope), so each entry stays sound.
+fn instanceMethodKeyScoped(receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
     if (receiver.* != .Instance) return null;
-    const sig = methodArgSig(args) orelse return null;
+    var sig = methodArgSig(args) orelse return null;
+    if (static_recv != null or declared_recv != null) {
+        var h = std.hash.Wyhash.init(0x517cc1b727220a95);
+        if (static_recv) |s| h.update(s);
+        h.update(&[_]u8{0});
+        if (declared_recv) |d| h.update(d);
+        sig ^= h.final();
+        // Keep 0 reserved for the unscoped empty-arg case.
+        if (sig == 0) sig = 1;
+    }
     const inst = receiver.Instance;
     const g = inst.borrow();
     defer g.deinit();
@@ -8158,10 +8251,11 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // path at `callMemberInnerStatic`'s entry consults this same cache before the
     // probe ladder, so a repeat call skips the binding/builtin probes too.
     //
-    // A `static_recv`-directed call bypasses the cache: the resolution then
-    // depends on the static receiver type, which the (class, name, args) key
-    // does not capture, so a cached entry from an ordinary call would be wrong.
-    const key = if (static_recv == null) instanceMethodKey(receiver, name, args) else null;
+    // A `static_recv`-directed call keys with the scope folded in (see
+    // `instanceMethodKeyScoped`): its resolution depends on the static receiver
+    // type, so it caches apart from the ordinary call's entry — never served
+    // one, never serves one.
+    const key = instanceMethodKeyScoped(receiver, name, args, static_recv, null);
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;

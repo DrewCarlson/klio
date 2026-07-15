@@ -48,6 +48,13 @@ const InlineLambdaFrame = struct {
 pub const InlineReturn = struct {
     reg: Reg,
     join: BlockId,
+    /// Depth of `finally_stack` when this inline frame was pushed. A
+    /// `return` targeting this frame replays only the finallys pushed
+    /// *inside* it (`finally_stack[finally_base..]`); finallys from an
+    /// enclosing inline frame belong to that frame's own return and must
+    /// not run here (else a nested inline `try/finally` inside another
+    /// inline `try/finally` runs the outer finally twice).
+    finally_base: usize = 0,
 };
 
 /// One labeled-return target for a spliced inline-argument lambda:
@@ -483,6 +490,10 @@ pub const FuncBuilder = struct {
     /// during inline expansion replays each finally body inline before
     /// exiting.
     finally_stack: std.ArrayList(ast.Block) = .empty,
+    /// Parallel to `finally_stack`: the try-region body-entry block of the
+    /// try each finally belongs to, so an inline `return` can pop exactly
+    /// those runtime `TryFrame`s when it jumps to its join.
+    finally_body_stack: std.ArrayList(BlockId) = .empty,
     is_lambda_body: bool,
     is_anon_fn_body: bool,
     is_named_local_fn: bool,
@@ -718,6 +729,7 @@ pub const FuncBuilder = struct {
         self.reified_type_names.deinit();
         self.splice_param_tys.deinit();
         self.finally_stack.deinit(a);
+        self.finally_body_stack.deinit(a);
         self.inline_return.deinit(a);
         self.inline_stack.deinit(a);
         for (self.inline_lambda_subst.items) |*frame| {
@@ -773,7 +785,7 @@ pub const FuncBuilder = struct {
         return self.inline_return.items[self.inline_return.items.len - 1];
     }
     pub fn pushInlineReturn(self: *FuncBuilder, r: Reg, join: BlockId) Allocator.Error!void {
-        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join });
+        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join, .finally_base = self.finally_stack.items.len });
     }
     pub fn popInlineReturn(self: *FuncBuilder) void {
         _ = self.inline_return.pop();
@@ -1523,11 +1535,26 @@ pub const FuncBuilder = struct {
     pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
         return self.splice_param_tys.get(name);
     }
-    pub fn pushFinally(self: *FuncBuilder, block: ast.Block) Allocator.Error!void {
+    pub fn pushFinally(self: *FuncBuilder, block: ast.Block, body_entry: BlockId) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);
+        try self.finally_body_stack.append(self.allocator, body_entry);
     }
     pub fn popFinally(self: *FuncBuilder) void {
         _ = self.finally_stack.pop();
+        _ = self.finally_body_stack.pop();
+    }
+    /// The try-region body-entry ids for the finallys currently at
+    /// `finally_stack[from..]` — the frames an inline `return` targeting a
+    /// frame whose base is `from` must pop when it jumps to its join.
+    pub fn finallyBodiesFrom(self: *const FuncBuilder, from: usize) Allocator.Error![]BlockId {
+        const items = self.finally_body_stack.items;
+        const start = @min(from, items.len);
+        return self.allocator.dupe(BlockId, items[start..]);
+    }
+    /// Record on `block` the try-region body-entry ids whose `TryFrame` the
+    /// runtime pops when the block exits via `Goto` (see `Block.pop_on_exit`).
+    pub fn setPopOnExit(self: *FuncBuilder, block: BlockId, bodies: []const BlockId) void {
+        self.blocks.items[block.int()].pop_on_exit = bodies;
     }
     /// Snapshot the active finally blocks into a fresh owned slice.
     pub fn activeFinallys(self: *const FuncBuilder) Allocator.Error![]ast.Block {

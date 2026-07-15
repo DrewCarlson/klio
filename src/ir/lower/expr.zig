@@ -140,9 +140,13 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // this the receiver of `TrieNode.EMPTY` in an importing file falls to
         // a member access on the implicit receiver (`get_field TrieNode on
         // Companion`).
+        var imported_fqn: ?[]const u8 = null;
         const imported_cid: ?ir.ClassId = if (!aliased and b.module.classId(n) == null) blk: {
             for (b.module.importAliasPathsIn(segments[0].span.file, n)) |p| {
-                if (b.module.classIdByFqn(p.fqn)) |cid| break :blk cid;
+                if (b.module.classIdByFqn(p.fqn)) |cid| {
+                    imported_fqn = p.fqn;
+                    break :blk cid;
+                }
             }
             break :blk null;
         } else null;
@@ -150,7 +154,12 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             (b.module.classId(n) != null or imported_cid != null) and !enclosingMemberShadowsClass(b, n))
         {
             const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = n });
+            // A collision-mangled import has no name-published singleton under
+            // its bare simple name; key the load on the FQN so the name-keyed
+            // fallback (used when the singleton is not yet published) drives
+            // the object/companion init by its fully-qualified name instead of
+            // missing on the bare simple name.
+            const nm = try b.module.internConst(b.allocator, .{ .String = imported_fqn orelse n });
             // The index-resolved class rides as the exact identity so a
             // same-simple-name class/object from an invisible package
             // cannot swap in at runtime (a nested `State` inside the
@@ -348,11 +357,26 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Member => return lowerMember(b, expr),
         .Index => |ix| {
-            // `r[a, b, ...]` → r.get(a, b, ...).
+            // `r[a, b, ...]` → r.get(a, b, ...). The `get` resolves against
+            // the receiver's STATIC type, as kotlinc does: carry the declared
+            // head so a runtime subtype's own generic `get<T>` cannot shadow
+            // the statically-visible member. `map[local]` on a
+            // `PersistentMap<CompositionLocal, ValueHolder>`-typed local must
+            // bind the plain map `get` (returning the holder), never
+            // `PersistentCompositionLocalHashMap.get<T>` (the composition-
+            // local READ, which returns the resolved value). A head that is
+            // not an ancestor of the runtime receiver disengages the static
+            // scope, so an imprecise head degrades to the unhinted walk.
             const recv = try lowerReceiver(b, ix.receiver);
             const run = try lowerArgRun(b, ix.args);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = "get" });
+            const static_recv: ?ConstId = blk: {
+                const t = argDeclTypeRef(b, ix.receiver) orelse break :blk null;
+                const head = std.mem.trimEnd(u8, t.name, "?");
+                if (head.len == 0) break :blk null;
+                break :blk try b.module.internConst(b.allocator, .{ .String = head });
+            };
             try b.push(.{ .CallMember = .{
                 .dst = dst,
                 .receiver = recv,
@@ -360,6 +384,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = &.{},
+                .static_recv = static_recv,
             } });
             return dst;
         },
@@ -1378,7 +1403,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // expression position), so the read decides at runtime with the
         // index-resolved class riding as the exact global arm; the
         // companion sentinel passes a member value through unchanged.
-        if (b.module.classId(name0) != null and
+        // The flat `classId` is null when a same-simple-name class in another
+        // package forced collision-mangling (both `gapbuffer` and `linkbuffer`
+        // `InsertSlotsWithFixups` leave the simple name out of the index). An
+        // explicit `import pkg.Outer.Name` in THIS file still names exactly one
+        // of them, so treat the bare name as that class reference rather than
+        // letting it fall to a by-name global read that binds first-registered.
+        if ((b.module.classId(name0) != null or
+            b.module.classIdExactImport(name0, segments[0].span.file) != null) and
             (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
         {
             const n = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -1575,9 +1607,30 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // must live for the module's lifetime — let the module allocator
         // own it rather than freeing it here.
         const fqn = try joinSegments(b.allocator, segments);
+        // Ride the exact class id of the longest FQN prefix that names a class
+        // so the runtime binds that declaration rather than re-resolving the
+        // tail by simple name (two packages with a same-simple-name
+        // `Operation.Ins` would otherwise both bind the first-registered one).
+        if (try emitFqnWithClassPrefix(b, fqn)) |r| return r;
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+        // A fully-qualified class-with-companion in value position resolves to
+        // its companion singleton (Kotlin: `C` yields `C.Companion`), the same
+        // forwarding the bare-name arm applies. Without it `pkg.C` loaded the
+        // class value while bare `C` loaded the companion, so `pkg.C === C`
+        // was false and `context[ContinuationInterceptor]` (an interface with a
+        // named companion Key) missed the dispatcher element. The
+        // `<class-companion-or-self>` sentinel returns the companion when one
+        // exists and the class/object value otherwise, so a plain object or a
+        // companion-less class is unaffected.
+        const fqn_simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+        if (classWithCompanion(b, fqn_simple) and b.module.funcIdByFqn(fqn) == null) {
+            const comp = b.allocReg();
+            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+            try b.push(.{ .GetField = .{ .dst = comp, .receiver = dst, .field = sentinel } });
+            return comp;
+        }
         return dst;
     }
 
@@ -1672,6 +1725,22 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
     var start = ci;
     while (start > 0 and b.module.classId(segs[start - 1]) != null) start -= 1;
 
+    // Keep the leading package segments when the class named by the import's
+    // FQN is NOT the one its simple name resolves to in the flat class index
+    // — either the simple name was collision-mangled out (two packages declare
+    // a same-simple-name nested member, gapbuffer vs linkbuffer `Operation`)
+    // or it resolves to a different, first-registered declaration. Dropping the
+    // package would bind that wrong one; the full `pkg.Outer.Member` path
+    // resolves the exact declaration the import named.
+    if (start > 0) {
+        const fqn_parts = segs[0 .. ci + 1];
+        const fqn = std.mem.join(b.allocator, ".", fqn_parts) catch return null;
+        if (b.module.classIdByFqn(fqn)) |fqn_cid| {
+            const simple_cid = b.module.classId(segs[ci]);
+            if (simple_cid == null or simple_cid.?.int() != fqn_cid.int()) start = 0;
+        }
+    }
+
     const last = segs.len - 1;
     var out = b.allocator.alloc([]const u8, segs.len - start) catch return null;
     var n: usize = 0;
@@ -1679,7 +1748,7 @@ fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?I
     while (j < segs.len) : (j += 1) {
         // Drop an intermediate `Companion` hop — `X.member` resolves the
         // companion member — but keep a nested classifier (`Outer.State`).
-        if (j != start and j != last and std.mem.eql(u8, segs[j], "Companion")) continue;
+        if (j != last and std.mem.eql(u8, segs[j], "Companion")) continue;
         out[n] = segs[j];
         n += 1;
     }
@@ -1858,9 +1927,31 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.module.classId(head) == null and
             (head_is_real_pkg or b.resolve("this") == null))
         {
+            if (try emitFqnWithClassPrefix(b, fqn)) |r| return r;
             const dst = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = fqn });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+            // A fully-qualified class-with-companion in value position yields its
+            // companion singleton (Kotlin: `C` yields `C.Companion`), matching the
+            // bare-name arm. Without it `pkg.C` loaded the class value while bare
+            // `C` loaded the companion, so `pkg.C === C` was false and
+            // `context[ContinuationInterceptor]` (an interface with a named
+            // companion Key) missed the dispatcher element. The
+            // `<class-companion-or-self>` sentinel returns the companion when one
+            // exists and the class/object value otherwise, leaving a plain object
+            // or a companion-less class unchanged.
+            const fqn_simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            // A same-FQN factory function (`kotlinx.coroutines.Job` is both an
+            // interface with a companion `Key` AND a `fun Job()` factory) keeps
+            // the class value: as a call callee it is the factory, and a bare
+            // reference reaches its companion through explicit `.Key`. Only a
+            // companioned classifier with no such function forwards.
+            if (classWithCompanion(b, fqn_simple) and b.module.funcIdByFqn(fqn) == null) {
+                const comp = b.allocReg();
+                const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+                try b.push(.{ .GetField = .{ .dst = comp, .receiver = dst, .field = sentinel } });
+                return comp;
+            }
             return dst;
         }
     }
@@ -1910,16 +2001,30 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (label == null) {
         if (b.inlineActiveReturn()) |ar| {
             if (r) |rr| try b.push(.{ .Move = .{ .dst = ar.reg, .src = rr } });
-            // Replay every active `finally { … }` block inline before exiting.
-            const pending = try b.activeFinallys();
-            defer b.allocator.free(pending);
-            if (pending.len != 0) {
+            // Replay the `finally { … }` blocks pushed *inside* this inline
+            // frame before jumping to its join. Finallys from an enclosing
+            // inline frame belong to that frame's own return and must not run
+            // here: `composing { try { return snap.enter(block) } finally { apply } }`
+            // inlines `enter { try { return block() } finally { restore } }`, so
+            // at `return block()` the stack holds [apply, restore]; replaying
+            // both would apply the snapshot twice.
+            const base = @min(ar.finally_base, b.finally_stack.items.len);
+            // The try-region bodies whose finally we replay here: their
+            // runtime `TryFrame`s must be popped when we jump to the join,
+            // because the jump bypasses the finally sentinel that would pop
+            // them. Captured before the replay swaps the stack.
+            const pop_bodies = try b.finallyBodiesFrom(base);
+            if (b.finally_stack.items.len > base) {
                 const prior = try b.swapFinallyStack(&.{});
                 defer b.allocator.free(prior);
-                var idx: usize = 0;
-                while (idx < pending.len) : (idx += 1) {
-                    const blk = &pending[pending.len - 1 - idx];
-                    const outer = try b.allocator.dupe(ast.Block, prior[0 .. prior.len - (idx + 1)]);
+                var idx: usize = prior.len;
+                while (idx > base) {
+                    idx -= 1;
+                    const blk = &prior[idx];
+                    // While replaying this finally, the finallys strictly
+                    // outside it (including the enclosing frame's base) stay
+                    // active so a `return` within the finally still unwinds.
+                    const outer = try b.allocator.dupe(ast.Block, prior[0..idx]);
                     const dropped = try b.swapFinallyStack(outer);
                     b.allocator.free(dropped);
                     _ = try lowerBlock(b, blk);
@@ -1927,6 +2032,11 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const restore = try b.allocator.dupe(ast.Block, prior);
                 const dropped2 = try b.swapFinallyStack(restore);
                 b.allocator.free(dropped2);
+            }
+            if (pop_bodies.len != 0) {
+                b.setPopOnExit(b.cur, pop_bodies);
+            } else {
+                b.allocator.free(pop_bodies);
             }
             b.terminate(.{ .Goto = ar.join });
             const dead = try b.allocBlock();
@@ -2006,7 +2116,7 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     b.attachCatches(cur_id, catch_handlers, finally_entry);
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
-    if (t.finally) |blk| try b.pushFinally(blk);
+    if (t.finally) |blk| try b.pushFinally(blk, cur_id);
     const body_val = try lowerBlock(b, &t.body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (finally_entry) |fin| {
@@ -4679,7 +4789,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // the class visible from the caller's package and imports, so a
     // cross-package simple-name collision constructs the right class.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file)) |class_id| {
+        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
+            b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file)) |class_id|
+        {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
@@ -4743,6 +4855,11 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.resolve(callee.Path.segments[0].name) == null and
         !b.knowsOuter(callee.Path.segments[0].name) and
         b.module.classId(callee.Path.segments[0].name) == null and
+        // A collision-mangled class reached only through an explicit import
+        // (`import a.Widget` with a same-named `b.Widget`) is registered under
+        // its mangled name, so `classId` misses — but it is a real class ctor,
+        // not an unresolved bare call.
+        b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file) == null and
         (b.module.funcId(callee.Path.segments[0].name) == null or inReceiverContext(b)))
     {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
@@ -7861,6 +7978,13 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
             }
         }
     }
+    // An explicit `import pkg.Outer.Name` in THIS file is unambiguous and
+    // outranks both the scope-tier index and the receiver-scope decline:
+    // when two files each import a different same-simple-name class (the
+    // gapbuffer vs linkbuffer `InsertSlotsWithFixups`), the flat index would
+    // hand every reference the first-registered one. Bind the file's own
+    // import instead.
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
     // A receiver context whose owner chain is unknown here (a super-arg /
     // default-value thunk, a lambda) may still see a NESTED classifier the
     // flat index cannot rank; committing the package-scope pick would
@@ -8474,23 +8598,34 @@ fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
     defer b.allocator.free(fqn);
     const tail = rsplitLast(fqn, '.');
     if (std.mem.eql(u8, tail, fqn)) return null; // not dotted
-    if (b.module.classIdByFqn(fqn) == null) return null; // FQN is not a class
+    const cid = b.module.classIdByFqn(fqn) orelse return null; // FQN is not a class
     const head = firstSegment(fqn);
     // The head must be a real package the reference qualifies through, not a
     // name that resolves in scope (which would be a member/local access).
     if (!headIsPackage(b, head)) return null;
     if (b.resolve(head) != null or b.knowsOuter(head) or b.hasEnclosingMember(head)) return null;
     if (b.module.classId(head) != null) return null; // head names a class: nested-class path handles it
-    // Rewrite the callee to the class's simple name and re-lower as a bare
-    // constructor call.
-    const segs = try b.allocator.alloc(ast.Ident, 1);
-    segs[0] = .{ .name = tail, .span = exprSpan(callee) };
-    const new_callee = try b.allocator.create(Expr);
-    new_callee.* = Expr{ .Path = .{ .segments = segs, .span = exprSpan(callee) } };
-    var new_call = expr.Call;
-    new_call.callee = new_callee;
-    const rewritten = Expr{ .Call = new_call };
-    return try lowerCallGeneral(b, &rewritten);
+    // Construct the EXACT class the FQN names. Rewriting to the bare simple
+    // name and re-lowering would re-resolve it by simple name and pick the
+    // first same-named class from another package (`gapbuffer.SlotTable` vs
+    // `linkbuffer.SlotTable`) — the package qualifier must decide.
+    const args = expr.Call.args;
+    const ast_arg_names = expr.Call.arg_names;
+    const ctor_arity = try ctorArgFnArities(b, cid, args, ast_arg_names);
+    defer if (ctor_arity) |ca| b.allocator.free(ca);
+    const run = try lowerArgRunFull(b, args, ctor_arity, null);
+    const realigned = try ctorRealignedArgNames(b, cid, args, ast_arg_names);
+    defer if (realigned) |r| b.allocator.free(r);
+    const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .NewInstance = .{
+        .dst = dst,
+        .class = cid,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+    } });
+    return dst;
 }
 
 /// Package-qualified call to a user / pack top-level function (FQN flatten).
@@ -9074,6 +9209,53 @@ fn rsplitLast(s: []const u8, sep: u8) []const u8 {
 fn firstSegment(s: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, s, '.')) |i| return s[0..i];
     return s;
+}
+
+/// Emit a dotted `pkg.Outer.Inner.member…` reference by binding the LONGEST
+/// prefix that names a class to its EXACT id, then reading each remaining
+/// segment as a field. Riding the class id keeps a same-simple-name class in
+/// another package from swapping in at runtime (the `gapbuffer` vs
+/// `linkbuffer` `Operation.Ins` collision), which a plain name-keyed global
+/// load cannot do. Returns null when no prefix names a class — the caller
+/// falls back to the name-keyed load.
+fn emitFqnWithClassPrefix(b: *FuncBuilder, fqn: []const u8) Allocator.Error!?Reg {
+    var end = fqn.len;
+    while (true) {
+        if (b.module.classIdByFqn(fqn[0..end])) |cid| {
+            // Ride the exact id ONLY when the prefix's simple name is
+            // genuinely ambiguous — collision-mangled out of the flat index
+            // (null) or resolving to a DIFFERENT first-registered class.
+            // When the simple name resolves to this very class the name-keyed
+            // load is already correct AND preferable: an id load returns a
+            // class's companion (or misses a same-named factory function),
+            // so overriding an unambiguous `kotlinx.coroutines.Job` would
+            // hand back `Job.Key` instead of the Job factory.
+            const prefix = fqn[0..end];
+            const simple = if (std.mem.lastIndexOfScalar(u8, prefix, '.')) |d| prefix[d + 1 ..] else prefix;
+            const simple_cid = b.module.classId(simple);
+            if (simple_cid != null and simple_cid.?.int() == cid.int()) return null;
+            // The id table resolves an `object` prefix straight to its
+            // singleton; a plain class prefix loads its class value, off which
+            // each remaining segment reads its nested classifier / member.
+            var cur = b.allocReg();
+            const n = try b.module.internConst(b.allocator, .{ .String = fqn[0..end] });
+            try b.push(.{ .LoadGlobal = .{ .dst = cur, .name = n, .class = cid } });
+            var rest = fqn[end..];
+            while (rest.len > 0) {
+                rest = rest[1..]; // skip '.'
+                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+                const next = b.allocReg();
+                const field = try b.module.internConst(b.allocator, .{ .String = rest[0..dot] });
+                try b.push(.{ .GetField = .{ .dst = next, .receiver = cur, .field = field } });
+                cur = next;
+                rest = rest[dot..];
+            }
+            return cur;
+        }
+        const dot = std.mem.lastIndexOfScalar(u8, fqn[0..end], '.') orelse break;
+        end = dot;
+    }
+    return null;
 }
 
 /// Join `segments[*].name` with `.`. The caller owns the returned slice.

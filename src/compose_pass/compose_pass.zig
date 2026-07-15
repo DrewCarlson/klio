@@ -44,6 +44,22 @@ const dbg_lambda = false;
 pub const composer_param = "$composer";
 /// Synthetic name of the injected changed-flags parameter.
 pub const changed_param = "$changed";
+/// FQN of the absent-argument marker singleton accessor (declared in the
+/// compose runtime engine pack). A defaulted `@Composable` parameter's default
+/// expression must evaluate INSIDE the function body — with `$composer` in
+/// scope — exactly as the upstream plugin's `$default`-mask rewrite does
+/// (`fun Test(n: Int = LocalNumber.current)` reads a CompositionLocal). The
+/// pass replaces the declared default with `klioComposableDefaultMarker()`
+/// (cheap, needs no composition) and prologues the body with
+/// `val n = if (n$arg === klioComposableDefaultMarker()) <default> else n$arg`.
+const default_marker_path = [_][]const u8{ "androidx", "compose", "runtime", "klioComposableDefaultMarker" };
+/// FQN of the ambient-composer host intrinsic (klioMain HostIntrinsics.kt,
+/// served by src/interp_ir/vm/compose.zig). A `@Composable` property GETTER
+/// has no `$composer` parameter to thread — upstream compiles `currentComposer`
+/// there as an intrinsic — so an ambient-mode walk substitutes reads (and the
+/// composer argument of threaded calls) with this call; the interpreter keeps
+/// the stack populated around every transformed-composable invocation.
+const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "__compose_currentComposer" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -115,6 +131,13 @@ const B = struct {
     fn pathExpr(self: B, name: []const u8) Expr {
         const segs = self.a.alloc(Ident, 1) catch @panic("oom");
         segs[0] = self.ident(name);
+        return .{ .Path = .{ .segments = segs, .span = self.gen_span } };
+    }
+
+    /// `a.b.c` as a multi-segment path expression.
+    fn pathExprSegs(self: B, names: []const []const u8) Expr {
+        const segs = self.a.alloc(Ident, names.len) catch @panic("oom");
+        for (names, segs) |nm, *s| s.* = self.ident(nm);
         return .{ .Path = .{ .segments = segs, .span = self.gen_span } };
     }
 
@@ -302,12 +325,112 @@ fn transformDecl(
         .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks),
         .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks),
         .Property => |p| {
-            var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = p.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
+            const pb = B{ .a = a, .gen_span = p.span };
+            var w = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
             if (p.init) |*ini| try w.walkExpr(ini);
             if (p.delegate) |del| try w.walkExpr(del);
+            // A `@Composable` property GETTER composes with no `$composer`
+            // param of its own: walk its body in ambient mode, where composer
+            // references go through the `__compose_currentComposer` intrinsic
+            // (the interpreter keeps that stack current around every
+            // transformed-composable call). The upstream `currentComposer`
+            // property ITSELF is the intrinsic stub ("Implemented as an
+            // intrinsic", a throwing body): replace its getter body with the
+            // intrinsic read.
+            if (p.getter) |g| {
+                if (isComposable(g.annotations) or isComposable(p.annotations)) {
+                    if (std.mem.eql(u8, p.name.name, "currentComposer")) {
+                        g.body = .{ .Expr = pb.call(pb.pathExprSegs(&ambient_composer_path), a.alloc(Expr, 0) catch @panic("oom")) };
+                    } else {
+                        var gw = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = true, .ambient = true };
+                        switch (g.body) {
+                            .Block => |*blk| try gw.walkBlock(blk),
+                            .Expr => |*e| try gw.walkExpr(e),
+                        }
+                    }
+                }
+            }
         },
         else => {},
     }
+}
+
+/// `androidx.compose.runtime.klioComposableDefaultMarker()` — the absent-arg
+/// sentinel call (see `default_marker_path`).
+fn markerCall(b: B) Expr {
+    return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
+}
+
+/// The transformed signature plus the body prologue that re-evaluates
+/// composable defaults in composition context. Every original param keeps its
+/// slot; a DEFAULTED param `p: T = D` is renamed to `p$arg` with the marker as
+/// its default, and the prologue declares `val p = if (p$arg === marker()) D
+/// else p$arg` — so `D` runs inside the body, where the threaded `$composer`
+/// is in scope (the body walk threads any composable call inside `D`). The
+/// restart re-call passes `p$arg`, so a recomposition of the scope re-evaluates
+/// the default exactly as upstream's `$default`-mask re-call does.
+/// `$composer`/`$changed` are appended last, as before.
+const ParamsAndPrologue = struct { params: []Param, prologue: []Stmt };
+
+/// The enclosing function's `@Composable`-lambda-typed param names, for the
+/// walker's bare-invoke threading (`content()`). Arena-allocated.
+fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    for (f.params) |*p| {
+        if (isComposableLambdaParam(p)) try set.put(p.name.name, {});
+    }
+    return set;
+}
+
+fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.mem.Allocator.Error!ParamsAndPrologue {
+    var params = try a.alloc(Param, f.params.len + 2);
+    var prologue: std.ArrayList(Stmt) = .empty;
+    for (f.params, 0..) |p, i| {
+        params[i] = p;
+        if (p.default == null or f.body == null) continue;
+        const argname = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
+        params[i].name = b.ident(argname);
+        params[i].default = b.box(markerCall(b));
+        const cond = Expr{ .Binary = .{
+            .op = .IdentEq,
+            .lhs = b.box(b.pathExpr(argname)),
+            .rhs = b.box(markerCall(b)),
+            .span = b.gen_span,
+        } };
+        const pick = Expr{ .If = .{
+            .cond = b.box(cond),
+            .then_branch = p.default.?,
+            .else_branch = b.box(b.pathExpr(argname)),
+            .span = b.gen_span,
+        } };
+        const prop = try a.create(ast.Property);
+        prop.* = .{
+            .mutable = false,
+            .name = p.name,
+            .receiver_type = null,
+            .ty = null,
+            .init = pick,
+            .delegate = null,
+            .getter = null,
+            .setter = null,
+            .is_abstract = false,
+            .is_open = false,
+            .is_override = false,
+            .is_lateinit = false,
+            .is_const = false,
+            .is_inline = false,
+            .is_expect = false,
+            .is_actual = false,
+            .setter_visibility = null,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = b.gen_span,
+        };
+        try prologue.append(a, .{ .Decl = .{ .Property = prop } });
+    }
+    params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
+    params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
+    return .{ .params = params, .prologue = try prologue.toOwnedSlice(a) };
 }
 
 /// The composable-function transform. Returns a NEW `Function` (the input is not
@@ -323,11 +446,10 @@ pub fn transformComposableFunction(
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
 
-    // 1. Signature: append `$composer: Composer` and `$changed: Int`.
-    var params = try a.alloc(Param, f.params.len + 2);
-    @memcpy(params[0..f.params.len], f.params);
-    params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
-    params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
+    // 1. Signature: append `$composer: Composer` and `$changed: Int`; move
+    //    composable defaults into the body prologue.
+    const pp = try buildParamsAndPrologue(a, b, f);
+    const params = pp.params;
 
     // 2. Body: thread the composer through @Composable calls, then bracket.
     const orig_stmts: []const Stmt = switch (f.body orelse return signatureOnly(f, params)) {
@@ -348,14 +470,22 @@ pub fn transformComposableFunction(
         b.slice1(b.intLit(positionalKey(f.span))),
     ) });
     // Threaded body: walk in place, replacing `currentComposer` with the
-    // threaded `$composer` and threading each @Composable call.
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks };
+    // threaded `$composer` and threading each @Composable call. The defaults
+    // prologue walks too, so a composable call inside a default expression is
+    // threaded against this body's `$composer`.
+    const lp = try a.create(std.StringHashMap(void));
+    lp.* = try composableLambdaParamNames(a, f);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp };
+    for (pp.prologue) |*s| {
+        try w.walkStmt(s);
+        try out.append(a, s.*);
+    }
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
         try out.append(a, s.*);
     }
     // `$composer.endRestartGroup()?.updateScope { c, f -> App(args, c, $changed or 1) }`
-    try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f) });
+    try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
 
     const new_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
     return withBody(f, params, .{ .Block = new_body });
@@ -373,22 +503,35 @@ pub fn transformThreadedComposable(
     sinks: ?*const std.StringHashMap(void),
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
-    var params = try a.alloc(Param, f.params.len + 2);
-    @memcpy(params[0..f.params.len], f.params);
-    params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
-    params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks };
+    const pp = try buildParamsAndPrologue(a, b, f);
+    const params = pp.params;
+    const lp = try a.create(std.StringHashMap(void));
+    lp.* = try composableLambdaParamNames(a, f);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp };
     const body = f.body orelse return signatureOnly(f, params);
     switch (body) {
         .Block => |blk| {
-            const stmts = try a.dupe(Stmt, blk.stmts);
+            const stmts = try a.alloc(Stmt, pp.prologue.len + blk.stmts.len);
+            @memcpy(stmts[0..pp.prologue.len], pp.prologue);
+            @memcpy(stmts[pp.prologue.len..], blk.stmts);
             for (stmts) |*s| try w.walkStmt(s);
             return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = blk.span } });
         },
         .Expr => |e| {
             var ne = e;
             try w.walkExpr(&ne);
-            return withBody(f, params, .{ .Expr = ne });
+            if (pp.prologue.len == 0) return withBody(f, params, .{ .Expr = ne });
+            // A value-returning single-expression body gains the prologue as a
+            // block; the expression becomes an explicit `return`.
+            const stmts = try a.alloc(Stmt, pp.prologue.len + 1);
+            @memcpy(stmts[0..pp.prologue.len], pp.prologue);
+            for (stmts[0..pp.prologue.len]) |*s| try w.walkStmt(s);
+            stmts[pp.prologue.len] = .{ .Expr = .{ .Return = .{
+                .value = b.box(ne),
+                .label = null,
+                .span = b.gen_span,
+            } } };
+            return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = f.span } });
         },
     }
 }
@@ -404,12 +547,30 @@ const Walker = struct {
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
     sinks: ?*const std.StringHashMap(void) = null,
+    /// Names of the enclosing function's `@Composable`-lambda-typed value
+    /// parameters. A bare call to one (`content()` inside
+    /// `CompositionLocalProvider`) invokes a plugin-lowered composable lambda,
+    /// so it is threaded exactly like an oracle-named composable call — the
+    /// closure's trailing params are `$composer`/`$changed`.
+    lambda_params: ?*const std.StringHashMap(void) = null,
+    /// Ambient mode: the scope is a `@Composable` property GETTER, which has
+    /// no `$composer` param. Composer references resolve through the
+    /// `__compose_currentComposer` host intrinsic instead.
+    ambient: bool = false,
     /// Whether the current scope is composable — a composable function body or a
     /// composable lambda body. Only there are @Composable calls threaded and
     /// `currentComposer` substituted. A non-composable body is still walked (to
     /// transform composable-lambda-sink arguments a `compose { … }` passes down),
     /// but its own calls are left alone.
     thread: bool = true,
+
+    /// The composer reference for the current scope: the threaded `$composer`
+    /// param, or the ambient intrinsic call in a getter.
+    fn composerRef(w: *Walker) Expr {
+        if (w.ambient)
+            return w.b.call(w.b.pathExprSegs(&ambient_composer_path), w.a.alloc(Expr, 0) catch @panic("oom"));
+        return w.b.pathExpr(composer_param);
+    }
 
     fn walkBlock(w: *Walker, blk: *Block) std.mem.Allocator.Error!void {
         for (blk.stmts) |*s| try w.walkStmt(s);
@@ -445,7 +606,7 @@ const Walker = struct {
         // `currentComposer` (bare or trailing member segment) IS the threaded
         // composer inside a composable body.
         if (w.thread and isCurrentComposer(e)) {
-            e.* = w.b.pathExpr(composer_param);
+            e.* = w.composerRef();
             return;
         }
         switch (e.*) {
@@ -471,7 +632,8 @@ const Walker = struct {
                 }
                 if (w.thread) {
                     if (name) |nm| {
-                        if (w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
+                        const is_lambda_param = w.lambda_params != null and w.lambda_params.?.contains(nm);
+                        if (is_lambda_param or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
                     }
                 }
             },
@@ -570,14 +732,22 @@ const Walker = struct {
         w.thread = saved;
     }
 
-    /// Append `($composer, childChanged)` to a resolved @Composable call.
+    /// Append `($composer = <composer>, $changed = <childChanged>)` to a
+    /// resolved @Composable call. The pair is passed by NAME: the callee may
+    /// declare defaulted params between the caller's positional args and the
+    /// synthetic pair (`Test(number: Int = …, $composer, $changed)` called
+    /// `Test($composer, 0)`), and a positional append would bind the composer
+    /// into the first omitted param. Named, the binder slots the pair exactly
+    /// and the omitted params take their defaults.
     fn threadCall(w: *Walker, c: anytype) std.mem.Allocator.Error!void {
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
-        new_args[c.args.len] = w.b.pathExpr(composer_param);
+        new_args[c.args.len] = w.composerRef();
         new_args[c.args.len + 1] = w.b.intLit(0);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
+        new_names[c.args.len] = composer_param;
+        new_names[c.args.len + 1] = changed_param;
         c.args = new_args;
         c.arg_names = new_names;
         c.has_trailing_lambda = false;
@@ -596,11 +766,14 @@ fn isCurrentComposer(e: *const Expr) bool {
 /// `$composer.endRestartGroup()?.updateScope { c, f -> Self(origArgs, c, $changed or 1) }`
 /// — Phase 1 emits the recompose lambda that re-invokes the function with the
 /// same value arguments, the recompose composer, and `$changed or 1`.
-fn endRestartGroupExpr(a: std.mem.Allocator, b: B, f: *const Function) std.mem.Allocator.Error!Expr {
+/// `value_params` are the TRANSFORMED value params (a defaulted param is its
+/// renamed `p$arg`, so a restart passes the marker through and the default
+/// re-evaluates in the new composition).
+fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
     // `$composer.endRestartGroup()`
     const end_call = b.callMember(b.pathExpr(composer_param), "endRestartGroup", &.{});
     // `?.updateScope(<lambda>)` — safe member call.
-    const lambda = try recomposeLambda(a, b, f);
+    const lambda = try recomposeLambda(a, b, fn_name, value_params);
     return .{ .Call = .{
         .callee = b.box(.{ .Member = .{
             .receiver = b.box(end_call),
@@ -618,20 +791,20 @@ fn endRestartGroupExpr(a: std.mem.Allocator, b: B, f: *const Function) std.mem.A
 }
 
 /// `{ c, _f -> Self(origValueArgs, c, $changed or 1) }`
-fn recomposeLambda(a: std.mem.Allocator, b: B, f: *const Function) std.mem.Allocator.Error!Expr {
+fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
     // Re-invoke the function: original value params by name + (recompose
     // composer, $changed or 1).
-    var call_args = try a.alloc(Expr, f.params.len + 2);
-    for (f.params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
-    call_args[f.params.len] = b.pathExpr("$rc"); // recompose composer lambda param
+    var call_args = try a.alloc(Expr, value_params.len + 2);
+    for (value_params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
+    call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
     // `$changed or 1`
-    call_args[f.params.len + 1] = .{ .Binary = .{
+    call_args[value_params.len + 1] = .{ .Binary = .{
         .op = .Or,
         .lhs = b.box(b.pathExpr(changed_param)),
         .rhs = b.box(b.intLit(1)),
         .span = b.gen_span,
     } };
-    const reinvoke = b.call(b.pathExpr(f.name.name), call_args);
+    const reinvoke = b.call(b.pathExpr(fn_name), call_args);
 
     const lam_params = try a.alloc(Ident, 2);
     lam_params[0] = b.ident("$rc");
@@ -911,6 +1084,82 @@ test "transform injects composer/changed params and brackets the body" {
     try testing.expect(upd.callee.Member.safe);
     try testing.expectEqualStrings("updateScope", upd.callee.Member.name.name);
     try testing.expectEqualStrings("endRestartGroup", upd.callee.Member.receiver.Call.callee.Member.name.name);
+}
+
+test "defaulted composable param becomes marker-guarded prologue" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // @Composable fun App(x: Int = 5) { }
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    var five = Expr{ .IntLit = .{ .value = 5, .kind = .Int, .span = gsp } };
+    var app_params = [_]Param{.{
+        .name = dummyIdent("x"),
+        .ty = .{ .name = dummyIdent("Int"), .nullable = false, .span = gsp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .default = &five,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = gsp,
+    }};
+    var body_stmts = [_]Stmt{};
+    const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null);
+
+    // The param is renamed and its default is the marker call.
+    try testing.expectEqualStrings("x$arg", out.params[0].name.name);
+    const marker = out.params[0].default.?.Call;
+    const seg = marker.callee.Path.segments;
+    try testing.expectEqualStrings("klioComposableDefaultMarker", seg[seg.len - 1].name);
+
+    // Body: startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`,
+    // endRestartGroup?.updateScope.
+    const stmts = out.body.?.Block.stmts;
+    try testing.expectEqual(@as(usize, 3), stmts.len);
+    const prop = stmts[1].Decl.Property;
+    try testing.expectEqualStrings("x", prop.name.name);
+    const pick = prop.init.?.If;
+    try testing.expect(pick.cond.Binary.op == .IdentEq);
+    try testing.expectEqualStrings("x$arg", pick.cond.Binary.lhs.Path.segments[0].name);
+    try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
+    try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
+
+    // The restart re-call passes the RENAMED param (marker flows through).
+    const upd = stmts[2].Expr.Call;
+    const lam = upd.args[0].Lambda;
+    const reinvoke = lam.body.stmts[0].Expr.Call;
+    try testing.expectEqualStrings("x$arg", reinvoke.args[0].Path.segments[0].name);
+}
+
+test "threadCall appends the composer pair as named args" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    var text_segs = [_]Ident{dummyIdent("Text")};
+    var text_callee = Expr{ .Path = .{ .segments = &text_segs, .span = gsp } };
+    var text_argnames = [_]?[]const u8{};
+    var call = Expr{ .Call = .{
+        .callee = &text_callee,
+        .args = &.{},
+        .arg_names = &text_argnames,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } };
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx };
+    try w.walkExpr(&call);
+    const c = call.Call;
+    try testing.expectEqual(@as(usize, 2), c.args.len);
+    try testing.expectEqualStrings(composer_param, c.arg_names[0].?);
+    try testing.expectEqualStrings(changed_param, c.arg_names[1].?);
 }
 
 test "non-composable callees are not threaded" {
