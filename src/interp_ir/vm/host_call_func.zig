@@ -1357,6 +1357,21 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
 /// run), which is how a sibling that did not read the changed state avoids
 /// re-running. Plain calls, or a `@Composable` invoked with no active composer
 /// (e.g. directly from `main`), run the body unwrapped.
+/// Cached `KLIO_COMPOSE_PLUGIN` gate. When the lowering plugin is enabled the
+/// pass threads the real `$composer` through composable bodies, so the implicit
+/// composer hook must stand down entirely — otherwise it re-brackets every
+/// composable call and recurses without bound.
+var g_compose_plugin: ?bool = null;
+fn composePluginEnabled() bool {
+    if (g_compose_plugin) |v| return v;
+    const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
+        v.len != 0 and !std.mem.eql(u8, v, "0")
+    else
+        false;
+    g_compose_plugin = on;
+    return on;
+}
+
 fn composableEval(
     self: *VmHost,
     allocator: Allocator,
@@ -1364,7 +1379,9 @@ fn composableEval(
     f: *const Func,
     packed_args: std.ArrayList(Value),
 ) Allocator.Error!EvalResult {
-    if (!compose.isComposable(f))
+    // Plugin path: the pass already lowered composition into the body; run it
+    // directly with no implicit-composer bracketing.
+    if (composePluginEnabled() or !compose.isComposable(f))
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
     const composer = compose.currentComposer() orelse
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
