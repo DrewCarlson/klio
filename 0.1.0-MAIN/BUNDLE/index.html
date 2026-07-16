@@ -10,28 +10,28 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/architecture/concurrency/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/BUNDLE/">
       
       
-        <link rel="prev" href="../stdlib/">
+        <link rel="prev" href="../testing/">
       
       
-        <link rel="next" href="../memory-model/">
+        <link rel="next" href="../architecture/pipeline/">
       
       
         
       
       
-      <link rel="icon" href="../../assets/images/favicon.png">
+      <link rel="icon" href="../assets/images/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>Concurrency - Klio</title>
+        <title>Bundling Programs - Klio</title>
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
       
       
 
@@ -50,9 +50,9 @@
       
     
     
-      <link rel="stylesheet" href="../../stylesheets/extra.css">
+      <link rel="stylesheet" href="../stylesheets/extra.css">
     
-    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -70,7 +70,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#concurrency" class="md-skip">
+        <a href="#klio-bundle-single-executable-programs" class="md-skip">
           Skip to content
         </a>
       
@@ -90,7 +90,7 @@
 
 <header class="md-header md-header--shadow" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href=".." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Concurrency
+              Bundling Programs
             
           </span>
         </div>
@@ -202,7 +202,7 @@
 
 <nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href=".." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -232,7 +232,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../.." class="md-nav__link">
+      <a href=".." class="md-nav__link">
         
   
   
@@ -256,8 +256,10 @@
       
   
   
+    
   
   
+  
     
     
       
@@ -280,11 +282,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
         
           
           <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
@@ -305,7 +307,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_2">
             <span class="md-nav__icon md-icon"></span>
             
@@ -323,7 +325,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../getting-started/installation/" class="md-nav__link">
+      <a href="../getting-started/installation/" class="md-nav__link">
         
   
   
@@ -351,7 +353,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../getting-started/hello-world/" class="md-nav__link">
+      <a href="../getting-started/hello-world/" class="md-nav__link">
         
   
   
@@ -379,7 +381,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../getting-started/cli/" class="md-nav__link">
+      <a href="../getting-started/cli/" class="md-nav__link">
         
   
   
@@ -407,7 +409,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../testing/" class="md-nav__link">
+      <a href="../testing/" class="md-nav__link">
         
   
   
@@ -415,195 +417,6 @@
     
   
     Testing Your Code
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../BUNDLE/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Bundling Programs
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-    
-      
-      
-  
-  
-    
-  
-  
-  
-    
-    
-      
-        
-      
-        
-      
-        
-      
-        
-      
-        
-      
-        
-      
-        
-      
-    
-    
-    
-      
-        
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
-        
-          
-          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
-          <label class="md-nav__title" for="__nav_3">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    Architecture
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../pipeline/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Pipeline Overview
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../interpreter/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    The Vm
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../stdlib/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Standard Library
   
 
     
@@ -640,7 +453,7 @@
   <span class="md-ellipsis">
     
   
-    Concurrency
+    Bundling Programs
   
 
     
@@ -658,7 +471,7 @@
   <span class="md-ellipsis">
     
   
-    Concurrency
+    Bundling Programs
   
 
     
@@ -684,10 +497,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#two-layers" class="md-nav__link">
+  <a href="#quick-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Two layers
+        Quick start
       
     </span>
   </a>
@@ -695,49 +508,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#one-memory-model" class="md-nav__link">
+  <a href="#options" class="md-nav__link">
     <span class="md-ellipsis">
       
-        One memory model
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="One memory model">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#one-primitive-many-clients" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        One primitive, many clients
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#front-end-and-runtime-responsibilities" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Front end and runtime responsibilities
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#the-value-handle-and-the-publication-boundary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The value handle and the publication boundary
+        Options
       
     </span>
   </a>
@@ -745,38 +519,76 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#parallelism" class="md-nav__link">
+  <a href="#embedded-resources" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Parallelism
+        Embedded resources
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Parallelism">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#the-dispatcher-worker-pool" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The dispatcher worker pool
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
+  <a href="#program-surface" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Status
+        Program surface
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#bundle-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bundle format
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ui-bundles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UI bundles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-target-bundles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-target bundles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#desktop-integration-linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Desktop integration (Linux)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure modes
       
     </span>
   </a>
@@ -792,6 +604,81 @@
 
               
             
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
               
                 
   
@@ -799,7 +686,119 @@
   
   
     <li class="md-nav__item">
-      <a href="../memory-model/" class="md-nav__link">
+      <a href="../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/memory-model/" class="md-nav__link">
         
   
   
@@ -827,7 +826,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../diagnostics/" class="md-nav__link">
+      <a href="../architecture/diagnostics/" class="md-nav__link">
         
   
   
@@ -855,7 +854,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../performance/" class="md-nav__link">
+      <a href="../architecture/performance/" class="md-nav__link">
         
   
   
@@ -956,7 +955,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/overview/" class="md-nav__link">
+      <a href="../packs/overview/" class="md-nav__link">
         
   
   
@@ -984,7 +983,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/format/" class="md-nav__link">
+      <a href="../packs/format/" class="md-nav__link">
         
   
   
@@ -1012,7 +1011,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/using/" class="md-nav__link">
+      <a href="../packs/using/" class="md-nav__link">
         
   
   
@@ -1040,7 +1039,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/authoring/" class="md-nav__link">
+      <a href="../packs/authoring/" class="md-nav__link">
         
   
   
@@ -1068,7 +1067,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/native-bindings/" class="md-nav__link">
+      <a href="../packs/native-bindings/" class="md-nav__link">
         
   
   
@@ -1161,7 +1160,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/atomicfu/" class="md-nav__link">
+      <a href="../packs/shipped/atomicfu/" class="md-nav__link">
         
   
   
@@ -1189,7 +1188,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/io/" class="md-nav__link">
+      <a href="../packs/shipped/io/" class="md-nav__link">
         
   
   
@@ -1217,7 +1216,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/datetime/" class="md-nav__link">
+      <a href="../packs/shipped/datetime/" class="md-nav__link">
         
   
   
@@ -1245,7 +1244,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/coroutines/" class="md-nav__link">
+      <a href="../packs/shipped/coroutines/" class="md-nav__link">
         
   
   
@@ -1273,7 +1272,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/serialization/" class="md-nav__link">
+      <a href="../packs/shipped/serialization/" class="md-nav__link">
         
   
   
@@ -1301,7 +1300,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/ktor/" class="md-nav__link">
+      <a href="../packs/shipped/ktor/" class="md-nav__link">
         
   
   
@@ -1329,7 +1328,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../packs/shipped/compose-runtime/" class="md-nav__link">
+      <a href="../packs/shipped/compose-runtime/" class="md-nav__link">
         
   
   
@@ -1432,7 +1431,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/workspace/" class="md-nav__link">
+      <a href="../development/workspace/" class="md-nav__link">
         
   
   
@@ -1460,7 +1459,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/testing/" class="md-nav__link">
+      <a href="../development/testing/" class="md-nav__link">
         
   
   
@@ -1488,7 +1487,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/contributing/" class="md-nav__link">
+      <a href="../development/contributing/" class="md-nav__link">
         
   
   
@@ -1543,10 +1542,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#two-layers" class="md-nav__link">
+  <a href="#quick-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Two layers
+        Quick start
       
     </span>
   </a>
@@ -1554,49 +1553,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#one-memory-model" class="md-nav__link">
+  <a href="#options" class="md-nav__link">
     <span class="md-ellipsis">
       
-        One memory model
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="One memory model">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#one-primitive-many-clients" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        One primitive, many clients
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#front-end-and-runtime-responsibilities" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Front end and runtime responsibilities
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#the-value-handle-and-the-publication-boundary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The value handle and the publication boundary
+        Options
       
     </span>
   </a>
@@ -1604,38 +1564,76 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#parallelism" class="md-nav__link">
+  <a href="#embedded-resources" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Parallelism
+        Embedded resources
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Parallelism">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#the-dispatcher-worker-pool" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The dispatcher worker pool
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
+  <a href="#program-surface" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Status
+        Program surface
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#bundle-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bundle format
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ui-bundles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UI bundles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-target-bundles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-target bundles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#desktop-integration-linux" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Desktop integration (Linux)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure modes
       
     </span>
   </a>
@@ -1659,7 +1657,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/architecture/concurrency.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/BUNDLE.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1667,252 +1665,185 @@
   
 
 
-<h1 id="concurrency">Concurrency<a class="headerlink" href="#concurrency" title="Permanent link">&para;</a></h1>
-<p>klio runs Kotlin concurrency on real OS threads. <code>Thread.start</code> /
-<code>join</code> spawn and join genuine <code>std.Thread</code>s. Coroutines within
-one <code>runBlocking</code> interleave cooperatively on their driver
-thread; <code>Dispatchers.Default</code> / <code>IO</code> dispatch their bodies onto a
-shared pool of real worker threads (<code>DefaultDispatcher-worker-N</code>),
-so dispatched bodies overlap in wall time across OS threads, and a
-coroutine that parks on one worker resumes wherever its resume
-lands — another worker, the driver, or a <code>kotlin.concurrent.thread</code>
-body. <code>Thread</code>, <code>synchronized</code>, <code>@Volatile</code>, and atomics have
-faithful Kotlin semantics; the value model
-(<code>runtime.Value</code>, backed by <code>ObjRef</code> over an atomically
-reference-counted cell) is safe to share across threads and
-the publication protocol is stress-verified race-free. Every cell
-carries a per-cell reader/writer spin lock that mediates each
-borrow; on an uncontended cell (the common case) a borrow is a
-single uncontended <code>cmpxchg</code>, the same fast path a <code>RefCell</code> borrow
-flag would take, and the lock's acquire/release ordering is the
-happens-before edge that lets a reference escape to another thread
-with no separate publication step.</p>
-<p>Three ideas structure the design.</p>
-<h2 id="two-layers">Two layers<a class="headerlink" href="#two-layers" title="Permanent link">&para;</a></h2>
-<p>The core Kotlin <code>suspend</code> system and <code>kotlinx.coroutines</code> are kept
-strictly separate.</p>
-<p><strong>Layer 1 — core suspend.</strong> A <code>suspend fun</code> is an ordinary function
-with a <code>Continuation</code> and a state machine; resumed synchronously it
-is plain sequential code, with no concurrency or happens-before
-concern. This layer lives in <code>ir.eval</code>: the
-<code>SuspendState</code> / <code>FrameSnapshot</code> save-restore engine,
-<code>resumeContinuation</code>, and the <code>EvalError.Suspended</code> unwind. It is
-thread-, dispatcher-, and fence-agnostic — it only decides <em>how</em> to
-pause and resume, never <em>where</em> or <em>when</em>.</p>
-<p><strong>Layer 2 — kotlinx.coroutines.</strong> Everything that schedules:
-<code>CoroutineScope</code>, <code>Job</code>, <code>Deferred</code>, <code>launch</code>, <code>async</code>,
-<code>runBlocking</code>, <code>withContext</code>, <code>coroutineScope</code>, <code>supervisorScope</code>,
-cancellation, <code>Dispatchers</code>, <code>delay</code>, <code>Channel</code>. It is the
-<code>kotlinx.coroutines</code> pack (Kotlin) plus a few host hooks, built on
-Layer 1.</p>
-<p>The seam between them is the interceptor. In <code>interp_ir</code> the
-default interceptor is <code>CooperativeInterceptor</code>, a per-pump
-scheduler exposed through a named seam (<code>interceptSuspend</code>,
-<code>drainLaunched</code>, <code>nextReady</code>, <code>takeParked</code>, <code>advanceTime</code>). Every
-OS thread that drives coroutines — the <code>runBlocking</code> driver and each
-dispatcher pool worker executing a task — owns one pump. Scheduling
-happens only here, so this is also the only place a cross-thread
-happens-before edge for coroutine code is established.
-<code>async</code>/<code>await</code>/<code>join</code> park on a host slot and resume on completion
-(routed across pumps through the slot-owner registry and each
-driver’s wakeup mailbox, or — once a pump has exited — through the
-process-global persisted-continuation registry, which lets a
-coroutine hop between OS threads); <code>withContext</code> /
-<code>coroutineScope</code> / <code>supervisorScope</code> run inline on the current
-interceptor (no nested driver); <code>Channel</code> suspends on empty/full,
-rendezvouses across OS threads, and exposes an iterator for
-<code>for (v in ch)</code>.</p>
-<h2 id="one-memory-model">One memory model<a class="headerlink" href="#one-memory-model" title="Permanent link">&para;</a></h2>
-<p>Kotlin on the JVM inherits the Java Memory Model. klio guarantees a
-model <strong>at least as strong</strong> as the JMM: every correctly
-synchronized program behaves identically to the JVM, and racy
-programs are defined rather than undefined.</p>
+<h1 id="klio-bundle-single-executable-programs"><code>klio bundle</code> — single-executable programs<a class="headerlink" href="#klio-bundle-single-executable-programs" title="Permanent link">&para;</a></h1>
+<p><code>klio bundle main.kt -o myapp</code> turns a Kotlin program plus everything it
+needs — the baked dependency image, embedded resources, and (for Compose
+programs) the Skia/SDL2 rendering backend — into one self-contained
+executable. The result runs on a machine with no klio, no Kotlin, no
+toolchain, and no <code>~/.klio</code>.</p>
+<p>Bundling is file surgery: the running <code>klio</code> binary is copied as the
+runtime stub, the payload is appended in an aligned overlay, and a
+72-byte trailer is written at the end. No compiler or linker is invoked,
+ever — everything a program needs at run time is data (baked IR images
+and pack sections), and all native code already lives in the <code>klio</code>
+binary (plus the dlopen'd Skia shim for UI bundles).</p>
+<h2 id="quick-start">Quick start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h2>
+<p>Headless CLI tool:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>$ klio bundle tool.kt -o tool
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>bundled tool (22.9 MB): stdlib + kotlinx.serialization
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>$ ./tool --input data.json     # argv goes to the program&#39;s main(args)
+</code></pre></div>
+<p>Compose UI app:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>$ klio bundle app.kt -o myapp
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>bundled myapp (78.4 MB, ui): stdlib + 14 packs + skia backend
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>$ ./myapp                      # opens the window; no klio, no SDL2 install
+</code></pre></div>
+<p>Bundling performs the full assemble-and-lower pipeline (the same one
+<code>klio run</code> uses), so every resolution diagnostic surfaces at bundle
+time, not on the user's machine. A program that does not lower cleanly
+does not bundle. <code>klio run</code> remains the dev loop; <code>bundle</code> is the
+release step.</p>
+<h2 id="options">Options<a class="headerlink" href="#options" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>klio bundle &lt;main.kt | project-dir&gt; [options]
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  -o, --output &lt;path&gt;        Output executable (default: source basename,
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>                             `.exe` appended on windows targets)
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  --target &lt;target&gt;          linux-x64 (default: host), linux-arm64,
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>                             macos-x64, macos-arm64, windows-x64, windows-arm64
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>  --ui | --headless          Force the flavor. Default: auto-detected — the
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>                             pack fixpoint selecting any androidx.compose.ui*
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>                             pack (or klio.compose.ui) marks the bundle UI.
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>  --include &lt;path[:mount]&gt;   Embed a file or directory into the bundle&#39;s
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>                             resource table (repeatable). Mount defaults to
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>                             the path relative to the source file&#39;s directory.
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>  --name &lt;string&gt;            App display name (window title default).
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>                             Default: output basename.
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>  --icon &lt;png&gt;               App icon source (single square PNG); applied as
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>                             the window icon when the first window opens.
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>  --feature &lt;pack&gt;/&lt;feat&gt;    Enable a pack feature, baked into the bundle
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>                             (same meaning as `klio run --feature`).
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>  --stub &lt;path&gt;              Explicit stub binary (skips self-copy/fetch).
+<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>  --desktop-dir &lt;dir&gt;        Also emit &lt;name&gt;.desktop + the icon PNG for
+<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>                             GUI-first Linux distribution.
+<a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>  --dry-run                  Print the resolved pack set, flavor, sections,
+<a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>                             and projected size without writing.
+</code></pre></div>
+<p>Project mode: <code>klio bundle &lt;dir&gt;</code> reads <code>&lt;dir&gt;/klio.toml</code>. The manifest's
+<code>[application]</code> table supplies <code>name</code>, <code>icon</code>, <code>include = [...]</code>, and
+<code>main = "path/to/main.kt"</code> (optional when the project's source roots
+contain exactly one <code>main</code>). Flags override the manifest.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">[application]</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;MyApp&quot;</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">icon</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;assets/icon.png&quot;</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">main</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;src/main.kt&quot;</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">include</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;assets&quot;</span><span class="p">]</span>
+</code></pre></div>
+<h2 id="embedded-resources">Embedded resources<a class="headerlink" href="#embedded-resources" title="Permanent link">&para;</a></h2>
+<p>Files embedded with <code>--include</code> are read back through the <code>klio.bundle</code>
+pack (installed like any other pack; it ships in-repo under
+<code>kotlin-klio/klio-bundle</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">klio.bundle.Resources</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">cfg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Resources</span><span class="p">.</span><span class="na">readText</span><span class="p">(</span><span class="s">&quot;assets/config.json&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">icon</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Resources</span><span class="p">.</span><span class="na">readBytes</span><span class="p">(</span><span class="s">&quot;assets/icon.png&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="n">println</span><span class="p">(</span><span class="n">Resources</span><span class="p">.</span><span class="na">list</span><span class="p">())</span><span class="w">          </span><span class="c1">// every mount path, sorted</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">    </span><span class="n">println</span><span class="p">(</span><span class="n">Resources</span><span class="p">.</span><span class="na">exists</span><span class="p">(</span><span class="s">&quot;x.txt&quot;</span><span class="p">))</span><span class="w"> </span><span class="c1">// false</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="p">}</span>
+</code></pre></div>
+<p>Reading a path that was not bundled throws <code>IllegalArgumentException</code>;
+calling <code>readBytes</code>/<code>readText</code> outside a bundle throws
+<code>IllegalStateException</code>. Resources are served straight from the
+executable's memory map (zstd-compressed entries decompress on read).</p>
+<h2 id="program-surface">Program surface<a class="headerlink" href="#program-surface" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Sequential consistency for data-race-free programs.</strong> A single
-  global order of interpreter steps always exists.</li>
-<li><strong>No out-of-thin-air values, and no tearing — ever.</strong> Every
-  <code>Value</code> slot, including <code>Long</code> / <code>Double</code> and object references,
-  is read and written whole even under a data race. This is
-  stronger than the JVM (which may tear non-volatile 64-bit) and is
-  free here because slots are whole cells.</li>
-<li><strong><code>val</code> / immutable safe publication.</strong> A fully constructed
-  object's <code>val</code> fields are visible to any thread that observes the
-  reference.</li>
-<li><strong><code>@Volatile</code></strong> — sequentially consistent per field; part of the
-  total order of volatile/atomic operations.</li>
-<li><strong><code>@Synchronized</code> / <code>synchronized(m){}</code></strong> — mutual exclusion;
-  unlock happens-before the next lock on the same monitor.</li>
-<li><strong>Atomics</strong> (<code>atomicfu</code>, <code>kotlin.concurrent.atomics</code>,
-  <code>java.util.concurrent.atomic</code>) — atomic and sequentially
-  consistent; explicit memory orders are honored or conservatively
-  upgraded to SC.</li>
-<li><strong>Thread <code>start</code> / <code>join</code></strong> — <code>start</code> happens-before the body;
-  the body's completion happens-before <code>join()</code> returning.</li>
-<li><strong>Coroutines</strong> — code before a suspension point happens-before
-  code after it; <code>launch</code> / <code>async</code> of a child happens-before the
-  child body; child completion happens-before <code>join()</code> / <code>await()</code>.</li>
-<li><strong>Channels</strong> — a <code>send</code> happens-before the matching <code>receive</code>.</li>
+<li><code>fun main(args: Array&lt;String&gt;)</code> receives the bundle's <code>argv[1..]</code>
+  verbatim; klio subcommands are unreachable from a bundle.</li>
+<li><code>kotlin.system.exitProcess(code)</code> terminates the process with <code>code</code>.</li>
+<li>stdin passes through (<code>readLine()</code> reads the process stdin).</li>
+<li>The <code>KLIO_*</code> diagnostic environment variables (GC, profiling, tracing,
+  <code>KLIO_OPT</code>) keep working. The <code>~/.klio</code> cache and pack directories are
+  never consulted in bundle mode.</li>
+<li><code>KLIO_BUNDLE_INSPECT=1 ./myapp</code> prints the manifest (versions, packs,
+  sections, resources) and exits — the only bundle-mode CLI affordance.</li>
 </ul>
-<p>The normative statement of these rules, with an executable litmus
-program for each, is in <a href="../memory-model/">memory-model.md</a>.</p>
-<h3 id="one-primitive-many-clients">One primitive, many clients<a class="headerlink" href="#one-primitive-many-clients" title="Permanent link">&para;</a></h3>
-<p>Every happens-before edge is established at a closed set of seams:
-monitor enter/exit, volatile access, atomic op, thread start/join,
-the interceptor's dispatch/resume, and channel send/receive.
-<code>ObjRef.publish</code> is the stable, named call site that marks these
-boundaries in the code; the concrete edge for each seam is real and
-is stated normatively in the fence matrix on the adaptive cell
-(shared-object access → the per-cell reader/writer lock plus the
-release/acquire <code>state</code> transition on <code>ObjRef.publish</code>; monitors →
-the process-wide reentrant monitor; <code>@Volatile</code> → subsumed by
-lock-mediated shared access; atomics → the underlying
-<code>std.atomic.Value</code> ops; <code>Thread.start</code>/<code>join</code> → <code>std.Thread</code>
-spawn/join, with the escaping object graph published deep via
-<code>publishValue</code> before spawn). The invariant that keeps the two
-layers consistent: core suspend never creates an edge; the
-interceptor and the publication path do — so the model is obeyed
-identically whether code uses raw <code>suspend</code> or all of
-<code>kotlinx.coroutines</code>. The protocol is stress-verified across real OS
-threads (<code>src/itests/runtime_objref_threads.zig</code>).</p>
-<h3 id="front-end-and-runtime-responsibilities">Front end and runtime responsibilities<a class="headerlink" href="#front-end-and-runtime-responsibilities" title="Permanent link">&para;</a></h3>
+<h2 id="bundle-format">Bundle format<a class="headerlink" href="#bundle-format" title="Permanent link">&para;</a></h2>
+<p>A bundle is the unmodified stub executable, padding to a 16384-byte
+boundary, a payload area, and a 72-byte trailer:</p>
 <ul>
-<li><strong>Front end</strong> (<code>typeck</code> / lowering) recognizes <code>@Volatile</code>,
-  <code>@Synchronized</code>, <code>synchronized</code>, and the atomic types, keeps the
-  well-formedness diagnostics (e.g. <code>@Volatile</code> only on mutable,
-  non-delegated fields), and lowers each to the fenced operation
-  rather than a plain access. It does not attempt race detection
-  (undecidable, and not required by the model).</li>
-<li><strong>Runtime</strong> (<code>interp_ir</code> / <code>runtime</code>) provides the
-  operation and the no-tearing / safe-publication guarantees
-  structurally.</li>
+<li><strong>Sections</strong>: <code>manifest</code> (postcard-encoded <code>BundleManifest</code>),
+  <code>program-image</code> (deps + program lowered as one module and baked,
+  uncompressed and 16 KiB-aligned so boot mmaps it straight out of the
+  file and runs with zero parsing or lowering), <code>program-src</code> (the user
+  sources), <code>resources</code> (zstd per entry), <code>skia-shim</code> (UI flavor only,
+  zstd), <code>icon</code> (raw PNG). When the program bake refuses (a base outside
+  the image codec's serializable surface) the bundle instead carries
+  <code>base-image</code> (the dependency base alone) and boots by parsing
+  <code>program-src</code> against it — the always-works path, recorded in the
+  manifest and reported by <code>--dry-run</code>; startup is the only difference.
+  <code>KLIO_BUNDLE_PROGRAM_IMAGE=0</code> at bundle time forces that path.</li>
+<li><strong>Trailer</strong>: magic <code>"KBND\0KL1"</code>, payload offset/length, section-table
+  offset/length, and a blake3 hash of the whole payload area, verified
+  at boot before anything decodes.</li>
+<li><strong>Versioning</strong>: the manifest carries the producing klio version and
+  the image format version; a stub refuses a payload from a different
+  version with an actionable error. A bundle is only ever assembled by
+  the same-version binary that boots it.</li>
+<li><strong>Determinism</strong>: two <code>klio bundle</code> runs over identical inputs (same
+  sources, packs, features, flags) produce byte-identical output. The
+  bundler adds no timestamps.</li>
 </ul>
-<h2 id="the-value-handle-and-the-publication-boundary">The value handle and the publication boundary<a class="headerlink" href="#the-value-handle-and-the-publication-boundary" title="Permanent link">&para;</a></h2>
-<p>All shared Kotlin heap state — collections, instances, <code>Cell</code>,
-<code>StringBuilder</code>, iterator state, delegates — is reached through one
-handle, <code>runtime.ObjRef(T)</code>, backed by an atomically
-reference-counted adaptive cell. Call sites never name the backing;
-they use <code>borrow</code> / <code>borrowMut</code> / <code>clone</code> / <code>ptrEq</code>. Because every
-shared-object access funnels through this one type, the adaptive
-publication protocol — and any future backing change — is localized
-to one type and the publication seam, not a codebase-wide concern.</p>
-<p>Per-thread interpreter state lives in <code>threadlocal</code> slots (the
-cooperative interceptor stack and the constructor-shell guard). This
-is the publication boundary: that thread-local state is never shared
-across threads directly. Deliberately process-global configuration
-(e.g. the <code>stdlib</code> known-packages registry) lives outside the
-boundary by design and is already mutex-guarded.</p>
-<h2 id="parallelism">Parallelism<a class="headerlink" href="#parallelism" title="Permanent link">&para;</a></h2>
-<p>True multicore execution is implemented. <code>Value</code> is shareable
-across OS threads: <code>ObjRef</code>'s adaptive-cell backing is escape-aware
-atomic reference counting — a cell stays at <code>RefCell</code> speed (a
-single non-atomic borrow flag) while it is reachable from only its
-creating thread, and promotes to a reader/writer lock the moment a
-reference is published across threads via <code>publishValue</code> at an
-escape seam. <code>Thread.start</code> / <code>join</code> spawn and join real
-<code>std.Thread</code>s; <code>Dispatchers.Default</code> / <code>IO</code> dispatch coroutine
-bodies onto a real worker pool for genuine CPU-bound parallelism.
-The single cooperative driver per <code>runBlocking</code> is retained for
-intra-scope coroutine interleaving.</p>
-<h3 id="the-dispatcher-worker-pool">The dispatcher worker pool<a class="headerlink" href="#the-dispatcher-worker-pool" title="Permanent link">&para;</a></h3>
-<p>One shared pool (<code>src/interp_ir/vm/scheduler.zig</code>) serves both
-dispatchers, mirroring the upstream JVM <code>CoroutineScheduler</code> model:</p>
+<p>Per-OS payload placement: on Linux (ELF) the overlay append is free and
+the trailer sits at EOF. Windows needs an Authenticode-aware probe and
+macOS needs the <code>__LINKEDIT</code> extension + ad-hoc re-sign; the probe seams
+for both are in <code>src/cli/bundle_boot.zig</code> and land with Windows/macOS
+support. Binary packers (UPX) hide overlays — do not pack bundles.</p>
+<h2 id="ui-bundles">UI bundles<a class="headerlink" href="#ui-bundles" title="Permanent link">&para;</a></h2>
+<p>A UI bundle embeds the Skia rendering backend (<code>libklio_skia.so</code>,
+zstd-compressed). On first launch the shim is extracted to a
+content-addressed per-user cache
+(<code>$XDG_CACHE_HOME/klio/shim/&lt;blake3-16&gt;/libklio_skia.so</code>, default
+<code>~/.cache/...</code>) via temp file + atomic rename — concurrent first
+launches are safe, upgrades and co-installed bundles coexist, and later
+launches skip the write. If the cache directory is unwritable the shim
+falls back to the system temp dir; if that also fails the program gets
+the existing headless fallback plus one stderr line.</p>
+<p>The flavor is auto-detected: a program whose pack fixpoint selects any
+<code>androidx.compose.ui*</code> pack (or <code>klio.compose.ui</code>) bundles as UI.
+<code>--ui</code>/<code>--headless</code> force it.</p>
+<p>The release shim links SDL2 statically (<code>scripts/fetch-sdl.sh</code> +
+<code>zig build skia-lib -Dsdl-static</code>), so end users need no SDL2 install;
+statically-linked SDL still dlopens the host's X11/Wayland client
+libraries at runtime, so one Linux shim covers both display servers.
+Dev builds keep dynamic SDL2. <code>libstdc++</code>/<code>glibc</code> remain dynamic —
+present on every desktop Linux distribution; the release CI builder
+image sets the supported floor.</p>
+<h2 id="cross-target-bundles">Cross-target bundles<a class="headerlink" href="#cross-target-bundles" title="Permanent link">&para;</a></h2>
+<p><code>--target</code> selects one of <code>linux-x64</code>, <code>linux-arm64</code>, <code>macos-x64</code>,
+<code>macos-arm64</code>, <code>windows-x64</code>, <code>windows-arm64</code>. Same-target bundling is
+always offline (the stub is the running executable). Cross-target
+bundling resolves the target's stub (and shim, for UI):</p>
+<ol>
+<li><code>--stub &lt;path&gt;</code> explicit.</li>
+<li><code>KLIO_STUB_DIR</code>: <code>&lt;dir&gt;/&lt;target&gt;/klio</code> (CI / air-gapped).</li>
+<li><code>~/.klio/stubs/&lt;version&gt;/&lt;target&gt;/</code> — the fetch cache.</li>
+<li>An HTTPS fetch from the GitHub release of the bundler's own version,
+   verified against the sha256 manifest baked into release binaries,
+   then cached. Offline after the first fetch. Dev builds carry no
+   manifest and refuse to fetch:
+   <code>error: no cached stub for windows-x64 (klio 0.1.0); connect once to fetch it, or pass --stub &lt;path&gt;</code></li>
+</ol>
+<p>The stub must be the same klio version as the bundler — enforced, not
+advised. Windows and macOS cross-bundles additionally need the PE/Mach-O
+patchers, which land with Windows/macOS support.</p>
+<h2 id="desktop-integration-linux">Desktop integration (Linux)<a class="headerlink" href="#desktop-integration-linux" title="Permanent link">&para;</a></h2>
+<p>A bare ELF does not reliably double-click on stock GNOME. The bundle
+itself stays a plain executable (terminal-first); for GUI-first
+distribution, <code>--desktop-dir &lt;out&gt;</code> additionally emits <code>&lt;name&gt;.desktop</code>
+plus the icon PNG for the user (or a package) to install under
+<code>~/.local/share/applications</code>. AppImage layers cleanly on top later
+(same appended-payload family) and is deliberately not built in.</p>
+<h2 id="failure-modes">Failure modes<a class="headerlink" href="#failure-modes" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>Dispatchers.Default</code> is the CPU-bounded view — at most
-  <code>max(2, nproc)</code> of its tasks run concurrently.</li>
-<li><code>Dispatchers.IO</code> is the elastic view — up to <code>max(64, nproc)</code>
-  workers in total — over the <em>same</em> threads, so a
-  <code>withContext(Dispatchers.IO)</code> hop from a Default coroutine stays
-  inside the pool.</li>
-<li>Dispatcher tasks are daemons, exactly as upstream JVM dispatcher
-  threads are: they never block the run's end. At the run boundary
-  still-queued tasks are dropped without running, and in-flight
-  tasks are abandoned cooperatively (the evaluator and the host
-  sleep primitives poll an abandon flag on worker threads, so even
-  a non-terminating daemon body stops at its next instruction or
-  sleep slice) before every worker is joined.</li>
-<li>Workers are spawned on demand against the queue backlog, park by
-  polling when idle, and are named <code>DefaultDispatcher-worker-N</code>.</li>
-<li>Per-view execution is FIFO; both dispatchers report
-  <code>isDispatchNeeded == true</code>, and <code>dispatch</code> posts the upstream
-  <code>DispatchedContinuation</code> runnable verbatim — cancellation, the Job
-  tree, and exception propagation are the consumed upstream common
-  code, untouched by where bodies execute.</li>
-<li><code>limitedParallelism(n)</code> is the upstream common <code>LimitedDispatcher</code>
-  over these views: never more than <code>n</code> concurrent, excess queues in
-  FIFO order, threads shared with the underlying pool.</li>
+<li>Missing pack at bundle time: same failure as <code>klio run</code>, surfaced at
+  bundle time with the fetch hint.</li>
+<li>Version mismatch at boot:
+  <code>error: this bundle was produced by klio X but the runtime is Y; rebundle with a matching klio</code></li>
+<li>Payload corruption at boot:
+  <code>error: bundle payload hash mismatch (file truncated or modified); rebundle</code></li>
+<li>UI bundle on a display-less machine: the existing headless fallback
+  applies; no new failure mode.</li>
 </ul>
-<p>Each dispatched runnable executes on a worker under its own
-cooperative pump (<code>driveRoot</code>, persist mode). A body that parks
-indefinitely (join, await, channel) releases its worker: the parked
-<code>SuspendState</code> moves to the process-global persisted-continuation
-registry keyed by its rendezvous slot, and the eventual resume —
-itself a dispatched runnable, a mailbox post, or an inline drive —
-claims it (single winner) and continues the coroutine on whatever
-thread the resume arrived on. A <code>delay</code> under a dispatcher parks on
-the worker’s own pump and resumes there, never on the runBlocking
-driver. Coroutines launched in <code>runBlocking</code>’s scope <em>without</em> a
-dispatcher stay on the runBlocking thread (the cooperative
-<code>KlioDispatcher</code> is the default interceptor).</p>
-<p><code>runBlocking</code> itself is the upstream shape: a <code>BlockingCoroutine</code>
-job over the caller's context, the body started as its child, and
-the calling thread pumping until the coroutine's whole job tree
-completes — the root activation parks on a completion slot that the
-job's <code>invokeOnCompletion</code> resumes. The Job machinery, not a
-host-side count, decides when blocking ends: children on the local
-pump, children dispatched to pool workers, and children resumed
-from explicit <code>kotlin.concurrent.thread</code>s all complete the job
-first, while <code>GlobalScope</code> daemons are not part of it and never
-block the return. A failing child cancels the blocking job per
-structured concurrency — parked siblings resume with the
-cancellation at their suspension points, cross-pump through the
-mailbox/persisted routing — and the failure rethrows out of
-<code>runBlocking</code> through <code>onCancelled</code>, exactly as kotlinc+kotlinx
-propagate it. An uncaught exception in a root coroutine with no
-parent (<code>GlobalScope.launch { throw … }</code>) reports through the
-final-resort handler to stderr and the program continues, matching
-the JVM uncaught-handler behavior.</p>
-<p>The driver-exit protocol closes the park/resume race: a pump that
-exits first persists its indefinitely-parked continuations, then
-closes its mailbox (taking anything that raced in), then releases
-its slot-owner registrations, and finally re-routes the raced-in
-entries through the persisted registry; a resumer whose mailbox post
-is rejected falls through to the same registry, so no resume can
-land in a mailbox nobody will drain.</p>
-<p>This is validated by three gates:</p>
-<ul>
-<li><strong>Real-thread stress</strong> — <code>src/itests/runtime_objref_threads.zig</code>
-  stress-checks the UNSHARED→SHARED publication protocol
-  (cross-thread borrow after publish, two post-publish writers,
-  reader/writer no-torn-read) across many genuine OS threads.</li>
-<li><strong>Threaded litmus</strong> — <code>src/itests/parity_threaded_litmus.zig</code>
-  (programs under <code>tests/fixtures/threaded_litmus/</code>) exercises
-  real-thread guarantees end to end (mutual exclusion, safe
-  publication, no lost update, parallel partition, parallel <code>async</code>,
-  <code>withContext(IO)</code>, many-dispatch, genuine Default overlap, worker
-  thread names, the spin-wait flag handoff, the elastic IO cap,
-  <code>limitedParallelism(1)</code> serialization, delay-resumes-on-worker,
-  undispatched-stays-on-caller, cross-dispatcher channel ping-pong,
-  and the cross-OS-thread channel bridge), each asserting exact
-  stdout and verified against the kotlinc-JVM oracle where plain
-  kotlinx semantics allow.</li>
-<li><strong>Single-thread benchmark</strong> — the fixed bench corpus
-  (<code>tests/fixtures/bench_corpus</code>, run by <code>zig build itest-bench</code>,
-  diffable against <code>benches-baseline/HEAD.json</code>) guards the common path
-  against regression; the adaptive cell's UNSHARED fast path keeps
-  it at the pre-parallel cost.</li>
-</ul>
-<p>The normative litmus statements live in
-<a href="../memory-model/">memory-model.md</a>. The production backing is the
-adaptive reference-counted cell.</p>
-<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p><code>launch</code>, <code>async</code>/<code>await</code>, <code>delay</code>, <code>join</code>, <code>job.cancel()</code>,
-<code>withTimeout</code> / <code>withTimeoutOrNull</code>, real-thread dispatch,
-<code>Channel</code>, <code>Flow</code>, and the memory model are working and gated —
-cancellation and timeouts run the consumed upstream common code
-end-to-end. The design record for the coroutine engine is
-<code>plans/COROUTINE-MODEL.md</code>. Do not add library-type-specific
-branches to <code>ir</code> / <code>interp_ir</code> to work around a coroutine bug; fix
-the general mechanism.</p>
 
 
 
@@ -1988,10 +1919,10 @@ the general mechanism.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
