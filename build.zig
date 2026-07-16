@@ -204,6 +204,17 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
     }, .weight = 15 },
+    // UI bundle gate: the Skia shim embeds, extracts to the per-user
+    // cache on first launch, and renders the headless pixel gate
+    // byte-identically to a direct run (skips without the built shim).
+    .{ .name = "bundle_ui", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlinx-io",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-ui",
+    }, .weight = 40 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
@@ -1138,11 +1149,29 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     }
     if (group) run.addArg("-Wl,--end-group");
 
-    // SDL2 windowing backend (the shim's on-screen surface). Compiled in only when
-    // the SDL2 headers + lib are found; otherwise the window functions are stubs
-    // and the pack falls back to headless rendering.
+    // SDL2 windowing backend (the shim's on-screen surface). Dev builds link
+    // the system's dynamic SDL2 (detectSdl); release CI passes -Dsdl-static
+    // to link the -fPIC static archive from scripts/fetch-sdl.sh so the
+    // shipped shim carries no libSDL2 install dependency (SDL still dlopens
+    // the host's X11/Wayland client libs at runtime). Without either, the
+    // window functions are stubs and the pack falls back to headless
+    // rendering.
     if (os == .linux) {
-        if (detectSdl(b)) |sdl| {
+        const want_sdl_static = b.option(bool, "sdl-static", "Link SDL2 statically into the Skia shim from third_party/sdl (release artifacts; run scripts/fetch-sdl.sh first)") orelse false;
+        const static_sdl: ?struct { inc: []const u8, lib: []const u8 } = blk: {
+            if (!want_sdl_static) break :blk null;
+            const arch_name: []const u8 = if (target.result.cpu.arch == .x86_64) "x64" else "arm64";
+            const sdl_base = b.fmt("third_party/sdl/linux-{s}", .{arch_name});
+            const lib = b.fmt("{s}/lib/libSDL2.a", .{sdl_base});
+            b.build_root.handle.access(io, lib, .{}) catch {
+                std.log.warn("-Dsdl-static set but {s} is missing; run scripts/fetch-sdl.sh", .{lib});
+                break :blk null;
+            };
+            break :blk .{ .inc = b.fmt("{s}/include/SDL2", .{sdl_base}), .lib = lib };
+        };
+        if (static_sdl) |sdl| {
+            run.addArgs(&.{ "-DKLIO_SDL", b.fmt("-I{s}", .{sdl.inc}), sdl.lib });
+        } else if (detectSdl(b)) |sdl| {
             run.addArgs(&.{ "-DKLIO_SDL", b.fmt("-I{s}", .{sdl.inc}), sdl.lib });
         } else {
             std.log.warn("SDL2 not found; the Compose-UI window backend is disabled (headless render only). Install libsdl2-dev.", .{});

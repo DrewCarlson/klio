@@ -204,20 +204,27 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     }
     const cross = !std.mem.eql(u8, target, hostTarget());
 
-    // Project mode: a directory with klio.toml supplies [application].
+    // Project mode: a directory with klio.toml supplies [application] and
+    // the full project source set.
     var proj: ?project.Application = null;
     var main_path: []const u8 = opts.input;
+    var paths: []const []const u8 = undefined;
     if (isDirectory(fio, opts.input)) {
         proj = project.loadApplication(gpa, opts.input) orelse {
             io.printStderr(gpa, "error: `{s}` is a directory but has no klio.toml with an [application] table (or a single main .kt)\n", .{opts.input});
             return 2;
         };
         main_path = proj.?.main;
+        paths = proj.?.sources;
         if (opts.name == null and proj.?.name.len != 0) opts.name = proj.?.name;
         if (opts.icon == null and proj.?.icon.len != 0) opts.icon = proj.?.icon;
         for (proj.?.includes) |inc| {
             opts.includes.append(gpa, parseInclude(inc)) catch return 2;
         }
+    } else {
+        const single = gpa.alloc([]const u8, 1) catch return 2;
+        single[0] = opts.input;
+        paths = single;
     }
     if (!std.mem.endsWith(u8, main_path, ".kt")) {
         io.printStderr(gpa, "error: expected a `.kt` source file, got `{s}`\n", .{main_path});
@@ -240,10 +247,9 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
 
     // 1. Parse the program.
     var scratch_map = SourceMap.init(gpa);
-    const paths = [_][]const u8{main_path};
-    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, &paths, null) orelse {
+    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
         // Re-run through the check pipeline so the diagnostics render.
-        return commands.runCheck(gpa, &paths, .Plain, &requested);
+        return commands.runCheck(gpa, paths, .Plain, &requested);
     };
 
     // 2. Dependency load + base image (cache reuse or fresh bake).
@@ -264,7 +270,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         const map = gpa.create(SourceMap) catch return 1;
         map.* = SourceMap.init(gpa);
         map.files.appendSlice(map.arena.allocator(), bb.map.files.items) catch return 1;
-        const user2 = stdlib_image.parseUserFiles(gpa, map, &paths, user.texts) orelse return 1;
+        const user2 = stdlib_image.parseUserFiles(gpa, map, paths, user.texts) orelse return 1;
         var built = interp_ir.build.buildModuleFilesExtend(gpa, bb.base, user2.asts) catch return 1;
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -290,7 +296,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const program_src = encodeProgramSources(arena, &paths, user.texts) catch return 1;
+    const program_src = encodeProgramSources(arena, paths, user.texts) catch return 1;
 
     var resources_blob: std.ArrayList(u8) = .empty;
     var resource_entries: std.ArrayList(bf.ResourceEntry) = .empty;

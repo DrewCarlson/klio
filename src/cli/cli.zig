@@ -703,6 +703,7 @@ test {
     std.testing.refAllDecls(bundle);
     std.testing.refAllDecls(bundle_boot);
     std.testing.refAllDecls(@import("stub_fetch.zig"));
+    std.testing.refAllDecls(@import("shim_extract.zig"));
     std.testing.refAllDecls(project);
 }
 

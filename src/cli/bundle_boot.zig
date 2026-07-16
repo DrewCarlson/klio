@@ -27,11 +27,14 @@ const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 const ir_mod = @import("ir");
 
+const compose_ui = @import("compose_ui");
+
 const io = @import("io.zig");
 const commands = @import("commands.zig");
 const pack_cache = @import("pack_cache.zig");
 const stdlib_image = @import("stdlib_image.zig");
 const bundle = @import("bundle.zig");
+const shim_extract = @import("shim_extract.zig");
 
 /// Memoized probe result for the process.
 const ProbeState = union(enum) {
@@ -198,6 +201,42 @@ fn bootProgram(
     // the program runs.
     installResources(gpa, bytes, table, manifest);
 
+    // UI bundles: extract the embedded Skia shim to the content-addressed
+    // cache and point the loader at it; install the window icon + the
+    // default title. A failed extraction keeps the existing headless
+    // fallback with one stderr line.
+    if (manifest.flavor == .ui) {
+        if (bf.findSection(table, bf.section_names.SKIA_SHIM)) |shim_section| {
+            const shim = (bf.sectionBytes(gpa, bytes, shim_section) catch null) orelse {
+                io.writeStderr("warning: embedded rendering backend is corrupt; running headless\n");
+                return bootRest(gpa, bytes, table, manifest, argv);
+            };
+            if (shim_extract.ensureExtracted(gpa, shim.slice())) |path| {
+                compose_ui.setSkiaLibPath(path);
+            } else {
+                io.writeStderr("warning: cannot extract the rendering backend (cache and temp dirs unwritable); running headless\n");
+            }
+        }
+    }
+    if (bf.findSection(table, bf.section_names.ICON)) |icon_section| {
+        compose_ui.setWindowIconPng(bf.sectionStored(bytes, icon_section));
+    }
+    if (manifest.name.len != 0) {
+        if (std.fmt.allocPrintSentinel(gpa, "{s}", .{manifest.name}, 0) catch null) |title| {
+            compose_ui.setDefaultWindowTitle(title);
+        }
+    }
+
+    return bootRest(gpa, bytes, table, manifest, argv);
+}
+
+fn bootRest(
+    gpa: Allocator,
+    bytes: []const u8,
+    table: *const bf.SectionTable,
+    manifest: *const bf.BundleManifest,
+    argv: []const []const u8,
+) u8 {
     for (manifest.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
 
     // Base image, mmap-backed straight out of the executable.
