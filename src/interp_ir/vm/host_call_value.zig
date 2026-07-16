@@ -15,6 +15,7 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_call_func = @import("host_call_func.zig");
+const compose = @import("compose.zig");
 const host_call_member = @import("host_call_member.zig");
 const overload_match = @import("overload_match.zig");
 const host_fields = @import("host_fields.zig");
@@ -634,6 +635,24 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try capture_values.appendSlice(allocator, g.get().*);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
+        // A pass-threaded composable invoked as a value (a restart-scope
+        // re-invocation is a positional closure call) must publish its
+        // `$composer` argument as the ambient composer, exactly like the
+        // named-call path: a `@Composable` property getter reached from the
+        // body reads it via `__compose_currentComposer`.
+        if (host_call_func.composePluginEnabled() and
+            func.params.len >= 2 and call_args.items.len == func.params.len)
+        {
+            const cpos = func.params.len - 2;
+            if (std.mem.eql(u8, func.params[cpos].name, "$composer") and
+                std.mem.eql(u8, func.params[cpos + 1].name, "$changed") and
+                call_args.items[cpos] == .Instance)
+            {
+                compose.pushComposer(call_args.items[cpos]);
+                defer compose.popComposer();
+                return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
+            }
+        }
         return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
     }
     // `Comparator` is a `fun interface`: invoking it as a value

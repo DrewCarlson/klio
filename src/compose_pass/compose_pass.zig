@@ -797,13 +797,15 @@ fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params
     var call_args = try a.alloc(Expr, value_params.len + 2);
     for (value_params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
     call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
-    // `$changed or 1`
-    call_args[value_params.len + 1] = .{ .Binary = .{
-        .op = .Or,
-        .lhs = b.box(b.pathExpr(changed_param)),
-        .rhs = b.box(b.intLit(1)),
-        .span = b.gen_span,
-    } };
+    // `$changed.or(1)` — Kotlin's bitwise `or` is an INFIX FUNCTION, not an
+    // operator: the AST `BinOp.Or` is logical `||`, whose short-circuit branch
+    // on an Int operand kills the restart invocation. Emit the member call the
+    // parser would produce for `$changed or 1`.
+    call_args[value_params.len + 1] = b.callMember(
+        b.pathExpr(changed_param),
+        "or",
+        b.slice1(b.intLit(1)),
+    );
     const reinvoke = b.call(b.pathExpr(fn_name), call_args);
 
     const lam_params = try a.alloc(Ident, 2);

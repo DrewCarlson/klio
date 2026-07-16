@@ -1,0 +1,4 @@
+fn n=5 tag=direct
+fn n=5 tag=lambda
+fn n=5 tag=nested
+fn n=5 tag=coroutine
