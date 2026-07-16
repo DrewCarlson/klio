@@ -3275,8 +3275,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // decisions are a pure function of (class, name) — stable across calls — so
     // consulting the cache here is identical to letting them decline again, just
     // without the per-call FQN building, supertype walk, and ~35 type checks.
+    // The key folds `static_recv` in, so a statically-directed call is cached
+    // apart from the unscoped one (see `instanceMethodKeyScoped`). It matches
+    // `irMethodWalk`'s key exactly — that walk populates the entries served
+    // here. `declared_recv` is not folded: a user instance method's resolution
+    // never depends on it (it only directs the extension fallback, which the
+    // ext-cache probe below guards separately).
     if (receiver.* == .Instance) {
-        if (instanceMethodKey(receiver, name, args)) |k| {
+        if (instanceMethodKeyScoped(receiver, name, args, static_recv, null)) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
@@ -8136,8 +8142,28 @@ fn methodArgSig(args: []const Value) ?u64 {
 }
 
 fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
+    return instanceMethodKeyScoped(receiver, name, args, null, null);
+}
+
+/// Scope-aware cache key. A `static_recv`/`declared_recv`-directed call
+/// resolves in the STATIC type's scope, not the runtime class's, so its
+/// resolution must never be conflated with the unscoped one — `Map.getOrElse`'s
+/// inlined `get` must not be served a cached subtype `get<T>` (which
+/// self-recurses), nor vice versa. Folding the scope names into `sig` keeps
+/// both resolutions cached under distinct keys; resolution is a pure function
+/// of (class, name, arg-sig, scope), so each entry stays sound.
+fn instanceMethodKeyScoped(receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
     if (receiver.* != .Instance) return null;
-    const sig = methodArgSig(args) orelse return null;
+    var sig = methodArgSig(args) orelse return null;
+    if (static_recv != null or declared_recv != null) {
+        var h = std.hash.Wyhash.init(0x517cc1b727220a95);
+        if (static_recv) |s| h.update(s);
+        h.update(&[_]u8{0});
+        if (declared_recv) |d| h.update(d);
+        sig ^= h.final();
+        // Keep 0 reserved for the unscoped empty-arg case.
+        if (sig == 0) sig = 1;
+    }
     const inst = receiver.Instance;
     const g = inst.borrow();
     defer g.deinit();
@@ -8210,10 +8236,11 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // path at `callMemberInnerStatic`'s entry consults this same cache before the
     // probe ladder, so a repeat call skips the binding/builtin probes too.
     //
-    // A `static_recv`-directed call bypasses the cache: the resolution then
-    // depends on the static receiver type, which the (class, name, args) key
-    // does not capture, so a cached entry from an ordinary call would be wrong.
-    const key = if (static_recv == null) instanceMethodKey(receiver, name, args) else null;
+    // A `static_recv`-directed call keys with the scope folded in (see
+    // `instanceMethodKeyScoped`): its resolution depends on the static receiver
+    // type, so it caches apart from the ordinary call's entry — never served
+    // one, never serves one.
+    const key = instanceMethodKeyScoped(receiver, name, args, static_recv, null);
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;

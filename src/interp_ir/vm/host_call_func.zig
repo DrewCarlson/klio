@@ -1107,9 +1107,15 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // Array at its positional index), which is already bound.
     if (hasNonFinalVararg(f.params) and f.hasBody()) {
         const prepacked = blk: {
-            if (args_in.len != f.params.len) break :blk false;
+            // A prefix shorter than the param list also counts as pre-packed
+            // when its vararg slot already holds an Array: the named binder
+            // hands exactly that shape back when a post-vararg param has no
+            // value and no default ("hand the prefix to call_func, whose own
+            // padding finishes the job"). Re-routing it through the named
+            // binder would re-produce the same prefix forever.
+            if (args_in.len > f.params.len) break :blk false;
             for (f.params, 0..) |*p, i| {
-                if (p.is_vararg) break :blk args_in[i] == .Array;
+                if (p.is_vararg) break :blk i < args_in.len and args_in[i] == .Array;
             }
             break :blk false;
         };
@@ -1605,6 +1611,15 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     break;
                 }
             }
+            const walk_defaults = funcDefaults(self, func);
+            var n_pos_total: usize = 0;
+            for (args, 0..) |_, i| {
+                const is_named = i < arg_names.len and arg_names[i] != null;
+                if (is_named) continue;
+                if (trailing_lambda != null and i == trailing_lambda.?) continue;
+                n_pos_total += 1;
+            }
+            var pos_seen: usize = 0;
             var positional_idx: usize = 0;
             var vararg_acc: std.ArrayList(Value) = .empty;
             defer vararg_acc.deinit(allocator);
@@ -1620,14 +1635,37 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                         // passes through untouched.
                         slots[positional_idx] = a;
                         positional_idx += 1;
+                        pos_seen += 1;
                         continue;
                     }
-                    try vararg_acc.append(allocator, a);
-                    hit_vararg = true;
-                    continue;
+                    // The vararg absorbs an arg only while more positional args
+                    // remain than the unfilled NON-defaulted params after it
+                    // strictly need. Those params cannot default and (in source
+                    // Kotlin) could only have been supplied positionally by a
+                    // slot-exact generated call — `CompositionLocalProvider(
+                    // value, content, $composer, $changed)` from the compose
+                    // plugin — so the tail args are theirs. Defaulted params
+                    // never claim a tail arg: a source call can only pass them
+                    // by name, and absorbing through them is the pre-existing
+                    // behaviour.
+                    var required_tail: usize = 0;
+                    for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1 ..) |_, j| {
+                        if (slots[j] != null) continue;
+                        const has_default = walk_defaults != null and j < walk_defaults.?.len and walk_defaults.?[j] != null;
+                        if (!has_default) required_tail += 1;
+                    }
+                    if (n_pos_total - pos_seen > required_tail) {
+                        try vararg_acc.append(allocator, a);
+                        hit_vararg = true;
+                        pos_seen += 1;
+                        continue;
+                    }
+                    positional_idx = vararg_pos.? + 1;
+                    while (positional_idx < params.len and slots[positional_idx] != null) positional_idx += 1;
                 }
                 if (positional_idx < params.len) slots[positional_idx] = a;
                 positional_idx += 1;
+                pos_seen += 1;
             }
             if (vararg_pos) |vp| {
                 const velem = params[vp].ty.name;
