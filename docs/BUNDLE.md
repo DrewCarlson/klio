@@ -118,10 +118,16 @@ A bundle is the unmodified stub executable, padding to a 16384-byte
 boundary, a payload area, and a 72-byte trailer:
 
 - **Sections**: `manifest` (postcard-encoded `BundleManifest`),
-  `base-image` (the baked dependency `.klio-image`, uncompressed and
-  16 KiB-aligned so boot mmaps it straight out of the file),
-  `program-src` (the user sources), `resources` (zstd per entry),
-  `skia-shim` (UI flavor only, zstd), `icon` (raw PNG).
+  `program-image` (deps + program lowered as one module and baked,
+  uncompressed and 16 KiB-aligned so boot mmaps it straight out of the
+  file and runs with zero parsing or lowering), `program-src` (the user
+  sources), `resources` (zstd per entry), `skia-shim` (UI flavor only,
+  zstd), `icon` (raw PNG). When the program bake refuses (a base outside
+  the image codec's serializable surface) the bundle instead carries
+  `base-image` (the dependency base alone) and boots by parsing
+  `program-src` against it — the always-works path, recorded in the
+  manifest and reported by `--dry-run`; startup is the only difference.
+  `KLIO_BUNDLE_PROGRAM_IMAGE=0` at bundle time forces that path.
 - **Trailer**: magic `"KBND\0KL1"`, payload offset/length, section-table
   offset/length, and a blake3 hash of the whole payload area, verified
   at boot before anything decodes.

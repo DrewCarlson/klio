@@ -2,42 +2,78 @@
 
 ## Status
 
-Linux support is implemented and gated (`zig build itest-bundle_smoke`);
-user docs live in `docs/BUNDLE.md`.
+FULL LINUX SUPPORT LANDED and gated (`zig build itest-bundle_smoke`,
+`itest-bundle_ui`, `itest-bundle_cross`; `bundle_smoke` in
+`scripts/gate.sh`). Windows/macOS are clean drop-ins: their probe
+positions and patcher call sites are marked extension points in
+`src/cli/bundle_boot.zig`, the Cocoa/Win32 icon entries exist in
+`skia_shim.cpp`, and the release workflow already carries their shim
+jobs. User docs: `docs/BUNDLE.md`.
 
-Landed:
+Landed (in commit order):
 
-- Bundle core: `src/pack/bundle_format.zig` (trailer + section table +
-  `BundleManifest`, blake3 payload hash, 16 KiB mmap alignment),
-  `src/cli/bundle.zig` (assembly: full dep load, base-image cache reuse
-  or fresh bake, bundle-time program verification), `src/cli/bundle_boot.zig`
-  (probe in `cli.run` + main.zig profile guard; mmap → hash check →
-  manifest/version checks → image load → program-src extend → bindings
-  replay from the manifest — `~/.klio` is never consulted),
-  `KLIO_BUNDLE_INSPECT`. Float encode/decode in `image.zig` and the pack
-  codec normalized to explicit little-endian (with codec byte tests).
-- Program surface: argv[1..] → `main(args: Array<String>)` (also fixes
-  `klio run` binding Unit for the missing parameter),
-  `kotlin.system.exitProcess`, stdin passthrough, `--include` resources +
-  the `klio.bundle` pack (`kotlin-klio/klio-bundle`) with mmap-served
-  `Resources.readBytes/readText/exists/list`.
-- Manifest replay: known packages snapshot, platform binding FQNs, and
-  pack host bindings as `(fqn, host symbol)` pairs re-resolved at boot
-  (hard error on an unresolvable symbol).
-- Tests: `bundle_format` unit tests; itest `bundle_smoke` (hello +
-  serialization-with-feature byte-identical to `klio run` under an empty
-  HOME, argv, resources round-trip + missing-resource exception, exit
-  code, stdin, corruption refusal, inspect shape, double-bundle byte
-  determinism). `bundle_smoke` joined `scripts/gate.sh`.
+- Bundle core + program surface: `src/pack/bundle_format.zig` (trailer +
+  section table + `BundleManifest`, blake3 payload hash, 16 KiB mmap
+  alignment), `src/cli/bundle.zig` (assembly + verification),
+  `src/cli/bundle_boot.zig` (probe before CLI dispatch; argv belongs to
+  the program; `~/.klio` never consulted; exact refusal messages;
+  `KLIO_BUNDLE_INSPECT`). Float encode/decode in `image.zig` and the
+  pack codec normalized to explicit little-endian (byte-asserted).
+  argv[1..] → `main(args)` (also fixes `klio run` binding Unit),
+  `kotlin.system.exitProcess`, stdin passthrough, `--include` resources
+  + the `klio.bundle` pack (`kotlin-klio/klio-bundle`) served from the
+  executable's mmap. Manifest replay: known-packages snapshot, platform
+  binding FQNs, pack host bindings as `(fqn, host symbol)` pairs (hard
+  error on an unresolvable symbol).
+- UI bundles: shim embedded zstd'd; content-addressed extraction
+  (`src/cli/shim_extract.zig`, `$XDG_CACHE_HOME/klio/shim/<blake3-16>/`,
+  atomic rename, temp-dir fallback, headless + one stderr line when
+  unwritable); explicit shim-path override ahead of `KLIO_SKIA_LIB` in
+  `compose_ui.zig`; `klio_win_set_icon_png` (SDL real, Cocoa written,
+  Win32 with the PE milestone) + untitled windows take `--name`; flavor
+  auto-detect off the pack fixpoint; `scripts/fetch-sdl.sh` +
+  `-Dsdl-static` (release CI; dev keeps dynamic SDL2). Project mode
+  (`[application]` in klio.toml: name/icon/include/main with single-main
+  discovery, whole source set), `--dry-run`, `--desktop-dir`.
+- Whole-program image: `buildProgramBase` + main serialized in the image
+  (FORMAT_VERSION 21); boot is mmap → load → run, zero re-lowering.
+  Measured (ReleaseSafe): hello bundle ~29 ms vs ~32 ms warm `klio run`;
+  gated by a min-of-three timing scenario. Bake refusal falls back to
+  base-image + program-src, recorded in the manifest;
+  `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces it.
+- Cross-target: `src/cli/stub_fetch.zig` (--stub → KLIO_STUB_DIR →
+  ~/.klio/stubs cache → HTTPS fetch verified against the baked
+  `src/cli/stubs-manifest.json`, an empty placeholder in dev builds);
+  build-time tools now compile for the HOST so `zig build -Dtarget=...`
+  produces real cross stubs (aarch64 ELF verified);
+  `.github/workflows/release.yml` (six stubs from one Linux runner,
+  three per-OS shim jobs, manifest generation).
 
-Deviations so far:
+Deviations from the letter of the design (rationale):
 
+- The two image sections are mutually exclusive: a successful program
+  bake drops the base image (boot never reads it; keeping it doubled the
+  payload). `program-src` is always embedded.
 - A program that redeclares a base name refuses to bundle with a clear
-  error (the run path's whole-program fallback has no image to embed);
-  the plan's silent-fallback language applies to the program-image bake
+  error (the run path's whole-program fallback has no base image to
+  embed); the silent-fallback language applies to the program-image bake
   only.
-- `zstd` gained a `frameContentSize` helper for release shim artifacts
-  distributed as bare frames.
+- Each bake attempt performs its own dependency load: lowering mutates
+  the parsed ASTs and baking strips dead AST bodies, so AST reuse across
+  lowers corrupted the second image (pack methods lowered to empty
+  bodies).
+- `zstd` gained `frameContentSize` for release shim artifacts shipped as
+  bare frames; `scripts/zigcheck.py`'s module graph caught up with
+  compose_pass/compose_ui.
+
+Remaining for Windows (M6): `src/cli/pe_patch.zig` (GUI-subsystem flip +
+checksum, icon resource), the cert-table-aware trailer probe (seam in
+`bundle_boot.probeSelfInner`), `GetModuleFileNameW` self-path, Win32
+backend verification, CI job. Remaining for macOS (M7):
+`src/cli/macho_sign.zig` (__LINKEDIT extension + ad-hoc CodeDirectory),
+the `LC_CODE_SIGNATURE`-aware probe (same seam), `--app-dir` emitter,
+Cocoa verification. Follow-ons noted, not committed: IR-level
+tree-shaking of unreferenced pack decls; AppImage layering.
 
 The original design (all decisions committed) follows. It supersedes the
 Rust-era "Phase 14 — Application packs" section of
