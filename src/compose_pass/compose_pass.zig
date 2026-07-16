@@ -44,6 +44,8 @@ const dbg_lambda = false;
 pub const composer_param = "$composer";
 /// Synthetic name of the injected changed-flags parameter.
 pub const changed_param = "$changed";
+/// The skip-calculus accumulator local (`var $dirty = $changed and 1`).
+pub const dirty_local = "$dirty";
 /// FQN of the absent-argument marker singleton accessor (declared in the
 /// compose runtime engine pack). A defaulted `@Composable` parameter's default
 /// expression must evaluate INSIDE the function body — with `$composer` in
@@ -86,6 +88,16 @@ pub fn isComposable(annotations: []const ast.Annotation) bool {
 fn isRestartableComposable(f: *const Function) bool {
     if (!isComposable(f.annotations)) return false;
     if (f.is_inline) return false;
+    // A restart scope returns Unit. A declared non-Unit return type — or an
+    // expression body with no declared type, whose value IS the body — is a
+    // value-returning composable (`collectAsState`, `rememberUpdatedState`):
+    // threaded, never restart-wrapped, or the wrap collapses its value to
+    // Unit.
+    if (f.return_type) |rt| {
+        if (!std.mem.eql(u8, rt.name.name, "Unit")) return false;
+    } else if (f.body != null and f.body.? == .Expr) {
+        return false;
+    }
     for (f.annotations) |ann| {
         if (ann.path.len == 0) continue;
         const nm = ann.path[ann.path.len - 1].name;
@@ -294,7 +306,7 @@ pub fn transformDecls(
     lambda_sinks: *const std.StringHashMap(void),
 ) std.mem.Allocator.Error!void {
     var oracle = NameSetOracle{ .names = composable_names };
-    for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks);
+    for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks, false);
 }
 
 fn transformDecl(
@@ -302,13 +314,14 @@ fn transformDecl(
     d: *ast.Decl,
     oracle: *NameSetOracle,
     sinks: *const std.StringHashMap(void),
+    in_class: bool,
 ) std.mem.Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| {
             if (f.body == null) return;
             if (isComposable(f.annotations)) {
                 if (isRestartableComposable(f)) {
-                    f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks);
+                    f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks, in_class);
                 } else {
                     f.* = try transformThreadedComposable(a, f, NameSetOracle.isComposableCall, oracle, sinks);
                 }
@@ -322,8 +335,8 @@ fn transformDecl(
                 };
             }
         },
-        .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks),
-        .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks),
+        .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks, true),
+        .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks, true),
         .Property => |p| {
             const pb = B{ .a = a, .gen_span = p.span };
             var w = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
@@ -359,6 +372,22 @@ fn transformDecl(
 /// sentinel call (see `default_marker_path`).
 fn markerCall(b: B) Expr {
     return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
+}
+
+/// `$dirty = $dirty or (if (<probe>) 2 else 0)` — one skip-calculus probe.
+fn dirtyOrProbe(b: B, probe: Expr) Stmt {
+    const pick = Expr{ .If = .{
+        .cond = b.box(probe),
+        .then_branch = b.box(b.intLit(2)),
+        .else_branch = b.box(b.intLit(0)),
+        .span = b.gen_span,
+    } };
+    return .{ .Assign = .{
+        .target = b.pathExpr(dirty_local),
+        .op = .Assign,
+        .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(pick)),
+        .span = b.gen_span,
+    } };
 }
 
 /// The transformed signature plus the body prologue that re-evaluates
@@ -443,6 +472,7 @@ pub fn transformComposableFunction(
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
     sinks: ?*const std.StringHashMap(void),
+    in_class: bool,
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
 
@@ -480,10 +510,95 @@ pub fn transformComposableFunction(
         try w.walkStmt(s);
         try out.append(a, s.*);
     }
+    // Skip calculus: probe every value parameter through
+    // `$composer.changed(p)` — the probe also stores the value in the slot
+    // table, so it runs on every invocation regardless of the skip decision.
+    // The body executes when a probe reported a change, the scope was forced
+    // (`$changed` bit 0, set by the restart re-invoke), or the composer is
+    // not in a skippable state; otherwise the group skips wholesale. A
+    // vararg parameter is not probed element-wise and conservatively always
+    // recomposes; a receiver (member or extension) probes `this`. Probes run
+    // AFTER the defaults prologue so a defaulted parameter probes its
+    // resolved value.
+    {
+        const dirty_prop = try a.create(ast.Property);
+        dirty_prop.* = .{
+            .mutable = true,
+            .name = b.ident(dirty_local),
+            .receiver_type = null,
+            .ty = null,
+            .init = b.callMember(b.pathExpr(changed_param), "and", b.slice1(b.intLit(1))),
+            .delegate = null,
+            .getter = null,
+            .setter = null,
+            .is_abstract = false,
+            .is_open = false,
+            .is_override = false,
+            .is_lateinit = false,
+            .is_const = false,
+            .is_inline = false,
+            .is_expect = false,
+            .is_actual = false,
+            .setter_visibility = null,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = b.gen_span,
+        };
+        try out.append(a, .{ .Decl = .{ .Property = dirty_prop } });
+        if (f.receiver_type != null or in_class) {
+            try out.append(a, dirtyOrProbe(b, b.callMember(
+                b.pathExpr(composer_param),
+                "changed",
+                b.slice1(.{ .This = .{ .qualifier = null, .span = b.gen_span } }),
+            )));
+        }
+        for (f.params) |p| {
+            if (p.is_vararg) {
+                try out.append(a, .{ .Assign = .{
+                    .target = b.pathExpr(dirty_local),
+                    .op = .Assign,
+                    .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(b.intLit(2))),
+                    .span = b.gen_span,
+                } });
+                continue;
+            }
+            try out.append(a, dirtyOrProbe(b, b.callMember(
+                b.pathExpr(composer_param),
+                "changed",
+                b.slice1(b.pathExpr(p.name.name)),
+            )));
+        }
+    }
+    // `if ($dirty != 0 || !$composer.skipping) { <body> } else
+    // { $composer.skipToGroupEnd() }`
+    var body_list: std.ArrayList(Stmt) = .empty;
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
-        try out.append(a, s.*);
+        try body_list.append(a, s.*);
     }
+    const skip_stmts = try a.alloc(Stmt, 1);
+    skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };
+    const run_cond = Expr{ .Binary = .{
+        .op = .Or,
+        .lhs = b.box(.{ .Binary = .{
+            .op = .Neq,
+            .lhs = b.box(b.pathExpr(dirty_local)),
+            .rhs = b.box(b.intLit(0)),
+            .span = b.gen_span,
+        } }),
+        .rhs = b.box(.{ .Unary = .{
+            .op = .Not,
+            .expr = b.box(b.member(b.pathExpr(composer_param), "skipping")),
+            .span = b.gen_span,
+        } }),
+        .span = b.gen_span,
+    } };
+    try out.append(a, .{ .Expr = .{ .If = .{
+        .cond = b.box(run_cond),
+        .then_branch = b.box(.{ .Block = .{ .stmts = try body_list.toOwnedSlice(a), .span = f.span } }),
+        .else_branch = b.box(.{ .Block = .{ .stmts = skip_stmts, .span = b.gen_span } }),
+        .span = b.gen_span,
+    } } });
     // `$composer.endRestartGroup()?.updateScope { c, f -> App(args, c, $changed or 1) }`
     try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
 
@@ -913,9 +1028,9 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     var sinks = std.StringHashMap(void).init(a);
     try sinks.put("Column", {});
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks);
-    // stmts: startRestartGroup, Column{…}, endRestartGroup
-    const col = out.body.?.Block.stmts[1].Expr.Call;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false);
+    // The Column call sits inside the skip-if's then-block.
+    const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
     const lam = col.args[0].Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
@@ -932,6 +1047,13 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
 
 fn noneComposable(_: *anyopaque, _: []const u8) bool {
     return false;
+}
+
+/// The restart-wrapped body statements: the then-block of the skip `if`
+/// (second-to-last statement of the transformed body).
+fn wrappedBodyStmts(out: *const Function) []const Stmt {
+    const stmts = out.body.?.Block.stmts;
+    return stmts[stmts.len - 2].Expr.If.then_branch.Block.stmts;
 }
 
 fn dummyIdent(name: []const u8) Ident {
@@ -1006,10 +1128,9 @@ test "walker replaces currentComposer with the threaded composer inside a nested
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, allComposable, &ctx, null);
-    const stmts = out.body.?.Block.stmts;
-    // startRestartGroup + Emit(...) + endRestartGroup
-    const emit = stmts[1].Expr.Call;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, null, false);
+    // The Emit call sits inside the skip-if's then-block.
+    const emit = wrappedBodyStmts(&out)[0].Expr.Call;
     // Emit gained ($composer, 0); its first arg — originally currentComposer —
     // is now the threaded $composer.
     try testing.expectEqual(@as(usize, 3), emit.args.len);
@@ -1061,7 +1182,7 @@ test "transform injects composer/changed params and brackets the body" {
     const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null);
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false);
 
     // Signature gained the two synthetic params.
     try testing.expectEqual(@as(usize, 3), out.params.len);
@@ -1071,18 +1192,31 @@ test "transform injects composer/changed params and brackets the body" {
     try testing.expectEqualStrings(changed_param, out.params[2].name.name);
 
     const stmts = out.body.?.Block.stmts;
-    // startRestartGroup + Text(...) + endRestartGroup?.updateScope{}
-    try testing.expectEqual(@as(usize, 3), stmts.len);
+    // startRestartGroup + $dirty decl + probe(x) + skip-if + endRestartGroup.
+    try testing.expectEqual(@as(usize, 5), stmts.len);
     // First stmt: $composer.startRestartGroup(<key>)
     try testing.expectEqualStrings("startRestartGroup", stmts[0].Expr.Call.callee.Member.name.name);
     try testing.expectEqualStrings(composer_param, stmts[0].Expr.Call.callee.Member.receiver.Path.segments[0].name);
-    // Middle stmt: the Text call gained 2 trailing args (composer + changed).
-    const text_call = stmts[1].Expr.Call;
+    // Skip calculus: `var $dirty = $changed and 1`, then one probe per param.
+    try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
+    try testing.expect(stmts[1].Decl.Property.mutable);
+    const probe = stmts[2].Assign.value.Call;
+    try testing.expectEqualStrings("or", probe.callee.Member.name.name);
+    try testing.expectEqualStrings("changed", probe.args[0].If.cond.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("x", probe.args[0].If.cond.Call.args[0].Path.segments[0].name);
+    // The skip if: body in the then-block, skipToGroupEnd in the else.
+    const skip_if = stmts[3].Expr.If;
+    try testing.expectEqualStrings(
+        "skipToGroupEnd",
+        skip_if.else_branch.?.Block.stmts[0].Expr.Call.callee.Member.name.name,
+    );
+    // The Text call gained 2 trailing args (composer + changed).
+    const text_call = wrappedBodyStmts(&out)[0].Expr.Call;
     try testing.expectEqual(@as(usize, 3), text_call.args.len);
     try testing.expectEqualStrings(composer_param, text_call.args[1].Path.segments[0].name);
     try testing.expectEqual(@as(i64, 0), text_call.args[2].IntLit.value);
     // Last stmt: endRestartGroup()?.updateScope { ... }
-    const upd = stmts[2].Expr.Call;
+    const upd = stmts[4].Expr.Call;
     try testing.expect(upd.callee.Member.safe);
     try testing.expectEqualStrings("updateScope", upd.callee.Member.name.name);
     try testing.expectEqualStrings("endRestartGroup", upd.callee.Member.receiver.Call.callee.Member.name.name);
@@ -1110,7 +1244,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null);
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false);
 
     // The param is renamed and its default is the marker call.
     try testing.expectEqualStrings("x$arg", out.params[0].name.name);
@@ -1119,9 +1253,9 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqualStrings("klioComposableDefaultMarker", seg[seg.len - 1].name);
 
     // Body: startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`,
-    // endRestartGroup?.updateScope.
+    // $dirty decl, probe(x), skip-if, endRestartGroup?.updateScope.
     const stmts = out.body.?.Block.stmts;
-    try testing.expectEqual(@as(usize, 3), stmts.len);
+    try testing.expectEqual(@as(usize, 6), stmts.len);
     const prop = stmts[1].Decl.Property;
     try testing.expectEqualStrings("x", prop.name.name);
     const pick = prop.init.?.If;
@@ -1130,8 +1264,10 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
     try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
 
+    // The probe reads the RESOLVED value `x`, not the renamed argument.
+    try testing.expectEqualStrings("x", stmts[3].Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
     // The restart re-call passes the RENAMED param (marker flows through).
-    const upd = stmts[2].Expr.Call;
+    const upd = stmts[5].Expr.Call;
     const lam = upd.args[0].Lambda;
     const reinvoke = lam.body.stmts[0].Expr.Call;
     try testing.expectEqualStrings("x$arg", reinvoke.args[0].Path.segments[0].name);
@@ -1185,8 +1321,7 @@ test "non-composable callees are not threaded" {
     var noparams: [0]Param = .{};
     const fnp = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null);
-    const stmts = out.body.?.Block.stmts;
+    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null, false);
     // println keeps 0 args (not threaded).
-    try testing.expectEqual(@as(usize, 0), stmts[1].Expr.Call.args.len);
+    try testing.expectEqual(@as(usize, 0), wrappedBodyStmts(&out)[0].Expr.Call.args.len);
 }
