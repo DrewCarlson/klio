@@ -32,6 +32,7 @@ zig build \
   itest-parity_extension_resolution itest-parity_object_init \
   itest-check_examples itest-e2e \
   itest-ktor_server itest-ktor_channel_async itest-concurrency_stress \
+  itest-bundle_smoke \
   --summary failures 2>&1 | tail -20 || fail=1
 
 if [ "$NO_SWEEP" = 0 ]; then

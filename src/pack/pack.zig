@@ -17,6 +17,8 @@ pub const format = @import("format.zig");
 pub const schema = @import("schema.zig");
 pub const read = @import("read.zig");
 pub const write = @import("write.zig");
+pub const bundle_format = @import("bundle_format.zig");
+pub const zstd = @import("zstd.zig");
 
 pub const Compression = format.Compression;
 pub const FORMAT_VERSION = format.FORMAT_VERSION;
@@ -43,6 +45,7 @@ test {
     _ = schema;
     _ = read;
     _ = write;
+    _ = bundle_format;
     _ = @import("errors.zig");
 }
 

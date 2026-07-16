@@ -95,7 +95,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
     if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeStart();
     defer if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeReport();
-    runtime.perf.setProfile(resolveProfile(init.args));
+    // In bundle mode argv belongs entirely to the embedded program, so the
+    // performance profile comes from the environment (KLIO_OPT) alone.
+    runtime.perf.setProfile(if (cli.bundleModeActive())
+        runtime.perf.resolveBinaryProfile(&.{})
+    else
+        resolveProfile(init.args));
     const mode = runtime.allocChoice();
     switch (mode) {
         .arena => {

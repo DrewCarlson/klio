@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -249,7 +249,15 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
     switch (info) {
         .bool => try e.byte(if (value.*) 1 else 0),
         .int => try encodeInt(T, e, value.*),
-        .float => try e.bytes(&std.mem.toBytes(value.*)),
+        // Floats are written as their IEEE-754 bit pattern in little-endian
+        // byte order, so an image baked on one host is byte-consumable on any
+        // other (all supported targets are little-endian; this removes the
+        // native-order dependence outright).
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const raw: Bits = @bitCast(value.*);
+            try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(Bits, raw)));
+        },
         .@"enum" => |en| try e.varint(@as(u64, @intCast(@as(en.tag_type, @intFromEnum(value.*))))),
         .optional => |o| {
             if (value.*) |*payload| {
@@ -433,8 +441,10 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
         .bool => out.* = (try d.byte()) != 0,
         .int => out.* = try decodeInt(T, d),
         .float => {
+            // Mirrors the encoder: IEEE-754 bit pattern, little-endian.
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const s = try d.take(@sizeOf(T));
-            out.* = std.mem.bytesToValue(T, s);
+            out.* = @bitCast(std.mem.littleToNative(Bits, std.mem.bytesToValue(Bits, s)));
         },
         .@"enum" => out.* = try enumFromIntAny(T, try d.varint()),
         .optional => |o| {
@@ -820,6 +830,9 @@ const ImageRoot = struct {
     bodyless_func_ids: []const u32 = &.{},
     /// Distinct first fqn segments of the funcs (for packageHeadDeclared).
     func_fqn_heads: []const []const u8 = &.{},
+    /// `main`'s FuncId + 1 for a whole-program image (`klio bundle`);
+    /// 0 for a dependency base.
+    main_func: u64 = 0,
 };
 
 const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
@@ -1201,6 +1214,7 @@ fn rootFromBase(
     root.enum_id_next = base.enum_id_next;
     root.known_packages = extras.known_packages;
     root.binding_fqns = extras.binding_fqns;
+    root.main_func = if (base.built.main) |m| @as(u64, m.int()) + 1 else 0;
     return root;
 }
 
@@ -1417,8 +1431,6 @@ fn strMapToSlice(comptime V: type, a: Allocator, m: *const std.StringHashMap(V))
 const strMapToSliceKV = strMapToSlice;
 
 fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator.Error!bool {
-    if (b.main != null) return false;
-
     // The ClassDef graph first: every def reachable from the table gets an
     // index, so edges and enum-entry instances can refer by index.
     var def_index = std.AutoHashMap(usize, u32).init(a);
@@ -1911,6 +1923,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
     const module_ref = try ObjRef(Module).init(a, module);
     var built = build.emptyBuiltShell(a, module_ref, null);
     if (!try builtFromImage(a, &root.built, &built)) return null;
+    if (root.main_func != 0) built.main = FuncId.from(@intCast(root.main_func - 1));
 
     const base = try a.create(StdlibBase);
     base.* = .{
@@ -2593,6 +2606,21 @@ test "forest resolver resolves a ForestRef to the decoded node" {
     // A second resolve hits the memo (same decoded pointer).
     const got2 = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }).?;
     try testing.expect(got == got2);
+}
+
+test "codec floats are little-endian IEEE-754 bits on the wire" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 1.5f64 = 0x3FF8000000000000; the wire bytes must be the little-endian
+    // bit pattern regardless of host byte order.
+    const v: f64 = 1.5;
+    const bytes = try encodeOne(f64, a, &v);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, bytes);
+    var d = Decoder{ .a = a, .buf = bytes };
+    var out: f64 = undefined;
+    try decodeInto(f64, &d, &out);
+    try testing.expectEqual(v, out);
 }
 
 test "codec rejects truncated input" {
