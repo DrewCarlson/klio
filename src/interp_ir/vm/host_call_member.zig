@@ -1687,6 +1687,21 @@ fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8)
 fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
+    // Expand typealiases: a member extension declared on `TestResult`
+    // (= Unit) must accept a Unit receiver. The registry stores the
+    // target's simple head, so expansion iterates on heads; the bound
+    // guards a self-referential entry.
+    var alias_fuel: u8 = 4;
+    while (alias_fuel > 0) : (alias_fuel -= 1) {
+        const target: ?[]const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(pn);
+        };
+        const t = target orelse break;
+        if (std.mem.eql(u8, t, pn)) break;
+        pn = std.mem.trimEnd(u8, simpleName(t), "?");
+    }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (std.mem.startsWith(u8, pn, "Function")) return true;
     if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
