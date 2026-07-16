@@ -273,6 +273,89 @@ fn isComposableLambdaParam(p: *const Param) bool {
     return p.ty.function != null and isComposable(p.ty.annotations);
 }
 
+/// A declared type that is a `@Composable`-annotated function type
+/// (`@Composable () -> Unit`) — a lambda bound to it composes.
+fn isComposableFnType(t: *const ast.TypeRef) bool {
+    return t.function != null and isComposable(t.annotations);
+}
+
+/// Names of functions returning a `@Composable` function type, installed by
+/// the build driver around `transformDecls` (module decls + baked base). A
+/// val initialized from one holds a composable lambda; the walker records
+/// the val's name in its scoped `locals` set so bare calls thread.
+pub var active_factories: ?*const std.StringHashMap(void) = null;
+
+/// Declared parameter count of a sink's `@Composable` lambda parameter,
+/// recorded only when NON-ZERO (module decls + baked base, installed around
+/// `transformDecls`). A header-less `{ … }` bound to a `@Composable (P) ->
+/// Unit` sink keeps its implicit `it` slot ahead of `$composer`/`$changed` —
+/// `MovableContent({ content() })` invokes its content with the movable
+/// parameter first.
+pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
+
+/// Collect `sink name -> composable-lambda param count` for sinks whose
+/// composable parameter declares at least one value parameter. Caller owns.
+pub fn collectComposableSinkArity(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(u8) {
+    var set = std.StringHashMap(u8).init(a);
+    try collectSinkArityInto(&set, decls);
+    return set;
+}
+
+fn compParamArity(t: *const ast.TypeRef) ?u8 {
+    if (t.function == null or !isComposable(t.annotations)) return null;
+    const n = t.function.?.params.len;
+    if (n == 0) return null;
+    return @intCast(@min(n, 255));
+}
+
+fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            for (f.params) |*p| if (compParamArity(&p.ty)) |n| {
+                try set.put(f.name.name, n);
+                break;
+            };
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| if (compParamArity(&p.ty)) |n| {
+                try set.put(c.name.name, n);
+                break;
+            };
+            try collectSinkArityInto(set, c.members);
+        },
+        .Object => |*o| try collectSinkArityInto(set, o.members),
+        else => {},
+    };
+}
+
+/// Collect the simple names of functions RETURNING a `@Composable` function
+/// type (`movableContentOf`): a val initialized from one holds a composable
+/// lambda, so a bare call through the val is threaded. Caller owns the map.
+pub fn collectComposableValFactories(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectFactoriesInto(&set, decls);
+    return set;
+}
+
+fn collectFactoriesInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (f.return_type != null and isComposableFnType(&f.return_type.?)) {
+                try set.put(f.name.name, {});
+            }
+        },
+        .Class => |*c| try collectFactoriesInto(set, c.members),
+        .Object => |*o| try collectFactoriesInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Collect the simple names of functions (and constructors) that declare a
 /// `@Composable`-typed lambda parameter, so a lambda bound to one is itself
 /// transformed. Caller owns the returned map.
@@ -293,7 +376,19 @@ fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.
                 break;
             };
         },
-        .Class => |*c| try collectSinksInto(set, c.members),
+        .Class => |*c| {
+            // A class whose PRIMARY constructor takes a `@Composable`-typed
+            // lambda is a sink under its own name: `MovableContent({ … })`
+            // transforms its content lambda exactly like a function call
+            // would.
+            for (c.primary_params) |*p| {
+                if (p.ty.function != null and isComposable(p.ty.annotations)) {
+                    try set.put(c.name.name, {});
+                    break;
+                }
+            }
+            try collectSinksInto(set, c.members);
+        },
         .Object => |*o| try collectSinksInto(set, o.members),
         else => {},
     };
@@ -333,10 +428,16 @@ fn transformDecl(
             } else {
                 // Not composable: still walk the body so a `compose { … }` /
                 // `setContent { … }` composable-lambda argument is transformed.
-                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
+                const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
+                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params };
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
-                    .Expr => |*e| try w.walkExpr(e),
+                    .Expr => |*e| if (ret_composable and e.* == .Lambda) {
+                        try w.transformComposableLambda(&e.Lambda, ret_fn_params);
+                    } else {
+                        try w.walkExpr(e);
+                    },
                 };
             }
         },
@@ -511,7 +612,8 @@ pub fn transformComposableFunction(
     // threaded against this body's `$composer`.
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals };
+    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     for (pp.prologue) |*s| {
         try w.walkStmt(s);
         try out.append(a, s.*);
@@ -635,7 +737,8 @@ pub fn transformThreadedComposable(
     const params = pp.params;
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals };
+    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     const body = f.body orelse return signatureOnly(f, params);
     switch (body) {
         .Block => |blk| {
@@ -698,6 +801,14 @@ const Walker = struct {
     /// transform composable-lambda-sink arguments a `compose { … }` passes down),
     /// but its own calls are left alone.
     thread: bool = true,
+    /// The enclosing function declares a `@Composable`-function-typed RETURN
+    /// type: a lambda in return position (`return { … }`, or the whole
+    /// expression body) is composable — `movableContentOf`'s returned
+    /// wrapper is the shape.
+    ret_composable: bool = false,
+    /// Declared param count of that return function type (the header-less
+    /// returned lambda keeps an `it` slot when it is 1).
+    ret_fn_params: u8 = 0,
 
     /// The composer reference for the current scope: the threaded `$composer`
     /// param, or the ambient intrinsic call in a getter.
@@ -726,8 +837,37 @@ const Walker = struct {
     fn walkDecl(w: *Walker, d: *Decl) std.mem.Allocator.Error!void {
         switch (d.*) {
             .Property => |p| {
-                if (p.init) |*ini| try w.walkExpr(ini);
+                // `val content: @Composable () -> Unit = { … }` — the
+                // declared type makes the initializer lambda composable.
+                if (p.init) |*ini| {
+                    if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
+                        try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)));
+                    } else {
+                        try w.walkExpr(ini);
+                    }
+                }
                 if (p.delegate) |del| try w.walkExpr(del);
+                // A val HOLDING a composable lambda — declared with a
+                // `@Composable` fn type, or initialized from a factory
+                // returning one (`val content = movableContentOf { … }`) —
+                // joins the scoped locals set: a bare `content()` threads.
+                const holds_composable = blk: {
+                    if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
+                    const ini = p.init orelse break :blk false;
+                    if (ini != .Call or ini.Call.callee.* != .Path) break :blk false;
+                    const segs = ini.Call.callee.Path.segments;
+                    if (segs.len == 0) break :blk false;
+                    const af = active_factories orelse break :blk false;
+                    break :blk af.contains(segs[segs.len - 1].name);
+                };
+                if (holds_composable) {
+                    if (w.locals == null) {
+                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                        set.* = std.StringHashMap(void).init(w.a);
+                        w.locals = set;
+                    }
+                    try w.locals.?.put(p.name.name, {});
+                }
             },
             .Function => |*f| {
                 // A LOCAL `@Composable` declaration transforms exactly like
@@ -747,9 +887,24 @@ const Walker = struct {
                     }
                     return;
                 }
+                // A local fn returning a `@Composable` fn-type: its
+                // return-position lambdas compose, exactly like a top-level
+                // one's (the walker flag is scoped to this declaration).
+                const saved_ret = w.ret_composable;
+                const saved_rfp = w.ret_fn_params;
+                w.ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                w.ret_fn_params = if (w.ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
+                defer {
+                    w.ret_composable = saved_ret;
+                    w.ret_fn_params = saved_rfp;
+                }
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
-                    .Expr => |*e| try w.walkExpr(e),
+                    .Expr => |*e| if (w.ret_composable and e.* == .Lambda) {
+                        try w.transformComposableLambda(&e.Lambda, w.ret_fn_params);
+                    } else {
+                        try w.walkExpr(e);
+                    },
                 };
             },
             else => {},
@@ -779,7 +934,8 @@ const Walker = struct {
                     name != null and w.sinks != null and w.sinks.?.contains(name.?);
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
-                        try w.transformComposableLambda(&arg.Lambda);
+                        const exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
+                        try w.transformComposableLambda(&arg.Lambda, exp);
                     } else {
                         try w.walkExpr(arg);
                     }
@@ -820,7 +976,13 @@ const Walker = struct {
                 try w.walkExpr(fr.iter);
                 try w.walkExpr(fr.body);
             },
-            .Return => |*r| if (r.value) |v| try w.walkExpr(v),
+            .Return => |*r| if (r.value) |v| {
+                if (w.ret_composable and v.* == .Lambda) {
+                    try w.transformComposableLambda(&v.Lambda, w.ret_fn_params);
+                } else {
+                    try w.walkExpr(v);
+                }
+            },
             .Throw => |*t| try w.walkExpr(t.value),
             .Labeled => |*l| try w.walkExpr(l.expr),
             .Block => |*blk| try w.walkBlock(blk),
@@ -859,7 +1021,7 @@ const Walker = struct {
     /// and thread its body. The plugin lowers a `@Composable (P…) -> R` to a
     /// `FunctionN<P…, Composer, Int, R>`; the engine's `invokeComposable` /
     /// composer invoke it with the composer and a changed flag.
-    fn transformComposableLambda(w: *Walker, lam: anytype) std.mem.Allocator.Error!void {
+    fn transformComposableLambda(w: *Walker, lam: anytype, expected_params: ?u8) std.mem.Allocator.Error!void {
         if (dbg_lambda) std.debug.print("[compose-pass] transform composable lambda ({d} params)\n", .{lam.params.len});
         // Idempotence: a lambda already carrying a trailing `$composer` param
         // (a shared node reached twice) is left alone.
@@ -868,10 +1030,16 @@ const Walker = struct {
         // A lambda with only the synthetic `it` (a header-less `{ … }` bound to a
         // `() -> R` sink) has no real parameters: the composer/changed pair
         // replaces `it`, not follows it. A header-declared lambda keeps its
-        // explicit parameters and gains the pair after them.
-        const n: usize = if (lam.implicit_it) 0 else lam.params.len;
+        // explicit parameters and gains the pair after them — as does the
+        // implicit `it` when the sink's declared composable type takes one
+        // parameter (`MovableContent({ content() })` invokes its content
+        // with the movable parameter first).
+        const keep_it = lam.implicit_it and (expected_params orelse 0) >= 1;
+        const n: usize = if (lam.implicit_it) (if (keep_it) 1 else 0) else lam.params.len;
         const new_params = try w.a.alloc(Ident, n + 2);
-        if (n != 0) @memcpy(new_params[0..n], lam.params[0..n]);
+        if (keep_it) {
+            new_params[0] = w.b.ident("it");
+        } else if (n != 0) @memcpy(new_params[0..n], lam.params[0..n]);
         new_params[n] = w.b.ident(composer_param);
         new_params[n + 1] = w.b.ident(changed_param);
         const new_tys = try w.a.alloc(?TypeRef, n + 2);

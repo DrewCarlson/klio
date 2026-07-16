@@ -459,12 +459,22 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
+        var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
+        defer factories.deinit();
+        var sink_arity = try compose_pass.collectComposableSinkArity(allocator, decls.items);
+        defer sink_arity.deinit();
         if (base) |bsp| {
             try composeBaseNames(&names, bsp);
             try composeBaseSinks(&sinks, bsp);
+            try composeBaseFactories(&factories, bsp);
+            try composeBaseSinkArity(&sink_arity, bsp);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null)
-            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
+            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} factories, {d} decls\n", .{ names.count(), sinks.count(), factories.count(), decls.items.len });
+        compose_pass.active_factories = &factories;
+        defer compose_pass.active_factories = null;
+        compose_pass.active_sink_arity = &sink_arity;
+        defer compose_pass.active_sink_arity = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
@@ -4021,6 +4031,51 @@ fn composeBaseSinks(sinks: *std.StringHashMap(void), base: *const StdlibBase) Al
     for (base.lifted_decls) |*d| try composeBaseSinkDecl(sinks, d);
 }
 
+fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseFactoryDecl(factories, d);
+}
+
+fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+}
+
+fn composeBaseSinkArityDecl(arity: *std.StringHashMap(u8), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| for (f.params) |*p| {
+            if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
+                try arity.put(f.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
+                break;
+            }
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| {
+                if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
+                    try arity.put(c.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
+                    break;
+                }
+            }
+            for (c.members) |*m| try composeBaseSinkArityDecl(arity, m);
+        },
+        .Object => |*o| for (o.members) |*m| try composeBaseSinkArityDecl(arity, m),
+        else => {},
+    }
+}
+
+fn composeBaseFactoryDecl(factories: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| {
+            if (f.return_type) |*rt| {
+                if (rt.function != null and compose_pass.isComposable(rt.annotations)) {
+                    try factories.put(f.name.name, {});
+                }
+            }
+        },
+        .Class => |*c| for (c.members) |*m| try composeBaseFactoryDecl(factories, m),
+        .Object => |*o| for (o.members) |*m| try composeBaseFactoryDecl(factories, m),
+        else => {},
+    }
+}
+
 fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| for (f.params) |*p| {
@@ -4029,7 +4084,17 @@ fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocato
                 break;
             }
         },
-        .Class => |*c| for (c.members) |*m| try composeBaseSinkDecl(sinks, m),
+        .Class => |*c| {
+            // A class constructor taking a `@Composable` lambda is a sink
+            // under the class name (`MovableContent({ … })`).
+            for (c.primary_params) |*p| {
+                if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
+                    try sinks.put(c.name.name, {});
+                    break;
+                }
+            }
+            for (c.members) |*m| try composeBaseSinkDecl(sinks, m);
+        },
         .Object => |*o| for (o.members) |*m| try composeBaseSinkDecl(sinks, m),
         else => {},
     }
