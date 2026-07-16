@@ -640,6 +640,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (try ir.eval.stackTraceArray(allocator, receiver)) |arr| return ok(arr);
         }
     }
+    // `Throwable.suppressedExceptions` on an interpreted throwable instance:
+    // the hidden `__suppressed__` list `addSuppressed` maintains (empty when
+    // none recorded). Host `Exception` values reach the stdlib binding via
+    // the intrinsic probes below.
+    if (std.mem.eql(u8, name, "suppressedExceptions") and receiver.* == .Instance) {
+        const inst = receiver.Instance;
+        const declared = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().get(name) != null;
+        };
+        if (!declared and vmhost.host_call_member.instanceIsThrowable(self, allocator, inst)) {
+            if (vmhost.host_call_member.instanceSuppressedList(inst)) |l| return ok(l);
+            const items = try runtime.ValueList.init(allocator, .empty);
+            return ok(.{ .List = .{ .items = items, .mutable = false, .backing = null } });
+        }
+    }
     // `e::class.simpleName`/`.qualifiedName` for a builtin exception.
     if ((std.mem.eql(u8, name, "simpleName") or std.mem.eql(u8, name, "qualifiedName")) and receiver.* == .Exception) {
         const g = receiver.Exception.fqn.borrow();

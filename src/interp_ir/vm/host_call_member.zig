@@ -3325,6 +3325,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // captured when the throwable was thrown.
     if (try throwableStackMember(self, allocator, receiver, name, args)) |r| return r;
 
+    // `Throwable.addSuppressed(e)` / `.getSuppressed()` on an interpreted
+    // throwable instance (host `Exception` values route through the stdlib
+    // binding).
+    if (try throwableSuppressedMember(self, allocator, receiver, name, args)) |r| return r;
+
     // Built-in delegate protocol.
     if (receiver.* == .Delegate) {
         if (try delegateMember(self, allocator, receiver.Delegate, name, args)) |r| return r;
@@ -8723,6 +8728,62 @@ fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Va
     // arena fast path would otherwise alias (then dangle) `buf.items`.
     const owned = try allocator.dupe(u8, buf.items);
     return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, owned) } };
+}
+
+/// `addSuppressed`/`getSuppressed` on an INTERPRETED throwable instance. The
+/// suppressed list lives in a hidden `__suppressed__` field on the instance
+/// (a user throwable is a plain Instance until thrown), so every alias of
+/// the instance observes the same set. Host `Exception` values carry their
+/// list in the value itself and dispatch through the stdlib binding instead.
+fn throwableSuppressedMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const is_add = std.mem.eql(u8, name, "addSuppressed") and args.len == 1;
+    const is_get = std.mem.eql(u8, name, "getSuppressed") and args.len == 0;
+    if (!is_add and !is_get) return null;
+    const inst = switch (receiver.*) {
+        .Instance => |i| i,
+        else => return null,
+    };
+    {
+        const g = inst.borrow();
+        defer g.deinit();
+        const declared = g.get().get(name) != null;
+        if (declared) return null;
+    }
+    if (!instanceIsThrowable(self, allocator, inst)) return null;
+    if (is_get) {
+        const cur = instanceSuppressedList(inst);
+        if (cur) |l| return .{ .ok = l };
+        const items = try runtime.ValueList.init(allocator, .empty);
+        return .{ .ok = .{ .List = .{ .items = items, .mutable = false, .backing = null } } };
+    }
+    try appendInstanceSuppressed(inst, allocator, args[0]);
+    return .{ .ok = .Unit };
+}
+
+/// The instance's `__suppressed__` list value, if one was created.
+pub fn instanceSuppressedList(inst: ObjRef(InstanceData)) ?Value {
+    const g = inst.borrow();
+    defer g.deinit();
+    const v = g.get().get("__suppressed__") orelse return null;
+    if (v != .List) return null;
+    return v;
+}
+
+/// Append to the instance's hidden suppressed list, creating it on first use.
+pub fn appendInstanceSuppressed(inst: ObjRef(InstanceData), allocator: Allocator, e: Value) Allocator.Error!void {
+    const list: Value = blk: {
+        if (instanceSuppressedList(inst)) |l| break :blk l;
+        const items = try runtime.ValueList.init(allocator, .empty);
+        const fresh = Value{ .List = .{ .items = items, .mutable = true, .backing = null } };
+        const g = inst.borrowMut();
+        defer g.deinit();
+        try g.get().define(allocator, "__suppressed__", fresh);
+        break :blk fresh;
+    };
+    const g = list.List.items.borrowMut();
+    defer g.deinit();
+    if (runtime.reclaimEnabled()) e.retain();
+    try g.get().append(allocator, e);
 }
 
 pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) bool {
