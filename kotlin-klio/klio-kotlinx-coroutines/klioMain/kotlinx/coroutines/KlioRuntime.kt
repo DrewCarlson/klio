@@ -19,7 +19,9 @@ internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 internal fun __kxco_newSlot(): Long = 0L
 internal fun __kxco_parkSlot(slot: Long) {}
+internal fun __kxco_armSlot(slot: Long) {}
 internal fun __kxco_resumeSlot(slot: Long) {}
+internal fun __kxco_systemProperty(name: String): String? = null
 internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 
 // Host intrinsic: remove a channel waiter parked on `slot` and resume its
@@ -157,8 +159,13 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -192,8 +199,13 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -226,8 +238,13 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -255,10 +272,20 @@ public actual object Dispatchers {
 // `withTimeout` disposes it when the body completes in time.
 private class TimeoutGate(private val block: Runnable) : DisposableHandle {
     private var cancelled = false
+    private var slot: Long = -1L
+    fun isDisposed(): Boolean = cancelled
+    fun bindSlot(s: Long) {
+        slot = s
+    }
     fun fire() {
         if (!cancelled) block.run()
     }
     override fun dispose() {
         cancelled = true
+        // Wake the parked waiter NOW. Its timed park is bound to the slot
+        // (armed before the delay), so this preempts the deadline; without
+        // it the waiter is a zombie child holding the enclosing job tree —
+        // and the pump — for the timeout's full real duration.
+        if (slot >= 0L) __kxco_resumeSlot(slot)
     }
 }

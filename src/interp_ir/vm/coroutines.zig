@@ -68,6 +68,8 @@ var wall_delay_buckets = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)}
 fn countWallDelay(millis: i64) void {
     const idx: usize = if (millis <= 1) 0 else if (millis <= 20) 1 else if (millis <= 200) 2 else if (millis <= 2000) 3 else 4;
     _ = wall_delay_buckets[idx].fetchAdd(1, .monotonic);
+    if (millis > 2000 and streakDiagOn())
+        std.debug.print("[wall-timer] registered {d}ms\n", .{millis});
 }
 pub fn dumpSleepCounts() void {
     std.debug.print("[pump-sleep] timer_wall={d} wakeup_pending={d} barrier_yield={d} root_parked={d} | wall delays <=1ms={d} <=20ms={d} <=200ms={d} <=2s={d} >2s={d}\n", .{
@@ -824,7 +826,11 @@ pub const CooperativeInterceptor = struct {
             INDEFINITE
         else
             self.nowMillis() + state.wake_in_millis;
-        if (self.mode == .Wall and state.wake_in_millis > 0) countWallDelay(state.wake_in_millis);
+        if (self.mode == .Wall and state.wake_in_millis > 0) {
+            countWallDelay(state.wake_in_millis);
+            if (state.wake_in_millis > 2000 and streakDiagOn())
+                std.debug.print("[wall-timer] slot_bound={}\n", .{self.pending_slot != null});
+        }
         if (state.wake_in_millis == 0) {
             try self.ready.append(self.allocator, token);
         }

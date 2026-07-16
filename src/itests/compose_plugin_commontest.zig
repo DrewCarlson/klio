@@ -56,6 +56,10 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    // Cap runTest's default 60s real-time timeout: a test that will time out
+    // should fail in 10s, not hold its class's child (and the pump's job
+    // tree) for a minute per occurrence.
+    try map.put("kotlinx_coroutines_test_default_timeout", "10s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
     return map;
 }

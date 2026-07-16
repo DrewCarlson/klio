@@ -1724,6 +1724,22 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Suspend = -1 } };
 }
 
+/// `__kxco_armSlot(slot)` — bind the current coroutine's NEXT suspension
+/// (including a timed `__kxco_delayMillis` park) to `slot` WITHOUT
+/// suspending now, so `__kxco_resumeSlot(slot)` can preempt the timer. A
+/// disposed `withTimeout` waiter must release its parked deadline this way,
+/// or the pump (and the enclosing job tree) waits out the full real
+/// duration of a timeout that already lost its race.
+fn armSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const slot: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "__kxco_armSlot: argument must be Long" } },
+    };
+    ctx.host.coroutineArmSlot(slot);
+    return .{ .ok = .Unit };
+}
+
 /// `__kxco_resumeSlot(slot)` — make the coroutine waiting on `slot` ready.
 /// No-op if nothing is parked on it yet; the Kotlin waiter re-checks its
 /// condition after each park so a missed resume just causes a re-park.
@@ -1765,6 +1781,8 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_scheduleResume", .f = scheduleResume },
     .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_armSlot", .f = armSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_systemProperty", .f = kxcoSystemProp },
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanBindWatcher", .f = channelBindWatcher },
