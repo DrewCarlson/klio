@@ -660,6 +660,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     if (callee.* == .Comparator and args.len == 2) {
         return self.callMember(allocator, callee, "compare", args);
     }
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null)
+        std.debug.print("[callvalue-miss] callee={s} args={d}\n", .{ callee.typeFqn(), args.len });
+    ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
 }

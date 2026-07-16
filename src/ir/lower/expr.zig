@@ -5968,6 +5968,16 @@ fn lowerValueInvocation(
         if (b.isNonFnParam(name0) and b.module.funcId(name0) != null) {
             return null;
         }
+        // Nor does a LOCAL whose initializer is a definite non-callable
+        // literal: `var nodeIndex = 0` beside `fun nodeIndex(slots, group)`
+        // resolves the call `nodeIndex(slots, startingGroup)` to the
+        // function (an Int is not invokable) — the composer's
+        // movable-content insert is the shape.
+        if (b.module.funcId(name0) != null and !b.isLocalFn(name0)) {
+            if (b.localInitExpr(name0)) |init_e| {
+                if (argLitKind(init_e) != null) return null;
+            }
+        }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
         // call it cannot accept. The lambda binds the callee's last parameter,
         // so a param whose own last parameter is not a function type is not

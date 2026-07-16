@@ -187,8 +187,14 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markBroadCollectionLocal(p.name.name);
         }
     } else if (p.init) |*e| {
-        if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
-        if (e.* == .ObjectExpr) try b.markObjectInitLocal(p.name.name);
+        // Literal initializers are recorded too: a call site uses them as
+        // definite NON-callable evidence (`var nodeIndex = 0` beside
+        // `fun nodeIndex(...)` — the call resolves to the function).
+        switch (e.*) {
+            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
+            .ObjectExpr => try b.markObjectInitLocal(p.name.name),
+            else => {},
+        }
     }
     if (b.isBoxed(p.name.name)) {
         // Captured `var` — box into a shared cell so writes
