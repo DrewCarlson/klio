@@ -1879,6 +1879,7 @@ fn pumpLoop(
 
         // 2. Resume a ready coroutine, if any.
         inline_turn_resumes = 0;
+        persist_inline_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
@@ -2257,6 +2258,25 @@ fn inlineResumeEnabled() bool {
     return runtime.getenvSlice("KLIO_NO_INLINE_RESUME") == null;
 }
 
+/// Cached `KLIO_COMPOSE_PLUGIN` gate for the persisted inline-resume path.
+/// That path (`resumePersistedOnTop`) exists solely so the Compose recomposer,
+/// parked inside a `withContext`/`coroutineScope` frame, can wake and settle
+/// synchronously while a test-scheduler advance is in progress. Outside the
+/// compose plugin it stands down: the coroutine suites never set the flag, so
+/// they keep their pre-existing deferral (a persisted resume queues rather than
+/// running inline) and cannot be driven into an unbounded re-dispatch during
+/// `advanceUntilIdle`.
+var g_persist_resume_gate: ?bool = null;
+fn persistResumeGateEnabled() bool {
+    if (g_persist_resume_gate) |v| return v;
+    const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
+        v.len != 0 and !std.mem.eql(u8, v, "0")
+    else
+        false;
+    g_persist_resume_gate = on;
+    return on;
+}
+
 /// Resume the activation parked on `slot` on the current stack. Returns false
 /// when no pump on this thread holds the slot, or it is a pump's own root.
 /// A resume that arrived while another one was already running inline on this
@@ -2283,6 +2303,19 @@ const INLINE_CHAIN_BUDGET: usize = 32;
 /// How many resumes one pump turn may run inline. Far above what driving a frame
 /// of recomposition needs, far below a hand-off loop's appetite.
 const INLINE_TURN_BUDGET: usize = 2048;
+
+/// How many PERSISTED resumes one synchronous scheduler advance may run inline
+/// (`resumePersistedOnTop`). Driving a recomposition frame to quiescence needs
+/// only a handful (recomposer wake, frame launch, frame fire, recompose); a
+/// `while (isActive) yield()` body re-dispatching every turn is deferred once
+/// past this, so `advanceUntilIdle` goes idle instead of spinning. Reset when
+/// the pump actually turns (it does not during an advance).
+const PERSIST_INLINE_BUDGET: usize = 64;
+
+/// Persisted resumes run inline since the pump last turned. Distinct from
+/// `inline_turn_resumes` so the tight per-advance cap does not also throttle the
+/// established live-pump inline path (`resumeInlineOnce`).
+threadlocal var persist_inline_resumes: usize = 0;
 
 pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!bool {
     if (!inlineResumeEnabled()) return false;
@@ -2373,6 +2406,51 @@ pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Val
     return coroutineResumeExternal(self, slot, value, out);
 }
 
+/// Resume a persisted coroutine (its owning drive already exited) on THIS
+/// thread's existing live pump, on the caller's stack — one step, re-parking
+/// into the same pump. Gated on the Compose lowering plugin
+/// (`persistResumeGateEnabled`): when a snapshot apply resumes the recomposer
+/// while the runBlocking pump `coroTop` is blocked in an `advanceTimeBy`,
+/// adopting the resume onto the pump's ready queue would defer it until the
+/// advance returns — the recomposer would never reach the `withFrameNanos`
+/// that schedules its frame, so a state change never settles. Running it on the
+/// existing pump (not a fresh one) keeps its later suspension owned by a live
+/// pump, so the next resume takes the ordinary inline path. Off outside the
+/// compose plugin, so the coroutine suites keep their pre-existing deferral.
+/// Bounded: `inline_depth` caps nested resumes; `persist_inline_resumes` caps
+/// the total inline resumes since the pump last turned, so a re-dispatching
+/// body cannot spin unbounded.
+fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value: Value, out: Output) Allocator.Error!bool {
+    if (!inlineResumeEnabled()) return false;
+    if (!persistResumeGateEnabled()) return false;
+    if (coroTop() == null) return false;
+    if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
+    if (persist_inline_resumes >= PERSIST_INLINE_BUDGET) return false;
+    persist_inline_resumes += 1;
+    inline_depth += 1;
+    defer inline_depth -= 1;
+    const a = self.allocator;
+    // Restore the coroutine's own scope for the step, then shrink back so a
+    // re-park's `finally` pop (skipped over the suspension) is re-captured and
+    // the caller's scope stack is left exactly as found.
+    const scope_depth = active_scope_stack.items.len;
+    defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
+    var state = pe.state;
+    const scope_base = activeScopeDepth();
+    restoreScopeDelta(pe.scope_delta);
+    coroStackAllocator().free(pe.scope_delta);
+    switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
+        .ok => {},
+        // A re-suspension re-parks onto the existing live pump (`park` targets
+        // `coroTop`), so it stays inline-resumable.
+        .err => |e| switch (e) {
+            .Suspended => |st| _ = try park(a, st, scope_base),
+            else => {},
+        },
+    }
+    return true;
+}
+
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
     if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} tid={d}\n", .{ slot, std.Thread.getCurrentId() });
     // A live cooperative driver on THIS thread still holding the slot?
@@ -2406,6 +2484,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             // Mailbox closed: the owner just exited and persisted its
             // parked coroutines strictly before closing.
             if (PersistedParked.take(slot)) |pe| {
+                if (try resumePersistedOnTop(self, pe, value, out)) return;
                 if (coroTop()) |top| {
                     try top.adoptPersisted(pe.state, pe.scope_delta, value);
                 } else {
@@ -2426,6 +2505,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
         // under a fresh pump — the cross-pump resume that lets a
         // coroutine continue on a different OS thread.
         if (PersistedParked.take(slot)) |pe| {
+            if (try resumePersistedOnTop(self, pe, value, out)) return;
             if (coroTop()) |top| {
                 try top.adoptPersisted(pe.state, pe.scope_delta, value);
                 return;
