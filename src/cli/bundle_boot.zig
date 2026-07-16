@@ -145,11 +145,10 @@ pub fn run(gpa: Allocator, argv: []const []const u8) u8 {
         return 1;
     }
 
-    var table = bf.decodeTable(gpa, bytes, &trailer) orelse {
+    const table = bf.decodeTable(gpa, bytes, &trailer) orelse {
         io.writeStderr("error: bundle section table is malformed; rebundle\n");
         return 1;
     };
-    _ = &table;
 
     const manifest_section = bf.findSection(&table, bf.section_names.MANIFEST) orelse {
         io.writeStderr("error: bundle carries no manifest; rebundle\n");
