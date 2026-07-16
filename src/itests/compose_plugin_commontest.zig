@@ -24,9 +24,11 @@ const runtime = @import("runtime");
 /// the plugin. A ratchet: bump it as fixes land, never down. Measured 841
 /// standalone (vs 445 for the implicit hook) with skip calculus + local
 /// composables and the 480s per-child cap. The persisted-resume throw fix
-/// converted the 18-class hang family: 926 measured, 1 class incomplete;
-/// the floor leaves saturation headroom like the implicit suite's does.
-const BASELINE: usize = 850;
+/// converted the 18-class hang family (926 measured); the typealias-receiver
+/// dispatch, event-loop actuals, pump mailbox-drain, and captured-counter
+/// fixes took it to 953. The floor leaves saturation headroom like the
+/// implicit suite's does.
+const BASELINE: usize = 940;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
