@@ -1034,6 +1034,9 @@ pub const Vm = struct {
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
     allocator: Allocator,
+    /// Process argv for the program's `main(args: Array<String>)`. Empty
+    /// under `klio run`; a bundle passes its argv[1..] through.
+    program_args: []const []const u8 = &.{},
 
     pub const new = run_mod.vmNew;
     pub const fromBuilt = run_mod.vmFromBuilt;

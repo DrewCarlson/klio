@@ -16,6 +16,7 @@ const StdlibFn = runtime.StdlibFn;
 
 // Per-area intrinsic submodules.
 pub const atomics = @import("implementations/atomics.zig");
+pub const bundle = @import("implementations/bundle.zig");
 pub const char = @import("implementations/char.zig");
 pub const collections = @import("implementations/collections.zig");
 pub const comparisons = @import("implementations/comparisons.zig");
@@ -96,6 +97,11 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.concurrent.Thread.currentThread", .f = concurrent.concurrent_thread_current },
     .{ .fqn = "kotlin.time.__klio_time_systemMillis", .f = time.time_system_millis },
     .{ .fqn = "kotlin.time.__klio_time_monotonicNanos", .f = time.time_monotonic_nanos },
+    .{ .fqn = "kotlin.system.exitProcess", .f = bundle.system_exit_process },
+    .{ .fqn = "klio.bundle.__klio_bundle_readBytes", .f = bundle.bundle_read_bytes },
+    .{ .fqn = "klio.bundle.__klio_bundle_readText", .f = bundle.bundle_read_text },
+    .{ .fqn = "klio.bundle.__klio_bundle_exists", .f = bundle.bundle_exists },
+    .{ .fqn = "klio.bundle.__klio_bundle_list", .f = bundle.bundle_list },
     .{ .fqn = "kotlin.io.print", .f = io.io_print },
     .{ .fqn = "kotlin.io.println", .f = io.io_println },
     .{ .fqn = "kotlin.io.readLine", .f = io.io_read_line },

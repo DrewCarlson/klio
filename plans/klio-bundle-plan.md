@@ -1,7 +1,46 @@
 # `klio bundle` — single-executable programs
 
-Status: design, ready to implement from M1. Supersedes the Rust-era
-"Phase 14 — Application packs" section of
+## Status
+
+Linux support is implemented and gated (`zig build itest-bundle_smoke`);
+user docs live in `docs/BUNDLE.md`.
+
+Landed:
+
+- Bundle core: `src/pack/bundle_format.zig` (trailer + section table +
+  `BundleManifest`, blake3 payload hash, 16 KiB mmap alignment),
+  `src/cli/bundle.zig` (assembly: full dep load, base-image cache reuse
+  or fresh bake, bundle-time program verification), `src/cli/bundle_boot.zig`
+  (probe in `cli.run` + main.zig profile guard; mmap → hash check →
+  manifest/version checks → image load → program-src extend → bindings
+  replay from the manifest — `~/.klio` is never consulted),
+  `KLIO_BUNDLE_INSPECT`. Float encode/decode in `image.zig` and the pack
+  codec normalized to explicit little-endian (with codec byte tests).
+- Program surface: argv[1..] → `main(args: Array<String>)` (also fixes
+  `klio run` binding Unit for the missing parameter),
+  `kotlin.system.exitProcess`, stdin passthrough, `--include` resources +
+  the `klio.bundle` pack (`kotlin-klio/klio-bundle`) with mmap-served
+  `Resources.readBytes/readText/exists/list`.
+- Manifest replay: known packages snapshot, platform binding FQNs, and
+  pack host bindings as `(fqn, host symbol)` pairs re-resolved at boot
+  (hard error on an unresolvable symbol).
+- Tests: `bundle_format` unit tests; itest `bundle_smoke` (hello +
+  serialization-with-feature byte-identical to `klio run` under an empty
+  HOME, argv, resources round-trip + missing-resource exception, exit
+  code, stdin, corruption refusal, inspect shape, double-bundle byte
+  determinism). `bundle_smoke` joined `scripts/gate.sh`.
+
+Deviations so far:
+
+- A program that redeclares a base name refuses to bundle with a clear
+  error (the run path's whole-program fallback has no image to embed);
+  the plan's silent-fallback language applies to the program-image bake
+  only.
+- `zstd` gained a `frameContentSize` helper for release shim artifacts
+  distributed as bare frames.
+
+The original design (all decisions committed) follows. It supersedes the
+Rust-era "Phase 14 — Application packs" section of
 [`PACK-DISTRIBUTION.md`](./PACK-DISTRIBUTION.md) (its locked decisions
 carry over and are restated here against the Zig codebase).
 

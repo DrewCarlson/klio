@@ -29,7 +29,15 @@ const stdlib_image = @import("stdlib_image.zig");
 
 const unimplemented = @import("unimplemented.zig");
 
-const VERSION = "0.1.0";
+const bundle = @import("bundle.zig");
+const bundle_boot = @import("bundle_boot.zig");
+
+pub const VERSION = "0.1.0";
+
+/// Whether the running executable carries a bundle payload (memoized
+/// probe). The exe entry point consults this before interpreting argv —
+/// bundle argv belongs entirely to the embedded program.
+pub const bundleModeActive = bundle_boot.bundleModeActive;
 
 const USAGE =
     \\klio — Experimental Kotlin interpreter
@@ -49,6 +57,9 @@ const USAGE =
     \\  check <file...> [options]  Type-check `.kt` files and emit diagnostics.
     \\  bake [file...] [options]   Bake the stdlib image cache (`klio run` does
     \\                             this automatically on first use).
+    \\  bundle <file|dir> [opts]   Package a program (with its baked
+    \\                             dependencies, resources, and rendering
+    \\                             backend) into one self-contained executable.
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
@@ -88,6 +99,13 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
     const argv = try io.processArgs(gpa, args_in);
     defer io.freeArgs(gpa, argv);
 
+    // A bundle payload appended to this executable takes over the whole
+    // process: argv[1..] belongs to the embedded program and klio
+    // subcommands are unreachable.
+    if (bundle_boot.bundleModeActive()) {
+        return bundle_boot.run(gpa, argv);
+    }
+
     // argv[0] is the program name.
     const args = argv[1..];
     if (args.len == 0) {
@@ -125,6 +143,8 @@ pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
         return runPackCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bake")) {
         return runBakeCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "bundle")) {
+        return bundle.runBundle(gpa, rest);
     }
 
     printErr(gpa, "error: unknown command `{s}`\n\n{s}", .{ cmd, USAGE });
@@ -680,6 +700,10 @@ test {
     std.testing.refAllDecls(unimplemented);
     std.testing.refAllDecls(stdlib_image);
     std.testing.refAllDecls(io);
+    std.testing.refAllDecls(bundle);
+    std.testing.refAllDecls(bundle_boot);
+    std.testing.refAllDecls(@import("stub_fetch.zig"));
+    std.testing.refAllDecls(project);
 }
 
 test "parseFormat maps known formats" {

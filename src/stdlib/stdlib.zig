@@ -28,6 +28,7 @@ const runtime = @import("runtime");
 pub const generated = @import("generated/mod.zig");
 pub const implementations = @import("implementations.zig");
 pub const pack_builder = @import("pack_builder.zig");
+pub const bundle_resources = @import("bundle_resources.zig");
 
 // Per-area documentation shims.
 pub const collections = @import("collections.zig");
@@ -392,6 +393,32 @@ var extra_known_packages: ExtraKnownPackages = .{};
 /// surface (e.g. `kotlinx.coroutines`). Idempotent.
 pub fn registerKnownPackage(package_path: []const u8) void {
     extra_known_packages.insert(package_path);
+}
+
+/// Snapshot of every package registered via `registerKnownPackage`, sorted
+/// for deterministic output. The bundler records this after the dependency
+/// load so bundle boot can replay the registrations without reading any
+/// pack. Caller owns the slice and its strings.
+pub fn knownPackagesSnapshot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]const []const u8 {
+    extra_known_packages.lock.lock();
+    defer extra_known_packages.lock.unlock();
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    if (extra_known_packages.set) |*s| {
+        var it = s.keyIterator();
+        while (it.next()) |k| {
+            try out.append(allocator, try allocator.dupe(u8, k.*));
+        }
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.toOwnedSlice(allocator);
 }
 
 pub const SymbolKind = enum {

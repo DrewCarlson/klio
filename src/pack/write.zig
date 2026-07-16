@@ -257,7 +257,13 @@ fn encodeValue(comptime T: type, allocator: Allocator, out: *std.ArrayList(u8), 
     switch (info) {
         .bool => try out.append(allocator, if (value) 1 else 0),
         .int => try encodeInt(T, allocator, out, value),
-        .float => try out.appendSlice(allocator, &std.mem.toBytes(value)),
+        // Floats are written as their IEEE-754 bit pattern in little-endian
+        // byte order, so the encoded stream is identical across hosts.
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const raw: Bits = @bitCast(value);
+            try out.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(Bits, raw)));
+        },
         .@"enum" => |e| try encodeVarint(allocator, out, @as(u64, @intCast(@as(e.tag_type, @intFromEnum(value))))),
         .optional => |o| {
             if (value) |v| {
@@ -339,6 +345,19 @@ fn encodeVarint(allocator: Allocator, out: *std.ArrayList(u8), value: u64) Alloc
 fn isPackedFlags(comptime T: type) bool {
     const s = @typeInfo(T).@"struct";
     return s.layout == .@"packed" and s.backing_integer != null;
+}
+
+test "float encodes as little-endian IEEE-754 bits" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    // 1.5f64 = 0x3FF8000000000000; little-endian byte order on the wire.
+    try encodeValue(f64, a, &out, 1.5);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, out.items);
+    out.clearRetainingCapacity();
+    // -2.25f32 = 0xC0100000.
+    try encodeValue(f32, a, &out, -2.25);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0x10, 0xc0 }, out.items);
 }
 
 test "varint matches postcard LEB128" {
