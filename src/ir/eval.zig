@@ -4260,6 +4260,23 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                         orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
                         v = gv;
                     } else {
+                        // A top-level `val` declared with only a custom getter
+                        // has no global binding; re-run its 0-arg getter, as
+                        // the plain LoadGlobal tail does — a receiver-context
+                        // read of `currentRecomposeScope` must resolve exactly
+                        // like a top-level one.
+                        if (comptime @hasDecl(H, "callFunc")) {
+                            if (frame.module.registry.top_level_prop_getters.get(bare_name)) |getter_fid| {
+                                switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
+                                    .ok => |gv2| {
+                                        orAudit("LoadFromThisOrGlobal", bare_name, "toplevel_getter", -1, null);
+                                        try frame.write(lt.dst, gv2);
+                                        return .cont;
+                                    },
+                                    .err => |e| return raiseStep(frame, e),
+                                }
+                            }
+                        }
                         const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                         if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
                             if (std.mem.eql(u8, w, bare_name)) {
