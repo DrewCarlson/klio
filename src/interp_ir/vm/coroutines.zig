@@ -334,6 +334,20 @@ const PersistedParked = struct {
     }
 
     fn put(slot: i64, state: SuspendState, scope_delta: []Value) Allocator.Error!void {
+        if (pumpDiagEnabled()) {
+            std.debug.print("[tok] persist slot={d} frames={d}:", .{ slot, state.frames.items.len });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            var seg = state.tails;
+            while (seg) |t| : (seg = t.next) {
+                std.debug.print(" |tail", .{});
+                var i = t.head;
+                while (i < t.frames.items.len) : (i += 1) {
+                    const fr2 = &t.frames.items[i];
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                }
+            }
+            std.debug.print("\n", .{});
+        }
         mutex.lock();
         defer mutex.unlock();
         if (map == null) {
@@ -862,6 +876,20 @@ pub const CooperativeInterceptor = struct {
         self.next_token += 1;
         const token = self.next_token;
         state.token = token;
+        if (pumpDiagEnabled()) {
+            std.debug.print("[tok] adopt tok={d} frames={d}:", .{ token, state.frames.items.len });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            var seg = state.tails;
+            while (seg) |t| : (seg = t.next) {
+                std.debug.print(" |tail", .{});
+                var i = t.head;
+                while (i < t.frames.items.len) : (i += 1) {
+                    const fr2 = &t.frames.items[i];
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                }
+            }
+            std.debug.print("\n", .{});
+        }
         try self.parked.put(token, .{ .state = state, .wake_at = INDEFINITE, .scope_delta = scope_delta });
         try self.token_resume_value.put(token, value);
         try self.ready.append(self.allocator, token);
@@ -1644,6 +1672,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
                 g.get().cont = null;
                 g.deinit();
             }
+ir.eval.resume_route = "yield-rotate";
             r = try intrinsic_host.resumeRaw(self, old, .Unit, out);
             // `resumeContinuation` freed `old.frames`; free the box itself.
             a.destroy(old);
@@ -1738,11 +1767,32 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
     const tok = try pump.interceptSuspend(value, delta);
     if (pumpDiagEnabled()) {
         const g = pump.parked.getPtr(tok);
-        std.debug.print("[tok] park tok={d} wake={?d} frames={d}\n", .{
+        std.debug.print("[tok] park tok={d} wake={?d} frames={d}:", .{
             tok,
             if (g) |e| e.wake_at else null,
             value.frames.items.len,
         });
+        for (value.frames.items) |*fr| {
+            var printed = false;
+            if (fr.module) |mm| {
+                if (mm.funcById(fr.func)) |f| {
+                    const loc = ir.eval.funcFirstLoc(f);
+                    std.debug.print(" #{d}({s}:{d})@{d}:{d}", .{ fr.func.int(), loc.path, loc.line, fr.block.int(), fr.inst_idx });
+                    printed = true;
+                }
+            }
+            if (!printed) std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+        }
+        var seg = value.tails;
+        while (seg) |t| : (seg = t.next) {
+            std.debug.print(" |tail", .{});
+            var i = t.head;
+            while (i < t.frames.items.len) : (i += 1) {
+                const fr = &t.frames.items[i];
+                std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            }
+        }
+        std.debug.print("\n", .{});
     }
     return tok;
 }
@@ -1866,6 +1916,7 @@ pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value
     // re-captures the restored delta).
     const root_scope_base = activeScopeDepth();
     restoreScopeDelta(scope_delta);
+ir.eval.resume_route = "driveResumed";
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
@@ -2033,6 +2084,7 @@ fn pumpLoop(
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
+ir.eval.resume_route = "pump-ready";
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => |v| {
                         if (root_token.* != null and root_token.*.? == tok) {
@@ -2531,6 +2583,7 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
         const scope_base = activeScopeDepth();
         restoreScopeDelta(entry.scope_delta);
         coroStackAllocator().free(entry.scope_delta);
+ir.eval.resume_route = "inline-claim";
         switch (try intrinsic_host.resumeRaw(self, &entry.state, value, out)) {
             .ok => {},
             .err => |e| switch (e) {
@@ -2612,6 +2665,7 @@ fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value
     const scope_base = activeScopeDepth();
     restoreScopeDelta(pe.scope_delta);
     coroStackAllocator().free(pe.scope_delta);
+    ir.eval.resume_route = "persisted-on-top";
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => {},
         // A re-suspension re-parks onto the existing live pump (`park` targets
@@ -2740,6 +2794,7 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
+                ir.eval.resume_route = "drain-ready";
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => {},
                     .err => |e| switch (e) {

@@ -516,6 +516,24 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         supertype_paths[i] = t.qualified_path;
     }
 
+    // Init blocks, with each block's member-index position converted to the
+    // body-property index it runs before (the ClassDef convention), so
+    // construction interleaves them with property initializers in
+    // declaration order. The blocks themselves execute through the
+    // `$init$block$<idx>` anon thunks registered alongside the methods.
+    const ib_blocks = try allocator.alloc(FF(ast.Block), class.init_blocks.len);
+    const ib_positions = try allocator.alloc(usize, class.init_blocks.len);
+    for (class.init_blocks, 0..) |*blk, idx| {
+        ib_blocks[idx] = FF(ast.Block).fromPtr(blk);
+        const member_pos = if (idx < class.init_block_positions.len) class.init_block_positions[idx] else class.members.len;
+        const upto = @min(member_pos, class.members.len);
+        var prop_pos: usize = 0;
+        for (class.members[0..upto]) |*m| {
+            if (m.* == .Property) prop_pos += 1;
+        }
+        ib_positions[idx] = prop_pos;
+    }
+
     const env = try ObjRef(Env).init(allocator, Env.init(allocator));
     return ObjRef(ClassDef).init(allocator, .{
         .name = class.name.name,
@@ -524,8 +542,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(allocator),
-        .init_blocks = &.{},
-        .init_block_property_positions = &.{},
+        .init_blocks = ib_blocks,
+        .init_block_property_positions = ib_positions,
         .is_data = class.is_data,
         .is_value = class.is_value,
         .is_object = false,
@@ -628,6 +646,23 @@ fn lowerAndRegisterMethods(
             else => {},
         }
     }
+    // `init { … }` blocks lower as 0-arg thunks over `this`, registered under
+    // `$init$block$<idx>` — the same shape the anonymous-object materializer
+    // uses — so construction can run them (with the class's captured cells
+    // bound) interleaved with the property initializers.
+    for (class.init_blocks, 0..) |*blk, idx| {
+        const thunk_name: ast.Ident = .{
+            .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
+            .span = blk.span,
+        };
+        const thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+        const caps = try allocator.dupe(NameValue, capture_pairs);
+        const tbl = self.anon_methods.borrowMut();
+        defer tbl.deinit();
+        try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = caps });
+    }
 }
 
 /// Collect a local class's own member names (primary-ctor properties, body
@@ -719,6 +754,15 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             if (tbl.get().getPtr(key)) |entry| {
                 entry.captures = capture_pairs;
             }
+        }
+    }
+    // The `$init$block$<idx>` thunks capture the same outer env: an
+    // `init { count++ }` writes through the enclosing fn's boxed cell.
+    for (class.init_blocks, 0..) |_, idx| {
+        const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
+        const key = try anonKey(allocator, class.name.name, nm);
+        if (tbl.get().getPtr(key)) |entry| {
+            entry.captures = capture_pairs;
         }
     }
     return .ok;

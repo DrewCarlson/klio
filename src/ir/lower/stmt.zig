@@ -187,8 +187,14 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markBroadCollectionLocal(p.name.name);
         }
     } else if (p.init) |*e| {
-        if (e.* == .Call) try b.setLocalInitExpr(p.name.name, e);
-        if (e.* == .ObjectExpr) try b.markObjectInitLocal(p.name.name);
+        // Literal initializers are recorded too: a call site uses them as
+        // definite NON-callable evidence (`var nodeIndex = 0` beside
+        // `fun nodeIndex(...)` — the call resolves to the function).
+        switch (e.*) {
+            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
+            .ObjectExpr => try b.markObjectInitLocal(p.name.name),
+            else => {},
+        }
     }
     if (b.isBoxed(p.name.name)) {
         // Captured `var` — box into a shared cell so writes
@@ -285,6 +291,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 .param_names = ov_names,
                 .n_required = n_required,
                 .has_vararg = has_vararg,
+                .is_ext = f.receiver_type != null,
             });
             break :mangled_blk home;
         };

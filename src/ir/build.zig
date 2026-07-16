@@ -282,6 +282,9 @@ pub const LocalFnOverload = struct {
     /// Parameters without defaults — a call must supply at least this many.
     n_required: usize,
     has_vararg: bool,
+    /// Declared with an extension receiver (`fun R.f(...)`): applicable
+    /// only where a receiver context exists, and the call prepends it.
+    is_ext: bool = false,
 };
 
 /// The split of a param's contextual function type `context(C..) (A..) -> R`

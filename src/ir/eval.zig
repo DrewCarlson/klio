@@ -555,6 +555,34 @@ pub fn dumpFrameChainForDiag() void {
     dumpFrameChainForDiagAlways();
 }
 
+/// Delivery-route tag for KLIO_RESUME_TRACE: which host path drove the
+/// current resume (park slot, persisted take, adopt, inline claim...).
+pub threadlocal var resume_route: []const u8 = "?";
+
+/// Declaring location of a func for the resume diagnostics.
+pub const FuncLoc = struct { path: []const u8, line: u32 };
+
+/// Declaring location of a func for the resume diagnostics: the span of
+/// its first `Trace` instruction, resolved through the active source map.
+pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
+    const fallback: FuncLoc = .{ .path = "?", .line = 0 };
+    if (func.blocks.len == 0) return fallback;
+    for (func.blocks) |*b| {
+        for (b.insts) |*inst| {
+            if (inst.* == .Trace) {
+                const sp = inst.Trace.span;
+                if (span.active_map) |sm| {
+                    if (sm.getChecked(sp.file)) |sf| {
+                        return .{ .path = sf.path, .line = sf.lineCol(sp.start).line };
+                    }
+                }
+                return fallback;
+            }
+        }
+    }
+    return fallback;
+}
+
 /// Ungated frame-chain dump for name-filtered diagnostics that gate at
 /// their own call site (e.g. `KLIO_MISS_TRACE`).
 pub fn dumpFrameChainForDiagAlways() void {
@@ -1659,6 +1687,7 @@ pub fn resumeContinuation(
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
+    _ = &resume_route;
     while (true) {
         if (head >= frames.items.len) {
             // Promote the next inherited segment.
@@ -1678,6 +1707,14 @@ pub fn resumeContinuation(
         const snap_module = snap.module;
         const m: *const Module = snap_module orelse module;
         const func = m.funcById(snap.func).?;
+        // KLIO_RESUME_TRACE: name every frame a resume drive re-runs — the
+        // instrument that finds a tail executing twice in one unwind. The
+        // route tag says which delivery path drove it (set by the host's
+        // resumeRaw call sites).
+        if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+            const loc = funcFirstLoc(func);
+            std.debug.print("[resume-frame] {s}#{d} ({s}:{d}) at={d}:{d} throw={} via={s} id={x}\n", .{ func.name, func.id.int(), loc.path, loc.line, snap.block.int(), snap.inst_idx, pending_throw_from_inner != null, resume_route, @intFromPtr(snap.regs.ptr) });
+        }
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;
@@ -3775,7 +3812,17 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
         defer allocator.free(names);
         const name_str = constStr(frame.module, cmv.name) orelse
             return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
-        const fb = frame.read(cmv.fallback);
+        var fb = frame.read(cmv.fallback);
+        // A boxed capture holds the callable in a cell (a captured local fn's
+        // shared binding); classify and invoke the CONTENT — the sibling
+        // CallValueOrMember arm unwraps identically. Without this a captured
+        // `fun MockViewValidator.Composition()` fallback read as `.Cell`,
+        // was judged non-invocable, and the member miss surfaced.
+        if (fb == .Cell) {
+            const cg = fb.Cell.borrow();
+            fb = cg.get().*;
+            cg.deinit();
+        }
         if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
             const rcls: []const u8 = if (recv == .Instance) blk: {
                 const g = recv.Instance.borrow();
