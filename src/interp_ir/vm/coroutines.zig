@@ -1144,6 +1144,25 @@ pub const CooperativeInterceptor = struct {
         return if (due.items.len != 0) .fired else .none;
     }
 
+    /// Arm every DUE Wall-clock deadline (already passed) into the ready
+    /// queue without waiting for an idle round. Timers otherwise fire only
+    /// when NO coroutine is ready, so a yield-livelocked pair starves
+    /// `withTimeout` forever — a real event loop interleaves its timer
+    /// queue with its run queue. Queued entries leave timer-land
+    /// (`wake_at` cleared) so successive rounds cannot double-queue them.
+    pub fn armDueWallTimers(self: *CooperativeInterceptor) Allocator.Error!void {
+        if (self.mode != .Wall) return;
+        const now = self.nowMillis();
+        var it = self.parked.iterator();
+        while (it.next()) |e| {
+            const w = e.value_ptr.wake_at;
+            if (w != INDEFINITE and w <= now) {
+                try self.ready.append(self.allocator, e.key_ptr.*);
+                e.value_ptr.wake_at = INDEFINITE;
+            }
+        }
+    }
+
     /// Bool-returning shim over `advanceTimeGated`: progress was made when
     /// a timer fired. A `.blocked` outcome reports no progress (the caller
     /// must keep draining its mailbox), preserving the historical
@@ -1933,7 +1952,11 @@ fn pumpLoop(
             continue;
         }
 
-        // 2. Resume a ready coroutine, if any.
+        // 2. Resume a ready coroutine, if any — but first fire any DUE
+        //    Wall deadlines, or a yield-livelocked coroutine pair starves
+        //    `withTimeout` (the runTest watchdog never fires and a livelock
+        //    reads as an unkillable hang instead of a timeout failure).
+        try (coroTop().?).armDueWallTimers();
         inline_turn_resumes = 0;
         persist_inline_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
