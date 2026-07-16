@@ -41,6 +41,9 @@ const ROOTS = [_][]const u8{
     UPSTREAM ++ "/runtime-test-utils/src/commonMain/kotlin",
     UPSTREAM ++ "/runtime/src/commonTest/kotlin",
     UPSTREAM ++ "/runtime/src/nonEmulatorCommonTest/kotlin",
+    // klio-owned actuals for the test sources' platform expects
+    // (`wrapRunTest`), following the stdlib_commontest_actuals pattern.
+    "tests/compose_commontest_actuals",
 };
 const SCRATCH_HOME = "/tmp/klio_itest_compose_runtime_home";
 
