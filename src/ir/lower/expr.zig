@@ -4755,7 +4755,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // the classifier arms, and a local `fun Test(a, b)` lost to an
             // imported `kotlin.test.Test` inside `r.go { Test(1, 2) }`.
             // Two or more siblings select through the mangled binding above.
-            if (b.localFnDecls(bare) != null and b.resolve(bare) == null and b.knowsOuter(bare)) {
+            // Gated on an actual classifier collision: a captured local fn
+            // with NO same-named class keeps its established route (its
+            // value binding is not always capturable — a `fun emit` inside
+            // a runtime-lowered lambda resolves through the scoped-global
+            // layers, not a capture slot).
+            if (b.localFnDecls(bare) != null and b.resolve(bare) == null and b.knowsOuter(bare) and
+                b.module.classIdIndexed(bare, b.self_package, callee.Path.segments[0].span.file) != null)
+            {
                 const cap = try resolveCapture(b, bare);
                 const callee_r = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = callee_r, .cell = cap } });
