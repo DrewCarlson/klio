@@ -59,6 +59,7 @@ nav:
     - Hello, world: getting-started/hello-world.md
     - CLI Tour: getting-started/cli.md
     - Testing Your Code: testing.md
+    - Bundling Programs: BUNDLE.md
   - Architecture:
     - Pipeline Overview: architecture/pipeline.md
     - The Vm: architecture/interpreter.md
