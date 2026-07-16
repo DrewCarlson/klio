@@ -23,15 +23,19 @@ const runtime = @import("runtime");
 /// Minimum number of upstream Compose runtime test cases that must pass under
 /// the plugin. A ratchet: bump it as fixes land, never down. Measured 841
 /// standalone (vs 445 for the implicit hook) with skip calculus + local
-/// composables and the 480s per-child cap, 18 classes incomplete; the floor
-/// leaves saturation headroom like the implicit suite's does.
-const BASELINE: usize = 700;
+/// composables and the 480s per-child cap. The persisted-resume throw fix
+/// converted the 18-class hang family: 926 measured, 1 class incomplete;
+/// the floor leaves saturation headroom like the implicit suite's does.
+const BASELINE: usize = 850;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
     UPSTREAM ++ "/runtime-test-utils/src/commonMain/kotlin",
     UPSTREAM ++ "/runtime/src/commonTest/kotlin",
     UPSTREAM ++ "/runtime/src/nonEmulatorCommonTest/kotlin",
+    // klio-owned actuals for the test sources' platform expects
+    // (`wrapRunTest`), following the stdlib_commontest_actuals pattern.
+    "tests/compose_commontest_actuals",
 };
 const SCRATCH_HOME = "/tmp/klio_itest_compose_plugin_home";
 
@@ -56,6 +60,10 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
+    // Cap runTest's default 60s real-time timeout: a test that will time out
+    // should fail in 10s, not hold its class's child (and the pump's job
+    // tree) for a minute per occurrence.
+    try map.put("kotlinx_coroutines_test_default_timeout", "10s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
     return map;
 }

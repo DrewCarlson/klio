@@ -19,7 +19,11 @@ internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 internal fun __kxco_newSlot(): Long = 0L
 internal fun __kxco_parkSlot(slot: Long) {}
+internal fun __kxco_armSlot(slot: Long) {}
 internal fun __kxco_resumeSlot(slot: Long) {}
+internal fun __kxco_systemProperty(name: String): String? = null
+internal fun __kxco_pushScope(scope: Any?) {}
+internal fun __kxco_popScope() {}
 internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 
 // Host intrinsic: remove a channel waiter parked on `slot` and resume its
@@ -27,6 +31,11 @@ internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 // native channel `send`/`receive` park calls `__kxco_chanArmCancel` below to
 // arm this against the active coroutine's Job.
 internal fun __kxco_chanCancelWaiter(channel: Any?, slot: Long, cause: Throwable?) {}
+
+// Diagnostic (KLIO_CHAN_DIAG): the arm handler was INVOKED for `slot`,
+// with or without a cause — discriminates a consumed one-shot from a
+// skipped/removed node when a cancellation never reaches a parked waiter.
+internal fun __kxco_chanDiag(slot: Long, cancelled: Boolean) {}
 
 // Host intrinsic: bind the cancellation-watcher continuation to a parked
 // channel `slot` so a normal value delivery on that slot can resume the
@@ -61,6 +70,7 @@ internal fun __kxco_chanArmCancel(scope: Any?, channel: Any?, slot: Long) {
     val cs = scope as? CoroutineScope ?: return
     val job = cs.coroutineContext[Job] ?: return
     val handle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        __kxco_chanDiag(slot, cause != null)
         if (cause != null) __kxco_chanCancelWaiter(channel, slot, cause)
     }
     __kxco_chanBindHandle(slot, handle)
@@ -132,7 +142,22 @@ private class KlioBlockingCoroutine<T>(
 
 internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
-        __kxco_spawn { block.run() }
+        // The dispatched segment runs with ITS coroutine as the active
+        // scope (the startBlock bracket for undispatched bodies): anything
+        // derived from the ambient scope — channel-cancellation arming,
+        // `coroutineContext` — must name THIS coroutine, not whatever a
+        // sibling activation leaked. The pop is skipped over a suspension
+        // unwind (the delta capture owns the entry then) and runs when the
+        // segment completes.
+        val job = context[Job]
+        __kxco_spawn {
+            if (job != null) __kxco_pushScope(job)
+            try {
+                block.run()
+            } finally {
+                if (job != null) __kxco_popScope()
+            }
+        }
     }
 
     override fun scheduleResumeAfterDelay(
@@ -157,8 +182,13 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -192,8 +222,13 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -226,8 +261,13 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
     ): DisposableHandle {
         val gate = TimeoutGate(block)
         __kxco_spawn {
-            __kxco_delayMillis(timeMillis)
-            gate.fire()
+            if (!gate.isDisposed()) {
+                val slot = __kxco_newSlot()
+                gate.bindSlot(slot)
+                __kxco_armSlot(slot)
+                __kxco_delayMillis(timeMillis)
+                gate.fire()
+            }
         }
         return gate
     }
@@ -255,10 +295,20 @@ public actual object Dispatchers {
 // `withTimeout` disposes it when the body completes in time.
 private class TimeoutGate(private val block: Runnable) : DisposableHandle {
     private var cancelled = false
+    private var slot: Long = -1L
+    fun isDisposed(): Boolean = cancelled
+    fun bindSlot(s: Long) {
+        slot = s
+    }
     fun fire() {
         if (!cancelled) block.run()
     }
     override fun dispose() {
         cancelled = true
+        // Wake the parked waiter NOW. Its timed park is bound to the slot
+        // (armed before the delay), so this preempts the deadline; without
+        // it the waiter is a zombie child holding the enclosing job tree —
+        // and the pump — for the timeout's full real duration.
+        if (slot >= 0L) __kxco_resumeSlot(slot)
     }
 }

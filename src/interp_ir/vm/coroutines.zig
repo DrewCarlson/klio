@@ -68,6 +68,8 @@ var wall_delay_buckets = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)}
 fn countWallDelay(millis: i64) void {
     const idx: usize = if (millis <= 1) 0 else if (millis <= 20) 1 else if (millis <= 200) 2 else if (millis <= 2000) 3 else 4;
     _ = wall_delay_buckets[idx].fetchAdd(1, .monotonic);
+    if (millis > 2000 and streakDiagOn())
+        std.debug.print("[wall-timer] registered {d}ms\n", .{millis});
 }
 pub fn dumpSleepCounts() void {
     std.debug.print("[pump-sleep] timer_wall={d} wakeup_pending={d} barrier_yield={d} root_parked={d} | wall delays <=1ms={d} <=20ms={d} <=200ms={d} <=2s={d} >2s={d}\n", .{
@@ -824,7 +826,11 @@ pub const CooperativeInterceptor = struct {
             INDEFINITE
         else
             self.nowMillis() + state.wake_in_millis;
-        if (self.mode == .Wall and state.wake_in_millis > 0) countWallDelay(state.wake_in_millis);
+        if (self.mode == .Wall and state.wake_in_millis > 0) {
+            countWallDelay(state.wake_in_millis);
+            if (state.wake_in_millis > 2000 and streakDiagOn())
+                std.debug.print("[wall-timer] slot_bound={}\n", .{self.pending_slot != null});
+        }
         if (state.wake_in_millis == 0) {
             try self.ready.append(self.allocator, token);
         }
@@ -967,7 +973,11 @@ pub const CooperativeInterceptor = struct {
 
     /// Seam: take the parked activation for a token.
     pub fn takeParked(self: *CooperativeInterceptor, token: u64) ?ParkedEntry {
-        if (self.parked.fetchRemove(token)) |kv| return kv.value;
+        if (self.parked.fetchRemove(token)) |kv| {
+            if (pumpDiagEnabled()) std.debug.print("[tok] take tok={d}\n", .{token});
+            return kv.value;
+        }
+        if (pumpDiagEnabled()) std.debug.print("[tok] take tok={d} MISSING\n", .{token});
         return null;
     }
 
@@ -983,6 +993,12 @@ pub const CooperativeInterceptor = struct {
         /// that may post a cross-pump resume. The caller must keep
         /// draining its mailbox and retry rather than fire or exit.
         blocked,
+        /// A Wall timer is pending but not yet due (one sleep slice was
+        /// taken). The caller must drain its mailbox before retrying — a
+        /// resume posted from this thread (a cancellation handler firing
+        /// inside an activation, before its park bound the slot) would
+        /// otherwise wait out the whole timer.
+        waiting,
     };
 
     /// Publish `floor` to the global barrier only when it differs from the
@@ -1096,14 +1112,15 @@ pub const CooperativeInterceptor = struct {
                     // mailbox between slices (a resume can preempt the
                     // timer — a cancellation arriving from another pump
                     // must not wait out a parked `delay`) and must keep
-                    // observing run-boundary abandonment. Returning
-                    // `true` reports the pending timer as progress; the
-                    // pump comes back next round.
+                    // observing run-boundary abandonment. `.waiting`
+                    // reports the pending timer as progress while sending
+                    // the pump through its mailbox drain before the next
+                    // round.
                     countSleep(.timer_wall);
                     wall_streak += 1;
                     if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null)
                         sleepMillis(@min(@as(u64, @intCast(wait)), 1));
-                    if (self.nowMillis() < t) return .fired;
+                    if (self.nowMillis() < t) return .waiting;
                     endStreak("timer-deadline-reached");
                 }
             },
@@ -1136,6 +1153,25 @@ pub const CooperativeInterceptor = struct {
             try self.ready.append(self.allocator, d.tok);
         }
         return if (due.items.len != 0) .fired else .none;
+    }
+
+    /// Arm every DUE Wall-clock deadline (already passed) into the ready
+    /// queue without waiting for an idle round. Timers otherwise fire only
+    /// when NO coroutine is ready, so a yield-livelocked pair starves
+    /// `withTimeout` forever — a real event loop interleaves its timer
+    /// queue with its run queue. Queued entries leave timer-land
+    /// (`wake_at` cleared) so successive rounds cannot double-queue them.
+    pub fn armDueWallTimers(self: *CooperativeInterceptor) Allocator.Error!void {
+        if (self.mode != .Wall) return;
+        const now = self.nowMillis();
+        var it = self.parked.iterator();
+        while (it.next()) |e| {
+            const w = e.value_ptr.wake_at;
+            if (w != INDEFINITE and w <= now) {
+                try self.ready.append(self.allocator, e.key_ptr.*);
+                e.value_ptr.wake_at = INDEFINITE;
+            }
+        }
     }
 
     /// Bool-returning shim over `advanceTimeGated`: progress was made when
@@ -1349,8 +1385,19 @@ fn activeScopeDepth() usize {
 /// own (cancellation over-delivery). Returning them to the ParkedEntry
 /// keeps the live stack reflecting only running activations. Caller owns
 /// the returned slice (page-allocator). Empty when nothing was pushed.
+fn scopeDiagOn() bool {
+    return runtime.getenvSlice("KLIO_SCOPE_DIAG") != null;
+}
+fn scopeIdent(v: *const Value) usize {
+    return if (v.* == .Instance) v.Instance.identity() else 0;
+}
 fn captureScopeDelta(base: usize) []Value {
     const n = active_scope_stack.items.len;
+    if (scopeDiagOn() and n > base) {
+        std.debug.print("[scope] capture base={d} n={d}:", .{ base, n });
+        for (active_scope_stack.items[base..n]) |*v| std.debug.print(" {x}", .{scopeIdent(v)});
+        std.debug.print("\n", .{});
+    }
     if (n <= base) return &.{};
     const delta = coroStackAllocator().dupe(Value, active_scope_stack.items[base..n]) catch return &.{};
     active_scope_stack.shrinkRetainingCapacity(base);
@@ -1363,6 +1410,11 @@ fn captureScopeDelta(base: usize) []Value {
 /// `__klio_co_popScope` (from `startBlock`'s `finally`) balances these
 /// pushes when it finally completes; a re-suspension re-captures them.
 fn restoreScopeDelta(delta: []const Value) void {
+    if (scopeDiagOn() and delta.len != 0) {
+        std.debug.print("[scope] restore depth={d}:", .{active_scope_stack.items.len});
+        for (delta) |*v| std.debug.print(" {x}", .{scopeIdent(v)});
+        std.debug.print("\n", .{});
+    }
     for (delta) |s| active_scope_stack.append(coroStackAllocator(), s) catch {};
 }
 
@@ -1371,19 +1423,41 @@ fn restoreScopeDelta(delta: []const Value) void {
 /// intrinsic resolves to it. Only `Instance` scopes are pushed.
 const ActiveScopeGuard = struct {
     pushed: bool,
+    ident: usize = 0,
 
     fn enter(scope: *const Value) ActiveScopeGuard {
         if (scope.* == .Instance) {
+            if (scopeDiagOn())
+                std.debug.print("[scope] guard-enter depth={d} id={x}\n", .{ active_scope_stack.items.len, scopeIdent(scope) });
             active_scope_stack.append(coroStackAllocator(), scope.*) catch return .{ .pushed = false };
-            return .{ .pushed = true };
+            return .{ .pushed = true, .ident = scopeIdent(scope) };
         }
         return .{ .pushed = false };
     }
 
     fn leave(self: ActiveScopeGuard) void {
-        if (self.pushed and active_scope_stack.items.len != 0) {
-            _ = active_scope_stack.pop();
+        if (!self.pushed) return;
+        // Remove OUR OWN entry, topmost-first by identity — never a blind
+        // top pop. Activations interleave on this stack: the driven body's
+        // own `startBlock` pushes (or a nested drive's guard) can sit above
+        // this guard's entry when it unwinds, and popping the top removes
+        // THEIRS while leaking OURS — a later positional delta capture then
+        // adopts the leaked scope as another coroutine's own, and every
+        // resume of that coroutine restores the wrong scope (a channel
+        // cancellation armed through it binds to the wrong Job). If our
+        // entry is gone already (captured into a delta), remove nothing.
+        var i: usize = active_scope_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (scopeIdent(&active_scope_stack.items[i]) == self.ident) {
+                if (scopeDiagOn())
+                    std.debug.print("[scope] guard-leave idx={d} id={x}\n", .{ i, self.ident });
+                _ = active_scope_stack.orderedRemove(i);
+                return;
+            }
         }
+        if (scopeDiagOn())
+            std.debug.print("[scope] guard-leave id={x} (already captured)\n", .{self.ident});
     }
 };
 
@@ -1661,7 +1735,16 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
     const value = st.*;
     allocator.destroy(st);
     const delta = captureScopeDelta(scope_base);
-    return pump.interceptSuspend(value, delta);
+    const tok = try pump.interceptSuspend(value, delta);
+    if (pumpDiagEnabled()) {
+        const g = pump.parked.getPtr(tok);
+        std.debug.print("[tok] park tok={d} wake={?d} frames={d}\n", .{
+            tok,
+            if (g) |e| e.wake_at else null,
+            value.frames.items.len,
+        });
+    }
+    return tok;
 }
 
 /// Layer 2 — the default interceptor's dispatch loop (`drive_run_blocking`).
@@ -1848,12 +1931,15 @@ fn pumpLoop(
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 var k: usize = 0;
-                while (k < st.frames.items.len and k < 9) : (k += 1) {
+                while (k < st.frames.items.len and k < 24) : (k += 1) {
                     const snap = st.frames.items[k];
                     const m: *const ir.Module = snap.module orelse mg.get();
                     const f = m.funcById(snap.func);
                     const nm = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "?";
-                    std.debug.print(" {s}", .{nm});
+                    // The declaration file disambiguates same-named frames
+                    // (`<lambda>`): which source declared the parked caller.
+                    const file: i64 = if (m.decl_span.get(snap.func.int())) |ds| @intCast(ds.file.int()) else -1;
+                    std.debug.print(" {s}#{d}@f{d}", .{ nm, snap.func.int(), file });
                 }
                 std.debug.print("\n", .{});
             }
@@ -1927,7 +2013,11 @@ fn pumpLoop(
             continue;
         }
 
-        // 2. Resume a ready coroutine, if any.
+        // 2. Resume a ready coroutine, if any — but first fire any DUE
+        //    Wall deadlines, or a yield-livelocked coroutine pair starves
+        //    `withTimeout` (the runTest watchdog never fires and a livelock
+        //    reads as an unkillable hang instead of a timeout failure).
+        try (coroTop().?).armDueWallTimers();
         inline_turn_resumes = 0;
         persist_inline_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
@@ -2029,6 +2119,11 @@ fn pumpLoop(
             continue;
         }
 
+        // 3c'. A Wall timer is pending but not due (advanceTimeGated took
+        //      its sleep slice). The mailbox above is drained; retry.
+        //      Never break or park the root here — the timer is real work.
+        if (advance == .waiting) continue;
+
         // 3d. A blocking root must not return while its root coroutine is
         //     still parked. For `runBlocking` the root parks until its
         //     coroutine's job completes, and the job machinery — not a
@@ -2106,9 +2201,20 @@ pub fn pumpDiagEnabled() bool {
 /// Gated on `KLIO_PUMP_DIAG`; a diagnosis aid, never load-bearing.
 fn diagStalledPump(top: *CooperativeInterceptor, root_tok: ?u64) void {
     if (!pumpDiagEnabled()) return;
-    std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d}\n", .{
-        root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len,
+    std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d} pumps={d}\n", .{
+        root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len, coro_stack.items.len,
     });
+    // EVERY interceptor on this thread: a cancelled-but-uncompleted
+    // coroutine's body can be parked in a NESTED pump the top-only view
+    // never shows.
+    for (coro_stack.items, 0..) |*drv, di| {
+        var pit = drv.parked.iterator();
+        while (pit.next()) |e| {
+            std.debug.print("[PUMP] pump[{d}] parked tok={d} wake={d} frames={d}\n", .{
+                di, e.key_ptr.*, e.value_ptr.wake_at, e.value_ptr.state.frames.items.len,
+            });
+        }
+    }
     var it = top.slot_to_token.iterator();
     while (it.next()) |e| {
         std.debug.print("[PUMP] slot={d} -> tok={d}\n", .{ e.key_ptr.*, e.value_ptr.* });
@@ -2138,7 +2244,9 @@ fn drainWakeupInto(allocator: Allocator, wakeup: *const ObjRef(DriverWakeup), to
     };
     defer allocator.free(drained);
     for (drained) |entry| {
-        _ = try top.resumeSlotValue(entry.slot, entry.value);
+        const routed = try top.resumeSlotValue(entry.slot, entry.value);
+        if (pumpDiagEnabled())
+            std.debug.print("[PUMP] drain slot={d} routed={}\n", .{ entry.slot, routed });
     }
     return drained.len != 0;
 }
@@ -2278,10 +2386,18 @@ pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
 /// Kotlin side (the pop is skipped over a suspension unwind and runs
 /// when the resumed body finally completes).
 pub fn coroutinePushScope(scope: *const Value) void {
+    if (scopeDiagOn())
+        std.debug.print("[scope] push depth={d} id={x}\n", .{ active_scope_stack.items.len, scopeIdent(scope) });
     active_scope_stack.append(coroStackAllocator(), scope.*) catch {};
 }
 
+pub fn coroutineScopeIdent(v: *const Value) usize {
+    return scopeIdent(v);
+}
+
 pub fn coroutinePopScope() void {
+    if (scopeDiagOn() and active_scope_stack.items.len != 0)
+        std.debug.print("[scope] pop depth={d} id={x}\n", .{ active_scope_stack.items.len - 1, scopeIdent(&active_scope_stack.items[active_scope_stack.items.len - 1]) });
     if (active_scope_stack.items.len != 0) {
         _ = active_scope_stack.pop();
     }
@@ -2429,10 +2545,12 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
                 // coroutine simply never completes and its awaiters hang.
                 .Throw => |v| {
                     if (!root.isCancellationException(&v)) {
+                        if (pumpDiagEnabled()) std.debug.print("[tok] inline-resume THROW held as pending_err\n", .{});
                         coro_stack.items[i].pending_err = e;
                     }
                 },
                 else => {
+                    if (pumpDiagEnabled()) std.debug.print("[tok] inline-resume ERR held as pending_err: {s}\n", .{@tagName(std.meta.activeTag(e))});
                     coro_stack.items[i].pending_err = e;
                 },
             },
@@ -2500,7 +2618,22 @@ fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value
         // `coroTop`), so it stays inline-resumable.
         .err => |e| switch (e) {
             .Suspended => |st| _ = try park(a, st, scope_base),
-            else => {},
+            // A cancelled child's throw dies with it, exactly as on the
+            // other resume paths. EVERY other outcome — an AssertionError
+            // out of a test body, a Vm miss — must reach the pump: the
+            // silent discard here turned every throwing test body under
+            // the compose plugin into an indefinite hang (the coroutine's
+            // Job never completed, and runTest joined against it forever).
+            .Throw => |v| {
+                if (!root.isCancellationException(&v)) {
+                    if (coro_stack.items.len != 0)
+                        coro_stack.items[coro_stack.items.len - 1].pending_err = e;
+                }
+            },
+            else => {
+                if (coro_stack.items.len != 0)
+                    coro_stack.items[coro_stack.items.len - 1].pending_err = e;
+            },
         },
     }
     return true;
@@ -2620,8 +2753,13 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
             }
             continue;
         }
-        if (try (coroTop().?).advanceTime()) continue;
-        break;
+        switch (try (coroTop().?).advanceTimeGated()) {
+            // `.waiting`: a Wall timer pends and one sleep slice was taken
+            // inside the gate — keep spinning toward it, as the old
+            // fired-while-pending contract did.
+            .fired, .waiting => continue,
+            .none, .blocked => break,
+        }
     }
     return null;
 }

@@ -400,7 +400,16 @@ fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
         return;
     };
     if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
-        std.debug.print("[chan] arm slot={d} scope={s}\n", .{ slot, scope.typeFqn() });
+        {
+        const cls: []const u8 = if (scope == .Instance) blk: {
+            const g = scope.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().name;
+        } else scope.typeFqn();
+        std.debug.print("[chan] arm slot={d} scope={s} id={x}\n", .{ slot, cls, if (scope == .Instance) scope.Instance.identity() else 0 });
+    }
     if (scope != .Instance) return;
     const helper = ctx.host.lookupGlobalFunc("__kxco_chanArmCancel") orelse return;
     const args = [_]Value{ scope, chan, .{ .Long = slot } };
@@ -1724,6 +1733,56 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Suspend = -1 } };
 }
 
+/// `__kxco_chanDiag(slot, cancelled)` — KLIO_CHAN_DIAG print from the
+/// Kotlin arm handler: proves the handler ran and with what cause.
+fn chanDiag(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null and ctx.args.len >= 2) {
+        const slot: i64 = switch (ctx.args[0]) {
+            .Long => |l| l,
+            .Int => |i| @as(i64, i),
+            else => -1,
+        };
+        const cancelled = ctx.args[1] == .Bool and ctx.args[1].Bool;
+        std.debug.print("[chan] handler-invoked slot={d} cancelled={}\n", .{ slot, cancelled });
+    }
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_pushScope(scope)` / `__kxco_popScope()` — the dispatched-run
+/// scope bracket: a dispatched continuation's segment executes with its
+/// own coroutine as the active scope, exactly as `startBlock` brackets an
+/// undispatched body. Without it, the segment runs under whatever scope
+/// leaked from an earlier activation, and anything derived from the
+/// ambient scope (channel-cancellation arming, `coroutineContext` reads)
+/// binds to the WRONG coroutine.
+fn kxcoPushScope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len >= 1 and ctx.args[0] == .Instance) {
+        ctx.host.coroutinePushScope(&ctx.args[0]);
+    }
+    return .{ .ok = .Unit };
+}
+
+fn kxcoPopScope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    ctx.host.coroutinePopScope();
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_armSlot(slot)` — bind the current coroutine's NEXT suspension
+/// (including a timed `__kxco_delayMillis` park) to `slot` WITHOUT
+/// suspending now, so `__kxco_resumeSlot(slot)` can preempt the timer. A
+/// disposed `withTimeout` waiter must release its parked deadline this way,
+/// or the pump (and the enclosing job tree) waits out the full real
+/// duration of a timeout that already lost its race.
+fn armSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const slot: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "__kxco_armSlot: argument must be Long" } },
+    };
+    ctx.host.coroutineArmSlot(slot);
+    return .{ .ok = .Unit };
+}
+
 /// `__kxco_resumeSlot(slot)` — make the coroutine waiting on `slot` ready.
 /// No-op if nothing is parked on it yet; the Kotlin waiter re-checks its
 /// condition after each park so a missed resume just causes a re-park.
@@ -1765,6 +1824,11 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_scheduleResume", .f = scheduleResume },
     .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_armSlot", .f = armSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_pushScope", .f = kxcoPushScope },
+    .{ .fqn = "kotlinx.coroutines.__kxco_popScope", .f = kxcoPopScope },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanDiag", .f = chanDiag },
+    .{ .fqn = "kotlinx.coroutines.__kxco_systemProperty", .f = kxcoSystemProp },
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanBindWatcher", .f = channelBindWatcher },
