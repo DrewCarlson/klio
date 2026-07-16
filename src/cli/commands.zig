@@ -676,6 +676,7 @@ fn runTestsOnBuilt(
     io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} skipped\n", .{
         report.results.len, report.passed, report.failed, report.skipped,
     });
+    if (runtime.getenvSlice("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     return if (report.failed > 0) 1 else 0;
 }
 

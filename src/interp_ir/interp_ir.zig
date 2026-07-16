@@ -34,6 +34,7 @@ pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 /// (`__compose_pushComposer` / `__compose_popComposer` /
 /// `__compose_currentComposer`) the loader merges into the host bindings.
 pub const compose = @import("vm/compose.zig");
+pub const coroutines_diag = @import("vm/coroutines.zig");
 
 /// Assert-empty + clear the process-wide receiver/coroutine thread-locals at a
 /// run boundary. Called by `Vm.deinit` and by the public runners so leaked

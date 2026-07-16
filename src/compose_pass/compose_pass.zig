@@ -46,6 +46,11 @@ pub const composer_param = "$composer";
 pub const changed_param = "$changed";
 /// The skip-calculus accumulator local (`var $dirty = $changed and 1`).
 pub const dirty_local = "$dirty";
+/// Whether restartable composables emit the skip calculus (probes + skip
+/// branch). The integration point sets this from `KLIO_COMPOSE_SKIP=0` so a
+/// pace or correctness question can A/B the emission without a rebuild; the
+/// pass itself stays free of environment access (ast+span only).
+pub var emit_skip_calculus: bool = true;
 /// FQN of the absent-argument marker singleton accessor (declared in the
 /// compose runtime engine pack). A defaulted `@Composable` parameter's default
 /// expression must evaluate INSIDE the function body — with `$composer` in
@@ -521,7 +526,7 @@ pub fn transformComposableFunction(
     // recomposes; a receiver (member or extension) probes `this`. Probes run
     // AFTER the defaults prologue so a defaulted parameter probes its
     // resolved value.
-    {
+    if (emit_skip_calculus) {
         const dirty_prop = try a.create(ast.Property);
         dirty_prop.* = .{
             .mutable = true,
@@ -576,6 +581,12 @@ pub fn transformComposableFunction(
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
         try body_list.append(a, s.*);
+    }
+    if (!emit_skip_calculus) {
+        for (body_list.items) |s| try out.append(a, s);
+        try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
+        const plain_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
+        return withBody(f, params, .{ .Block = plain_body });
     }
     const skip_stmts = try a.alloc(Stmt, 1);
     skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };

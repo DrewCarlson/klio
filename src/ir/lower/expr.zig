@@ -4320,6 +4320,13 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     // unrelated extension. A NON-function-typed local does not shadow a
     // call (the `flow`-param case), matching the bare-function path.
     if (b.resolve(nm) != null and !b.isNonFnParam(nm)) return null;
+    // A constructible same-named class that shadows this call per the scope
+    // rules (an own-scope constructor, or no applicable same-named factory)
+    // is the Kotlin target: never splice an inline factory over it —
+    // `MutableVector(arr, size)` inside the class body binds the internal
+    // constructor, not the reified `MutableVector(size, init)` factory that
+    // happens to fit the arity.
+    if (try shadowedByClass(b, callee, args)) return null;
     const inline_call_shape = CallShape{
         .want = args.len,
         .last_is_lambda = lastArgIsLambdaOrAnon(args),

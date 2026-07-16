@@ -39,6 +39,50 @@ fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
+/// Where pump wall-clock sleeps come from, counted when `KLIO_PUMP_DIAG` is
+/// set (`sleep_diag`) and dumped at process exit — the idle-tax attribution
+/// tool: a virtual-time test suite should spend ~0 here.
+pub const SleepSite = enum { timer_wall, wakeup_pending, barrier_yield, root_parked };
+var sleep_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** 4;
+fn countSleep(site: SleepSite) void {
+    _ = sleep_counts[@intFromEnum(site)].fetchAdd(1, .monotonic);
+}
+
+/// Consecutive wall-timer idle rounds; a progress point that ends a long
+/// streak reports its source under KLIO_PUMP_DIAG so the real wake channel
+/// is attributable.
+var wall_streak: u64 = 0;
+var streak_diag: ?bool = null;
+fn streakDiagOn() bool {
+    if (streak_diag == null) streak_diag = runtime.getenvSlice("KLIO_PUMP_DIAG") != null;
+    return streak_diag.?;
+}
+fn endStreak(source: []const u8) void {
+    if (wall_streak >= 50 and streakDiagOn())
+        std.debug.print("[pump-streak] {d} idle rounds ended by {s}\n", .{ wall_streak, source });
+    wall_streak = 0;
+}
+/// Wall-mode timer registrations bucketed by requested delay (<=1ms, <=20ms,
+/// <=200ms, <=2s, >2s): attribution for the real-wait tax.
+var wall_delay_buckets = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** 5;
+fn countWallDelay(millis: i64) void {
+    const idx: usize = if (millis <= 1) 0 else if (millis <= 20) 1 else if (millis <= 200) 2 else if (millis <= 2000) 3 else 4;
+    _ = wall_delay_buckets[idx].fetchAdd(1, .monotonic);
+}
+pub fn dumpSleepCounts() void {
+    std.debug.print("[pump-sleep] timer_wall={d} wakeup_pending={d} barrier_yield={d} root_parked={d} | wall delays <=1ms={d} <=20ms={d} <=200ms={d} <=2s={d} >2s={d}\n", .{
+        sleep_counts[0].load(.monotonic),
+        sleep_counts[1].load(.monotonic),
+        sleep_counts[2].load(.monotonic),
+        sleep_counts[3].load(.monotonic),
+        wall_delay_buckets[0].load(.monotonic),
+        wall_delay_buckets[1].load(.monotonic),
+        wall_delay_buckets[2].load(.monotonic),
+        wall_delay_buckets[3].load(.monotonic),
+        wall_delay_buckets[4].load(.monotonic),
+    });
+}
+
 
 /// Cross-thread wakeup primitive shared between a `runBlocking` driver
 /// and any worker threads it has dispatched via `__kxco_dispatch`
@@ -780,6 +824,7 @@ pub const CooperativeInterceptor = struct {
             INDEFINITE
         else
             self.nowMillis() + state.wake_in_millis;
+        if (self.mode == .Wall and state.wake_in_millis > 0) countWallDelay(state.wake_in_millis);
         if (state.wake_in_millis == 0) {
             try self.ready.append(self.allocator, token);
         }
@@ -1054,8 +1099,12 @@ pub const CooperativeInterceptor = struct {
                     // observing run-boundary abandonment. Returning
                     // `true` reports the pending timer as progress; the
                     // pump comes back next round.
-                    sleepMillis(@min(@as(u64, @intCast(wait)), 1));
+                    countSleep(.timer_wall);
+                    wall_streak += 1;
+                    if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null)
+                        sleepMillis(@min(@as(u64, @intCast(wait)), 1));
                     if (self.nowMillis() < t) return .fired;
+                    endStreak("timer-deadline-reached");
                 }
             },
         }
@@ -1873,6 +1922,7 @@ fn pumpLoop(
             }
         }
         if (launched.len != 0) {
+            endStreak("launched");
             idle_rounds = 0;
             continue;
         }
@@ -1881,6 +1931,7 @@ fn pumpLoop(
         inline_turn_resumes = 0;
         persist_inline_resumes = 0;
         if ((coroTop().?).nextReady()) |tok| {
+            endStreak("ready");
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
@@ -1950,6 +2001,7 @@ fn pumpLoop(
         }
         const had_resume = try drainWakeupInto(a, &wakeup, coroTop().?);
         if (had_resume) {
+            endStreak("mailbox");
             idle_rounds = 0;
             continue;
         }
@@ -1960,6 +2012,7 @@ fn pumpLoop(
             w.deinit();
         }
         if (pending > 0) {
+            countSleep(.wakeup_pending);
             sleepMillis(1);
             _ = try drainWakeupInto(a, &wakeup, coroTop().?);
             continue;
@@ -1971,6 +2024,7 @@ fn pumpLoop(
         //     Never break here — the timer is real work, just not yet
         //     allowed to fire.
         if (barrier_blocked) {
+            countSleep(.barrier_yield);
             std.Thread.yield() catch sleepMillis(1);
             continue;
         }
@@ -1987,6 +2041,7 @@ fn pumpLoop(
         if (!persist and root_token.* != null) {
             idle_rounds += 1;
             if (idle_rounds == 3000) diagStalledPump(coroTop().?, root_token.*);
+            countSleep(.root_parked);
             sleepMillis(1);
             continue;
         }
@@ -2545,6 +2600,7 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
         // before the clock can advance (same ordering as `pumpLoop`).
         if (launched.len != 0) continue;
         if ((coroTop().?).nextReady()) |tok| {
+            endStreak("ready");
             if ((coroTop().?).takeParked(tok)) |entry_in| {
                 var entry = entry_in;
                 const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
