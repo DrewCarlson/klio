@@ -2189,9 +2189,20 @@ pub fn pumpDiagEnabled() bool {
 /// Gated on `KLIO_PUMP_DIAG`; a diagnosis aid, never load-bearing.
 fn diagStalledPump(top: *CooperativeInterceptor, root_tok: ?u64) void {
     if (!pumpDiagEnabled()) return;
-    std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d}\n", .{
-        root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len,
+    std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d} pumps={d}\n", .{
+        root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len, coro_stack.items.len,
     });
+    // EVERY interceptor on this thread: a cancelled-but-uncompleted
+    // coroutine's body can be parked in a NESTED pump the top-only view
+    // never shows.
+    for (coro_stack.items, 0..) |*drv, di| {
+        var pit = drv.parked.iterator();
+        while (pit.next()) |e| {
+            std.debug.print("[PUMP] pump[{d}] parked tok={d} wake={d} frames={d}\n", .{
+                di, e.key_ptr.*, e.value_ptr.wake_at, e.value_ptr.state.frames.items.len,
+            });
+        }
+    }
     var it = top.slot_to_token.iterator();
     while (it.next()) |e| {
         std.debug.print("[PUMP] slot={d} -> tok={d}\n", .{ e.key_ptr.*, e.value_ptr.* });
@@ -2520,10 +2531,12 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
                 // coroutine simply never completes and its awaiters hang.
                 .Throw => |v| {
                     if (!root.isCancellationException(&v)) {
+                        if (pumpDiagEnabled()) std.debug.print("[tok] inline-resume THROW held as pending_err\n", .{});
                         coro_stack.items[i].pending_err = e;
                     }
                 },
                 else => {
+                    if (pumpDiagEnabled()) std.debug.print("[tok] inline-resume ERR held as pending_err: {s}\n", .{@tagName(std.meta.activeTag(e))});
                     coro_stack.items[i].pending_err = e;
                 },
             },
