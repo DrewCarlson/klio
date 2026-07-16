@@ -4731,10 +4731,16 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
         }
     }
-    if (resolved == null and runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placeApparentToRealOffset")) {
+    if (resolved == null and if (runtime.getenvSlice("KLIO_NU_TRACE")) |w| std.mem.eql(u8, name_str, w) else false) {
         const cands2 = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands2);
-        std.debug.print("[par-miss] in={s}#{d} ncands={d}:", .{ frame.func.name, frame.func.id.int(), cands2.len });
+        const dbg_srt: []const u8 = blk: {
+            if (cmg.static_recv) |sc| {
+                if (constStr(frame.module, sc)) |sname| break :blk sname;
+            }
+            break :blk "-";
+        };
+        std.debug.print("[par-miss] in={s}#{d} static_recv={s} skip={} ncands={d}:", .{ frame.func.name, frame.func.id.int(), dbg_srt, skip_member, cands2.len });
         for (cands2) |c| {
             if (c.v == .Instance) {
                 const ig = c.v.Instance.borrow();
@@ -5628,7 +5634,7 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
         },
     }
     const s = v.display(allocator) catch "?";
-    const msg = try std.fmt.allocPrint(allocator, "UnOp.{s} on {s}", .{ @tagName(op), s });
+    const msg = try std.fmt.allocPrint(allocator, "UnOp.{s} on {s} ({s})", .{ @tagName(op), s, @tagName(v.*) });
     return errResult(.{ .Type = msg });
 }
 

@@ -1264,17 +1264,18 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return r;
         }
         // A bare read of a name the enclosing anon object closes over reads
-        // the captured value.
+        // the captured value. Whether the capture is a shared Cell (a
+        // written-through outer `var`) is decided by the CAPTURE SITE's
+        // builder, invisible here — so always read through CellGet, which
+        // passes a non-cell value unchanged. Without this a captured
+        // counter's `++` handed the raw Cell to UnOp.
         if (isLowerAnonCapture(name0)) {
             const idx = try b.recordCapture(name0);
             const cell = b.allocReg();
             try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
-            if (b.isBoxed(name0)) {
-                const dst = b.allocReg();
-                try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-                return dst;
-            }
-            return cell;
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+            return dst;
         }
         // Lambda-body capture.
         if (b.knowsOuter(name0)) {
@@ -4748,6 +4749,36 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // outward to the top-level / member candidates below.
         if (!local_fn_inapplicable) {
             if (try lowerValueInvocation(b, callee, args, ast_arg_names)) |r| return r;
+            // A LONE applicable local fn reached as a CAPTURE (declared in
+            // an enclosing body, called from this closure): invoke the
+            // captured closure value. Without this the call fell through to
+            // the classifier arms, and a local `fun Test(a, b)` lost to an
+            // imported `kotlin.test.Test` inside `r.go { Test(1, 2) }`.
+            // Two or more siblings select through the mangled binding above.
+            // Gated on an actual classifier collision: a captured local fn
+            // with NO same-named class keeps its established route (its
+            // value binding is not always capturable — a `fun emit` inside
+            // a runtime-lowered lambda resolves through the scoped-global
+            // layers, not a capture slot).
+            if (b.localFnDecls(bare) != null and b.resolve(bare) == null and b.knowsOuter(bare) and
+                b.module.classIdIndexed(bare, b.self_package, callee.Path.segments[0].span.file) != null)
+            {
+                const cap = try resolveCapture(b, bare);
+                const callee_r = b.allocReg();
+                try b.push(.{ .CellGet = .{ .dst = callee_r, .cell = cap } });
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                orEmitAudit(b, "captured_local_fn_call", "CallValue", bare);
+                try b.push(.{ .CallValue = .{
+                    .dst = dst,
+                    .callee = callee_r,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
         }
     }
 
@@ -4818,6 +4849,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 {
                     _ = try b.recordCapture("this");
                 }
+                orEmitAudit(b, "bare_ctor_shadowed_by_class", "NewInstance", callee.Path.segments[0].name);
                 try b.push(.{ .NewInstance = .{
                     .dst = dst,
                     .class = class_id,
@@ -6365,6 +6397,14 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         std.debug.print("[sbc] {s} owner={s} own={} encl={} nested={}\n", .{ name, b.ownerClass() orelse "-", b.hasOwnMember(name), b.hasEnclosingMember(name), classNestedInEnclosing(b, cid) });
     }
     if (enclosingHasMemberNamed(b, name) and !classNestedInEnclosing(b, cid)) return false;
+    // Scope rule: a captured outer binding of the name (a local `fun Test`
+    // declared in an enclosing body, reaching this closure as a capture) is
+    // a nearer-scope candidate than an imported classifier — `Test(1, 2)`
+    // inside `r.go { … }` calls the local function, never constructs
+    // `kotlin.test.Test`. Deciding false routes through the deferred
+    // class-carrying form, whose runtime shadow gate lets the captured
+    // callable win and still reaches the constructor when nothing binds.
+    if (b.resolve(name) == null and (b.knowsOuter(name) or isLowerAnonCapture(name))) return false;
     if (lastArgIsLambda(args)) {
         // A trailing lambda routes to a same-named factory with a
         // function-typed param to receive it; only when none fits is it a ctor.

@@ -1617,6 +1617,8 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null)
+        std.debug.print("[getfield-miss] name={s} recv={s}\n", .{ name, tf });
     ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, tf });
     allocator.free(tf);

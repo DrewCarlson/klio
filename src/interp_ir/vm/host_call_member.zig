@@ -10147,7 +10147,24 @@ pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *con
 /// `fun I.helper()` a bare `describe()` binds `I.describe` even when the
 /// runtime value is a subtype with its own `describe` extension.
 pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
+    const r = try callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
+    if (runtime.getenvSlice("KLIO_NU_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) {
+            const tag: []const u8 = switch (r) {
+                .ok => "ok",
+                .err => |e| @tagName(e),
+            };
+            const detail: []const u8 = switch (r) {
+                .err => |e| switch (e) {
+                    .Unimplemented => |m| m,
+                    else => "",
+                },
+                else => "",
+            };
+            std.debug.print("[strictext] name={s} recv={s} -> {s} {s}\n", .{ name, receiver.typeFqn(), tag, detail });
+        }
+    }
+    return r;
 }
 
 /// Whether the committed extension target's declared receiver definitely
