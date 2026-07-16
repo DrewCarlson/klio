@@ -293,6 +293,42 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
+/// Names of class PROPERTIES declared with a `@Composable` function type
+/// (`MovableContent.content`). An explicit-receiver invoke of one
+/// (`content.content(parameter)` in the composer's movable-content path) is
+/// a composable call and threads the pair. Consulted only for `.Member`
+/// callees, so a same-named bare call cannot be captured.
+pub var active_composable_props: ?*const std.StringHashMap(void) = null;
+
+/// Collect `@Composable`-fn-typed property names (constructor vals and body
+/// properties) across the decls. Caller owns the map.
+pub fn collectComposableProps(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectComposablePropsInto(&set, decls);
+    return set;
+}
+
+fn collectComposablePropsInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Property => |p| {
+            if (p.ty != null and isComposableFnType(&p.ty.?)) try set.put(p.name.name, {});
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| {
+                if (p.property != null and p.ty.function != null and isComposable(p.ty.annotations)) {
+                    try set.put(p.name.name, {});
+                }
+            }
+            try collectComposablePropsInto(set, c.members);
+        },
+        .Object => |*o| try collectComposablePropsInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Collect `sink name -> composable-lambda param count` for sinks whose
 /// composable parameter declares at least one value parameter. Caller owns.
 pub fn collectComposableSinkArity(
@@ -944,7 +980,11 @@ const Walker = struct {
                     if (name) |nm| {
                         const is_lambda_param = w.lambda_params != null and w.lambda_params.?.contains(nm);
                         const is_local_composable = w.locals != null and w.locals.?.contains(nm);
-                        if (is_lambda_param or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
+                        // An explicit-receiver invoke of a `@Composable`-typed
+                        // property (`content.content(parameter)`).
+                        const is_composable_prop = c.callee.* == .Member and
+                            active_composable_props != null and active_composable_props.?.contains(nm);
+                        if (is_lambda_param or is_local_composable or is_composable_prop or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
                     }
                 }
             },

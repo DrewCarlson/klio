@@ -463,11 +463,14 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer factories.deinit();
         var sink_arity = try compose_pass.collectComposableSinkArity(allocator, decls.items);
         defer sink_arity.deinit();
+        var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
+        defer comp_props.deinit();
         if (base) |bsp| {
             try composeBaseNames(&names, bsp);
             try composeBaseSinks(&sinks, bsp);
             try composeBaseFactories(&factories, bsp);
             try composeBaseSinkArity(&sink_arity, bsp);
+            try composeBaseComposableProps(&comp_props, bsp);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null)
             std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} factories, {d} decls\n", .{ names.count(), sinks.count(), factories.count(), decls.items.len });
@@ -475,6 +478,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_factories = null;
         compose_pass.active_sink_arity = &sink_arity;
         defer compose_pass.active_sink_arity = null;
+        compose_pass.active_composable_props = &comp_props;
+        defer compose_pass.active_composable_props = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
@@ -4037,6 +4042,30 @@ fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const Stdlib
 
 fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) Allocator.Error!void {
     for (base.lifted_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+}
+
+fn composeBaseComposableProps(props: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseComposablePropDecl(props, d);
+}
+
+fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Property => |p| {
+            if (p.ty != null and p.ty.?.function != null and compose_pass.isComposable(p.ty.?.annotations)) {
+                try props.put(p.name.name, {});
+            }
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| {
+                if (p.property != null and p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
+                    try props.put(p.name.name, {});
+                }
+            }
+            for (c.members) |*m| try composeBaseComposablePropDecl(props, m);
+        },
+        .Object => |*o| for (o.members) |*m| try composeBaseComposablePropDecl(props, m),
+        else => {},
+    }
 }
 
 fn composeBaseSinkArityDecl(arity: *std.StringHashMap(u8), d: *const Decl) Allocator.Error!void {
