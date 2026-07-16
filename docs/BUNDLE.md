@@ -142,8 +142,8 @@ boundary, a payload area, and a 72-byte trailer:
 Per-OS payload placement: on Linux (ELF) the overlay append is free and
 the trailer sits at EOF. Windows needs an Authenticode-aware probe and
 macOS needs the `__LINKEDIT` extension + ad-hoc re-sign; the probe seams
-for both are in `src/cli/bundle_boot.zig` and land with their platform
-milestones. Binary packers (UPX) hide overlays — do not pack bundles.
+for both are in `src/cli/bundle_boot.zig` and land with Windows/macOS
+support. Binary packers (UPX) hide overlays — do not pack bundles.
 
 ## UI bundles
 
@@ -187,7 +187,7 @@ bundling resolves the target's stub (and shim, for UI):
 
 The stub must be the same klio version as the bundler — enforced, not
 advised. Windows and macOS cross-bundles additionally need the PE/Mach-O
-patchers, which land with those platform milestones.
+patchers, which land with Windows/macOS support.
 
 ## Desktop integration (Linux)
 

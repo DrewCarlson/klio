@@ -90,8 +90,8 @@ fn probeSelfInner() ?bf.Trailer {
 var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
 /// Resolve the own-executable path into a static buffer (never trusts
-/// bare argv[0]). Windows (`GetModuleFileNameW`) is the PE milestone's
-/// extension point.
+/// bare argv[0]). Windows (`GetModuleFileNameW`) is the extension point
+/// that lands with PE support.
 fn selfExePathZ() ?[*:0]const u8 {
     switch (builtin.os.tag) {
         .linux => {

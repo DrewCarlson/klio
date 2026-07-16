@@ -703,7 +703,7 @@ fn harvestPackBindings(arena: Allocator, bindings: *const HostBindings) ![]bf.Bi
 
 /// The running executable's path. Per-OS: /proc/self/exe on linux,
 /// `_NSGetExecutablePath` on macOS. Windows (`GetModuleFileNameW`) lands
-/// with the PE milestone.
+/// with PE support.
 pub fn selfExePath(arena: Allocator) ?[]const u8 {
     switch (builtin.os.tag) {
         .linux => {
