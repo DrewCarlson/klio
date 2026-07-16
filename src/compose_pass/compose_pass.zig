@@ -255,11 +255,82 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             if (isComposable(f.annotations)) try set.put(f.name.name, {});
+            // LOCAL `@Composable` declarations — the upstream tests' house
+            // style declares composables inside test-body lambdas
+            // (`compositionTest { @Composable fun Reporter(...) {...} }`).
+            // They transform during the body walk; their names must be in
+            // the oracle before any call site lowers.
+            if (f.body) |*fb| switch (fb.*) {
+                .Block => |*blk| for (blk.stmts) |*s| try collectStmt(set, s),
+                .Expr => |*e| try collectExpr(set, e),
+            };
         },
         .Class => |*c| try collectInto(set, c.members),
         .Object => |*o| try collectInto(set, o.members),
+        .Property => |p| {
+            if (p.init) |*ini| try collectExpr(set, ini);
+            if (p.delegate) |del| try collectExpr(set, @constCast(del));
+            if (p.getter) |g| switch (g.body) {
+                .Block => |*blk| for (blk.stmts) |*s| try collectStmt(set, @constCast(s)),
+                .Expr => |*e| try collectExpr(set, @constCast(e)),
+            };
+        },
         else => {},
     };
+}
+
+fn collectStmt(set: *std.StringHashMap(void), s: *const Stmt) std.mem.Allocator.Error!void {
+    switch (s.*) {
+        .Expr => |*e| try collectExpr(set, e),
+        .Assign => |*asg| {
+            try collectExpr(set, &asg.target);
+            try collectExpr(set, &asg.value);
+        },
+        .DestructuringDecl => |*dd| try collectExpr(set, &dd.init),
+        .Decl => |*d| {
+            const one = [_]ast.Decl{d.*};
+            try collectInto(set, &one);
+        },
+    }
+}
+
+/// The expression shapes a local declaration can hide inside: lambdas and
+/// anonymous functions (bodies), calls (args + callee), control flow, and
+/// blocks. Value-only leaves need no descent.
+fn collectExpr(set: *std.StringHashMap(void), e: *const Expr) std.mem.Allocator.Error!void {
+    switch (e.*) {
+        .Lambda => |*l| for (l.body.stmts) |*s| try collectStmt(set, s),
+        .AnonFun => |*af| {
+            if (af.body) |fb| switch (fb.*) {
+                .Block => |*blk| for (blk.stmts) |*s| try collectStmt(set, s),
+                .Expr => |*inner| try collectExpr(set, inner),
+            };
+        },
+        .Block => |*blk| for (blk.stmts) |*s| try collectStmt(set, s),
+        .Call => |*c| {
+            try collectExpr(set, c.callee);
+            for (c.args) |*arg| try collectExpr(set, arg);
+        },
+        .Member => |*m| try collectExpr(set, m.receiver),
+        .If => |*iff| {
+            try collectExpr(set, iff.cond);
+            try collectExpr(set, iff.then_branch);
+            if (iff.else_branch) |el| try collectExpr(set, el);
+        },
+        .While => |*wh| {
+            try collectExpr(set, wh.cond);
+            try collectExpr(set, wh.body);
+        },
+        .Binary => |*bin| {
+            try collectExpr(set, bin.lhs);
+            try collectExpr(set, bin.rhs);
+        },
+        .Unary => |*un| try collectExpr(set, un.expr),
+        .Return => |*r| {
+            if (r.value) |v| try collectExpr(set, v);
+        },
+        else => {},
+    }
 }
 
 /// Whether a parameter's type is a `@Composable`-annotated function type — a
@@ -709,9 +780,22 @@ const Walker = struct {
                 if (p.init) |*ini| try w.walkExpr(ini);
                 if (p.delegate) |del| try w.walkExpr(del);
             },
-            .Function => |*f| if (f.body) |*fb| switch (fb.*) {
-                .Block => |*blk| try w.walkBlock(blk),
-                .Expr => |*e| try w.walkExpr(e),
+            .Function => |*f| {
+                // A LOCAL `@Composable` declaration transforms exactly like
+                // a top-level one (its name is already in the oracle via the
+                // body-deep collection); the transform walks its body itself.
+                if (f.body != null and isComposable(f.annotations)) {
+                    if (isRestartableComposable(f)) {
+                        f.* = try transformComposableFunction(w.a, f, w.oracle, w.oracle_ctx, w.sinks, false);
+                    } else {
+                        f.* = try transformThreadedComposable(w.a, f, w.oracle, w.oracle_ctx, w.sinks);
+                    }
+                    return;
+                }
+                if (f.body) |*fb| switch (fb.*) {
+                    .Block => |*blk| try w.walkBlock(blk),
+                    .Expr => |*e| try w.walkExpr(e),
+                };
             },
             else => {},
         }
