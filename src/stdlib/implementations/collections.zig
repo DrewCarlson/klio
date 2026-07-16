@@ -2611,6 +2611,15 @@ pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
         return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
     }
+    // `HashMap(map)` over an INTERPRETED Map implementation (a
+    // SnapshotStateMap, a user class): copy through its `entries` view,
+    // exactly as `toMap` does.
+    if (ctx.args.len == 1 and ctx.args[0] == .Instance) {
+        switch (try userMapPairs(ctx, ctx.args[0], "HashMap")) {
+            .entries => |pairs| return ok(try makeMap(a, pairs, true)),
+            .err => |e| return e,
+        }
+    }
     // `HashMap(initialCapacity)` / `(initialCapacity, loadFactor)` /
     // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
     // load factor, and access-order flag do not change the observable behavior
