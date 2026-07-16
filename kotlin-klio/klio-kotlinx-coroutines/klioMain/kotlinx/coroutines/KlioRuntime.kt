@@ -30,6 +30,11 @@ internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 // arm this against the active coroutine's Job.
 internal fun __kxco_chanCancelWaiter(channel: Any?, slot: Long, cause: Throwable?) {}
 
+// Diagnostic (KLIO_CHAN_DIAG): the arm handler was INVOKED for `slot`,
+// with or without a cause — discriminates a consumed one-shot from a
+// skipped/removed node when a cancellation never reaches a parked waiter.
+internal fun __kxco_chanDiag(slot: Long, cancelled: Boolean) {}
+
 // Host intrinsic: bind the cancellation-watcher continuation to a parked
 // channel `slot` so a normal value delivery on that slot can resume the
 // watcher (otherwise its child coroutine would keep the parking coroutine's
@@ -63,6 +68,7 @@ internal fun __kxco_chanArmCancel(scope: Any?, channel: Any?, slot: Long) {
     val cs = scope as? CoroutineScope ?: return
     val job = cs.coroutineContext[Job] ?: return
     val handle = job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        __kxco_chanDiag(slot, cause != null)
         if (cause != null) __kxco_chanCancelWaiter(channel, slot, cause)
     }
     __kxco_chanBindHandle(slot, handle)

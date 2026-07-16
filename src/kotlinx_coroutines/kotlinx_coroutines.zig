@@ -1733,6 +1733,21 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Suspend = -1 } };
 }
 
+/// `__kxco_chanDiag(slot, cancelled)` — KLIO_CHAN_DIAG print from the
+/// Kotlin arm handler: proves the handler ran and with what cause.
+fn chanDiag(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null and ctx.args.len >= 2) {
+        const slot: i64 = switch (ctx.args[0]) {
+            .Long => |l| l,
+            .Int => |i| @as(i64, i),
+            else => -1,
+        };
+        const cancelled = ctx.args[1] == .Bool and ctx.args[1].Bool;
+        std.debug.print("[chan] handler-invoked slot={d} cancelled={}\n", .{ slot, cancelled });
+    }
+    return .{ .ok = .Unit };
+}
+
 /// `__kxco_armSlot(slot)` — bind the current coroutine's NEXT suspension
 /// (including a timed `__kxco_delayMillis` park) to `slot` WITHOUT
 /// suspending now, so `__kxco_resumeSlot(slot)` can preempt the timer. A
@@ -1791,6 +1806,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_armSlot", .f = armSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanDiag", .f = chanDiag },
     .{ .fqn = "kotlinx.coroutines.__kxco_systemProperty", .f = kxcoSystemProp },
     .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
