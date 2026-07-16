@@ -37,10 +37,18 @@ Landed (in commit order):
   discovery, whole source set), `--dry-run`, `--desktop-dir`.
 - Whole-program image: `buildProgramBase` + main serialized in the image
   (FORMAT_VERSION 21); boot is mmap → load → run, zero re-lowering.
-  Measured (ReleaseSafe): hello bundle ~29 ms vs ~32 ms warm `klio run`;
-  gated by a min-of-three timing scenario. Bake refusal falls back to
-  base-image + program-src, recorded in the manifest;
-  `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces it.
+  Gated by a min-of-three timing scenario (bundle ≤ warm run). Bake
+  refusal falls back to base-image + program-src, recorded in the
+  manifest; `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces it.
+
+Measured on linux-x64, ReleaseFast + strip (the release shape):
+
+| artifact | size | boot |
+|---|---|---|
+| stub (`klio`, stripped) | 15.1 MB | — |
+| hello bundle | 23.4 MB | 20 ms (warm `klio run`: 27 ms) |
+| kotlinx.serialization bundle | 24.5 MB | 24 ms |
+| Compose UI bundle (klio.compose.ui set + shim) | 44.3 MB | 119 ms first launch (incl. shim extraction), 100 ms warm to a rendered PNG |
 - Cross-target: `src/cli/stub_fetch.zig` (--stub → KLIO_STUB_DIR →
   ~/.klio/stubs cache → HTTPS fetch verified against the baked
   `src/cli/stubs-manifest.json`, an empty placeholder in dev builds);

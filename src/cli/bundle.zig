@@ -16,7 +16,6 @@ const ast = @import("ast");
 const KotlinFile = ast.KotlinFile;
 const span = @import("span");
 const SourceMap = span.SourceMap;
-const diagnostics = @import("diagnostics");
 
 const pack = @import("pack");
 const bf = pack.bundle_format;
@@ -26,7 +25,6 @@ const image = interp_ir.image;
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
-const ir_mod = @import("ir");
 
 const io = @import("io.zig");
 const commands = @import("commands.zig");
@@ -80,27 +78,27 @@ pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (flagValue(gpa, args, &i, "-o", "--output")) |v| {
+        if (flagValue(args, &i, "-o", "--output")) |v| {
             opts.output = v orelse return usageErr(gpa, "--output requires a path");
-        } else if (flagValue(gpa, args, &i, null, "--target")) |v| {
+        } else if (flagValue(args, &i, null, "--target")) |v| {
             opts.target = v orelse return usageErr(gpa, "--target requires a target name");
         } else if (std.mem.eql(u8, a, "--ui")) {
             opts.ui = true;
         } else if (std.mem.eql(u8, a, "--headless")) {
             opts.ui = false;
-        } else if (flagValue(gpa, args, &i, null, "--include")) |v| {
+        } else if (flagValue(args, &i, null, "--include")) |v| {
             const val = v orelse return usageErr(gpa, "--include requires a path[:mount]");
             const inc = parseInclude(val);
             opts.includes.append(gpa, inc) catch return 2;
-        } else if (flagValue(gpa, args, &i, null, "--name")) |v| {
+        } else if (flagValue(args, &i, null, "--name")) |v| {
             opts.name = v orelse return usageErr(gpa, "--name requires a value");
-        } else if (flagValue(gpa, args, &i, null, "--icon")) |v| {
+        } else if (flagValue(args, &i, null, "--icon")) |v| {
             opts.icon = v orelse return usageErr(gpa, "--icon requires a png path");
-        } else if (flagValue(gpa, args, &i, null, "--stub")) |v| {
+        } else if (flagValue(args, &i, null, "--stub")) |v| {
             opts.stub = v orelse return usageErr(gpa, "--stub requires a path");
-        } else if (flagValue(gpa, args, &i, null, "--desktop-dir")) |v| {
+        } else if (flagValue(args, &i, null, "--desktop-dir")) |v| {
             opts.desktop_dir = v orelse return usageErr(gpa, "--desktop-dir requires a directory");
-        } else if (flagValue(gpa, args, &i, null, "--feature")) |v| {
+        } else if (flagValue(args, &i, null, "--feature")) |v| {
             const val = v orelse return usageErr(gpa, "--feature requires a `<pack>/<feature>` value");
             opts.feature_specs.append(gpa, val) catch return 2;
         } else if (std.mem.eql(u8, a, "--dry-run")) {
@@ -123,13 +121,11 @@ pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {
 /// `--flag value` / `--flag=value` / short alias. Returns null when `args[i]`
 /// is not this flag; `?null` (inner null) when the value is missing.
 fn flagValue(
-    gpa: Allocator,
     args: []const []const u8,
     i: *usize,
     short: ?[]const u8,
     long: []const u8,
 ) ??[]const u8 {
-    _ = gpa;
     const a = args[i.*];
     const matches = std.mem.eql(u8, a, long) or (short != null and std.mem.eql(u8, a, short.?));
     if (matches) {
@@ -164,26 +160,11 @@ const target_names = [_][]const u8{
 };
 
 pub fn hostTarget() []const u8 {
-    const os: []const u8 = switch (builtin.os.tag) {
-        .linux => "linux",
-        .macos => "macos",
-        .windows => "windows",
-        else => "unknown",
-    };
-    const arch: []const u8 = switch (builtin.cpu.arch) {
-        .x86_64 => "x64",
-        .aarch64 => "arm64",
-        else => "unknown",
-    };
     return switch (builtin.os.tag) {
         .linux => if (builtin.cpu.arch == .x86_64) "linux-x64" else "linux-arm64",
         .macos => if (builtin.cpu.arch == .x86_64) "macos-x64" else "macos-arm64",
         .windows => if (builtin.cpu.arch == .x86_64) "windows-x64" else "windows-arm64",
-        else => {
-            _ = os;
-            _ = arch;
-            return "unknown";
-        },
+        else => "unknown",
     };
 }
 
