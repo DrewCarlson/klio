@@ -1557,6 +1557,25 @@ test "ctx: context clause on a property with accessor" {
     try testing.expectEqualStrings("u", p.context_params[0].name.name);
 }
 
+test "accessor annotations are parsed onto the accessor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\val current: Int
+        \\    @ReadOnlyComposable
+        \\    @Composable
+        \\    get() = 1
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const p = out.file.decls[0].Property;
+    const g = p.getter.?;
+    try testing.expectEqual(@as(usize, 2), g.annotations.len);
+    const a0 = g.annotations[0].path;
+    try testing.expectEqualStrings("ReadOnlyComposable", a0[a0.len - 1].name);
+    const a1 = g.annotations[1].path;
+    try testing.expectEqualStrings("Composable", a1[a1.len - 1].name);
+}
+
 test "ctx: bare-type entry rejected as CONTEXT_PARAMETER_WITHOUT_NAME" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

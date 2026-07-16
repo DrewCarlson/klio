@@ -926,8 +926,9 @@ fn scanAccessorModifiers(p: *const Parser, from: usize) AccessorScan {
     // `private inline set(v)`; both combinations parse here.
     while (i < p.tokens.len) {
         const tok = p.tokens[i];
-        // Skip an annotation on the accessor (`@InternalAPI set(value)`,
-        // `@Suppress("X") get()`); klio ignores accessor annotations.
+        // Scan past an annotation on the accessor (`@InternalAPI set(value)`,
+        // `@Composable get()`); the commit path re-parses the leading run into
+        // the accessor's `annotations`.
         if (tok.kind.isAt()) {
             had_annotation = true;
             i += 1; // `@`
@@ -1046,6 +1047,13 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
             break;
         }
         // Commit — consume the newlines, optional vis/annotation, and accessor.
+        // The leading annotations are parsed for real (`@Composable get()`
+        // marks a composable accessor the compose pass must transform); the
+        // scanner's index then lands on the `get`/`set` ident regardless of
+        // any modifier interleaving.
+        p.pos = save;
+        skipNl(p);
+        const acc_annotations = file.parseAnnotations(p);
         p.pos = i;
         const start_span = bump(p).span; // get / set
         if (is_bodyless) {
@@ -1101,7 +1109,7 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
             .body = body,
             .visibility = acc_visibility,
             .is_inline = acc_inline,
-            .annotations = &.{},
+            .annotations = acc_annotations,
             .span = start_span.join(end),
         };
         if (is_get) {
