@@ -993,6 +993,12 @@ pub const CooperativeInterceptor = struct {
         /// that may post a cross-pump resume. The caller must keep
         /// draining its mailbox and retry rather than fire or exit.
         blocked,
+        /// A Wall timer is pending but not yet due (one sleep slice was
+        /// taken). The caller must drain its mailbox before retrying — a
+        /// resume posted from this thread (a cancellation handler firing
+        /// inside an activation, before its park bound the slot) would
+        /// otherwise wait out the whole timer.
+        waiting,
     };
 
     /// Publish `floor` to the global barrier only when it differs from the
@@ -1106,14 +1112,15 @@ pub const CooperativeInterceptor = struct {
                     // mailbox between slices (a resume can preempt the
                     // timer — a cancellation arriving from another pump
                     // must not wait out a parked `delay`) and must keep
-                    // observing run-boundary abandonment. Returning
-                    // `true` reports the pending timer as progress; the
-                    // pump comes back next round.
+                    // observing run-boundary abandonment. `.waiting`
+                    // reports the pending timer as progress while sending
+                    // the pump through its mailbox drain before the next
+                    // round.
                     countSleep(.timer_wall);
                     wall_streak += 1;
                     if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null)
                         sleepMillis(@min(@as(u64, @intCast(wait)), 1));
-                    if (self.nowMillis() < t) return .fired;
+                    if (self.nowMillis() < t) return .waiting;
                     endStreak("timer-deadline-reached");
                 }
             },
@@ -2112,6 +2119,11 @@ fn pumpLoop(
             continue;
         }
 
+        // 3c'. A Wall timer is pending but not due (advanceTimeGated took
+        //      its sleep slice). The mailbox above is drained; retry.
+        //      Never break or park the root here — the timer is real work.
+        if (advance == .waiting) continue;
+
         // 3d. A blocking root must not return while its root coroutine is
         //     still parked. For `runBlocking` the root parks until its
         //     coroutine's job completes, and the job machinery — not a
@@ -2232,7 +2244,9 @@ fn drainWakeupInto(allocator: Allocator, wakeup: *const ObjRef(DriverWakeup), to
     };
     defer allocator.free(drained);
     for (drained) |entry| {
-        _ = try top.resumeSlotValue(entry.slot, entry.value);
+        const routed = try top.resumeSlotValue(entry.slot, entry.value);
+        if (pumpDiagEnabled())
+            std.debug.print("[PUMP] drain slot={d} routed={}\n", .{ entry.slot, routed });
     }
     return drained.len != 0;
 }
@@ -2739,8 +2753,13 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
             }
             continue;
         }
-        if (try (coroTop().?).advanceTime()) continue;
-        break;
+        switch (try (coroTop().?).advanceTimeGated()) {
+            // `.waiting`: a Wall timer pends and one sleep slice was taken
+            // inside the gate — keep spinning toward it, as the old
+            // fired-while-pending contract did.
+            .fired, .waiting => continue,
+            .none, .blocked => break,
+        }
     }
     return null;
 }
