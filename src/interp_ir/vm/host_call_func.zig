@@ -1386,8 +1386,27 @@ fn composableEval(
     packed_args: std.ArrayList(Value),
 ) Allocator.Error!EvalResult {
     // Plugin path: the pass already lowered composition into the body; run it
-    // directly with no implicit-composer bracketing.
-    if (composePluginEnabled() or !compose.isComposable(f))
+    // directly with no implicit-composer bracketing — but publish the threaded
+    // `$composer` argument as the ambient composer for the call. A
+    // `@Composable` property getter reached from this body has no composer
+    // param of its own; the pass compiles its composer references to the
+    // `__compose_currentComposer` intrinsic (upstream's "implemented as an
+    // intrinsic" contract), which reads this stack.
+    if (composePluginEnabled()) {
+        if (f.params.len >= 2 and packed_args.items.len == f.params.len) {
+            const cpos = f.params.len - 2;
+            if (std.mem.eql(u8, f.params[cpos].name, "$composer") and
+                std.mem.eql(u8, f.params[cpos + 1].name, "$changed") and
+                packed_args.items[cpos] == .Instance)
+            {
+                compose.pushComposer(packed_args.items[cpos]);
+                defer compose.popComposer();
+                return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+            }
+        }
+        return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
+    }
+    if (!compose.isComposable(f))
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
     const composer = compose.currentComposer() orelse
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
