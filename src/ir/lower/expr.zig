@@ -1264,17 +1264,18 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return r;
         }
         // A bare read of a name the enclosing anon object closes over reads
-        // the captured value.
+        // the captured value. Whether the capture is a shared Cell (a
+        // written-through outer `var`) is decided by the CAPTURE SITE's
+        // builder, invisible here — so always read through CellGet, which
+        // passes a non-cell value unchanged. Without this a captured
+        // counter's `++` handed the raw Cell to UnOp.
         if (isLowerAnonCapture(name0)) {
             const idx = try b.recordCapture(name0);
             const cell = b.allocReg();
             try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
-            if (b.isBoxed(name0)) {
-                const dst = b.allocReg();
-                try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-                return dst;
-            }
-            return cell;
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+            return dst;
         }
         // Lambda-body capture.
         if (b.knowsOuter(name0)) {

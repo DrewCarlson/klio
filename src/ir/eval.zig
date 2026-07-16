@@ -5628,7 +5628,7 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
         },
     }
     const s = v.display(allocator) catch "?";
-    const msg = try std.fmt.allocPrint(allocator, "UnOp.{s} on {s}", .{ @tagName(op), s });
+    const msg = try std.fmt.allocPrint(allocator, "UnOp.{s} on {s} ({s})", .{ @tagName(op), s, @tagName(v.*) });
     return errResult(.{ .Type = msg });
 }
 

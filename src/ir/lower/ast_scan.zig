@@ -149,6 +149,28 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
                         .Expr => |*ex| try collectPathIdents(ex, out),
                     };
                 },
+                // A LOCAL class's member bodies reference (and write)
+                // captured outer locals exactly as an anonymous object's
+                // do; a written capture must box, so its references count.
+                .Class => |*c| {
+                    for (c.members) |*m| switch (m.*) {
+                        .Function => |*f| {
+                            if (f.body) |fb| switch (fb) {
+                                .Block => |blk| {
+                                    for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                                },
+                                .Expr => |ex| try collectPathIdents(&ex, out),
+                            };
+                        },
+                        .Property => |p| {
+                            if (p.init) |*pi| try scanLambdaRefsExpr(pi, out);
+                        },
+                        else => {},
+                    };
+                    for (c.init_blocks) |*blk| {
+                        for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                    }
+                },
                 else => {},
             },
         }
@@ -342,6 +364,26 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
                     .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
                     .Expr => |*ex| try collectAssignTargets(ex, out),
                 };
+            },
+            // A LOCAL class's method bodies write captured outer locals
+            // exactly as an anonymous object's do; without this the local
+            // is never boxed and the write lands on a transient capture
+            // copy (a local `class Bumper { fun bump() { count++ } }`
+            // silently dropped the increment).
+            .Class => |*c| {
+                for (c.members) |*m| switch (m.*) {
+                    .Function => |*f| {
+                        if (f.body) |fb| switch (fb) {
+                            .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
+                            .Expr => |ex| try collectAssignTargets(&ex, out),
+                        };
+                    },
+                    .Property => |p| {
+                        if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
+                    },
+                    else => {},
+                };
+                for (c.init_blocks) |*blk| try collectLambdaBodyAssigns(blk.stmts, out);
             },
             else => {},
         },
