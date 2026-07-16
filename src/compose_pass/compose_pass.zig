@@ -55,6 +55,31 @@ pub fn isComposable(annotations: []const ast.Annotation) bool {
     return false;
 }
 
+/// A `@Composable` function that owns its OWN restart scope: the plugin brackets
+/// it with `startRestartGroup`/`endRestartGroup()?.updateScope`. Excluded:
+///   - `inline` composables — the compiler inlines them into the caller's group,
+///     so they emit no separate scope;
+///   - `@NonRestartableComposable` / `@ReadOnlyComposable` / `@ExplicitGroupsComposable`
+///     — the compiler emits no restart group; they recompose as part of their caller.
+/// Bracketing these (as the plugin did for every `@Composable`) creates spurious
+/// nested restart scopes: `setContent { Text(…) }` gained 3 nested scopes instead
+/// of 1, the state read attributed to the wrong (innermost) scope, and the outer
+/// scopes were left with null restart blocks — so recomposition threw
+/// "Invalid restart scope" / recorded no change. These still get the threaded
+/// `$composer`/`$changed` parameters, just no restart bracket.
+fn isRestartableComposable(f: *const Function) bool {
+    if (!isComposable(f.annotations)) return false;
+    if (f.is_inline) return false;
+    for (f.annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        const nm = ann.path[ann.path.len - 1].name;
+        if (std.mem.eql(u8, nm, "NonRestartableComposable")) return false;
+        if (std.mem.eql(u8, nm, "ReadOnlyComposable")) return false;
+        if (std.mem.eql(u8, nm, "ExplicitGroupsComposable")) return false;
+    }
+    return true;
+}
+
 /// A stable positional group key for a call site, derived from its span. The
 /// Compose plugin emits a compile-time constant here; a span hash plays the
 /// same role — identical across recompositions, distinct per source location.
@@ -259,7 +284,11 @@ fn transformDecl(
         .Function => |*f| {
             if (f.body == null) return;
             if (isComposable(f.annotations)) {
-                f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks);
+                if (isRestartableComposable(f)) {
+                    f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks);
+                } else {
+                    f.* = try transformThreadedComposable(a, f, NameSetOracle.isComposableCall, oracle, sinks);
+                }
             } else {
                 // Not composable: still walk the body so a `compose { … }` /
                 // `setContent { … }` composable-lambda argument is transformed.
@@ -330,6 +359,38 @@ pub fn transformComposableFunction(
 
     const new_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
     return withBody(f, params, .{ .Block = new_body });
+}
+
+/// Transform a non-restartable / inline @Composable (`isRestartableComposable`
+/// false): append `$composer`/`$changed` and thread the body, WITHOUT a
+/// start/endRestartGroup bracket. The body's original form (block or single
+/// expression) is preserved so a value-returning composable keeps its result.
+pub fn transformThreadedComposable(
+    a: std.mem.Allocator,
+    f: *const Function,
+    oracle: ComposableOracle,
+    oracle_ctx: *anyopaque,
+    sinks: ?*const std.StringHashMap(void),
+) std.mem.Allocator.Error!Function {
+    const b = B{ .a = a, .gen_span = f.span };
+    var params = try a.alloc(Param, f.params.len + 2);
+    @memcpy(params[0..f.params.len], f.params);
+    params[f.params.len] = b.param(composer_param, b.typeRef("Composer"));
+    params[f.params.len + 1] = b.param(changed_param, b.typeRef("Int"));
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks };
+    const body = f.body orelse return signatureOnly(f, params);
+    switch (body) {
+        .Block => |blk| {
+            const stmts = try a.dupe(Stmt, blk.stmts);
+            for (stmts) |*s| try w.walkStmt(s);
+            return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = blk.span } });
+        },
+        .Expr => |e| {
+            var ne = e;
+            try w.walkExpr(&ne);
+            return withBody(f, params, .{ .Expr = ne });
+        },
+    }
 }
 
 /// Recursive in-place body transformer. Within a `@Composable` function body it
