@@ -1,0 +1,187 @@
+name: release
+
+# Release artifacts for `klio bundle` (docs/BUNDLE.md): per target, the
+# runtime stub (the klio binary itself, ReleaseFast + stripped) and the
+# Skia shim blob. The six stubs cross-compile from one Linux runner (Zig
+# cross-compiles the interpreter freely; the build-time tools compile for
+# the host); the shim cannot cross-compile — each OS's C++ driver links
+# the prebuilt Skia archives against that OS's ABI — so a shim job runs
+# per OS. A final job computes stubs-manifest.json (artifact name ->
+# sha256); a tag build that bakes the manifest into the bundling binary
+# writes it over src/cli/stubs-manifest.json before building.
+#
+# Linux shims link SDL2 statically (scripts/fetch-sdl.sh) so bundles have
+# no libSDL2 install dependency; the builder image's glibc/libstdc++ set
+# the documented runtime floor.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  stubs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        target:
+          - { name: linux-x64, triple: x86_64-linux-gnu, exe: "" }
+          - { name: linux-arm64, triple: aarch64-linux-gnu, exe: "" }
+          - { name: macos-x64, triple: x86_64-macos, exe: "" }
+          - { name: macos-arm64, triple: aarch64-macos, exe: "" }
+          - { name: windows-x64, triple: x86_64-windows-gnu, exe: ".exe" }
+          - { name: windows-arm64, triple: aarch64-windows-gnu, exe: ".exe" }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - name: cache kotlin stdlib sources (kotlin/)
+        id: kotlin-src-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: kotlin
+          key: kotlin-src-${{ hashFiles('.gitmodules') }}-libraries-stdlib
+
+      - name: populate kotlin submodule (if not cached)
+        if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
+        run: ./scripts/init-kotlin-submodule.sh
+
+      - name: build stub
+        run: |
+          set -euo pipefail
+          VERSION="$(./scripts/klio-version.sh)"
+          zig build -Dtarget=${{ matrix.target.triple }} -Doptimize=ReleaseFast
+          mkdir -p dist
+          OUT="dist/klio-${VERSION}-${{ matrix.target.name }}${{ matrix.target.exe }}"
+          cp "zig-out/bin/klio${{ matrix.target.exe }}" "$OUT"
+          # Strip where the host strip understands the format (ELF). Safe:
+          # user-facing stack traces are Kotlin-level, rendered from spans.
+          case "${{ matrix.target.name }}" in
+            linux-*) strip "$OUT" ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stub-${{ matrix.target.name }}
+          path: dist/*
+
+  shim-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: fetch skia prebuilts + static SDL2
+        run: |
+          set -euo pipefail
+          ./scripts/fetch-skia.sh linux x64
+          ./scripts/fetch-sdl.sh
+      - name: build shim (static SDL2)
+        run: |
+          set -euo pipefail
+          VERSION="$(./scripts/klio-version.sh)"
+          zig build skia-lib -Dskia -Dsdl-static -Doptimize=ReleaseFast
+          mkdir -p dist
+          zstd -19 -o "dist/klio-skia-${VERSION}-linux-x64.zst" zig-out/lib/libklio_skia.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-linux-x64
+          path: dist/*
+
+  shim-macos:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+      - name: fetch skia prebuilts
+        run: ./scripts/fetch-skia.sh macos arm64
+      - name: build shim (Cocoa)
+        run: |
+          set -euo pipefail
+          VERSION="$(./scripts/klio-version.sh)"
+          zig build skia-lib -Dskia -Dcocoa -Doptimize=ReleaseFast
+          mkdir -p dist
+          zstd -19 -o "dist/klio-skia-${VERSION}-macos-arm64.zst" zig-out/lib/libklio_skia.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-macos-arm64
+          path: dist/*
+
+  shim-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip -o zig.zip
+          unzip -q zig.zip
+          echo "$PWD/zig-x86_64-windows-0.16.0" >> "$GITHUB_PATH"
+      - name: fetch skia prebuilts
+        shell: bash
+        run: ./scripts/fetch-skia.sh windows x64
+      - name: build shim (Win32, static CRT)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(./scripts/klio-version.sh)"
+          zig build skia-lib -Dskia -Doptimize=ReleaseFast
+          mkdir -p dist
+          zstd -19 -o "dist/klio-skia-${VERSION}-windows-x64.zst" zig-out/lib/klio_skia.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-windows-x64
+          path: dist/*
+
+  publish:
+    needs: [stubs, shim-linux, shim-macos, shim-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: stubs-manifest.json
+        run: |
+          set -euo pipefail
+          cd dist
+          python3 - <<'EOF'
+          import hashlib, json, os
+          out = {}
+          for name in sorted(os.listdir(".")):
+              if name == "stubs-manifest.json":
+                  continue
+              with open(name, "rb") as f:
+                  out[name] = hashlib.sha256(f.read()).hexdigest()
+          with open("stubs-manifest.json", "w") as f:
+              json.dump(out, f, indent=2, sort_keys=True)
+          EOF
+          cat stubs-manifest.json
+      # The manifest must be baked into the bundling binary
+      # (src/cli/stubs-manifest.json) for cross-target fetch verification:
+      # commit dist/stubs-manifest.json over that file and rebuild the tag.
+      - name: attach artifacts to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

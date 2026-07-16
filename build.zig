@@ -204,6 +204,10 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
     }, .weight = 15 },
+    // Cross-target bundling gate: stub + shim resolve via KLIO_STUB_DIR
+    // (no network), assembly is byte surgery, the fake-target bundle
+    // boots; the offline hint and --stub override are asserted.
+    .{ .name = "bundle_cross", .needs_exe = true, .weight = 10 },
     // UI bundle gate: the Skia shim embeds, extracts to the per-user
     // cache on first launch, and renders the headless pixel gate
     // byte-identically to a direct run (skips without the built shim).
@@ -470,15 +474,46 @@ pub fn build(b: *std.Build) void {
     // env override and the cwd checkout when present). Every source the
     // builder reads is declared as a run-step input, so editing a stdlib
     // `.kt` regenerates the embed on the next build.
+    //
+    // embed_gen RUNS at build time, so it always compiles for the build
+    // HOST — a `-Dtarget` cross build (the release stubs) reuses the
+    // target universe only when it coincides with the host, and otherwise
+    // gets its own host-target instances of embed_gen's module closure.
+    const host_resolved = b.resolveTargetQuery(.{});
+    const embed_gen_mods = blk: {
+        const cross_build = target.result.os.tag != host_resolved.result.os.tag or
+            target.result.cpu.arch != host_resolved.result.cpu.arch;
+        if (!cross_build) break :blk mods;
+        var host_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
+        for (mod_list) |m| {
+            const mod = b.createModule(.{
+                .root_source_file = b.path(modSource(b, m)),
+                .target = host_resolved,
+                .optimize = optimize,
+            });
+            host_mods.put(m.name, mod) catch @panic("oom");
+        }
+        for (mod_list) |m| {
+            const mod = host_mods.get(m.name).?;
+            for (m.deps) |d| mod.addImport(d, host_mods.get(d).?);
+        }
+        const zstd_host = buildZstd(b, host_resolved, optimize);
+        const pack_host = host_mods.get("pack").?;
+        pack_host.link_libc = true;
+        pack_host.linkLibrary(zstd_host);
+        host_mods.get("compose_ui").?.link_libc = true;
+        host_mods.get("ir").?.link_libc = true;
+        break :blk host_mods;
+    };
     const embed_gen = b.addExecutable(.{
         .name = "stdlib-embed-gen",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/stdlib_pack/embed_gen.zig"),
-            .target = target,
+            .target = host_resolved,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "pack", .module = mods.get("pack").? },
-                .{ .name = "stdlib", .module = mods.get("stdlib").? },
+                .{ .name = "pack", .module = embed_gen_mods.get("pack").? },
+                .{ .name = "stdlib", .module = embed_gen_mods.get("stdlib").? },
             },
         }),
     });

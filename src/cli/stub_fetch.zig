@@ -24,10 +24,11 @@ const runtime = @import("runtime");
 const pack = @import("pack");
 const io = @import("io.zig");
 
-/// Release-baked `name -> sha256` manifest (JSON). Empty in dev builds:
-/// the release workflow generates `release/stubs-manifest.json` and the
-/// tag build embeds it through this hook.
-pub const baked_manifest_json: []const u8 = "";
+/// Release-baked `name -> sha256` manifest (JSON object of
+/// `"artifact-name": "hex-sha256"`). The committed placeholder is empty
+/// (`{}`) so dev builds refuse to fetch; the release workflow writes the
+/// real manifest over `src/cli/stubs-manifest.json` for the tag build.
+pub const baked_manifest_json: []const u8 = @embedFile("stubs-manifest.json");
 
 const RELEASE_URL_BASE = "https://github.com/klio-lang/klio/releases/download";
 
@@ -162,9 +163,7 @@ fn fetchIntoCache(
     if (res.status != .ok) return null;
     const bytes = body.written();
 
-    var got: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &got, .{});
-    if (!std.mem.eql(u8, &got, &expect_hash)) {
+    if (!verifySha256(bytes, expect_hash)) {
         io.printStderr(gpa, "error: fetched {s} fails sha256 verification; refusing it\n", .{name});
         return null;
     }
@@ -180,11 +179,22 @@ fn fetchIntoCache(
     return dest;
 }
 
+/// Fetched-artifact integrity: sha256 must match the release manifest.
+fn verifySha256(bytes: []const u8, expect: [32]u8) bool {
+    var got: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &got, .{});
+    return std.mem.eql(u8, &got, &expect);
+}
+
 /// Look `name` up in the baked release manifest. The manifest is a flat
 /// JSON object of `"artifact-name": "hex-sha256"`.
 fn manifestSha256(gpa: Allocator, name: []const u8) ?[32]u8 {
-    if (baked_manifest_json.len == 0) return null;
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, baked_manifest_json, .{}) catch return null;
+    return manifestSha256In(gpa, baked_manifest_json, name);
+}
+
+fn manifestSha256In(gpa: Allocator, json: []const u8, name: []const u8) ?[32]u8 {
+    if (json.len == 0) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch return null;
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |o| o,
@@ -215,4 +225,21 @@ test "artifact names follow the release convention" {
 
 test "manifest lookup is absent in dev builds" {
     try std.testing.expect(manifestSha256(std.testing.allocator, "klio-0.1.0-linux-x64") == null);
+}
+
+test "sha256 verification accepts a match and refuses a mismatch" {
+    const gpa = std.testing.allocator;
+    const payload = "stub artifact bytes";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const json = try std.fmt.allocPrint(gpa, "{{\"klio-0.1.0-linux-arm64\": \"{s}\"}}", .{hex});
+    defer gpa.free(json);
+
+    const expect = manifestSha256In(gpa, json, "klio-0.1.0-linux-arm64").?;
+    try std.testing.expect(verifySha256(payload, expect));
+    // A tampered artifact is refused.
+    try std.testing.expect(!verifySha256("stub artifact bytez", expect));
+    // An artifact absent from the manifest never verifies.
+    try std.testing.expect(manifestSha256In(gpa, json, "klio-0.1.0-macos-x64") == null);
 }
