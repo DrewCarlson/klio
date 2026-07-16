@@ -466,7 +466,14 @@ fn transformDecl(
                 // `setContent { … }` composable-lambda argument is transformed.
                 const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
                 const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
-                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params };
+                // A NON-composable fn can still take `@Composable`-typed
+                // lambda params (`movableContentOf(content)`): a bare
+                // `content()` inside one of its composable lambdas (the
+                // ctor-sink wrapper `MovableContent({ content() })`) is a
+                // composable call and must thread.
+                const lp = a.create(std.StringHashMap(void)) catch @panic("oom");
+                lp.* = try composableLambdaParamNames(a, f);
+                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp };
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (ret_composable and e.* == .Lambda) {
