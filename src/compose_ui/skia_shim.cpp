@@ -36,6 +36,8 @@
 #include "include/core/SkStream.h"
 #include "include/core/SkSurface.h"
 #include "include/core/SkTypeface.h"
+#include "include/codec/SkCodec.h"
+#include "include/codec/SkPngDecoder.h"
 #include "include/encode/SkPngEncoder.h"
 #include "include/effects/SkGradient.h"
 #include "include/pathops/SkPathOps.h"
@@ -1433,6 +1435,28 @@ void klio_win_set_title(KlioWindow* kw, const char* title) {
     SDL_SetWindowTitle(kw->win, title);
 }
 
+// Set the window icon from encoded PNG bytes (a bundle's `--icon`). The PNG
+// decodes through Skia's codec into RGBA and hands SDL a borrowed-pixel
+// surface; SDL copies it, so both are released before returning.
+void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len) {
+    if (!kw || !kw->win || !png || len == 0) return;
+    sk_sp<SkData> data = SkData::MakeWithoutCopy(png, len);
+    std::unique_ptr<SkCodec> codec = SkPngDecoder::Decode(data, nullptr);
+    if (!codec) return;
+    SkImageInfo info = codec->getInfo()
+                           .makeColorType(kRGBA_8888_SkColorType)
+                           .makeAlphaType(kUnpremul_SkAlphaType);
+    SkBitmap bm;
+    if (!bm.tryAllocPixels(info)) return;
+    if (codec->getPixels(info, bm.getPixels(), bm.rowBytes()) != SkCodec::kSuccess) return;
+    SDL_Surface* surf = SDL_CreateRGBSurfaceWithFormatFrom(
+        bm.getPixels(), info.width(), info.height(), 32,
+        static_cast<int>(bm.rowBytes()), SDL_PIXELFORMAT_RGBA32);
+    if (!surf) return;
+    SDL_SetWindowIcon(kw->win, surf);
+    SDL_FreeSurface(surf);
+}
+
 // Resize the native window; the surface follows via the routed
 // SIZE_CHANGED event (or immediately, so a frame drawn before the event
 // lands still targets the new extent).
@@ -1749,6 +1773,14 @@ void klio_win_set_title(KlioWindow* kw, const char* title) {
     SetWindowTextA(kw->hwnd, title);
 }
 
+// Window icon from PNG bytes: decode + HICON via WM_SETICON belongs to the
+// Windows bring-up alongside the PE icon-resource patcher; no-op until then.
+void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len) {
+    (void)kw;
+    (void)png;
+    (void)len;
+}
+
 void klio_win_set_size(KlioWindow* kw, int w, int h) {
     if (!kw || w <= 0 || h <= 0) return;
     RECT r = {0, 0, w, h};
@@ -1939,6 +1971,18 @@ void klio_win_set_title(KlioWindow* kw, const char* title) {
     if (!kw || !kw->window || !title) return;
     @autoreleasepool {
         [kw->window setTitle:[NSString stringWithUTF8String:title]];
+    }
+}
+
+// The app icon (Dock + Cmd-Tab) from encoded PNG bytes; NSImage decodes PNG
+// natively. Written alongside the rest of the Cocoa backend, unverified here.
+void klio_win_set_icon_png(KlioWindow* kw, const unsigned char* png, size_t len) {
+    (void)kw;
+    if (!png || len == 0) return;
+    @autoreleasepool {
+        NSData* data = [NSData dataWithBytes:png length:len];
+        NSImage* img = [[NSImage alloc] initWithData:data];
+        if (img) [NSApp setApplicationIconImage:img];
     }
 }
 
@@ -2209,6 +2253,7 @@ int klio_win_poll(void*, int, int*, int*) { return 2; }
 void klio_win_close(void*) {}
 void klio_win_set_title(void*, const char*) {}
 void klio_win_set_size(void*, int, int) {}
+void klio_win_set_icon_png(void*, const unsigned char*, size_t) {}
 }  // extern "C"
 
 #endif

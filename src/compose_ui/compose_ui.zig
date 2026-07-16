@@ -202,6 +202,8 @@ const Skia = struct {
     winSetResizeCb: ?ResizeCbFn,
     winSetTitle: ?*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void,
     winSetSize: ?*const fn (?*SkWindow, c_int, c_int) callconv(.c) void,
+    /// Optional: window icon from encoded PNG bytes (a bundle's `--icon`).
+    winSetIconPng: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
 };
 
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
@@ -336,6 +338,7 @@ fn loadSkia() ?*Skia {
         // Optional (older shims lack them): recomposition-driven window params.
         .winSetTitle = lib.lookup(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
         .winSetSize = lib.lookup(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
+        .winSetIconPng = lib.lookup(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
     };
     skia_state = s;
     return &skia_state.?;
@@ -346,7 +349,37 @@ fn skiaLoadFail(lib: *std.DynLib) ?*Skia {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Bundle-mode configuration: a bundle boot installs the extracted shim's
+// path, the app name (the default window title), and the window-icon PNG
+// before the program runs. All set-up-time, read-only during execution.
+// ---------------------------------------------------------------------------
+
+var skia_lib_override: ?[]const u8 = null;
+var window_icon_png: ?[]const u8 = null;
+var default_window_title: ?[:0]const u8 = null;
+
+/// Load the Skia shim from this exact path (highest priority, ahead of
+/// `KLIO_SKIA_LIB`). The slice must outlive the process.
+pub fn setSkiaLibPath(path: []const u8) void {
+    skia_lib_override = path;
+}
+
+/// PNG bytes applied as the window icon when each window opens. The
+/// slice must outlive the process (a bundle's mmap qualifies).
+pub fn setWindowIconPng(png: []const u8) void {
+    window_icon_png = png;
+}
+
+/// Title used when the program opens a window without naming one.
+pub fn setDefaultWindowTitle(title: [:0]const u8) void {
+    default_window_title = title;
+}
+
 fn openSkiaLib() ?std.DynLib {
+    if (skia_lib_override) |p| {
+        if (std.DynLib.open(p)) |l| return l else |_| {}
+    }
     if (runtime.getenvSlice("KLIO_SKIA_LIB")) |p| {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
@@ -547,9 +580,18 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
     const h: c_int = @intCast(@max(1, argInt(ctx.args[1])));
     const tg = ctx.args[2].String.borrow();
     defer tg.deinit();
-    const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{tg.get().bytes}, 0) catch return ok(Value.newLong(0));
+    // A window the program leaves untitled takes the bundle's app name.
+    const kotlin_title = tg.get().bytes;
+    const title_bytes = if (kotlin_title.len == 0)
+        (default_window_title orelse kotlin_title)
+    else
+        kotlin_title;
+    const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{title_bytes}, 0) catch return ok(Value.newLong(0));
     defer ctx.allocator.free(title_z);
     const win = skia.winOpen(w, h, title_z.ptr) orelse return ok(Value.newLong(0));
+    if (window_icon_png) |png| {
+        if (skia.winSetIconPng) |set_icon| set_icon(win, png.ptr, png.len);
+    }
     return ok(Value.newLong(@bitCast(@as(u64, @intFromPtr(win)))));
 }
 

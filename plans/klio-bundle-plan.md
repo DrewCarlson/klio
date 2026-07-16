@@ -1,7 +1,90 @@
 # `klio bundle` — single-executable programs
 
-Status: design, ready to implement from M1. Supersedes the Rust-era
-"Phase 14 — Application packs" section of
+## Status
+
+FULL LINUX SUPPORT LANDED and gated (`zig build itest-bundle_smoke`,
+`itest-bundle_ui`, `itest-bundle_cross`; `bundle_smoke` in
+`scripts/gate.sh`). Windows/macOS are clean drop-ins: their probe
+positions and patcher call sites are marked extension points in
+`src/cli/bundle_boot.zig`, the Cocoa/Win32 icon entries exist in
+`skia_shim.cpp`, and the release workflow already carries their shim
+jobs. User docs: `docs/BUNDLE.md`.
+
+Landed (in commit order):
+
+- Bundle core + program surface: `src/pack/bundle_format.zig` (trailer +
+  section table + `BundleManifest`, blake3 payload hash, 16 KiB mmap
+  alignment), `src/cli/bundle.zig` (assembly + verification),
+  `src/cli/bundle_boot.zig` (probe before CLI dispatch; argv belongs to
+  the program; `~/.klio` never consulted; exact refusal messages;
+  `KLIO_BUNDLE_INSPECT`). Float encode/decode in `image.zig` and the
+  pack codec normalized to explicit little-endian (byte-asserted).
+  argv[1..] → `main(args)` (also fixes `klio run` binding Unit),
+  `kotlin.system.exitProcess`, stdin passthrough, `--include` resources
+  + the `klio.bundle` pack (`kotlin-klio/klio-bundle`) served from the
+  executable's mmap. Manifest replay: known-packages snapshot, platform
+  binding FQNs, pack host bindings as `(fqn, host symbol)` pairs (hard
+  error on an unresolvable symbol).
+- UI bundles: shim embedded zstd'd; content-addressed extraction
+  (`src/cli/shim_extract.zig`, `$XDG_CACHE_HOME/klio/shim/<blake3-16>/`,
+  atomic rename, temp-dir fallback, headless + one stderr line when
+  unwritable); explicit shim-path override ahead of `KLIO_SKIA_LIB` in
+  `compose_ui.zig`; `klio_win_set_icon_png` (SDL real, Cocoa written,
+  Win32 with the PE milestone) + untitled windows take `--name`; flavor
+  auto-detect off the pack fixpoint; `scripts/fetch-sdl.sh` +
+  `-Dsdl-static` (release CI; dev keeps dynamic SDL2). Project mode
+  (`[application]` in klio.toml: name/icon/include/main with single-main
+  discovery, whole source set), `--dry-run`, `--desktop-dir`.
+- Whole-program image: `buildProgramBase` + main serialized in the image
+  (FORMAT_VERSION 21); boot is mmap → load → run, zero re-lowering.
+  Gated by a min-of-three timing scenario (bundle ≤ warm run). Bake
+  refusal falls back to base-image + program-src, recorded in the
+  manifest; `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces it.
+
+Measured on linux-x64, ReleaseFast + strip (the release shape):
+
+| artifact | size | boot |
+|---|---|---|
+| stub (`klio`, stripped) | 15.1 MB | — |
+| hello bundle | 23.4 MB | 20 ms (warm `klio run`: 27 ms) |
+| kotlinx.serialization bundle | 24.5 MB | 24 ms |
+| Compose UI bundle (klio.compose.ui set + shim) | 44.3 MB | 119 ms first launch (incl. shim extraction), 100 ms warm to a rendered PNG |
+- Cross-target: `src/cli/stub_fetch.zig` (--stub → KLIO_STUB_DIR →
+  ~/.klio/stubs cache → HTTPS fetch verified against the baked
+  `src/cli/stubs-manifest.json`, an empty placeholder in dev builds);
+  build-time tools now compile for the HOST so `zig build -Dtarget=...`
+  produces real cross stubs (aarch64 ELF verified);
+  `.github/workflows/release.yml` (six stubs from one Linux runner,
+  three per-OS shim jobs, manifest generation).
+
+Deviations from the letter of the design (rationale):
+
+- The two image sections are mutually exclusive: a successful program
+  bake drops the base image (boot never reads it; keeping it doubled the
+  payload). `program-src` is always embedded.
+- A program that redeclares a base name refuses to bundle with a clear
+  error (the run path's whole-program fallback has no base image to
+  embed); the silent-fallback language applies to the program-image bake
+  only.
+- Each bake attempt performs its own dependency load: lowering mutates
+  the parsed ASTs and baking strips dead AST bodies, so AST reuse across
+  lowers corrupted the second image (pack methods lowered to empty
+  bodies).
+- `zstd` gained `frameContentSize` for release shim artifacts shipped as
+  bare frames; `scripts/zigcheck.py`'s module graph caught up with
+  compose_pass/compose_ui.
+
+Remaining for Windows (M6): `src/cli/pe_patch.zig` (GUI-subsystem flip +
+checksum, icon resource), the cert-table-aware trailer probe (seam in
+`bundle_boot.probeSelfInner`), `GetModuleFileNameW` self-path, Win32
+backend verification, CI job. Remaining for macOS (M7):
+`src/cli/macho_sign.zig` (__LINKEDIT extension + ad-hoc CodeDirectory),
+the `LC_CODE_SIGNATURE`-aware probe (same seam), `--app-dir` emitter,
+Cocoa verification. Follow-ons noted, not committed: IR-level
+tree-shaking of unreferenced pack decls; AppImage layering.
+
+The original design (all decisions committed) follows. It supersedes the
+Rust-era "Phase 14 — Application packs" section of
 [`PACK-DISTRIBUTION.md`](./PACK-DISTRIBUTION.md) (its locked decisions
 carry over and are restated here against the Zig codebase).
 

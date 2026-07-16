@@ -868,6 +868,19 @@ fn runBuiltModule(
     map: *const SourceMap,
     no_main_msg: []const u8,
 ) u8 {
+    return runBuiltModuleArgs(gpa, built_in, bindings, map, no_main_msg, &.{});
+}
+
+/// `runBuiltModule` with the program argv `main(args: Array<String>)`
+/// receives (a bundle's argv[1..]; empty under `klio run`).
+pub fn runBuiltModuleArgs(
+    gpa: std.mem.Allocator,
+    built_in: interp_ir.build.BuiltModule,
+    bindings: HostBindings,
+    map: *const SourceMap,
+    no_main_msg: []const u8,
+    program_args: []const []const u8,
+) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
@@ -892,6 +905,7 @@ fn runBuiltModule(
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
     var vm = fb.vm;
     defer vm.deinit();
+    vm.program_args = program_args;
     vm.setInstalledBindings(bindings) catch return 1;
 
     const main = main_id orelse {

@@ -24,6 +24,7 @@ extern fn ZSTD_decompress(
 ) usize;
 extern fn ZSTD_isError(code: usize) c_uint;
 extern fn ZSTD_getErrorName(code: usize) [*:0]const u8;
+extern fn ZSTD_getFrameContentSize(src: [*]const u8, srcSize: usize) c_ulonglong;
 
 extern fn ZSTD_createCCtx() ?*anyopaque;
 extern fn ZSTD_freeCCtx(cctx: ?*anyopaque) usize;
@@ -95,6 +96,16 @@ pub fn decompress(allocator: Allocator, src: []const u8, uncompressed_len: usize
     return dst;
 }
 
+/// Decompressed content size declared by a standalone zstd frame's
+/// header, or null when the frame is malformed or omits it. Used for
+/// artifacts distributed as bare frames (no directory carries the size).
+pub fn frameContentSize(src: []const u8) ?usize {
+    const size = ZSTD_getFrameContentSize(src.ptr, src.len);
+    // -1 = unknown, -2 = error (per zstd.h contract).
+    if (size == std.math.maxInt(c_ulonglong) or size == std.math.maxInt(c_ulonglong) - 1) return null;
+    return std.math.cast(usize, size) orelse null;
+}
+
 /// Compress `src` against `dict`. The caller owns the returned frame.
 pub fn compressDict(allocator: Allocator, src: []const u8, dict: []const u8, level: i32) ZstdError![]u8 {
     const cctx = ZSTD_createCCtx() orelse return error.OutOfMemory;
@@ -151,6 +162,15 @@ test "round trips bytes through the vendored zstd" {
     const back = try decompress(a, packed_bytes, src.len);
     defer a.free(back);
     try std.testing.expectEqualSlices(u8, src, back);
+}
+
+test "frame content size reads back from a bare frame" {
+    const a = std.testing.allocator;
+    const src = "frame content size probe " ** 8;
+    const frame = try compress(a, src, 3);
+    defer a.free(frame);
+    try std.testing.expectEqual(@as(?usize, src.len), frameContentSize(frame));
+    try std.testing.expect(frameContentSize("not a zstd frame") == null);
 }
 
 test "round trips against a dictionary" {
