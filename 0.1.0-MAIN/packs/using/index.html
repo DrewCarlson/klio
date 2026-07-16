@@ -1675,7 +1675,9 @@ loaded after the stdlib pack and before the cached packs.</p>
 <p>A pack can gate parts of its source behind named features
 (<code>[features]</code> in its <code>klio.toml</code>). Nothing gated loads by default;
 enable a feature per run with <code>--feature &lt;pack&gt;/&lt;feature&gt;</code>
-(repeatable, accepted by <code>klio run</code>, <code>klio test</code>, and <code>klio check</code>):</p>
+(repeatable, accepted by <code>klio run</code>, <code>klio test</code>, <code>klio check</code>, and
+<code>klio bundle</code> — which bakes the choice into the
+<a href="../../BUNDLE/">bundled executable</a>):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>kotlinx.serialization/json<span class="w"> </span>app.kt
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>io.ktor/client<span class="w"> </span>fetch.kt
 </code></pre></div>
