@@ -12,6 +12,7 @@ const build = @import("../build.zig");
 const decl = @import("decl.zig");
 const expr_mod = @import("expr.zig");
 const ast_scan = @import("ast_scan.zig");
+const literals = @import("literals.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -69,10 +70,20 @@ fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
 }
 
 pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Allocator.Error!FuncId {
+    return lowerExprAsThunkTyped(module, expr, name, null);
+}
+
+/// As [`lowerExprAsThunk`], seeding the declared type as the body's
+/// tail-position expected type: `var g: Long = 0` widens its literal
+/// exactly as a local `val x: Long = 0` does.
+pub fn lowerExprAsThunkTyped(module: *Module, expr: *const Expr, name: []const u8, expected: ?TypeRef) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
     try consumePendingCtx(&b);
-    const v = try lowerExpr(&b, expr);
+    const prev = b.pushExpected(expected);
+    const widened: ?Expr = if (expected) |*ty| literals.widenNumericLiteral(expr, ty) else null;
+    const v = try lowerExpr(&b, if (widened) |*w| w else expr);
+    b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
     return pushFunc(module, func);
@@ -356,7 +367,10 @@ fn lowerAccessorExprFull(
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     try bindParams(&b, params);
     const prev = b.pushExpected(expected);
-    const v = try lowerExpr(&b, expr);
+    // `var first: Long = 0` — the initializer literal takes the property's
+    // declared type, exactly as a local `val x: Long = 0` does.
+    const widened: ?Expr = if (expected) |*ty| literals.widenNumericLiteral(expr, ty) else null;
+    const v = try lowerExpr(&b, if (widened) |*w| w else expr);
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());

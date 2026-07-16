@@ -2866,7 +2866,7 @@ fn buildModuleWithOverrides(
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_tp_pkg);
         if (p.init) |*init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
-            const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
+            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, p.ty);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
     }
@@ -2895,7 +2895,7 @@ fn buildModuleWithOverrides(
             p.name.name;
         if (storage_init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
-            const fid = try ir.lower.lowerExprAsThunk(module, init, nm);
+            const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, p.ty);
             // Annotated: default from the declared type. Unannotated: infer
             // from a trivially-typed literal initializer so a forward read
             // observes the typed field default (matching kotlinc) instead of
