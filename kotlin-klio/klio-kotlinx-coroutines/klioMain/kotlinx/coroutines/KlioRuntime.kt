@@ -22,6 +22,8 @@ internal fun __kxco_parkSlot(slot: Long) {}
 internal fun __kxco_armSlot(slot: Long) {}
 internal fun __kxco_resumeSlot(slot: Long) {}
 internal fun __kxco_systemProperty(name: String): String? = null
+internal fun __kxco_pushScope(scope: Any?) {}
+internal fun __kxco_popScope() {}
 internal fun __kxco_rbPump(scope: Any?, block: () -> Unit) { block() }
 
 // Host intrinsic: remove a channel waiter parked on `slot` and resume its
@@ -140,7 +142,22 @@ private class KlioBlockingCoroutine<T>(
 
 internal object KlioDispatcher : CoroutineDispatcher(), Delay {
     override fun dispatch(context: CoroutineContext, block: Runnable) {
-        __kxco_spawn { block.run() }
+        // The dispatched segment runs with ITS coroutine as the active
+        // scope (the startBlock bracket for undispatched bodies): anything
+        // derived from the ambient scope — channel-cancellation arming,
+        // `coroutineContext` — must name THIS coroutine, not whatever a
+        // sibling activation leaked. The pop is skipped over a suspension
+        // unwind (the delta capture owns the entry then) and runs when the
+        // segment completes.
+        val job = context[Job]
+        __kxco_spawn {
+            if (job != null) __kxco_pushScope(job)
+            try {
+                block.run()
+            } finally {
+                if (job != null) __kxco_popScope()
+            }
+        }
     }
 
     override fun scheduleResumeAfterDelay(

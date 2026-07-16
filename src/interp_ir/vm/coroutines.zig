@@ -1374,8 +1374,19 @@ fn activeScopeDepth() usize {
 /// own (cancellation over-delivery). Returning them to the ParkedEntry
 /// keeps the live stack reflecting only running activations. Caller owns
 /// the returned slice (page-allocator). Empty when nothing was pushed.
+fn scopeDiagOn() bool {
+    return runtime.getenvSlice("KLIO_SCOPE_DIAG") != null;
+}
+fn scopeIdent(v: *const Value) usize {
+    return if (v.* == .Instance) v.Instance.identity() else 0;
+}
 fn captureScopeDelta(base: usize) []Value {
     const n = active_scope_stack.items.len;
+    if (scopeDiagOn() and n > base) {
+        std.debug.print("[scope] capture base={d} n={d}:", .{ base, n });
+        for (active_scope_stack.items[base..n]) |*v| std.debug.print(" {x}", .{scopeIdent(v)});
+        std.debug.print("\n", .{});
+    }
     if (n <= base) return &.{};
     const delta = coroStackAllocator().dupe(Value, active_scope_stack.items[base..n]) catch return &.{};
     active_scope_stack.shrinkRetainingCapacity(base);
@@ -1388,6 +1399,11 @@ fn captureScopeDelta(base: usize) []Value {
 /// `__klio_co_popScope` (from `startBlock`'s `finally`) balances these
 /// pushes when it finally completes; a re-suspension re-captures them.
 fn restoreScopeDelta(delta: []const Value) void {
+    if (scopeDiagOn() and delta.len != 0) {
+        std.debug.print("[scope] restore depth={d}:", .{active_scope_stack.items.len});
+        for (delta) |*v| std.debug.print(" {x}", .{scopeIdent(v)});
+        std.debug.print("\n", .{});
+    }
     for (delta) |s| active_scope_stack.append(coroStackAllocator(), s) catch {};
 }
 
@@ -1396,19 +1412,41 @@ fn restoreScopeDelta(delta: []const Value) void {
 /// intrinsic resolves to it. Only `Instance` scopes are pushed.
 const ActiveScopeGuard = struct {
     pushed: bool,
+    ident: usize = 0,
 
     fn enter(scope: *const Value) ActiveScopeGuard {
         if (scope.* == .Instance) {
+            if (scopeDiagOn())
+                std.debug.print("[scope] guard-enter depth={d} id={x}\n", .{ active_scope_stack.items.len, scopeIdent(scope) });
             active_scope_stack.append(coroStackAllocator(), scope.*) catch return .{ .pushed = false };
-            return .{ .pushed = true };
+            return .{ .pushed = true, .ident = scopeIdent(scope) };
         }
         return .{ .pushed = false };
     }
 
     fn leave(self: ActiveScopeGuard) void {
-        if (self.pushed and active_scope_stack.items.len != 0) {
-            _ = active_scope_stack.pop();
+        if (!self.pushed) return;
+        // Remove OUR OWN entry, topmost-first by identity — never a blind
+        // top pop. Activations interleave on this stack: the driven body's
+        // own `startBlock` pushes (or a nested drive's guard) can sit above
+        // this guard's entry when it unwinds, and popping the top removes
+        // THEIRS while leaking OURS — a later positional delta capture then
+        // adopts the leaked scope as another coroutine's own, and every
+        // resume of that coroutine restores the wrong scope (a channel
+        // cancellation armed through it binds to the wrong Job). If our
+        // entry is gone already (captured into a delta), remove nothing.
+        var i: usize = active_scope_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (scopeIdent(&active_scope_stack.items[i]) == self.ident) {
+                if (scopeDiagOn())
+                    std.debug.print("[scope] guard-leave idx={d} id={x}\n", .{ i, self.ident });
+                _ = active_scope_stack.orderedRemove(i);
+                return;
+            }
         }
+        if (scopeDiagOn())
+            std.debug.print("[scope] guard-leave id={x} (already captured)\n", .{self.ident});
     }
 };
 
@@ -2310,10 +2348,18 @@ pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
 /// Kotlin side (the pop is skipped over a suspension unwind and runs
 /// when the resumed body finally completes).
 pub fn coroutinePushScope(scope: *const Value) void {
+    if (scopeDiagOn())
+        std.debug.print("[scope] push depth={d} id={x}\n", .{ active_scope_stack.items.len, scopeIdent(scope) });
     active_scope_stack.append(coroStackAllocator(), scope.*) catch {};
 }
 
+pub fn coroutineScopeIdent(v: *const Value) usize {
+    return scopeIdent(v);
+}
+
 pub fn coroutinePopScope() void {
+    if (scopeDiagOn() and active_scope_stack.items.len != 0)
+        std.debug.print("[scope] pop depth={d} id={x}\n", .{ active_scope_stack.items.len - 1, scopeIdent(&active_scope_stack.items[active_scope_stack.items.len - 1]) });
     if (active_scope_stack.items.len != 0) {
         _ = active_scope_stack.pop();
     }
