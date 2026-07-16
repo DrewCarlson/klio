@@ -141,6 +141,25 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-17: **The 18-class hang family is FIXED — the plugin suite jumps to
+  926 passing with a single incomplete class (implicit hook: 445).** The root
+  (commit 2122f5c3): `resumePersistedOnTop` — the plugin-gated path that lets
+  the recomposer settle synchronously during a scheduler advance — silently
+  discarded every non-suspension error from the resumed activation
+  (`else => {}`). Any test body that THREW under the plugin evaporated: no
+  throw reached runTest, the coroutine's Job never completed, and structured
+  concurrency held the whole test tree forever. Throws and errors now land in
+  the owning pump's `pending_err` (the inline-resume protocol). Found by a
+  twelve-theory elimination (every probe recorded in the
+  klio-compose-plugin-triage memory) that ended with a step-marked MIRROR
+  test localizing the wedge inside `validate{}` and an A/B against the
+  implicit home proving the plugin path turned the same AssertionError into
+  a hang. Ratchet now 850 (bfe680f2). Remaining: one incomplete class (sweep
+  running), then the per-test failure triage of the now-honest suite, then
+  cutover (flip default, delete the implicit implementation, rebuild shipped
+  packs, pixel scenes).
+
+
 - 2026-07-16 (later): **$changed skipping + local composables land; the plugin
   suite passes 616 upstream tests vs the implicit hook's 445.** New itest
   `compose_plugin_commontest` (88cc3ea3) runs the full upstream suite against
