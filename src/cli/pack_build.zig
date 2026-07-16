@@ -1757,6 +1757,39 @@ test "parseLibraryToml reads header, deps, bindings, source, features" {
     try std.testing.expectEqualStrings("json", cfg.features.defs[0].name);
 }
 
+test "parseLibraryToml reads the application table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text =
+        \\[application]
+        \\name = "MyApp"
+        \\icon = "assets/icon.png"
+        \\main = "src/main.kt"
+        \\include = ["assets", "data/config.json:cfg.json"]
+        \\
+        \\[[source]]
+        \\root = "src"
+        \\
+    ;
+    const res = parseLibraryToml(a, text);
+    const cfg = switch (res) {
+        .ok => |c| c,
+        .err => return error.TestParseFailed,
+    };
+    try std.testing.expectEqualStrings("MyApp", cfg.application.name);
+    try std.testing.expectEqualStrings("assets/icon.png", cfg.application.icon);
+    try std.testing.expectEqualStrings("src/main.kt", cfg.application.main);
+    try std.testing.expectEqual(@as(usize, 2), cfg.application.include.len);
+    try std.testing.expectEqualStrings("data/config.json:cfg.json", cfg.application.include[1]);
+    // A manifest without the table parses to the empty default.
+    const bare = switch (parseLibraryToml(a, "[library]\nid = \"x\"\n")) {
+        .ok => |c| c,
+        .err => return error.TestParseFailed,
+    };
+    try std.testing.expectEqual(@as(usize, 0), bare.application.main.len);
+}
+
 test "parseLibraryToml folds multi-line arrays and inline-table features" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
