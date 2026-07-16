@@ -369,3 +369,71 @@ test "double-bundle output is byte-identical" {
     const second = try std.Io.Dir.cwd().readFileAlloc(c.io, two, c.a, .unlimited);
     try std.testing.expect(std.mem.eql(u8, first, second));
 }
+
+test "project mode: [application] table, multi-file sources, includes, discovered main" {
+    const c = try ctx();
+    const cwd = std.Io.Dir.cwd();
+    const proj = try freshDir(c.a, c.io, "proj");
+    try cwd.createDirPath(c.io, try std.fmt.allocPrint(c.a, "{s}/src", .{proj}));
+    try cwd.createDirPath(c.io, try std.fmt.allocPrint(c.a, "{s}/assets", .{proj}));
+    try cwd.writeFile(c.io, .{
+        .sub_path = try std.fmt.allocPrint(c.a, "{s}/klio.toml", .{proj}),
+        .data =
+        \\[application]
+        \\name = "GreetTool"
+        \\include = ["assets"]
+        \\
+        \\[[source]]
+        \\root = "src"
+        \\
+        ,
+    });
+    try cwd.writeFile(c.io, .{
+        .sub_path = try std.fmt.allocPrint(c.a, "{s}/src/main.kt", .{proj}),
+        .data =
+        \\import klio.bundle.Resources
+        \\fun main() {
+        \\    println(greeting() + " " + Resources.readText("assets/who.txt").trim())
+        \\}
+        \\
+        ,
+    });
+    try cwd.writeFile(c.io, .{
+        .sub_path = try std.fmt.allocPrint(c.a, "{s}/src/util.kt", .{proj}),
+        .data = "fun greeting(): String = \"hello\"\n",
+    });
+    try cwd.writeFile(c.io, .{
+        .sub_path = try std.fmt.allocPrint(c.a, "{s}/assets/who.txt", .{proj}),
+        .data = "project-world\n",
+    });
+
+    const desk = try freshDir(c.a, c.io, "desk");
+    const bundle_path = try bundleProgram(c, proj, "greet", &.{ "--desktop-dir", desk });
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
+    const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
+    try std.testing.expectEqual(@as(u32, 0), got.code);
+    try std.testing.expectEqualStrings("hello project-world\n", got.stdout);
+
+    // The manifest name reached the bundle and the desktop entry.
+    try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
+    defer _ = c.run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
+    const inspect = try runChild(c.a, c.io, c.run_env, null, &.{abs});
+    try std.testing.expect(std.mem.startsWith(u8, inspect.stdout, "bundle: GreetTool\n"));
+    const desktop = try cwd.readFileAlloc(c.io, try std.fmt.allocPrint(c.a, "{s}/GreetTool.desktop", .{desk}), c.a, .unlimited);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "[Desktop Entry]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "Name=GreetTool\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desktop, "Exec=") != null);
+}
+
+test "--dry-run prints the plan and writes nothing" {
+    const c = try ctx();
+    const out = try std.fmt.allocPrint(c.a, "{s}/dryrun_out", .{TMP_ROOT});
+    const r = try runChild(c.a, c.io, c.build_env, null, &.{
+        c.bin, "bundle", "examples/hello.kt", "-o", out, "--dry-run",
+    });
+    try std.testing.expectEqual(@as(u32, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "flavor: headless\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "base-image ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "projected size: ") != null);
+    try std.testing.expect((std.Io.Dir.cwd().statFile(c.io, out, .{}) catch null) == null);
+}
