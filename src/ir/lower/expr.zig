@@ -357,11 +357,26 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Member => return lowerMember(b, expr),
         .Index => |ix| {
-            // `r[a, b, ...]` → r.get(a, b, ...).
+            // `r[a, b, ...]` → r.get(a, b, ...). The `get` resolves against
+            // the receiver's STATIC type, as kotlinc does: carry the declared
+            // head so a runtime subtype's own generic `get<T>` cannot shadow
+            // the statically-visible member. `map[local]` on a
+            // `PersistentMap<CompositionLocal, ValueHolder>`-typed local must
+            // bind the plain map `get` (returning the holder), never
+            // `PersistentCompositionLocalHashMap.get<T>` (the composition-
+            // local READ, which returns the resolved value). A head that is
+            // not an ancestor of the runtime receiver disengages the static
+            // scope, so an imprecise head degrades to the unhinted walk.
             const recv = try lowerReceiver(b, ix.receiver);
             const run = try lowerArgRun(b, ix.args);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = "get" });
+            const static_recv: ?ConstId = blk: {
+                const t = argDeclTypeRef(b, ix.receiver) orelse break :blk null;
+                const head = std.mem.trimEnd(u8, t.name, "?");
+                if (head.len == 0) break :blk null;
+                break :blk try b.module.internConst(b.allocator, .{ .String = head });
+            };
             try b.push(.{ .CallMember = .{
                 .dst = dst,
                 .receiver = recv,
@@ -369,6 +384,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = &.{},
+                .static_recv = static_recv,
             } });
             return dst;
         },
