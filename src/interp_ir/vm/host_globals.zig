@@ -133,8 +133,10 @@ const ClaimOutcome = union(enum) {
     reentrant: ?Value,
     /// Another thread is constructing — wait and re-check.
     wait,
-    /// A previous construction failed; throw without retrying.
-    failed,
+    /// A previous construction failed; throw without retrying. Carries
+    /// the stashed original cause when this is the first throwing read to
+    /// reach the failure (take-once — later reads observe null).
+    failed: ?Value,
 };
 
 fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
@@ -147,7 +149,13 @@ fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
                 if (ip.thread == tid) return .{ .reentrant = ip.instance };
                 return .wait;
             },
-            .Failed => return .failed,
+            .Failed => |*f| {
+                const c = f.cause;
+                f.cause = null;
+                if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+                    std.debug.print("[init-debug] {s} failed-take cause={}\n", .{ key, c != null });
+                return .{ .failed = c };
+            },
         }
     }
     g.get().put(key, .{ .InProgress = .{ .thread = tid, .instance = null } }) catch return .wait;
@@ -206,7 +214,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         switch (claimObjectInit(self, name)) {
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
-            .failed => return .{ .err = try fileInitFailedThrow(allocator, null) },
+            .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
             .wait => {
                 std.atomic.spinLoopHint();
                 std.Thread.yield() catch {};
@@ -310,7 +318,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         },
         .err => |e| {
             initDebugLog(name, e);
-            markObjectFailed(self, name);
+            markObjectFailed(self, name, null);
             // First access surfaces the failure wrapped with the original
             // throwable as its cause; non-throw eval errors (an unresolved
             // call inside init) propagate as-is.
@@ -362,7 +370,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
         switch (claimObjectInit(self, fqn)) {
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
-            .failed => return .{ .err = try fileInitFailedThrow(allocator, null) },
+            .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
             .wait => {
                 std.atomic.spinLoopHint();
                 std.Thread.yield() catch {};
@@ -427,7 +435,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
         },
         .err => |e| {
             initDebugLog(fqn, e);
-            markObjectFailed(self, fqn);
+            markObjectFailed(self, fqn, null);
             switch (e) {
                 .Throw => |cause| return .{ .err = try fileInitFailedThrow(allocator, cause) },
                 else => return .{ .err = e },
@@ -438,13 +446,50 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
 
 /// Non-throwing gate for resolution chains that cannot carry an error
 /// (`lookupGlobal`, pack-native lookups). An init failure resolves to
-/// null here; the throwing read paths surface it.
+/// null here; the throwing read paths surface it. The swallowed wrapper's
+/// original cause is put back into the failed state so the first THROWING
+/// read still surfaces it — without this, a quiet gate driving the
+/// construction consumed the cause and every visible throw was cause-less.
 pub fn objectSingletonQuiet(self: *VmHost, name: []const u8) ?Value {
     const r = ensureObjectSingleton(self, name) catch return null;
     return switch (r) {
         .ok => |v| v,
-        .err => null,
+        .err => |e| blk: {
+            if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+                std.debug.print("[init-debug] {s} quiet-swallow err={s}\n", .{ name, @tagName(e) });
+            if (e == .Throw and e.Throw == .Exception) {
+                if (e.Throw.Exception.cause) |cause_cell| {
+                    const cause = (runtime.ValueBox{ .cell = cause_cell }).asPtr().*;
+                    restashObjectCause(self, name, cause);
+                }
+            }
+            break :blk null;
+        },
     };
+}
+
+/// Put a swallowed init-failure cause back into the `.Failed` state entry
+/// (keyed by the canonical object name), so the next throwing read's
+/// take-once still surfaces it.
+fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
+    // Canonical program-image key when the name registry knows it; the
+    // id-directed path marks failure under the raw FQN, so fall back to
+    // the raw key (the entry lookup below tolerates a miss either way).
+    const name = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().object_names.getKey(raw_name) orelse raw_name;
+    };
+    const g = self.object_states.borrowMut();
+    defer g.deinit();
+    if (g.get().getPtr(name)) |entry| {
+        if (entry.* == .Failed and entry.Failed.cause == null) {
+            if (runtime.reclaimEnabled()) cause.retain();
+            entry.Failed.cause = cause;
+            if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+                std.debug.print("[init-debug] {s} restash-cause\n", .{name});
+        }
+    }
 }
 
 /// Whether the (possibly not-yet-initialized) singleton class
@@ -524,10 +569,18 @@ fn clearObjectState(self: *VmHost, name: []const u8) void {
     _ = g.get().remove(name);
 }
 
-fn markObjectFailed(self: *VmHost, name: []const u8) void {
+/// Record a terminal init failure. `cause` (when set) is the original
+/// throwable, retained into the state table so the first THROWING read can
+/// surface it — the construction attempt may have been driven by a quiet
+/// resolution gate whose wrapper never reached user code. A throwing
+/// construction site passes null (it surfaces the cause itself).
+fn markObjectFailed(self: *VmHost, name: []const u8, cause: ?Value) void {
     const g = self.object_states.borrowMut();
     defer g.deinit();
-    g.get().put(name, .Failed) catch {};
+    if (cause) |c| {
+        if (runtime.reclaimEnabled()) c.retain();
+    }
+    g.get().put(name, .{ .Failed = .{ .cause = cause } }) catch {};
 }
 
 // -------------------------------------------------------------------------
@@ -925,7 +978,19 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                         const rr = ensureObjectSingletonById(self, cid) catch return null;
                         return switch (rr) {
                             .ok => |maybe| if (maybe) |v| (if (v == .Instance) v else null) else null,
-                            .err => null,
+                            // This lookup has no error channel; the throwing
+                            // read path re-surfaces the failure. Put the
+                            // swallowed wrapper's original cause back into
+                            // the failed state so that throw still carries it.
+                            .err => |e| blk: {
+                                if (e == .Throw and e.Throw == .Exception) {
+                                    if (e.Throw.Exception.cause) |cause_cell| {
+                                        const cause = (runtime.ValueBox{ .cell = cause_cell }).asPtr().*;
+                                        restashObjectCause(self, f, cause);
+                                    }
+                                }
+                                break :blk null;
+                            },
                         };
                     }
                     const published: ?Value = blk: {
@@ -1754,7 +1819,7 @@ test "object init gate: failed state throws the no-cause wrapper" {
         defer pg.deinit();
         try pg.get().object_names.put("O", {});
     }
-    markObjectFailed(&fx.host, "O");
+    markObjectFailed(&fx.host, "O", null);
     try testing.expect(claimObjectInit(&fx.host, "O") == .failed);
 
     const r = try ensureObjectSingleton(&fx.host, "O");
