@@ -1599,6 +1599,22 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+        // A fully-qualified class-with-companion in value position resolves to
+        // its companion singleton (Kotlin: `C` yields `C.Companion`), the same
+        // forwarding the bare-name arm applies. Without it `pkg.C` loaded the
+        // class value while bare `C` loaded the companion, so `pkg.C === C`
+        // was false and `context[ContinuationInterceptor]` (an interface with a
+        // named companion Key) missed the dispatcher element. The
+        // `<class-companion-or-self>` sentinel returns the companion when one
+        // exists and the class/object value otherwise, so a plain object or a
+        // companion-less class is unaffected.
+        const fqn_simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+        if (classWithCompanion(b, fqn_simple) and b.module.funcIdByFqn(fqn) == null) {
+            const comp = b.allocReg();
+            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+            try b.push(.{ .GetField = .{ .dst = comp, .receiver = dst, .field = sentinel } });
+            return comp;
+        }
         return dst;
     }
 
@@ -1899,6 +1915,27 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const dst = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = fqn });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+            // A fully-qualified class-with-companion in value position yields its
+            // companion singleton (Kotlin: `C` yields `C.Companion`), matching the
+            // bare-name arm. Without it `pkg.C` loaded the class value while bare
+            // `C` loaded the companion, so `pkg.C === C` was false and
+            // `context[ContinuationInterceptor]` (an interface with a named
+            // companion Key) missed the dispatcher element. The
+            // `<class-companion-or-self>` sentinel returns the companion when one
+            // exists and the class/object value otherwise, leaving a plain object
+            // or a companion-less class unchanged.
+            const fqn_simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            // A same-FQN factory function (`kotlinx.coroutines.Job` is both an
+            // interface with a companion `Key` AND a `fun Job()` factory) keeps
+            // the class value: as a call callee it is the factory, and a bare
+            // reference reaches its companion through explicit `.Key`. Only a
+            // companioned classifier with no such function forwards.
+            if (classWithCompanion(b, fqn_simple) and b.module.funcIdByFqn(fqn) == null) {
+                const comp = b.allocReg();
+                const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+                try b.push(.{ .GetField = .{ .dst = comp, .receiver = dst, .field = sentinel } });
+                return comp;
+            }
             return dst;
         }
     }
