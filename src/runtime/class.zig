@@ -390,14 +390,18 @@ pub const InstanceData = struct {
 
     pub fn get(self: *const InstanceData, name: []const u8) ?Value {
         for (self.fields.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) return f.value;
+            // Field names are interned program-lifetime strings, so an identical
+            // pointer is an identical name — a cheap integer compare that skips
+            // the byte scan on the common hit. The `eql` keeps correctness when
+            // the lookup name was not interned from the same table.
+            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return f.value;
         }
         return null;
     }
 
     pub fn set(self: *InstanceData, name: []const u8, v: Value) bool {
         for (self.fields.items) |*f| {
-            if (std.mem.eql(u8, f.name, name)) {
+            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {
                 f.value = v;
                 return true;
             }

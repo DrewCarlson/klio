@@ -8110,6 +8110,15 @@ fn methodArgSig(args: []const Value) ?u64 {
             .Short => 5, .Byte => 6,   .Char => 7,    .Bool => 8,
             .UInt => 9,  .ULong => 10, .UShort => 11, .UByte => 12,
             .Instance => 13,
+            // A `String` is always `kotlin.String` and a `Unit` always
+            // `kotlin.Unit`: their runtime shape fully fixes the type the
+            // overload walk sees, so folding a stable tag is sound and keeps
+            // the common String-argument calls (pervasive on the coroutine
+            // resume path) on the inline-cache fast path. `Null` stays
+            // uncacheable — it matches any nullable parameter, so its
+            // resolution is not a pure function of the value shape.
+            .String => 14,
+            .Unit => 15,
             else => return null,
         };
         h.update((&tag)[0..1]);

@@ -621,14 +621,41 @@ pub fn paramNames(fqn: []const u8) ?[]const []const u8 {
 }
 
 fn directParamLookup(fqn: []const u8) ?[]const []const u8 {
-    // The upstream mining produces multiple rows per FQN; the first non-empty
-    // hit is correct for the common case.
-    for (generated.stdlibSymbols()) |e| {
-        if (std.mem.eql(u8, e.fqn, fqn) and e.param_names.len != 0) {
-            return e.param_names;
-        }
+    // Indexed lookup. The upstream mining produces multiple rows per FQN; the
+    // first non-empty hit is correct for the common case, and that is exactly
+    // what `buildParamIndex` records (first insert wins). A linear scan here
+    // was O(total-symbols) per probe and dominated named-argument dispatch on
+    // hot paths (every coroutine resume probes several FQNs).
+    return paramIndex().get(fqn);
+}
+
+/// FQN -> declared parameter names, first non-empty row winning. Built once
+/// from `stdlibSymbols()`; the keys/values borrow the process-lifetime symbol
+/// slices, so the map is never freed.
+var param_index: std.StringHashMapUnmanaged([]const []const u8) = .empty;
+var param_index_lock = std.atomic.Value(u32).init(0);
+var param_index_done = std.atomic.Value(bool).init(false);
+
+fn paramIndex() *const std.StringHashMapUnmanaged([]const []const u8) {
+    if (param_index_done.load(.acquire)) return &param_index;
+    while (param_index_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
     }
-    return null;
+    defer param_index_lock.store(0, .release);
+    if (!param_index_done.load(.acquire)) {
+        buildParamIndex() catch {};
+        param_index_done.store(true, .release);
+    }
+    return &param_index;
+}
+
+fn buildParamIndex() std.mem.Allocator.Error!void {
+    const a = std.heap.page_allocator;
+    for (generated.stdlibSymbols()) |e| {
+        if (e.param_names.len == 0) continue;
+        const gop = try param_index.getOrPut(a, e.fqn);
+        if (!gop.found_existing) gop.value_ptr.* = e.param_names;
+    }
 }
 
 // -------------------------------------------------------------------------
