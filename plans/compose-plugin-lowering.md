@@ -141,6 +141,36 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-16 (later): **$changed skipping + local composables land; the plugin
+  suite passes 616 upstream tests vs the implicit hook's 445.** New itest
+  `compose_plugin_commontest` (88cc3ea3) runs the full upstream suite against
+  the ENGINE pack with KLIO_COMPOSE_PLUGIN=1 (ratchet 550; the implicit suite
+  re-verified at exactly 445 after all interpreter changes). Landed:
+  - **Skip calculus** (f16101e9): restartable composables probe every value
+    param through `$composer.changed(p)` after the defaults prologue, run the
+    body only when dirty/forced/not-skipping, else `skipToGroupEnd()`.
+    Vararg params conservatively always recompose; member/extension
+    composables probe `this` (strong-skip stance). Restartability now also
+    requires a Unit return — the wrap collapsed `collectAsState`-class
+    value-returning composables to Unit.
+  - **Local `@Composable` declarations** (a93a1a1e): collection walks function
+    bodies (lambdas included) and the body walker transforms local composable
+    fns — the upstream tests' house style (`compositionTest { @Composable fun
+    Reporter(..) {..} }`); the whole model-composition family previously died
+    silently mid-compose.
+  - Two more general fixes en route: a Long-typed property initialized with an
+    Int literal stores a Long in every property position (cc17a4c0, unblocked
+    BitVectorTests 6/6), and an inline factory never splices over a shadowing
+    constructor (5920072f, MutableVectorTest 104/104).
+  Per-test map of CompositionTests (124 methods): 26→29 pass with skipping,
+  74 still hang on a shared root — after the local-composable fix,
+  `testComponent` composes and FINALIZES through the GapComposer, then an
+  applied change-list op's stored lambda parks in `yield()` and the test-body
+  coroutine never resumes (the task-#46 teardown family). That dive is next;
+  the FAIL clusters (createEventLoop actual missing, HashMap(Map-instance),
+  snapshot lifecycle, SlotTableEditor DSL resolution) are mapped in
+  the memory file klio-compose-plugin-triage.
+
 - 2026-07-16: **Restart-driven recomposition WORKS end to end; all three
   `CompositionTests.remember*` tests pass under engine+plugin, on BOTH
   composers (gapbuffer + linkbuffer).** The teardown-hang family
