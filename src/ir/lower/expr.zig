@@ -6346,6 +6346,18 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
             if (nargs >= required and (has_vararg or nargs <= ps.len)) return true;
         }
     }
+    // Scope rule: a MEMBER of the enclosing class hierarchy is a nearer-scope
+    // candidate than a same-named foreign classifier — a bare `Test(...)`
+    // inside a class declaring `fun Test(...)` calls the member, never
+    // constructs an imported `kotlin.test.Test`. A class NESTED in the
+    // enclosing chain keeps constructor semantics: its bare name also sits in
+    // the member set, but a capitalized call to it is a constructor. Deciding
+    // `false` here routes the call through `CallMemberOrGlobal`, whose runtime
+    // scoring still reaches the constructor when no member actually binds.
+    if (runtime.getenvSlice("KLIO_SBC_TRACE") != null) {
+        std.debug.print("[sbc] {s} owner={s} own={} encl={} nested={}\n", .{ name, b.ownerClass() orelse "-", b.hasOwnMember(name), b.hasEnclosingMember(name), classNestedInEnclosing(b, cid) });
+    }
+    if (enclosingHasMemberNamed(b, name) and !classNestedInEnclosing(b, cid)) return false;
     if (lastArgIsLambda(args)) {
         // A trailing lambda routes to a same-named factory with a
         // function-typed param to receive it; only when none fits is it a ctor.
@@ -6391,6 +6403,31 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         }
     }
     return canonical_cant_take or !any_factory_applicable;
+}
+
+/// Whether the enclosing class scope (own members, outer-class members, or
+/// the supertype hierarchy) declares a member named `name`.
+fn enclosingHasMemberNamed(b: *FuncBuilder, name: []const u8) bool {
+    if (b.hasOwnMember(name) or b.hasEnclosingMember(name)) return true;
+    const oc = b.ownerClass() orelse return false;
+    const hs = b.module.registry.hierarchy_shadow_names.get(oc) orelse return false;
+    return hs.names.contains(name);
+}
+
+/// Whether class `cid` is declared inside the enclosing class chain (a
+/// nested/inner class of the class being lowered or of one of its outers).
+fn classNestedInEnclosing(b: *FuncBuilder, cid: ir.ClassId) bool {
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls_name = b.module.classes.items[cid.int()].name;
+    const enc = b.module.registry.enclosing_class.get(cls_name) orelse return false;
+    var owner = b.ownerClass();
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        if (std.mem.eql(u8, o, enc)) return true;
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    return false;
 }
 
 fn anyFunctionParam(params: []const ir.Param) bool {

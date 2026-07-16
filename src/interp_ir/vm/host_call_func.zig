@@ -1368,7 +1368,7 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
 /// composer hook must stand down entirely — otherwise it re-brackets every
 /// composable call and recurses without bound.
 var g_compose_plugin: ?bool = null;
-fn composePluginEnabled() bool {
+pub fn composePluginEnabled() bool {
     if (g_compose_plugin) |v| return v;
     const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
         v.len != 0 and !std.mem.eql(u8, v, "0")

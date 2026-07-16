@@ -111,6 +111,9 @@ Run any program with:
 | `delegated_member_named_args.kt` | Class delegation serving a member invoked with named arguments binds parameters by name through the forward. |
 | `positional_lambda_binding.kt` | Two positional lambdas with a defaulted third lambda parameter bind positionally; the trailing-lambda shift fires only when the callable does not fit its positional slot. |
 | `companion_import_identity.kt` | A named companion-member import aliases the same value as the qualified read and outranks a same-named class in expression position. |
+| `member_shadows_imported_class.kt` | A member function named like an imported class wins the bare call from the method body, lambdas, nested lambdas, and coroutine blocks — never the imported constructor. |
+| `inline_member_owner_pick.kt` | A bare call inside an extension splices the receiver class's own `internal inline` member, not a same-named member of an unrelated class that registered first. |
+| `block_body_returns_unit.kt` | A block-bodied function with no `return` yields Unit, never its last statement's value. |
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `typealias.kt`                | `typealias`.                                                |

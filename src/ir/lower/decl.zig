@@ -1290,7 +1290,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     var result: ?ir.Reg = null;
     if (f.body) |body| {
         switch (body) {
-            .Block => |*blk| result = try mod.lowerBlock(&b, blk),
+            .Block => |*blk| {
+                // A block body's fall-through returns Unit, never the tail
+                // statement's value — `fun f() { 42 }` returns Unit in Kotlin
+                // (an explicit `return` terminates before reaching here).
+                // Leaking the tail value broke callers that null-test a
+                // Unit-typed call: Compose's `block?.invoke(c, 1) ?:
+                // error("Invalid restart scope")` saw the restart-wrapped
+                // body's trailing `endRestartGroup()?.updateScope(..)` null.
+                _ = try mod.lowerBlock(&b, blk);
+            },
             .Expr => |*e| {
                 // An expression body has no statements, so mark its source
                 // position here (stack-trace support) — without this a frame

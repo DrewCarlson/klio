@@ -4260,6 +4260,23 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                         orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
                         v = gv;
                     } else {
+                        // A top-level `val` declared with only a custom getter
+                        // has no global binding; re-run its 0-arg getter, as
+                        // the plain LoadGlobal tail does — a receiver-context
+                        // read of `currentRecomposeScope` must resolve exactly
+                        // like a top-level one.
+                        if (comptime @hasDecl(H, "callFunc")) {
+                            if (frame.module.registry.top_level_prop_getters.get(bare_name)) |getter_fid| {
+                                switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
+                                    .ok => |gv2| {
+                                        orAudit("LoadFromThisOrGlobal", bare_name, "toplevel_getter", -1, null);
+                                        try frame.write(lt.dst, gv2);
+                                        return .cont;
+                                    },
+                                    .err => |e| return raiseStep(frame, e),
+                                }
+                            }
+                        }
                         const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                         if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
                             if (std.mem.eql(u8, w, bare_name)) {
@@ -4468,8 +4485,31 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // `HttpResponseValidator { … }` is an extension on HttpClientConfig), so
     // the member/extension passes are skipped only when the name really
     // names a class.
-    const is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
+    var is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
         cmg.class != null;
+    // A capitalized name that is ALSO a method of the implicit receiver is a
+    // nearer-scope member call, not a constructor (`Test(...)` inside a class
+    // declaring `fun Test(...)` next to an imported `kotlin.test.Test`): run
+    // the member passes; the constructor stays the fallback when no member
+    // binds.
+    if (is_ctor_name and this_val != .Null and this_val != .Unit) refine: {
+        // The nearest receiver carrying the member may sit deeper in the
+        // implicit chain than the innermost `this` (a suspend block's
+        // innermost receiver is the coroutine, not the declaring class).
+        const rcands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
+        defer allocator.free(rcands);
+        for (rcands) |c| {
+            if (c.v != .Null and c.v != .Unit and host.hostHasMember(&c.v, name_str)) {
+                is_ctor_name = false;
+                break :refine;
+            }
+        }
+    }
+    if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name_str)) {
+            std.debug.print("[cmg] {s} this_tag={s} ctor_name={} in_fn={s} this_idx={d} ncaps={d}\n", .{ name_str, @tagName(std.meta.activeTag(this_val)), is_ctor_name, frame.func.name, cmg.this_idx, frame.captures.items.len });
+        }
+    }
     var committed_ext_h: ?FuncId = null;
     var committed_recv_h: ?Value = null;
     var resolved: ?Value = null;

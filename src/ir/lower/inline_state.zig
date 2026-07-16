@@ -372,17 +372,21 @@ pub fn inlineFnAstForRecvExt(
     if (cands.len < 2) return inlineFnAstFor(name, call);
 
     // Determine whether overloads span different receiver types and
-    // whether any candidate is a top-level (no-receiver) overload.
+    // whether any candidate is a top-level (no-receiver) overload. A
+    // member-inline fn's owner class is its receiver type for this
+    // purpose: a bare `traverseChildren(...)` inside an extension on
+    // `SlotTableAddressSpace` must bind that class's own member, not a
+    // same-named member of an unrelated class that registered first.
     var first_recv: ?[]const u8 = null;
     var have_first = false;
     var multi_recv = false;
     var has_toplevel = false;
     for (cands) |f| {
-        if (f.receiver_type) |rt| {
+        if (candRecvName(f)) |rn| {
             if (!have_first) {
-                first_recv = rt.name.name;
+                first_recv = rn;
                 have_first = true;
-            } else if (!eqOpt(first_recv, rt.name.name)) {
+            } else if (!eqOpt(first_recv, rn)) {
                 multi_recv = true;
             }
         } else {
@@ -407,8 +411,8 @@ pub fn inlineFnAstForRecvExt(
         if (chain.len == 0) break :blk null;
         for (chain) |rn| {
             for (cands) |f| {
-                if (f.receiver_type) |rt| {
-                    if (std.mem.eql(u8, rt.name.name, rn)) break :blk rn;
+                if (candRecvName(f)) |crn| {
+                    if (std.mem.eql(u8, crn, rn)) break :blk rn;
                 }
             }
         }
@@ -439,10 +443,18 @@ fn keepNarrowed(
     if (require_receiver and f.receiver_type == null) return false;
     if (multi_recv) {
         if (recv_ty) |rt| {
-            return if (f.receiver_type) |r| std.mem.eql(u8, r.name.name, rt) else false;
+            return if (candRecvName(f)) |r| std.mem.eql(u8, r, rt) else false;
         }
     }
     return true;
+}
+
+/// A candidate's effective receiver class name: an extension's declared
+/// `receiver_type`, or the owner class for a member-inline fn. Null only
+/// for a plain top-level inline fn.
+fn candRecvName(f: *const ast.Function) ?[]const u8 {
+    if (f.receiver_type) |rt| return rt.name.name;
+    return inlineMemberOwner(f);
 }
 
 fn eqOpt(a: ?[]const u8, b: []const u8) bool {
