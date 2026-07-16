@@ -310,8 +310,10 @@ fn decodeValue(comptime T: type, allocator: Allocator, c: *Cursor) DecodeError!T
         .bool => return (try c.byte()) != 0,
         .int => return decodeInt(T, c),
         .float => {
+            // Mirrors the encoder: IEEE-754 bit pattern, little-endian.
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const s = try c.take(@sizeOf(T));
-            return std.mem.bytesToValue(T, s);
+            return @bitCast(std.mem.littleToNative(Bits, std.mem.bytesToValue(Bits, s)));
         },
         .@"enum" => |e| {
             const v = try c.varint();
@@ -409,6 +411,14 @@ fn hasDeinit(comptime T: type) bool {
 fn isPackedFlags(comptime T: type) bool {
     const s = @typeInfo(T).@"struct";
     return s.layout == .@"packed" and s.backing_integer != null;
+}
+
+test "float decodes little-endian IEEE-754 bits" {
+    const a = std.testing.allocator;
+    var c = Cursor{ .bytes = &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f } };
+    try std.testing.expectEqual(@as(f64, 1.5), try decodeValue(f64, a, &c));
+    var c32 = Cursor{ .bytes = &.{ 0, 0, 0x10, 0xc0 } };
+    try std.testing.expectEqual(@as(f32, -2.25), try decodeValue(f32, a, &c32));
 }
 
 test "varint decode round-trips LEB128" {

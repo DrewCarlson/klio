@@ -957,6 +957,16 @@ pub const TestRoot = struct {
     feature: []const u8 = "",
 };
 
+/// The `[application]` table: how `klio bundle <dir>` packages the
+/// project. `main` may be omitted when the source roots contain exactly
+/// one `main` function.
+pub const ApplicationToml = struct {
+    name: []const u8 = "",
+    icon: []const u8 = "",
+    main: []const u8 = "",
+    include: [][]const u8 = &.{},
+};
+
 pub const LibraryToml = struct {
     library: LibraryHeader = .{},
     deps: []DepEntry = &.{},
@@ -964,6 +974,7 @@ pub const LibraryToml = struct {
     source: []SourceRoot = &.{},
     tests: []TestRoot = &.{},
     features: FeaturesToml = .{},
+    application: ApplicationToml = .{},
 };
 
 /// Minimal TOML reader for the `klio.toml` shape the builder consumes:
@@ -981,7 +992,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
     var feature_defs: std.ArrayList(FeatureTomlDef) = .empty;
 
     // Section context: which table the following key/value lines fill.
-    const Section = enum { none, library, dep, bindings, source, test_source, features, feature_def };
+    const Section = enum { none, library, dep, bindings, source, test_source, features, feature_def, application };
     var section: Section = .none;
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
@@ -1030,6 +1041,8 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
                 const name = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
                 if (std.mem.eql(u8, name, "library")) {
                     section = .library;
+                } else if (std.mem.eql(u8, name, "application")) {
+                    section = .application;
                 } else if (std.mem.eql(u8, name, "bindings")) {
                     section = .bindings;
                 } else if (std.mem.eql(u8, name, "features")) {
@@ -1072,6 +1085,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
                 }
             },
             .feature_def => assignFeatureDef(a, &feature_defs.items[feature_defs.items.len - 1], key, val),
+            .application => assignApplication(a, &cfg.application, key, val),
         }
     }
 
@@ -1174,6 +1188,18 @@ fn assignSource(a: std.mem.Allocator, s: *SourceRoot, key: []const u8, val: []co
         s.include = parseStrArray(a, val) catch &.{};
     } else if (std.mem.eql(u8, key, "exclude")) {
         s.exclude = parseStrArray(a, val) catch &.{};
+    }
+}
+
+fn assignApplication(a: std.mem.Allocator, app: *ApplicationToml, key: []const u8, val: []const u8) void {
+    if (std.mem.eql(u8, key, "name")) {
+        app.name = tomlString(a, val);
+    } else if (std.mem.eql(u8, key, "icon")) {
+        app.icon = tomlString(a, val);
+    } else if (std.mem.eql(u8, key, "main")) {
+        app.main = tomlString(a, val);
+    } else if (std.mem.eql(u8, key, "include")) {
+        app.include = parseStrArray(a, val) catch &.{};
     }
 }
 

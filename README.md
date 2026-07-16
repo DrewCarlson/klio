@@ -61,6 +61,7 @@ fun main() {
 | `klio parse <file>`        | Print the AST                                           |
 | `klio dump-ir <file>`      | Lower a file and print its IR without executing         |
 | `klio bake [file...]`      | Pre-bake the stdlib image cache                         |
+| `klio bundle <file\|dir>`  | Package a program into one self-contained executable — see [docs/BUNDLE.md](docs/BUNDLE.md) |
 | `klio repl`                | Interactive prompt (placeholder; see note below)        |
 | `klio pack <subcommand>`   | Build, install, inspect, verify, publish, and fetch packs |
 

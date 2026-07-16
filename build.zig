@@ -197,6 +197,13 @@ const itests_files = [_]Itest{
     // corruption through a child `klio` against a scratch HOME, plus the
     // in-process bake/load round trip.
     .{ .name = "stdlib_image", .needs_exe = true, .weight = 12 },
+    // Single-executable bundle gate: `klio bundle` output runs against an
+    // empty HOME byte-identically to `klio run` (argv, resources, exit
+    // code, stdin, corruption refusal, inspect, determinism).
+    .{ .name = "bundle_smoke", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-bundle",
+    }, .weight = 15 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{

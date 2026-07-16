@@ -418,11 +418,27 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         };
     }
     var host = vmMakeHost(self, sink);
-    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, .empty, &host);
+    // `fun main(args: Array<String>)` receives the program argv (a bundle's
+    // argv[1..]; empty under `klio run`), matching Kotlin's entry contract.
+    var args: std.ArrayList(Value) = .empty;
+    if (func.params.len >= 1) {
+        try args.append(self.allocator, try programArgsValue(self.allocator, self.program_args));
+    }
+    const r = try ir.eval.evalWith(VmHost, self.allocator, module, func, args, &host);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },
     };
+}
+
+/// Build the `Array<String>` value bound to `main`'s parameter.
+fn programArgsValue(a: Allocator, argv: []const []const u8) Allocator.Error!Value {
+    var list: std.ArrayList(Value) = .empty;
+    errdefer list.deinit(a);
+    for (argv) |s| {
+        try list.append(a, .{ .String = try runtime.strInit(a, s) });
+    }
+    return runtime.ArrayData.fromBoxedList(try runtime.ValueList.init(a, list));
 }
 
 /// Outcome of invoking a function/method/constructor into a prepared Vm.

@@ -371,14 +371,14 @@ fn pruneImages(gpa: Allocator, cache: []const u8) void {
 // User-file parsing (scratch + final maps)
 // ---------------------------------------------------------------------
 
-const ParsedUser = struct {
+pub const ParsedUser = struct {
     texts: [][]const u8,
     asts: []KotlinFile,
 };
 
 /// Parse the user files onto `map`. Null on any read/lex/parse failure —
 /// the caller then takes the legacy path, which renders the diagnostics.
-fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8, texts: ?[][]const u8) ?ParsedUser {
+pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8, texts: ?[][]const u8) ?ParsedUser {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
     const fio = threaded.io();
@@ -707,6 +707,71 @@ fn bakeAndPrepare(
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
+}
+
+// ---------------------------------------------------------------------
+// `klio bundle` support
+// ---------------------------------------------------------------------
+
+/// The dependency base assembled for a bundle: the image bytes to embed,
+/// the in-memory base + map for bundle-time program verification, and the
+/// run bindings the dependency load produced.
+pub const BundleBase = struct {
+    bytes: []const u8,
+    base: *interp_ir.build.StdlibBase,
+    map: *const SourceMap,
+    bindings: HostBindings,
+};
+
+/// Assemble the dependency base image for `klio bundle`: run the full
+/// dependency load (embedded stdlib + installed packs), then reuse a
+/// cache-keyed image when one matches or bake fresh (publishing the bake
+/// into the cache like a normal run). Fills `report`/`selection` from the
+/// load. Null when the base cannot bake — the caller surfaces the error.
+pub fn bundleBaseImage(
+    gpa: Allocator,
+    user_asts: []const KotlinFile,
+    features: *const RequestedFeatures,
+    report: *pack_cache.EmbeddedReport,
+    selection: *pack_cache.Selection,
+) ?BundleBase {
+    const dep_map = gpa.create(SourceMap) catch return null;
+    dep_map.* = SourceMap.init(gpa);
+    const deps = pack_cache.loadInstalledPacksOpts(gpa, user_asts, dep_map, features, .{
+        .embedded_report = report,
+        .selection = selection,
+    });
+
+    const cache = if (disabled(gpa)) null else cacheDir(gpa);
+    var image_path: ?[]u8 = null;
+    if (cache) |c| blk: {
+        const exe = exeStamp(gpa) orelse break :blk;
+        const stdlib_hash = stdlibContentHash(gpa) orelse break :blk;
+        const key = imageKey(stdlib_hash, exe, report.gate_full, selection.packs.items);
+        const hex = keyHex(key);
+        image_path = std.fmt.allocPrint(gpa, "{s}/stdlib-{s}.klio-image", .{ c, hex }) catch break :blk;
+        var threaded = threadedIo(gpa);
+        defer threaded.deinit();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(threaded.io(), image_path.?, gpa, .unlimited) catch break :blk;
+        const loaded = (image.load(gpa, bytes) catch null) orelse break :blk;
+        for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+        trace(gpa, "bundle reuses cached image {s}", .{hex});
+        return .{ .bytes = bytes, .base = loaded.base, .map = loaded.map, .bindings = deps.bindings };
+    }
+
+    const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
+    base.user_file_start = @intCast(dep_map.files.items.len);
+    const bytes = (image.bake(gpa, base, dep_map, .{
+        .known_packages = report.known_packages.items,
+        .binding_fqns = report.binding_fqns.items,
+    }) catch return null) orelse return null;
+    if (cache) |c| {
+        if (image_path) |p| {
+            writeAtomic(gpa, c, p, bytes);
+            pruneImages(gpa, c);
+        }
+    }
+    return .{ .bytes = bytes, .base = base, .map = dep_map, .bindings = deps.bindings };
 }
 
 // ---------------------------------------------------------------------

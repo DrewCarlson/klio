@@ -249,7 +249,15 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
     switch (info) {
         .bool => try e.byte(if (value.*) 1 else 0),
         .int => try encodeInt(T, e, value.*),
-        .float => try e.bytes(&std.mem.toBytes(value.*)),
+        // Floats are written as their IEEE-754 bit pattern in little-endian
+        // byte order, so an image baked on one host is byte-consumable on any
+        // other (all supported targets are little-endian; this removes the
+        // native-order dependence outright).
+        .float => {
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+            const raw: Bits = @bitCast(value.*);
+            try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(Bits, raw)));
+        },
         .@"enum" => |en| try e.varint(@as(u64, @intCast(@as(en.tag_type, @intFromEnum(value.*))))),
         .optional => |o| {
             if (value.*) |*payload| {
@@ -433,8 +441,10 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
         .bool => out.* = (try d.byte()) != 0,
         .int => out.* = try decodeInt(T, d),
         .float => {
+            // Mirrors the encoder: IEEE-754 bit pattern, little-endian.
+            const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const s = try d.take(@sizeOf(T));
-            out.* = std.mem.bytesToValue(T, s);
+            out.* = @bitCast(std.mem.littleToNative(Bits, std.mem.bytesToValue(Bits, s)));
         },
         .@"enum" => out.* = try enumFromIntAny(T, try d.varint()),
         .optional => |o| {
@@ -2593,6 +2603,21 @@ test "forest resolver resolves a ForestRef to the decoded node" {
     // A second resolve hits the memo (same decoded pointer).
     const got2 = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }).?;
     try testing.expect(got == got2);
+}
+
+test "codec floats are little-endian IEEE-754 bits on the wire" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 1.5f64 = 0x3FF8000000000000; the wire bytes must be the little-endian
+    // bit pattern regardless of host byte order.
+    const v: f64 = 1.5;
+    const bytes = try encodeOne(f64, a, &v);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, bytes);
+    var d = Decoder{ .a = a, .buf = bytes };
+    var out: f64 = undefined;
+    try decodeInto(f64, &d, &out);
+    try testing.expectEqual(v, out);
 }
 
 test "codec rejects truncated input" {

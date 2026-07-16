@@ -34,7 +34,6 @@ pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 /// (`__compose_pushComposer` / `__compose_popComposer` /
 /// `__compose_currentComposer`) the loader merges into the host bindings.
 pub const compose = @import("vm/compose.zig");
-pub const coroutines_diag = @import("vm/coroutines.zig");
 
 /// Assert-empty + clear the process-wide receiver/coroutine thread-locals at a
 /// run boundary. Called by `Vm.deinit` and by the public runners so leaked
@@ -1035,6 +1034,9 @@ pub const Vm = struct {
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
     allocator: Allocator,
+    /// Process argv for the program's `main(args: Array<String>)`. Empty
+    /// under `klio run`; a bundle passes its argv[1..] through.
+    program_args: []const []const u8 = &.{},
 
     pub const new = run_mod.vmNew;
     pub const fromBuilt = run_mod.vmFromBuilt;
