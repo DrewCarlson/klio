@@ -252,17 +252,38 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         return commands.runCheck(gpa, paths, .Plain, &requested);
     };
 
-    // 2. Dependency load + base image (cache reuse or fresh bake).
+    // 2. Dependency load: embedded stdlib + installed packs. Lowering
+    //    mutates the parsed ASTs and baking strips dead AST bodies, so
+    //    each bake attempt below gets its own load.
     var report = pack_cache.EmbeddedReport{};
     var selection = pack_cache.Selection{};
-    const bb = stdlib_image.bundleBaseImage(gpa, user.asts, &requested, &report, &selection) orelse {
-        io.writeStderr("error: the dependency base for this program cannot bake to an image; bundling requires a bakeable base\n");
-        return 1;
-    };
+    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, &report, &selection) orelse return 1;
 
-    // 3. Verify the program lowers cleanly against the base (all
-    //    resolution diagnostics surface at bundle time).
-    {
+    // 3. Whole-program image first (mmap -> load -> run at boot, zero
+    //    parsing or lowering). The bake refuses outside the serializable
+    //    surface; the bundle then falls back to the always-works
+    //    base-image + program-src boot (startup is the only difference),
+    //    recorded in the manifest. A successful program bake is also the
+    //    program verification: it lowers cleanly with a main.
+    var program_image: ?[]const u8 = null;
+    var program_src_fallback = false;
+    if (programImageEnabled()) {
+        program_image = bakeProgramImage(gpa, &deps, paths, user.texts, &report);
+        program_src_fallback = program_image == null;
+    }
+
+    // 4. The base-image + program-src path (the program-image refusal
+    //    fallback, and the diagnostic renderer): fresh dep load, base
+    //    bake (or cache reuse), then an extend that surfaces every
+    //    resolution diagnostic at bundle time.
+    var base_image: ?[]const u8 = null;
+    if (program_image == null) {
+        const deps2 = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, null, null) orelse return 1;
+        const bb = stdlib_image.bundleBaseImage(gpa, &deps2, &report, &selection) orelse {
+            io.writeStderr("error: the dependency base for this program cannot bake to an image; bundling requires a bakeable base\n");
+            return 1;
+        };
+        base_image = bb.bytes;
         if (!interp_ir.build.canExtendBase(bb.base, user.asts)) {
             io.writeStderr("error: the program redeclares a name from its dependency base and cannot bundle; rename the declaration\n");
             return 1;
@@ -288,10 +309,10 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         }
     }
 
-    // 4. Flavor: forced, or auto-detected off the selected pack set.
+    // 5. Flavor: forced, or auto-detected off the selected pack set.
     const is_ui = opts.ui orelse detectUiFlavor(&selection);
 
-    // 5. Sections.
+    // 6. Sections.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -326,9 +347,11 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     const manifest = buildManifest(arena, .{
         .flavor = if (is_ui) bf.Flavor.ui else bf.Flavor.headless,
         .name = app_name,
+        .entry = if (program_image != null) "main" else "",
+        .program_src_fallback = program_src_fallback,
         .report = &report,
         .selection = &selection,
-        .bindings = &bb.bindings,
+        .bindings = &deps.bindings,
         .resources = resource_entries.items,
     }) catch return 1;
     var perr: pack.PackError = undefined;
@@ -353,8 +376,13 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     var w = bf.Writer.init(gpa);
     defer w.deinit();
     w.addSection(bf.section_names.MANIFEST, manifest_bytes.items, .none, false) catch return 1;
-    w.addSection(bf.section_names.BASE_IMAGE, bb.bytes, .none, true) catch return 1;
+    if (base_image) |bi| {
+        w.addSection(bf.section_names.BASE_IMAGE, bi, .none, true) catch return 1;
+    }
     w.addSection(bf.section_names.PROGRAM_SRC, program_src, .none, false) catch return 1;
+    if (program_image) |pi| {
+        w.addSection(bf.section_names.PROGRAM_IMAGE, pi, .none, true) catch return 1;
+    }
     if (resource_entries.items.len != 0) {
         w.addSection(bf.section_names.RESOURCES, resources_blob.items, .none, false) catch return 1;
     }
@@ -564,9 +592,45 @@ pub fn shimFileName(target: []const u8) []const u8 {
     return "libklio_skia.so";
 }
 
+/// Whether the whole-program image bake is attempted (default yes;
+/// KLIO_BUNDLE_PROGRAM_IMAGE=0 forces the program-src boot, mainly so
+/// tests can gate both paths).
+fn programImageEnabled() bool {
+    const v = runtime.getenvSlice("KLIO_BUNDLE_PROGRAM_IMAGE") orelse return true;
+    return v.len == 0 or !std.mem.eql(u8, v, "0");
+}
+
+/// Lower deps + program as one module and bake it (semantically equal to
+/// the extend path — the run pipeline treats them as byte-identical).
+/// Null on any refusal; the caller records the program-src fallback.
+fn bakeProgramImage(
+    gpa: Allocator,
+    deps: *const stdlib_image.BundleDeps,
+    paths: []const []const u8,
+    texts: [][]const u8,
+    report: *const pack_cache.EmbeddedReport,
+) ?[]const u8 {
+    // Parse the user files onto the dependency map (their FileIds continue
+    // after the deps'), then lower everything as one module.
+    const dep_file_count = deps.map.files.items.len;
+    const user = stdlib_image.parseUserFiles(gpa, deps.map, paths, texts) orelse return null;
+    var all: std.ArrayList(KotlinFile) = .empty;
+    defer all.deinit(gpa);
+    all.appendSlice(gpa, deps.asts) catch return null;
+    all.appendSlice(gpa, user.asts) catch return null;
+    const pb = (interp_ir.build.buildProgramBase(gpa, all.items) catch return null) orelse return null;
+    pb.user_file_start = @intCast(dep_file_count);
+    return (image.bake(gpa, pb, deps.map, .{
+        .known_packages = report.known_packages.items,
+        .binding_fqns = report.binding_fqns.items,
+    }) catch return null) orelse null;
+}
+
 const ManifestInputs = struct {
     flavor: bf.Flavor,
     name: []const u8,
+    entry: []const u8,
+    program_src_fallback: bool,
     report: *const pack_cache.EmbeddedReport,
     selection: *const pack_cache.Selection,
     bindings: *const HostBindings,
@@ -610,8 +674,8 @@ fn buildManifest(arena: Allocator, in: ManifestInputs) !bf.BundleManifest {
         .image_format_version = image.FORMAT_VERSION,
         .flavor = in.flavor,
         .name = in.name,
-        .entry = "",
-        .program_src_fallback = false,
+        .entry = in.entry,
+        .program_src_fallback = in.program_src_fallback,
         .packs = packs.items,
         .known_packages = known,
         .binding_fqns = fqns,
@@ -698,6 +762,10 @@ fn printDryRun(
 ) void {
     io.printStdout(gpa, "bundle (dry run): {s}\n", .{out_path});
     io.printStdout(gpa, "flavor: {s}\n", .{@tagName(manifest.flavor)});
+    io.printStdout(gpa, "entry: {s}{s}\n", .{
+        if (manifest.entry.len != 0) manifest.entry else "program-src",
+        if (manifest.program_src_fallback) @as([]const u8, " (program-image refused)") else "",
+    });
     io.printStdout(gpa, "packs:\n", .{});
     for (manifest.packs) |p| {
         io.printStdout(gpa, "  {s} {s}\n", .{ p.id, p.version });

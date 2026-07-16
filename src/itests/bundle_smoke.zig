@@ -356,8 +356,8 @@ test "KLIO_BUNDLE_INSPECT prints the manifest and exits 0" {
     try std.testing.expect(std.mem.startsWith(u8, got.stdout, "bundle: hello_inspect\n"));
     try std.testing.expect(std.mem.indexOf(u8, got.stdout, "klio: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, got.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "entry: program-src\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "  base-image ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "entry: main\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "  program-image ") != null);
     try std.testing.expect(std.mem.indexOf(u8, got.stdout, "  program-src ") != null);
 }
 
@@ -425,6 +425,67 @@ test "project mode: [application] table, multi-file sources, includes, discovere
     try std.testing.expect(std.mem.indexOf(u8, desktop, "Exec=") != null);
 }
 
+test "program-image is the default entry; the src fallback is byte-identical" {
+    const c = try ctx();
+    // Default: whole-program image, entry `main`.
+    const pi = try bundleProgram(c, "examples/hello.kt", "hello_pi", &.{});
+    const pi_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, pi, c.a);
+    try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
+    const inspect_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
+    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "entry: main\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  program-image ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  base-image ") == null);
+
+    // Forced program-src boot (the refusal fallback path), same output.
+    try c.build_env.put("KLIO_BUNDLE_PROGRAM_IMAGE", "0");
+    const src = try bundleProgram(c, "examples/hello.kt", "hello_srcboot", &.{});
+    _ = c.build_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_PROGRAM_IMAGE"));
+    const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, src, c.a);
+    const inspect_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
+    // Operator-disabled (env) is a choice, not a bake refusal: plain
+    // program-src entry, base image present, no program image.
+    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "entry: program-src\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  base-image ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  program-image ") == null);
+    _ = c.run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
+
+    const got_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
+    const got_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
+    try std.testing.expectEqual(@as(u32, 0), got_pi.code);
+    try std.testing.expectEqual(@as(u32, 0), got_src.code);
+    try std.testing.expectEqualStrings(got_pi.stdout, got_src.stdout);
+    try std.testing.expectEqualStrings("2\n", got_pi.stdout);
+}
+
+test "bundle boot is at least as fast as a warm klio run" {
+    const c = try ctx();
+    const bundle_path = try bundleProgram(c, "examples/hello.kt", "hello_bench", &.{});
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
+
+    // Warm the image cache, then take the minimum of three timings each
+    // (minimum absorbs scheduler noise on a shared box).
+    _ = try runChild(c.a, c.io, c.build_env, null, &.{ c.bin, "run", "examples/hello.kt" });
+    var run_min: u64 = std.math.maxInt(u64);
+    var bundle_min: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        var t0 = runtime.clockMonotonicNanos();
+        _ = try runChild(c.a, c.io, c.build_env, null, &.{ c.bin, "run", "examples/hello.kt" });
+        run_min = @min(run_min, runtime.clockMonotonicNanos() - t0);
+        t0 = runtime.clockMonotonicNanos();
+        _ = try runChild(c.a, c.io, c.run_env, null, &.{abs});
+        bundle_min = @min(bundle_min, runtime.clockMonotonicNanos() - t0);
+    }
+    // The bundle skips the pack-cache walk and (with the program image)
+    // all parsing/lowering; a regression to re-lowering at boot would be
+    // several times slower, far outside this bound.
+    if (bundle_min > run_min + run_min / 3) {
+        std.debug.print("bundle_smoke: bundle boot {d}ms > warm run {d}ms\n", .{
+            bundle_min / 1_000_000, run_min / 1_000_000,
+        });
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "--dry-run prints the plan and writes nothing" {
     const c = try ctx();
     const out = try std.fmt.allocPrint(c.a, "{s}/dryrun_out", .{TMP_ROOT});
@@ -433,7 +494,7 @@ test "--dry-run prints the plan and writes nothing" {
     });
     try std.testing.expectEqual(@as(u32, 0), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "base-image ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "program-image ") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "projected size: ") != null);
     try std.testing.expect((std.Io.Dir.cwd().statFile(c.io, out, .{}) catch null) == null);
 }
