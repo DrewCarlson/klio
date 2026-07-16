@@ -400,7 +400,16 @@ fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
         return;
     };
     if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
-        std.debug.print("[chan] arm slot={d} scope={s}\n", .{ slot, scope.typeFqn() });
+        {
+        const cls: []const u8 = if (scope == .Instance) blk: {
+            const g = scope.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().name;
+        } else scope.typeFqn();
+        std.debug.print("[chan] arm slot={d} scope={s}\n", .{ slot, cls });
+    }
     if (scope != .Instance) return;
     const helper = ctx.host.lookupGlobalFunc("__kxco_chanArmCancel") orelse return;
     const args = [_]Value{ scope, chan, .{ .Long = slot } };
