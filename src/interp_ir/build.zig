@@ -451,10 +451,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     // spans this module's decls plus the baked base (pack composables the user
     // calls, e.g. `Text`).
     if (composePluginEnabled()) {
-        // A/B gate for the skip emission (pace/correctness bisection).
-        if (runtime.getenvSlice("KLIO_COMPOSE_SKIP")) |v| {
-            compose_pass.emit_skip_calculus = v.len != 0 and !std.mem.eql(u8, v, "0");
-        }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
@@ -3898,12 +3894,25 @@ pub const StdlibBase = struct {
 /// base program is not snapshot-safe (it has resolve diagnostics or a
 /// `main`), in which case callers must use the full per-program build.
 pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
+    return buildBaseInner(allocator, files, false);
+}
+
+/// Whole-program variant of `buildStdlibBase` for `klio bundle`: the same
+/// lowered snapshot, but `files` includes the user program so `main` is
+/// present (and serialized). Boot then runs the loaded module directly —
+/// no parse, no extend.
+pub fn buildProgramBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
+    return buildBaseInner(allocator, files, true);
+}
+
+fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: bool) Allocator.Error!?*StdlibBase {
     var lifted: []Decl = &.{};
     var built = try buildModuleFilesInner(allocator, files, null, &lifted);
     {
         const mg = built.module.borrow();
         defer mg.deinit();
-        if (mg.get().resolve_diags.items.len != 0 or built.main != null) {
+        const main_ok = if (allow_main) built.main != null else built.main == null;
+        if (mg.get().resolve_diags.items.len != 0 or !main_ok) {
             built.deinit();
             return null;
         }

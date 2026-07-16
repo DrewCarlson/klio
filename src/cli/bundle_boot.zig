@@ -239,6 +239,22 @@ fn bootRest(
 ) u8 {
     for (manifest.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
 
+    // Whole-program image: mmap -> load -> run, no parsing or lowering.
+    if (manifest.entry.len != 0) {
+        if (bf.findSection(table, bf.section_names.PROGRAM_IMAGE)) |pi_section| {
+            const pi_bytes = bf.sectionStored(bytes, pi_section);
+            const loaded = (image.load(gpa, pi_bytes) catch null) orelse {
+                io.printStderr(gpa, "error: bundle program image rejected ({s}); rebundle\n", .{image.lastLoadFailure()});
+                return 1;
+            };
+            for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+            const bindings = replayBindings(gpa, loaded.binding_fqns, manifest) orelse return 1;
+            return commands.runBuiltModuleArgs(gpa, loaded.base.built, bindings, loaded.map, "error: no main function found", argv[1..]);
+        }
+        io.writeStderr("error: bundle names an entry but carries no program image; rebundle\n");
+        return 1;
+    }
+
     // Base image, mmap-backed straight out of the executable.
     const image_section = bf.findSection(table, bf.section_names.BASE_IMAGE) orelse {
         io.writeStderr("error: bundle carries no base image; rebundle\n");
@@ -286,22 +302,30 @@ fn bootRest(
     if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return 1;
 
-    // Host bindings: the in-binary registry plus the manifest's replay
-    // lists. An unresolvable pack symbol means a version-skewed stub —
-    // already refused by the manifest check — so it errors hard.
+    const bindings = replayBindings(gpa, loaded.binding_fqns, manifest) orelse return 1;
+    return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", argv[1..]);
+}
+
+/// Host bindings: the in-binary registry plus the manifest's replay
+/// lists. An unresolvable pack symbol means a version-skewed stub —
+/// already refused by the manifest check — so it errors hard (null).
+fn replayBindings(
+    gpa: Allocator,
+    binding_fqns: []const []const u8,
+    manifest: *const bf.BundleManifest,
+) ?HostBindings {
     var bindings = pack_cache.mergedHostBindings(gpa);
-    for (loaded.binding_fqns) |fqn| {
+    for (binding_fqns) |fqn| {
         if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
     }
     for (manifest.pack_bindings) |pb| {
         const f = bindings.resolve(pb.host_symbol) orelse {
             io.printStderr(gpa, "error: bundle host binding `{s}` does not resolve in this runtime; rebundle with a matching klio\n", .{pb.host_symbol});
-            return 1;
+            return null;
         };
-        bindings.register(gpa.dupe(u8, pb.fqn) catch return 1, f) catch {};
+        bindings.register(gpa.dupe(u8, pb.fqn) catch return null, f) catch {};
     }
-
-    return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", argv[1..]);
+    return bindings;
 }
 
 /// The mmap-backed resource table served to `klio.bundle.Resources`.
@@ -334,7 +358,10 @@ fn printInspect(gpa: Allocator, manifest: *const bf.BundleManifest, table: *cons
     io.printStdout(gpa, "bundle: {s}\n", .{manifest.name});
     io.printStdout(gpa, "klio: {s} (image format {d})\n", .{ manifest.klio_version, manifest.image_format_version });
     io.printStdout(gpa, "flavor: {s}\n", .{@tagName(manifest.flavor)});
-    io.printStdout(gpa, "entry: {s}\n", .{if (manifest.entry.len != 0) manifest.entry else "program-src"});
+    io.printStdout(gpa, "entry: {s}{s}\n", .{
+        if (manifest.entry.len != 0) manifest.entry else "program-src",
+        if (manifest.program_src_fallback) @as([]const u8, " (program-image refused)") else "",
+    });
     io.printStdout(gpa, "packs:\n", .{});
     for (manifest.packs) |p| {
         io.printStdout(gpa, "  {s} {s}", .{ p.id, p.version });

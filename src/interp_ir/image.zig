@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -830,6 +830,9 @@ const ImageRoot = struct {
     bodyless_func_ids: []const u32 = &.{},
     /// Distinct first fqn segments of the funcs (for packageHeadDeclared).
     func_fqn_heads: []const []const u8 = &.{},
+    /// `main`'s FuncId + 1 for a whole-program image (`klio bundle`);
+    /// 0 for a dependency base.
+    main_func: u64 = 0,
 };
 
 const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
@@ -1211,6 +1214,7 @@ fn rootFromBase(
     root.enum_id_next = base.enum_id_next;
     root.known_packages = extras.known_packages;
     root.binding_fqns = extras.binding_fqns;
+    root.main_func = if (base.built.main) |m| @as(u64, m.int()) + 1 else 0;
     return root;
 }
 
@@ -1427,8 +1431,6 @@ fn strMapToSlice(comptime V: type, a: Allocator, m: *const std.StringHashMap(V))
 const strMapToSliceKV = strMapToSlice;
 
 fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator.Error!bool {
-    if (b.main != null) return false;
-
     // The ClassDef graph first: every def reachable from the table gets an
     // index, so edges and enum-entry instances can refer by index.
     var def_index = std.AutoHashMap(usize, u32).init(a);
@@ -1921,6 +1923,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
     const module_ref = try ObjRef(Module).init(a, module);
     var built = build.emptyBuiltShell(a, module_ref, null);
     if (!try builtFromImage(a, &root.built, &built)) return null;
+    if (root.main_func != 0) built.main = FuncId.from(@intCast(root.main_func - 1));
 
     const base = try a.create(StdlibBase);
     base.* = .{
