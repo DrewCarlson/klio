@@ -1873,12 +1873,15 @@ fn pumpLoop(
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 var k: usize = 0;
-                while (k < st.frames.items.len and k < 9) : (k += 1) {
+                while (k < st.frames.items.len and k < 24) : (k += 1) {
                     const snap = st.frames.items[k];
                     const m: *const ir.Module = snap.module orelse mg.get();
                     const f = m.funcById(snap.func);
                     const nm = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "?";
-                    std.debug.print(" {s}", .{nm});
+                    // The declaration file disambiguates same-named frames
+                    // (`<lambda>`): which source declared the parked caller.
+                    const file: i64 = if (m.decl_span.get(snap.func.int())) |ds| @intCast(ds.file.int()) else -1;
+                    std.debug.print(" {s}#{d}@f{d}", .{ nm, snap.func.int(), file });
                 }
                 std.debug.print("\n", .{});
             }
