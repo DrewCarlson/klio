@@ -141,6 +141,39 @@ implicit-composer default) while the real-engine + pass path is brought up.
 
 ## Status
 
+- 2026-07-16: **Restart-driven recomposition WORKS end to end; all three
+  `CompositionTests.remember*` tests pass under engine+plugin, on BOTH
+  composers (gapbuffer + linkbuffer).** The teardown-hang family
+  (state++ / advance() / revalidate()) is fixed — commit 11c2a02c, four
+  stacked roots, each verified by its own repro then by the real tests:
+  1. Block-bodied functions returned their tail value instead of Unit, so a
+     restart-wrapped composable leaked `endRestartGroup()?.updateScope(..)`'s
+     null as its return and the engine's "Invalid restart scope" elvis fired
+     (`ir/lower/decl.zig`; example `block_body_returns_unit.kt`).
+  2. The pass emitted `$changed or 1` as `BinOp.Or` — logical `||`; on an Int
+     operand the branch silently killed the restart invocation. Kotlin's
+     bitwise `or` is an infix FUNCTION — emit `callMember($changed, "or", 1)`.
+  3. A restart re-invocation is a positional VALUE call (`call_value_closure`)
+     and bypassed `composableEval`'s ambient-composer push, so a
+     `@Composable` default-param getter read a Null composer;
+     `host_call_value.zig` now mirrors the push.
+  4. The member-composable shape (`@Composable fun Test(..)` in the test class
+     next to `import kotlin.test.Test`) exposed two GENERAL resolution bugs:
+     the inline donor pick spliced an unrelated class's same-named
+     `internal inline` member (fix: owner class counts as receiver evidence in
+     `inline_state.zig`; example `inline_member_owner_pick.kt`), and a member
+     function named like an imported class lost the bare call to the imported
+     constructor — both at lowering (`shadowedByClass`) and at runtime
+     (`CallMemberOrGlobal`'s ctor-name gate now scans the implicit receiver
+     chain; a suspend block's innermost receiver is the coroutine, not the
+     declaring class; example `member_shadows_imported_class.kt`).
+  Regression-clean: stdlib_commontest 2298 (canonical), coroutines_commontest
+  230 (baseline 220), unit + e2e green. NEXT: run the full
+  compose_runtime_commontest under KLIO_COMPOSE_PLUGIN=1 and triage to the
+  implicit-mode baseline (445/143-class), then minimal $changed skipping,
+  then cutover (flip default, REMOVE the implicit-composer implementation,
+  rebuild shipped packs, re-verify pixel scenes).
+
 - 2026-07-15: **Three more interpreter fixes: composition now RENDERS fully and
   runs into the coroutines test-harness teardown.** On the engine + plugin path
   (`HOME=/tmp/klio_engine_home KLIO_COMPOSE_PLUGIN=1 klio test <ROOTS>

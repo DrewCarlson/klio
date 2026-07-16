@@ -223,6 +223,18 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 90 },
+    // The same upstream suite against the ENGINE pack with the `@Composable`
+    // lowering plugin (KLIO_COMPOSE_PLUGIN=1) — the conformance signal for
+    // the plugin path replacing the implicit hook, and the whole compose
+    // gate once the cutover lands.
+    .{ .name = "compose_plugin_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-runtime-engine",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 90 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
