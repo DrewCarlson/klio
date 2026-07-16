@@ -2604,7 +2604,22 @@ fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value
         // `coroTop`), so it stays inline-resumable.
         .err => |e| switch (e) {
             .Suspended => |st| _ = try park(a, st, scope_base),
-            else => {},
+            // A cancelled child's throw dies with it, exactly as on the
+            // other resume paths. EVERY other outcome — an AssertionError
+            // out of a test body, a Vm miss — must reach the pump: the
+            // silent discard here turned every throwing test body under
+            // the compose plugin into an indefinite hang (the coroutine's
+            // Job never completed, and runTest joined against it forever).
+            .Throw => |v| {
+                if (!root.isCancellationException(&v)) {
+                    if (coro_stack.items.len != 0)
+                        coro_stack.items[coro_stack.items.len - 1].pending_err = e;
+                }
+            },
+            else => {
+                if (coro_stack.items.len != 0)
+                    coro_stack.items[coro_stack.items.len - 1].pending_err = e;
+            },
         },
     }
     return true;
