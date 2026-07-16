@@ -15,6 +15,7 @@ the live list.
 | `klio dump-ir <file>`   | Lower a file and print its IR without executing (`--func N` for one function); tallies DIRECT vs DYNAMIC call sites. |
 | `klio repl`             | Placeholder prompt — currently echoes input; not yet a live evaluator.                   |
 | `klio bake [files...]`  | Pre-bake the stdlib image cache (see below). `klio run` does this automatically on first use. |
+| `klio bundle <file\|dir>` | Package a program into one self-contained executable; see [Bundling programs](../BUNDLE.md). |
 
 `klio run` takes `--virtual-time` (deterministic virtual time
 for coroutines) and `--feature <pack>/<feature>` (enable a

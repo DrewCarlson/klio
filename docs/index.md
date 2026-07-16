@@ -31,7 +31,8 @@ your code also runs it.
   shadows the matching Kotlin body at dispatch.
 - **Single binary.** `zig build` produces a `./zig-out/bin/klio`
   command that runs files, runs tests, type-checks, and manages
-  packs.
+  packs — and [`klio bundle`](BUNDLE.md) packages a program into a
+  self-contained executable of its own.
 
 ## Where to start
 
@@ -41,6 +42,8 @@ your code also runs it.
 - Take the [CLI tour](getting-started/cli.md) for the full command
   surface.
 - Test your Kotlin with [`klio test` and `kotlin.test`](testing.md).
+- Ship a program as one self-contained executable with
+  [`klio bundle`](BUNDLE.md).
 
 ## Architecture
 

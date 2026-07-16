@@ -45,7 +45,9 @@ loaded after the stdlib pack and before the cached packs.
 A pack can gate parts of its source behind named features
 (`[features]` in its `klio.toml`). Nothing gated loads by default;
 enable a feature per run with `--feature <pack>/<feature>`
-(repeatable, accepted by `klio run`, `klio test`, and `klio check`):
+(repeatable, accepted by `klio run`, `klio test`, `klio check`, and
+`klio bundle` — which bakes the choice into the
+[bundled executable](../BUNDLE.md)):
 
 ```sh
 klio run --feature kotlinx.serialization/json app.kt
