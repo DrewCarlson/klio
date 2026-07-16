@@ -21,8 +21,10 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 /// Minimum number of upstream Compose runtime test cases that must pass under
-/// the plugin. A ratchet: bump it as fixes land, never down.
-const BASELINE: usize = 0;
+/// the plugin. A ratchet: bump it as fixes land, never down. First measured
+/// run: 616 standalone (vs 445 for the implicit hook), 19 classes incomplete;
+/// the floor leaves saturation headroom like the implicit suite's does.
+const BASELINE: usize = 550;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
@@ -197,7 +199,14 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
-                const r = runKlio(arena.allocator(), penv, queue[i], 240_000) catch {
+                // 480s: the skip calculus probes every composable call's
+                // params through `$composer.changed`, so the big snapshot
+                // classes run 2-3x longer than the implicit hook did; under
+                // 8-way saturation they crossed a 240s cap while still making
+                // progress and their (buffered, lost-on-kill) passes vanished
+                // from the count — a deterministic 616 -> 403 that was pace,
+                // not correctness.
+                const r = runKlio(arena.allocator(), penv, queue[i], 480_000) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     continue;
                 };
