@@ -973,7 +973,11 @@ pub const CooperativeInterceptor = struct {
 
     /// Seam: take the parked activation for a token.
     pub fn takeParked(self: *CooperativeInterceptor, token: u64) ?ParkedEntry {
-        if (self.parked.fetchRemove(token)) |kv| return kv.value;
+        if (self.parked.fetchRemove(token)) |kv| {
+            if (pumpDiagEnabled()) std.debug.print("[tok] take tok={d}\n", .{token});
+            return kv.value;
+        }
+        if (pumpDiagEnabled()) std.debug.print("[tok] take tok={d} MISSING\n", .{token});
         return null;
     }
 
@@ -1724,7 +1728,16 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
     const value = st.*;
     allocator.destroy(st);
     const delta = captureScopeDelta(scope_base);
-    return pump.interceptSuspend(value, delta);
+    const tok = try pump.interceptSuspend(value, delta);
+    if (pumpDiagEnabled()) {
+        const g = pump.parked.getPtr(tok);
+        std.debug.print("[tok] park tok={d} wake={?d} frames={d}\n", .{
+            tok,
+            if (g) |e| e.wake_at else null,
+            value.frames.items.len,
+        });
+    }
+    return tok;
 }
 
 /// Layer 2 — the default interceptor's dispatch loop (`drive_run_blocking`).
