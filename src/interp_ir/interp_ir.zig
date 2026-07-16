@@ -946,15 +946,19 @@ pub const ObjectInitState = union(enum) {
     /// init) observes the partially-initialized singleton, matching
     /// Kotlin. Any other thread waits for the entry to resolve.
     InProgress: struct { thread: std.Thread.Id, instance: ?Value },
-    /// The first construction threw. The initializer is never retried;
-    /// every later access throws `FileFailedToInitializeException`
-    /// without the original cause, matching kotlinc.
-    Failed,
+    /// The first construction threw. The initializer is never retried.
+    /// `cause` holds the original throwable until the first THROWING read
+    /// surfaces it (a quiet resolution gate may have consumed the
+    /// construction attempt itself, so the wrap-at-construction site never
+    /// reached user code); every later access throws
+    /// `FileFailedToInitializeException` without the cause, matching
+    /// kotlinc.
+    Failed: struct { cause: ?Value },
 
     pub fn gcTrace(self: *const ObjectInitState, m: *runtime.gc.Marker) void {
         switch (self.*) {
             .InProgress => |ip| if (ip.instance) |v| v.gcMark(m),
-            .Failed => {},
+            .Failed => |f| if (f.cause) |v| v.gcMark(m),
         }
     }
 };

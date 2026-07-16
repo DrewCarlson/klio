@@ -40,6 +40,18 @@ const Decl = ast.Decl;
 
 const dbg_lambda = false;
 
+/// Composable-lambda memoization emission (KLIO_COMPOSE_MEMO=0 disables,
+/// an A/B bisection switch like KLIO_COMPOSE_SKIP). ON by default: kotlinc
+/// always wraps composable lambda arguments in remembered
+/// `composableLambda` instances — without it an unchanged content lambda
+/// is a fresh closure every recomposition, `composer.changed(content)` is
+/// always true, and a forced recomposition of unchanged content reports
+/// spurious changes (the expectNoChanges family).
+pub var emit_lambda_memo: bool = true;
+
+/// Group-emission debug (set by the build driver from KLIO_COMPOSE_DBG).
+pub var dbg_groups: bool = false;
+
 /// Synthetic name of the injected composer parameter.
 pub const composer_param = "$composer";
 /// Synthetic name of the injected changed-flags parameter.
@@ -67,6 +79,12 @@ const default_marker_path = [_][]const u8{ "androidx", "compose", "runtime", "kl
 /// composer argument of threaded calls) with this call; the interpreter keeps
 /// the stack populated around every transformed-composable invocation.
 const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "__compose_currentComposer" };
+
+/// `androidx.compose.runtime.internal.composableLambda(composer, key, tracked,
+/// block)` — the remembered composable-lambda wrapper kotlinc emits around
+/// every composable lambda argument, so an unchanged content lambda compares
+/// EQUAL across recompositions and its group skips.
+const composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambda" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -273,6 +291,125 @@ fn isComposableLambdaParam(p: *const Param) bool {
     return p.ty.function != null and isComposable(p.ty.annotations);
 }
 
+/// A declared type that is a `@Composable`-annotated function type
+/// (`@Composable () -> Unit`) — a lambda bound to it composes.
+fn isComposableFnType(t: *const ast.TypeRef) bool {
+    return t.function != null and isComposable(t.annotations);
+}
+
+/// Names of functions returning a `@Composable` function type, installed by
+/// the build driver around `transformDecls` (module decls + baked base). A
+/// val initialized from one holds a composable lambda; the walker records
+/// the val's name in its scoped `locals` set so bare calls thread.
+pub var active_factories: ?*const std.StringHashMap(void) = null;
+
+/// Declared parameter count of a sink's `@Composable` lambda parameter,
+/// recorded only when NON-ZERO (module decls + baked base, installed around
+/// `transformDecls`). A header-less `{ … }` bound to a `@Composable (P) ->
+/// Unit` sink keeps its implicit `it` slot ahead of `$composer`/`$changed` —
+/// `MovableContent({ content() })` invokes its content with the movable
+/// parameter first.
+pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
+
+/// Names of class PROPERTIES declared with a `@Composable` function type
+/// (`MovableContent.content`). An explicit-receiver invoke of one
+/// (`content.content(parameter)` in the composer's movable-content path) is
+/// a composable call and threads the pair. Consulted only for `.Member`
+/// callees, so a same-named bare call cannot be captured.
+pub var active_composable_props: ?*const std.StringHashMap(void) = null;
+
+/// Collect `@Composable`-fn-typed property names (constructor vals and body
+/// properties) across the decls. Caller owns the map.
+pub fn collectComposableProps(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectComposablePropsInto(&set, decls);
+    return set;
+}
+
+fn collectComposablePropsInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Property => |p| {
+            if (p.ty != null and isComposableFnType(&p.ty.?)) try set.put(p.name.name, {});
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| {
+                if (p.property != null and p.ty.function != null and isComposable(p.ty.annotations)) {
+                    try set.put(p.name.name, {});
+                }
+            }
+            try collectComposablePropsInto(set, c.members);
+        },
+        .Object => |*o| try collectComposablePropsInto(set, o.members),
+        else => {},
+    };
+}
+
+/// Collect `sink name -> composable-lambda param count` for sinks whose
+/// composable parameter declares at least one value parameter. Caller owns.
+pub fn collectComposableSinkArity(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(u8) {
+    var set = std.StringHashMap(u8).init(a);
+    try collectSinkArityInto(&set, decls);
+    return set;
+}
+
+fn compParamArity(t: *const ast.TypeRef) ?u8 {
+    if (t.function == null or !isComposable(t.annotations)) return null;
+    const n = t.function.?.params.len;
+    if (n == 0) return null;
+    return @intCast(@min(n, 255));
+}
+
+fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            for (f.params) |*p| if (compParamArity(&p.ty)) |n| {
+                try set.put(f.name.name, n);
+                break;
+            };
+        },
+        .Class => |*c| {
+            for (c.primary_params) |*p| if (compParamArity(&p.ty)) |n| {
+                try set.put(c.name.name, n);
+                break;
+            };
+            try collectSinkArityInto(set, c.members);
+        },
+        .Object => |*o| try collectSinkArityInto(set, o.members),
+        else => {},
+    };
+}
+
+/// Collect the simple names of functions RETURNING a `@Composable` function
+/// type (`movableContentOf`): a val initialized from one holds a composable
+/// lambda, so a bare call through the val is threaded. Caller owns the map.
+pub fn collectComposableValFactories(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectFactoriesInto(&set, decls);
+    return set;
+}
+
+fn collectFactoriesInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (f.return_type != null and isComposableFnType(&f.return_type.?)) {
+                try set.put(f.name.name, {});
+            }
+        },
+        .Class => |*c| try collectFactoriesInto(set, c.members),
+        .Object => |*o| try collectFactoriesInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Collect the simple names of functions (and constructors) that declare a
 /// `@Composable`-typed lambda parameter, so a lambda bound to one is itself
 /// transformed. Caller owns the returned map.
@@ -293,7 +430,19 @@ fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.
                 break;
             };
         },
-        .Class => |*c| try collectSinksInto(set, c.members),
+        .Class => |*c| {
+            // A class whose PRIMARY constructor takes a `@Composable`-typed
+            // lambda is a sink under its own name: `MovableContent({ … })`
+            // transforms its content lambda exactly like a function call
+            // would.
+            for (c.primary_params) |*p| {
+                if (p.ty.function != null and isComposable(p.ty.annotations)) {
+                    try set.put(c.name.name, {});
+                    break;
+                }
+            }
+            try collectSinksInto(set, c.members);
+        },
         .Object => |*o| try collectSinksInto(set, o.members),
         else => {},
     };
@@ -333,10 +482,23 @@ fn transformDecl(
             } else {
                 // Not composable: still walk the body so a `compose { … }` /
                 // `setContent { … }` composable-lambda argument is transformed.
-                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
+                const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
+                // A NON-composable fn can still take `@Composable`-typed
+                // lambda params (`movableContentOf(content)`): a bare
+                // `content()` inside one of its composable lambdas (the
+                // ctor-sink wrapper `MovableContent({ content() })`) is a
+                // composable call and must thread.
+                const lp = a.create(std.StringHashMap(void)) catch @panic("oom");
+                lp.* = try composableLambdaParamNames(a, f);
+                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp };
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
-                    .Expr => |*e| try w.walkExpr(e),
+                    .Expr => |*e| if (ret_composable and e.* == .Lambda) {
+                        try w.transformComposableLambda(&e.Lambda, ret_fn_params);
+                    } else {
+                        try w.walkExpr(e);
+                    },
                 };
             }
         },
@@ -511,7 +673,8 @@ pub fn transformComposableFunction(
     // threaded against this body's `$composer`.
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals };
+    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     for (pp.prologue) |*s| {
         try w.walkStmt(s);
         try out.append(a, s.*);
@@ -635,7 +798,8 @@ pub fn transformThreadedComposable(
     const params = pp.params;
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals };
+    const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
     const body = f.body orelse return signatureOnly(f, params);
     switch (body) {
         .Block => |blk| {
@@ -688,6 +852,13 @@ const Walker = struct {
     /// threaded (`Composition(applier, parent)` is the non-composable
     /// factory).
     locals: ?*std.StringHashMap(void) = null,
+    /// Scoped names of VALS holding composable lambdas (factory-initialized
+    /// or declared with a @Composable fn type). Their bare calls are VALUE
+    /// invocations: the pair passes POSITIONALLY (a wrapped
+    /// ComposableLambdaImpl declares `invoke(c, changed)` — named
+    /// `$composer=`/`$changed=` args cannot bind it). Function calls keep
+    /// the named pair for the defaulted-marker machinery.
+    composable_vals: ?*std.StringHashMap(void) = null,
     /// Ambient mode: the scope is a `@Composable` property GETTER, which has
     /// no `$composer` param. Composer references resolve through the
     /// `__compose_currentComposer` host intrinsic instead.
@@ -698,6 +869,14 @@ const Walker = struct {
     /// transform composable-lambda-sink arguments a `compose { … }` passes down),
     /// but its own calls are left alone.
     thread: bool = true,
+    /// The enclosing function declares a `@Composable`-function-typed RETURN
+    /// type: a lambda in return position (`return { … }`, or the whole
+    /// expression body) is composable — `movableContentOf`'s returned
+    /// wrapper is the shape.
+    ret_composable: bool = false,
+    /// Declared param count of that return function type (the header-less
+    /// returned lambda keeps an `it` slot when it is 1).
+    ret_fn_params: u8 = 0,
 
     /// The composer reference for the current scope: the threaded `$composer`
     /// param, or the ambient intrinsic call in a getter.
@@ -726,8 +905,47 @@ const Walker = struct {
     fn walkDecl(w: *Walker, d: *Decl) std.mem.Allocator.Error!void {
         switch (d.*) {
             .Property => |p| {
-                if (p.init) |*ini| try w.walkExpr(ini);
+                // `val content: @Composable () -> Unit = { … }` — the
+                // declared type makes the initializer lambda composable.
+                if (p.init) |*ini| {
+                    if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
+                        try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)));
+                    } else {
+                        try w.walkExpr(ini);
+                    }
+                }
                 if (p.delegate) |del| try w.walkExpr(del);
+                // A val HOLDING a composable lambda — declared with a
+                // `@Composable` fn type, or initialized from a factory
+                // returning one (`val content = movableContentOf { … }`) —
+                // joins the scoped locals set: a bare `content()` threads.
+                const holds_composable = blk: {
+                    if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
+                    const ini = p.init orelse break :blk false;
+                    if (ini != .Call or ini.Call.callee.* != .Path) break :blk false;
+                    const segs = ini.Call.callee.Path.segments;
+                    if (segs.len == 0) break :blk false;
+                    const af = active_factories orelse break :blk false;
+                    break :blk af.contains(segs[segs.len - 1].name);
+                };
+                if (holds_composable) {
+                    // The name joins BOTH sets: `locals` feeds every
+                    // established consumer (nested transforms, branch
+                    // scans); `composable_vals` only decides the
+                    // positional pair under the memo emission.
+                    if (w.locals == null) {
+                        const lset = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                        lset.* = std.StringHashMap(void).init(w.a);
+                        w.locals = lset;
+                    }
+                    try w.locals.?.put(p.name.name, {});
+                    if (w.composable_vals == null) {
+                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                        set.* = std.StringHashMap(void).init(w.a);
+                        w.composable_vals = set;
+                    }
+                    try w.composable_vals.?.put(p.name.name, {});
+                }
             },
             .Function => |*f| {
                 // A LOCAL `@Composable` declaration transforms exactly like
@@ -747,13 +965,111 @@ const Walker = struct {
                     }
                     return;
                 }
+                // A local fn returning a `@Composable` fn-type: its
+                // return-position lambdas compose, exactly like a top-level
+                // one's (the walker flag is scoped to this declaration).
+                const saved_ret = w.ret_composable;
+                const saved_rfp = w.ret_fn_params;
+                w.ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                w.ret_fn_params = if (w.ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
+                defer {
+                    w.ret_composable = saved_ret;
+                    w.ret_fn_params = saved_rfp;
+                }
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
-                    .Expr => |*e| try w.walkExpr(e),
+                    .Expr => |*e| if (w.ret_composable and e.* == .Lambda) {
+                        try w.transformComposableLambda(&e.Lambda, w.ret_fn_params);
+                    } else {
+                        try w.walkExpr(e);
+                    },
                 };
             },
             else => {},
         }
+    }
+
+    /// Replace a just-transformed composable lambda ARGUMENT with
+    /// `composableLambda($composer, <span key>, true, <lambda>)` — the
+    /// remembered instance the engine slots, so `composer.changed(content)`
+    /// is false when the content is unchanged and the child group SKIPS.
+    /// Threaded scope only ($composer must be in scope); entry-point sinks
+    /// in plain scope stay raw (invokeComposable wraps the root itself).
+    fn wrapInComposableLambda(w: *Walker, arg: *Expr) void {
+        const key = positionalKey(exprSpanOf(arg));
+        const args = w.a.alloc(Expr, 4) catch @panic("oom");
+        args[0] = w.composerRef();
+        args[1] = w.b.intLit(key);
+        args[2] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        args[3] = arg.*;
+        arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_path), args);
+    }
+
+    /// Whether a branch contains a call the pass considers composable
+    /// (oracle name, scoped local, composable lambda param, or sink) —
+    /// the gate for the per-branch replace groups: kotlinc brackets only
+    /// conditional COMPOSITION, and bracketing plain control flow inside
+    /// threaded engine functions corrupts their group structure.
+    fn branchHasComposable(w: *Walker, e: *const Expr) bool {
+        switch (e.*) {
+            .Call => |c| {
+                if (calleeSimpleName(c.callee)) |nm| {
+                    const is_lp = w.lambda_params != null and w.lambda_params.?.contains(nm);
+                    const is_local = w.locals != null and w.locals.?.contains(nm);
+                    const is_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
+                    const is_sink = w.sinks != null and w.sinks.?.contains(nm);
+                    if (is_lp or is_local or is_val or is_sink or w.oracle(w.oracle_ctx, nm)) return true;
+                }
+                if (w.branchHasComposable(c.callee)) return true;
+                for (c.args) |*a| if (w.branchHasComposable(a)) return true;
+                return false;
+            },
+            .Block => |blk| {
+                for (blk.stmts) |*st| switch (st.*) {
+                    .Expr => |*se| if (w.branchHasComposable(se)) return true,
+                    .Assign => |a| {
+                        if (w.branchHasComposable(&a.value)) return true;
+                    },
+                    .Decl => |d| switch (d) {
+                        .Property => |pp| {
+                            if (pp.init) |*ini| if (w.branchHasComposable(ini)) return true;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                };
+                return false;
+            },
+            .If => |ff| {
+                if (w.branchHasComposable(ff.then_branch)) return true;
+                if (ff.else_branch) |eb| if (w.branchHasComposable(eb)) return true;
+                return false;
+            },
+            .Lambda => |lam| {
+                for (lam.body.stmts) |*st| switch (st.*) {
+                    .Expr => |*se| if (w.branchHasComposable(se)) return true,
+                    else => {},
+                };
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Bracket a Block-shaped branch with
+    /// `$composer.startReplaceGroup(<span key>)` / `endReplaceGroup()`.
+    fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
+        if (branch.* != .Block) return;
+        const blk = &branch.Block;
+        const key = positionalKey(blk.span);
+        if (dbg_groups) std.debug.print("[compose-pass] replace-group key={d} stmts={d}\n", .{ key, blk.stmts.len });
+        const stmts = w.a.alloc(ast.Stmt, blk.stmts.len + 2) catch @panic("oom");
+        const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
+        start_args[0] = w.b.intLit(key);
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startReplaceGroup", start_args) };
+        @memcpy(stmts[1 .. blk.stmts.len + 1], blk.stmts);
+        stmts[blk.stmts.len + 1] = .{ .Expr = w.b.callMember(w.composerRef(), "endReplaceGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        blk.stmts = stmts;
     }
 
     fn walkExpr(w: *Walker, e: *Expr) std.mem.Allocator.Error!void {
@@ -774,12 +1090,27 @@ const Walker = struct {
                 // place of the generic lambda-body recursion, so its body is
                 // threaded once against its own `$composer` — not the enclosing
                 // one — and no argument is threaded twice.
+                // A sink whose name is ITSELF a composable function (`Linear`,
+                // `Text` mocks) is only callable from composable context; the
+                // same bare name in a NON-composable scope is a different
+                // declaration (the validator extension `MockViewValidator.
+                // Linear(block)`), and transforming its lambda handed the
+                // validator's calls a phantom composer. A non-composable sink
+                // (`compose { }`, `movableContentOf { }` — the entry points)
+                // transforms its lambda from any scope.
+                const sink_applies = name != null and w.sinks != null and w.sinks.?.contains(name.?) and
+                    (w.thread or !w.oracle(w.oracle_ctx, name.?));
                 const sink_last = c.args.len != 0 and
-                    c.args[c.args.len - 1] == .Lambda and
-                    name != null and w.sinks != null and w.sinks.?.contains(name.?);
+                    c.args[c.args.len - 1] == .Lambda and sink_applies;
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
-                        try w.transformComposableLambda(&arg.Lambda);
+                        const exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
+                        try w.transformComposableLambda(&arg.Lambda, exp);
+                        // Wrap only content that actually COMPOSES: the
+                        // name-keyed sink also catches sibling overloads'
+                        // plain trailing lambdas (ComposeNode's update),
+                        // whose wrapped invoke shape would not exist.
+                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) w.wrapInComposableLambda(arg);
                     } else {
                         try w.walkExpr(arg);
                     }
@@ -788,7 +1119,25 @@ const Walker = struct {
                     if (name) |nm| {
                         const is_lambda_param = w.lambda_params != null and w.lambda_params.?.contains(nm);
                         const is_local_composable = w.locals != null and w.locals.?.contains(nm);
-                        if (is_lambda_param or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
+                        const is_composable_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
+                        // An explicit-receiver invoke of a `@Composable`-typed
+                        // property (`content.content(parameter)`).
+                        const is_composable_prop = c.callee.* == .Member and
+                            active_composable_props != null and active_composable_props.?.contains(nm);
+                        // VALUE invocations take the pair positionally —
+                        // only under the memoization emission (a wrapped
+                        // ComposableLambdaImpl cannot bind the named pair);
+                        // unwrapped closures keep the named pair, the
+                        // established shape.
+                        // Positional pair ONLY where the value can be a
+                        // memo-wrapped ComposableLambdaImpl: sink-arg
+                        // lambdas reach lambda params and composable
+                        // props. A composable VAL (movableContentOf's
+                        // returned wrapper) holds an unwrapped closure
+                        // with literal `$composer`/`$changed` params — it
+                        // keeps the named pair.
+                        const positional = emit_lambda_memo and (is_lambda_param or is_composable_prop);
+                        if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
                     }
                 }
             },
@@ -807,6 +1156,22 @@ const Walker = struct {
                 try w.walkExpr(f.cond);
                 try w.walkExpr(f.then_branch);
                 if (f.else_branch) |eb| try w.walkExpr(eb);
+                // Conditional content in a composable body gets a
+                // REPLACEABLE GROUP per branch (distinct span keys), the
+                // plugin ABI's slot-alignment bracket: without it a forced
+                // recomposition of an UNCHANGED body misaligns at the
+                // branch and reports spurious changes, and a branch flip
+                // cannot replace its content atomically. Statement-shaped
+                // (Block) branches only: an expression-if's value must not
+                // be displaced by the bracket call. A `return` inside the
+                // branch skips the end call (kotlinc brackets returns too;
+                // acceptable gap, noted).
+                if (w.thread and (w.branchHasComposable(f.then_branch) or
+                    (if (f.else_branch) |eb2| w.branchHasComposable(eb2) else false)))
+                {
+                    w.wrapBranchInReplaceGroup(f.then_branch);
+                    if (f.else_branch) |eb| w.wrapBranchInReplaceGroup(eb);
+                }
             },
             .While => |*wl| {
                 try w.walkExpr(wl.cond);
@@ -820,7 +1185,13 @@ const Walker = struct {
                 try w.walkExpr(fr.iter);
                 try w.walkExpr(fr.body);
             },
-            .Return => |*r| if (r.value) |v| try w.walkExpr(v),
+            .Return => |*r| if (r.value) |v| {
+                if (w.ret_composable and v.* == .Lambda) {
+                    try w.transformComposableLambda(&v.Lambda, w.ret_fn_params);
+                } else {
+                    try w.walkExpr(v);
+                }
+            },
             .Throw => |*t| try w.walkExpr(t.value),
             .Labeled => |*l| try w.walkExpr(l.expr),
             .Block => |*blk| try w.walkBlock(blk),
@@ -859,7 +1230,7 @@ const Walker = struct {
     /// and thread its body. The plugin lowers a `@Composable (P…) -> R` to a
     /// `FunctionN<P…, Composer, Int, R>`; the engine's `invokeComposable` /
     /// composer invoke it with the composer and a changed flag.
-    fn transformComposableLambda(w: *Walker, lam: anytype) std.mem.Allocator.Error!void {
+    fn transformComposableLambda(w: *Walker, lam: anytype, expected_params: ?u8) std.mem.Allocator.Error!void {
         if (dbg_lambda) std.debug.print("[compose-pass] transform composable lambda ({d} params)\n", .{lam.params.len});
         // Idempotence: a lambda already carrying a trailing `$composer` param
         // (a shared node reached twice) is left alone.
@@ -868,10 +1239,16 @@ const Walker = struct {
         // A lambda with only the synthetic `it` (a header-less `{ … }` bound to a
         // `() -> R` sink) has no real parameters: the composer/changed pair
         // replaces `it`, not follows it. A header-declared lambda keeps its
-        // explicit parameters and gains the pair after them.
-        const n: usize = if (lam.implicit_it) 0 else lam.params.len;
+        // explicit parameters and gains the pair after them — as does the
+        // implicit `it` when the sink's declared composable type takes one
+        // parameter (`MovableContent({ content() })` invokes its content
+        // with the movable parameter first).
+        const keep_it = lam.implicit_it and (expected_params orelse 0) >= 1;
+        const n: usize = if (lam.implicit_it) (if (keep_it) 1 else 0) else lam.params.len;
         const new_params = try w.a.alloc(Ident, n + 2);
-        if (n != 0) @memcpy(new_params[0..n], lam.params[0..n]);
+        if (keep_it) {
+            new_params[0] = w.b.ident("it");
+        } else if (n != 0) @memcpy(new_params[0..n], lam.params[0..n]);
         new_params[n] = w.b.ident(composer_param);
         new_params[n + 1] = w.b.ident(changed_param);
         const new_tys = try w.a.alloc(?TypeRef, n + 2);
@@ -894,20 +1271,36 @@ const Walker = struct {
     /// `Test($composer, 0)`), and a positional append would bind the composer
     /// into the first omitted param. Named, the binder slots the pair exactly
     /// and the omitted params take their defaults.
-    fn threadCall(w: *Walker, c: anytype) std.mem.Allocator.Error!void {
+    fn threadCall(w: *Walker, c: anytype, positional: bool) std.mem.Allocator.Error!void {
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
         new_args[c.args.len] = w.composerRef();
         new_args[c.args.len + 1] = w.b.intLit(0);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
-        new_names[c.args.len] = composer_param;
-        new_names[c.args.len + 1] = changed_param;
+        if (!positional) {
+            new_names[c.args.len] = composer_param;
+            new_names[c.args.len + 1] = changed_param;
+        } else {
+            new_names[c.args.len] = null;
+            new_names[c.args.len + 1] = null;
+        }
         c.args = new_args;
         c.arg_names = new_names;
         c.has_trailing_lambda = false;
     }
 };
+
+/// The span of an expression, for the memoization key. Falls back to a
+/// zero span when the node form carries none the pass knows about.
+fn exprSpanOf(e: *const Expr) Span {
+    return switch (e.*) {
+        .Lambda => |l| l.span,
+        .Call => |c| exprSpanOf(c.callee),
+        .Path => |pp| if (pp.segments.len != 0) pp.segments[0].span else Span.init(span_mod.FileId.from(0), 0, 0),
+        else => Span.init(span_mod.FileId.from(0), 0, 0),
+    };
+}
 
 /// Whether `e` denotes `currentComposer` — a bare path or a trailing member
 /// segment of that name.
@@ -1072,7 +1465,13 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     // The Column call sits inside the skip-if's then-block.
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
-    const lam = col.args[0].Lambda;
+    // The sink lambda is memoized — wrapped in
+    // `composableLambda($composer, key, true, <lambda>)` with the lambda last.
+    const memo = col.args[0].Call;
+    const memo_path = memo.callee.Path;
+    try testing.expectEqualStrings("composableLambda", memo_path.segments[memo_path.segments.len - 1].name);
+    try testing.expectEqual(@as(usize, 4), memo.args.len);
+    const lam = memo.args[3].Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
     // ($composer, $changed), not appended after.
     try testing.expectEqual(@as(usize, 2), lam.params.len);
