@@ -9467,13 +9467,32 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         defer mg.deinit();
         const mod = mg.get();
         const mtrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+        // A file-private PLAIN function `Row` is mangled to `Row$f<id>` and
+        // its bare calls rewrite to that name, but a same-file EXTENSION
+        // namesake `T.Row` is left unmangled (the private-fn rename skips
+        // receiver-typed decls). So a receiver-context call rewritten to
+        // `Row$f0` must ALSO consult the base name `Row` to reach the
+        // extension — otherwise the call can only ever bind the plain global.
+        const base_name: ?[]const u8 = blk: {
+            if (std.mem.lastIndexOf(u8, name, "$f")) |i| {
+                if (i > 0 and i + 2 < name.len and std.ascii.isDigit(name[i + 2])) break :blk name[0..i];
+            }
+            break :blk null;
+        };
         if (mtrace) {
             std.debug.print("[extfb] name={s} simple-name fids={d} want={d} args:", .{ name, mod.funcsBySimpleName(name).len, want });
             for (args) |*a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a.*))});
             std.debug.print("\n", .{});
         }
-        for (mod.funcsBySimpleName(name)) |fid| {
+        var name_bufs = [_][]const u8{ name, base_name orelse name };
+        const name_set: []const []const u8 = if (base_name != null) name_bufs[0..2] else name_bufs[0..1];
+        for (name_set) |cand_name| {
+        for (mod.funcsBySimpleName(cand_name)) |fid| {
             const f = funcAt(mod, fid) orelse continue;
+            // From the base-name pass, keep only true extensions (the plain
+            // global is already reachable under the mangled name / global arm).
+            if (base_name != null and std.mem.eql(u8, cand_name, base_name.?) and
+                !(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
             if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) {
                 if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
                 continue;
@@ -9553,6 +9572,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             }
             if (mtrace) std.debug.print("[extfb]  fid={d} CANDIDATE recv={s}\n", .{ fid.int(), if (mod.decl_sigs.get(fid.int())) |sg| (if (sg.receiver_ty) |rt| rt.name else "-") else "-" });
             try candidates.append(allocator, .{ .fid = fid, .func = f });
+        }
         }
     }
 
