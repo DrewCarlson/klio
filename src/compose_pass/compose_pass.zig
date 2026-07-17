@@ -1237,7 +1237,20 @@ const Walker = struct {
                     c.args[c.args.len - 1] == .Lambda and sink_applies;
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
-                        const exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
+                        var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
+                        // `movableContentOf` is OVERLOADED on the lambda's
+                        // parameter count (`() -> Unit` vs `(P) -> Unit`);
+                        // the name-keyed sink-arity map conflates them, and
+                        // a spurious synthetic `it` on the 0-param variant
+                        // shifts the invoke protocol (the 3-param block is
+                        // invoked 2-arg and `$composer` receives the Int
+                        // dirty flag). A headerless lambda that never reads
+                        // `it` is the 0-param overload.
+                        if (std.mem.eql(u8, name.?, "movableContentOf") and
+                            arg.Lambda.implicit_it and !blockUsesIt(&arg.Lambda.body))
+                        {
+                            exp = 0;
+                        }
                         try w.transformComposableLambda(&arg.Lambda, exp);
                         // Wrap only content that actually COMPOSES: the
                         // name-keyed sink also catches sibling overloads'
@@ -1683,6 +1696,80 @@ const EpilogueInjector = struct {
         }
     }
 };
+
+/// Whether a headerless lambda body reads the implicit `it` anywhere.
+fn blockUsesIt(blk: *const ast.Block) bool {
+    for (blk.stmts) |*st| {
+        if (stmtUsesIt(st)) return true;
+    }
+    return false;
+}
+
+fn stmtUsesIt(s: *const Stmt) bool {
+    switch (s.*) {
+        .Expr => |*e| return exprUsesIt(e),
+        .Assign => |*asg| return exprUsesIt(&asg.target) or exprUsesIt(&asg.value),
+        .DestructuringDecl => |*dd| return exprUsesIt(&dd.init),
+        .Decl => |*d| switch (d.*) {
+            .Property => |pr| {
+                if (pr.init) |*ini| return exprUsesIt(ini);
+                return false;
+            },
+            else => return false,
+        },
+    }
+}
+
+fn exprUsesIt(e: *const Expr) bool {
+    switch (e.*) {
+        .Path => |p| return p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "it"),
+        .Call => |*c| {
+            if (exprUsesIt(c.callee)) return true;
+            for (c.args) |*a| {
+                switch (a.*) {
+                    // A nested headerless lambda rebinds `it`.
+                    .Lambda => {},
+                    else => if (exprUsesIt(a)) return true,
+                }
+            }
+            return false;
+        },
+        .If => |*f| {
+            if (exprUsesIt(f.cond) or exprUsesIt(f.then_branch)) return true;
+            if (f.else_branch) |eb| return exprUsesIt(eb);
+            return false;
+        },
+        .When => |*wh| {
+            if (wh.subject) |sub| if (exprUsesIt(sub)) return true;
+            for (wh.branches) |*br| if (exprUsesIt(&br.body)) return true;
+            return false;
+        },
+        .Block => |*blk| return blockUsesIt(blk),
+        .Binary => |*bn| return exprUsesIt(bn.lhs) or exprUsesIt(bn.rhs),
+        .Unary => |*u| return exprUsesIt(u.expr),
+        .Postfix => |*p| return exprUsesIt(p.expr),
+        .Member => |*m| return exprUsesIt(m.receiver),
+        .Index => |*ix| {
+            if (exprUsesIt(ix.receiver)) return true;
+            for (ix.args) |*a| if (exprUsesIt(a)) return true;
+            return false;
+        },
+        .StringTemplate => |*st| {
+            for (st.parts) |*part| switch (part.*) {
+                .Interp => |ie| if (exprUsesIt(ie)) return true,
+                else => {},
+            };
+            return false;
+        },
+        .Labeled => |*l| return exprUsesIt(l.expr),
+        .Throw => |*t| return exprUsesIt(t.value),
+        .Return => |*r| {
+            if (r.value) |v| return exprUsesIt(v);
+            return false;
+        },
+        else => return false,
+    }
+}
 
 /// Whether `s` is a bare `$composer.<name>()` call statement.
 fn isComposerCallStmt(s: *const Stmt, name: []const u8) bool {
