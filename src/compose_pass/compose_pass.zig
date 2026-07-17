@@ -311,6 +311,46 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
+/// Sink name -> the NAME of its last parameter when that parameter is the
+/// composable lambda. The memo wrap turns the trailing lambda into a plain
+/// call expression, which no longer binds as a trailing lambda: with
+/// defaulted middle parameters it would slide into the FIRST open slot
+/// positionally. Emitting the wrapped argument by name keeps the binding.
+pub var active_sink_last_param: ?*const std.StringHashMap([]const u8) = null;
+
+pub fn collectComposableSinkLastParam(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap([]const u8) {
+    var set = std.StringHashMap([]const u8).init(a);
+    try collectSinkLastParamInto(&set, decls);
+    return set;
+}
+
+pub fn collectSinkLastParamInto(set: *std.StringHashMap([]const u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (f.params.len != 0) {
+                const lp = &f.params[f.params.len - 1];
+                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
+                    try set.put(f.name.name, lp.name.name);
+                }
+            }
+        },
+        .Class => |*c| {
+            if (c.primary_params.len != 0) {
+                const lp = &c.primary_params[c.primary_params.len - 1];
+                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
+                    try set.put(c.name.name, lp.name.name);
+                }
+            }
+            try collectSinkLastParamInto(set, c.members);
+        },
+        .Object => |*o| try collectSinkLastParamInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Names of INLINE functions in the compile universe. A composable call is
 /// legal inside a lambda argument only when the callee inlines it (the body
 /// splices into the composable caller) or the parameter is composable (the
@@ -1189,7 +1229,23 @@ const Walker = struct {
                         // name-keyed sink also catches sibling overloads'
                         // plain trailing lambdas (ComposeNode's update),
                         // whose wrapped invoke shape would not exist.
-                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) w.wrapInComposableLambda(arg);
+                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) {
+                            w.wrapInComposableLambda(arg);
+                            // The wrapped argument is no longer a lambda:
+                            // bind it by the sink's last-parameter name so a
+                            // defaulted middle parameter cannot absorb it
+                            // positionally.
+                            if (active_sink_last_param) |lp| {
+                                if (lp.get(name.?)) |pname| {
+                                    const names = w.a.alloc(?[]const u8, c.args.len) catch @panic("oom");
+                                    for (0..c.args.len) |k| {
+                                        names[k] = if (k < c.arg_names.len) c.arg_names[k] else null;
+                                    }
+                                    names[c.args.len - 1] = pname;
+                                    c.arg_names = names;
+                                }
+                            }
+                        }
                     } else if (arg.* == .Lambda and w.thread and name != null and
                         !calleeInlinesLambda(name.?))
                     {

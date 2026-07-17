@@ -470,6 +470,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer comp_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
+        var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
+        defer sink_last_param.deinit();
         if (base) |bsp| {
             try composeBaseNames(&names, bsp);
             try composeBaseSinks(&sinks, bsp);
@@ -477,6 +479,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseSinkArity(&sink_arity, bsp);
             try composeBaseComposableProps(&comp_props, bsp);
             try composeBaseInlineFns(&inline_fns, bsp);
+            try composeBaseSinkLastParam(&sink_last_param, bsp);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -490,6 +493,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_composable_props = null;
         compose_pass.active_inline_fns = &inline_fns;
         defer compose_pass.active_inline_fns = null;
+        compose_pass.active_sink_last_param = &sink_last_param;
+        defer compose_pass.active_sink_last_param = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
@@ -4053,6 +4058,12 @@ fn composeBaseSinks(sinks: *std.StringHashMap(void), base: *const StdlibBase) Al
 
 fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
     for (base.lifted_decls) |*d| try composeBaseFactoryDecl(factories, d);
+}
+
+fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| {
+        try compose_pass.collectSinkLastParamInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseInlineFns(set: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
