@@ -825,10 +825,49 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// `Binary` lowering: the short-circuiting operators (`&&`, `||`, `?:`),
 /// the `in`/`!in` desugars, generic-operand comparisons, and the eager
 /// primitive operators.
+
+/// Numeric/string/char/bool simple type heads whose `+`/`-` stay primitive.
+fn isPrimitiveTypeName(name: []const u8) bool {
+    const prims = [_][]const u8{ "Int", "Long", "Short", "Byte", "Double", "Float", "Char", "Boolean", "String", "UInt", "ULong", "UShort", "UByte", "Number" };
+    for (prims) |p2| {
+        if (std.mem.eql(u8, name, p2)) return true;
+    }
+    return false;
+}
+
 fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const op = bin.op;
     const lhs = bin.lhs;
     const rhs = bin.rhs;
+
+    // `this + x` where the receiver's STATIC type is known and non-primitive:
+    // kotlinc resolves the operator against the static type — inside a
+    // `CoroutineScope.() -> Unit` lambda, `this + dispatcher` binds the
+    // `CoroutineScope.plus` extension (the static type has no member), never
+    // the runtime class's inherited `CoroutineContext.Element.plus`. A plain
+    // BinOp lost the static type and the runtime member won.
+    if ((op == .Add or op == .Sub) and lhs.* == .This and lhs.This.qualifier == null) {
+        const sty: ?[]const u8 = b.recvTy() orelse b.enclosingRecvTy();
+        if (sty) |ty| {
+            if (!isPrimitiveTypeName(ty)) {
+                const l = try lowerExpr(b, lhs);
+                const r = try lowerExpr(b, rhs);
+                const args_start = try packContiguous(b, &.{r});
+                const dst = b.allocReg();
+                const nm = try b.module.internConst(b.allocator, .{ .String = if (op == .Add) "plus" else "minus" });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = l,
+                    .name = nm,
+                    .static_recv = try b.module.internConst(b.allocator, .{ .String = ty }),
+                    .args = args_start,
+                    .n_args = 1,
+                    .arg_names = &.{},
+                } });
+                return dst;
+            }
+        }
+    }
 
     // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the
     // RHS's STATIC type, appending the value as one element even when it

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const decl = @import("decl.zig");
 const span = @import("span");
 pub const runtime = @import("runtime");
 
@@ -324,8 +325,20 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
     // the reverse fn-addr -> id map entries via inlineAstById-style population is
     // not needed here (ids come from the id registry).
     const a = std.heap.page_allocator;
-    const resolved = a.alloc(*const ast.Function, fields.len) catch return null;
-    for (fields, 0..) |ff, i| resolved[i] = ff.get();
+    var buf = a.alloc(*const ast.Function, fields.len) catch return null;
+    // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+    // inline overload is not a source-level candidate (kotlinc hides it): the
+    // HIDDEN `Flow.collect(action)` binary-compat form was the SOLE inline
+    // candidate for `collect`, so `collect(NopCollector)` spliced it and
+    // wrapped the collector in its action-invoking anon object.
+    var n: usize = 0;
+    for (fields) |ff| {
+        const f = ff.get();
+        if (decl.annotationsAreLowPriority(f.annotations)) continue;
+        buf[n] = f;
+        n += 1;
+    }
+    const resolved = buf[0..n];
     if (inline_fn_asts_resolved == null) {
         inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(a);
     }
