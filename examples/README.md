@@ -122,6 +122,7 @@ Run any program with:
 | `typealias_receiver_member_ext.kt` | A member extension declared on a typealias receiver (`fun AliasedUnit.report()` where `typealias AliasedUnit = Unit`) dispatches on values of the aliased type through the enclosing scope. |
 | `throwable_suppressed_user_class.kt` | `addSuppressed`/`suppressedExceptions` on a user-defined throwable class: the suppressed set is shared across aliases and survives throw/catch. |
 | `captured_counter_in_object_method.kt` | A captured outer `var` incremented (`++`) inside an anonymous object's method and inside a local class's method writes through to the declaration site, like a lambda capture. |
+| `local_class_init_block.kt` | A local class's `init { }` blocks run at construction — interleaved with property initializers in declaration order — and read/write the enclosing function's captured vars through shared cells. |
 | `local_fn_shadows_imported_class.kt` | A local `fun Test(a, b)` shadows an imported same-named class (`kotlin.test.Test`) at a bare call, including from inside a closure where the binding arrives as a capture. |
 | `local_var_shadows_fn_call.kt` | A local `var` initialized with a literal does not shadow a same-named function at a call site — an Int is not invokable, so the call binds the function. |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |

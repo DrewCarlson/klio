@@ -1,0 +1,5 @@
+init#1 a count=1
+init#2 doubled=2
+init#1 b count=2
+init#2 doubled=4
+outer count=3
