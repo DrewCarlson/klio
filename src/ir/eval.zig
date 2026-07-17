@@ -555,6 +555,10 @@ pub fn dumpFrameChainForDiag() void {
     dumpFrameChainForDiagAlways();
 }
 
+/// Delivery-route tag for KLIO_RESUME_TRACE: which host path drove the
+/// current resume (park slot, persisted take, adopt, inline claim...).
+pub threadlocal var resume_route: []const u8 = "?";
+
 /// Ungated frame-chain dump for name-filtered diagnostics that gate at
 /// their own call site (e.g. `KLIO_MISS_TRACE`).
 pub fn dumpFrameChainForDiagAlways() void {
@@ -1659,6 +1663,7 @@ pub fn resumeContinuation(
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
+    _ = &resume_route;
     while (true) {
         if (head >= frames.items.len) {
             // Promote the next inherited segment.
@@ -1679,9 +1684,11 @@ pub fn resumeContinuation(
         const m: *const Module = snap_module orelse module;
         const func = m.funcById(snap.func).?;
         // KLIO_RESUME_TRACE: name every frame a resume drive re-runs — the
-        // instrument that finds a tail executing twice in one unwind.
+        // instrument that finds a tail executing twice in one unwind. The
+        // route tag says which delivery path drove it (set by the host's
+        // resumeRaw call sites).
         if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null)
-            std.debug.print("[resume-frame] {s}#{d} at={d}:{d} throw={}\n", .{ func.name, func.id.int(), snap.block.int(), snap.inst_idx, pending_throw_from_inner != null });
+            std.debug.print("[resume-frame] {s}#{d} at={d}:{d} throw={} via={s}\n", .{ func.name, func.id.int(), snap.block.int(), snap.inst_idx, pending_throw_from_inner != null, resume_route });
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;

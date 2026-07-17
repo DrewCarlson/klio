@@ -1644,6 +1644,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
                 g.get().cont = null;
                 g.deinit();
             }
+ir.eval.resume_route = "yield-rotate";
             r = try intrinsic_host.resumeRaw(self, old, .Unit, out);
             // `resumeContinuation` freed `old.frames`; free the box itself.
             a.destroy(old);
@@ -1866,6 +1867,7 @@ pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value
     // re-captures the restored delta).
     const root_scope_base = activeScopeDepth();
     restoreScopeDelta(scope_delta);
+ir.eval.resume_route = "driveResumed";
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
@@ -2033,6 +2035,7 @@ fn pumpLoop(
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
+ir.eval.resume_route = "pump-ready";
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => |v| {
                         if (root_token.* != null and root_token.*.? == tok) {
@@ -2531,6 +2534,7 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
         const scope_base = activeScopeDepth();
         restoreScopeDelta(entry.scope_delta);
         coroStackAllocator().free(entry.scope_delta);
+ir.eval.resume_route = "inline-claim";
         switch (try intrinsic_host.resumeRaw(self, &entry.state, value, out)) {
             .ok => {},
             .err => |e| switch (e) {
@@ -2612,6 +2616,7 @@ fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value
     const scope_base = activeScopeDepth();
     restoreScopeDelta(pe.scope_delta);
     coroStackAllocator().free(pe.scope_delta);
+    ir.eval.resume_route = "persisted-on-top";
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => {},
         // A re-suspension re-parks onto the existing live pump (`park` targets
@@ -2740,6 +2745,7 @@ pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
+                ir.eval.resume_route = "drain-ready";
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => {},
                     .err => |e| switch (e) {
