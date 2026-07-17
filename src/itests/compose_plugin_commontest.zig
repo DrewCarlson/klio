@@ -29,7 +29,7 @@ const runtime = @import("runtime");
 /// fixes took it to 953; the movable-content chain and the validator-side
 /// sink-scope gate took it to 987. The floor leaves saturation headroom
 /// like the implicit suite's does.
-const BASELINE: usize = 970;
+const BASELINE: usize = 985;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
