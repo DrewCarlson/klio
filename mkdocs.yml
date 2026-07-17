@@ -85,4 +85,5 @@ nav:
   - Development:
     - Workspace Layout: development/workspace.md
     - Testing: development/testing.md
+    - Debugging: development/debugging.md
     - Contributing: development/contributing.md
