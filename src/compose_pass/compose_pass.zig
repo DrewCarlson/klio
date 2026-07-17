@@ -1238,18 +1238,26 @@ const Walker = struct {
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
                         var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
-                        // `movableContentOf` is OVERLOADED on the lambda's
-                        // parameter count (`() -> Unit` vs `(P) -> Unit`);
-                        // the name-keyed sink-arity map conflates them, and
-                        // a spurious synthetic `it` on the 0-param variant
-                        // shifts the invoke protocol (the 3-param block is
-                        // invoked 2-arg and `$composer` receives the Int
-                        // dirty flag). A headerless lambda that never reads
-                        // `it` is the 0-param overload.
-                        if (std.mem.eql(u8, name.?, "movableContentOf") and
-                            arg.Lambda.implicit_it and !blockUsesIt(&arg.Lambda.body))
-                        {
-                            exp = 0;
+                        // `movableContentOf` / `movableContentWithReceiverOf`
+                        // are OVERLOADED on the lambda's parameter count
+                        // (`() -> Unit` vs `(P) -> Unit` … `R.(P1..P3)`); the
+                        // name-keyed sink-arity map conflates them, and a
+                        // spurious synthetic `it` shifts the invoke protocol
+                        // (the 3-param block is invoked 2-arg and `$composer`
+                        // receives the Int dirty flag). Explicit call-site
+                        // type args name the overload exactly (the receiver
+                        // form spends its first type arg on R, not a lambda
+                        // param); otherwise a headerless lambda that never
+                        // reads `it` is the 0-param overload.
+                        const is_mco = std.mem.eql(u8, name.?, "movableContentOf");
+                        const is_mcwro = std.mem.eql(u8, name.?, "movableContentWithReceiverOf");
+                        if ((is_mco or is_mcwro) and arg.Lambda.implicit_it) {
+                            if (c.type_args.len != 0) {
+                                const ta: u8 = @intCast(@min(c.type_args.len, 255));
+                                exp = if (is_mcwro) ta - 1 else ta;
+                            } else {
+                                exp = if (blockUsesIt(&arg.Lambda.body)) 1 else 0;
+                            }
                         }
                         try w.transformComposableLambda(&arg.Lambda, exp);
                         // Wrap only content that actually COMPOSES: the
@@ -2230,4 +2238,61 @@ test "non-composable callees are not threaded" {
     const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null, false, null);
     // println keeps 0 args (not threaded).
     try testing.expectEqual(@as(usize, 0), wrappedBodyStmts(&out)[0].Expr.Call.args.len);
+}
+
+test "movableContentWithReceiverOf type args pick the headerless lambda's overload arity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    // mcwro<Int>() { … } — headerless it-free lambda; one type arg = receiver
+    // only, so the block gains exactly ($composer, $changed), no `it`.
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var call_args = [_]Expr{.{ .Lambda = .{
+        .params = &lam_params,
+        .param_tys = &lam_ptys,
+        .body = .{ .stmts = &.{}, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } }};
+    var segs = [_]Ident{dummyIdent("movableContentWithReceiverOf")};
+    var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
+    var names = [_]?[]const u8{null};
+    var tas = [_]TypeRef{.{
+        .name = dummyIdent("Int"),
+        .nullable = false,
+        .span = gsp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    }};
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &callee,
+        .args = &call_args,
+        .arg_names = &names,
+        .type_args = &tas,
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+    var sinks = std.StringHashMap(void).init(a);
+    try sinks.put("movableContentWithReceiverOf", {});
+    // Conflated name-keyed arity says 3 (the R.(P1..P3) overload) — the
+    // call-site type args must override it down to 0.
+    var arity = std.StringHashMap(u8).init(a);
+    try arity.put("movableContentWithReceiverOf", 3);
+    active_sink_arity = &arity;
+    defer active_sink_arity = null;
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null);
+    const call = wrappedBodyStmts(&out)[0].Expr.Call;
+    const lam = call.args[call.args.len - 1].Lambda;
+    try testing.expectEqual(@as(usize, 2), lam.params.len);
+    try testing.expectEqualStrings(composer_param, lam.params[0].name);
+    try testing.expectEqualStrings(changed_param, lam.params[1].name);
 }
