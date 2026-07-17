@@ -973,6 +973,10 @@ pub const Class = struct {
     /// is therefore never construction; it must resolve to a same-named
     /// factory function, so bare-call lowering must not treat it as a ctor.
     is_abstract: bool = false,
+    /// `interface` specifically: its member set is exactly its declared
+    /// (+ inherited) AST members, so a static-receiver walk can trust the
+    /// registry's transitive method-name set for visibility decisions.
+    is_interface: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;
@@ -1076,6 +1080,16 @@ pub const Module = struct {
     /// on the receiver outranks a same-named plain top-level function. Not
     /// serialized.
     pending_lambda_own_recv: ?[]const u8 = null,
+    /// The body about to lower belongs to a LOCAL `fun` with a BLOCK body:
+    /// its fall-through returns Unit, never the tail statement's value —
+    /// `fun f() { 42 }` yields Unit in Kotlin, while a lambda literal yields
+    /// its last expression. Same rule `lowerFunctionBodyWithImplicitOwner-
+    /// Enclosing` applies to top-level/member block bodies; without it a
+    /// restart-wrapped local composable returned its trailing
+    /// `endRestartGroup()?.updateScope(..)` null and Compose's
+    /// `block?.invoke(c, 1) ?: error("Invalid restart scope")` elvis fired.
+    /// Not serialized.
+    pending_lambda_fn_block_body: bool = false,
     /// Non-reified type-parameter names in scope at the lambda body about to
     /// lower, carried into that body so an `x as T` cast inside the lambda is
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
@@ -2944,9 +2958,60 @@ pub const Module = struct {
     /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
     /// inside `fun Box(s: String)` self-recursing past the constructor). No
     /// signature view, or no refuting evidence, keeps the candidate.
-    fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
+    pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
         const sv = self.sigViewForApplicability(fid) orelse return true;
         return applicability.applicable(&sv, args, .{}) != null;
+    }
+
+    /// Among the exact-declared-arity, non-extension candidates, the one whose
+    /// `FunctionN`-headed parameters best fit the call's lambda LITERALS:
+    /// exact header-count match scores highest, a headerless literal (arity
+    /// 0) serving a 1-param type via implicit `it` just below. Null unless a
+    /// single candidate strictly wins with positive functional evidence, so
+    /// evidence-free calls keep the established fallback order.
+    fn fnArityBestPick(self: *const Module, name: []const u8, want_arity: u32, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
+        var any_literal = false;
+        for (args) |a| {
+            if (a.lambda_is_literal and a.lambda_arity != null) any_literal = true;
+        }
+        if (!any_literal) return null;
+        var best: ?FuncId = null;
+        var best_score: i32 = 0;
+        var tied = false;
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+            if (!self.isNonExtFid(fid)) continue;
+            if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
+            if (self.declArityOf(fid) != want_arity) continue;
+            const f = self.funcById(fid) orelse continue;
+            const sv = self.sigViewOf(fid, f) orelse continue;
+            if (sv.len() != args.len) continue;
+            var score: i32 = 0;
+            for (args, 0..) |a, i| {
+                if (!a.lambda_is_literal) continue;
+                const got = a.lambda_arity orelse continue;
+                const head = sv.at(i).name;
+                const hn = if (std.mem.lastIndexOfScalar(u8, head, '.')) |dot| head[dot + 1 ..] else head;
+                if (!std.mem.startsWith(u8, hn, "Function")) continue;
+                const want = std.fmt.parseInt(usize, hn["Function".len..], 10) catch continue;
+                if (got == want) {
+                    score += 3;
+                } else if (got == 0 and want == 1) {
+                    score += 2;
+                } else {
+                    score -= 1;
+                }
+            }
+            if (score > best_score) {
+                best = fid;
+                best_score = score;
+                tied = false;
+            } else if (score == best_score and best != null) {
+                tied = true;
+            }
+        }
+        if (tied) return null;
+        return best;
     }
 
     fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
@@ -2984,6 +3049,15 @@ pub const Module = struct {
                 }
             }
         }
+        // Same-name overloads that differ ONLY in a functional parameter's
+        // arity (`movableContentOf` takes `() -> Unit` … `(P1..P4) -> Unit`,
+        // all user arity 1): the order-based fallback blind-binds one, and
+        // `declSigCompatible` keeps every stub. When the call carries a
+        // LAMBDA LITERAL, rank the declared-arity candidates by how their
+        // `FunctionN` param heads fit the literal's header count and bind a
+        // strictly-best candidate. Ties (including no functional evidence)
+        // fall through to the established order.
+        if (self.fnArityBestPick(name, want_u32, args, ctx_owner)) |pick| return pick;
         if (fallback_fits) return fallback;
         for (self.funcsBySimpleName(name)) |fid| {
             if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
@@ -3004,7 +3078,53 @@ pub const Module = struct {
             }
             if (all_ext_zero_arity) return null;
         }
+        // No exact-arity candidate fit: a UNIQUE overload whose vararg
+        // absorbs the surplus is Kotlin's pick — a plugin-threaded
+        // `remember(k1..k4, calculation, $composer, $changed)` (7 args) can
+        // only be the `vararg keys` overload, never the first-declared
+        // zero-key one the plain fallback would blind-bind.
+        if (fallback != null and !fallback_fits) {
+            var only: ?FuncId = null;
+            var count: usize = 0;
+            for (self.funcsBySimpleName(name)) |fid| {
+                if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+                if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
+                if (!self.varargArityFits(fid, want)) continue;
+                only = fid;
+                count += 1;
+                if (count > 1) break;
+            }
+            if (count == 1) return only;
+        }
         return fallback;
+    }
+
+    /// Whether `id` declares a vararg and can absorb a `want`-argument call:
+    /// at least the required (non-defaulted, non-vararg) parameter count.
+    /// The exact-arity helpers deliberately exclude vararg candidates; this
+    /// is their positive complement for the no-exact-fit fallback.
+    fn varargArityFits(self: *const Module, id: FuncId, want: usize) bool {
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (!ds.has_body) return false;
+            if (!ds.arity.has_vararg) return false;
+            return want >= ds.arity.required;
+        }
+        const f = self.funcById(id) orelse return false;
+        if (!f.hasBody()) return false;
+        // Defaults live on ProgramImage, not here: count every non-vararg
+        // param as required. Conservative — a defaulted param only ever
+        // RAISES this bound, so a fit found here is always a real fit.
+        var has_vararg = false;
+        var required: usize = 0;
+        for (f.params, 0..) |p, i| {
+            if (i == 0 and std.mem.eql(u8, p.name, "this")) continue;
+            if (p.is_vararg) {
+                has_vararg = true;
+                continue;
+            }
+            required += 1;
+        }
+        return has_vararg and want >= required;
     }
 
     /// Index-refined target: the heuristic's ladder pick refined by the
@@ -3973,6 +4093,12 @@ pub const ModuleRegistry = struct {
     /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
     /// name.
     type_aliases: std.StringHashMap([]const u8),
+    /// Function-type aliases whose target declares an extension RECEIVER
+    /// (`typealias Workflow = suspend WScope.() -> Unit`) → the target's
+    /// VALUE-parameter count. The `Function{N}` tag in `type_aliases`
+    /// deliberately drops the receiver; a bare call through a param of
+    /// such an alias must still bind the enclosing `this`.
+    recv_fn_aliases: std.StringHashMap(u8),
     /// Per-file (`FileId`) non-wildcard import leaf → every import in
     /// the file bound to that leaf, in declaration order. Keyed by file
     /// because a Kotlin named import is file-scoped; a list because
@@ -4069,6 +4195,7 @@ pub const ModuleRegistry = struct {
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
+            .recv_fn_aliases = std.StringHashMap(u8).init(allocator),
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
@@ -4146,6 +4273,7 @@ pub const ModuleRegistry = struct {
             self.abstract_member_defaults.deinit();
         }
         self.type_aliases.deinit();
+        self.recv_fn_aliases.deinit();
         {
             var it = self.import_aliases.valueIterator();
             while (it.next()) |inner| {

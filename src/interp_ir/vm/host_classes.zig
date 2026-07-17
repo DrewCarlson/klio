@@ -746,14 +746,28 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     const tbl = self.anon_methods.borrowMut();
     defer tbl.deinit();
     for (class.members) |*m| {
-        if (m.* != .Function) continue;
-        const f = &m.Function;
-        const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
-        for ([_][]const u8{ arity_name, f.name.name }) |member| {
-            const key = try anonKey(allocator, class.name.name, member);
-            if (tbl.get().getPtr(key)) |entry| {
-                entry.captures = capture_pairs;
-            }
+        switch (m.*) {
+            .Function => |*f| {
+                const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                for ([_][]const u8{ arity_name, f.name.name }) |member| {
+                    const key = try anonKey(allocator, class.name.name, member);
+                    if (tbl.get().getPtr(key)) |entry| {
+                        entry.captures = capture_pairs;
+                    }
+                }
+            },
+            // Accessor / property-initializer thunks capture the same outer
+            // env: `val doubled = count * 2` reads the enclosing fn's cell.
+            .Property => |p| {
+                for ([_][]const u8{ "$get$", "$set$", "$init$" }) |prefix| {
+                    const nm = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, p.name.name });
+                    const key = try anonKey(allocator, class.name.name, nm);
+                    if (tbl.get().getPtr(key)) |entry| {
+                        entry.captures = capture_pairs;
+                    }
+                }
+            },
+            else => {},
         }
     }
     // The `$init$block$<idx>` thunks capture the same outer env: an

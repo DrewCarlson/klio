@@ -285,7 +285,11 @@ pub fn lowerArgRunFull(
     slots[0] = first;
     var i: usize = 1;
     while (i < n) : (i += 1) slots[i] = b.allocReg();
-    const call_label = b.pending_lambda_label;
+    // Prefer the enclosing call's own name over the ambient pending label:
+    // lowering a call-shaped receiver re-arms the ambient state with the
+    // receiver's callee, and the argument lambdas here belong to the call
+    // the user wrote, not to its receiver.
+    const call_label = b.current_call_label orelse b.pending_lambda_label;
     b.pending_lambda_label = null;
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
@@ -334,11 +338,12 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
     slots[0] = first;
     var i: usize = 1;
     while (i < n) : (i += 1) slots[i] = b.allocReg();
-    // The call's simple name (set by the Call lowering just before this)
-    // is the implicit label of any lambda literal directly in this
-    // argument list. Re-arm it before each argument so a trailing lambda
-    // records it, then clear it so it never leaks past this run.
-    const call_label = b.pending_lambda_label;
+    // The call's simple name is the implicit label of any lambda literal
+    // directly in this argument list. Re-arm it before each argument so a
+    // trailing lambda records it, then clear it so it never leaks past
+    // this run. The scoped `current_call_label` wins over the ambient
+    // pending label, which a call-shaped receiver re-arms in passing.
+    const call_label = b.current_call_label orelse b.pending_lambda_label;
     b.pending_lambda_label = null;
     // Arguments are not in the call's tail position, so the enclosing
     // expected-type hint must not reach a reified inline call here.

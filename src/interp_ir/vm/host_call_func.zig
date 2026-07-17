@@ -142,25 +142,46 @@ fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayLis
 /// packed list. A `f(*arr)` spread (a lone `Array` already in the slot)
 /// passes through untouched.
 fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(Value)) Allocator.Error!std.ArrayList(Value) {
-    if (!lastIsVararg(func.params)) return args.*;
     const n_params = func.params.len;
-    const fixed = if (n_params == 0) 0 else n_params - 1;
-    if (args.items.len == n_params and args.items[args.items.len - 1] == .Array) {
+    // The vararg may sit before trailing fixed params (Kotlin allows it;
+    // `remember(vararg keys, calculation)` — and the compose plugin appends
+    // `$composer`/`$changed` after that). The vararg absorbs the middle
+    // positional args, leaving exactly the trailing fixed params' worth at
+    // the end.
+    var vararg_pos: ?usize = null;
+    for (func.params, 0..) |p, i| {
+        if (p.is_vararg) {
+            vararg_pos = i;
+            break;
+        }
+    }
+    const vp = vararg_pos orelse return args.*;
+    const tail_fixed = n_params - vp - 1;
+    // Already packed: an Array sits at the vararg slot of a slot-exact list.
+    if (args.items.len == n_params and args.items[vp] == .Array) {
         return args.*;
     }
+    // Underfilled before the trailing fixed params: leave for the defaults
+    // machinery (only reachable through named/defaulted shapes).
+    if (tail_fixed != 0 and args.items.len < vp + tail_fixed) return args.*;
+    const n_var = if (args.items.len > vp + tail_fixed) args.items.len - vp - tail_fixed else 0;
     var out: std.ArrayList(Value) = .empty;
     try out.ensureTotalCapacity(allocator, n_params);
     var i: usize = 0;
-    while (i < fixed and i < args.items.len) : (i += 1) {
+    while (i < vp and i < args.items.len) : (i += 1) {
         out.appendAssumeCapacity(args.items[i]);
     }
     var rest: std.ArrayList(Value) = .empty;
-    var j: usize = fixed;
-    while (j < args.items.len) : (j += 1) {
+    var j: usize = vp;
+    while (j < vp + n_var and j < args.items.len) : (j += 1) {
         try rest.append(allocator, args.items[j]);
     }
-    const velem = func.params[n_params - 1].ty.name;
+    const velem = func.params[vp].ty.name;
     try out.append(allocator, try packVarargArray(allocator, velem, rest));
+    j = vp + n_var;
+    while (j < args.items.len) : (j += 1) {
+        try out.append(allocator, args.items[j]);
+    }
     args.deinit(allocator);
     return out;
 }
@@ -723,12 +744,52 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
     return pickOverload(self, module, func, args);
 }
 
+/// A closure's SOURCE-level param count: the compose plugin threads
+/// composable lambdas before lowering, appending `($composer, $changed)`.
+/// Overload selection must rank by the declared header, or the +2 shift
+/// binds a `{ d -> }` argument to a 3-param functional overload.
+pub fn closureUserParams(self: *VmHost, info: anytype) usize {
+    return closureUserParamsChecked(self, info).n;
+}
+
+/// As `closureUserParams`, also reporting whether the composer pair was
+/// stripped. A stripped count came from the transformed literal's own
+/// header, so it is AUTHORITATIVE for overload ranking — without that,
+/// `movableContentOf { key: Int -> … }` re-picked at runtime ties the
+/// 1-param closure between the `(P) -> Unit` and `() -> Unit` overloads
+/// (flat want/want+1 parity) and the first overload wins arbitrarily.
+pub fn closureUserParamsChecked(self: *VmHost, info: anytype) struct { n: usize, stripped: bool } {
+    var n: usize = info.n_params;
+    var stripped = false;
+    if (n >= 2) {
+        const module_ref = self.module.clone();
+        defer module_ref.deinit();
+        const module = info.module orelse module_ref.asPtr();
+        if (module.funcById(info.body_func)) |bf| {
+            const p = bf.params;
+            if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                std.mem.eql(u8, p[p.len - 2].name, "$composer"))
+            {
+                n -= 2;
+                stripped = true;
+            }
+        }
+    }
+    return .{ .n = n, .stripped = stripped };
+}
+
 /// Build an `ArgShape` describing one runtime value for the shared applicability
 /// scorer. Named args are not threaded into the positional `pickOverload`
 /// path, so `named` stays null here.
 fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
+    var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, info.n_params) else null,
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(c.id) orelse break :blk null;
+            const up = closureUserParamsChecked(self, info);
+            arity_authoritative = up.stripped;
+            break :blk std.math.cast(u8, up.n);
+        },
         .Function => |f| std.math.cast(u8, f.decl.params.len),
         .Class => 0,
         else => null,
@@ -738,6 +799,7 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
         .is_null = v.* == .Null,
         .is_lambda = valueIsCallable(v),
         .lambda_arity = arity,
+        .lambda_is_literal = arity_authoritative,
         .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
         .value = @ptrCast(v),
     };

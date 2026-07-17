@@ -27,9 +27,11 @@ const runtime = @import("runtime");
 /// converted the 18-class hang family (926 measured); the typealias-receiver
 /// dispatch, event-loop actuals, pump mailbox-drain, and captured-counter
 /// fixes took it to 953; the movable-content chain and the validator-side
-/// sink-scope gate took it to 987. The floor leaves saturation headroom
-/// like the implicit suite's does.
-const BASELINE: usize = 985;
+/// sink-scope gate took it to 987; the receiver-lambda dispatch, local-fun
+/// Unit-return, local-class init-block, and vararg-overload-resolution
+/// fixes held five consecutive runs at 1031-1050. The floor leaves
+/// saturation headroom like the implicit suite's does.
+const BASELINE: usize = 1020;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{

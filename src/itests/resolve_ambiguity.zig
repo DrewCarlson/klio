@@ -448,6 +448,80 @@ test "cross-package class collision constructs the caller's class in either orde
     try expectFilesOutput("xpkg_cls_lib_first", &.{ xcls_lib, xcls_main }, want);
 }
 
+const xobj_ga_decl =
+    \\package com.ga
+    \\sealed class Operation(val n: Int) {
+    \\    object Marker : Operation(1) { val tag = "A" }
+    \\}
+    \\
+;
+const xobj_gb_decl =
+    \\package com.gb
+    \\sealed class Operation(val n: Int) {
+    \\    object Marker : Operation(2) { val tag = "B" }
+    \\}
+    \\
+;
+const xobj_ga_use =
+    \\package com.ga
+    \\import com.ga.Operation.Marker
+    \\class Ops {
+    \\    var last: Operation? = null
+    \\    fun push(op: Operation) { last = op }
+    \\}
+    \\class ChangeList {
+    \\    val operations = Ops()
+    \\    fun pushMarker() { operations.push(Marker) }
+    \\}
+    \\fun runA(): String {
+    \\    val cl = ChangeList()
+    \\    cl.pushMarker()
+    \\    val pushed = cl.operations.last
+    \\    return "" + pushed?.n + (pushed === Marker) + (pushed is Marker)
+    \\}
+    \\
+;
+const xobj_gb_use =
+    \\package com.gb
+    \\import com.gb.Operation.Marker
+    \\class Ops {
+    \\    var last: Operation? = null
+    \\    fun push(op: Operation) { last = op }
+    \\}
+    \\class ChangeList {
+    \\    val operations = Ops()
+    \\    fun pushMarker() { operations.push(Marker) }
+    \\}
+    \\fun runB(): String {
+    \\    val cl = ChangeList()
+    \\    cl.pushMarker()
+    \\    val pushed = cl.operations.last
+    \\    return "" + pushed?.n + (pushed === Marker) + (pushed is Marker)
+    \\}
+    \\
+;
+const xobj_main =
+    \\import com.ga.runA
+    \\import com.gb.runB
+    \\fun main() {
+    \\    println(runA())
+    \\    println(runB())
+    \\}
+    \\
+;
+
+test "same-simple-name nested object twins bind own-package singletons in either order" {
+    // Two packages each declare `object Marker` nested in a same-named
+    // sealed class (the gapbuffer/linkbuffer `Operation.*` op shape): both
+    // lift to the same `Operation$Marker` simple name, so every read must
+    // resolve through the declaring class's FQN — a name-keyed pick binds
+    // whichever twin registered the name. The `is` check must compare the
+    // imported class's identity, not the unregistered bare simple name.
+    const want = "1truetrue\n2truetrue\n";
+    try expectFilesOutput("xpkg_obj_ga_first", &.{ xobj_main, xobj_ga_decl, xobj_ga_use, xobj_gb_decl, xobj_gb_use }, want);
+    try expectFilesOutput("xpkg_obj_gb_first", &.{ xobj_main, xobj_gb_decl, xobj_gb_use, xobj_ga_decl, xobj_ga_use }, want);
+}
+
 test "cross-package data-class twins keep their own arity and copy() in either order" {
     const root_p =
         \\data class P(val x: Int, val y: Int)

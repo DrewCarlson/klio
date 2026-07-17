@@ -825,10 +825,49 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// `Binary` lowering: the short-circuiting operators (`&&`, `||`, `?:`),
 /// the `in`/`!in` desugars, generic-operand comparisons, and the eager
 /// primitive operators.
+
+/// Numeric/string/char/bool simple type heads whose `+`/`-` stay primitive.
+fn isPrimitiveTypeName(name: []const u8) bool {
+    const prims = [_][]const u8{ "Int", "Long", "Short", "Byte", "Double", "Float", "Char", "Boolean", "String", "UInt", "ULong", "UShort", "UByte", "Number" };
+    for (prims) |p2| {
+        if (std.mem.eql(u8, name, p2)) return true;
+    }
+    return false;
+}
+
 fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const op = bin.op;
     const lhs = bin.lhs;
     const rhs = bin.rhs;
+
+    // `this + x` where the receiver's STATIC type is known and non-primitive:
+    // kotlinc resolves the operator against the static type — inside a
+    // `CoroutineScope.() -> Unit` lambda, `this + dispatcher` binds the
+    // `CoroutineScope.plus` extension (the static type has no member), never
+    // the runtime class's inherited `CoroutineContext.Element.plus`. A plain
+    // BinOp lost the static type and the runtime member won.
+    if ((op == .Add or op == .Sub) and lhs.* == .This and lhs.This.qualifier == null) {
+        const sty: ?[]const u8 = b.recvTy() orelse b.enclosingRecvTy();
+        if (sty) |ty| {
+            if (!isPrimitiveTypeName(ty)) {
+                const l = try lowerExpr(b, lhs);
+                const r = try lowerExpr(b, rhs);
+                const args_start = try packContiguous(b, &.{r});
+                const dst = b.allocReg();
+                const nm = try b.module.internConst(b.allocator, .{ .String = if (op == .Add) "plus" else "minus" });
+                try b.push(.{ .CallMember = .{
+                    .dst = dst,
+                    .receiver = l,
+                    .name = nm,
+                    .static_recv = try b.module.internConst(b.allocator, .{ .String = ty }),
+                    .args = args_start,
+                    .n_args = 1,
+                    .arg_names = &.{},
+                } });
+                return dst;
+            }
+        }
+    }
 
     // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the
     // RHS's STATIC type, appending the value as one element even when it
@@ -1191,7 +1230,29 @@ pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []con
         }
         return qp;
     }
-    return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
+    if (scopeTypeRename(b, ty.name.name, ty.span.file.int())) |renamed| return renamed;
+    // A bare check type this file's explicit import names (`import
+    // …Operation.Marker`; `x is Marker`) normalises to the imported class's
+    // canonical FQN, so the runtime compares class identity — the simple
+    // name alone cannot resolve a nested member two packages both declare
+    // (its lifted name is shared, so a name compare matches either twin).
+    // An enclosing class's own nested classifier still wins over the
+    // import (inner scope first), keeping the simple-name compare.
+    if (!enclosingDeclaresNestedClassifier(b, ty.name.name)) {
+        if (b.module.classIdExactImport(ty.name.name, ty.span.file)) |cid| {
+            if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].fqn;
+        }
+    }
+    return ty.name.name;
+}
+
+/// Whether any class in the enclosing-class chain declares a NESTED
+/// classifier named `name` — the scope where a bare check-type name binds
+/// before the file's imports are consulted.
+fn enclosingDeclaresNestedClassifier(b: *const FuncBuilder, name: []const u8) bool {
+    const oc = b.ownerClass() orelse return false;
+    const owner_id = b.module.classId(oc) orelse return false;
+    return b.module.classIdNestedIn(owner_id, name) != null;
 }
 
 /// The mangled per-file global for a bare `name` referenced from the file
@@ -3350,6 +3411,9 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         break :blk c;
     };
+    const prev_call_label = b.current_call_label;
+    b.current_call_label = helpers.calleeLabel(callee);
+    defer b.current_call_label = prev_call_label;
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
@@ -3390,6 +3454,39 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     }
                 }
                 recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
+            }
+        } else if (args.len != 0 and (args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) {
+            // Ambiguous name, no receiver disambiguation: when EVERY overload
+            // declares the SAME receiver head for its trailing function-typed
+            // parameter (`runTest`'s block is `TestScope.() -> Unit` in every
+            // overload), that head is safe to record — `this + dispatcher`
+            // inside the lambda then dispatches against the static type.
+            if (b.module.func_name_index.get(cnm)) |ids| {
+                var common: ?[]const u8 = null;
+                var ok = ids.items.len >= 2;
+                for (ids.items) |fid2| {
+                    const f2 = b.module.funcById(fid2) orelse {
+                        ok = false;
+                        break;
+                    };
+                    if (f2.params.len == 0) {
+                        ok = false;
+                        break;
+                    }
+                    const rh = fnTypeReceiverHead(b, f2.params[f2.params.len - 1].ty) orelse {
+                        ok = false;
+                        break;
+                    };
+                    if (common) |c0| {
+                        if (!std.mem.eql(u8, c0, rh)) {
+                            ok = false;
+                            break;
+                        }
+                    } else common = rh;
+                }
+                if (ok) {
+                    if (common) |rh| b.recordLambdaArgRecv(args[args.len - 1].span(), rh);
+                }
             }
         }
     }
@@ -4540,6 +4637,47 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return r;
     }
 
+    // `collector.block()` — an EXPLICIT receiver invoking the enclosing
+    // class's RECEIVER-function-typed property (`SafeFlow.block: suspend
+    // FlowCollector.() -> Unit`): Kotlin runs the stored callable with the
+    // explicit value as its receiver. Without this arm the call dispatched
+    // as a member of the receiver and missed (`invoke` on NopCollector).
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        callee.Member.receiver.* != .This)
+    {
+        const mname0 = callee.Member.name.name;
+        const own_recv_fn = blk: {
+            if (b.resolve("this") == null) break :blk false;
+            var owner = b.ownerClass() orelse build.currentOwnerClass();
+            var hops: usize = 0;
+            while (owner) |o| : (hops += 1) {
+                if (hops > 32) break;
+                if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = mname0 }) != null) break :blk true;
+                owner = b.module.registry.enclosing_class.get(o);
+            }
+            break :blk false;
+        };
+        if (own_recv_fn) {
+            const recv_r = try lowerExpr(b, callee.Member.receiver);
+            const this_reg = b.resolve("this").?;
+            const cal = b.allocReg();
+            const fld = try b.module.internConst(b.allocator, .{ .String = mname0 });
+            try b.push(.{ .GetField = .{ .dst = cal, .receiver = this_reg, .field = fld } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = cal,
+                .receiver = recv_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
     // Inside an inline-extension splice, a bare call to a member of the
     // spliced extension's bound receiver (`receiveNullable(...)` inside a
     // spliced `ApplicationCall.receive`) is `this.member(...)` on that
@@ -4837,6 +4975,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         if (b.localFnDecls(bare)) |decls| {
             local_fn_inapplicable = !anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names);
+            // A LONE local fn reached from a NESTED body (its own body, or
+            // a local fn declared inside it): the PLAIN name binds only
+            // after the body lowers, so it is never in the nested scope
+            // chain — but the mangled overload cell binds BEFORE the body
+            // lowers exactly so nested calls can capture it. Route the
+            // call through the cell (`fun traverse` inside GapComposer's
+            // `movableContentReferenceFor` recursing into its encloser).
+            // Multi-overload sets select above; an inapplicable local
+            // keeps outward resolution.
+            if (decls.len == 1 and !local_fn_inapplicable and
+                b.resolve(bare) == null and !b.knowsOuter(bare) and
+                b.resolve(decls[0].mangled) == null and b.knowsOuter(decls[0].mangled))
+            {
+                if (try lowerSelectedLocalOverloadCall(b, decls[0].mangled, args, ast_arg_names)) |r| return r;
+            }
         }
         // A local function shadows an outer one by NAME, but only among
         // candidates that can take the call. A local `fun validate()` does
@@ -6226,7 +6379,21 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// so overload resolution treats it as a `() -> R` handler.
 fn astArgLambdaArity(arg: *const Expr) ?u8 {
     return switch (arg.*) {
-        .Lambda => |l| if (l.implicit_it) @as(u8, 0) else @intCast(l.params.len),
+        .Lambda => |l| blk: {
+            if (l.implicit_it) break :blk @as(u8, 0);
+            // The compose plugin threads every composable lambda BEFORE
+            // lowering, appending `($composer, $changed)`. Those are not
+            // source params: overload selection must rank the literal by
+            // its DECLARED header, or the +2 shift binds `{ d -> }` to a
+            // 3-param overload (`movableContentOf`'s P3 form).
+            var n = l.params.len;
+            if (n >= 2 and std.mem.eql(u8, l.params[n - 1].name, "$changed") and
+                std.mem.eql(u8, l.params[n - 2].name, "$composer"))
+            {
+                n -= 2;
+            }
+            break :blk @intCast(n);
+        },
         .AnonFun => |af| @intCast(af.params.len),
         else => null,
     };
@@ -6247,6 +6414,7 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
         .is_spread = arg.* == .Spread,
         .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
         .lambda_arity = astArgLambdaArity(arg),
+        .lambda_is_literal = arg.* == .Lambda or arg.* == .AnonFun,
         .literal_kind = if (argEvidenceLitKind(b, arg)) |k| switch (k) {
             .numeric => .numeric,
             .string => .string,
@@ -6796,7 +6964,30 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             imported_func_id = b.module.funcIdByFqn(alias_paths[0].fqn);
         }
     }
-    if (imported_func_id) |func_id| {
+    // The import may name a whole OVERLOAD SET (five `remember`s share one
+    // FQN): `funcIdByFqn` returns the first by declaration order, which can
+    // be arity-incompatible with this call — a 4-key `remember(a,b,c,d){..}`
+    // blind-bound the zero-key overload. A multi-overload FQN skips BOTH
+    // import-routing arms and falls to the full resolver, whose overload
+    // scoring ranks every sibling (vararg included) — and whose implicit-
+    // receiver dispatch keeps a bare `launch {}` on the scope extension
+    // instead of the qualified rewrite's non-extension guidance stub.
+    var imported_fqn_multi = false;
+    if (imported_func_id != null) {
+        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (alias_paths.len == 1) {
+            var fqn_overloads: usize = 0;
+            for (b.module.funcsBySimpleName(name0)) |cid| {
+                if (b.module.funcById(cid)) |cf| {
+                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) fqn_overloads += 1;
+                }
+            }
+            imported_fqn_multi = fqn_overloads > 1;
+        }
+    }
+    if (imported_func_id != null and imported_fqn_multi) {
+        // fall through to the generic resolution below (skip both arms)
+    } else if (imported_func_id) |func_id| {
         // An applicable extension on an in-scope implicit receiver outranks the
         // imported plain namesake: inside `validate { contact(c) }`
         // (`MockViewValidator.() -> Unit`), the imported `contact` FQN resolves
@@ -7794,6 +7985,13 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
+    if (runtime.getenvSlice("KLIO_EMIT_TRACE") != null) {
+        const c0 = call.callee;
+        if (c0.* == .Path and c0.Path.segments.len == 1 and std.mem.eql(u8, c0.Path.segments[0].name, "remember") and @intFromEnum(c0.Path.segments[0].span.file) == 0) {
+            std.debug.print("[emitCall] remember -> #{d} nargs={d}\n", .{ func_id.int(), call.args.len });
+            std.debug.dumpCurrentStackTrace(.{});
+        }
+    }
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
     defer _ = b.setCallTrailingLambda(prev_trailing);
     const args = call.args;
@@ -9011,6 +9209,49 @@ fn lowerFqnGlobalCall(
         (head_is_real_pkg or !isTopLevelProp(head)) and
         (head_is_real_pkg or b.resolve("this") == null))
     {
+        // An exact-FQN name can cover a whole OVERLOAD SET
+        // (`kotlin.test.assertTrue` is (Boolean, String?) AND (String?,
+        // () -> Boolean)); the runtime value load binds the first by
+        // declaration order regardless of the call's arguments. With the
+        // arguments in hand, bind the UNIQUE overload whose declared
+        // signature the argument shapes fit; only an undecidable tie keeps
+        // the value-call fallback.
+        {
+            const last = rsplitLast(fqn, '.');
+            const shapes = try buildArgShapes(b, args, ast_arg_names);
+            defer b.allocator.free(shapes);
+            var only: ?FuncId = null;
+            var fit_count: usize = 0;
+            var fqn_overloads: usize = 0;
+            for (b.module.funcsBySimpleName(last)) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                if (!std.mem.eql(u8, f.fqn, fqn)) continue;
+                if (!f.hasBody()) continue;
+                if (f.low_priority) continue;
+                fqn_overloads += 1;
+                if (!fqnCallArityFits(b, fid, args.len)) continue;
+                if (!b.module.declSigCompatible(fid, shapes)) continue;
+                only = fid;
+                fit_count += 1;
+                if (fit_count > 1) break;
+            }
+            if (fqn_overloads > 1 and fit_count == 1) {
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                try b.push(.{ .Call = .{
+                    .dst = dst,
+                    .func = only.?,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                    .type_args = &.{},
+                    .exact = false,
+                } });
+                return dst;
+            }
+        }
         const callee_r = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = n } });
@@ -9027,6 +9268,15 @@ fn lowerFqnGlobalCall(
         return dst;
     }
     return null;
+}
+
+/// Whether `fid` can take `want` positional args: at least the required
+/// (non-defaulted, non-vararg) count, at most the declared total unless a
+/// vararg absorbs the excess.
+fn fqnCallArityFits(b: *FuncBuilder, fid: FuncId, want: usize) bool {
+    const arity = b.module.decl_user_arity.get(fid.int()) orelse return false;
+    if (want < arity.required) return false;
+    return arity.has_vararg or want <= arity.total;
 }
 
 /// The simple head of a type name: drop a package qualifier and any generic
@@ -9782,6 +10032,55 @@ test "lowers is-check to instance-of" {
     try testing.expect(insts[insts.len - 1] == .InstanceOf);
 }
 
+test "bare is-check type normalises to the file's exact-import class FQN" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    // Two packages declare a nested `Marker` under a same-named outer class:
+    // both lift as `Operation$Marker`, so the bare simple name identifies
+    // neither. The file's explicit import names exactly one; the check type
+    // must carry that class's canonical FQN so the runtime compares identity.
+    _ = try m.reserveClassFqn(a, "Operation$Marker", "com.ga.Operation.Marker", "com.ga", false);
+    _ = try m.reserveClassFqn(a, "Operation$Marker", "com.gb.Operation.Marker", "com.gb", false);
+    {
+        var paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+        const segs = try a.alloc([]const u8, 4);
+        segs[0] = "com";
+        segs[1] = "ga";
+        segs[2] = "Operation";
+        segs[3] = "Marker";
+        try paths.append(a, .{ .fqn = try a.dupe(u8, "com.ga.Operation.Marker"), .segs = segs });
+        var inner_map = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        try inner_map.put("Marker", paths);
+        try m.registry.import_aliases.put(span.FileId.from(0), inner_map);
+    }
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const ty = ast.TypeRef{
+        .name = .{ .name = "Marker", .span = dummySpan() },
+        .nullable = false,
+        .span = dummySpan(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    try testing.expectEqualStrings("com.ga.Operation.Marker", loweredCheckTypeName(&b, &ty));
+    // A file without the import keeps the bare simple name.
+    const ty2 = ast.TypeRef{
+        .name = .{ .name = "Marker", .span = span.Span.init(span.FileId.from(3), 0, 0) },
+        .nullable = false,
+        .span = span.Span.init(span.FileId.from(3), 0, 0),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
+}
+
 test "headCompatible: literal heads disprove scalar params only" {
     // Literal Boolean disproves a String param — the local-fn overload
     // shape that recursed before selection existed.
@@ -9819,4 +10118,62 @@ test "lowers postfix not-null assert" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .NotNullAssert);
+}
+
+test "trailing lambda's implicit label survives a call-shaped receiver" {
+    // `Stack().apply { … }`: lowering the receiver `Stack()` re-arms the
+    // ambient pending label with "Stack"; the argument lambda must still
+    // record "apply" so `return@apply` unwinds to the lambda, not into
+    // the `apply` frame itself. Arena-backed: lambda lowering hangs side
+    // tables off the module that outlive the builder.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var recv_segs = [_]ast.Ident{.{ .name = "Stack", .span = dummySpan() }};
+    var recv_callee = Expr{ .Path = .{ .segments = &recv_segs, .span = dummySpan() } };
+    var recv_call = Expr{ .Call = .{
+        .callee = &recv_callee,
+        .args = &.{},
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    var callee = Expr{ .Member = .{
+        .receiver = &recv_call,
+        .name = .{ .name = "apply", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    var args = [_]Expr{.{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } }};
+    var arg_names = [_]?[]const u8{null};
+    const e = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    // Arena-owned: no freeFunc — the arena reclaims the whole build.
+    _ = try b.finish("f", "f", build.typeUnit());
+    var found = false;
+    for (m.funcs.items) |*f| {
+        if (f.is_lambda) {
+            try testing.expectEqualStrings("apply", f.implicit_label orelse "");
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }

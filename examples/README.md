@@ -22,6 +22,7 @@ Run any program with:
 | `compound_assign.kt`     | Compound assignment operators.                                   |
 | `do_while.kt`            | `do`/`while` loops.                                              |
 | `labeled_jumps.kt`       | Labeled `break` / `continue` / `return`.                         |
+| `labeled_return_scope.kt` | `return@apply` exits the block only — the scoped function still returns its receiver, including when the receiver is itself a constructor call and when the return crosses a nested inline lambda. |
 | `const_val.kt`           | `const val` and compile-time constants.                          |
 | `top_level_computed_val.kt` | Top-level `val` with a custom getter (no backing field) re-evaluating per read. |
 | `definite_assignment.kt` | Definite-assignment behavior for `val`.                          |
@@ -38,6 +39,7 @@ Run any program with:
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
 | `inner_outer_property.kt`  | An inner class reads the outer instance's overridden property (virtual getter dispatch), incl. an `AbstractMutableList` subclass. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |
+| `local_fn_nested_recursion.kt` | A nested local function calling back into its enclosing local function (`fun inner` inside `fun step` invoking `step`), routed through the pre-bound overload cell; includes a `?.let` chain over the recursive result. |
 | `local_fn_overloads.kt`    | Same-named local functions as true overloads: call-site selection by arity and argument types, one overload calling its sibling (no self-recursion through the shared binding), selection from a nested lambda. |
 | `extension_property_delegates.kt` | Delegated extension properties (`val R.x by …`): bound-reference and top-level-var delegates, writes through `setValue`, a custom `getValue` operator receiving the `KProperty`, and bound property references (`obj::extVal`) reading through the delegate. |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |
@@ -122,6 +124,7 @@ Run any program with:
 | `typealias_receiver_member_ext.kt` | A member extension declared on a typealias receiver (`fun AliasedUnit.report()` where `typealias AliasedUnit = Unit`) dispatches on values of the aliased type through the enclosing scope. |
 | `throwable_suppressed_user_class.kt` | `addSuppressed`/`suppressedExceptions` on a user-defined throwable class: the suppressed set is shared across aliases and survives throw/catch. |
 | `captured_counter_in_object_method.kt` | A captured outer `var` incremented (`++`) inside an anonymous object's method and inside a local class's method writes through to the declaration site, like a lambda capture. |
+| `local_class_init_block.kt` | A local class's `init { }` blocks run at construction — interleaved with property initializers in declaration order — and read/write the enclosing function's captured vars through shared cells. |
 | `local_fn_shadows_imported_class.kt` | A local `fun Test(a, b)` shadows an imported same-named class (`kotlin.test.Test`) at a bare call, including from inside a closure where the binding arrives as a capture. |
 | `local_var_shadows_fn_call.kt` | A local `var` initialized with a literal does not shadow a same-named function at a call site — an Int is not invokable, so the call binds the function. |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
@@ -168,6 +171,7 @@ Run any program with:
 | `m6b_taste.kt`             | Exceptions, lambdas, scope functions, and the broad numeric/string/char intrinsic surface together. |
 | `finally_own_throw.kt`     | A throw or return raised inside a `finally` exits the region without re-running that finally (single-block and multi-block finallys, catch sees the finally's own exception). |
 | `local_ext_fn_receiver_overload.kt` | A bare call with an implicit receiver in scope (top-level extension body, receiver lambda, LOCAL extension function) binds the receiver's extension over a same-named plain top-level function. |
+| `receiver_fn_typealias_param.kt` | A parameter typed as an ALIASED receiver function type (`typealias Workflow = WScope.() -> Unit`) binds the enclosing receiver when invoked bare. |
 | `jit_capture_cell_loop.kt` | A hot loop mutating `var`s captured by a nested lambda (boxed cells); output is identical with the loop JIT off or on. |
 | `mutable_iterator_remove.kt` | `MutableIterator.remove()` over a `MutableList` writes through to the source list. |
 | `jit_double_loop.kt`       | Hot `Double` arithmetic + comparison over a `DoubleArray` (loop JIT → SSE2); identical output JIT off or on, incl. NaN comparison semantics. |
@@ -268,3 +272,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `private_helper_overload_capture.kt` | Private same-named class helpers decline calls their parameter/receiver types definitely cannot bind; Char numeric conversions. |
 | `range_in_range_operator.kt` | A user `operator LongRange.contains(LongRange)` decides range-in-range membership over the builtin element `contains`. |
 | `vararg_overload_binding.kt` | Non-final vararg binding (middle args absorbed, trailing defaults kept, named args past the vararg), List-vs-vararg overload selection, and the materialized Array type of a vararg param in its body. |
+| `property_shadowed_by_block_local.kt` | A branch-block `var` shadowing a same-named class property ends with its block: later bare-name writes reach the property (SetField), not the dead local's register, and reads/writes agree on the target. |

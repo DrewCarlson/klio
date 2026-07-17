@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
+const decl = @import("decl.zig");
 const span = @import("span");
 pub const runtime = @import("runtime");
 
@@ -324,8 +325,20 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
     // the reverse fn-addr -> id map entries via inlineAstById-style population is
     // not needed here (ids come from the id registry).
     const a = std.heap.page_allocator;
-    const resolved = a.alloc(*const ast.Function, fields.len) catch return null;
-    for (fields, 0..) |ff, i| resolved[i] = ff.get();
+    var buf = a.alloc(*const ast.Function, fields.len) catch return null;
+    // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
+    // inline overload is not a source-level candidate (kotlinc hides it): the
+    // HIDDEN `Flow.collect(action)` binary-compat form was the SOLE inline
+    // candidate for `collect`, so `collect(NopCollector)` spliced it and
+    // wrapped the collector in its action-invoking anon object.
+    var n: usize = 0;
+    for (fields) |ff| {
+        const f = ff.get();
+        if (decl.annotationsAreLowPriority(f.annotations)) continue;
+        buf[n] = f;
+        n += 1;
+    }
+    const resolved = buf[0..n];
     if (inline_fn_asts_resolved == null) {
         inline_fn_asts_resolved = std.StringHashMap([]const *const ast.Function).init(a);
     }
@@ -587,6 +600,41 @@ fn noRequiredFnParam(f: *const ast.Function) bool {
     return true;
 }
 
+/// Whether `f` can take `want` positional arguments: at least the required
+/// (non-defaulted, non-vararg) count, and no more than the declared total —
+/// unless a vararg absorbs the excess.
+fn fitsArity(f: *const ast.Function, want: usize) bool {
+    var required: usize = 0;
+    var has_vararg = false;
+    for (f.params) |p| {
+        if (p.is_vararg) {
+            has_vararg = true;
+            continue;
+        }
+        if (p.default == null) required += 1;
+    }
+    if (want < required) return false;
+    return has_vararg or want <= f.params.len;
+}
+
+/// The single overload whose arity fits the call's argument count, or null
+/// when zero or several fit. The last-resort discriminator before blind
+/// first-declared: a plugin-threaded `remember(k1..k4, calc, $composer,
+/// $changed)` (7 args, lambda NOT last) only fits the vararg overload.
+fn pickUniqueArityFit(cands: []const *const ast.Function, want: usize) ?*const ast.Function {
+    var only: ?*const ast.Function = null;
+    var count: usize = 0;
+    for (cands) |f| {
+        if (fitsArity(f, want)) {
+            only = f;
+            count += 1;
+            if (count > 1) return null;
+        }
+    }
+    if (count == 1) return only;
+    return null;
+}
+
 /// Resolve the inline overload of `name` for a call whose shape is
 /// `call = (positional_arg_count, last_arg_is_lambda)`.
 ///
@@ -600,7 +648,10 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     const first: ?*const ast.Function = if (cands.len > 0) cands[0] else null;
     const shape = call orelse return first;
     if (cands.len < 2) return first;
-    if (!shape.last_is_lambda) return pickNonlambdaShape(cands) orelse first;
+    if (!shape.last_is_lambda) {
+        return pickNonlambdaShape(cands) orelse
+            pickUniqueArityFit(cands, shape.want) orelse first;
+    }
     const lead = shape.want -| 1;
     var match: ?*const ast.Function = null;
     var count: usize = 0;
@@ -611,7 +662,7 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
         }
     }
     if (count == 1) return match;
-    return first;
+    return pickUniqueArityFit(cands, shape.want) orelse first;
 }
 
 /// Among the inline overloads of `name` that fit the call shape, return the
