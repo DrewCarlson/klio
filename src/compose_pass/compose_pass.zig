@@ -921,6 +921,24 @@ const Walker = struct {
                 // joins the scoped locals set: a bare `content()` threads.
                 const holds_composable = blk: {
                     if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
+                    // `val current by rememberUpdatedState(content)` — a
+                    // DELEGATED val whose delegate call carries a value the
+                    // walker already knows is composable reads back that
+                    // value: `current()` must thread like `content()`.
+                    if (p.delegate) |del| {
+                        if (del.* == .Call) {
+                            for (del.Call.args) |*da| {
+                                if (da.* != .Path) continue;
+                                const dsegs = da.Path.segments;
+                                if (dsegs.len != 1) continue;
+                                const dn = dsegs[0].name;
+                                const known = (w.lambda_params != null and w.lambda_params.?.contains(dn)) or
+                                    (w.composable_vals != null and w.composable_vals.?.contains(dn)) or
+                                    (w.locals != null and w.locals.?.contains(dn));
+                                if (known) break :blk true;
+                            }
+                        }
+                    }
                     const ini = p.init orelse break :blk false;
                     if (ini != .Call or ini.Call.callee.* != .Path) break :blk false;
                     const segs = ini.Call.callee.Path.segments;

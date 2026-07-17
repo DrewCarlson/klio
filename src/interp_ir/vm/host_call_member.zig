@@ -2404,6 +2404,32 @@ fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
 /// `Function*` type (kotlinc: assignability needs the type relation — a
 /// class merely declaring an `invoke` member is not a Function subtype).
 fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
+    // A class declaring `operator fun invoke` is function-like whatever its
+    // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke
+    // overloads, no Function* supertype in common code) satisfies a
+    // function-typed parameter exactly like a lambda. Checked on the
+    // instance's own class chain directly — this runs under callers that
+    // already hold module borrows, so it must not re-enter the member
+    // dispatch (hostHasMember deadlocks here).
+    {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        var cls: ?ObjRef(runtime.ClassDef) = g.get().class.clone();
+        while (cls) |c| {
+            const cg = c.borrow();
+            for (cg.get().methods) |m| {
+                if (std.mem.eql(u8, m.name, "invoke")) {
+                    cg.deinit();
+                    c.deinit();
+                    return true;
+                }
+            }
+            const parent = if (cg.get().parent) |p| p.clone() else null;
+            cg.deinit();
+            c.deinit();
+            cls = parent;
+        }
+    }
     {
         const g = v.Instance.borrow();
         defer g.deinit();
@@ -10242,11 +10268,30 @@ pub fn callMemberNamedDeclared(self: *VmHost, allocator: Allocator, receiver: *c
     return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false, declared_recv);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names_in: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     // Receiver-function-typed property invoked as a call (see
     // `recvFnFieldInvoke` on the static ladder): the stored lambda runs
     // with the owning instance as its receiver.
     if (try recvFnFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+    // A member `invoke` whose only named arguments are plugin-synthetic
+    // (`$composer = c, $changed = n`): the names were emitted against a
+    // transformed closure's literal parameter names, but a memo-wrapped
+    // value is a ComposableLambdaImpl whose `invoke(composer, changed)`
+    // members use plain names, so the named binding can never match. The
+    // pair is appended in declaration order, so positional binding is
+    // exact — drop the synthetic names.
+    var arg_names = arg_names_in;
+    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke")) {
+        var any_synth = false;
+        var all_synth = true;
+        for (arg_names) |n| {
+            if (n) |nn| {
+                any_synth = true;
+                if (!std.mem.startsWith(u8, nn, "$")) all_synth = false;
+            }
+        }
+        if (any_synth and all_synth) arg_names = &.{};
+    }
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
