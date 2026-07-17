@@ -342,6 +342,16 @@ const RunState = struct {
 
 /// Pull a printable `type: message` (or just `type`) out of a thrown value.
 fn describeThrow(gpa: Allocator, v: Value) []const u8 {
+    // Full rendered throwable (type, message, frames, causes) under
+    // KLIO_ERR_TRACE — a teardown-masked failure is undiagnosable from
+    // the type+message line alone.
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        if (ir.eval.formatThrowable(gpa, &v, &buf, false, 0)) {
+            if (gpa.dupe(u8, buf.items)) |owned| return owned else |_| {}
+        } else |_| {}
+    }
     const ty: []const u8 = v.exceptionFqn() orelse "exception";
     const msg: ?[]const u8 = switch (v) {
         .Exception => |e| if (e.message) |m| blk: {
