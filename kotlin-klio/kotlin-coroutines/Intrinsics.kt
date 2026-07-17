@@ -96,6 +96,29 @@ public fun <R, P, T> (suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(
     return startBlock(completion) { receiver.block(param) }
 }
 
+// One VALUE parameter, no receiver — the shape kotlinx's
+// `startCoroutineUndispatched` starts (`suspend (R) -> T` from
+// `CoroutineStart.UNDISPATCHED`). Without this overload the start fell
+// through to an inline invoke with no coroutine boundary: the child's
+// first suspension parked the CALLER's frames along with its own, and
+// runTest's teardown then existed as two runnable copies (the double
+// `leave()` that masked every throwing test body's real failure).
+public fun <P, T> (suspend (P) -> T).startCoroutineUninterceptedOrReturn(
+    param: P,
+    completion: Continuation<T>
+): Any? {
+    val block = this
+    return startBlock(completion) { block(param) }
+}
+
+public fun <P, T> (suspend (P) -> T).createCoroutineUnintercepted(
+    param: P,
+    completion: Continuation<T>
+): Continuation<Unit> {
+    val block = this
+    return KlioStartContinuation(completion) { block(param) }
+}
+
 public fun <R, P, T> (suspend R.(P) -> T).createCoroutineUnintercepted(
     receiver: R,
     param: P,
