@@ -654,12 +654,21 @@ fn lowerAssign(
     // keeps a second compound-assign (after the first
     // rebinds the name to a plain reg) on the rebind path
     // instead of mis-dispatching `plusAssign` on the Int.
+    // A captured outer VAL (knowsOuter, never locally bound, not boxed —
+    // boxing covers every captured-and-written `var`) is also on this
+    // path: `xs += y` inside a closure over `val xs = mutableListOf(..)`
+    // must dispatch `xs.plusAssign(y)` on the capture. Routing it to the
+    // rebind path instead loses the write — and when a same-named member
+    // field exists, `storeCombinedToTarget`'s member fallback overwrites
+    // THAT field with the combined value.
     const path_is_val = switch (target.*) {
         .Path => |p| p.segments.len == 1 and
             !b.isMutable(p.segments[0].name) and
             !b.isBoxed(p.segments[0].name) and
-            !b.knowsOuter(p.segments[0].name) and
-            b.resolve(p.segments[0].name) != null,
+            (if (b.resolve(p.segments[0].name) != null)
+                !b.knowsOuter(p.segments[0].name)
+            else
+                b.knowsOuter(p.segments[0].name)),
         else => false,
     };
     if (op != .Assign and path_is_val) {
@@ -1317,6 +1326,36 @@ test "compound assign to val local dispatches plusAssign" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .CallMember);
+}
+
+test "compound assign to captured val dispatches plusAssign not member store" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    // Lambda body capturing `val xs` from the enclosing frame.
+    var outer = build.StringSet.init(testing.allocator);
+    try outer.put("xs", {});
+    b.setOuterNames(outer);
+    var segs = [_]ast.Ident{.{ .name = "xs", .span = dummySpan() }};
+    const target = pathExpr(&segs);
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Add,
+        .value = intLit(1),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    // plusAssign member call on the capture; never a SetField / StoreGlobal.
+    try testing.expect(insts[insts.len - 1] == .CallMember);
+    for (insts) |inst| {
+        try testing.expect(inst != .SetField);
+        try testing.expect(inst != .StoreGlobal);
+    }
 }
 
 test "member assign emits set field" {
