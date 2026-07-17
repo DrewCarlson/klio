@@ -997,6 +997,7 @@ pub const FuncBuilder = struct {
             .label = label,
             .continue_target = cont_t,
             .break_target = brk_t,
+            .finally_base = self.finally_stack.items.len,
         });
     }
     pub fn popLoop(self: *FuncBuilder) void {
@@ -1869,6 +1870,10 @@ pub const LoopFrame = struct {
     label: ?[]const u8,
     continue_target: BlockId,
     break_target: BlockId,
+    /// Depth of `finally_stack` when the loop was entered. A `break`/
+    /// `continue` targeting this loop replays the finallys pushed above
+    /// this (the try regions the jump exits) before its Goto.
+    finally_base: usize = 0,
 };
 
 /// Duplicate a `StringHashMap(void)` into a fresh owned set sharing the

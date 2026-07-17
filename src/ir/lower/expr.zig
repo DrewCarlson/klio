@@ -451,7 +451,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Break => |brk| {
             const lbl: ?[]const u8 = if (brk.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
-                b.terminate(.{ .Goto = frame.break_target });
+                const target = frame.break_target;
+                try replayFinallysForJump(b, frame.finally_base);
+                b.terminate(.{ .Goto = target });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
             } else {
@@ -462,7 +464,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Continue => |cont| {
             const lbl: ?[]const u8 = if (cont.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
-                b.terminate(.{ .Goto = frame.continue_target });
+                const target = frame.continue_target;
+                try replayFinallysForJump(b, frame.finally_base);
+                b.terminate(.{ .Goto = target });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
             } else {
@@ -1984,6 +1988,39 @@ fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef, label: ?ast.Ident) A
     return null;
 }
 
+/// Replay the `finally { … }` bodies pushed above `base` inline, innermost
+/// first, ahead of a jump that leaves their try regions (an inline `return`
+/// to its join, a `break`/`continue` crossing a `try`). While one finally
+/// replays, only the finallys strictly outside it stay active, so a jump
+/// within the finally body still unwinds correctly. The bypassed try
+/// regions' runtime `TryFrame`s are popped when the current block exits —
+/// the jump bypasses the finally sentinel that would pop them.
+fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void {
+    const base = @min(base_raw, b.finally_stack.items.len);
+    const pop_bodies = try b.finallyBodiesFrom(base);
+    if (b.finally_stack.items.len > base) {
+        const prior = try b.swapFinallyStack(&.{});
+        defer b.allocator.free(prior);
+        var idx: usize = prior.len;
+        while (idx > base) {
+            idx -= 1;
+            const blk = &prior[idx];
+            const outer = try b.allocator.dupe(ast.Block, prior[0..idx]);
+            const dropped = try b.swapFinallyStack(outer);
+            b.allocator.free(dropped);
+            _ = try lowerBlock(b, blk);
+        }
+        const restore = try b.allocator.dupe(ast.Block, prior);
+        const dropped2 = try b.swapFinallyStack(restore);
+        b.allocator.free(dropped2);
+    }
+    if (pop_bodies.len != 0) {
+        b.setPopOnExit(b.cur, pop_bodies);
+    } else {
+        b.allocator.free(pop_bodies);
+    }
+}
+
 fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ret = expr.Return;
     const label = ret.label;
@@ -2009,36 +2046,7 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // inlines `enter { try { return block() } finally { restore } }`, so
             // at `return block()` the stack holds [apply, restore]; replaying
             // both would apply the snapshot twice.
-            const base = @min(ar.finally_base, b.finally_stack.items.len);
-            // The try-region bodies whose finally we replay here: their
-            // runtime `TryFrame`s must be popped when we jump to the join,
-            // because the jump bypasses the finally sentinel that would pop
-            // them. Captured before the replay swaps the stack.
-            const pop_bodies = try b.finallyBodiesFrom(base);
-            if (b.finally_stack.items.len > base) {
-                const prior = try b.swapFinallyStack(&.{});
-                defer b.allocator.free(prior);
-                var idx: usize = prior.len;
-                while (idx > base) {
-                    idx -= 1;
-                    const blk = &prior[idx];
-                    // While replaying this finally, the finallys strictly
-                    // outside it (including the enclosing frame's base) stay
-                    // active so a `return` within the finally still unwinds.
-                    const outer = try b.allocator.dupe(ast.Block, prior[0..idx]);
-                    const dropped = try b.swapFinallyStack(outer);
-                    b.allocator.free(dropped);
-                    _ = try lowerBlock(b, blk);
-                }
-                const restore = try b.allocator.dupe(ast.Block, prior);
-                const dropped2 = try b.swapFinallyStack(restore);
-                b.allocator.free(dropped2);
-            }
-            if (pop_bodies.len != 0) {
-                b.setPopOnExit(b.cur, pop_bodies);
-            } else {
-                b.allocator.free(pop_bodies);
-            }
+            try replayFinallysForJump(b, ar.finally_base);
             b.terminate(.{ .Goto = ar.join });
             const dead = try b.allocBlock();
             b.switchTo(dead);
