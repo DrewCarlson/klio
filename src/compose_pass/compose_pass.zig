@@ -959,7 +959,7 @@ const Walker = struct {
     /// `CompositionLocalProvider`) invokes a plugin-lowered composable lambda,
     /// so it is threaded exactly like an oracle-named composable call — the
     /// closure's trailing params are `$composer`/`$changed`.
-    lambda_params: ?*const std.StringHashMap(void) = null,
+    lambda_params: ?*std.StringHashMap(void) = null,
     /// Simple names of LOCAL `@Composable` declarations seen so far in this
     /// walk. Scoped to the enclosing function's transform — a local name
     /// (`Composition`, `View`, `Test` in the upstream tests) must never join
@@ -1259,6 +1259,35 @@ const Walker = struct {
                                 exp = if (blockUsesIt(&arg.Lambda.body)) 1 else 0;
                             }
                         }
+                        // A movable-content type arg that is ITSELF a
+                        // `@Composable` function type makes the lambda param
+                        // at that position a composable value: a bare
+                        // `child()` in the body must thread the composer
+                        // (`movableContentOf<@Composable () -> Unit> {
+                        // child -> Wrap { child() } }`). Record those param
+                        // names in the walker's lambda-param set for the
+                        // body walk, scoped — remove after unless already
+                        // present.
+                        var added_names: [8]?[]const u8 = @splat(null);
+                        var added_n: usize = 0;
+                        if ((is_mco or is_mcwro) and w.lambda_params != null and !arg.Lambda.implicit_it) {
+                            const ta_off: usize = if (is_mcwro) 1 else 0;
+                            for (arg.Lambda.params, 0..) |*lp2, pi| {
+                                const ti = pi + ta_off;
+                                if (ti >= c.type_args.len) break;
+                                const tref = &c.type_args[ti];
+                                if (tref.function != null and isComposable(tref.annotations) and
+                                    !w.lambda_params.?.contains(lp2.name) and added_n < added_names.len)
+                                {
+                                    w.lambda_params.?.put(lp2.name, {}) catch @panic("oom");
+                                    added_names[added_n] = lp2.name;
+                                    added_n += 1;
+                                }
+                            }
+                        }
+                        defer for (added_names[0..added_n]) |an| {
+                            if (an) |nme| _ = w.lambda_params.?.remove(nme);
+                        };
                         try w.transformComposableLambda(&arg.Lambda, exp);
                         // Wrap only content that actually COMPOSES: the
                         // name-keyed sink also catches sibling overloads'
@@ -1397,6 +1426,7 @@ const Walker = struct {
             },
             .When => |*wh| {
                 if (wh.subject) |sub| try w.walkExpr(sub);
+                var any_composable = false;
                 for (wh.branches) |*br| {
                     for (br.patterns) |*pat| switch (pat.kind) {
                         .Value => |*ve| try w.walkExpr(ve),
@@ -1404,6 +1434,15 @@ const Walker = struct {
                         else => {},
                     };
                     try w.walkExpr(&br.body);
+                    if (w.branchHasComposable(&br.body)) any_composable = true;
+                }
+                // `when` branches take the same per-branch REPLACEABLE
+                // GROUP as `if` branches (see the `.If` arm): conditional
+                // composable content needs a slot-alignment bracket per
+                // branch, or a branch flip cannot replace its content
+                // atomically. Statement-shaped (Block) branches only.
+                if (w.thread and any_composable) {
+                    for (wh.branches) |*br| w.wrapBranchInReplaceGroup(&br.body);
                 }
             },
             .IsCheck => |*ic| try w.walkExpr(ic.expr),
