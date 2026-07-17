@@ -972,9 +972,18 @@ const Walker = struct {
                 // place of the generic lambda-body recursion, so its body is
                 // threaded once against its own `$composer` — not the enclosing
                 // one — and no argument is threaded twice.
+                // A sink whose name is ITSELF a composable function (`Linear`,
+                // `Text` mocks) is only callable from composable context; the
+                // same bare name in a NON-composable scope is a different
+                // declaration (the validator extension `MockViewValidator.
+                // Linear(block)`), and transforming its lambda handed the
+                // validator's calls a phantom composer. A non-composable sink
+                // (`compose { }`, `movableContentOf { }` — the entry points)
+                // transforms its lambda from any scope.
+                const sink_applies = name != null and w.sinks != null and w.sinks.?.contains(name.?) and
+                    (w.thread or !w.oracle(w.oracle_ctx, name.?));
                 const sink_last = c.args.len != 0 and
-                    c.args[c.args.len - 1] == .Lambda and
-                    name != null and w.sinks != null and w.sinks.?.contains(name.?);
+                    c.args[c.args.len - 1] == .Lambda and sink_applies;
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
                         const exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
