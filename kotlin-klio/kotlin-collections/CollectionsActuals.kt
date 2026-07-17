@@ -71,3 +71,28 @@ public actual fun <T> MutableList<T>.fill(value: T): Unit {
 }
 
 public actual fun <T> MutableList<T>.shuffle(): Unit = shuffle(Random)
+
+// In-place operations run through the receiver's own get/set, so they work
+// for any MutableList implementation (SnapshotStateList included), not only
+// the interpreter's native list.
+public actual fun <T> MutableList<T>.reverse(): Unit {
+    var left = 0
+    var right = lastIndex
+    while (left < right) {
+        val tmp = this[left]
+        this[left] = this[right]
+        this[right] = tmp
+        left++
+        right--
+    }
+}
+
+public actual fun <T : Comparable<T>> MutableList<T>.sort(): Unit {
+    val sorted = this.sorted()
+    for (index in 0..lastIndex) this[index] = sorted[index]
+}
+
+public actual fun <T> MutableList<T>.sortWith(comparator: Comparator<in T>): Unit {
+    val sorted = this.sortedWith(comparator)
+    for (index in 0..lastIndex) this[index] = sorted[index]
+}
