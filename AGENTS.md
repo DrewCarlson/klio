@@ -37,6 +37,31 @@ binaries) during iteration; never use `--watch -fincremental` (broken for this
 graph — see the plan); prune the GC-less cache with `scripts/prune-zig-cache.sh`
 when it grows.
 
+Debugging knobs:
+
+The interpreter honors a large set of environment variables for tracing and
+diagnosis; the full catalogue (accepted values, output tags, workflow recipes)
+is `docs/development/debugging.md`. The highest-value ones when debugging the
+interpreter:
+
+| Variable | Use |
+|----------|-----|
+| `KLIO_ERR_TRACE=1` | frame chain + miss detail on traceless Vm failures; full throwable rendering in `klio test` (`[errtrace]`) |
+| `KLIO_THROW_TRACE=1` (+ `KLIO_THROW_STACK=1`) | one line per throw as it unwinds, optionally with the frame chain (`[throw-trace]`) |
+| `KLIO_PUMP_DIAG=1` | coroutine pump loop + park/adopt/persist token lifecycle, stalled-pump dumps (`[PUMP]`, `[tok]`) |
+| `KLIO_RESUME_TRACE=1` | who resumed a continuation and every frame the resume re-ran, with file:line and route (`[resume-call]`, `[resume-frame]`) |
+| `KLIO_SPIN_TRACE=10` | frame-chain + register dump every 10s of a run that never returns (`[spin]`) |
+| `KLIO_BARE_TRACE=<fn>` | static: how the bare call resolved at lowering (`[bare]`) |
+| `KLIO_MISS_TRACE=<fn>` | dynamic: which runtime dispatch tail missed for that name (`[member-miss]`, `[extfb]`, ...) |
+| `KLIO_NU_TRACE=<fn>` | candidate/visibility detail for hard dispatch cases (`[mev]`, `[strictext]`, ...) |
+| `KLIO_COMPOSE_PLUGIN=1` | enable the `@Composable` lowering plugin (unset/`0` = implicit hook); rebuild baked packs after flipping |
+| `KLIO_COMPOSE_MEMO=0` / `KLIO_COMPOSE_SKIP=0` | bisect the plugin's lambda-memoization / skip-calculus emission |
+| `kotlinx_coroutines_test_default_timeout=10s` | cap runTest's 60s default timeout (dots-to-underscores env alias for the property) |
+
+Note that `zig build` forwards only a fixed passthrough list of these to itest
+child processes (see the docs page); an exported trace variable reaches
+`klio run` and a hand-run itest binary, but not necessarily `zig build itest-*`.
+
 Scope and regressions — big changes are expected:
 
 Risk is not a reason to stay small. When there is a valid plan to get from A to B,
