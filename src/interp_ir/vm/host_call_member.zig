@@ -3773,7 +3773,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // twice, `samsusp` ×N).
     if (isCallableOrIntrinsic(receiver)) {
         const has_ext = extWithThisLongerThanArgs(self, name, args.len);
-        const arity_ok = if (callableFieldArity(self, receiver)) |n| n == args.len else true;
+        // A SAM-converted value may carry one extra leading slot (the
+        // adapter's receiver): `callback.shouldPause()` on a wrapped
+        // `() -> Boolean` reads as arity 1. The invoke path binds the
+        // receiver, so +1 is as unambiguous as an exact match.
+        const arity_ok = if (callableFieldArity(self, receiver)) |n| n == args.len or n == args.len + 1 else true;
         // A bare name a top-level NON-extension function serves is that
         // function, never the callable's interface method: kotlinc
         // resolves `probeCoroutineResumed(completion)` to the top-level
@@ -3791,6 +3795,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             break :blk false;
         };
+        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-gate] name={s} nargs={d} has_ext={} arity_ok={} tl={}\n", .{ name, args.len, has_ext, arity_ok, toplevel_serves });
         if (!std.mem.eql(u8, name, "invoke") and !has_ext and arity_ok and !toplevel_serves) {
             if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
             const r = try callValueRec(self, allocator, receiver, args);
@@ -5054,6 +5059,13 @@ fn extWithThisLongerThanArgs(self: *VmHost, name: []const u8, argc: usize) bool 
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
         if (mod.funcById(fid)) |f| {
+            // Only true EXTENSIONS gate the SAM arm. An interface's own
+            // method also leads with `this` (`ShouldPauseCallback.
+            // shouldPause()`), but for a CALLABLE receiver that method IS
+            // the SAM dispatch — invoking the callable is the reading
+            // kotlinc takes, exactly like `FlowCollector.emit` on a
+            // collector that arrived as a plain lambda.
+            if (f.kind != .top_level_extension and f.kind != .member_extension) continue;
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this") and f.params.len > argc) return true;
         }
     }

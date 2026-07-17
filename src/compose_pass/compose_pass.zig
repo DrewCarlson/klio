@@ -839,8 +839,12 @@ pub fn transformComposableFunction(
             )));
         }
     }
-    // `if ($dirty != 0 || !$composer.skipping) { <body> } else
-    // { $composer.skipToGroupEnd() }`
+    // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping,
+    // $dirty and 1)) { <body> } else { $composer.skipToGroupEnd() }` —
+    // the shouldExecute wrapper is what gives PausableComposition its
+    // pause points (the composer pauses inserting/reusing content there
+    // when the shouldPause callback says so); for ordinary composition it
+    // returns its first argument unchanged.
     var body_list: std.ArrayList(Stmt) = .empty;
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
@@ -854,7 +858,7 @@ pub fn transformComposableFunction(
     }
     const skip_stmts = try a.alloc(Stmt, 1);
     skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };
-    const run_cond = Expr{ .Binary = .{
+    const params_changed = Expr{ .Binary = .{
         .op = .Or,
         .lhs = b.box(.{ .Binary = .{
             .op = .Neq,
@@ -869,6 +873,10 @@ pub fn transformComposableFunction(
         } }),
         .span = b.gen_span,
     } };
+    const se_args = try a.alloc(Expr, 2);
+    se_args[0] = params_changed;
+    se_args[1] = b.callMember(b.pathExpr(dirty_local), "and", b.slice1(b.intLit(1)));
+    const run_cond = b.callMember(b.pathExpr(composer_param), "shouldExecute", se_args);
     try out.append(a, .{ .Expr = .{ .If = .{
         .cond = b.box(run_cond),
         .then_branch = b.box(.{ .Block = .{ .stmts = try body_list.toOwnedSlice(a), .span = f.span } }),
