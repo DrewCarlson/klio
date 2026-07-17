@@ -468,12 +468,15 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer sink_arity.deinit();
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
+        var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
+        defer inline_fns.deinit();
         if (base) |bsp| {
             try composeBaseNames(&names, bsp);
             try composeBaseSinks(&sinks, bsp);
             try composeBaseFactories(&factories, bsp);
             try composeBaseSinkArity(&sink_arity, bsp);
             try composeBaseComposableProps(&comp_props, bsp);
+            try composeBaseInlineFns(&inline_fns, bsp);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -485,6 +488,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
+        compose_pass.active_inline_fns = &inline_fns;
+        defer compose_pass.active_inline_fns = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
@@ -3047,6 +3052,7 @@ fn buildModuleWithOverrides(
         else
             recv_name;
         const ep_pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
+
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
         if (p.getter) |getter| {
@@ -3057,6 +3063,10 @@ fn buildModuleWithOverrides(
                 .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &empty_members, &.{"this"}, &body, nm),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
             };
+            if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                if (std.mem.eql(u8, w, p.name.name))
+                    std.debug.print("[extprop-reg] key=({s},{s}) fid={d}\n", .{ recv_key, p.name.name, fid.int() });
+            }
             try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             // A PRIVATE member-extension property's (receiver, name) pair is
             // not unique across classes (each lazy-layout item type declares
@@ -4043,6 +4053,12 @@ fn composeBaseSinks(sinks: *std.StringHashMap(void), base: *const StdlibBase) Al
 
 fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
     for (base.lifted_decls) |*d| try composeBaseFactoryDecl(factories, d);
+}
+
+fn composeBaseInlineFns(set: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| {
+        try compose_pass.collectInlineFnNamesInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) Allocator.Error!void {

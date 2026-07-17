@@ -2186,7 +2186,21 @@ fn resolveExtensionPropImpl(
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
         }
+        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name))
+                std.debug.print("[extprop-walk] try=({s},{s})\n", .{ recv_simple, name });
+        }
         if (lookupPairFunc(Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+        // A file-mangled class (`KeyInfo$f352`, one of two same-simple-name
+        // internal classes) registers its extension properties under the
+        // SOURCE-WRITTEN receiver name: retry with the base name.
+        if (std.mem.indexOf(u8, recv_simple, "$f")) |dol| {
+            if (dol > 0 and dol + 2 < recv_simple.len and
+                std.ascii.isDigit(recv_simple[dol + 2]))
+            {
+                if (lookupPairFunc(Pick.map(pg.get().*), recv_simple[0..dol], name)) |fid| return fid;
+            }
+        }
     }
     // An extension property on a supertype applies to a subtype receiver.
     if (receiver.* == .Instance) {

@@ -311,6 +311,67 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
+/// Names of INLINE functions in the compile universe. A composable call is
+/// legal inside a lambda argument only when the callee inlines it (the body
+/// splices into the composable caller) or the parameter is composable (the
+/// sink path): a plain callback lambda (`DisposableEffect { … }`) is not a
+/// composable scope, and threading it emits composer traffic that runs
+/// POST-composition through the captured outer composer.
+pub var active_inline_fns: ?*const std.StringHashMap(void) = null;
+
+/// Collect the names of `inline fun` declarations (top-level and members).
+pub fn collectInlineFnNames(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectInlineFnNamesInto(&set, decls);
+    return set;
+}
+
+pub fn collectInlineFnNamesInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (f.is_inline) try set.put(f.name.name, {});
+        },
+        .Class => |*c| try collectInlineFnNamesInto(set, c.members),
+        .Object => |*o| try collectInlineFnNamesInto(set, o.members),
+        else => {},
+    };
+}
+
+/// Common Kotlin stdlib inline higher-order functions. The stdlib lowers
+/// from a baked image, so its `inline` modifiers are not in the collected
+/// AST universe; these names splice their lambdas and keep the composable
+/// scope.
+const stdlib_inline_hofs = [_][]const u8{
+    "let",           "run",        "with",       "apply",     "also",
+    "takeIf",        "takeUnless", "repeat",     "use",       "synchronized",
+    "forEach",       "forEachIndexed", "onEach", "map",       "mapIndexed",
+    "mapNotNull",    "filter",     "filterNot",  "flatMap",   "fold",
+    "sumOf",         "count",      "any",        "all",       "none",
+    "first",         "firstOrNull", "last",      "lastOrNull", "find",
+    "indexOfFirst",  "indexOfLast", "groupBy",   "associateBy", "associateWith",
+    "getOrElse",     "getOrPut",   "buildString", "buildList", "buildSet",
+    "buildMap",      "maxOf",      "minOf",      "runCatching", "withLock",
+    "measureTime",   "fastForEach", "fastForEachIndexed", "fastMap", "fastAny",
+    "fastFilter",    "fastGroupBy", "fastFirstOrNull", "trace", "sortedBy",
+    "joinToString",  "removeIf",   "partition",  "single",    "singleOrNull",
+};
+
+/// Whether a lambda argument of a call to `name` keeps the composable
+/// scope: the callee inlines the lambda (collected decls or the stdlib
+/// list). Sink last-params are handled before this on the sink path.
+fn calleeInlinesLambda(name: []const u8) bool {
+    if (active_inline_fns) |ifns| {
+        if (ifns.contains(name)) return true;
+    }
+    for (stdlib_inline_hofs) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
 /// Names of class PROPERTIES declared with a `@Composable` function type
 /// (`MovableContent.content`). An explicit-receiver invoke of one
 /// (`content.content(parameter)` in the composer's movable-content path) is
@@ -1129,6 +1190,21 @@ const Walker = struct {
                         // plain trailing lambdas (ComposeNode's update),
                         // whose wrapped invoke shape would not exist.
                         if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) w.wrapInComposableLambda(arg);
+                    } else if (arg.* == .Lambda and w.thread and name != null and
+                        !calleeInlinesLambda(name.?))
+                    {
+                        // A plain callback lambda at a non-inline callee
+                        // (`DisposableEffect { … }`, `LaunchedEffect { … }`)
+                        // is not a composable scope: kotlinc only admits
+                        // composable calls through inline splices or
+                        // composable parameters. Threading it emits memo
+                        // wraps and composer brackets that execute AFTER
+                        // composition through the captured outer composer,
+                        // leaving unapplied change ops behind.
+                        const saved = w.thread;
+                        w.thread = false;
+                        try w.walkExpr(arg);
+                        w.thread = saved;
                     } else {
                         try w.walkExpr(arg);
                     }
