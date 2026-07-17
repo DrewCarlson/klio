@@ -2407,10 +2407,13 @@ fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     // A class declaring `operator fun invoke` is function-like whatever its
     // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke
     // overloads, no Function* supertype in common code) satisfies a
-    // function-typed parameter exactly like a lambda. Checked on the
-    // instance's own class chain directly — this runs under callers that
-    // already hold module borrows, so it must not re-enter the member
-    // dispatch (hostHasMember deadlocks here).
+    // function-typed parameter exactly like a lambda. This runs under
+    // callers holding module borrows (some exclusive), so it may only read
+    // the instance's own class chain — ClassDef method tables. Pack-loaded
+    // classes keep their methods in the lowered registry and their
+    // ClassDef.methods EMPTY: an empty chain means the member surface is
+    // UNKNOWN here, and a disproof needs knowledge — report the invoke
+    // surface as possible so the candidate survives to real dispatch.
     {
         const g = v.Instance.borrow();
         defer g.deinit();
@@ -2824,7 +2827,38 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
 /// Pick the best-scoring method overload from `candidates` for `args`.
 /// Each candidate's slot 0 is the implicit `this` receiver, so value
 /// arguments score against params 1..n.
-fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Value) ?Func {
+/// Whether the runtime class chain of an Instance value declares an
+/// `invoke` member, answered from an ALREADY-BORROWED module's registry
+/// (pack classes keep their methods there; their ClassDef tables stay
+/// empty). Callers without a live borrow pass null and keep the
+/// conservative disproof.
+fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const cls_name: []const u8 = blk: {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const reg = &mod.registry;
+    var cur: ?[]const u8 = cls_name;
+    var hops: usize = 0;
+    while (cur) |cn| : (hops += 1) {
+        if (hops > 32) break;
+        if (reg.hierarchy_methods.get(cn)) |methods| {
+            if (methods.contains("invoke")) return true;
+        }
+        const chain = reg.class_super_names.get(cn) orelse break;
+        if (chain.len == 0) break;
+        var sn = chain[0];
+        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        cur = sn;
+    }
+    return false;
+}
+
+fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args: []const Value) ?Func {
     if (candidates.len == 0) return null;
     if (candidates.len == 1) {
         // Even a lone same-named member must be *applicable*. By arity:
@@ -2887,13 +2921,17 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         if (args.len > effective.len and
             (effective.len == 0 or !effective[effective.len - 1].is_vararg))
         {
+            if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=oversupply args={d} params={d}\n", .{ f.name, args.len, effective.len });
             return null;
         }
         if (args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
             var k: usize = args.len;
             while (k < effective.len) : (k += 1) {
-                if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) return null;
+                if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) {
+                    if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=undersupply param#{d}\n", .{ f.name, k });
+                    return null;
+                }
             }
         }
         // By type: a definite argument-type mismatch must fall through so
@@ -2902,8 +2940,25 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         // class's) is never adjudicated nominally.
         var i: usize = 0;
         while (i < args.len and i < effective.len) : (i += 1) {
+            // A LONE member whose function-typed parameter meets an Instance
+            // argument whose class chain declares `invoke` stays applicable:
+            // a memo-wrapped ComposableLambdaImpl keeps its invoke overloads
+            // in the pack registry, which the borrow-free disproof cannot
+            // see, so `setContent(content)` was dropped on its only
+            // candidate. Answered from the caller's live module borrow; an
+            // invoke-less instance (a JobNode against a CompletionHandler
+            // parameter) still declines so the extension wins.
+            if (args[i] == .Instance and std.mem.startsWith(u8, effective[i].ty.name, "Function")) {
+                if (mod_opt) |m| {
+                    if (classChainHasInvokeIn(m, &args[i])) continue;
+                }
+            }
             if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
-                !paramTypeIsTypeVar(self, &f, effective[i].ty.name)) return null;
+                !paramTypeIsTypeVar(self, &f, effective[i].ty.name))
+            {
+                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(args[i])) });
+                return null;
+            }
         }
         return f;
     }
@@ -7977,7 +8032,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                         }
                     }
                 }
-                if (pickMethodOverload(self, candidates.items, args)) |f| {
+                if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
                         return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
@@ -10639,7 +10694,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
 fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) bool {
     {
         const one = [_]Func{f.*};
-        if (pickMethodOverload(self, &one, args) != null) return true;
+        if (pickMethodOverload(self, null, &one, args) != null) return true;
     }
     if (args.len == 0) return false;
     const last_arg = args[args.len - 1];
@@ -11387,7 +11442,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     if (std.mem.eql(u8, cf.name, name)) cands.append(allocator, cf.*) catch {};
                 }
                 if (cands.items.len != 0) {
-                    const chosen = pickMethodOverload(self, cands.items, args) orelse cands.items[0];
+                    const chosen = pickMethodOverload(self, m, cands.items, args) orelse cands.items[0];
                     found_fid = chosen.id;
                 }
                 break;
