@@ -1163,6 +1163,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // methods) never come in this shape, so we only walk the source
     // params.
     for (f.params) |*p| {
+        if (p.ty.function == null) {
+            // An ALIASED receiver-fn type (`done: Workflow` where
+            // `typealias Workflow = suspend WScope.() -> Unit`) carries no
+            // syntactic function type; the alias registry keeps the
+            // receiver-ness the `Function{N}` tag drops.
+            if (b.module.registry.recv_fn_aliases.get(p.ty.name.name)) |ar| {
+                try b.markReceiverLambdaParam(p.name.name);
+                try b.markReceiverLambdaArity(p.name.name, ar);
+            }
+        }
         if (p.ty.function) |ft| {
             if (ft.receiver != null) {
                 try b.markReceiverLambdaParam(p.name.name);

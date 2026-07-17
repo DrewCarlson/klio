@@ -403,6 +403,11 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
                 try b.markReceiverLambdaParam(pname.name);
                 try b.markReceiverLambdaArity(pname.name, fnty.params.len);
             }
+        } else if (b.module.registry.recv_fn_aliases.get(t.name.name)) |ar| {
+            // Aliased receiver-fn type: the alias registry keeps the
+            // receiver-ness the `Function{N}` tag drops.
+            try b.markReceiverLambdaParam(pname.name);
+            try b.markReceiverLambdaArity(pname.name, ar);
         }
     }
     const result = try expr.lowerBlock(&b, body);

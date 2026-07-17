@@ -1986,6 +1986,9 @@ fn buildModuleWithOverrides(
         if (ta.target.function) |ft| {
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{ft.params.len});
             try module.registry.type_aliases.put(ta.name.name, tag);
+            if (ft.receiver != null) {
+                try module.registry.recv_fn_aliases.put(ta.name.name, @intCast(@min(ft.params.len, 255)));
+            }
         }
     }
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
@@ -3193,6 +3196,9 @@ fn buildModuleWithOverrides(
             const arity = ft.params.len;
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{arity});
             try module.registry.type_aliases.put(ta.name.name, tag);
+            if (ft.receiver != null) {
+                try module.registry.recv_fn_aliases.put(ta.name.name, @intCast(@min(arity, 255)));
+            }
             continue;
         }
         const full = ta.target.name.name;

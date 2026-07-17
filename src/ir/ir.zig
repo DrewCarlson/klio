@@ -3973,6 +3973,12 @@ pub const ModuleRegistry = struct {
     /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
     /// name.
     type_aliases: std.StringHashMap([]const u8),
+    /// Function-type aliases whose target declares an extension RECEIVER
+    /// (`typealias Workflow = suspend WScope.() -> Unit`) → the target's
+    /// VALUE-parameter count. The `Function{N}` tag in `type_aliases`
+    /// deliberately drops the receiver; a bare call through a param of
+    /// such an alias must still bind the enclosing `this`.
+    recv_fn_aliases: std.StringHashMap(u8),
     /// Per-file (`FileId`) non-wildcard import leaf → every import in
     /// the file bound to that leaf, in declaration order. Keyed by file
     /// because a Kotlin named import is file-scoped; a list because
@@ -4069,6 +4075,7 @@ pub const ModuleRegistry = struct {
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
             .type_aliases = std.StringHashMap([]const u8).init(allocator),
+            .recv_fn_aliases = std.StringHashMap(u8).init(allocator),
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
@@ -4146,6 +4153,7 @@ pub const ModuleRegistry = struct {
             self.abstract_member_defaults.deinit();
         }
         self.type_aliases.deinit();
+        self.recv_fn_aliases.deinit();
         {
             var it = self.import_aliases.valueIterator();
             while (it.next()) |inner| {
