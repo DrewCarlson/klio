@@ -3775,7 +3775,17 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
         defer allocator.free(names);
         const name_str = constStr(frame.module, cmv.name) orelse
             return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
-        const fb = frame.read(cmv.fallback);
+        var fb = frame.read(cmv.fallback);
+        // A boxed capture holds the callable in a cell (a captured local fn's
+        // shared binding); classify and invoke the CONTENT — the sibling
+        // CallValueOrMember arm unwraps identically. Without this a captured
+        // `fun MockViewValidator.Composition()` fallback read as `.Cell`,
+        // was judged non-invocable, and the member miss surfaced.
+        if (fb == .Cell) {
+            const cg = fb.Cell.borrow();
+            fb = cg.get().*;
+            cg.deinit();
+        }
         if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
             const rcls: []const u8 = if (recv == .Instance) blk: {
                 const g = recv.Instance.borrow();

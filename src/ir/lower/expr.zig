@@ -4739,7 +4739,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
         if (b.localFnDecls(bare)) |decls| {
-            local_fn_inapplicable = !anyLocalFnOverloadApplicable(decls, args, ast_arg_names);
+            local_fn_inapplicable = !anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names);
         }
         // A local function shadows an outer one by NAME, but only among
         // candidates that can take the call. A local `fun validate()` does
@@ -5716,10 +5716,12 @@ fn headCompatible(h: []const u8, d_raw: []const u8) bool {
 /// (arity, varargs, defaults, argument names)? When none can, the local
 /// name does not shadow the outer candidates.
 fn anyLocalFnOverloadApplicable(
+    b: *const FuncBuilder,
     ovs: []const build.LocalFnOverload,
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) bool {
+    _ = b;
     outer: for (ovs) |*ov| {
         if (args.len < ov.n_required and !ov.has_vararg) continue;
         if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
@@ -5752,6 +5754,14 @@ fn selectLocalFnOverload(
     var exact: ?*const build.LocalFnOverload = null;
     var n_exact: usize = 0;
     outer: for (ovs) |*ov| {
+        // An EXTENSION sibling is only a candidate where a KNOWN
+        // receiver type is in scope (the enclosing receiver-lambda's
+        // declared receiver, carried across lambda boundaries):
+        // `fun Checker.Composition()` beside a plain local
+        // `fun Composition(...)` binds inside the validator's receiver
+        // lambda and never from a receiver-less scope. A merely-captured
+        // `this` is not enough — every lambda captures one.
+        if (ov.is_ext and b.enclosingRecvTy() == null) continue;
         if (args.len < ov.n_required and !ov.has_vararg) continue;
         if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
         var bound = [_]bool{false} ** 64;
@@ -5819,7 +5829,10 @@ fn lowerSelectedLocalOverloadCall(
     // A selected local *extension* overload takes the enclosing receiver
     // as its leading `this` param, like the plain-name ext arm.
     if (b.isLocalExtFn(mangled)) {
+        // No reachable receiver: fall back to the plain-name route rather
+        // than invoking the extension with its `this` slot missing.
         const this_reg = try resolveThisForBareCallNoBind(b);
+        if (this_reg == null) return null;
         if (this_reg) |tr| {
             const recv = b.allocReg();
             try b.push(.{ .Move = .{ .dst = recv, .src = tr } });
@@ -6606,7 +6619,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // for `validate { … }`, and routing through the captured self-cell made
     // the local call itself.
     const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
-        anyLocalFnOverloadApplicable(decls, args, ast_arg_names)
+        anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names)
     else
         true;
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and

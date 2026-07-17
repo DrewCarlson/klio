@@ -291,6 +291,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 .param_names = ov_names,
                 .n_required = n_required,
                 .has_vararg = has_vararg,
+                .is_ext = f.receiver_type != null,
             });
             break :mangled_blk home;
         };
