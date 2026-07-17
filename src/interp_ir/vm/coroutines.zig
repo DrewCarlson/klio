@@ -1744,14 +1744,14 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
             if (g) |e| e.wake_at else null,
             value.frames.items.len,
         });
-        for (value.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+        for (value.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
         var seg = value.tails;
         while (seg) |t| : (seg = t.next) {
             std.debug.print(" |tail", .{});
             var i = t.head;
             while (i < t.frames.items.len) : (i += 1) {
                 const fr = &t.frames.items[i];
-                std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+                std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
             }
         }
         std.debug.print("\n", .{});

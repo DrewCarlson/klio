@@ -1688,7 +1688,7 @@ pub fn resumeContinuation(
         // route tag says which delivery path drove it (set by the host's
         // resumeRaw call sites).
         if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null)
-            std.debug.print("[resume-frame] {s}#{d} at={d}:{d} throw={} via={s}\n", .{ func.name, func.id.int(), snap.block.int(), snap.inst_idx, pending_throw_from_inner != null, resume_route });
+            std.debug.print("[resume-frame] {s}#{d} at={d}:{d} throw={} via={s} id={x}\n", .{ func.name, func.id.int(), snap.block.int(), snap.inst_idx, pending_throw_from_inner != null, resume_route, @intFromPtr(snap.regs.ptr) });
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;
