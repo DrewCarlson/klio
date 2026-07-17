@@ -334,6 +334,11 @@ const PersistedParked = struct {
     }
 
     fn put(slot: i64, state: SuspendState, scope_delta: []Value) Allocator.Error!void {
+        if (pumpDiagEnabled()) {
+            std.debug.print("[tok] persist slot={d} frames={d}:", .{ slot, state.frames.items.len });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            std.debug.print("\n", .{});
+        }
         mutex.lock();
         defer mutex.unlock();
         if (map == null) {
@@ -862,6 +867,11 @@ pub const CooperativeInterceptor = struct {
         self.next_token += 1;
         const token = self.next_token;
         state.token = token;
+        if (pumpDiagEnabled()) {
+            std.debug.print("[tok] adopt tok={d} frames={d}:", .{ token, state.frames.items.len });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            std.debug.print("\n", .{});
+        }
         try self.parked.put(token, .{ .state = state, .wake_at = INDEFINITE, .scope_delta = scope_delta });
         try self.token_resume_value.put(token, value);
         try self.ready.append(self.allocator, token);
