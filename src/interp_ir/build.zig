@@ -472,8 +472,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseSinkArity(&sink_arity, bsp);
             try composeBaseComposableProps(&comp_props, bsp);
         }
-        if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null)
+        if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
+            compose_pass.dbg_groups = true;
             std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} factories, {d} decls\n", .{ names.count(), sinks.count(), factories.count(), decls.items.len });
+        }
         compose_pass.active_factories = &factories;
         defer compose_pass.active_factories = null;
         compose_pass.active_sink_arity = &sink_arity;

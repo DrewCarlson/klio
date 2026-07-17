@@ -40,6 +40,9 @@ const Decl = ast.Decl;
 
 const dbg_lambda = false;
 
+/// Group-emission debug (set by the build driver from KLIO_COMPOSE_DBG).
+pub var dbg_groups: bool = false;
+
 /// Synthetic name of the injected composer parameter.
 pub const composer_param = "$composer";
 /// Synthetic name of the injected changed-flags parameter.
@@ -954,6 +957,72 @@ const Walker = struct {
         }
     }
 
+    /// Whether a branch contains a call the pass considers composable
+    /// (oracle name, scoped local, composable lambda param, or sink) —
+    /// the gate for the per-branch replace groups: kotlinc brackets only
+    /// conditional COMPOSITION, and bracketing plain control flow inside
+    /// threaded engine functions corrupts their group structure.
+    fn branchHasComposable(w: *Walker, e: *const Expr) bool {
+        switch (e.*) {
+            .Call => |c| {
+                if (calleeSimpleName(c.callee)) |nm| {
+                    const is_lp = w.lambda_params != null and w.lambda_params.?.contains(nm);
+                    const is_local = w.locals != null and w.locals.?.contains(nm);
+                    const is_sink = w.sinks != null and w.sinks.?.contains(nm);
+                    if (is_lp or is_local or is_sink or w.oracle(w.oracle_ctx, nm)) return true;
+                }
+                if (w.branchHasComposable(c.callee)) return true;
+                for (c.args) |*a| if (w.branchHasComposable(a)) return true;
+                return false;
+            },
+            .Block => |blk| {
+                for (blk.stmts) |*st| switch (st.*) {
+                    .Expr => |*se| if (w.branchHasComposable(se)) return true,
+                    .Assign => |a| {
+                        if (w.branchHasComposable(&a.value)) return true;
+                    },
+                    .Decl => |d| switch (d) {
+                        .Property => |pp| {
+                            if (pp.init) |*ini| if (w.branchHasComposable(ini)) return true;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                };
+                return false;
+            },
+            .If => |ff| {
+                if (w.branchHasComposable(ff.then_branch)) return true;
+                if (ff.else_branch) |eb| if (w.branchHasComposable(eb)) return true;
+                return false;
+            },
+            .Lambda => |lam| {
+                for (lam.body.stmts) |*st| switch (st.*) {
+                    .Expr => |*se| if (w.branchHasComposable(se)) return true,
+                    else => {},
+                };
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Bracket a Block-shaped branch with
+    /// `$composer.startReplaceGroup(<span key>)` / `endReplaceGroup()`.
+    fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
+        if (branch.* != .Block) return;
+        const blk = &branch.Block;
+        const key = positionalKey(blk.span);
+        if (dbg_groups) std.debug.print("[compose-pass] replace-group key={d} stmts={d}\n", .{ key, blk.stmts.len });
+        const stmts = w.a.alloc(ast.Stmt, blk.stmts.len + 2) catch @panic("oom");
+        const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
+        start_args[0] = w.b.intLit(key);
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startReplaceGroup", start_args) };
+        @memcpy(stmts[1 .. blk.stmts.len + 1], blk.stmts);
+        stmts[blk.stmts.len + 1] = .{ .Expr = w.b.callMember(w.composerRef(), "endReplaceGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        blk.stmts = stmts;
+    }
+
     fn walkExpr(w: *Walker, e: *Expr) std.mem.Allocator.Error!void {
         // `currentComposer` (bare or trailing member segment) IS the threaded
         // composer inside a composable body.
@@ -1019,6 +1088,22 @@ const Walker = struct {
                 try w.walkExpr(f.cond);
                 try w.walkExpr(f.then_branch);
                 if (f.else_branch) |eb| try w.walkExpr(eb);
+                // Conditional content in a composable body gets a
+                // REPLACEABLE GROUP per branch (distinct span keys), the
+                // plugin ABI's slot-alignment bracket: without it a forced
+                // recomposition of an UNCHANGED body misaligns at the
+                // branch and reports spurious changes, and a branch flip
+                // cannot replace its content atomically. Statement-shaped
+                // (Block) branches only: an expression-if's value must not
+                // be displaced by the bracket call. A `return` inside the
+                // branch skips the end call (kotlinc brackets returns too;
+                // acceptable gap, noted).
+                if (w.thread and (w.branchHasComposable(f.then_branch) or
+                    (if (f.else_branch) |eb2| w.branchHasComposable(eb2) else false)))
+                {
+                    w.wrapBranchInReplaceGroup(f.then_branch);
+                    if (f.else_branch) |eb| w.wrapBranchInReplaceGroup(eb);
+                }
             },
             .While => |*wl| {
                 try w.walkExpr(wl.cond);
