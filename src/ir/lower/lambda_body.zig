@@ -255,6 +255,14 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_enclosing_recv = null;
         b.setEnclosingRecvTy(rt);
     }
+    // A local extension FUNCTION's body owns its declared receiver outright
+    // (stashed by `lowerLocalFnDecl`): the same standing a top-level
+    // extension body gets from `setRecvTy`, so bare-call resolution prefers
+    // extensions on the receiver over same-named plain top-level functions.
+    if (module.pending_lambda_own_recv) |rt| {
+        module.pending_lambda_own_recv = null;
+        b.setRecvTy(rt);
+    }
     // Enclosing non-reified type params, so an `x as T` cast in this body is
     // erased (see FuncBuilder.type_param_names).
     if (module.pending_lambda_type_params) |tps| {

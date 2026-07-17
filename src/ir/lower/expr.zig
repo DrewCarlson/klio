@@ -2277,14 +2277,24 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // (`T.() -> R`) rebinds the implicit `this` to `T`, otherwise a plain
     // block captures the enclosing `this`. Carried into the body so a bare
     // call there can still disambiguate a receiver-lambda argument's arity.
+    // A receiver-lambda ARGUMENT whose receiver type the resolved callee made
+    // concrete (recorded by `recordLambdaArgReceivers`) — reached when the
+    // call is deferred so no expected type carries the receiver to lowerLambda.
+    const recorded_recv: ?[]const u8 = b.lambdaArgRecv(expr.span());
     b.module.pending_lambda_enclosing_recv = blk: {
         if (b.peekExpected()) |exp| {
             if (exp.function) |ft| {
                 if (ft.receiver) |r| break :blk r.name.name;
             }
         }
+        if (recorded_recv) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
     };
+    // The body owns that receiver as its extension receiver, so a bare call
+    // there prefers an extension on it over a same-file plain namesake —
+    // `validate { contact(c) }` binds `MockViewValidator.contact`, not the
+    // same-file `@Composable contact`.
+    if (recorded_recv) |rr| b.module.pending_lambda_own_recv = rr;
     // Carry the enclosing non-reified type-parameter names so an `x as T`
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
@@ -2712,6 +2722,62 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
         return null;
     }
     return out;
+}
+
+/// The declared receiver-type head of a receiver-lambda parameter type
+/// (`MockViewValidator.() -> Unit`), or null when the type is not a direct
+/// receiver function. The lowered encoding is
+/// `[#suspend?] [receiver?] params(n) ret(1) [#markers]`; a receiver is present
+/// when the non-marker, non-suspend arg count is `n + 2`.
+fn fnTypeReceiverHead(b: *FuncBuilder, ty: ir.TypeRef) ?[]const u8 {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    const arity = fnTypeArityAlias(b, ty) orelse return null;
+    const n: usize = if (arity < 0) 0 else @intCast(arity);
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    const remaining = hi - lo; // [receiver?] params(n) ret(1)
+    if (remaining == n + 2 and lo < hi) {
+        const head = ty.args[lo].name;
+        if (head.len != 0 and head[0] != '#') return head;
+    }
+    return null;
+}
+
+/// Record the receiver-type head of each receiver-lambda ARGUMENT so its body
+/// owns that receiver even when the call is deferred and no expected type
+/// reaches `lowerLambda`. Mirrors `argFnArities`' arg→param alignment.
+fn recordLambdaArgReceivers(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) void {
+    if (args.len == 0 or func.params.len < recv_offset) return;
+    for (args) |*a| if (a.* == .Spread) return;
+    const params = func.params[recv_offset..];
+    if (anyNamedArg(arg_names)) {
+        const map = (mapArgsToParams(b, params, args, arg_names) catch return) orelse return;
+        defer b.allocator.free(map);
+        for (args, map) |*a, m| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            if (m) |pi| if (pi < params.len) {
+                if (fnTypeReceiverHead(b, params[pi].ty)) |rh| b.recordLambdaArgRecv(a.span(), rh);
+            };
+        }
+        return;
+    }
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            if ((args[i] == .Lambda or args[i] == .AnonFun)) {
+                if (fnTypeReceiverHead(b, params[i].ty)) |rh| b.recordLambdaArgRecv(args[i].span(), rh);
+            }
+        }
+        if (fnTypeReceiverHead(b, params[params.len - 1].ty)) |rh| b.recordLambdaArgRecv(args[args.len - 1].span(), rh);
+    } else if (args.len == params.len) {
+        for (args, params) |*a, p| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            if (fnTypeReceiverHead(b, p.ty)) |rh| b.recordLambdaArgRecv(a.span(), rh);
+        }
+    }
 }
 
 /// A bitmask of which of a `FunctionN`-typed parameter's `arity` value
@@ -3323,6 +3389,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                     }
                 }
+                recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
             }
         }
     }
@@ -3405,11 +3472,17 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A bare call to a file-private top-level function mangled per file (two
     // files in one package each declaring the same-signature `private fun`)
     // resolves to the calling file's mangled name. Locals / outer captures /
-    // own members still shadow it (Kotlin scope order).
+    // own members still shadow it (Kotlin scope order). An applicable
+    // EXTENSION on an in-scope implicit receiver also shadows it: Kotlin
+    // resolves the implicit-receiver candidate group before any no-receiver
+    // candidate, so `Text(…)` inside `fun MockViewValidator.value()` binds
+    // the validator extension, never the file's private plain fn.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
-            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name) and
+                !extOnEnclosingReceiverApplies(b, head.name, call.args.len))
+            {
                 var new_segs = [_]ast.Ident{.{ .name = renamed, .span = head.span }};
                 var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
                 var rewritten = expr.*;
@@ -4517,19 +4590,35 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
                 (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
             if (binds_this) {
+                // Pinning the dispatch to the innermost bound `this` is only
+                // sound when the receiver evidence proves that value serves
+                // the member (`member_of_recv`, an extension on the proven
+                // chain). The `hasOwnMember` leg names a member of the
+                // lexically enclosing CLASS — inside a receiver lambda whose
+                // receiver does not own the member (a `(Long) -> R` frame
+                // callback created in a `CoroutineScope.()` block, calling a
+                // Recomposer private), the bound `this` is the scope receiver
+                // and the owner sits further out; a lazily lowered pack body
+                // has no receiver-type context to tell the cases apart. Emit
+                // the receiver-walking form for that leg: the walk tries the
+                // bound receiver's members first (identical to the pin when
+                // `this` IS the owner), then each enclosing receiver.
                 if (b.resolve("this")) |bound_this| {
                     const run = try lowerArgRun(b, args);
                     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const dst = b.allocReg();
                     const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                    try b.push(.{ .CallMember = .{
+                    orEmitAudit(b, "inline_splice_recv_walk", "CallMemberOrGlobal", nm);
+                    try b.push(.{ .CallMemberOrGlobal = .{
                         .dst = dst,
-                        .receiver = bound_this,
+                        .this_idx = 0,
                         .name = nmc,
                         .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
+                        .recv = bound_this,
+                        .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
                 }
@@ -6555,6 +6644,28 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
 /// ambiguous bare call inside an extension body resolve its arity/receiver-lambda
 /// shape. Null when no enclosing receiver type is known or no single overload
 /// matches.
+/// Whether any same-named EXTENSION whose declared receiver head matches the
+/// enclosing receiver type accepts `n_args` value arguments. Kotlin checks
+/// implicit-receiver candidates before no-receiver ones, so such an extension
+/// shadows a same-named file-private top-level function.
+fn extOnEnclosingReceiverApplies(b: *FuncBuilder, name: []const u8, n_args: usize) bool {
+    const recv = b.enclosingRecvTy() orelse return false;
+    const recv_simple = simpleTypeHead(recv);
+    const ids = b.module.func_name_index.get(name) orelse return false;
+    for (ids.items) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), recv_simple)) continue;
+        const user_params = f.params.len - 1;
+        var required: usize = 0;
+        for (f.params[1..]) |*pp| {
+            if (!pp.has_default and !pp.is_vararg) required += 1;
+        }
+        if (n_args >= required and n_args <= user_params) return true;
+    }
+    return false;
+}
+
 fn disambiguateByReceiver(b: *FuncBuilder, name: []const u8) ?FuncId {
     const recv = b.enclosingRecvTy() orelse return null;
     const recv_simple = simpleTypeHead(recv);
@@ -6686,7 +6797,14 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         }
     }
     if (imported_func_id) |func_id| {
-        if (!shadowed_by_class) {
+        // An applicable extension on an in-scope implicit receiver outranks the
+        // imported plain namesake: inside `validate { contact(c) }`
+        // (`MockViewValidator.() -> Unit`), the imported `contact` FQN resolves
+        // to the `@Composable contact`, but the receiver's
+        // `MockViewValidator.contact` extension must win (Kotlin resolves the
+        // implicit-receiver candidate group first). Defer to the member/
+        // extension dispatch below when such an extension applies.
+        if (!shadowed_by_class and !extOnEnclosingReceiverApplies(b, name0, args.len)) {
             const needs_this = blk: {
                 if (b.module.funcById(func_id)) |f| {
                     break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
@@ -6920,7 +7038,44 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
 
+    // KLIO_BARE_TRACE=<name>: print the static resolution for a bare call —
+    // which overload bound (or that none did), the emit form, and the
+    // receiver context the decision saw. The static complement of
+    // KLIO_MISS_TRACE.
+    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0) and res_final.target == null) {
+            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={}\n", .{
+                name0,
+                b.recvTy() orelse "-",
+                b.enclosingRecvTy() orelse "-",
+                b.self_package,
+                shadowed_by_class,
+            });
+        }
+    }
     if (res_final.target) |target| {
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0)) {
+                const tfn = b.module.funcById(target);
+                const tf = if (tfn) |f| f.fqn else "?";
+                const np: usize = if (tfn) |f| f.params.len else 0;
+                const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
+                std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
+                    name0,
+                    tf,
+                    target.int(),
+                    np,
+                    is_ext_t,
+                    @tagName(res_final.emit_form),
+                    b.recvTy() orelse "-",
+                    b.enclosingRecvTy() orelse "-",
+                    b.self_package,
+                    shadowed_by_class,
+                    @intFromEnum(segments[0].span.file),
+                    segments[0].span.start,
+                });
+            }
+        }
         if (!shadowed_by_class) {
             // A constructible same-named class competes with this pick and
             // the pick is not type-proven: yield to the class arm's deferred

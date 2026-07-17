@@ -2404,6 +2404,35 @@ fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
 /// `Function*` type (kotlinc: assignability needs the type relation — a
 /// class merely declaring an `invoke` member is not a Function subtype).
 fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
+    // A class declaring `operator fun invoke` is function-like whatever its
+    // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke
+    // overloads, no Function* supertype in common code) satisfies a
+    // function-typed parameter exactly like a lambda. This runs under
+    // callers holding module borrows (some exclusive), so it may only read
+    // the instance's own class chain — ClassDef method tables. Pack-loaded
+    // classes keep their methods in the lowered registry and their
+    // ClassDef.methods EMPTY: an empty chain means the member surface is
+    // UNKNOWN here, and a disproof needs knowledge — report the invoke
+    // surface as possible so the candidate survives to real dispatch.
+    {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        var cls: ?ObjRef(runtime.ClassDef) = g.get().class.clone();
+        while (cls) |c| {
+            const cg = c.borrow();
+            for (cg.get().methods) |m| {
+                if (std.mem.eql(u8, m.name, "invoke")) {
+                    cg.deinit();
+                    c.deinit();
+                    return true;
+                }
+            }
+            const parent = if (cg.get().parent) |p| p.clone() else null;
+            cg.deinit();
+            c.deinit();
+            cls = parent;
+        }
+    }
     {
         const g = v.Instance.borrow();
         defer g.deinit();
@@ -2798,7 +2827,38 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
 /// Pick the best-scoring method overload from `candidates` for `args`.
 /// Each candidate's slot 0 is the implicit `this` receiver, so value
 /// arguments score against params 1..n.
-fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Value) ?Func {
+/// Whether the runtime class chain of an Instance value declares an
+/// `invoke` member, answered from an ALREADY-BORROWED module's registry
+/// (pack classes keep their methods there; their ClassDef tables stay
+/// empty). Callers without a live borrow pass null and keep the
+/// conservative disproof.
+fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const cls_name: []const u8 = blk: {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const reg = &mod.registry;
+    var cur: ?[]const u8 = cls_name;
+    var hops: usize = 0;
+    while (cur) |cn| : (hops += 1) {
+        if (hops > 32) break;
+        if (reg.hierarchy_methods.get(cn)) |methods| {
+            if (methods.contains("invoke")) return true;
+        }
+        const chain = reg.class_super_names.get(cn) orelse break;
+        if (chain.len == 0) break;
+        var sn = chain[0];
+        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        cur = sn;
+    }
+    return false;
+}
+
+fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args: []const Value) ?Func {
     if (candidates.len == 0) return null;
     if (candidates.len == 1) {
         // Even a lone same-named member must be *applicable*. By arity:
@@ -2861,13 +2921,17 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         if (args.len > effective.len and
             (effective.len == 0 or !effective[effective.len - 1].is_vararg))
         {
+            if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=oversupply args={d} params={d}\n", .{ f.name, args.len, effective.len });
             return null;
         }
         if (args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
             var k: usize = args.len;
             while (k < effective.len) : (k += 1) {
-                if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) return null;
+                if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) {
+                    if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=undersupply param#{d}\n", .{ f.name, k });
+                    return null;
+                }
             }
         }
         // By type: a definite argument-type mismatch must fall through so
@@ -2876,8 +2940,25 @@ fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Val
         // class's) is never adjudicated nominally.
         var i: usize = 0;
         while (i < args.len and i < effective.len) : (i += 1) {
+            // A LONE member whose function-typed parameter meets an Instance
+            // argument whose class chain declares `invoke` stays applicable:
+            // a memo-wrapped ComposableLambdaImpl keeps its invoke overloads
+            // in the pack registry, which the borrow-free disproof cannot
+            // see, so `setContent(content)` was dropped on its only
+            // candidate. Answered from the caller's live module borrow; an
+            // invoke-less instance (a JobNode against a CompletionHandler
+            // parameter) still declines so the extension wins.
+            if (args[i] == .Instance and std.mem.startsWith(u8, effective[i].ty.name, "Function")) {
+                if (mod_opt) |m| {
+                    if (classChainHasInvokeIn(m, &args[i])) continue;
+                }
+            }
             if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
-                !paramTypeIsTypeVar(self, &f, effective[i].ty.name)) return null;
+                !paramTypeIsTypeVar(self, &f, effective[i].ty.name))
+            {
+                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(args[i])) });
+                return null;
+            }
         }
         return f;
     }
@@ -3692,7 +3773,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // twice, `samsusp` ×N).
     if (isCallableOrIntrinsic(receiver)) {
         const has_ext = extWithThisLongerThanArgs(self, name, args.len);
-        const arity_ok = if (callableFieldArity(self, receiver)) |n| n == args.len else true;
+        // A SAM-converted value may carry one extra leading slot (the
+        // adapter's receiver): `callback.shouldPause()` on a wrapped
+        // `() -> Boolean` reads as arity 1. The invoke path binds the
+        // receiver, so +1 is as unambiguous as an exact match.
+        const arity_ok = if (callableFieldArity(self, receiver)) |n| n == args.len or n == args.len + 1 else true;
         // A bare name a top-level NON-extension function serves is that
         // function, never the callable's interface method: kotlinc
         // resolves `probeCoroutineResumed(completion)` to the top-level
@@ -3710,6 +3795,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             break :blk false;
         };
+        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-gate] name={s} nargs={d} has_ext={} arity_ok={} tl={}\n", .{ name, args.len, has_ext, arity_ok, toplevel_serves });
         if (!std.mem.eql(u8, name, "invoke") and !has_ext and arity_ok and !toplevel_serves) {
             if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
             const r = try callValueRec(self, allocator, receiver, args);
@@ -4973,6 +5059,13 @@ fn extWithThisLongerThanArgs(self: *VmHost, name: []const u8, argc: usize) bool 
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
         if (mod.funcById(fid)) |f| {
+            // Only true EXTENSIONS gate the SAM arm. An interface's own
+            // method also leads with `this` (`ShouldPauseCallback.
+            // shouldPause()`), but for a CALLABLE receiver that method IS
+            // the SAM dispatch — invoking the callable is the reading
+            // kotlinc takes, exactly like `FlowCollector.emit` on a
+            // collector that arrived as a plain lambda.
+            if (f.kind != .top_level_extension and f.kind != .member_extension) continue;
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this") and f.params.len > argc) return true;
         }
     }
@@ -7951,7 +8044,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                         }
                     }
                 }
-                if (pickMethodOverload(self, candidates.items, args)) |f| {
+                if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
                         return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
@@ -9639,6 +9732,37 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
 
+    // Kotlin gathers candidates scope level by scope level — the call
+    // site's own file (its file-privates included) before anything from
+    // another file — and resolution stops at the innermost level with an
+    // applicable candidate. With several receiver-fitting candidates,
+    // keep the call-site file's own when any exist: a file-private
+    // `MockViewValidator.Text` outranks another package's same-signature
+    // extension the file never imported.
+    if (candidates.items.len > 1) {
+        const site_file: ?ir.FileId = ir.eval.refSiteFile() orelse
+            if (ir.eval.currentCallSiteSpan()) |csp| csp.file else null;
+        if (site_file) |sf| {
+            const smg = self.module.borrow();
+            defer smg.deinit();
+            const smod = smg.get();
+            var same_file: usize = 0;
+            for (candidates.items) |c| {
+                const ds = smod.decl_span.get(c.fid.int()) orelse continue;
+                if (ds.file.int() == sf.int()) same_file += 1;
+            }
+            if (same_file != 0 and same_file != candidates.items.len) {
+                var filtered: std.ArrayList(Candidate) = .empty;
+                for (candidates.items) |c| {
+                    const ds = smod.decl_span.get(c.fid.int()) orelse continue;
+                    if (ds.file.int() == sf.int()) filtered.append(allocator, c) catch {};
+                }
+                candidates.deinit(allocator);
+                candidates = filtered;
+            }
+        }
+    }
+
     // Unique-exact-arity pick — only when every supplied argument can
     // bind its parameter. An arity-exact candidate whose param types the
     // args definitely don't satisfy is inapplicable (kotlinc drops it),
@@ -10211,11 +10335,30 @@ pub fn callMemberNamedDeclared(self: *VmHost, allocator: Allocator, receiver: *c
     return callMemberNamedInner(self, allocator, receiver, name, args, arg_names, false, null, false, declared_recv);
 }
 
-fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names_in: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     // Receiver-function-typed property invoked as a call (see
     // `recvFnFieldInvoke` on the static ladder): the stored lambda runs
     // with the owning instance as its receiver.
     if (try recvFnFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+    // A member `invoke` whose only named arguments are plugin-synthetic
+    // (`$composer = c, $changed = n`): the names were emitted against a
+    // transformed closure's literal parameter names, but a memo-wrapped
+    // value is a ComposableLambdaImpl whose `invoke(composer, changed)`
+    // members use plain names, so the named binding can never match. The
+    // pair is appended in declaration order, so positional binding is
+    // exact — drop the synthetic names.
+    var arg_names = arg_names_in;
+    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke")) {
+        var any_synth = false;
+        var all_synth = true;
+        for (arg_names) |n| {
+            if (n) |nn| {
+                any_synth = true;
+                if (!std.mem.startsWith(u8, nn, "$")) all_synth = false;
+            }
+        }
+        if (any_synth and all_synth) arg_names = &.{};
+    }
     var any_named = false;
     for (arg_names) |n| {
         if (n != null) any_named = true;
@@ -10563,7 +10706,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
 fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) bool {
     {
         const one = [_]Func{f.*};
-        if (pickMethodOverload(self, &one, args) != null) return true;
+        if (pickMethodOverload(self, null, &one, args) != null) return true;
     }
     if (args.len == 0) return false;
     const last_arg = args[args.len - 1];
@@ -11311,7 +11454,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     if (std.mem.eql(u8, cf.name, name)) cands.append(allocator, cf.*) catch {};
                 }
                 if (cands.items.len != 0) {
-                    const chosen = pickMethodOverload(self, cands.items, args) orelse cands.items[0];
+                    const chosen = pickMethodOverload(self, m, cands.items, args) orelse cands.items[0];
                     found_fid = chosen.id;
                 }
                 break;

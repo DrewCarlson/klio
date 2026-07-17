@@ -575,6 +575,12 @@ pub const FuncBuilder = struct {
     /// is only set on some paths, so a non-trailing receiver-lambda argument
     /// (`f({ member() }, other)`) would otherwise stay an `it`-lambda.
     lambda_arg_arity: std.AutoHashMap(span_mod.Span, i16) = undefined,
+    /// The declared receiver-type head of a receiver-lambda ARGUMENT
+    /// (`block: T.() -> R`), keyed by the lambda literal's span. Recorded from
+    /// the resolved callee's parameter type so the lambda body owns `T` as its
+    /// extension receiver even when the call is deferred and no expected type
+    /// reaches `lowerLambda` (e.g. `validate { … }`).
+    lambda_arg_recv: std.AutoHashMap(span_mod.Span, []const u8) = undefined,
 
     /// Per-argument bitmask: bit `i` set means the lambda value-parameter `i`
     /// of the argument currently being lowered has a broad-collection declared
@@ -632,6 +638,7 @@ pub const FuncBuilder = struct {
             .type_param_names = StringSet.init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
+            .lambda_arg_recv = std.AutoHashMap(span_mod.Span, []const u8).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
@@ -680,6 +687,7 @@ pub const FuncBuilder = struct {
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
         self.lambda_arg_arity.deinit();
+        self.lambda_arg_recv.deinit();
         self.outer_names.deinit();
         self.capture_order.deinit(a);
         self.capture_regs.deinit();
@@ -1208,6 +1216,16 @@ pub const FuncBuilder = struct {
     /// The recorded expected arity for the lambda argument at `sp`, if any.
     pub fn lambdaArgArity(self: *const FuncBuilder, sp: span_mod.Span) ?i16 {
         return self.lambda_arg_arity.get(sp);
+    }
+
+    pub fn recordLambdaArgRecv(self: *FuncBuilder, sp: span_mod.Span, recv: []const u8) void {
+        self.lambda_arg_recv.put(sp, recv) catch {};
+    }
+
+    /// The declared receiver-type head for the receiver-lambda argument at
+    /// `sp`, if any.
+    pub fn lambdaArgRecv(self: *const FuncBuilder, sp: span_mod.Span) ?[]const u8 {
+        return self.lambda_arg_recv.get(sp);
     }
 
     pub fn setBodySpan(self: *FuncBuilder, sp: span_mod.Span) void {

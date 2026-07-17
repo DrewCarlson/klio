@@ -167,6 +167,7 @@ Run any program with:
 | `map_views.kt`             | Live `MutableMap` `keys`/`values`/`entries` views: `remove`/`removeAll`/`retainAll`/`clear` and `MutableEntry.setValue` write through to the map. |
 | `m6b_taste.kt`             | Exceptions, lambdas, scope functions, and the broad numeric/string/char intrinsic surface together. |
 | `finally_own_throw.kt`     | A throw or return raised inside a `finally` exits the region without re-running that finally (single-block and multi-block finallys, catch sees the finally's own exception). |
+| `local_ext_fn_receiver_overload.kt` | A bare call with an implicit receiver in scope (top-level extension body, receiver lambda, LOCAL extension function) binds the receiver's extension over a same-named plain top-level function. |
 | `jit_capture_cell_loop.kt` | A hot loop mutating `var`s captured by a nested lambda (boxed cells); output is identical with the loop JIT off or on. |
 | `mutable_iterator_remove.kt` | `MutableIterator.remove()` over a `MutableList` writes through to the source list. |
 | `jit_double_loop.kt`       | Hot `Double` arithmetic + comparison over a `DoubleArray` (loop JIT → SSE2); identical output JIT off or on, incl. NaN comparison semantics. |
