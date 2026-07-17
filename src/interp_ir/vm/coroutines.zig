@@ -1744,7 +1744,17 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
             if (g) |e| e.wake_at else null,
             value.frames.items.len,
         });
-        for (value.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+        for (value.frames.items) |*fr| {
+            var printed = false;
+            if (fr.module) |mm| {
+                if (mm.funcById(fr.func)) |f| {
+                    const loc = ir.eval.funcFirstLoc(f);
+                    std.debug.print(" #{d}({s}:{d})@{d}:{d}", .{ fr.func.int(), loc.path, loc.line, fr.block.int(), fr.inst_idx });
+                    printed = true;
+                }
+            }
+            if (!printed) std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+        }
         var seg = value.tails;
         while (seg) |t| : (seg = t.next) {
             std.debug.print(" |tail", .{});
