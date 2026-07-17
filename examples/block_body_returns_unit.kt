@@ -22,4 +22,16 @@ fun main() {
     println(a)
     println(b)
     println(c)
+    // The same rule holds for a LOCAL fun's block body — it lowers through
+    // the lambda path but keeps function semantics, while an expression
+    // body and a lambda literal keep their values.
+    fun localTail() {
+        42
+    }
+    fun localExpr() = 7
+    val d: Any = localTail()
+    println(d)
+    println(localExpr())
+    val lambdaKeepsValue = { 5 }
+    println(lambdaKeepsValue())
 }
