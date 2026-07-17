@@ -4540,6 +4540,47 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return r;
     }
 
+    // `collector.block()` — an EXPLICIT receiver invoking the enclosing
+    // class's RECEIVER-function-typed property (`SafeFlow.block: suspend
+    // FlowCollector.() -> Unit`): Kotlin runs the stored callable with the
+    // explicit value as its receiver. Without this arm the call dispatched
+    // as a member of the receiver and missed (`invoke` on NopCollector).
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        callee.Member.receiver.* != .This)
+    {
+        const mname0 = callee.Member.name.name;
+        const own_recv_fn = blk: {
+            if (b.resolve("this") == null) break :blk false;
+            var owner = b.ownerClass() orelse build.currentOwnerClass();
+            var hops: usize = 0;
+            while (owner) |o| : (hops += 1) {
+                if (hops > 32) break;
+                if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = mname0 }) != null) break :blk true;
+                owner = b.module.registry.enclosing_class.get(o);
+            }
+            break :blk false;
+        };
+        if (own_recv_fn) {
+            const recv_r = try lowerExpr(b, callee.Member.receiver);
+            const this_reg = b.resolve("this").?;
+            const cal = b.allocReg();
+            const fld = try b.module.internConst(b.allocator, .{ .String = mname0 });
+            try b.push(.{ .GetField = .{ .dst = cal, .receiver = this_reg, .field = fld } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = cal,
+                .receiver = recv_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
     // Inside an inline-extension splice, a bare call to a member of the
     // spliced extension's bound receiver (`receiveNullable(...)` inside a
     // spliced `ApplicationCall.receive`) is `this.member(...)` on that
