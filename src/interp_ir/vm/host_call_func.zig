@@ -142,25 +142,46 @@ fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayLis
 /// packed list. A `f(*arr)` spread (a lone `Array` already in the slot)
 /// passes through untouched.
 fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(Value)) Allocator.Error!std.ArrayList(Value) {
-    if (!lastIsVararg(func.params)) return args.*;
     const n_params = func.params.len;
-    const fixed = if (n_params == 0) 0 else n_params - 1;
-    if (args.items.len == n_params and args.items[args.items.len - 1] == .Array) {
+    // The vararg may sit before trailing fixed params (Kotlin allows it;
+    // `remember(vararg keys, calculation)` — and the compose plugin appends
+    // `$composer`/`$changed` after that). The vararg absorbs the middle
+    // positional args, leaving exactly the trailing fixed params' worth at
+    // the end.
+    var vararg_pos: ?usize = null;
+    for (func.params, 0..) |p, i| {
+        if (p.is_vararg) {
+            vararg_pos = i;
+            break;
+        }
+    }
+    const vp = vararg_pos orelse return args.*;
+    const tail_fixed = n_params - vp - 1;
+    // Already packed: an Array sits at the vararg slot of a slot-exact list.
+    if (args.items.len == n_params and args.items[vp] == .Array) {
         return args.*;
     }
+    // Underfilled before the trailing fixed params: leave for the defaults
+    // machinery (only reachable through named/defaulted shapes).
+    if (tail_fixed != 0 and args.items.len < vp + tail_fixed) return args.*;
+    const n_var = if (args.items.len > vp + tail_fixed) args.items.len - vp - tail_fixed else 0;
     var out: std.ArrayList(Value) = .empty;
     try out.ensureTotalCapacity(allocator, n_params);
     var i: usize = 0;
-    while (i < fixed and i < args.items.len) : (i += 1) {
+    while (i < vp and i < args.items.len) : (i += 1) {
         out.appendAssumeCapacity(args.items[i]);
     }
     var rest: std.ArrayList(Value) = .empty;
-    var j: usize = fixed;
-    while (j < args.items.len) : (j += 1) {
+    var j: usize = vp;
+    while (j < vp + n_var and j < args.items.len) : (j += 1) {
         try rest.append(allocator, args.items[j]);
     }
-    const velem = func.params[n_params - 1].ty.name;
+    const velem = func.params[vp].ty.name;
     try out.append(allocator, try packVarargArray(allocator, velem, rest));
+    j = vp + n_var;
+    while (j < args.items.len) : (j += 1) {
+        try out.append(allocator, args.items[j]);
+    }
     args.deinit(allocator);
     return out;
 }

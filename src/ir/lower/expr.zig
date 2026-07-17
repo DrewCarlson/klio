@@ -6796,7 +6796,30 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             imported_func_id = b.module.funcIdByFqn(alias_paths[0].fqn);
         }
     }
-    if (imported_func_id) |func_id| {
+    // The import may name a whole OVERLOAD SET (five `remember`s share one
+    // FQN): `funcIdByFqn` returns the first by declaration order, which can
+    // be arity-incompatible with this call — a 4-key `remember(a,b,c,d){..}`
+    // blind-bound the zero-key overload. A multi-overload FQN skips BOTH
+    // import-routing arms and falls to the full resolver, whose overload
+    // scoring ranks every sibling (vararg included) — and whose implicit-
+    // receiver dispatch keeps a bare `launch {}` on the scope extension
+    // instead of the qualified rewrite's non-extension guidance stub.
+    var imported_fqn_multi = false;
+    if (imported_func_id != null) {
+        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (alias_paths.len == 1) {
+            var fqn_overloads: usize = 0;
+            for (b.module.funcsBySimpleName(name0)) |cid| {
+                if (b.module.funcById(cid)) |cf| {
+                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) fqn_overloads += 1;
+                }
+            }
+            imported_fqn_multi = fqn_overloads > 1;
+        }
+    }
+    if (imported_func_id != null and imported_fqn_multi) {
+        // fall through to the generic resolution below (skip both arms)
+    } else if (imported_func_id) |func_id| {
         // An applicable extension on an in-scope implicit receiver outranks the
         // imported plain namesake: inside `validate { contact(c) }`
         // (`MockViewValidator.() -> Unit`), the imported `contact` FQN resolves
@@ -7794,6 +7817,13 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
+    if (runtime.getenvSlice("KLIO_EMIT_TRACE") != null) {
+        const c0 = call.callee;
+        if (c0.* == .Path and c0.Path.segments.len == 1 and std.mem.eql(u8, c0.Path.segments[0].name, "remember") and @intFromEnum(c0.Path.segments[0].span.file) == 0) {
+            std.debug.print("[emitCall] remember -> #{d} nargs={d}\n", .{ func_id.int(), call.args.len });
+            std.debug.dumpCurrentStackTrace(.{});
+        }
+    }
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
     defer _ = b.setCallTrailingLambda(prev_trailing);
     const args = call.args;

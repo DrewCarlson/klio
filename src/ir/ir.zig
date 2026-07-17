@@ -3014,7 +3014,53 @@ pub const Module = struct {
             }
             if (all_ext_zero_arity) return null;
         }
+        // No exact-arity candidate fit: a UNIQUE overload whose vararg
+        // absorbs the surplus is Kotlin's pick — a plugin-threaded
+        // `remember(k1..k4, calculation, $composer, $changed)` (7 args) can
+        // only be the `vararg keys` overload, never the first-declared
+        // zero-key one the plain fallback would blind-bind.
+        if (fallback != null and !fallback_fits) {
+            var only: ?FuncId = null;
+            var count: usize = 0;
+            for (self.funcsBySimpleName(name)) |fid| {
+                if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+                if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
+                if (!self.varargArityFits(fid, want)) continue;
+                only = fid;
+                count += 1;
+                if (count > 1) break;
+            }
+            if (count == 1) return only;
+        }
         return fallback;
+    }
+
+    /// Whether `id` declares a vararg and can absorb a `want`-argument call:
+    /// at least the required (non-defaulted, non-vararg) parameter count.
+    /// The exact-arity helpers deliberately exclude vararg candidates; this
+    /// is their positive complement for the no-exact-fit fallback.
+    fn varargArityFits(self: *const Module, id: FuncId, want: usize) bool {
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (!ds.has_body) return false;
+            if (!ds.arity.has_vararg) return false;
+            return want >= ds.arity.required;
+        }
+        const f = self.funcById(id) orelse return false;
+        if (!f.hasBody()) return false;
+        // Defaults live on ProgramImage, not here: count every non-vararg
+        // param as required. Conservative — a defaulted param only ever
+        // RAISES this bound, so a fit found here is always a real fit.
+        var has_vararg = false;
+        var required: usize = 0;
+        for (f.params, 0..) |p, i| {
+            if (i == 0 and std.mem.eql(u8, p.name, "this")) continue;
+            if (p.is_vararg) {
+                has_vararg = true;
+                continue;
+            }
+            required += 1;
+        }
+        return has_vararg and want >= required;
     }
 
     /// Index-refined target: the heuristic's ladder pick refined by the
