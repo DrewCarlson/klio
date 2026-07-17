@@ -1678,6 +1678,10 @@ pub fn resumeContinuation(
         const snap_module = snap.module;
         const m: *const Module = snap_module orelse module;
         const func = m.funcById(snap.func).?;
+        // KLIO_RESUME_TRACE: name every frame a resume drive re-runs — the
+        // instrument that finds a tail executing twice in one unwind.
+        if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null)
+            std.debug.print("[resume-frame] {s}#{d} at={d}:{d} throw={}\n", .{ func.name, func.id.int(), snap.block.int(), snap.inst_idx, pending_throw_from_inner != null });
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
         var caps: std.ArrayList(Value) = .empty;
