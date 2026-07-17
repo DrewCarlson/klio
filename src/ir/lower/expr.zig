@@ -6339,7 +6339,21 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// so overload resolution treats it as a `() -> R` handler.
 fn astArgLambdaArity(arg: *const Expr) ?u8 {
     return switch (arg.*) {
-        .Lambda => |l| if (l.implicit_it) @as(u8, 0) else @intCast(l.params.len),
+        .Lambda => |l| blk: {
+            if (l.implicit_it) break :blk @as(u8, 0);
+            // The compose plugin threads every composable lambda BEFORE
+            // lowering, appending `($composer, $changed)`. Those are not
+            // source params: overload selection must rank the literal by
+            // its DECLARED header, or the +2 shift binds `{ d -> }` to a
+            // 3-param overload (`movableContentOf`'s P3 form).
+            var n = l.params.len;
+            if (n >= 2 and std.mem.eql(u8, l.params[n - 1].name, "$changed") and
+                std.mem.eql(u8, l.params[n - 2].name, "$composer"))
+            {
+                n -= 2;
+            }
+            break :blk @intCast(n);
+        },
         .AnonFun => |af| @intCast(af.params.len),
         else => null,
     };
@@ -6360,6 +6374,7 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
         .is_spread = arg.* == .Spread,
         .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
         .lambda_arity = astArgLambdaArity(arg),
+        .lambda_is_literal = arg.* == .Lambda or arg.* == .AnonFun,
         .literal_kind = if (argEvidenceLitKind(b, arg)) |k| switch (k) {
             .numeric => .numeric,
             .string => .string,

@@ -2963,6 +2963,57 @@ pub const Module = struct {
         return applicability.applicable(&sv, args, .{}) != null;
     }
 
+    /// Among the exact-declared-arity, non-extension candidates, the one whose
+    /// `FunctionN`-headed parameters best fit the call's lambda LITERALS:
+    /// exact header-count match scores highest, a headerless literal (arity
+    /// 0) serving a 1-param type via implicit `it` just below. Null unless a
+    /// single candidate strictly wins with positive functional evidence, so
+    /// evidence-free calls keep the established fallback order.
+    fn fnArityBestPick(self: *const Module, name: []const u8, want_arity: u32, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
+        var any_literal = false;
+        for (args) |a| {
+            if (a.lambda_is_literal and a.lambda_arity != null) any_literal = true;
+        }
+        if (!any_literal) return null;
+        var best: ?FuncId = null;
+        var best_score: i32 = 0;
+        var tied = false;
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+            if (!self.isNonExtFid(fid)) continue;
+            if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
+            if (self.declArityOf(fid) != want_arity) continue;
+            const f = self.funcById(fid) orelse continue;
+            const sv = self.sigViewOf(fid, f) orelse continue;
+            if (sv.len() != args.len) continue;
+            var score: i32 = 0;
+            for (args, 0..) |a, i| {
+                if (!a.lambda_is_literal) continue;
+                const got = a.lambda_arity orelse continue;
+                const head = sv.at(i).name;
+                const hn = if (std.mem.lastIndexOfScalar(u8, head, '.')) |dot| head[dot + 1 ..] else head;
+                if (!std.mem.startsWith(u8, hn, "Function")) continue;
+                const want = std.fmt.parseInt(usize, hn["Function".len..], 10) catch continue;
+                if (got == want) {
+                    score += 3;
+                } else if (got == 0 and want == 1) {
+                    score += 2;
+                } else {
+                    score -= 1;
+                }
+            }
+            if (score > best_score) {
+                best = fid;
+                best_score = score;
+                tied = false;
+            } else if (score == best_score and best != null) {
+                tied = true;
+            }
+        }
+        if (tied) return null;
+        return best;
+    }
+
     fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
         // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
         // overload is not a source-level candidate (kotlinc hides it; it exists
@@ -2998,6 +3049,15 @@ pub const Module = struct {
                 }
             }
         }
+        // Same-name overloads that differ ONLY in a functional parameter's
+        // arity (`movableContentOf` takes `() -> Unit` … `(P1..P4) -> Unit`,
+        // all user arity 1): the order-based fallback blind-binds one, and
+        // `declSigCompatible` keeps every stub. When the call carries a
+        // LAMBDA LITERAL, rank the declared-arity candidates by how their
+        // `FunctionN` param heads fit the literal's header count and bind a
+        // strictly-best candidate. Ties (including no functional evidence)
+        // fall through to the established order.
+        if (self.fnArityBestPick(name, want_u32, args, ctx_owner)) |pick| return pick;
         if (fallback_fits) return fallback;
         for (self.funcsBySimpleName(name)) |fid| {
             if (self.funcById(fid)) |ff| if (ff.low_priority) continue;

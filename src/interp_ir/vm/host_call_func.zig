@@ -744,12 +744,34 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
     return pickOverload(self, module, func, args);
 }
 
+/// A closure's SOURCE-level param count: the compose plugin threads
+/// composable lambdas before lowering, appending `($composer, $changed)`.
+/// Overload selection must rank by the declared header, or the +2 shift
+/// binds a `{ d -> }` argument to a 3-param functional overload.
+pub fn closureUserParams(self: *VmHost, info: anytype) usize {
+    var n: usize = info.n_params;
+    if (n >= 2) {
+        const module_ref = self.module.clone();
+        defer module_ref.deinit();
+        const module = info.module orelse module_ref.asPtr();
+        if (module.funcById(info.body_func)) |bf| {
+            const p = bf.params;
+            if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                std.mem.eql(u8, p[p.len - 2].name, "$composer"))
+            {
+                n -= 2;
+            }
+        }
+    }
+    return n;
+}
+
 /// Build an `ArgShape` describing one runtime value for the shared applicability
 /// scorer. Named args are not threaded into the positional `pickOverload`
 /// path, so `named` stays null here.
 fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
     const arity: ?u8 = switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, info.n_params) else null,
+        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, closureUserParams(self, info)) else null,
         .Function => |f| std.math.cast(u8, f.decl.params.len),
         .Class => 0,
         else => null,

@@ -55,6 +55,14 @@ pub const ArgShape = struct {
     /// per-arg callable gate for callables that carry no `lambda_arity`.
     func_typed: bool = false,
 
+    /// The argument is a LAMBDA LITERAL at the call site (AST-time shape),
+    /// so `lambda_arity` is the literal's declared header count — reliable
+    /// for exact-arity overload ranking. Runtime closure shapes leave this
+    /// false: their `n_params` includes lowering-added params (receiver,
+    /// continuation, composer pair), where only the `want`/`want+1` parity
+    /// is sound.
+    lambda_is_literal: bool = false,
+
     /// Declared lambda parameter types when the caller can see them. Unused by
     /// the runtime path (the refine callback re-derives them from the value);
     /// carried for the eager caller of a later step.
@@ -609,6 +617,28 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
             const expected = nm["Function".len..];
             if (std.fmt.parseInt(usize, expected, 10)) |want| {
                 if (arg_arity) |got| {
+                    // A LAMBDA LITERAL's header count is authoritative: an
+                    // exact param-count match outranks the adapted shapes,
+                    // because same-name overloads often differ only in
+                    // their functional param's arity (`movableContentOf`
+                    // takes `() -> Unit` … `(P1..P4) -> Unit`) and scoring
+                    // `got == want + 1` level with `got == want` tied
+                    // every such call onto an arbitrary overload. A
+                    // headerless literal serving a 1-param type via
+                    // implicit `it` stays applicable just below. Runtime
+                    // closure shapes keep the flat parity — their param
+                    // count includes lowering-added params.
+                    if (arg.lambda_is_literal) {
+                        if (got == want) {
+                            const d = refineDelta(scope, param_ty, arg) orelse return null;
+                            return 92 + d;
+                        }
+                        if (got == want + 1 or (got == 0 and want == 1)) {
+                            const d = refineDelta(scope, param_ty, arg) orelse return null;
+                            return 90 + d;
+                        }
+                        return 20;
+                    }
                     if (got == want or got == want + 1) {
                         const d = refineDelta(scope, param_ty, arg) orelse return null;
                         return 90 + d;

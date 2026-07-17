@@ -2272,7 +2272,7 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
 /// gate), not the broader `valueIsCallable`.
 fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
     const arity: ?u8 = switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(@intCast(c.id))) |info| std.math.cast(u8, info.n_params) else null,
+        .IrClosure => |c| if (self.closures.get(@intCast(c.id))) |info| std.math.cast(u8, host_call_func.closureUserParams(self, info)) else null,
         else => null,
     };
     return .{
