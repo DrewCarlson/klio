@@ -1242,8 +1242,18 @@ const Walker = struct {
                         // Wrap only content that actually COMPOSES: the
                         // name-keyed sink also catches sibling overloads'
                         // plain trailing lambdas (ComposeNode's update),
-                        // whose wrapped invoke shape would not exist.
-                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) {
+                        // whose wrapped invoke shape would not exist. An
+                        // INLINE composable's lambda stays raw — kotlinc
+                        // splices it into the caller's group and never wraps
+                        // it; wrapping also re-parents the lambda under
+                        // `composableLambda(..)`, so its implicit label no
+                        // longer matches and a `return@InlineWrapper` inside
+                        // unwound non-locally past ComposableLambdaImpl.invoke,
+                        // leaving the root restart group open (the
+                        // conditional-return "Start/end imbalance" family).
+                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg) and
+                            !calleeInlinesLambda(name.?))
+                        {
                             w.wrapInComposableLambda(arg);
                             // The wrapped argument is no longer a lambda:
                             // bind it by the sink's last-parameter name so a
