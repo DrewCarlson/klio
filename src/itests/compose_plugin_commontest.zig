@@ -26,9 +26,10 @@ const runtime = @import("runtime");
 /// composables and the 480s per-child cap. The persisted-resume throw fix
 /// converted the 18-class hang family (926 measured); the typealias-receiver
 /// dispatch, event-loop actuals, pump mailbox-drain, and captured-counter
-/// fixes took it to 953. The floor leaves saturation headroom like the
-/// implicit suite's does.
-const BASELINE: usize = 940;
+/// fixes took it to 953; the movable-content chain and the validator-side
+/// sink-scope gate took it to 987. The floor leaves saturation headroom
+/// like the implicit suite's does.
+const BASELINE: usize = 970;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
