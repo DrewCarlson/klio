@@ -7878,6 +7878,33 @@ fn ancestorClosureFqns(self: *VmHost, allocator: Allocator, start_cid: ir.ClassI
     }
 }
 
+fn isOperatorConventionName(name: []const u8) bool {
+    const ops = [_][]const u8{ "plus", "minus", "times", "div", "rem", "get", "set", "contains", "rangeTo", "rangeUntil", "compareTo", "inc", "dec", "unaryPlus", "unaryMinus", "not", "invoke" };
+    for (ops) |o| {
+        if (std.mem.eql(u8, name, o)) return true;
+    }
+    return false;
+}
+
+fn staticIsInterface(mod: *const Module, cid: ir.ClassId) bool {
+    if (@intFromEnum(cid) >= mod.classes.items.len) return false;
+    return mod.classes.items[@intFromEnum(cid)].is_interface;
+}
+
+/// Whether the static receiver type's transitive member-name set contains
+/// `name`, via the build-time `hierarchy_methods` registry. No registry
+/// entry answers true, keeping the exclusion conservative.
+fn closureHasMethodNamed(mod: *const Module, start_cid: ir.ClassId, name: []const u8) bool {
+    // `Any`'s members are visible from every static type; the interface
+    // registry sets do not record them.
+    if (std.mem.eql(u8, name, "equals") or std.mem.eql(u8, name, "hashCode") or std.mem.eql(u8, name, "toString")) return true;
+    if (@intFromEnum(start_cid) >= mod.classes.items.len) return true;
+    const irc = mod.classes.items[@intFromEnum(start_cid)];
+    const hm = mod.registry.hierarchy_methods.get(irc.name) orelse
+        mod.registry.hierarchy_methods.get(simpleName(irc.fqn)) orelse return true;
+    return hm.contains(name);
+}
+
 /// Whether the static receiver type `start_cid` (or one of its supertypes)
 /// declares a method named `name` with exactly `tvc` OWN type parameters. A
 /// generic same-name method a runtime subtype introduces is a legitimate
@@ -8039,6 +8066,27 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             if (static_up_ready and !static_up.contains(irc.fqn)) {
                                 const tvc = funcTypeParamCount(self, f.id);
                                 if (tvc > 0 and !(try closureHasGenericMethod(self, allocator, static_cid, name, tvc))) continue;
+                                // A NON-generic member declared outside the static
+                                // type's closure is invisible when the static type is
+                                // an INTERFACE whose transitive member set lacks the
+                                // name: `this + dispatcher` on a CoroutineScope-typed
+                                // receiver must not bind the runtime coroutine's
+                                // inherited `CoroutineContext.Element.plus`; the
+                                // `CoroutineScope.plus` extension is Kotlin's target.
+                                // Interface-only: an interface's registry member set
+                                // is exact, so the exclusion cannot drop a legitimate
+                                // inherited member the set fails to record.
+                                // Operator-convention names only: klio has no
+                                // smart-cast narrowing, so a general exclusion
+                                // loops when an extension's body re-calls the
+                                // member under an `is` check (`Continuation.
+                                // resumeCancellableWith` -> DispatchedContinuation
+                                // member). Operators do not take that shape, and
+                                // they are where the static-type divergence bites
+                                // (`this + dispatcher` on CoroutineScope).
+                                if (tvc == 0 and isOperatorConventionName(name) and
+                                    staticIsInterface(mod, static_cid) and
+                                    !closureHasMethodNamed(mod, static_cid, name)) continue;
                             }
                             try candidates.append(allocator, f);
                         }

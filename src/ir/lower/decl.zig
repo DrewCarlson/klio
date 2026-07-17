@@ -509,6 +509,7 @@ pub fn lowerClassWithExtras(
         .supertypes = &.{},
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
+        .is_interface = c.is_interface,
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`

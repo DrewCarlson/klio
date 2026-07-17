@@ -973,6 +973,10 @@ pub const Class = struct {
     /// is therefore never construction; it must resolve to a same-named
     /// factory function, so bare-call lowering must not treat it as a ctor.
     is_abstract: bool = false,
+    /// `interface` specifically: its member set is exactly its declared
+    /// (+ inherited) AST members, so a static-receiver walk can trust the
+    /// registry's transitive method-name set for visibility decisions.
+    is_interface: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;

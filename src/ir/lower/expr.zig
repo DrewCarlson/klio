@@ -3430,6 +3430,39 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
                 recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
             }
+        } else if (args.len != 0 and (args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) {
+            // Ambiguous name, no receiver disambiguation: when EVERY overload
+            // declares the SAME receiver head for its trailing function-typed
+            // parameter (`runTest`'s block is `TestScope.() -> Unit` in every
+            // overload), that head is safe to record — `this + dispatcher`
+            // inside the lambda then dispatches against the static type.
+            if (b.module.func_name_index.get(cnm)) |ids| {
+                var common: ?[]const u8 = null;
+                var ok = ids.items.len >= 2;
+                for (ids.items) |fid2| {
+                    const f2 = b.module.funcById(fid2) orelse {
+                        ok = false;
+                        break;
+                    };
+                    if (f2.params.len == 0) {
+                        ok = false;
+                        break;
+                    }
+                    const rh = fnTypeReceiverHead(b, f2.params[f2.params.len - 1].ty) orelse {
+                        ok = false;
+                        break;
+                    };
+                    if (common) |c0| {
+                        if (!std.mem.eql(u8, c0, rh)) {
+                            ok = false;
+                            break;
+                        }
+                    } else common = rh;
+                }
+                if (ok) {
+                    if (common) |rh| b.recordLambdaArgRecv(args[args.len - 1].span(), rh);
+                }
+            }
         }
     }
 
