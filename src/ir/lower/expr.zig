@@ -2277,14 +2277,24 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // (`T.() -> R`) rebinds the implicit `this` to `T`, otherwise a plain
     // block captures the enclosing `this`. Carried into the body so a bare
     // call there can still disambiguate a receiver-lambda argument's arity.
+    // A receiver-lambda ARGUMENT whose receiver type the resolved callee made
+    // concrete (recorded by `recordLambdaArgReceivers`) — reached when the
+    // call is deferred so no expected type carries the receiver to lowerLambda.
+    const recorded_recv: ?[]const u8 = b.lambdaArgRecv(expr.span());
     b.module.pending_lambda_enclosing_recv = blk: {
         if (b.peekExpected()) |exp| {
             if (exp.function) |ft| {
                 if (ft.receiver) |r| break :blk r.name.name;
             }
         }
+        if (recorded_recv) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
     };
+    // The body owns that receiver as its extension receiver, so a bare call
+    // there prefers an extension on it over a same-file plain namesake —
+    // `validate { contact(c) }` binds `MockViewValidator.contact`, not the
+    // same-file `@Composable contact`.
+    if (recorded_recv) |rr| b.module.pending_lambda_own_recv = rr;
     // Carry the enclosing non-reified type-parameter names so an `x as T`
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
@@ -2712,6 +2722,62 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
         return null;
     }
     return out;
+}
+
+/// The declared receiver-type head of a receiver-lambda parameter type
+/// (`MockViewValidator.() -> Unit`), or null when the type is not a direct
+/// receiver function. The lowered encoding is
+/// `[#suspend?] [receiver?] params(n) ret(1) [#markers]`; a receiver is present
+/// when the non-marker, non-suspend arg count is `n + 2`.
+fn fnTypeReceiverHead(b: *FuncBuilder, ty: ir.TypeRef) ?[]const u8 {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    const arity = fnTypeArityAlias(b, ty) orelse return null;
+    const n: usize = if (arity < 0) 0 else @intCast(arity);
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    const remaining = hi - lo; // [receiver?] params(n) ret(1)
+    if (remaining == n + 2 and lo < hi) {
+        const head = ty.args[lo].name;
+        if (head.len != 0 and head[0] != '#') return head;
+    }
+    return null;
+}
+
+/// Record the receiver-type head of each receiver-lambda ARGUMENT so its body
+/// owns that receiver even when the call is deferred and no expected type
+/// reaches `lowerLambda`. Mirrors `argFnArities`' arg→param alignment.
+fn recordLambdaArgReceivers(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) void {
+    if (args.len == 0 or func.params.len < recv_offset) return;
+    for (args) |*a| if (a.* == .Spread) return;
+    const params = func.params[recv_offset..];
+    if (anyNamedArg(arg_names)) {
+        const map = (mapArgsToParams(b, params, args, arg_names) catch return) orelse return;
+        defer b.allocator.free(map);
+        for (args, map) |*a, m| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            if (m) |pi| if (pi < params.len) {
+                if (fnTypeReceiverHead(b, params[pi].ty)) |rh| b.recordLambdaArgRecv(a.span(), rh);
+            };
+        }
+        return;
+    }
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    if (trailing_lambda and args.len <= params.len) {
+        var i: usize = 0;
+        while (i + 1 < args.len) : (i += 1) {
+            if ((args[i] == .Lambda or args[i] == .AnonFun)) {
+                if (fnTypeReceiverHead(b, params[i].ty)) |rh| b.recordLambdaArgRecv(args[i].span(), rh);
+            }
+        }
+        if (fnTypeReceiverHead(b, params[params.len - 1].ty)) |rh| b.recordLambdaArgRecv(args[args.len - 1].span(), rh);
+    } else if (args.len == params.len) {
+        for (args, params) |*a, p| {
+            if (a.* != .Lambda and a.* != .AnonFun) continue;
+            if (fnTypeReceiverHead(b, p.ty)) |rh| b.recordLambdaArgRecv(a.span(), rh);
+        }
+    }
 }
 
 /// A bitmask of which of a `FunctionN`-typed parameter's `arity` value
@@ -3323,6 +3389,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                     }
                 }
+                recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
             }
         }
     }
@@ -6730,7 +6797,14 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         }
     }
     if (imported_func_id) |func_id| {
-        if (!shadowed_by_class) {
+        // An applicable extension on an in-scope implicit receiver outranks the
+        // imported plain namesake: inside `validate { contact(c) }`
+        // (`MockViewValidator.() -> Unit`), the imported `contact` FQN resolves
+        // to the `@Composable contact`, but the receiver's
+        // `MockViewValidator.contact` extension must win (Kotlin resolves the
+        // implicit-receiver candidate group first). Defer to the member/
+        // extension dispatch below when such an extension applies.
+        if (!shadowed_by_class and !extOnEnclosingReceiverApplies(b, name0, args.len)) {
             const needs_this = blk: {
                 if (b.module.funcById(func_id)) |f| {
                     break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
