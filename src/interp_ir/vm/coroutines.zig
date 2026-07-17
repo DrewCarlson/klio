@@ -1739,11 +1739,22 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
     const tok = try pump.interceptSuspend(value, delta);
     if (pumpDiagEnabled()) {
         const g = pump.parked.getPtr(tok);
-        std.debug.print("[tok] park tok={d} wake={?d} frames={d}\n", .{
+        std.debug.print("[tok] park tok={d} wake={?d} frames={d}:", .{
             tok,
             if (g) |e| e.wake_at else null,
             value.frames.items.len,
         });
+        for (value.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+        var seg = value.tails;
+        while (seg) |t| : (seg = t.next) {
+            std.debug.print(" |tail", .{});
+            var i = t.head;
+            while (i < t.frames.items.len) : (i += 1) {
+                const fr = &t.frames.items[i];
+                std.debug.print(" #{d}@{d}:{d}", .{ fr.func.int(), fr.block.int(), fr.inst_idx });
+            }
+        }
+        std.debug.print("\n", .{});
     }
     return tok;
 }
