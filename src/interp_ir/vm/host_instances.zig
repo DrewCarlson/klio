@@ -1014,7 +1014,13 @@ fn runInitBlocksAt(
     const fids: []const FuncId = blk: {
         const g = self.prog.borrow();
         defer g.deinit();
-        break :blk g.get().init_blocks.get(sideTableKey(cls_fqn, cls_name)) orelse return .{ .ok = {} };
+        break :blk g.get().init_blocks.get(sideTableKey(cls_fqn, cls_name)) orelse {
+            // A runtime-registered local class has no build-time side-table
+            // entry; its init blocks lowered as `$init$block$<idx>` anon
+            // thunks at registration (with the enclosing scope's captured
+            // cells bound). Run the ones due at this property position.
+            return runAnonInitBlocksAt(self, cls, cls_name, before_prop_idx, inst_value);
+        };
     };
     var cls_args: []const Value = fallback_args;
     for (chain) |*c| {
@@ -1050,6 +1056,50 @@ fn runInitBlocksAt(
                     .err => |e| return .{ .err = e },
                 }
             },
+        }
+    }
+    return .{ .ok = {} };
+}
+
+/// Run a runtime-registered local class's `$init$block$<idx>` anon thunks
+/// whose declaration position matches `before_prop_idx`. The ClassDef's
+/// `init_block_property_positions` (filled by `synthLocalClassDef`) carries
+/// each block's body-property index; a block declared after every property
+/// has position == body_properties.len, matching the terminal call.
+pub fn runAnonInitBlocksAt(
+    self: *VmHost,
+    cls: ObjRef(ClassDef),
+    cls_name: []const u8,
+    before_prop_idx: usize,
+    inst_value: *const Value,
+) Allocator.Error!UnitOrErr {
+    const allocator = self.allocator;
+    const n_blocks = blk: {
+        const g = cls.borrow();
+        defer g.deinit();
+        break :blk g.get().init_block_property_positions.len;
+    };
+    if (n_blocks == 0) return .{ .ok = {} };
+    for (0..n_blocks) |idx| {
+        const pos = blk: {
+            const g = cls.borrow();
+            defer g.deinit();
+            break :blk g.get().init_block_property_positions[idx];
+        };
+        if (pos != before_prop_idx) continue;
+        const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
+        defer allocator.free(nm);
+        const has = blk: {
+            const key = try anonKey(allocator, cls_name, nm);
+            defer allocator.free(key);
+            const ag = self.anon_methods.borrow();
+            defer ag.deinit();
+            break :blk ag.get().contains(key);
+        };
+        if (!has) continue;
+        switch (try host_call_member.callMember(self, allocator, inst_value, nm, &.{})) {
+            .ok => {},
+            .err => |e| return .{ .err = e },
         }
     }
     return .{ .ok = {} };

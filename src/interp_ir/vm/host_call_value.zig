@@ -333,31 +333,54 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             .native_state = null,
         });
         const inst_value: Value = .{ .Instance = inst };
-        {
+        // Interleave `init { … }` blocks (lowered as `$init$block$<idx>` anon
+        // thunks at registration, with the enclosing scope's captured cells
+        // bound) with the complex property initializers in declaration order.
+        const n_props = blk: {
             const g = cls.borrow();
             defer g.deinit();
-            for (g.get().body_properties) |p| {
-                const init_field = p.init orelse continue;
-                if (simpleLiteral(allocator, init_field.get()) != null) continue;
-                const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name});
-                defer allocator.free(init_name);
-                const has = blk: {
-                    const key = try std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ cls_name, init_name });
-                    defer allocator.free(key);
-                    const ag = self.anon_methods.borrow();
-                    defer ag.deinit();
-                    break :blk ag.get().contains(key);
-                };
-                if (!has) continue;
-                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
-                    .ok => |rv| {
-                        const ig = inst.borrowMut();
-                        defer ig.deinit();
-                        _ = ig.get().set(p.name, rv);
-                    },
-                    .err => |e| return .{ .err = e },
-                }
+            break :blk g.get().body_properties.len;
+        };
+        var prop_idx: usize = 0;
+        while (prop_idx < n_props) : (prop_idx += 1) {
+            switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, prop_idx, &inst_value)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
             }
+            const pname: []const u8 = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().body_properties[prop_idx].name;
+            };
+            const complex = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                const init_field = g.get().body_properties[prop_idx].init orelse break :blk false;
+                break :blk simpleLiteral(allocator, init_field.get()) == null;
+            };
+            if (!complex) continue;
+            const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{pname});
+            defer allocator.free(init_name);
+            const has = blk: {
+                const key = try std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ cls_name, init_name });
+                defer allocator.free(key);
+                const ag = self.anon_methods.borrow();
+                defer ag.deinit();
+                break :blk ag.get().contains(key);
+            };
+            if (!has) continue;
+            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                .ok => |rv| {
+                    const ig = inst.borrowMut();
+                    defer ig.deinit();
+                    _ = ig.get().set(pname, rv);
+                },
+                .err => |e| return .{ .err = e },
+            }
+        }
+        switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, n_props, &inst_value)) {
+            .ok => {},
+            .err => |e| return .{ .err = e },
         }
         return .{ .ok = inst_value };
     }
