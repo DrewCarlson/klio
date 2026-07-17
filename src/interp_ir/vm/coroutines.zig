@@ -337,6 +337,15 @@ const PersistedParked = struct {
         if (pumpDiagEnabled()) {
             std.debug.print("[tok] persist slot={d} frames={d}:", .{ slot, state.frames.items.len });
             for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            var seg = state.tails;
+            while (seg) |t| : (seg = t.next) {
+                std.debug.print(" |tail", .{});
+                var i = t.head;
+                while (i < t.frames.items.len) : (i += 1) {
+                    const fr2 = &t.frames.items[i];
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                }
+            }
             std.debug.print("\n", .{});
         }
         mutex.lock();
@@ -870,6 +879,15 @@ pub const CooperativeInterceptor = struct {
         if (pumpDiagEnabled()) {
             std.debug.print("[tok] adopt tok={d} frames={d}:", .{ token, state.frames.items.len });
             for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            var seg = state.tails;
+            while (seg) |t| : (seg = t.next) {
+                std.debug.print(" |tail", .{});
+                var i = t.head;
+                while (i < t.frames.items.len) : (i += 1) {
+                    const fr2 = &t.frames.items[i];
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                }
+            }
             std.debug.print("\n", .{});
         }
         try self.parked.put(token, .{ .state = state, .wake_at = INDEFINITE, .scope_delta = scope_delta });
