@@ -40,6 +40,15 @@ const Decl = ast.Decl;
 
 const dbg_lambda = false;
 
+/// Composable-lambda memoization emission (KLIO_COMPOSE_MEMO=0 disables,
+/// an A/B bisection switch like KLIO_COMPOSE_SKIP). ON by default: kotlinc
+/// always wraps composable lambda arguments in remembered
+/// `composableLambda` instances — without it an unchanged content lambda
+/// is a fresh closure every recomposition, `composer.changed(content)` is
+/// always true, and a forced recomposition of unchanged content reports
+/// spurious changes (the expectNoChanges family).
+pub var emit_lambda_memo: bool = true;
+
 /// Group-emission debug (set by the build driver from KLIO_COMPOSE_DBG).
 pub var dbg_groups: bool = false;
 
@@ -70,6 +79,12 @@ const default_marker_path = [_][]const u8{ "androidx", "compose", "runtime", "kl
 /// composer argument of threaded calls) with this call; the interpreter keeps
 /// the stack populated around every transformed-composable invocation.
 const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "__compose_currentComposer" };
+
+/// `androidx.compose.runtime.internal.composableLambda(composer, key, tracked,
+/// block)` — the remembered composable-lambda wrapper kotlinc emits around
+/// every composable lambda argument, so an unchanged content lambda compares
+/// EQUAL across recompositions and its group skips.
+const composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambda" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -295,6 +310,60 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// `MovableContent({ content() })` invokes its content with the movable
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
+
+/// Per-sink bitmask of the TOTAL param counts of overloads whose LAST param
+/// is the composable lambda (bit n set = an n-param overload exists). A
+/// name-keyed sink cannot distinguish `ComposeNode(factory, update)` from
+/// `ComposeNode(factory, update, content)`; without this the 2-arg call's
+/// trailing UPDATE lambda was transformed (and under the memo emission,
+/// wrapped) as composable.
+pub var active_sink_argcounts: ?*const std.StringHashMap(u64) = null;
+
+/// Collect `sink name -> arg-count bitmask` (see active_sink_argcounts).
+pub fn collectComposableSinkArgCounts(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(u64) {
+    var set = std.StringHashMap(u64).init(a);
+    try collectSinkArgCountsInto(&set, decls);
+    return set;
+}
+
+fn noteSinkArgCount(set: *std.StringHashMap(u64), name: []const u8, n_params: usize) std.mem.Allocator.Error!void {
+    if (n_params >= 64) return;
+    const gop = try set.getOrPut(name);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* |= @as(u64, 1) << @intCast(n_params);
+}
+
+fn collectSinkArgCountsInto(set: *std.StringHashMap(u64), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (f.params.len != 0 and isComposableLambdaParam(&f.params[f.params.len - 1])) {
+                // Defaulted middle params permit shorter calls: every count
+                // from the required minimum up to the full list matches.
+                var required: usize = 0;
+                for (f.params) |*p| {
+                    if (p.default == null) required += 1;
+                }
+                var n = required;
+                if (n == 0) n = 1;
+                while (n <= f.params.len) : (n += 1) try noteSinkArgCount(set, f.name.name, n);
+            }
+        },
+        .Class => |*c| {
+            if (c.primary_params.len != 0) {
+                const lp = &c.primary_params[c.primary_params.len - 1];
+                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
+                    try noteSinkArgCount(set, c.name.name, c.primary_params.len);
+                }
+            }
+            try collectSinkArgCountsInto(set, c.members);
+        },
+        .Object => |*o| try collectSinkArgCountsInto(set, o.members),
+        else => {},
+    };
+}
 
 /// Names of class PROPERTIES declared with a `@Composable` function type
 /// (`MovableContent.content`). An explicit-receiver invoke of one
@@ -837,6 +906,13 @@ const Walker = struct {
     /// threaded (`Composition(applier, parent)` is the non-composable
     /// factory).
     locals: ?*std.StringHashMap(void) = null,
+    /// Scoped names of VALS holding composable lambdas (factory-initialized
+    /// or declared with a @Composable fn type). Their bare calls are VALUE
+    /// invocations: the pair passes POSITIONALLY (a wrapped
+    /// ComposableLambdaImpl declares `invoke(c, changed)` — named
+    /// `$composer=`/`$changed=` args cannot bind it). Function calls keep
+    /// the named pair for the defaulted-marker machinery.
+    composable_vals: ?*std.StringHashMap(void) = null,
     /// Ambient mode: the scope is a `@Composable` property GETTER, which has
     /// no `$composer` param. Composer references resolve through the
     /// `__compose_currentComposer` host intrinsic instead.
@@ -907,12 +983,22 @@ const Walker = struct {
                     break :blk af.contains(segs[segs.len - 1].name);
                 };
                 if (holds_composable) {
+                    // The name joins BOTH sets: `locals` feeds every
+                    // established consumer (nested transforms, branch
+                    // scans); `composable_vals` only decides the
+                    // positional pair under the memo emission.
                     if (w.locals == null) {
-                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
-                        set.* = std.StringHashMap(void).init(w.a);
-                        w.locals = set;
+                        const lset = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                        lset.* = std.StringHashMap(void).init(w.a);
+                        w.locals = lset;
                     }
                     try w.locals.?.put(p.name.name, {});
+                    if (w.composable_vals == null) {
+                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                        set.* = std.StringHashMap(void).init(w.a);
+                        w.composable_vals = set;
+                    }
+                    try w.composable_vals.?.put(p.name.name, {});
                 }
             },
             .Function => |*f| {
@@ -957,6 +1043,22 @@ const Walker = struct {
         }
     }
 
+    /// Replace a just-transformed composable lambda ARGUMENT with
+    /// `composableLambda($composer, <span key>, true, <lambda>)` — the
+    /// remembered instance the engine slots, so `composer.changed(content)`
+    /// is false when the content is unchanged and the child group SKIPS.
+    /// Threaded scope only ($composer must be in scope); entry-point sinks
+    /// in plain scope stay raw (invokeComposable wraps the root itself).
+    fn wrapInComposableLambda(w: *Walker, arg: *Expr) void {
+        const key = positionalKey(exprSpanOf(arg));
+        const args = w.a.alloc(Expr, 4) catch @panic("oom");
+        args[0] = w.composerRef();
+        args[1] = w.b.intLit(key);
+        args[2] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        args[3] = arg.*;
+        arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_path), args);
+    }
+
     /// Whether a branch contains a call the pass considers composable
     /// (oracle name, scoped local, composable lambda param, or sink) —
     /// the gate for the per-branch replace groups: kotlinc brackets only
@@ -968,8 +1070,9 @@ const Walker = struct {
                 if (calleeSimpleName(c.callee)) |nm| {
                     const is_lp = w.lambda_params != null and w.lambda_params.?.contains(nm);
                     const is_local = w.locals != null and w.locals.?.contains(nm);
+                    const is_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
                     const is_sink = w.sinks != null and w.sinks.?.contains(nm);
-                    if (is_lp or is_local or is_sink or w.oracle(w.oracle_ctx, nm)) return true;
+                    if (is_lp or is_local or is_val or is_sink or w.oracle(w.oracle_ctx, nm)) return true;
                 }
                 if (w.branchHasComposable(c.callee)) return true;
                 for (c.args) |*a| if (w.branchHasComposable(a)) return true;
@@ -1057,6 +1160,11 @@ const Walker = struct {
                     if (sink_last and i == c.args.len - 1) {
                         const exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
                         try w.transformComposableLambda(&arg.Lambda, exp);
+                        // Wrap only content that actually COMPOSES: the
+                        // name-keyed sink also catches sibling overloads'
+                        // plain trailing lambdas (ComposeNode's update),
+                        // whose wrapped invoke shape would not exist.
+                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg)) w.wrapInComposableLambda(arg);
                     } else {
                         try w.walkExpr(arg);
                     }
@@ -1065,11 +1173,25 @@ const Walker = struct {
                     if (name) |nm| {
                         const is_lambda_param = w.lambda_params != null and w.lambda_params.?.contains(nm);
                         const is_local_composable = w.locals != null and w.locals.?.contains(nm);
+                        const is_composable_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
                         // An explicit-receiver invoke of a `@Composable`-typed
                         // property (`content.content(parameter)`).
                         const is_composable_prop = c.callee.* == .Member and
                             active_composable_props != null and active_composable_props.?.contains(nm);
-                        if (is_lambda_param or is_local_composable or is_composable_prop or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c);
+                        // VALUE invocations take the pair positionally —
+                        // only under the memoization emission (a wrapped
+                        // ComposableLambdaImpl cannot bind the named pair);
+                        // unwrapped closures keep the named pair, the
+                        // established shape.
+                        // Positional pair ONLY where the value can be a
+                        // memo-wrapped ComposableLambdaImpl: sink-arg
+                        // lambdas reach lambda params and composable
+                        // props. A composable VAL (movableContentOf's
+                        // returned wrapper) holds an unwrapped closure
+                        // with literal `$composer`/`$changed` params — it
+                        // keeps the named pair.
+                        const positional = emit_lambda_memo and (is_lambda_param or is_composable_prop);
+                        if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
                     }
                 }
             },
@@ -1203,20 +1325,36 @@ const Walker = struct {
     /// `Test($composer, 0)`), and a positional append would bind the composer
     /// into the first omitted param. Named, the binder slots the pair exactly
     /// and the omitted params take their defaults.
-    fn threadCall(w: *Walker, c: anytype) std.mem.Allocator.Error!void {
+    fn threadCall(w: *Walker, c: anytype, positional: bool) std.mem.Allocator.Error!void {
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
         new_args[c.args.len] = w.composerRef();
         new_args[c.args.len + 1] = w.b.intLit(0);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
-        new_names[c.args.len] = composer_param;
-        new_names[c.args.len + 1] = changed_param;
+        if (!positional) {
+            new_names[c.args.len] = composer_param;
+            new_names[c.args.len + 1] = changed_param;
+        } else {
+            new_names[c.args.len] = null;
+            new_names[c.args.len + 1] = null;
+        }
         c.args = new_args;
         c.arg_names = new_names;
         c.has_trailing_lambda = false;
     }
 };
+
+/// The span of an expression, for the memoization key. Falls back to a
+/// zero span when the node form carries none the pass knows about.
+fn exprSpanOf(e: *const Expr) Span {
+    return switch (e.*) {
+        .Lambda => |l| l.span,
+        .Call => |c| exprSpanOf(c.callee),
+        .Path => |pp| if (pp.segments.len != 0) pp.segments[0].span else Span.init(span_mod.FileId.from(0), 0, 0),
+        else => Span.init(span_mod.FileId.from(0), 0, 0),
+    };
+}
 
 /// Whether `e` denotes `currentComposer` — a bare path or a trailing member
 /// segment of that name.
@@ -1381,7 +1519,13 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     // The Column call sits inside the skip-if's then-block.
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
-    const lam = col.args[0].Lambda;
+    // The sink lambda is memoized — wrapped in
+    // `composableLambda($composer, key, true, <lambda>)` with the lambda last.
+    const memo = col.args[0].Call;
+    const memo_path = memo.callee.Path;
+    try testing.expectEqualStrings("composableLambda", memo_path.segments[memo_path.segments.len - 1].name);
+    try testing.expectEqual(@as(usize, 4), memo.args.len);
+    const lam = memo.args[3].Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
     // ($composer, $changed), not appended after.
     try testing.expectEqual(@as(usize, 2), lam.params.len);

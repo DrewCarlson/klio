@@ -455,6 +455,9 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         if (runtime.getenvSlice("KLIO_COMPOSE_SKIP")) |v| {
             compose_pass.emit_skip_calculus = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
+        if (runtime.getenvSlice("KLIO_COMPOSE_MEMO")) |v| {
+            compose_pass.emit_lambda_memo = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
@@ -465,12 +468,15 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer sink_arity.deinit();
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
+        var sink_counts = try compose_pass.collectComposableSinkArgCounts(allocator, decls.items);
+        defer sink_counts.deinit();
         if (base) |bsp| {
             try composeBaseNames(&names, bsp);
             try composeBaseSinks(&sinks, bsp);
             try composeBaseFactories(&factories, bsp);
             try composeBaseSinkArity(&sink_arity, bsp);
             try composeBaseComposableProps(&comp_props, bsp);
+            try composeBaseSinkArgCounts(&sink_counts, bsp);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -482,6 +488,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
+        compose_pass.active_sink_argcounts = &sink_counts;
+        defer compose_pass.active_sink_argcounts = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
@@ -4044,6 +4052,47 @@ fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const Stdlib
 
 fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) Allocator.Error!void {
     for (base.lifted_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+}
+
+fn composeBaseSinkArgCounts(counts: *std.StringHashMap(u64), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| try composeBaseSinkArgCountDecl(counts, d);
+}
+
+fn composeBaseSinkArgCountDecl(counts: *std.StringHashMap(u64), d: *const Decl) Allocator.Error!void {
+    switch (d.*) {
+        .Function => |*f| {
+            if (f.params.len != 0) {
+                const lp = &f.params[f.params.len - 1];
+                if (lp.ty.function != null and compose_pass.isComposable(lp.ty.annotations)) {
+                    if (f.params.len < 64) {
+                        var required: usize = 0;
+                        for (f.params) |*p| {
+                            if (p.default == null) required += 1;
+                        }
+                        var n = if (required == 0) 1 else required;
+                        const gop = try counts.getOrPut(f.name.name);
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        while (n <= f.params.len) : (n += 1) {
+                            gop.value_ptr.* |= @as(u64, 1) << @intCast(n);
+                        }
+                    }
+                }
+            }
+        },
+        .Class => |*c| {
+            if (c.primary_params.len != 0) {
+                const lp = &c.primary_params[c.primary_params.len - 1];
+                if (lp.ty.function != null and compose_pass.isComposable(lp.ty.annotations) and c.primary_params.len < 64) {
+                    const gop = try counts.getOrPut(c.name.name);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* |= @as(u64, 1) << @intCast(c.primary_params.len);
+                }
+            }
+            for (c.members) |*m| try composeBaseSinkArgCountDecl(counts, m);
+        },
+        .Object => |*o| for (o.members) |*m| try composeBaseSinkArgCountDecl(counts, m),
+        else => {},
+    }
 }
 
 fn composeBaseComposableProps(props: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
