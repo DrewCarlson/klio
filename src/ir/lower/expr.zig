@@ -4523,19 +4523,35 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
                 (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
             if (binds_this) {
+                // Pinning the dispatch to the innermost bound `this` is only
+                // sound when the receiver evidence proves that value serves
+                // the member (`member_of_recv`, an extension on the proven
+                // chain). The `hasOwnMember` leg names a member of the
+                // lexically enclosing CLASS — inside a receiver lambda whose
+                // receiver does not own the member (a `(Long) -> R` frame
+                // callback created in a `CoroutineScope.()` block, calling a
+                // Recomposer private), the bound `this` is the scope receiver
+                // and the owner sits further out; a lazily lowered pack body
+                // has no receiver-type context to tell the cases apart. Emit
+                // the receiver-walking form for that leg: the walk tries the
+                // bound receiver's members first (identical to the pin when
+                // `this` IS the owner), then each enclosing receiver.
                 if (b.resolve("this")) |bound_this| {
                     const run = try lowerArgRun(b, args);
                     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const dst = b.allocReg();
                     const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                    try b.push(.{ .CallMember = .{
+                    orEmitAudit(b, "inline_splice_recv_walk", "CallMemberOrGlobal", nm);
+                    try b.push(.{ .CallMemberOrGlobal = .{
                         .dst = dst,
-                        .receiver = bound_this,
+                        .this_idx = 0,
                         .name = nmc,
                         .trailing_lambda = b.callTrailingLambda(),
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
+                        .recv = bound_this,
+                        .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
                 }

@@ -2188,6 +2188,27 @@ ir.eval.resume_route = "pump-ready";
         if (!persist and root_token.* != null) {
             idle_rounds += 1;
             if (idle_rounds == 3000) diagStalledPump(coroTop().?, root_token.*);
+            // Deadlock breaker: an activation belonging to an OUTER pump that
+            // failed during an inline resume leaves its error stashed on that
+            // pump (`resumeInlineOnce`), whose own loop is frozen beneath this
+            // one — its coroutine never completes, so every awaiter up here
+            // parks forever and this loop idles above a recorded failure.
+            // After a grace period of total idleness, surface the stashed
+            // error instead of sleeping indefinitely; a cross-thread resume
+            // arriving within the grace period keeps the normal path, and an
+            // outer pump that regains control raises its own stash first.
+            if (idle_rounds >= 3000) {
+                var pi: usize = coro_stack.items.len;
+                while (pi > 1) {
+                    pi -= 1;
+                    const outer = &coro_stack.items[pi - 1];
+                    if (outer.pending_err) |pe| {
+                        outer.pending_err = null;
+                        try pumpExit(self, out, persist);
+                        return .{ .err = mapDriverErr(a, pe) };
+                    }
+                }
+            }
             countSleep(.root_parked);
             sleepMillis(1);
             continue;
@@ -2215,6 +2236,22 @@ fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!
         const saved = try (coroTop().?).drainIndefiniteParked(a);
         defer a.free(saved);
         for (saved) |s| try PersistedParked.put(s.slot, s.state, s.scope_delta);
+    }
+    // A stashed inline-resume failure this pump never got to raise (its exit
+    // path skipped the loop-head check) must not die with it: hand it to the
+    // pump below, whose loop-head raises it. Dropping it here left the failed
+    // activation's coroutine incomplete and every awaiter parked forever.
+    if (coroTop()) |top| {
+        if (top.pending_err) |pe| {
+            top.pending_err = null;
+            if (coro_stack.items.len >= 2) {
+                const below = &coro_stack.items[coro_stack.items.len - 2];
+                if (below.pending_err == null) below.pending_err = pe;
+                if (pumpDiagEnabled()) std.debug.print("[tok] pumpExit hands pending_err down\n", .{});
+            } else if (pumpDiagEnabled()) {
+                std.debug.print("[tok] pumpExit DROPS pending_err (last pump)\n", .{});
+            }
+        }
     }
     var leftovers: []DriverWakeup.MailboxEntry = &.{};
     if (coroPop()) |w| {
