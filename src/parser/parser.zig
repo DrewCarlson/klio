@@ -1714,3 +1714,23 @@ test "extension receiver with qualified type inside generic args" {
     try testing.expectEqual(@as(usize, 1), recv.type_args.len);
     try testing.expectEqualStrings("Entry", recv.type_args[0].ty.name.name);
 }
+
+test "annotation on a receiver function type annotates the function type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun mount(content: @Composable Int.(String) -> Unit) {}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const f = out.file.decls[0].Function;
+    const ty = f.params[0].ty;
+    try testing.expect(ty.function != null);
+    // The annotation written before the receiver head belongs to the
+    // FUNCTION type, not the receiver.
+    try testing.expectEqual(@as(usize, 1), ty.annotations.len);
+    try testing.expectEqualStrings("Composable", ty.annotations[0].path[ty.annotations[0].path.len - 1].name);
+    const recv = ty.function.?.receiver.?;
+    try testing.expectEqual(@as(usize, 0), recv.annotations.len);
+    try testing.expectEqualStrings("Int", recv.name.name);
+    try testing.expectEqual(@as(usize, 1), ty.function.?.params.len);
+}

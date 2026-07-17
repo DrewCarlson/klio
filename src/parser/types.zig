@@ -403,8 +403,14 @@ pub fn parseType(p: *Parser) ?TypeRef {
         const ret_span = ret.span;
         const sp = ty.span.join(ret_span);
         const func = p.allocator.create(FunctionTypeRef) catch @panic("OOM in parseType");
+        // Annotations written before the receiver head annotate the whole
+        // function type (`@Composable R.() -> Unit`), not the receiver:
+        // hoist them onto the outer TypeRef so `isComposable`-style
+        // consumers see them.
+        var recv_ty = ty;
+        recv_ty.annotations = &.{};
         func.* = .{
-            .receiver = ty,
+            .receiver = recv_ty,
             .params = params,
             .ret = ret,
             .is_suspend = is_suspend,
@@ -417,7 +423,7 @@ pub fn parseType(p: *Parser) ?TypeRef {
             .type_args = &.{},
             .function = func,
             .definitely_non_null = false,
-            .annotations = &.{},
+            .annotations = ty.annotations,
             .qualified_path = null,
         };
     }
