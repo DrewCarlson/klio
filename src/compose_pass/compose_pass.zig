@@ -311,60 +311,6 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
-/// Per-sink bitmask of the TOTAL param counts of overloads whose LAST param
-/// is the composable lambda (bit n set = an n-param overload exists). A
-/// name-keyed sink cannot distinguish `ComposeNode(factory, update)` from
-/// `ComposeNode(factory, update, content)`; without this the 2-arg call's
-/// trailing UPDATE lambda was transformed (and under the memo emission,
-/// wrapped) as composable.
-pub var active_sink_argcounts: ?*const std.StringHashMap(u64) = null;
-
-/// Collect `sink name -> arg-count bitmask` (see active_sink_argcounts).
-pub fn collectComposableSinkArgCounts(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(u64) {
-    var set = std.StringHashMap(u64).init(a);
-    try collectSinkArgCountsInto(&set, decls);
-    return set;
-}
-
-fn noteSinkArgCount(set: *std.StringHashMap(u64), name: []const u8, n_params: usize) std.mem.Allocator.Error!void {
-    if (n_params >= 64) return;
-    const gop = try set.getOrPut(name);
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* |= @as(u64, 1) << @intCast(n_params);
-}
-
-fn collectSinkArgCountsInto(set: *std.StringHashMap(u64), decls: []const ast.Decl) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            if (f.params.len != 0 and isComposableLambdaParam(&f.params[f.params.len - 1])) {
-                // Defaulted middle params permit shorter calls: every count
-                // from the required minimum up to the full list matches.
-                var required: usize = 0;
-                for (f.params) |*p| {
-                    if (p.default == null) required += 1;
-                }
-                var n = required;
-                if (n == 0) n = 1;
-                while (n <= f.params.len) : (n += 1) try noteSinkArgCount(set, f.name.name, n);
-            }
-        },
-        .Class => |*c| {
-            if (c.primary_params.len != 0) {
-                const lp = &c.primary_params[c.primary_params.len - 1];
-                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
-                    try noteSinkArgCount(set, c.name.name, c.primary_params.len);
-                }
-            }
-            try collectSinkArgCountsInto(set, c.members);
-        },
-        .Object => |*o| try collectSinkArgCountsInto(set, o.members),
-        else => {},
-    };
-}
-
 /// Names of class PROPERTIES declared with a `@Composable` function type
 /// (`MovableContent.content`). An explicit-receiver invoke of one
 /// (`content.content(parameter)` in the composer's movable-content path) is
