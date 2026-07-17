@@ -2954,7 +2954,7 @@ pub const Module = struct {
     /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
     /// inside `fun Box(s: String)` self-recursing past the constructor). No
     /// signature view, or no refuting evidence, keeps the candidate.
-    fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
+    pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
         const sv = self.sigViewForApplicability(fid) orelse return true;
         return applicability.applicable(&sv, args, .{}) != null;
     }

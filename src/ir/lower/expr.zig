@@ -9041,6 +9041,49 @@ fn lowerFqnGlobalCall(
         (head_is_real_pkg or !isTopLevelProp(head)) and
         (head_is_real_pkg or b.resolve("this") == null))
     {
+        // An exact-FQN name can cover a whole OVERLOAD SET
+        // (`kotlin.test.assertTrue` is (Boolean, String?) AND (String?,
+        // () -> Boolean)); the runtime value load binds the first by
+        // declaration order regardless of the call's arguments. With the
+        // arguments in hand, bind the UNIQUE overload whose declared
+        // signature the argument shapes fit; only an undecidable tie keeps
+        // the value-call fallback.
+        {
+            const last = rsplitLast(fqn, '.');
+            const shapes = try buildArgShapes(b, args, ast_arg_names);
+            defer b.allocator.free(shapes);
+            var only: ?FuncId = null;
+            var fit_count: usize = 0;
+            var fqn_overloads: usize = 0;
+            for (b.module.funcsBySimpleName(last)) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                if (!std.mem.eql(u8, f.fqn, fqn)) continue;
+                if (!f.hasBody()) continue;
+                if (f.low_priority) continue;
+                fqn_overloads += 1;
+                if (!fqnCallArityFits(b, fid, args.len)) continue;
+                if (!b.module.declSigCompatible(fid, shapes)) continue;
+                only = fid;
+                fit_count += 1;
+                if (fit_count > 1) break;
+            }
+            if (fqn_overloads > 1 and fit_count == 1) {
+                const run = try lowerArgRun(b, args);
+                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                const dst = b.allocReg();
+                try b.push(.{ .Call = .{
+                    .dst = dst,
+                    .func = only.?,
+                    .trailing_lambda = b.callTrailingLambda(),
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                    .type_args = &.{},
+                    .exact = false,
+                } });
+                return dst;
+            }
+        }
         const callee_r = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = n } });
@@ -9057,6 +9100,15 @@ fn lowerFqnGlobalCall(
         return dst;
     }
     return null;
+}
+
+/// Whether `fid` can take `want` positional args: at least the required
+/// (non-defaulted, non-vararg) count, at most the declared total unless a
+/// vararg absorbs the excess.
+fn fqnCallArityFits(b: *FuncBuilder, fid: FuncId, want: usize) bool {
+    const arity = b.module.decl_user_arity.get(fid.int()) orelse return false;
+    if (want < arity.required) return false;
+    return arity.has_vararg or want <= arity.total;
 }
 
 /// The simple head of a type name: drop a package qualifier and any generic
