@@ -334,6 +334,16 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             b.module.has_context_decls = true;
             b.module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
         }
+        // The receiver type in scope inside this body: a local EXTENSION fn's
+        // own declared receiver (innermost, wins bare-call disambiguation —
+        // `fun MockViewValidator.value() { Text(…) }` must pick the
+        // MockViewValidator ext over a same-named top-level fn), else the
+        // enclosing receiver, exactly as a receiver lambda carries it.
+        b.module.pending_lambda_enclosing_recv = if (f.receiver_type) |r|
+            r.name.name
+        else
+            b.enclosingRecvTy();
+        if (f.receiver_type) |r| b.module.pending_lambda_own_recv = r.name.name;
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,

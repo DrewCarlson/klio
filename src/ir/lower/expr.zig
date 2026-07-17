@@ -3405,11 +3405,17 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A bare call to a file-private top-level function mangled per file (two
     // files in one package each declaring the same-signature `private fun`)
     // resolves to the calling file's mangled name. Locals / outer captures /
-    // own members still shadow it (Kotlin scope order).
+    // own members still shadow it (Kotlin scope order). An applicable
+    // EXTENSION on an in-scope implicit receiver also shadows it: Kotlin
+    // resolves the implicit-receiver candidate group before any no-receiver
+    // candidate, so `Text(…)` inside `fun MockViewValidator.value()` binds
+    // the validator extension, never the file's private plain fn.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
-            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
+            if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name) and
+                !extOnEnclosingReceiverApplies(b, head.name, call.args.len))
+            {
                 var new_segs = [_]ast.Ident{.{ .name = renamed, .span = head.span }};
                 var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
                 var rewritten = expr.*;
@@ -6555,6 +6561,28 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
 /// ambiguous bare call inside an extension body resolve its arity/receiver-lambda
 /// shape. Null when no enclosing receiver type is known or no single overload
 /// matches.
+/// Whether any same-named EXTENSION whose declared receiver head matches the
+/// enclosing receiver type accepts `n_args` value arguments. Kotlin checks
+/// implicit-receiver candidates before no-receiver ones, so such an extension
+/// shadows a same-named file-private top-level function.
+fn extOnEnclosingReceiverApplies(b: *FuncBuilder, name: []const u8, n_args: usize) bool {
+    const recv = b.enclosingRecvTy() orelse return false;
+    const recv_simple = simpleTypeHead(recv);
+    const ids = b.module.func_name_index.get(name) orelse return false;
+    for (ids.items) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), recv_simple)) continue;
+        const user_params = f.params.len - 1;
+        var required: usize = 0;
+        for (f.params[1..]) |*pp| {
+            if (!pp.has_default and !pp.is_vararg) required += 1;
+        }
+        if (n_args >= required and n_args <= user_params) return true;
+    }
+    return false;
+}
+
 fn disambiguateByReceiver(b: *FuncBuilder, name: []const u8) ?FuncId {
     const recv = b.enclosingRecvTy() orelse return null;
     const recv_simple = simpleTypeHead(recv);
@@ -6920,7 +6948,44 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
 
+    // KLIO_BARE_TRACE=<name>: print the static resolution for a bare call —
+    // which overload bound (or that none did), the emit form, and the
+    // receiver context the decision saw. The static complement of
+    // KLIO_MISS_TRACE.
+    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0) and res_final.target == null) {
+            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={}\n", .{
+                name0,
+                b.recvTy() orelse "-",
+                b.enclosingRecvTy() orelse "-",
+                b.self_package,
+                shadowed_by_class,
+            });
+        }
+    }
     if (res_final.target) |target| {
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0)) {
+                const tfn = b.module.funcById(target);
+                const tf = if (tfn) |f| f.fqn else "?";
+                const np: usize = if (tfn) |f| f.params.len else 0;
+                const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
+                std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
+                    name0,
+                    tf,
+                    target.int(),
+                    np,
+                    is_ext_t,
+                    @tagName(res_final.emit_form),
+                    b.recvTy() orelse "-",
+                    b.enclosingRecvTy() orelse "-",
+                    b.self_package,
+                    shadowed_by_class,
+                    @intFromEnum(segments[0].span.file),
+                    segments[0].span.start,
+                });
+            }
+        }
         if (!shadowed_by_class) {
             // A constructible same-named class competes with this pick and
             // the pick is not type-proven: yield to the class arm's deferred

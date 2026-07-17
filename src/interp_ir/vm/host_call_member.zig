@@ -9639,6 +9639,37 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
 
+    // Kotlin gathers candidates scope level by scope level — the call
+    // site's own file (its file-privates included) before anything from
+    // another file — and resolution stops at the innermost level with an
+    // applicable candidate. With several receiver-fitting candidates,
+    // keep the call-site file's own when any exist: a file-private
+    // `MockViewValidator.Text` outranks another package's same-signature
+    // extension the file never imported.
+    if (candidates.items.len > 1) {
+        const site_file: ?ir.FileId = ir.eval.refSiteFile() orelse
+            if (ir.eval.currentCallSiteSpan()) |csp| csp.file else null;
+        if (site_file) |sf| {
+            const smg = self.module.borrow();
+            defer smg.deinit();
+            const smod = smg.get();
+            var same_file: usize = 0;
+            for (candidates.items) |c| {
+                const ds = smod.decl_span.get(c.fid.int()) orelse continue;
+                if (ds.file.int() == sf.int()) same_file += 1;
+            }
+            if (same_file != 0 and same_file != candidates.items.len) {
+                var filtered: std.ArrayList(Candidate) = .empty;
+                for (candidates.items) |c| {
+                    const ds = smod.decl_span.get(c.fid.int()) orelse continue;
+                    if (ds.file.int() == sf.int()) filtered.append(allocator, c) catch {};
+                }
+                candidates.deinit(allocator);
+                candidates = filtered;
+            }
+        }
+    }
+
     // Unique-exact-arity pick — only when every supplied argument can
     // bind its parameter. An arity-exact candidate whose param types the
     // args definitely don't satisfy is inapplicable (kotlinc drops it),

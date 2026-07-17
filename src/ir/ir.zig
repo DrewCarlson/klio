@@ -1069,6 +1069,13 @@ pub const Module = struct {
     /// receiver-lambda argument's arity by the enclosing receiver. Not
     /// serialized.
     pending_lambda_enclosing_recv: ?[]const u8 = null,
+    /// The DECLARED extension receiver of the local function whose body is
+    /// about to lower (`fun MockViewValidator.value() { … }` inside another
+    /// body), carried into that body's builder as its own `recv_ty` so bare
+    /// calls resolve exactly as in a top-level extension body — an extension
+    /// on the receiver outranks a same-named plain top-level function. Not
+    /// serialized.
+    pending_lambda_own_recv: ?[]const u8 = null,
     /// Non-reified type-parameter names in scope at the lambda body about to
     /// lower, carried into that body so an `x as T` cast inside the lambda is
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
