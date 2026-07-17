@@ -263,6 +263,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_own_recv = null;
         b.setRecvTy(rt);
     }
+    // A local `fun`'s BLOCK body returns Unit on fall-through, never the
+    // tail statement's value (stashed by `lowerLocalFnDecl`; a lambda
+    // literal keeps last-expression semantics). Consumed here, before any
+    // nested lambda inside this body lowers, so it never leaks inward.
+    const fn_block_body = module.pending_lambda_fn_block_body;
+    module.pending_lambda_fn_block_body = false;
     // Enclosing non-reified type params, so an `x as T` cast in this body is
     // erased (see FuncBuilder.type_param_names).
     if (module.pending_lambda_type_params) |tps| {
@@ -411,7 +417,16 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         }
     }
     const result = try expr.lowerBlock(&b, body);
-    b.terminate(.{ .Return = result });
+    if (fn_block_body) {
+        // `fun f() { 42 }` returns Unit, not 42 — an explicit `return`
+        // terminated before reaching this fall-through.
+        const unit_dst = b.allocReg();
+        const unit = try b.module.internConst(b.allocator, .Unit);
+        try b.push(.{ .Const = .{ .dst = unit_dst, .value = unit } });
+        b.terminate(.{ .Return = unit_dst });
+    } else {
+        b.terminate(.{ .Return = result });
+    }
     const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
     var func = try b.finish("<lambda>", "<lambda>", literalReturnTy(body) orelse build.typeUnit());
     // Function count is bounded well below u32::MAX; the index is the new FuncId.

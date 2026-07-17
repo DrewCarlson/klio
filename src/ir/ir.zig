@@ -1076,6 +1076,16 @@ pub const Module = struct {
     /// on the receiver outranks a same-named plain top-level function. Not
     /// serialized.
     pending_lambda_own_recv: ?[]const u8 = null,
+    /// The body about to lower belongs to a LOCAL `fun` with a BLOCK body:
+    /// its fall-through returns Unit, never the tail statement's value —
+    /// `fun f() { 42 }` yields Unit in Kotlin, while a lambda literal yields
+    /// its last expression. Same rule `lowerFunctionBodyWithImplicitOwner-
+    /// Enclosing` applies to top-level/member block bodies; without it a
+    /// restart-wrapped local composable returned its trailing
+    /// `endRestartGroup()?.updateScope(..)` null and Compose's
+    /// `block?.invoke(c, 1) ?: error("Invalid restart scope")` elvis fired.
+    /// Not serialized.
+    pending_lambda_fn_block_body: bool = false,
     /// Non-reified type-parameter names in scope at the lambda body about to
     /// lower, carried into that body so an `x as T` cast inside the lambda is
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a

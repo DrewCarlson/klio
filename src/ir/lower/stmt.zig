@@ -344,6 +344,12 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         else
             b.enclosingRecvTy();
         if (f.receiver_type) |r| b.module.pending_lambda_own_recv = r.name.name;
+        // A local `fun` with a BLOCK body returns Unit on fall-through,
+        // never its tail statement's value (an expression body keeps the
+        // expression as the return — it lowered to a single-statement
+        // synthetic block above). Mirrors the top-level/member block-body
+        // rule in `lowerFunctionBodyWithImplicitOwnerEnclosing`.
+        b.module.pending_lambda_fn_block_body = f.body != null and f.body.? == .Block;
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
