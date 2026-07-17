@@ -2318,6 +2318,20 @@ fn runFrameInner(
                 _ = try_stack.orderedRemove(p);
             }
         }
+        // Control entering a finally body disarms its try-frame: once the
+        // finally has begun, the region's catches and the finally itself must
+        // not capture anything raised inside it (a throw or return in the
+        // finally would otherwise re-enter and run the block twice). The
+        // exception/return entry paths pop the frame before jumping here, so
+        // a frame still armed at this point is the normal-completion entry.
+        // Keyed on block entry (not the entry block's Goto exit) because a
+        // multi-block finally — a Branch terminator, a suspension — leaves
+        // the exit-side pop unreached while later blocks run.
+        if (resume_idx == 0) {
+            if (rpositionByFinallyEntry(try_stack.items, cur)) |p| {
+                _ = try_stack.orderedRemove(p);
+            }
+        }
         const insts: []const Inst = block.insts;
         const term = block.terminator;
         const finally = block.finally;
@@ -2423,6 +2437,14 @@ fn runFrameInner(
             // Mid-block throw — same try-stack walk as Terminator.Throw.
             var routed = false;
             while (try_stack.pop()) |tf| {
+                // A throw raised inside this frame's own finally body must not
+                // route back into that finally, nor into the frame's catches:
+                // control already left the try region when the finally began.
+                // The frame is still armed here only on the normal-completion
+                // entry (the symmetric pop runs when the entry block exits).
+                if (tf.finally_entry) |fin0| {
+                    if (std.meta.eql(fin0, cur)) continue;
+                }
                 if (findCatch(H, host, &exc, tf.catches)) |h| {
                     try frame.write(h.exception_reg, exc);
                     cur = h.handler;
@@ -2553,6 +2575,10 @@ fn runFrameInner(
                 while (i > 0) {
                     i -= 1;
                     if (try_stack.items[i].finally_entry) |fin| {
+                        // A return from inside this frame's own finally body
+                        // exits through OUTER finallys only; re-entering its
+                        // own finally would run the block twice.
+                        if (std.meta.eql(fin, cur)) continue;
                         const key = try_stack.items[i].finally_done orelse fin;
                         chosen = .{ .i = i, .jump = fin, .key = key };
                         break;
@@ -2603,6 +2629,11 @@ fn runFrameInner(
                 // Walk the try stack for a matching handler.
                 var routed = false;
                 while (try_stack.pop()) |tf| {
+                    // Same own-finally guard as the mid-block walk: a throw
+                    // from inside this frame's finally body skips the frame.
+                    if (tf.finally_entry) |fin0| {
+                        if (std.meta.eql(fin0, cur)) continue;
+                    }
                     if (findCatch(H, host, &exc, tf.catches)) |h| {
                         try frame.write(h.exception_reg, exc);
                         cur = h.handler;

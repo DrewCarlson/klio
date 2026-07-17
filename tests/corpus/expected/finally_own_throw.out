@@ -1,0 +1,9 @@
+plain fin 1
+caught fin-throw n=1
+branchy fin 1 elvis
+caught branchy-throw n=1
+2
+iter1 fin1 fin2 iter3 fin3 
+inner fin 11
+inner fin 12
+outer fin 1

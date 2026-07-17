@@ -2628,6 +2628,13 @@ ir.eval.resume_route = "inline-claim";
 /// interceptor at all, so for them the pump queue IS the dispatch: they keep
 /// using `coroutineResumeExternal` and run on a later pump turn.
 pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
+    // KLIO_RESUME_TRACE: name the RESUMER — the route prints below show the
+    // frames a delivery re-runs, but a double-delivery diagnosis needs to know
+    // which Kotlin code performed each `Continuation.resumeWith`.
+    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+        std.debug.print("[resume-call] slot={d} resumer:\n", .{slot});
+        ir.eval.dumpFrameChainForDiagAlways();
+    }
     if (try coroutineResumeInline(self, slot, value, out)) return;
     return coroutineResumeExternal(self, slot, value, out);
 }
