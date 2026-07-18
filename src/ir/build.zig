@@ -372,6 +372,11 @@ pub const FuncBuilder = struct {
     /// receiver still fires inside nested lambdas. Distinct from `recv_ty`
     /// so the two never conflate a decl receiver with a captured one.
     enclosing_recv_ty: ?[]const u8 = null,
+    /// The LOCAL `fun` this builder is lowering the body of (or a lambda
+    /// nested inside that body). A bare call to `self_local_fn.name` binds
+    /// the fn ITSELF through its mangled cell — the shared plain-name slot
+    /// may be rebound by a later same-named sibling declaration.
+    self_local_fn: ?ir.SelfLocalFn = null,
     /// See `callTrailingLambda`.
     cur_call_trailing: bool = false,
     /// Names declared on the owning class (methods, body
@@ -1090,6 +1095,12 @@ pub const FuncBuilder = struct {
     }
     pub fn setEnclosingRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
         self.enclosing_recv_ty = name;
+    }
+    pub fn selfLocalFn(self: *const FuncBuilder) ?ir.SelfLocalFn {
+        return self.self_local_fn;
+    }
+    pub fn setSelfLocalFn(self: *FuncBuilder, v: ?ir.SelfLocalFn) void {
+        self.self_local_fn = v;
     }
     /// Whether the Call expression currently being lowered supplied its
     /// final argument as a TRAILING lambda (`f(x) { … }`). Set by

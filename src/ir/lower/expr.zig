@@ -2359,6 +2359,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Carry the enclosing non-reified type-parameter names so an `x as T`
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
+    // A lambda inside a local fn's body keeps that fn's self-identity (a
+    // named local fn overrides this with its own before its body lowers).
+    if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -4988,6 +4991,18 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
             }
         }
+        // SELF-reference: a bare call to the enclosing local fn's own name
+        // from inside its body — including generated nested lambdas (the
+        // compose restart re-invoke) — binds the fn ITSELF through its
+        // mangled cell. The plain name cannot serve it: a later same-named
+        // sibling declaration rebinds the shared plain-name slot (last bind
+        // wins), and Kotlin scopes this call to the declarations visible at
+        // this point in the body — the enclosing fn, never the sibling.
+        if (b.selfLocalFn()) |slf| {
+            if (std.mem.eql(u8, slf.name, bare) and selfLocalFnApplicable(b, slf.mangled, bare, args, ast_arg_names)) {
+                if (try lowerSelectedLocalOverloadCall(b, slf.mangled, args, ast_arg_names)) |r| return r;
+            }
+        }
         if (b.localFnDecls(bare)) |decls| {
             local_fn_inapplicable = !anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names);
             // A LONE local fn reached from a NESTED body (its own body, or
@@ -6006,6 +6021,25 @@ fn anyLocalFnOverloadApplicable(
         return true;
     }
     return false;
+}
+
+/// Whether the enclosing local fn's own overload record can take this call
+/// (arity + argument names). Missing record (the table did not reach this
+/// deferred body) keeps the route available — the runtime binder still
+/// resolves the mangled cell's closure.
+fn selfLocalFnApplicable(
+    b: *const FuncBuilder,
+    mangled: []const u8,
+    bare: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) bool {
+    const decls = b.localFnDecls(bare) orelse return true;
+    for (decls) |*ov| {
+        if (!std.mem.eql(u8, ov.mangled, mangled)) continue;
+        return anyLocalFnOverloadApplicable(b, @as([*]const build.LocalFnOverload, @ptrCast(ov))[0..1], args, ast_arg_names);
+    }
+    return true;
 }
 
 fn selectLocalFnOverload(

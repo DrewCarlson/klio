@@ -273,3 +273,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `range_in_range_operator.kt` | A user `operator LongRange.contains(LongRange)` decides range-in-range membership over the builtin element `contains`. |
 | `vararg_overload_binding.kt` | Non-final vararg binding (middle args absorbed, trailing defaults kept, named args past the vararg), List-vs-vararg overload selection, and the materialized Array type of a vararg param in its body. |
 | `spread_vararg_overload.kt` | A `*spread` call binds only a `vararg`-bearing overload — a zero-arg namesake never wins the pick and drops the elements. |
+| `local_fn_self_reference_shadow.kt` | A self-re-invoking lambda inside the first of two same-named local functions binds the enclosing function, not the later sibling that rebinds the plain name. |

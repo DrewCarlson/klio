@@ -1050,6 +1050,14 @@ pub const PendingCtx = struct {
     type_params: []const ast.TypeParam,
 };
 
+/// A local `fun`'s identity carried into its body's builder (and nested
+/// lambdas): the declared name plus the mangled overload-cell binding a bare
+/// self-reference must call through.
+pub const SelfLocalFn = struct {
+    name: []const u8,
+    mangled: []const u8,
+};
+
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
     /// True when any declaration in this module has a `context(...)`
@@ -1095,6 +1103,13 @@ pub const Module = struct {
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
     /// generic class). Not serialized.
     pending_lambda_type_params: ?[]const []const u8 = null,
+    /// The LOCAL `fun` whose body (or a lambda nested in it) is about to
+    /// lower: its declared name and its mangled overload-cell binding. A bare
+    /// self-reference in that body must call through the mangled cell — the
+    /// plain-name slot is shared with any later same-named sibling declaration
+    /// (last bind wins), so a self re-invoke captured by name (the compose
+    /// restart lambda) would run the SIBLING. Not serialized.
+    pending_lambda_self_fn: ?SelfLocalFn = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.
