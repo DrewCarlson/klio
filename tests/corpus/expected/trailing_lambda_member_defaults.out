@@ -1,0 +1,10 @@
+member ro=true wo=false
+1
+companion ro=true wo=false
+2
+companion ro=true wo=false
+3
+object ro=true wo=false
+4
+member ro=false wo=false
+5

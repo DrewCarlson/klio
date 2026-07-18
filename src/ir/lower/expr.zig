@@ -9614,6 +9614,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         .dst = dst,
         .receiver = recv,
         .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
