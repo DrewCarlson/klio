@@ -1760,7 +1760,7 @@ fn elementSatisfies(self: *VmHost, allocator: Allocator, elem: *const Value, fid
 /// class hierarchy for an `Instance`, the runtime type-name sets
 /// otherwise. No generosity for generics or function shapes — callers
 /// handle those.
-fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
+pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
         .Instance => |inst| {
             const a = self.allocator;

@@ -354,6 +354,7 @@ pub const VmHost = struct {
     pub const setTrailingMemberCall = host_call_member.setTrailingMemberCall;
     pub const callNamedOverload = host_call_func.callNamedOverload;
     pub const pickNamedOverloadId = host_call_func.pickNamedOverloadId;
+    pub const pickNamedOverloadIdRecv = host_call_func.pickNamedOverloadIdRecv;
     pub const bareUnsettledHeaderNoOp = host_call_func.bareUnsettledHeaderNoOp;
 };
 
