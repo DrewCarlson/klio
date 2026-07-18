@@ -85,6 +85,34 @@ pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
                 .Expr => |*ex| try collectPathIdents(ex, out),
             };
         },
+        // An anonymous object's member bodies reference captured outer
+        // locals like a lambda body does. Without this arm a `var` whose
+        // ONLY references sit inside an object-expression's methods (an
+        // `order++` stamp counter built by a factory lambda) never counted
+        // as referenced, the enclosing lambda skipped boxing it, and the
+        // object captured a dead value copy.
+        .ObjectExpr => |o| {
+            for (o.members) |*d| switch (d.*) {
+                .Function => |*f| {
+                    if (f.body) |fb| switch (fb) {
+                        .Block => |blk| {
+                            for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                        },
+                        .Expr => |ex| try collectPathIdents(&ex, out),
+                    };
+                },
+                .Property => |p| {
+                    if (p.init) |*pi| try collectPathIdents(pi, out);
+                },
+                else => {},
+            };
+            for (o.init_blocks) |*blk| {
+                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+            }
+            for (o.supertype_args) |sa| if (sa) |sargs| {
+                for (sargs) |*sarg| try collectPathIdents(sarg, out);
+            };
+        },
         .When => |w| {
             if (w.subject) |s| try collectPathIdents(s, out);
             for (w.branches) |*br| try collectPathIdents(&br.body, out);

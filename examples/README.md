@@ -275,3 +275,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `spread_vararg_overload.kt` | A `*spread` call binds only a `vararg`-bearing overload — a zero-arg namesake never wins the pick and drops the elements. |
 | `local_fn_self_reference_shadow.kt` | A self-re-invoking lambda inside the first of two same-named local functions binds the enclosing function, not the later sibling that rebinds the plain name. |
 | `captured_var_shadows_fn_call.kt` | A captured non-callable `var` does not shadow a same-named function for a call made inside a nested lambda. |
+| `captured_counter_via_factory_lambda.kt` | A `var` referenced only inside an anonymous object built by a factory lambda still boxes; the object-method write reaches the enclosing scope. |
