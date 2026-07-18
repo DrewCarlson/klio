@@ -85,6 +85,7 @@ const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "
 /// every composable lambda argument, so an unchanged content lambda compares
 /// EQUAL across recompositions and its group skips.
 const composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambda" };
+const composable_lambda_instance_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambdaInstance" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -585,6 +586,7 @@ fn transformDecl(
                 // `setContent { … }` composable-lambda argument is transformed.
                 const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
                 const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
+                const wrap_ret = ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
                 // A NON-composable fn can still take `@Composable`-typed
                 // lambda params (`movableContentOf(content)`): a bare
                 // `content()` inside one of its composable lambdas (the
@@ -592,11 +594,12 @@ fn transformDecl(
                 // composable call and must thread.
                 const lp = a.create(std.StringHashMap(void)) catch @panic("oom");
                 lp.* = try composableLambdaParamNames(a, f);
-                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp };
+                var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp, .wrap_ret_lambda = wrap_ret };
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (ret_composable and e.* == .Lambda) {
                         try w.transformComposableLambda(&e.Lambda, ret_fn_params);
+                        if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
                     },
@@ -960,6 +963,11 @@ const Walker = struct {
     /// so it is threaded exactly like an oracle-named composable call — the
     /// closure's trailing params are `$composer`/`$changed`.
     lambda_params: ?*std.StringHashMap(void) = null,
+    /// Wrap a returned composable lambda in composableLambdaInstance —
+    /// enabled only for the movable-content factories today (kotlinc wraps
+    /// every such return; klio gates the rollout while the general wrap's
+    /// interactions are driven out).
+    wrap_ret_lambda: bool = false,
     /// Simple names of LOCAL `@Composable` declarations seen so far in this
     /// walk. Scoped to the enclosing function's transform — a local name
     /// (`Composition`, `View`, `Test` in the upstream tests) must never join
@@ -1113,6 +1121,7 @@ const Walker = struct {
                 const saved_ret = w.ret_composable;
                 const saved_rfp = w.ret_fn_params;
                 w.ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
+                w.wrap_ret_lambda = w.ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
                 w.ret_fn_params = if (w.ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
                 defer {
                     w.ret_composable = saved_ret;
@@ -1122,6 +1131,7 @@ const Walker = struct {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (w.ret_composable and e.* == .Lambda) {
                         try w.transformComposableLambda(&e.Lambda, w.ret_fn_params);
+                        if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
                     },
@@ -1145,6 +1155,22 @@ const Walker = struct {
         args[2] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
         args[3] = arg.*;
         arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_path), args);
+    }
+
+    /// A composable lambda RETURNED by a (non-composable) factory has no
+    /// `$composer` in scope: kotlinc wraps it in
+    /// `composableLambdaInstance(key, true, block)` — a ComposableLambdaImpl
+    /// whose invoke supplies the RESTART GROUP each call site needs
+    /// (`movableContentOf`'s wrapper: without it, `content(n)` composes the
+    /// movable group with no restart bracket and multi-insert positioning
+    /// breaks).
+    fn wrapInComposableLambdaInstance(w: *Walker, arg: *Expr) void {
+        const key = positionalKey(exprSpanOf(arg));
+        const args = w.a.alloc(Expr, 3) catch @panic("oom");
+        args[0] = w.b.intLit(key);
+        args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        args[2] = arg.*;
+        arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_instance_path), args);
     }
 
     /// Whether a branch contains a call the pass considers composable
@@ -1432,7 +1458,7 @@ const Walker = struct {
                         // returned wrapper) holds an unwrapped closure
                         // with literal `$composer`/`$changed` params — it
                         // keeps the named pair.
-                        const positional = emit_lambda_memo and (is_lambda_param or is_composable_prop);
+                        const positional = emit_lambda_memo and (is_lambda_param or is_composable_prop or is_composable_val or is_local_composable);
                         if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
                     }
                 }
@@ -1484,6 +1510,7 @@ const Walker = struct {
             .Return => |*r| if (r.value) |v| {
                 if (w.ret_composable and v.* == .Lambda) {
                     try w.transformComposableLambda(&v.Lambda, w.ret_fn_params);
+                    if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(v);
                 } else {
                     try w.walkExpr(v);
                 }
