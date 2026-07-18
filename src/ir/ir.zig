@@ -1990,6 +1990,40 @@ pub const Module = struct {
         return first_user orelse first_body orelse first orelse first_lp;
     }
 
+    /// Overload pick for a call carrying a `*spread` argument. Kotlin only
+    /// lets a spread bind to a `vararg` parameter, so fixed-arity overloads
+    /// are not candidates at all — without the restriction the arg-blind
+    /// by-name pick hands `mutableStateListOf(*arr)` the zero-arg overload
+    /// and the spread's elements are silently dropped. Ordering within the
+    /// vararg-bearing candidates mirrors `funcIdForBareCall`.
+    pub fn funcIdForSpreadCall(self: *const Module, name: []const u8, ctx_owner: ?[]const u8) ?FuncId {
+        const candidates = self.funcsBySimpleName(name);
+        var first: ?FuncId = null;
+        var first_user: ?FuncId = null;
+        var first_body: ?FuncId = null;
+        var first_lp: ?FuncId = null;
+        for (candidates) |id| {
+            if (self.memberExtOutOfScope(id, ctx_owner)) continue;
+            const f = self.funcById(id) orelse continue;
+            var has_vararg = false;
+            for (f.params) |p| {
+                if (p.is_vararg) {
+                    has_vararg = true;
+                    break;
+                }
+            }
+            if (!has_vararg) continue;
+            if (f.low_priority) {
+                if (first_lp == null) first_lp = id;
+                continue;
+            }
+            if (first == null) first = id;
+            if (first_body == null and f.hasBody()) first_body = id;
+            if (first_user == null and !isShippedPackage(f.package)) first_user = id;
+        }
+        return first_user orelse first_body orelse first orelse first_lp;
+    }
+
     /// Whether any top-level function with this simple name exists.
     /// Pure existence — no order-based pick — for callers that only
     /// gate on the name being callable. Answers over the name index,
