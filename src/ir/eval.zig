@@ -3330,8 +3330,14 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
         // List equality already dispatches element `equals` via
         // `collectionsEqualHostAware` and its array/sublist views need the
         // established path.
+        // A native-collection LEFT operand against a user Instance also
+        // routes here: Kotlin dispatches `a.equals(b)` on the LEFT, and a
+        // native Set/List/Map's equals is the collection contract — the
+        // instance need not override `equals` for `setOf(x) == wrapper`.
         if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-            isSetOrMap(&l) and isSetOrMap(&r))
+            ((isSetOrMap(&l) and isSetOrMap(&r)) or
+                ((isSetOrMap(&l) or l == .List) and r == .Instance) or
+                (l == .Pair and r == .Pair) or (l == .Triple and r == .Triple)))
         {
             if (comptime @hasDecl(H, "deepValueEquals")) {
                 const eq = try host.deepValueEquals(allocator, &l, &r);
