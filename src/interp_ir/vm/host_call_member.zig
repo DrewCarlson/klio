@@ -241,6 +241,108 @@ fn callMemberRec(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 /// compared under a live borrow (never a heap snapshot, which the GC would not
 /// root across the nested VM dispatch), mirroring `collectionsEqualHostAware`.
 pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    // A NATIVE collection on the left compares against a user Instance
+    // implementing the matching collection interface by the Kotlin
+    // collection contract (same size, equal elements/entries) — that is
+    // what the native receiver's own `equals` does. The instance side
+    // need not override `equals` for `setOf(x) == wrapper` to hold.
+    if (a.* != .Instance and b.* == .Instance) {
+        switch (a.*) {
+            .Set => if (receiverImplementsHead(self, b, "Set")) {
+                const dr = try drainIterableToList(self, allocator, b);
+                const drained = switch (dr) {
+                    .ok => |v| v,
+                    .err => return false,
+                };
+                defer if (runtime.reclaimEnabled()) drained.release(allocator);
+                const ga = a.Set.items.borrow();
+                defer ga.deinit();
+                const gb = drained.List.items.borrow();
+                defer gb.deinit();
+                const xa = ga.get().items;
+                const xb = gb.get().items;
+                if (xa.len != xb.len) return false;
+                for (xa) |*ea| {
+                    var found = false;
+                    for (xb) |*eb| {
+                        if (try deepValueEquals(self, allocator, ea, eb)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return false;
+                }
+                return true;
+            },
+            .List => if (receiverImplementsHead(self, b, "List")) {
+                const dr = try drainIterableToList(self, allocator, b);
+                const drained = switch (dr) {
+                    .ok => |v| v,
+                    .err => return false,
+                };
+                defer if (runtime.reclaimEnabled()) drained.release(allocator);
+                a.refreshArrayView();
+                a.refreshSublistView();
+                const ga = a.List.items.borrow();
+                defer ga.deinit();
+                const gb = drained.List.items.borrow();
+                defer gb.deinit();
+                const xa = ga.get().items;
+                const xb = gb.get().items;
+                if (xa.len != xb.len) return false;
+                for (xa, xb) |*ea, *eb| {
+                    if (!try deepValueEquals(self, allocator, ea, eb)) return false;
+                }
+                return true;
+            },
+            .Map => if (receiverImplementsHead(self, b, "Map")) {
+                const er = try self.callMember(allocator, b, "entries", &.{});
+                const entries_val = switch (er) {
+                    .ok => |v| v,
+                    .err => return false,
+                };
+                defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
+                const dr = try drainIterableToList(self, allocator, &entries_val);
+                const drained = switch (dr) {
+                    .ok => |v| v,
+                    .err => return false,
+                };
+                defer if (runtime.reclaimEnabled()) drained.release(allocator);
+                const ga = a.Map.entries.borrow();
+                defer ga.deinit();
+                const gb = drained.List.items.borrow();
+                defer gb.deinit();
+                const pa = ga.get().pairs.items;
+                const xb = gb.get().items;
+                if (pa.len != xb.len) return false;
+                for (pa) |*ka| {
+                    var found = false;
+                    for (xb) |*eb| {
+                        const kr = try self.getField(allocator, eb, "key");
+                        const key = switch (kr) {
+                            .ok => |v| v,
+                            .err => continue,
+                        };
+                        defer if (runtime.reclaimEnabled()) key.release(allocator);
+                        if (!try deepValueEquals(self, allocator, &ka.key, &key)) continue;
+                        const vr = try self.getField(allocator, eb, "value");
+                        const val = switch (vr) {
+                            .ok => |v| v,
+                            .err => continue,
+                        };
+                        defer if (runtime.reclaimEnabled()) val.release(allocator);
+                        if (try deepValueEquals(self, allocator, &ka.value, &val)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return false;
+                }
+                return true;
+            },
+            else => {},
+        }
+    }
     if (a.* == .Instance or b.* == .Instance) {
         if (a.* == .Instance and b.* == .Instance) {
             switch (try callMemberRec(self, allocator, a, "equals", &.{b.*})) {
@@ -315,6 +417,20 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 if (!found) return false;
             }
             return true;
+        },
+        // Pair/Triple recurse component-wise so a nested native-vs-instance
+        // collection (a `snapshot to setOf(state)` against a
+        // `snapshot to ScatterSetWrapper`) compares by the same rules.
+        .Pair => |x| {
+            if (b.* != .Pair) return Value.structuralEqBoxed(a, b);
+            return try deepValueEquals(self, allocator, x.first.asPtr(), b.Pair.first.asPtr()) and
+                try deepValueEquals(self, allocator, x.second.asPtr(), b.Pair.second.asPtr());
+        },
+        .Triple => |x| {
+            if (b.* != .Triple) return Value.structuralEqBoxed(a, b);
+            return try deepValueEquals(self, allocator, x.first.asPtr(), b.Triple.first.asPtr()) and
+                try deepValueEquals(self, allocator, x.second.asPtr(), b.Triple.second.asPtr()) and
+                try deepValueEquals(self, allocator, x.third.asPtr(), b.Triple.third.asPtr());
         },
         else => return Value.structuralEqBoxed(a, b),
     }
