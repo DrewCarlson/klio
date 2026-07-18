@@ -497,6 +497,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
     for (class.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
+        if (p.receiver_type != null) continue;
         try body_props.append(allocator, .{
             .name = p.name.name,
             .mutable = p.mutable,
