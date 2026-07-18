@@ -341,6 +341,9 @@ pub const FuncBuilder = struct {
     outer_names: StringSet,
     capture_order: std.ArrayList([]const u8) = .empty,
     capture_regs: StringRegMap,
+    /// Capture names whose one-time entry-block `LoadCapture` has been
+    /// emitted (see `loadCaptureHoisted`).
+    capture_loads_emitted: StringSet,
     /// Loop context stack. Each frame names the loop's continue
     /// target (header / latch) and break target (exit). The frame's
     /// optional `label` matches an explicit `break@label` /
@@ -668,6 +671,7 @@ pub const FuncBuilder = struct {
             .next_reg = 0,
             .outer_names = StringSet.init(allocator),
             .capture_regs = StringRegMap.init(allocator),
+            .capture_loads_emitted = StringSet.init(allocator),
             .mutables = StringSet.init(allocator),
             .mutable_homes = StringRegMap.init(allocator),
             .boxed_vars = StringSet.init(allocator),
@@ -731,6 +735,7 @@ pub const FuncBuilder = struct {
         self.outer_names.deinit();
         self.capture_order.deinit(a);
         self.capture_regs.deinit();
+        self.capture_loads_emitted.deinit();
         self.loops.deinit(a);
         self.mutables.deinit();
         self.mutable_homes.deinit();
@@ -1027,6 +1032,28 @@ pub const FuncBuilder = struct {
         const r = self.allocReg();
         try self.capture_regs.put(name, r);
         return idx;
+    }
+
+    /// Load capture slot `idx` into its stable per-name register, ONCE, in
+    /// the ENTRY block — so the value dominates every use. Emitting the
+    /// load at the reference site and caching the register is unsound: the
+    /// first reference may sit in a conditional branch (the LHS of an
+    /// `?:`), and a later use on the other branch then reads a register no
+    /// executed path ever wrote.
+    pub fn loadCaptureHoisted(self: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
+        const idx = try self.recordCapture(name);
+        const dst = self.capture_regs.get(name).?;
+        if (!self.capture_loads_emitted.contains(name)) {
+            try self.capture_loads_emitted.put(name, {});
+            const b0 = &self.blocks.items[0];
+            const old = b0.insts;
+            const new = try self.allocator.alloc(Inst, old.len + 1);
+            @memcpy(new[0..old.len], old);
+            new[old.len] = .{ .LoadCapture = .{ .dst = dst, .idx = idx } };
+            if (old.len != 0) self.allocator.free(old);
+            b0.insts = new;
+        }
+        return dst;
     }
 
     /// True when a name names an outer-frame capture this builder is
