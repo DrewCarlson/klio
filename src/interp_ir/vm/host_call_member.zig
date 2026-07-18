@@ -2933,8 +2933,20 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         }
         if (args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
-            var k: usize = args.len;
-            while (k < effective.len) : (k += 1) {
+            // Trailing-lambda rule: a final callable arg binds the LAST
+            // parameter when that parameter is function-typed; only the GAP
+            // parameters between it and the lead positional args need
+            // defaults. `observe(readObserver) { block }` on
+            // `(readObserver = null, writeObserver = null, block)` is
+            // applicable -- block is filled by the lambda, writeObserver by
+            // its default.
+            const trailing_bind = args.len > 0 and
+                isFunctionTypeRef(&effective[effective.len - 1].ty) and
+                isCallable(&args[args.len - 1]);
+            const first_unfilled = if (trailing_bind) args.len - 1 else args.len;
+            const last_checked = if (trailing_bind) effective.len - 1 else effective.len;
+            var k: usize = first_unfilled;
+            while (k < last_checked) : (k += 1) {
                 if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) {
                     if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=undersupply param#{d}\n", .{ f.name, k });
                     return null;
