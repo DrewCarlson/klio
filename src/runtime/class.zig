@@ -86,6 +86,12 @@ pub const ClassDef = struct {
     delegate_forwarders: []const MethodDef,
     /// Lazily-constructed singleton for nested `is_object` classes.
     object_singleton: ObjRef(?ObjRef(InstanceData)),
+    /// `true` for a def synthesized at runtime from a LOCAL class declaration
+    /// (a `class`/`data class` inside a function body). Such a def is the
+    /// class — a constructor call on its `.Class` value must never be
+    /// redirected through the module class index, where an unrelated
+    /// same-simple-name class (a nested class of another owner) can shadow it.
+    is_local_runtime: bool = false,
 
     /// One eager enum entry: its name and the `Value::Instance` for it.
     pub const EnumEntry = struct { name: []const u8, value: Value };

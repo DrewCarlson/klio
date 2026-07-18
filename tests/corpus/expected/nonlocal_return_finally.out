@@ -1,0 +1,7 @@
+inside
+finally: withThing
+after test
+finally: lambda-local
+finally: withThing
+finally: inner
+7

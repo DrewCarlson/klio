@@ -296,7 +296,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // The bound ClassDef carries the resolved FQN; the module class
         // resolves by it, so `(::Ctor)(args)` constructs the referenced
         // class even when another package declares the same simple name.
-        const class_id: ?ir.ClassId = blk: {
+        // A runtime-registered LOCAL class def IS the class: never redirect
+        // it through the module index, where an unrelated same-simple-name
+        // class (a nested class of another owner) can shadow it.
+        const is_local_runtime = blk: {
+            const g = cls.borrow();
+            defer g.deinit();
+            break :blk g.get().is_local_runtime;
+        };
+        const class_id: ?ir.ClassId = if (is_local_runtime) null else blk: {
             const mg = self.module.borrow();
             defer mg.deinit();
             if (mg.get().classIdByFqn(cls_fqn)) |cid| break :blk cid;
@@ -840,7 +848,14 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                 defer g.deinit();
                 break :blk g.get().fqn;
             };
-            const class_id: ?ir.ClassId = blk: {
+            // Same local-runtime guard as the positional arm: the def in
+            // hand is the class; the index scan can only mis-resolve it.
+            const is_local_runtime = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().is_local_runtime;
+            };
+            const class_id: ?ir.ClassId = if (is_local_runtime) null else blk: {
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 if (mg.get().classIdByFqn(cls_fqn)) |cid| break :blk cid;
