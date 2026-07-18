@@ -749,7 +749,18 @@ fn pickOverloadCached(self: *VmHost, module: *const Module, func: FuncId, args: 
 /// Overload selection must rank by the declared header, or the +2 shift
 /// binds a `{ d -> }` argument to a 3-param functional overload.
 pub fn closureUserParams(self: *VmHost, info: anytype) usize {
+    return closureUserParamsChecked(self, info).n;
+}
+
+/// As `closureUserParams`, also reporting whether the composer pair was
+/// stripped. A stripped count came from the transformed literal's own
+/// header, so it is AUTHORITATIVE for overload ranking — without that,
+/// `movableContentOf { key: Int -> … }` re-picked at runtime ties the
+/// 1-param closure between the `(P) -> Unit` and `() -> Unit` overloads
+/// (flat want/want+1 parity) and the first overload wins arbitrarily.
+pub fn closureUserParamsChecked(self: *VmHost, info: anytype) struct { n: usize, stripped: bool } {
     var n: usize = info.n_params;
+    var stripped = false;
     if (n >= 2) {
         const module_ref = self.module.clone();
         defer module_ref.deinit();
@@ -760,18 +771,25 @@ pub fn closureUserParams(self: *VmHost, info: anytype) usize {
                 std.mem.eql(u8, p[p.len - 2].name, "$composer"))
             {
                 n -= 2;
+                stripped = true;
             }
         }
     }
-    return n;
+    return .{ .n = n, .stripped = stripped };
 }
 
 /// Build an `ArgShape` describing one runtime value for the shared applicability
 /// scorer. Named args are not threaded into the positional `pickOverload`
 /// path, so `named` stays null here.
 fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
+    var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(c.id)) |info| std.math.cast(u8, closureUserParams(self, info)) else null,
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(c.id) orelse break :blk null;
+            const up = closureUserParamsChecked(self, info);
+            arity_authoritative = up.stripped;
+            break :blk std.math.cast(u8, up.n);
+        },
         .Function => |f| std.math.cast(u8, f.decl.params.len),
         .Class => 0,
         else => null,
@@ -781,6 +799,7 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
         .is_null = v.* == .Null,
         .is_lambda = valueIsCallable(v),
         .lambda_arity = arity,
+        .lambda_is_literal = arity_authoritative,
         .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
         .value = @ptrCast(v),
     };

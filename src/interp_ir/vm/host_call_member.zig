@@ -2271,8 +2271,14 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
 /// `overloadScoreArg`), and `is_lambda` from `isCallable` (the trailing-lambda
 /// gate), not the broader `valueIsCallable`.
 fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
+    var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(@intCast(c.id))) |info| std.math.cast(u8, host_call_func.closureUserParams(self, info)) else null,
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(@intCast(c.id)) orelse break :blk null;
+            const up = host_call_func.closureUserParamsChecked(self, info);
+            arity_authoritative = up.stripped;
+            break :blk std.math.cast(u8, up.n);
+        },
         else => null,
     };
     return .{
@@ -2280,6 +2286,7 @@ fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
         .is_null = v.* == .Null,
         .is_lambda = isCallable(v),
         .lambda_arity = arity,
+        .lambda_is_literal = arity_authoritative,
         .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
         .value = @ptrCast(v),
     };

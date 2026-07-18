@@ -617,17 +617,20 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
             const expected = nm["Function".len..];
             if (std.fmt.parseInt(usize, expected, 10)) |want| {
                 if (arg_arity) |got| {
-                    // A LAMBDA LITERAL's header count is authoritative: an
-                    // exact param-count match outranks the adapted shapes,
+                    // An AUTHORITATIVE arity — a lambda literal's header
+                    // count, or a runtime closure whose composer pair was
+                    // stripped (the count then IS the transformed
+                    // literal's own header) — ranks exactly: an exact
+                    // param-count match outranks the adapted shapes,
                     // because same-name overloads often differ only in
                     // their functional param's arity (`movableContentOf`
                     // takes `() -> Unit` … `(P1..P4) -> Unit`) and scoring
                     // `got == want + 1` level with `got == want` tied
                     // every such call onto an arbitrary overload. A
                     // headerless literal serving a 1-param type via
-                    // implicit `it` stays applicable just below. Runtime
-                    // closure shapes keep the flat parity — their param
-                    // count includes lowering-added params.
+                    // implicit `it` stays applicable just below. Other
+                    // runtime closure shapes keep the flat parity — their
+                    // param count may include lowering-added params.
                     if (arg.lambda_is_literal) {
                         if (got == want) {
                             const d = refineDelta(scope, param_ty, arg) orelse return null;
