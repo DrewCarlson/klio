@@ -2268,6 +2268,18 @@ fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!
         defer a.free(saved);
         for (saved) |s| try PersistedParked.put(s.slot, s.state, s.scope_delta);
     }
+    // Queued-but-unstarted child launches must still run: dispatch guarantees
+    // a dispatched block eventually executes. A root that exits with a throw
+    // (a `coroutineScope` body failing) has just CANCELLED those children —
+    // but a cancelled coroutine only COMPLETES when its start task runs and
+    // observes the dead Job. Dropping the tasks here left every such child
+    // active forever, and the scope's completing-waiting-children state (and
+    // every awaiter of it) hung. Hand them to the enclosing pump.
+    var orphan_launched: []Value = &.{};
+    if (coroTop()) |top| {
+        if (top.launched.items.len != 0) orphan_launched = try top.drainLaunched(a);
+    }
+    defer if (orphan_launched.len != 0) a.free(orphan_launched);
     // A stashed inline-resume failure this pump never got to raise (its exit
     // path skipped the loop-head check) must not die with it: hand it to the
     // pump below, whose loop-head raises it. Dropping it here left the failed
@@ -2294,6 +2306,19 @@ fn pumpExit(self: *VmIntrinsicHost, out: Output, persist: bool) Allocator.Error!
             g.deinit();
         }
         ww.deinit();
+    }
+    if (orphan_launched.len != 0) {
+        if (coroTop()) |below| {
+            // Ownership transfers: the drained blocks carry the retain their
+            // original enqueue took.
+            for (orphan_launched) |b| try below.launched.append(below.allocator, b);
+            if (pumpDiagEnabled())
+                std.debug.print("[PUMP] pumpExit hands {d} unstarted launch(es) down\n", .{orphan_launched.len});
+        } else {
+            if (runtime.reclaimEnabled()) for (orphan_launched) |b| b.release(a);
+            if (pumpDiagEnabled())
+                std.debug.print("[PUMP] pumpExit drops {d} unstarted launch(es) (last pump)\n", .{orphan_launched.len});
+        }
     }
     defer if (leftovers.len != 0) a.free(leftovers);
     for (leftovers) |entry| {
