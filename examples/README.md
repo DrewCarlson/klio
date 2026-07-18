@@ -273,3 +273,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `range_in_range_operator.kt` | A user `operator LongRange.contains(LongRange)` decides range-in-range membership over the builtin element `contains`. |
 | `vararg_overload_binding.kt` | Non-final vararg binding (middle args absorbed, trailing defaults kept, named args past the vararg), List-vs-vararg overload selection, and the materialized Array type of a vararg param in its body. |
 | `property_shadowed_by_block_local.kt` | A branch-block `var` shadowing a same-named class property ends with its block: later bare-name writes reach the property (SetField), not the dead local's register, and reads/writes agree on the target. |
+| `member_extension_scope_priority.kt` | A member extension of an enclosing class is a closer-scope candidate than a same-named top-level extension: calls inside the class bind the member extension; outside, the top-level one. |

@@ -9792,6 +9792,34 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
 
+    // Kotlin resolves scope level by scope level, and a class body is an
+    // INNER scope relative to its file: a member extension of an enclosing
+    // class outranks a same-named top-level extension for calls inside the
+    // class. Surviving member-ext candidates already passed
+    // `memberExtVisible`, so their owner is on the enclosing-`this` chain —
+    // exactly the calls where kotlinc binds the member extension. Without
+    // this tier a same-shape pair ties in scoring and the pick falls to
+    // declaration order (SlotWriter's gap-aware `IntArray.nodeIndex` lost
+    // to the file-level raw-anchor accessor, correct for positive anchors
+    // and silently wrong for end-relative ones).
+    if (candidates.items.len > 1) {
+        const mg2 = self.module.borrow();
+        defer mg2.deinit();
+        const mod2 = mg2.get();
+        var n_member: usize = 0;
+        for (candidates.items) |c| {
+            if (isMemberExt(mod2, c.fid)) n_member += 1;
+        }
+        if (n_member != 0 and n_member != candidates.items.len) {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                if (isMemberExt(mod2, c.fid)) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+        }
+    }
+
     // Kotlin gathers candidates scope level by scope level — the call
     // site's own file (its file-privates included) before anything from
     // another file — and resolution stops at the innermost level with an
