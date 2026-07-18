@@ -66,16 +66,12 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     // through this builder's own capture slot rather than collapsing
     // it to `Unit`.
     if (std.mem.eql(u8, name, "this") and b.capturesThisSlot()) {
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        const dst = try b.loadCaptureHoisted("this");
         try b.bind("this", dst);
         return dst;
     }
     if (b.knowsOuter(name)) {
-        const idx = try b.recordCapture(name);
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        const dst = try b.loadCaptureHoisted(name);
         try b.bind(name, dst);
         return dst;
     }
@@ -86,10 +82,7 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     // captures are supplied by name from the instance at dispatch. The
     // silent-Unit tail below would bind the lambda's capture to nothing.
     if (decl.isLowerAnonCapture(name)) {
-        const idx = try b.recordCapture(name);
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        return dst;
+        return try b.loadCaptureHoisted(name);
     }
     // A zero-parameter / receiver lambda whose `it` was deliberately not
     // bound, and no enclosing lambda supplies one: kotlinc rejects this as
