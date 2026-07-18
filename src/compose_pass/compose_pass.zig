@@ -550,6 +550,267 @@ fn collectSinksInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.
     };
 }
 
+// --------------------------------------------------------------------------
+// Stability inference
+// --------------------------------------------------------------------------
+
+/// The Compose plugin's per-class stability classification. A composable whose
+/// value parameters (and receiver) are all STABLE gets the skip calculus; one
+/// with ANY unstable parameter is "restartable but not skippable" — it keeps
+/// its restart scope but emits no `changed()` probes and never skips, so an
+/// invalidation of an enclosing scope re-runs it even when the parameter
+/// INSTANCE is unchanged (a mutated model object still recomposes through it).
+/// `stable_annotated` (`@Stable`/`@Immutable`) is unconditionally stable;
+/// inferred `stable` still requires stable type arguments at the use site.
+pub const Stability = enum { unstable, stable, stable_annotated };
+
+/// Class-name → stability registry for the current transform run, built by
+/// `collectClassStability` over the module's declarations (plus the baked
+/// base's). Null (unit tests, no registry) treats every type as stable.
+pub var active_stability: ?*const std.StringHashMap(Stability) = null;
+
+/// Delegate factories whose backing field is a stable snapshot-state object:
+/// `var x by mutableStateOf(…)` keeps the declaring class stable (the field
+/// is a `MutableState`, itself `@Stable`).
+const stable_delegate_factories = [_][]const u8{
+    "mutableStateOf",
+    "mutableIntStateOf",
+    "mutableLongStateOf",
+    "mutableFloatStateOf",
+    "mutableDoubleStateOf",
+};
+
+const stable_builtin_types = [_][]const u8{
+    "Int",    "Long",   "Short", "Byte",    "Char",  "Boolean",
+    "Float",  "Double", "String", "Unit",   "Nothing",
+    "UInt",   "ULong",  "UShort", "UByte",
+};
+
+fn isStableBuiltinType(name: []const u8) bool {
+    for (stable_builtin_types) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn hasStableAnnotation(annotations: []const ast.Annotation) bool {
+    for (annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        const nm = ann.path[ann.path.len - 1].name;
+        if (std.mem.eql(u8, nm, "Stable")) return true;
+        if (std.mem.eql(u8, nm, "Immutable")) return true;
+        if (std.mem.eql(u8, nm, "StableMarker")) return true;
+    }
+    return false;
+}
+
+fn isTypeParamName(name: []const u8, tps: []const ast.TypeParam) bool {
+    for (tps) |*tp| if (std.mem.eql(u8, tp.name.name, name)) return true;
+    return false;
+}
+
+/// Build the class-stability registry over every class/object/typealias in
+/// `module_decls` + `base_decls` (nested declarations included). Caller owns
+/// the returned map. Same-simple-name collisions keep the weaker verdict.
+pub fn collectClassStability(
+    a: std.mem.Allocator,
+    module_decls: []const Decl,
+    base_decls: []const Decl,
+) std.mem.Allocator.Error!std.StringHashMap(Stability) {
+    var cls = StabilityClassifier{
+        .classes = std.StringHashMap(*const ast.Class).init(a),
+        .objects = std.StringHashMap(*const ast.ObjectDecl).init(a),
+        .aliases = std.StringHashMap(*const ast.TypeAlias).init(a),
+        .memo = std.StringHashMap(Stability).init(a),
+        .in_progress = std.StringHashMap(void).init(a),
+    };
+    defer cls.classes.deinit();
+    defer cls.objects.deinit();
+    defer cls.aliases.deinit();
+    defer cls.in_progress.deinit();
+    try cls.index(module_decls);
+    try cls.index(base_decls);
+    var it = cls.classes.keyIterator();
+    while (it.next()) |k| _ = try cls.classifyName(k.*);
+    var oit = cls.objects.keyIterator();
+    while (oit.next()) |k| _ = try cls.classifyName(k.*);
+    var ait = cls.aliases.keyIterator();
+    while (ait.next()) |k| _ = try cls.classifyName(k.*);
+    return cls.memo;
+}
+
+const StabilityClassifier = struct {
+    classes: std.StringHashMap(*const ast.Class),
+    objects: std.StringHashMap(*const ast.ObjectDecl),
+    aliases: std.StringHashMap(*const ast.TypeAlias),
+    memo: std.StringHashMap(Stability),
+    in_progress: std.StringHashMap(void),
+
+    fn index(self: *StabilityClassifier, decls: []const Decl) std.mem.Allocator.Error!void {
+        for (decls) |*d| switch (d.*) {
+            .Class => |*c| {
+                const gop = try self.classes.getOrPut(c.name.name);
+                if (!gop.found_existing) gop.value_ptr.* = c;
+                try self.index(c.members);
+            },
+            .Object => |*o| {
+                const gop = try self.objects.getOrPut(o.name.name);
+                if (!gop.found_existing) gop.value_ptr.* = o;
+                try self.index(o.members);
+            },
+            .TypeAlias => |*t| {
+                const gop = try self.aliases.getOrPut(t.name.name);
+                if (!gop.found_existing) gop.value_ptr.* = t;
+            },
+            else => {},
+        };
+    }
+
+    fn classifyName(self: *StabilityClassifier, name: []const u8) std.mem.Allocator.Error!Stability {
+        if (self.memo.get(name)) |s| return s;
+        if (self.in_progress.contains(name)) return .stable; // recursive back-edge
+        try self.in_progress.put(name, {});
+        defer _ = self.in_progress.remove(name);
+        const result: Stability = blk: {
+            if (self.classes.get(name)) |c| break :blk try self.classifyClass(c);
+            if (self.objects.get(name)) |o| break :blk try self.classifyObject(o);
+            if (self.aliases.get(name)) |t| {
+                break :blk if (try self.typeStable(&t.target, t.type_params)) .stable else .unstable;
+            }
+            break :blk .unstable;
+        };
+        try self.memo.put(name, result);
+        return result;
+    }
+
+    fn typeStable(self: *StabilityClassifier, t: *const TypeRef, tps: []const ast.TypeParam) std.mem.Allocator.Error!bool {
+        if (t.function != null) return true; // function types are stable
+        const n = t.name.name;
+        if (isTypeParamName(n, tps)) return false;
+        if (isStableBuiltinType(n)) return true;
+        switch (try self.classifyName(n)) {
+            .stable_annotated => return true,
+            .unstable => return false,
+            .stable => {
+                for (t.type_args) |*ta| {
+                    if (ta.is_star) return false;
+                    if (!try self.typeStable(&ta.ty, tps)) return false;
+                }
+                return true;
+            },
+        }
+    }
+
+    fn classifyClass(self: *StabilityClassifier, c: *const ast.Class) std.mem.Allocator.Error!Stability {
+        if (hasStableAnnotation(c.annotations)) return .stable_annotated;
+        if (c.is_enum) return .stable;
+        if (c.is_interface or c.is_fun_interface or c.is_annotation) return .unstable;
+        if (c.is_open or c.is_abstract or c.is_sealed) return .unstable;
+        // A class supertype (ctor-call form) folds its own stability in;
+        // interface supertypes carry no state and are ignored.
+        for (c.supertypes, c.supertype_args) |*st, sa| {
+            if (sa == null) continue;
+            switch (try self.classifyName(st.name.name)) {
+                .unstable => return .unstable,
+                else => {},
+            }
+        }
+        for (c.primary_params) |*p| {
+            const is_prop = p.property orelse continue;
+            if (is_prop) return .unstable; // `var` constructor property
+            if (!try self.typeStable(&p.ty, c.type_params)) return .unstable;
+        }
+        if (!try self.membersStable(c.members, c.type_params)) return .unstable;
+        return .stable;
+    }
+
+    fn classifyObject(self: *StabilityClassifier, o: *const ast.ObjectDecl) std.mem.Allocator.Error!Stability {
+        if (!try self.membersStable(o.members, &.{})) return .unstable;
+        return .stable;
+    }
+
+    fn membersStable(self: *StabilityClassifier, members: []const Decl, tps: []const ast.TypeParam) std.mem.Allocator.Error!bool {
+        for (members) |*m| {
+            if (m.* != .Property) continue;
+            const p = m.Property;
+            if (p.receiver_type != null) continue; // extension member: no backing field
+            if (p.delegate) |del| {
+                if (delegateFactoryStable(del)) continue;
+                return false;
+            }
+            // Computed property (getter, no backing field) carries no state.
+            if (p.getter != null and p.init == null and p.explicit_field == null) continue;
+            if (p.mutable) return false;
+            if (p.ty) |*ty| {
+                if (!try self.typeStable(ty, tps)) return false;
+            } else if (p.init) |*ini| {
+                if (!literalStable(ini)) return false;
+            }
+        }
+        return true;
+    }
+};
+
+fn delegateFactoryStable(e: *const Expr) bool {
+    if (e.* != .Call) return false;
+    const nm = calleeSimpleName(e.Call.callee) orelse return false;
+    for (stable_delegate_factories) |f| if (std.mem.eql(u8, f, nm)) return true;
+    return false;
+}
+
+fn literalStable(e: *const Expr) bool {
+    return switch (e.*) {
+        .IntLit, .FloatLit, .BoolLit, .CharLit => true,
+        .StringTemplate => |st| blk: {
+            for (st.parts) |part| if (part == .Interp) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// Registry-only stability check for a parameter type at transform time
+/// (`active_stability` is the finished map; no recursion into declarations).
+fn typeStableFromMap(map: *const std.StringHashMap(Stability), t: *const TypeRef, tps: []const ast.TypeParam) bool {
+    if (t.function != null) return true;
+    const n = t.name.name;
+    if (isTypeParamName(n, tps)) return false;
+    if (isStableBuiltinType(n)) return true;
+    switch (map.get(n) orelse .unstable) {
+        .stable_annotated => return true,
+        .unstable => return false,
+        .stable => {
+            for (t.type_args) |*ta| {
+                if (ta.is_star) return false;
+                if (!typeStableFromMap(map, &ta.ty, tps)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+/// Whether the plugin gives `f` the skip calculus: every value parameter, the
+/// extension receiver, and the enclosing class (for a member) must be stable.
+/// No registry (`active_stability == null`) keeps the legacy all-stable
+/// behavior for direct unit-test callers.
+fn fnIsSkippable(f: *const Function, in_class: bool, enclosing_class: ?[]const u8) bool {
+    const map = active_stability orelse return true;
+    if (f.receiver_type) |*rt| {
+        if (!typeStableFromMap(map, rt, f.type_params)) return false;
+    }
+    if (in_class) {
+        const ec = enclosing_class orelse return false;
+        switch (map.get(ec) orelse Stability.unstable) {
+            .unstable => return false,
+            else => {},
+        }
+    }
+    for (f.params) |*p| {
+        if (p.is_vararg) continue; // keeps its own always-recompose arm
+        if (isComposableLambdaParam(p)) continue;
+        if (!typeStableFromMap(map, &p.ty, f.type_params)) return false;
+    }
+    return true;
+}
+
 /// Transform every `@Composable` top-level function in `decls` in place,
 /// threading the composer per the plugin ABI. `composable_names` is the oracle
 /// set (built with `collectComposableNames`, optionally extended with names from
@@ -562,7 +823,7 @@ pub fn transformDecls(
     lambda_sinks: *const std.StringHashMap(void),
 ) std.mem.Allocator.Error!void {
     var oracle = NameSetOracle{ .names = composable_names };
-    for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks, false);
+    for (decls) |*d| try transformDecl(a, d, &oracle, lambda_sinks, false, null);
 }
 
 fn transformDecl(
@@ -571,13 +832,14 @@ fn transformDecl(
     oracle: *NameSetOracle,
     sinks: *const std.StringHashMap(void),
     in_class: bool,
+    enclosing_class: ?[]const u8,
 ) std.mem.Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| {
             if (f.body == null) return;
             if (isComposable(f.annotations)) {
                 if (isRestartableComposable(f)) {
-                    f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks, in_class, null);
+                    f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks, in_class, null, enclosing_class);
                 } else {
                     f.* = try transformThreadedComposable(a, f, NameSetOracle.isComposableCall, oracle, sinks, null);
                 }
@@ -606,8 +868,8 @@ fn transformDecl(
                 };
             }
         },
-        .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks, true),
-        .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks, true),
+        .Class => |*c| for (c.members) |*m| try transformDecl(a, m, oracle, sinks, true, c.name.name),
+        .Object => |*o| for (o.members) |*m| try transformDecl(a, m, oracle, sinks, true, o.name.name),
         .Property => |p| {
             const pb = B{ .a = a, .gen_span = p.span };
             var w = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
@@ -745,8 +1007,12 @@ pub fn transformComposableFunction(
     sinks: ?*const std.StringHashMap(void),
     in_class: bool,
     locals: ?*std.StringHashMap(void),
+    enclosing_class: ?[]const u8,
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
+    // kotlinc parity: any unstable value parameter (or receiver) makes the
+    // function restartable but NOT skippable — no probes, no skip branch.
+    const skippable = emit_skip_calculus and fnIsSkippable(f, in_class, enclosing_class);
 
     // 1. Signature: append `$composer: Composer` and `$changed: Int`; move
     //    composable defaults into the body prologue.
@@ -793,7 +1059,7 @@ pub fn transformComposableFunction(
     // recomposes; a receiver (member or extension) probes `this`. Probes run
     // AFTER the defaults prologue so a defaulted parameter probes its
     // resolved value.
-    if (emit_skip_calculus) {
+    if (skippable) {
         const dirty_prop = try a.create(ast.Property);
         dirty_prop.* = .{
             .mutable = true,
@@ -867,7 +1133,10 @@ pub fn transformComposableFunction(
     }
     const skip_stmts = try a.alloc(Stmt, 1);
     skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };
-    const params_changed = Expr{ .Binary = .{
+    // Skippable: `$dirty != 0 || !$composer.skipping`. Non-skippable keeps the
+    // shouldExecute pause point but always executes (`true`), exactly as the
+    // plugin emits for a restartable-but-not-skippable composable.
+    const params_changed: Expr = if (skippable) .{ .Binary = .{
         .op = .Or,
         .lhs = b.box(.{ .Binary = .{
             .op = .Neq,
@@ -881,10 +1150,10 @@ pub fn transformComposableFunction(
             .span = b.gen_span,
         } }),
         .span = b.gen_span,
-    } };
+    } } else .{ .BoolLit = .{ .value = true, .span = b.gen_span } };
     const se_args = try a.alloc(Expr, 2);
     se_args[0] = params_changed;
-    se_args[1] = b.callMember(b.pathExpr(dirty_local), "and", b.slice1(b.intLit(1)));
+    se_args[1] = b.callMember(b.pathExpr(if (skippable) dirty_local else changed_param), "and", b.slice1(b.intLit(1)));
     const run_cond = b.callMember(b.pathExpr(composer_param), "shouldExecute", se_args);
     try out.append(a, .{ .Expr = .{ .If = .{
         .cond = b.box(run_cond),
@@ -1121,7 +1390,7 @@ const Walker = struct {
                     }
                     try w.locals.?.put(f.name.name, {});
                     if (isRestartableComposable(f)) {
-                        f.* = try transformComposableFunction(w.a, f, w.oracle, w.oracle_ctx, w.sinks, false, w.locals);
+                        f.* = try transformComposableFunction(w.a, f, w.oracle, w.oracle_ctx, w.sinks, false, w.locals, null);
                     } else {
                         f.* = try transformThreadedComposable(w.a, f, w.oracle, w.oracle_ctx, w.sinks, w.locals);
                     }
@@ -1289,6 +1558,58 @@ const Walker = struct {
         w.wrapBranchInReplaceGroup(branch);
     }
 
+    /// Rewrite a (threaded) `key(k…, block, …)` call into
+    ///     { $composer.startMovableGroup(<site key>, <joined keys>)
+    ///       val $key$v = key(…)
+    ///       $composer.endMovableGroup()
+    ///       $key$v }
+    /// `dyn_n` is the count of dynamic key arguments (the original args
+    /// before the content lambda). Multiple keys join pairwise through
+    /// `$composer.joinKey`, exactly as the plugin emits.
+    fn wrapKeyCall(w: *Walker, e: *Expr, dyn_n: usize) void {
+        const call_expr = e.*;
+        const sp = exprSpanOf(&call_expr);
+        var joined = call_expr.Call.args[0];
+        for (call_expr.Call.args[1..dyn_n]) |k| {
+            const jargs = w.a.alloc(Expr, 2) catch @panic("oom");
+            jargs[0] = joined;
+            jargs[1] = k;
+            joined = w.b.callMember(w.composerRef(), "joinKey", jargs);
+        }
+        const start_args = w.a.alloc(Expr, 2) catch @panic("oom");
+        start_args[0] = w.b.intLit(positionalKey(sp));
+        start_args[1] = joined;
+        const result_prop = w.a.create(ast.Property) catch @panic("oom");
+        result_prop.* = .{
+            .mutable = false,
+            .name = w.b.ident("$key$v"),
+            .receiver_type = null,
+            .ty = null,
+            .init = call_expr,
+            .delegate = null,
+            .getter = null,
+            .setter = null,
+            .is_abstract = false,
+            .is_open = false,
+            .is_override = false,
+            .is_lateinit = false,
+            .is_const = false,
+            .is_inline = false,
+            .is_expect = false,
+            .is_actual = false,
+            .setter_visibility = null,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = w.b.gen_span,
+        };
+        const stmts = w.a.alloc(ast.Stmt, 4) catch @panic("oom");
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startMovableGroup", start_args) };
+        stmts[1] = .{ .Decl = .{ .Property = result_prop } };
+        stmts[2] = .{ .Expr = w.b.callMember(w.composerRef(), "endMovableGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        stmts[3] = .{ .Expr = w.b.pathExpr("$key$v") };
+        e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+    }
+
     fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
         if (branch.* != .Block) return;
         const blk = &branch.Block;
@@ -1314,6 +1635,13 @@ const Walker = struct {
             .Call => |*c| {
                 try w.walkExpr(c.callee);
                 const name = calleeSimpleName(c.callee);
+                // `key(k…) { content }` before its args gain the composer
+                // pair: the dynamic key count is every argument before the
+                // trailing content lambda.
+                const key_dyn_n: usize = if (c.args.len >= 2) c.args.len - 1 else 0;
+                const is_key_call = w.thread and name != null and
+                    std.mem.eql(u8, name.?, "key") and key_dyn_n >= 1 and
+                    c.args[c.args.len - 1] == .Lambda and w.oracle(w.oracle_ctx, "key");
                 // A trailing lambda bound to a `@Composable`-typed parameter
                 // becomes a `{ …, $composer, $changed -> … }` lambda (the plugin
                 // lowers composable lambdas to FunctionN<…, Composer, Int, …>);
@@ -1489,6 +1817,14 @@ const Walker = struct {
                         if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
                     }
                 }
+                // `key(k…) { content }` is a COMPILER intrinsic: kotlinc
+                // brackets it with a MOVABLE group whose data key joins the
+                // dynamic key arguments, so a changed key replaces (or moves)
+                // the content's group identity. The upstream function body is
+                // just `block()` — without the bracket the dynamic keys are
+                // ignored entirely (a `key(k)` flip recomposed in place and
+                // reported "no changes").
+                if (is_key_call) w.wrapKeyCall(e, key_dyn_n);
             },
             .Member => |*m| try w.walkExpr(m.receiver),
             .Index => |*ix| {
@@ -2101,7 +2437,7 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     var sinks = std.StringHashMap(void).init(a);
     try sinks.put("Column", {});
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null);
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
     // The Column call sits inside the skip-if's then-block.
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
@@ -2207,7 +2543,7 @@ test "walker replaces currentComposer with the threaded composer inside a nested
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, allComposable, &ctx, null, false, null);
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, null, false, null, null);
     // The Emit call sits inside the skip-if's then-block.
     const emit = wrappedBodyStmts(&out)[0].Expr.Call;
     // Emit gained ($composer, 0); its first arg — originally currentComposer —
@@ -2261,7 +2597,7 @@ test "transform injects composer/changed params and brackets the body" {
     const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null);
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null, null);
 
     // Signature gained the two synthetic params.
     try testing.expectEqual(@as(usize, 3), out.params.len);
@@ -2323,7 +2659,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     const app = emptyFn("App", &app_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
 
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null);
+    const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null, null);
 
     // The param is renamed and its default is the marker call.
     try testing.expectEqualStrings("x$arg", out.params[0].name.name);
@@ -2400,7 +2736,7 @@ test "non-composable callees are not threaded" {
     var noparams: [0]Param = .{};
     const fnp = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null, false, null);
+    const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null, false, null, null);
     // println keeps 0 args (not threaded).
     try testing.expectEqual(@as(usize, 0), wrappedBodyStmts(&out)[0].Expr.Call.args.len);
 }
@@ -2454,10 +2790,221 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     active_sink_arity = &arity;
     defer active_sink_arity = null;
     var ctx: u8 = 0;
-    const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null);
+    const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null, null);
     const call = wrappedBodyStmts(&out)[0].Expr.Call;
     const lam = call.args[call.args.len - 1].Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
+}
+
+fn testTypeRef(name: []const u8) TypeRef {
+    return .{
+        .name = dummyIdent(name),
+        .nullable = false,
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
+fn testClassParam(name: []const u8, ty_name: []const u8, mutable_prop: ?bool) ast.ClassParam {
+    return .{
+        .property = mutable_prop,
+        .name = dummyIdent(name),
+        .ty = testTypeRef(ty_name),
+        .default = null,
+        .visibility = .Public,
+        .is_vararg = false,
+        .annotations = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    };
+}
+
+fn testClass(name: []const u8, primary_params: []ast.ClassParam) ast.Class {
+    return .{
+        .name = dummyIdent(name),
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .primary_params = primary_params,
+        .init_blocks = &.{},
+        .init_block_positions = &.{},
+        .supertypes = &.{},
+        .supertype_args = &.{},
+        .supertype_delegates = &.{},
+        .is_data = false,
+        .is_companion = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .secondary_ctors = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .is_value = false,
+        .is_annotation = false,
+        .is_expect = false,
+        .is_actual = false,
+        .enum_entries = &.{},
+        .members = &.{},
+        .visibility = .Public,
+        .primary_ctor_visibility = null,
+        .annotations = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    };
+}
+
+test "stability: a var-bearing class is unstable, a val-only class is stable" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // class Model(var contacts: String); class Point(val x: Int, val y: Int)
+    var model_params = [_]ast.ClassParam{testClassParam("contacts", "String", true)};
+    var point_params = [_]ast.ClassParam{
+        testClassParam("x", "Int", false),
+        testClassParam("y", "Int", false),
+    };
+    var decls = [_]Decl{
+        .{ .Class = testClass("Model", &model_params) },
+        .{ .Class = testClass("Point", &point_params) },
+    };
+    var map = try collectClassStability(a, &decls, &.{});
+    defer map.deinit();
+    try testing.expectEqual(Stability.unstable, map.get("Model").?);
+    try testing.expectEqual(Stability.stable, map.get("Point").?);
+}
+
+test "stability: an unstable param drops the skip calculus, a stable one keeps it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    var model_params = [_]ast.ClassParam{testClassParam("contacts", "String", true)};
+    var decls = [_]Decl{.{ .Class = testClass("Model", &model_params) }};
+    var map = try collectClassStability(a, &decls, &.{});
+    defer map.deinit();
+    active_stability = &map;
+    defer active_stability = null;
+
+    var body_stmts = [_]Stmt{};
+    var ctx: u8 = 0;
+
+    // @Composable fun Show(m: Model) — restartable but NOT skippable:
+    // no $dirty, no changed() probe, shouldExecute(true, $changed and 1).
+    var unstable_params = [_]Param{.{
+        .name = dummyIdent("m"),
+        .ty = testTypeRef("Model"),
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = gsp,
+    }};
+    const show = emptyFn("Show", &unstable_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+    const out = try transformComposableFunction(a, &show, allComposable, &ctx, null, false, null, null);
+    const stmts = out.body.?.Block.stmts;
+    // startRestartGroup + shouldExecute-if + endRestartGroup (no $dirty decl,
+    // no probes).
+    try testing.expectEqual(@as(usize, 3), stmts.len);
+    const cond = stmts[1].Expr.If.cond.Call;
+    try testing.expectEqualStrings("shouldExecute", cond.callee.Member.name.name);
+    try testing.expect(cond.args[0].BoolLit.value);
+    // The pause argument reads $changed (there is no $dirty).
+    try testing.expectEqualStrings(changed_param, cond.args[1].Call.callee.Member.receiver.Path.segments[0].name);
+    // The restart re-call is still emitted.
+    try testing.expectEqualStrings("updateScope", stmts[2].Expr.Call.callee.Member.name.name);
+
+    // @Composable fun ShowInt(x: Int) keeps the probe + $dirty calculus.
+    var stable_params = [_]Param{.{
+        .name = dummyIdent("x"),
+        .ty = testTypeRef("Int"),
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = gsp,
+    }};
+    var body_stmts2 = [_]Stmt{};
+    const show_int = emptyFn("ShowInt", &stable_params, .{ .Block = .{ .stmts = &body_stmts2, .span = gsp } }, true);
+    const out2 = try transformComposableFunction(a, &show_int, allComposable, &ctx, null, false, null, null);
+    const stmts2 = out2.body.?.Block.stmts;
+    // startRestartGroup + $dirty + probe + skip-if + endRestartGroup.
+    try testing.expectEqual(@as(usize, 5), stmts2.len);
+    try testing.expectEqualStrings(dirty_local, stmts2[1].Decl.Property.name.name);
+}
+
+test "key(k) { } gains a movable-group bracket with the dynamic key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 40, 60);
+
+    // @Composable fun Host() { key(k) { Text("hi") } }
+    var text_segs = [_]Ident{dummyIdent("Text")};
+    var text_callee = Expr{ .Path = .{ .segments = &text_segs, .span = gsp } };
+    var str_parts = [_]ast.StringPart{.{ .Text = "hi" }};
+    var text_args = [_]Expr{.{ .StringTemplate = .{ .parts = &str_parts, .span = gsp } }};
+    var text_names = [_]?[]const u8{null};
+    var lam_body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &text_callee,
+        .args = &text_args,
+        .arg_names = &text_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } } }};
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var k_segs = [_]Ident{dummyIdent("k")};
+    var key_args = [_]Expr{
+        .{ .Path = .{ .segments = &k_segs, .span = gsp } },
+        .{ .Lambda = .{
+            .params = &lam_params,
+            .param_tys = &lam_ptys,
+            .body = .{ .stmts = &lam_body_stmts, .span = gsp },
+            .implicit_it = true,
+            .span = gsp,
+        } },
+    };
+    var key_segs = [_]Ident{dummyIdent("key")};
+    var key_callee = Expr{ .Path = .{ .segments = &key_segs, .span = gsp } };
+    var key_names = [_]?[]const u8{ null, null };
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &key_callee,
+        .args = &key_args,
+        .arg_names = &key_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+    var sinks = std.StringHashMap(void).init(a);
+    try sinks.put("key", {});
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
+    // The key call became { startMovableGroup(site, k); val $key$v = key(...);
+    // endMovableGroup(); $key$v }.
+    const blk = wrappedBodyStmts(&out)[0].Expr.Block;
+    try testing.expectEqual(@as(usize, 4), blk.stmts.len);
+    const start = blk.stmts[0].Expr.Call;
+    try testing.expectEqualStrings("startMovableGroup", start.callee.Member.name.name);
+    try testing.expectEqual(@as(usize, 2), start.args.len);
+    try testing.expectEqualStrings("k", start.args[1].Path.segments[0].name);
+    const kcall = blk.stmts[1].Decl.Property.init.?.Call;
+    try testing.expectEqualStrings("key", kcall.callee.Path.segments[0].name);
+    // Threaded: keys + lambda + $composer + $changed.
+    try testing.expectEqual(@as(usize, 4), kcall.args.len);
+    try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
 }

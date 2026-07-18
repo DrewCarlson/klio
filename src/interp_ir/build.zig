@@ -495,6 +495,14 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_inline_fns = null;
         compose_pass.active_sink_last_param = &sink_last_param;
         defer compose_pass.active_sink_last_param = null;
+        var stability = try compose_pass.collectClassStability(
+            allocator,
+            decls.items,
+            if (base) |bsp| bsp.lifted_decls else &.{},
+        );
+        defer stability.deinit();
+        compose_pass.active_stability = &stability;
+        defer compose_pass.active_stability = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
     }
 
