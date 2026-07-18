@@ -1526,6 +1526,42 @@ pub fn evalWithCapturesIn(
 /// `with`, …) only ever matches through `implicit_label` — used when a
 /// labeled return is spliced out of an inlined argument lambda as a
 /// `LabeledReturn` and must unwind to the labeled lambda's frame.
+/// Pop try frames until one with a finally is found (skipping the frame whose
+/// finally body is currently executing, `cur`); catch clauses never intercept
+/// a non-local return. Null when no finally remains armed.
+fn nearestFinally(try_stack: *std.ArrayList(TryFrame), cur: BlockId) ?struct { jump: BlockId, key: BlockId } {
+    while (try_stack.pop()) |tf| {
+        if (tf.finally_entry) |fin| {
+            if (std.meta.eql(fin, cur)) continue;
+            const key = tf.finally_done orelse fin;
+            return .{ .jump = fin, .key = key };
+        }
+    }
+    return null;
+}
+
+/// Where a non-local return goes once this frame's finallys have run: a
+/// labeled return is absorbed by the frame carrying its label, an untargeted
+/// one by the nearest non-lambda non-inline frame; anything else keeps
+/// unwinding as an error the caller frame routes the same way.
+fn unwindTerminal(frame: *Frame, e: EvalError) EvalResult {
+    switch (e) {
+        .NonLocalReturn => |v| {
+            if (frame.func.is_lambda or frame.func.is_inline) {
+                return errResult(.{ .NonLocalReturn = v });
+            }
+            return ok(v);
+        },
+        .LabeledReturn => |lr| {
+            if (frameMatchesLabel(frame.func, lr.label)) {
+                return ok(lr.value);
+            }
+            return errResult(e);
+        },
+        else => return errResult(e),
+    }
+}
+
 fn frameMatchesLabel(func: *const Func, label: []const u8) bool {
     if (std.mem.eql(u8, func.name, label)) return true;
     // A collision-mangled declaration (`makePending$f172`, a file-private
@@ -2214,6 +2250,10 @@ fn runFrameInner(
     // intercept the re-raised exception.
     var pending_rethrow: ?struct { key: BlockId, exc: Value, depth: usize } = null;
     var pending_return: ?struct { key: BlockId, val: Value } = null;
+    // A non-local return (`LabeledReturn` / `NonLocalReturn`) traversing this
+    // frame's finally blocks on its way out; same replay discipline as
+    // `pending_rethrow`.
+    var pending_unwind: ?struct { key: BlockId, err: EvalError, depth: usize } = null;
     const func: *const Func = frame.func;
     // Lazy IR: materialise a deferred function's blocks before the dispatch
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
@@ -2346,6 +2386,7 @@ fn runFrameInner(
             });
         }
         var thrown: ?Value = null;
+        var unwound: ?EvalError = null;
         var start_idx = resume_idx;
         resume_idx = 0;
         if (resume_throw) |exc| {
@@ -2376,16 +2417,16 @@ fn runFrameInner(
                         thrown = tv;
                         break;
                     },
-                    .NonLocalReturn => |v| {
-                        // A non-local return unwinds through the lambda
-                        // frame *and* through any inline-function frames it
-                        // was passed into, landing in the function that
-                        // wrote the lambda (Kotlin allows non-local return
-                        // only via inline functions).
-                        if (frame.func.is_lambda or frame.func.is_inline) {
-                            return errResult(.{ .NonLocalReturn = v });
-                        }
-                        return ok(v);
+                    .NonLocalReturn, .LabeledReturn => {
+                        // A non-local return (labeled or untargeted) unwinds
+                        // through the lambda frame *and* through any
+                        // inline-function frames it was passed into, landing
+                        // in the function that wrote the lambda (Kotlin allows
+                        // non-local return only via inline functions). Like a
+                        // throw, it runs the finally blocks of every armed try
+                        // region it crosses -- but no catch clause takes it.
+                        unwound = e;
+                        break;
                     },
                     .Suspended => |state| {
                         // Snapshot this activation so it can be resumed
@@ -2433,6 +2474,23 @@ fn runFrameInner(
                 }
             }
         }
+        if (unwound) |e| {
+            // Mid-block non-local return -- route through the armed finally
+            // blocks only (never a catch), then keep unwinding.
+            var routed = false;
+            while (try_stack.pop()) |tf| {
+                if (tf.finally_entry) |fin| {
+                    if (std.meta.eql(fin, cur)) continue;
+                    const key = tf.finally_done orelse fin;
+                    pending_unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
+                    cur = fin;
+                    routed = true;
+                    break;
+                }
+            }
+            if (!routed) return unwindTerminal(frame, e);
+            continue;
+        }
         if (thrown) |exc| {
             // Mid-block throw — same try-stack walk as Terminator.Throw.
             var routed = false;
@@ -2464,7 +2522,7 @@ fn runFrameInner(
             continue;
         }
         // Symmetric try-stack pop on normal flow through finally.
-        if (term == .Goto and pending_rethrow == null and pending_return == null) {
+        if (term == .Goto and pending_rethrow == null and pending_return == null and pending_unwind == null) {
             const done_for = frame.block(cur).finally_done_for;
             const pos: ?usize = if (done_for) |body|
                 rpositionByBody(try_stack.items, body)
@@ -2554,6 +2612,32 @@ fn runFrameInner(
                 pending_rethrow = null;
             }
         }
+        // Finally exit with a pending non-local return: replay it through any
+        // outer finally, otherwise resume the unwind out of this frame.
+        if (pending_unwind) |pu| {
+            if (std.meta.eql(pu.key, cur) and term == .Goto) {
+                const e = pu.err;
+                pending_unwind = null;
+                if (try_stack.items.len > pu.depth) try_stack.shrinkRetainingCapacity(pu.depth);
+                var routed = false;
+                while (try_stack.pop()) |tf| {
+                    if (tf.finally_entry) |fin2| {
+                        const key = tf.finally_done orelse fin2;
+                        pending_unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
+                        cur = fin2;
+                        routed = true;
+                        break;
+                    }
+                }
+                if (!routed) return unwindTerminal(frame, e);
+                continue;
+            }
+            // A `return` / `throw` inside the finally replaces the pending
+            // non-local return.
+            if (std.meta.eql(pu.key, cur) and isReturnLike(term)) {
+                pending_unwind = null;
+            }
+        }
         switch (term) {
             .Goto => |next| cur = next,
             .Branch => |br| {
@@ -2595,10 +2679,13 @@ fn runFrameInner(
             .NonLocalReturn => |maybe_r| {
                 const v = if (maybe_r) |r| frame.read(r) else Value.Unit;
                 v.retain();
-                if (frame.func.is_lambda or frame.func.is_inline) {
-                    return errResult(.{ .NonLocalReturn = v });
+                const e = EvalError{ .NonLocalReturn = v };
+                if (nearestFinally(try_stack, cur)) |c| {
+                    pending_unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
+                    cur = c.jump;
+                    continue;
                 }
-                return ok(v);
+                return unwindTerminal(frame, e);
             },
             .LabeledReturn => |lr| {
                 if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
@@ -2607,10 +2694,13 @@ fn runFrameInner(
                 }
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
                 v.retain();
-                if (frameMatchesLabel(frame.func, lr.label)) {
-                    return ok(v);
+                const e = EvalError{ .LabeledReturn = .{ .label = lr.label, .value = v } };
+                if (nearestFinally(try_stack, cur)) |c| {
+                    pending_unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
+                    cur = c.jump;
+                    continue;
                 }
-                return errResult(.{ .LabeledReturn = .{ .label = lr.label, .value = v } });
+                return unwindTerminal(frame, e);
             },
             .Throw => |r| {
                 var exc = frame.read(r);

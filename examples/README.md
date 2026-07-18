@@ -23,6 +23,7 @@ Run any program with:
 | `do_while.kt`            | `do`/`while` loops.                                              |
 | `labeled_jumps.kt`       | Labeled `break` / `continue` / `return`.                         |
 | `labeled_return_scope.kt` | `return@apply` exits the block only — the scoped function still returns its receiver, including when the receiver is itself a constructor call and when the return crosses a nested inline lambda. |
+| `nonlocal_return_finally.kt` | A bare `return` in an argument lambda returns from the function the lambda is written in — a LOCAL fun included — and runs every `finally` the unwind crosses, through a non-spliced inline callee's real frame. |
 | `const_val.kt`           | `const val` and compile-time constants.                          |
 | `top_level_computed_val.kt` | Top-level `val` with a custom getter (no backing field) re-evaluating per read. |
 | `definite_assignment.kt` | Definite-assignment behavior for `val`.                          |
