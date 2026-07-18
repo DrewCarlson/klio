@@ -785,10 +785,18 @@ fn lowerAssign(
             // produce a fresh list and leave the original untouched. A val /
             // member / global target cannot be rebound, so the in-place
             // operator is what Kotlin uses there.
+            // A boxed name is a captured-and-written `var`: it is always
+            // reassignable through its shared cell, whether or not the name
+            // also `resolve`s to a reg in this frame (inside a lambda nested
+            // in a property GETTER the capture is reached only through the
+            // cell, so `resolve` returns null even though the write-back path
+            // rebinds it fine). Treating it as a reassignable local keeps the
+            // combine on Kotlin's `a = a.plus(b)` form instead of dispatching
+            // the in-place `plusAssign`, which an `Int` does not declare.
             const target_reassignable_local = switch (target.*) {
                 .Path => |p| p.segments.len == 1 and
-                    b.resolve(p.segments[0].name) != null and
-                    (b.isMutable(p.segments[0].name) or b.isBoxed(p.segments[0].name)),
+                    (b.isBoxed(p.segments[0].name) or
+                        (b.resolve(p.segments[0].name) != null and b.isMutable(p.segments[0].name))),
                 else => false,
             };
             const dst = b.allocReg();

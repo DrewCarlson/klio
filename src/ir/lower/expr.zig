@@ -1320,6 +1320,23 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (std.mem.eql(u8, name0, "Unit") and b.resolve("Unit") == null) {
             return b.emitConst(.Unit);
         }
+        // Splice hygiene for the suspend-implicit `coroutineContext`: inside a
+        // SPLICED inline-fn body (not an inline-argument lambda, whose source
+        // lives at the caller), the bare name means the intrinsic — the callee
+        // could not see a caller local/param that happens to share it. Without
+        // this, `currentCoroutineContext()` (body: bare `coroutineContext`)
+        // spliced into a function with a `coroutineContext` PARAMETER answered
+        // with the parameter.
+        if (std.mem.eql(u8, name0, "coroutineContext") and b.lambda_splice_resolve == null) {
+            if (b.inlineLambdaCallerDepth()) |base| {
+                if (b.resolveSpliceLocal(name0, base) == null) {
+                    const dst = b.allocReg();
+                    const n = try b.module.internConst(b.allocator, .{ .String = "coroutineContext" });
+                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+                    return dst;
+                }
+            }
+        }
         if (b.resolve(name0)) |r| {
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
@@ -2705,9 +2722,17 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         if (fallback == null) fallback = fid;
     }
     if (fallback) |fid| return fid;
+    // A member on the enclosing/receiver class outranks a SIGNATURE-ONLY
+    // top-level namesake: at pack bake the StateRecord.withCurrent extension
+    // is still body-less while SnapshotStateMap.mutate's call to its own
+    // private withCurrent lowers, and letting the extension's (r: T) -> R
+    // arity re-shape the member call's `{ this }` block made a fresh engine
+    // pack return the outer map from every mutate (the get_field-map
+    // family). A WITH-BODY top-level (the fallback above) still wins as
+    // before.
+    if (memberHostingTrailingLambda(b, name, user_arg_count)) |fid| return fid;
     if (bodyless) |fid| return fid;
-    // No top-level function serves the name at this arity: it may be a member.
-    return memberHostingTrailingLambda(b, name, user_arg_count);
+    return null;
 }
 
 /// Whether any argument in the call is passed by name.

@@ -86,6 +86,14 @@ const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "
 /// EQUAL across recompositions and its group skips.
 const composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambda" };
 const composable_lambda_instance_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambdaInstance" };
+/// `androidx.compose.runtime.internal.rememberComposableLambda(key, tracked,
+/// block)` — the modern memoization wrapper. Unlike `composableLambda`, which
+/// opens a movable child group, this stores the `ComposableLambdaImpl` in a
+/// `remember` SLOT of the current group, so it adds no child group. A group
+/// here would sit as an extra first child of an enclosing reusable group and
+/// hide the real content from `deactivateToEndGroup` (which deactivates the
+/// group's first child subtree).
+const remember_composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "rememberComposableLambda" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -130,6 +138,18 @@ fn isRestartableComposable(f: *const Function) bool {
         if (std.mem.eql(u8, nm, "ExplicitGroupsComposable")) return false;
     }
     return true;
+}
+
+/// A `@Composable` function annotated `@ExplicitGroupsComposable`: it emits its
+/// own groups explicitly, so the plugin threads the composer but inserts no
+/// automatic groups (no restart bracket — see `isRestartableComposable` — and
+/// no per-branch replace-groups).
+fn isExplicitGroups(f: *const Function) bool {
+    for (f.annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "ExplicitGroupsComposable")) return true;
+    }
+    return false;
 }
 
 /// A stable positional group key for a call site, derived from its span. The
@@ -907,6 +927,33 @@ fn markerCall(b: B) Expr {
     return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
 }
 
+/// Guard a marker-defaulted param's skip-calculus probe with
+/// `if (p$arg !== marker()) { <probe> }`. A parameter that fell back to its
+/// default value is NOT probed: kotlinc's `$default`-mask path sets the dirty
+/// bits directly and never emits a `composer.changed()` for it, so probing it
+/// here would store an extra slot the compiler never stores (the slot-size
+/// validation tests count exactly these). The default's own composition-local
+/// / snapshot-state reads still invalidate the scope when they change, so
+/// skipping the probe does not lose recomposition. A defaulted param that the
+/// caller DID pass (`p$arg !== marker()`) is probed normally, matching the
+/// compiler's uncertain-bits path.
+fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt) Stmt {
+    const not_default = Expr{ .Binary = .{
+        .op = .IdentNeq,
+        .lhs = b.box(b.pathExpr(arg_name)),
+        .rhs = b.box(markerCall(b)),
+        .span = b.gen_span,
+    } };
+    const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    then_stmts[0] = probe;
+    return .{ .Expr = .{ .If = .{
+        .cond = b.box(not_default),
+        .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
+        .else_branch = null,
+        .span = b.gen_span,
+    } } };
+}
+
 /// `$dirty = $dirty or (if (<probe>) 2 else 0)` — one skip-calculus probe.
 fn dirtyOrProbe(b: B, probe: Expr) Stmt {
     const pick = Expr{ .If = .{
@@ -1101,11 +1148,17 @@ pub fn transformComposableFunction(
                 } });
                 continue;
             }
-            try out.append(a, dirtyOrProbe(b, b.callMember(
+            const probe = dirtyOrProbe(b, b.callMember(
                 b.pathExpr(composer_param),
                 "changed",
                 b.slice1(b.pathExpr(p.name.name)),
-            )));
+            ));
+            if (p.default != null and f.body != null) {
+                const arg_name = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
+                try out.append(a, dirtyProbeIfPassed(b, arg_name, probe));
+            } else {
+                try out.append(a, probe);
+            }
         }
     }
     // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping,
@@ -1186,7 +1239,7 @@ pub fn transformThreadedComposable(
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };
     const body = f.body orelse return signatureOnly(f, params);
     switch (body) {
         .Block => |blk| {
@@ -1255,6 +1308,16 @@ const Walker = struct {
     /// no `$composer` param. Composer references resolve through the
     /// `__compose_currentComposer` host intrinsic instead.
     ambient: bool = false,
+    /// The enclosing function is `@ExplicitGroupsComposable`: it manages its
+    /// own groups with explicit `startX`/`endX` composer calls, so the plugin
+    /// must NOT insert the automatic per-branch replace-groups it inserts for
+    /// ordinary composable bodies. Inserting them corrupts the group structure
+    /// (e.g. `ReusableContentHost`'s `if (active) content() else
+    /// deactivateToEndGroup()` — a branch bracket makes the `else` deactivate
+    /// path start a key-mismatched replace-group that deletes the reused
+    /// content's nodes). Reset to false inside a nested composable lambda,
+    /// which is its own (non-explicit) scope.
+    explicit_groups: bool = false,
     /// Whether the current scope is composable — a composable function body or a
     /// composable lambda body. Only there are @Composable calls threaded and
     /// `currentComposer` substituted. A non-composable body is still walked (to
@@ -1336,7 +1399,10 @@ const Walker = struct {
             // its value must not be displaced.
             .Expr => |*e| {
                 try w.walkExpr(e);
-                if (w.thread) w.wrapStatementConditional(e);
+                // An `@ExplicitGroupsComposable` body manages its own groups; the
+                // plugin must not add per-branch replace-groups to its statement
+                // conditionals (see `explicit_groups`).
+                if (w.thread and !w.explicit_groups) w.wrapStatementConditional(e);
             },
             .Assign => |*asg| {
                 try w.walkExpr(&asg.target);
@@ -1467,19 +1533,25 @@ const Walker = struct {
     }
 
     /// Replace a just-transformed composable lambda ARGUMENT with
-    /// `composableLambda($composer, <span key>, true, <lambda>)` — the
-    /// remembered instance the engine slots, so `composer.changed(content)`
+    /// `rememberComposableLambda(<span key>, true, <lambda>, $composer, 0)` —
+    /// the remembered instance the engine slots, so `composer.changed(content)`
     /// is false when the content is unchanged and the child group SKIPS.
     /// Threaded scope only ($composer must be in scope); entry-point sinks
     /// in plain scope stay raw (invokeComposable wraps the root itself).
     fn wrapInComposableLambda(w: *Walker, arg: *Expr) void {
         const key = positionalKey(exprSpanOf(arg));
-        const args = w.a.alloc(Expr, 4) catch @panic("oom");
-        args[0] = w.composerRef();
-        args[1] = w.b.intLit(key);
-        args[2] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
-        args[3] = arg.*;
-        arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_path), args);
+        // `rememberComposableLambda(key, tracked, block)` threaded with the
+        // composer pair: `rememberComposableLambda(key, true, block, $composer,
+        // 0)`. It remembers the `ComposableLambdaImpl` in a slot of the current
+        // group rather than opening a child group (the pre-1.5 `composableLambda`
+        // did the latter, whose stray group breaks `deactivateToEndGroup`).
+        const args = w.a.alloc(Expr, 5) catch @panic("oom");
+        args[0] = w.b.intLit(key);
+        args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        args[2] = arg.*;
+        args[3] = w.composerRef();
+        args[4] = w.b.intLit(0);
+        arg.* = w.b.call(w.b.pathExprSegs(&remember_composable_lambda_path), args);
     }
 
     /// A composable lambda RETURNED by a (non-composable) factory has no
@@ -1907,9 +1979,24 @@ const Walker = struct {
                 // be displaced by the bracket call. A `return` inside the
                 // branch skips the end call (kotlinc brackets returns too;
                 // acceptable gap, noted).
-                if (w.thread and (w.branchHasComposable(f.then_branch) or
+                if (w.thread and !w.explicit_groups and (w.branchHasComposable(f.then_branch) or
                     (if (f.else_branch) |eb2| w.branchHasComposable(eb2) else false)))
                 {
+                    // A composable `if` with no `else` still needs a group in
+                    // the not-taken branch: without it the conditional's group
+                    // is absent when the condition is false and present when
+                    // true, so a flip shifts every following sibling and
+                    // `startReplaceGroup` deletes the sibling that moved into
+                    // its slot (kotlinc emits the same synthesized empty else).
+                    if (f.else_branch == null) {
+                        // Key the empty else off the `if`'s own span so each
+                        // conditional's else group is stable and distinct from
+                        // its then group (which keys off the then-branch span).
+                        const eb = w.a.create(Expr) catch @panic("oom");
+                        const empty = w.a.alloc(ast.Stmt, 0) catch @panic("oom");
+                        eb.* = .{ .Block = .{ .stmts = empty, .span = f.span } };
+                        f.else_branch = eb;
+                    }
                     w.wrapBranchInReplaceGroup(f.then_branch);
                     if (f.else_branch) |eb| w.wrapBranchInReplaceGroup(eb);
                 }
@@ -1977,7 +2064,7 @@ const Walker = struct {
                 // composable content needs a slot-alignment bracket per
                 // branch, or a branch flip cannot replace its content
                 // atomically. Statement-shaped (Block) branches only.
-                if (w.thread and any_composable) {
+                if (w.thread and !w.explicit_groups and any_composable) {
                     for (wh.branches) |*br| w.wrapBranchInReplaceGroup(&br.body);
                 }
             },
@@ -2027,9 +2114,13 @@ const Walker = struct {
         lam.param_tys = new_tys;
         lam.implicit_it = false;
         // The lambda body IS composable: thread it (and substitute
-        // currentComposer) even when the enclosing scope was not.
+        // currentComposer) even when the enclosing scope was not. A composable
+        // lambda is its own scope, not the enclosing `@ExplicitGroupsComposable`
+        // function's — its branches take the automatic replace-groups again.
         const saved = w.thread;
+        const saved_eg = w.explicit_groups;
         w.thread = true;
+        w.explicit_groups = false;
         // Register this lambda as a `return@label` target so a nested non-local
         // return can close the groups it opened. The marker capture is prepended
         // only if such a return is found while walking the body.
@@ -2047,6 +2138,7 @@ const Walker = struct {
             if (sc.needs) prependMarkerCapture(w, lam, marker_var.?);
         }
         w.thread = saved;
+        w.explicit_groups = saved_eg;
         // A labeled early return (`return@run`) crossing a wrapped branch
         // bracket must close the replace-groups it exits; the content
         // lambda's restart group belongs to ComposableLambdaImpl, so only
@@ -2098,12 +2190,28 @@ const Walker = struct {
     /// into the first omitted param. Named, the binder slots the pair exactly
     /// and the omitted params take their defaults.
     fn threadCall(w: *Walker, c: anytype, positional: bool) std.mem.Allocator.Error!void {
+        const had_trailing = c.has_trailing_lambda;
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
         new_args[c.args.len] = w.composerRef();
         new_args[c.args.len + 1] = w.b.intLit(0);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
+        // A trailing lambda bound the callee's last function-typed parameter,
+        // even across a defaulted middle parameter (`ExplicitStartReplaceGroup(
+        // key, insertGroup = true) { content }` binds the lambda to `content`,
+        // not `insertGroup`). Clearing `has_trailing_lambda` below and appending
+        // the composer pair strips that signal: the now-plain positional lambda
+        // would slide into the first open slot (`insertGroup`) and its `if
+        // (insertGroup)` sees a closure. Re-emit it by the callee's last
+        // parameter name so the binder rejoins it to `content` across the gap.
+        if (had_trailing and c.args.len != 0 and new_names[c.args.len - 1] == null) {
+            if (calleeSimpleName(c.callee)) |nm| {
+                if (active_sink_last_param) |lp| {
+                    if (lp.get(nm)) |pname| new_names[c.args.len - 1] = pname;
+                }
+            }
+        }
         if (!positional) {
             new_names[c.args.len] = composer_param;
             new_names[c.args.len + 1] = changed_param;
@@ -2575,12 +2683,15 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
     // The sink lambda is memoized — wrapped in
-    // `composableLambda($composer, key, true, <lambda>)` with the lambda last.
+    // `rememberComposableLambda(key, true, <lambda>, $composer, 0)`: the
+    // slot-based memoizer (no child group), block third, composer pair last.
     const memo = col.args[0].Call;
     const memo_path = memo.callee.Path;
-    try testing.expectEqualStrings("composableLambda", memo_path.segments[memo_path.segments.len - 1].name);
-    try testing.expectEqual(@as(usize, 4), memo.args.len);
-    const lam = memo.args[3].Lambda;
+    try testing.expectEqualStrings("rememberComposableLambda", memo_path.segments[memo_path.segments.len - 1].name);
+    try testing.expectEqual(@as(usize, 5), memo.args.len);
+    // The threaded composer pair trails the (key, tracked, block) triple.
+    try testing.expectEqualStrings(composer_param, memo.args[3].Path.segments[0].name);
+    const lam = memo.args[2].Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
     // ($composer, $changed), not appended after.
     try testing.expectEqual(@as(usize, 2), lam.params.len);
@@ -2812,8 +2923,14 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
     try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
 
+    // A DEFAULTED param's probe is guarded by `if (x$arg !== marker())` so a
+    // param that fell back to its default stores no `changed` slot.
+    const guard = stmts[3].Expr.If;
+    try testing.expect(guard.cond.Binary.op == .IdentNeq);
+    try testing.expectEqualStrings("x$arg", guard.cond.Binary.lhs.Path.segments[0].name);
+    const probe = guard.then_branch.Block.stmts[0];
     // The probe reads the RESOLVED value `x`, not the renamed argument.
-    try testing.expectEqualStrings("x", stmts[3].Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings("x", probe.Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
     // The restart re-call passes the RENAMED param (marker flows through).
     const upd = stmts[5].Expr.Call;
     const lam = upd.args[0].Lambda;
@@ -2846,6 +2963,58 @@ test "threadCall appends the composer pair as named args" {
     try testing.expectEqual(@as(usize, 2), c.args.len);
     try testing.expectEqualStrings(composer_param, c.arg_names[0].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[1].?);
+}
+
+test "threadCall re-names a trailing lambda across a defaulted gap" {
+    // `ExplicitStartReplaceGroup(key) { content }` — one positional arg then a
+    // trailing lambda binding the last param `content`, with a defaulted
+    // `insertGroup` in between. Threading appends the composer pair and clears
+    // `has_trailing_lambda`; the lambda must be re-emitted by name so it rejoins
+    // `content` rather than sliding into `insertGroup`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    var last_param = std.StringHashMap([]const u8).init(a);
+    try last_param.put("ExplicitStartReplaceGroup", "content");
+    active_sink_last_param = &last_param;
+    defer active_sink_last_param = null;
+
+    var callee_segs = [_]Ident{dummyIdent("ExplicitStartReplaceGroup")};
+    var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var args = [_]Expr{
+        .{ .IntLit = .{ .value = 42, .kind = .Int, .span = gsp } },
+        .{ .Lambda = .{
+            .params = &lam_params,
+            .param_tys = &lam_ptys,
+            .body = .{ .stmts = &.{}, .span = gsp },
+            .implicit_it = false,
+            .span = gsp,
+        } },
+    };
+    var arg_names = [_]?[]const u8{ null, null };
+    var call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } };
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx };
+    try w.threadCall(&call.Call, false);
+    const c = call.Call;
+    try testing.expectEqual(@as(usize, 4), c.args.len);
+    try testing.expect(c.arg_names[0] == null); // key stays positional
+    try testing.expectEqualStrings("content", c.arg_names[1].?); // lambda re-named
+    try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
+    try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
+    try testing.expect(!c.has_trailing_lambda);
 }
 
 test "non-composable callees are not threaded" {
@@ -3247,4 +3416,103 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     try testing.expectEqualStrings("endToMarker", cleanup.callee.Member.name.name);
     try testing.expectEqualStrings(marker_name, cleanup.args[0].Path.segments[0].name);
     try testing.expect(wrapped.Block.stmts[1].Expr == .Return);
+}
+
+var explicitGroupsAnno = [_]ast.Annotation{
+    .{
+        .use_site = null,
+        .path = &composablePath,
+        .type_args = &.{},
+        .args = &.{},
+        .arg_names = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    },
+    .{
+        .use_site = null,
+        .path = &explicitGroupsPath,
+        .type_args = &.{},
+        .args = &.{},
+        .arg_names = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    },
+};
+var explicitGroupsPath = [_]Ident{dummyIdent("ExplicitGroupsComposable")};
+
+// A statement-position `if (cond) { Foo() }` in an @ExplicitGroupsComposable
+// body must NOT gain the per-branch replace-group the plugin inserts for
+// ordinary composables — the function manages its own groups. (Inserting one
+// makes `ReusableContentHost`'s deactivate/reactivate branches mis-key their
+// groups and delete the reused nodes.) A plain @Composable inline body with the
+// same shape DOES get the bracket.
+test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 40, 60);
+
+    // Build `if (true) { Foo() }` as a statement body. `buildIfFooBody` is
+    // re-run per fixture so the two transforms don't share mutated AST.
+    const S = struct {
+        fn buildBody(al: std.mem.Allocator, sp: Span) ![]Stmt {
+            const foo_segs = try al.alloc(Ident, 1);
+            foo_segs[0] = dummyIdent("Foo");
+            const foo_callee = try al.create(Expr);
+            foo_callee.* = .{ .Path = .{ .segments = foo_segs, .span = sp } };
+            const foo_call = try al.create(Expr);
+            foo_call.* = .{ .Call = .{
+                .callee = foo_callee,
+                .args = &.{},
+                .arg_names = &.{},
+                .type_args = &.{},
+                .is_infix = false,
+                .has_trailing_lambda = false,
+                .span = sp,
+            } };
+            const then_stmts = try al.alloc(Stmt, 1);
+            then_stmts[0] = .{ .Expr = foo_call.* };
+            const then_branch = try al.create(Expr);
+            then_branch.* = .{ .Block = .{ .stmts = then_stmts, .span = sp } };
+            const cond = try al.create(Expr);
+            cond.* = .{ .BoolLit = .{ .value = true, .span = sp } };
+            const if_expr = Expr{ .If = .{
+                .cond = cond,
+                .then_branch = then_branch,
+                .else_branch = null,
+                .span = sp,
+            } };
+            const body = try al.alloc(Stmt, 1);
+            body[0] = .{ .Expr = if_expr };
+            return body;
+        }
+    };
+
+    var ctx: u8 = 0;
+
+    // Explicit-groups: no bracket.
+    const eg_body = try S.buildBody(a, gsp);
+    var eg = emptyFn("EgHost", &.{}, .{ .Block = .{ .stmts = eg_body, .span = gsp } }, true);
+    eg.is_inline = true;
+    eg.annotations = &explicitGroupsAnno;
+    const eg_out = try transformThreadedComposable(a, &eg, allComposable, &ctx, null, null);
+    const eg_if = eg_out.body.?.Block.stmts[0].Expr.If;
+    const eg_then = eg_if.then_branch.Block.stmts;
+    // First (and only) statement is the Foo() call, NOT a startReplaceGroup.
+    try testing.expect(!isComposerCallStmt(&eg_then[0], "startReplaceGroup"));
+    try testing.expectEqualStrings("Foo", eg_then[0].Expr.Call.callee.Path.segments[0].name);
+    // No synthesized else either — it manages its own groups.
+    try testing.expect(eg_if.else_branch == null);
+
+    // Plain composable inline: the branch IS bracketed.
+    const plain_body = try S.buildBody(a, gsp);
+    var plain = emptyFn("PlainHost", &.{}, .{ .Block = .{ .stmts = plain_body, .span = gsp } }, true);
+    plain.is_inline = true;
+    const plain_out = try transformThreadedComposable(a, &plain, allComposable, &ctx, null, null);
+    const plain_if = plain_out.body.?.Block.stmts[0].Expr.If;
+    try testing.expect(isComposerCallStmt(&plain_if.then_branch.Block.stmts[0], "startReplaceGroup"));
+    // A no-else composable `if` gains a synthesized empty else whose replace
+    // group keeps the conditional position-stable across a branch flip.
+    try testing.expect(plain_if.else_branch != null);
+    const plain_else = plain_if.else_branch.?.Block.stmts;
+    try testing.expect(isComposerCallStmt(&plain_else[0], "startReplaceGroup"));
+    try testing.expect(isComposerCallStmt(&plain_else[plain_else.len - 1], "endReplaceGroup"));
 }

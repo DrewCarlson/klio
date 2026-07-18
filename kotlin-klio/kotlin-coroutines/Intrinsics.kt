@@ -211,11 +211,21 @@ internal class KlioStartContinuation<T>(
         get() = completion.context
 
     public override fun resumeWith(result: Result<Unit>) {
+        // A failure resume of the START continuation aborts the coroutine
+        // before its body runs — the dispatcher observed a dead Job
+        // (`launch` into an already-cancelled Job) and resumed with the
+        // CancellationException. The body must NOT run; the failure
+        // completes the coroutine.
+        val comp = completion
+        val ex = result.exceptionOrNull()
+        if (ex != null) {
+            comp.resumeWith(Result.failure(ex))
+            return
+        }
         // Deliver the body's outcome to `completion` *inside* the
         // driver root: a suspension inside `body()` parks the whole
         // activation (including this pending completion delivery),
         // and the later resume drives it to the real result.
-        val comp = completion
         val b = body
         __klio_co_runRoot(comp) {
             val r: Result<T> = try {

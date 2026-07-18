@@ -411,6 +411,12 @@ pub fn lowerAccessorBlock(
     b.setOwnerClass(owner_class);
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    // Box body `var`s (and params) a nested lambda mutates into shared cells,
+    // exactly as a normal function body does — a block-body accessor
+    // (`val x get() { var acc = 0; xs.forEach { acc += it }; acc }`) that
+    // mutates a local from inside a non-inline lambda would otherwise capture
+    // a copy and lose the write.
+    try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
