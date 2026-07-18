@@ -147,10 +147,15 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
 }
 
 /// `filter == null` runs everything; otherwise a test runs when its display
-/// name (a top-level `method`, or a class's `Class`) contains the substring.
+/// name (a top-level `method`, or a class's `Class`) contains any of the
+/// comma-separated substrings.
 fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
-    return std.mem.indexOf(u8, name, pat) != null;
+    var it = std.mem.splitScalar(u8, pat, ',');
+    while (it.next()) |p| {
+        if (p.len != 0 and std.mem.indexOf(u8, name, p) != null) return true;
+    }
+    return false;
 }
 
 fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32, filter: ?[]const u8) Allocator.Error!Plan {
@@ -279,10 +284,10 @@ fn discoverClass(
     // only the methods whose `Class.method` display matches (a class whose
     // name matches keeps all its methods). Dropped methods are freed here.
     if (filter) |pat| {
-        if (std.mem.indexOf(u8, c.name.name, pat) == null) {
+        if (!filterMatches(pat, c.name.name)) {
             var kept: usize = 0;
             for (methods.items) |m| {
-                if (std.mem.indexOf(u8, m.display, pat) != null) {
+                if (filterMatches(pat, m.display)) {
                     methods.items[kept] = m;
                     kept += 1;
                 } else {
@@ -527,4 +532,12 @@ pub fn runTests(
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "filter matches any comma-separated substring" {
+    try std.testing.expect(filterMatches(null, "Anything"));
+    try std.testing.expect(filterMatches("Foo", "FooTests.bar"));
+    try std.testing.expect(filterMatches("Foo,Baz", "BazTests.qux"));
+    try std.testing.expect(!filterMatches("Foo,Baz", "QuuxTests.qux"));
+    try std.testing.expect(!filterMatches(",", "QuuxTests.qux"));
 }

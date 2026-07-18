@@ -1038,10 +1038,19 @@ const Walker = struct {
         switch (d.*) {
             .Property => |p| {
                 // `val content: @Composable () -> Unit = { … }` — the
-                // declared type makes the initializer lambda composable.
+                // declared type makes the initializer lambda composable —
+                // or `val content = @Composable { … }`, where the literal
+                // carries the annotation itself.
                 if (p.init) |*ini| {
                     if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
                         try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)));
+                    } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
+                        // No declared type: the literal's own header is the
+                        // arity, and a headerless literal is `() -> Unit`
+                        // (its parser-injected `it` never binds without an
+                        // expected type).
+                        const arity: u8 = if (ini.Lambda.implicit_it) 0 else @intCast(@min(ini.Lambda.params.len, 255));
+                        try w.transformComposableLambda(&ini.Lambda, arity);
                     } else {
                         try w.walkExpr(ini);
                     }
@@ -1053,6 +1062,9 @@ const Walker = struct {
                 // joins the scoped locals set: a bare `content()` threads.
                 const holds_composable = blk: {
                     if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
+                    if (p.init) |*ini2| {
+                        if (ini2.* == .Lambda and isComposable(ini2.Lambda.annotations)) break :blk true;
+                    }
                     // `val current by rememberUpdatedState(content)` — a
                     // DELEGATED val whose delegate call carries a value the
                     // walker already knows is composable reads back that
@@ -1345,8 +1357,12 @@ const Walker = struct {
                         // receives the Int dirty flag). Explicit call-site
                         // type args name the overload exactly (the receiver
                         // form spends its first type arg on R, not a lambda
-                        // param); otherwise a headerless lambda that never
-                        // reads `it` is the 0-param overload.
+                        // param); otherwise a headerless lambda IS the
+                        // 0-param overload — kotlinc cannot infer `P` from a
+                        // headerless literal, so a bare `it` inside belongs
+                        // to an ENCLOSING implicit-`it` lambda
+                        // (`Array(4) { movableContentOf { level[it * 2]() } }`),
+                        // never to this one.
                         const is_mco = std.mem.eql(u8, name.?, "movableContentOf");
                         const is_mcwro = std.mem.eql(u8, name.?, "movableContentWithReceiverOf");
                         if ((is_mco or is_mcwro) and arg.Lambda.implicit_it) {
@@ -1354,7 +1370,7 @@ const Walker = struct {
                                 const ta: u8 = @intCast(@min(c.type_args.len, 255));
                                 exp = if (is_mcwro) ta - 1 else ta;
                             } else {
-                                exp = if (blockUsesIt(&arg.Lambda.body)) 1 else 0;
+                                exp = 0;
                             }
                         }
                         // A movable-content type arg that is ITSELF a
@@ -1399,6 +1415,17 @@ const Walker = struct {
                         // unwound non-locally past ComposableLambdaImpl.invoke,
                         // leaving the root restart group open (the
                         // conditional-return "Start/end imbalance" family).
+                        // A movable-content FACTORY call outside composition
+                        // (`val c = movableContentOf { … }` in a test fn)
+                        // still stores its content as a
+                        // composableLambdaInstance singleton — that wrapper
+                        // supplies the restart group the movable machinery
+                        // re-invokes on nested recompose; a raw threaded
+                        // closure has none and the group walk diverges
+                        // ("Started group at N must be a subgroup ...").
+                        if (!w.thread and emit_lambda_memo and (is_mco or is_mcwro)) {
+                            w.wrapInComposableLambdaInstance(arg);
+                        }
                         if (w.thread and emit_lambda_memo and w.branchHasComposable(arg) and
                             !calleeInlinesLambda(name.?))
                         {
