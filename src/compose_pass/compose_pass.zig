@@ -1357,8 +1357,12 @@ const Walker = struct {
                         // receives the Int dirty flag). Explicit call-site
                         // type args name the overload exactly (the receiver
                         // form spends its first type arg on R, not a lambda
-                        // param); otherwise a headerless lambda that never
-                        // reads `it` is the 0-param overload.
+                        // param); otherwise a headerless lambda IS the
+                        // 0-param overload — kotlinc cannot infer `P` from a
+                        // headerless literal, so a bare `it` inside belongs
+                        // to an ENCLOSING implicit-`it` lambda
+                        // (`Array(4) { movableContentOf { level[it * 2]() } }`),
+                        // never to this one.
                         const is_mco = std.mem.eql(u8, name.?, "movableContentOf");
                         const is_mcwro = std.mem.eql(u8, name.?, "movableContentWithReceiverOf");
                         if ((is_mco or is_mcwro) and arg.Lambda.implicit_it) {
@@ -1366,7 +1370,7 @@ const Walker = struct {
                                 const ta: u8 = @intCast(@min(c.type_args.len, 255));
                                 exp = if (is_mcwro) ta - 1 else ta;
                             } else {
-                                exp = if (blockUsesIt(&arg.Lambda.body)) 1 else 0;
+                                exp = 0;
                             }
                         }
                         // A movable-content type arg that is ITSELF a

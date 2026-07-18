@@ -200,6 +200,37 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             return r;
         }
         const inv = try host_call_member.callMember(self, allocator, callee, "invoke", args);
+        const callee_is_cli = blk: {
+            if (callee.* != .Instance) break :blk false;
+            const g = callee.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk std.mem.eql(u8, cg.get().fqn, "androidx.compose.runtime.internal.ComposableLambdaImpl");
+        };
+        // Compose-plugin arg completion, instance side: a
+        // ComposableLambdaImpl invoked through a typeless route
+        // (`arr[i]()`, forEach's `it()`) misses its `invoke` because the
+        // call lacks the trailing `(composer, changed)` the wrapper's
+        // overloads declare. With a composer ambient, complete the pair
+        // and retry — the type-directed emission kotlinc performs from the
+        // value's declared `@Composable` fn type.
+        if (inv == .err and inv.err == .Unimplemented and callee_is_cli and
+            host_call_func.composePluginEnabled())
+        {
+            if (compose.currentComposer()) |comp| {
+                if (runtime.freeScratch()) {
+                    const m = inv.err.Unimplemented;
+                    if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+                }
+                const buf = try allocator.alloc(Value, args.len + 2);
+                defer allocator.free(buf);
+                @memcpy(buf[0..args.len], args);
+                buf[args.len] = comp;
+                buf[args.len + 1] = .{ .Int = 0 };
+                return host_call_member.callMember(self, allocator, callee, "invoke", buf);
+            }
+        }
         // A `fun interface` instance with a single abstract method that is NOT
         // `invoke` — notably `kotlinx.coroutines.Runnable { fun run() }` — is
         // invoked as a function value by the dispatcher resume path
@@ -467,6 +498,28 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             const msg = try std.fmt.allocPrint(allocator, "closure body FuncId {d} out of range", .{info.body_func.int()});
             return .{ .err = .{ .Type = msg } };
         };
+        // Compose-plugin arg completion: a pass-threaded composable value
+        // invoked through a TYPELESS route (`arr[i]()`, forEach's `it()`)
+        // has no static site the pass could append the pair to — kotlinc
+        // knows the value's `@Composable` fn type, the interpreter only
+        // sees the value. When the closure's protocol wants exactly the
+        // trailing `($composer, $changed)` more than the call supplied and
+        // a composer is ambient, complete the pair and re-enter, exactly
+        // as the type-directed emission would have.
+        if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
+            args.len + 2 == info.n_params and
+            std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer"))
+        {
+            if (compose.currentComposer()) |comp| {
+                const buf = try allocator.alloc(Value, args.len + 2);
+                defer allocator.free(buf);
+                @memcpy(buf[0..args.len], args);
+                buf[args.len] = comp;
+                buf[args.len + 1] = .{ .Int = 0 };
+                return callValue(self, allocator, callee, buf);
+            }
+        }
         // One executable form per symbol: when the wrapped top-level fn's
         // single form was resolved to a native binding at link time
         // (e.g. a closure-of `kotlinx.datetime.__kxdt_*`), dispatch that
