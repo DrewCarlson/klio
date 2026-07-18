@@ -1558,6 +1558,58 @@ const Walker = struct {
         w.wrapBranchInReplaceGroup(branch);
     }
 
+    /// Rewrite a (threaded) `key(k…, block, …)` call into
+    ///     { $composer.startMovableGroup(<site key>, <joined keys>)
+    ///       val $key$v = key(…)
+    ///       $composer.endMovableGroup()
+    ///       $key$v }
+    /// `dyn_n` is the count of dynamic key arguments (the original args
+    /// before the content lambda). Multiple keys join pairwise through
+    /// `$composer.joinKey`, exactly as the plugin emits.
+    fn wrapKeyCall(w: *Walker, e: *Expr, dyn_n: usize) void {
+        const call_expr = e.*;
+        const sp = exprSpanOf(&call_expr);
+        var joined = call_expr.Call.args[0];
+        for (call_expr.Call.args[1..dyn_n]) |k| {
+            const jargs = w.a.alloc(Expr, 2) catch @panic("oom");
+            jargs[0] = joined;
+            jargs[1] = k;
+            joined = w.b.callMember(w.composerRef(), "joinKey", jargs);
+        }
+        const start_args = w.a.alloc(Expr, 2) catch @panic("oom");
+        start_args[0] = w.b.intLit(positionalKey(sp));
+        start_args[1] = joined;
+        const result_prop = w.a.create(ast.Property) catch @panic("oom");
+        result_prop.* = .{
+            .mutable = false,
+            .name = w.b.ident("$key$v"),
+            .receiver_type = null,
+            .ty = null,
+            .init = call_expr,
+            .delegate = null,
+            .getter = null,
+            .setter = null,
+            .is_abstract = false,
+            .is_open = false,
+            .is_override = false,
+            .is_lateinit = false,
+            .is_const = false,
+            .is_inline = false,
+            .is_expect = false,
+            .is_actual = false,
+            .setter_visibility = null,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = w.b.gen_span,
+        };
+        const stmts = w.a.alloc(ast.Stmt, 4) catch @panic("oom");
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startMovableGroup", start_args) };
+        stmts[1] = .{ .Decl = .{ .Property = result_prop } };
+        stmts[2] = .{ .Expr = w.b.callMember(w.composerRef(), "endMovableGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        stmts[3] = .{ .Expr = w.b.pathExpr("$key$v") };
+        e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+    }
+
     fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
         if (branch.* != .Block) return;
         const blk = &branch.Block;
@@ -1583,6 +1635,13 @@ const Walker = struct {
             .Call => |*c| {
                 try w.walkExpr(c.callee);
                 const name = calleeSimpleName(c.callee);
+                // `key(k…) { content }` before its args gain the composer
+                // pair: the dynamic key count is every argument before the
+                // trailing content lambda.
+                const key_dyn_n: usize = if (c.args.len >= 2) c.args.len - 1 else 0;
+                const is_key_call = w.thread and name != null and
+                    std.mem.eql(u8, name.?, "key") and key_dyn_n >= 1 and
+                    c.args[c.args.len - 1] == .Lambda and w.oracle(w.oracle_ctx, "key");
                 // A trailing lambda bound to a `@Composable`-typed parameter
                 // becomes a `{ …, $composer, $changed -> … }` lambda (the plugin
                 // lowers composable lambdas to FunctionN<…, Composer, Int, …>);
@@ -1743,6 +1802,14 @@ const Walker = struct {
                         if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
                     }
                 }
+                // `key(k…) { content }` is a COMPILER intrinsic: kotlinc
+                // brackets it with a MOVABLE group whose data key joins the
+                // dynamic key arguments, so a changed key replaces (or moves)
+                // the content's group identity. The upstream function body is
+                // just `block()` — without the bracket the dynamic keys are
+                // ignored entirely (a `key(k)` flip recomposed in place and
+                // reported "no changes").
+                if (is_key_call) w.wrapKeyCall(e, key_dyn_n);
             },
             .Member => |*m| try w.walkExpr(m.receiver),
             .Index => |*ix| {
@@ -2857,4 +2924,72 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     // startRestartGroup + $dirty + probe + skip-if + endRestartGroup.
     try testing.expectEqual(@as(usize, 5), stmts2.len);
     try testing.expectEqualStrings(dirty_local, stmts2[1].Decl.Property.name.name);
+}
+
+test "key(k) { } gains a movable-group bracket with the dynamic key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 40, 60);
+
+    // @Composable fun Host() { key(k) { Text("hi") } }
+    var text_segs = [_]Ident{dummyIdent("Text")};
+    var text_callee = Expr{ .Path = .{ .segments = &text_segs, .span = gsp } };
+    var str_parts = [_]ast.StringPart{.{ .Text = "hi" }};
+    var text_args = [_]Expr{.{ .StringTemplate = .{ .parts = &str_parts, .span = gsp } }};
+    var text_names = [_]?[]const u8{null};
+    var lam_body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &text_callee,
+        .args = &text_args,
+        .arg_names = &text_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } } }};
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var k_segs = [_]Ident{dummyIdent("k")};
+    var key_args = [_]Expr{
+        .{ .Path = .{ .segments = &k_segs, .span = gsp } },
+        .{ .Lambda = .{
+            .params = &lam_params,
+            .param_tys = &lam_ptys,
+            .body = .{ .stmts = &lam_body_stmts, .span = gsp },
+            .implicit_it = true,
+            .span = gsp,
+        } },
+    };
+    var key_segs = [_]Ident{dummyIdent("key")};
+    var key_callee = Expr{ .Path = .{ .segments = &key_segs, .span = gsp } };
+    var key_names = [_]?[]const u8{ null, null };
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &key_callee,
+        .args = &key_args,
+        .arg_names = &key_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+    var sinks = std.StringHashMap(void).init(a);
+    try sinks.put("key", {});
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
+    // The key call became { startMovableGroup(site, k); val $key$v = key(...);
+    // endMovableGroup(); $key$v }.
+    const blk = wrappedBodyStmts(&out)[0].Expr.Block;
+    try testing.expectEqual(@as(usize, 4), blk.stmts.len);
+    const start = blk.stmts[0].Expr.Call;
+    try testing.expectEqualStrings("startMovableGroup", start.callee.Member.name.name);
+    try testing.expectEqual(@as(usize, 2), start.args.len);
+    try testing.expectEqualStrings("k", start.args[1].Path.segments[0].name);
+    const kcall = blk.stmts[1].Decl.Property.init.?.Call;
+    try testing.expectEqualStrings("key", kcall.callee.Path.segments[0].name);
+    // Threaded: keys + lambda + $composer + $changed.
+    try testing.expectEqual(@as(usize, 4), kcall.args.len);
+    try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
 }
