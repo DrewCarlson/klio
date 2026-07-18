@@ -104,6 +104,7 @@ Run any program with:
 | `fn_param_name_shadows_operator.kt` | A function-typed parameter does not shadow a same-named function for a trailing-lambda call it cannot accept (`Flow.map`'s `crossinline transform` vs the `transform` operator). |
 | `backing_field_in_nested_scope.kt` | The accessor's `field` binding is visible inside a nested scope (lambda, `when`, loop, `try`), not just the flat accessor body. |
 | `yield_dispatches_to_the_pump.kt` | `yield()` reschedules through the coroutine's DISPATCHER (a queued child runs before it resumes), and a property reference works as a `compareValuesBy` key selector. |
+| `dispatched_delay_loop_is_cancellable.kt` | `Job.cancel` preempts a `while (true) { delay(1) }` loop dispatched onto `Dispatchers.Default`: the coroutine's scope survives every cross-pump resume hop, so each fresh `delay` installs its parent-cancellation handle and the loop dies with a `CancellationException` (its `catch`/`finally` run) instead of out-living the Job. |
 | `super_property_setter.kt` | `super.prop = value` reaches the superclass accessor, so an overriding setter that writes through `super` does not re-enter itself. |
 | `stored_override_of_accessor.kt` | A field-backed `override var` overrides an inherited accessor property, so a write stores the field and never reaches the base's custom setter. |
 | `local_fun_arity_shadowing.kt` | A local function shadows an outer one by name only for calls it can take: `validate { … }` inside a no-arg local `validate()` resolves outward. |

@@ -1831,10 +1831,19 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
     const guard = ActiveScopeGuard.enter(scope);
     defer guard.leave();
 
-    // Root coroutine.
+    // Root coroutine. Its scope base sits BELOW the guard's push, so the
+    // root's park carries the coroutine scope in its ParkedEntry (the same
+    // contract as `coroutineRunRoot`'s enclosing-driver branch). A root
+    // persisted at pump exit then re-establishes its own scope when
+    // `driveResumed` re-drives it on a later pump — without this, every
+    // fresh suspension point after the first cross-pump hop resolved
+    // `coroutineContext` to nothing: `context[Job]` was null, no
+    // parent-cancellation handle was installed, and a dispatched
+    // `while (true) { delay(1) }` loop became uncancellable. The guard's
+    // identity-aware `leave` no-ops once the entry moved into the delta.
     var root_value: ?Value = null;
     var root_token: ?u64 = null;
-    const root_scope_base = activeScopeDepth();
+    const root_scope_base = scope_depth;
     switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
@@ -2437,9 +2446,12 @@ pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Valu
     const guard = ActiveScopeGuard.enter(scope_v);
     defer guard.leave();
 
+    // Base below the guard's push, as in `driveRoot`: the root's park
+    // carries its coroutine scope so a persisted root resumes with
+    // `coroutineContext` (Job + interceptor) intact on any later pump.
     var root_value: ?Value = null;
     var root_token: ?u64 = null;
-    const root_scope_base = activeScopeDepth();
+    const root_scope_base = scope_depth;
     switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
@@ -2889,6 +2901,87 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "pump-root scope base sits below the guard so a persisted root carries its scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Minimal Instance scope (the shape `ActiveScopeGuard` pushes).
+    const cls: runtime.ClassDef = .{
+        .name = "S",
+        .fqn = "S",
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = null,
+        .interfaces = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = &.{},
+        .companion = try runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null),
+        .enclosing_class = try runtime.ObjRef(?runtime.ObjRef(runtime.ClassDef)).init(a, null),
+        .nested_classes = &.{},
+        .captured_env = try runtime.ObjRef(runtime.Env).init(a, runtime.Env.init(a)),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
+        .object_singleton = try runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null),
+    };
+    const cls_ref = try runtime.ObjRef(runtime.ClassDef).init(a, cls);
+    const inst = try runtime.ObjRef(runtime.InstanceData).init(a, .{
+        .class = cls_ref,
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const scope: Value = .{ .Instance = inst };
+
+    // The contract `driveRoot` / `coroutineStartRootOrSuspended` rely on:
+    // with the root's scope base read BEFORE the guard's push, a park at
+    // that base captures the guard's scope entry into the root's delta
+    // (removing it from the live stack), the guard's identity-aware
+    // `leave` then no-ops, and a later restore re-establishes the scope
+    // for the resumed root. Without this the persisted root resumed with
+    // no scope: `coroutineContext` lost its `Job`, no parent-cancellation
+    // handle was installed, and a dispatched delay loop out-lived
+    // `Job.cancel`.
+    const base = activeScopeDepth();
+    const guard = ActiveScopeGuard.enter(&scope);
+    try testing.expectEqual(base + 1, activeScopeDepth());
+
+    const delta = captureScopeDelta(base);
+    defer coroStackAllocator().free(delta);
+    try testing.expectEqual(@as(usize, 1), delta.len);
+    try testing.expectEqual(scopeIdent(&scope), scopeIdent(&delta[0]));
+    try testing.expectEqual(base, activeScopeDepth());
+
+    // The entry moved into the delta: leave must not pop anything else.
+    guard.leave();
+    try testing.expectEqual(base, activeScopeDepth());
+
+    // The resumed root re-establishes its scope from the delta.
+    restoreScopeDelta(delta);
+    try testing.expectEqual(base + 1, activeScopeDepth());
+    try testing.expectEqual(scopeIdent(&scope), scopeIdent(&activeCoroScope().?));
+    _ = active_scope_stack.pop();
+    try testing.expectEqual(base, activeScopeDepth());
 }
 
 test "intercept_suspend assigns tokens and queues ready / parks timed" {
