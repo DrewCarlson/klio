@@ -4415,6 +4415,21 @@ fn lowerCallSpread(
                     break :blk this_reg;
                 }
             }
+            // A bare global with overloads: the spread can only bind a
+            // `vararg` parameter, so pick among the vararg-bearing
+            // candidates explicitly — the generic value read below is
+            // arg-blind and can hand back a zero-arg overload, silently
+            // dropping the spread's elements.
+            if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
+                !b.hasOwnMember(name) and b.module.funcsBySimpleName(name).len > 1)
+            {
+                if (b.module.funcIdForSpreadCall(name, b.ownerClass())) |fid| {
+                    const nm = try b.module.internConst(b.allocator, .{ .String = name });
+                    const dst = b.allocReg();
+                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = fid } });
+                    break :blk dst;
+                }
+            }
         }
         break :blk try lowerExpr(b, callee);
     };
