@@ -1233,8 +1233,20 @@ const Walker = struct {
                 // transforms its lambda from any scope.
                 const sink_applies = name != null and w.sinks != null and w.sinks.?.contains(name.?) and
                     (w.thread or !w.oracle(w.oracle_ctx, name.?));
+                // A call THROUGH a composable-lambda VALUE (a movableContentOf
+                // val, a composable lambda param) is a composable call too:
+                // its trailing lambda binds a `@Composable`-typed parameter
+                // (`parent { Wrap { child() } }` where `parent` came from
+                // `movableContentOf<@Composable () -> Unit>`), so it must be
+                // transformed like a named sink's. Threaded scope only — the
+                // same bare name outside composition (a validator block) is a
+                // different declaration.
+                const val_sink = name != null and w.thread and
+                    ((w.composable_vals != null and w.composable_vals.?.contains(name.?)) or
+                        (w.locals != null and w.locals.?.contains(name.?)) or
+                        (w.lambda_params != null and w.lambda_params.?.contains(name.?)));
                 const sink_last = c.args.len != 0 and
-                    c.args[c.args.len - 1] == .Lambda and sink_applies;
+                    c.args[c.args.len - 1] == .Lambda and (sink_applies or val_sink);
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
                         var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
