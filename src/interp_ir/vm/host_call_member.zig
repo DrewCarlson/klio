@@ -2279,6 +2279,11 @@ fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
             arity_authoritative = up.stripped;
             break :blk std.math.cast(u8, up.n);
         },
+        .Instance => blk: {
+            const cli = host_call_func.composableLambdaBlockArity(self, v) orelse break :blk null;
+            arity_authoritative = cli.authoritative;
+            break :blk cli.n;
+        },
         else => null,
     };
     return .{

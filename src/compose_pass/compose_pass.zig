@@ -1415,6 +1415,17 @@ const Walker = struct {
                         // unwound non-locally past ComposableLambdaImpl.invoke,
                         // leaving the root restart group open (the
                         // conditional-return "Start/end imbalance" family).
+                        // A movable-content FACTORY call outside composition
+                        // (`val c = movableContentOf { … }` in a test fn)
+                        // still stores its content as a
+                        // composableLambdaInstance singleton — that wrapper
+                        // supplies the restart group the movable machinery
+                        // re-invokes on nested recompose; a raw threaded
+                        // closure has none and the group walk diverges
+                        // ("Started group at N must be a subgroup ...").
+                        if (!w.thread and emit_lambda_memo and (is_mco or is_mcwro)) {
+                            w.wrapInComposableLambdaInstance(arg);
+                        }
                         if (w.thread and emit_lambda_memo and w.branchHasComposable(arg) and
                             !calleeInlinesLambda(name.?))
                         {
