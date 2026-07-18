@@ -38,6 +38,7 @@ Run any program with:
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
 | `inner_outer_property.kt`  | An inner class reads the outer instance's overridden property (virtual getter dispatch), incl. an `AbstractMutableList` subclass. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |
+| `local_fn_nested_recursion.kt` | A nested local function calling back into its enclosing local function (`fun inner` inside `fun step` invoking `step`), routed through the pre-bound overload cell; includes a `?.let` chain over the recursive result. |
 | `local_fn_overloads.kt`    | Same-named local functions as true overloads: call-site selection by arity and argument types, one overload calling its sibling (no self-recursion through the shared binding), selection from a nested lambda. |
 | `extension_property_delegates.kt` | Delegated extension properties (`val R.x by …`): bound-reference and top-level-var delegates, writes through `setValue`, a custom `getValue` operator receiving the `KProperty`, and bound property references (`obj::extVal`) reading through the delegate. |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |

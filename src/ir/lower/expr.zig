@@ -4950,6 +4950,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         if (b.localFnDecls(bare)) |decls| {
             local_fn_inapplicable = !anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names);
+            // A LONE local fn reached from a NESTED body (its own body, or
+            // a local fn declared inside it): the PLAIN name binds only
+            // after the body lowers, so it is never in the nested scope
+            // chain — but the mangled overload cell binds BEFORE the body
+            // lowers exactly so nested calls can capture it. Route the
+            // call through the cell (`fun traverse` inside GapComposer's
+            // `movableContentReferenceFor` recursing into its encloser).
+            // Multi-overload sets select above; an inapplicable local
+            // keeps outward resolution.
+            if (decls.len == 1 and !local_fn_inapplicable and
+                b.resolve(bare) == null and !b.knowsOuter(bare) and
+                b.resolve(decls[0].mangled) == null and b.knowsOuter(decls[0].mangled))
+            {
+                if (try lowerSelectedLocalOverloadCall(b, decls[0].mangled, args, ast_arg_names)) |r| return r;
+            }
         }
         // A local function shadows an outer one by NAME, but only among
         // candidates that can take the call. A local `fun validate()` does
