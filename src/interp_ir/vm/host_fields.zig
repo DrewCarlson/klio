@@ -1712,26 +1712,13 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
             cur = firstSupertype(self, cn);
         }
     }
-    // A nested object lifted as `Outer$Name`: resolve the mangled
-    // singleton (then class) for a qualified `Outer.Name` access. First
-    // access constructs the singleton through the gate.
-    const mangled = try std.fmt.allocPrint(allocator, "{s}${s}", .{ cls_name, name });
-    defer allocator.free(mangled);
-    switch (try host_globals.ensureObjectSingleton(self, mangled)) {
-        .ok => |maybe| if (maybe) |v| {
-            if (v == .Instance) return ok(v);
-        },
-        .err => |e| return errRes(e),
-    }
-    {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(mangled)) |def| return ok(.{ .Class = def });
-    }
     // A nested class registered under its enclosing-qualified FQN
-    // (`Outer.Nested`): the exact declaration resolves before any
-    // simple-name fallback below can adopt an unrelated namesake from
-    // another package.
+    // (`Outer.Nested`): the exact declaration resolves before the
+    // lifted-simple-name probes below. Those keys are ambiguous when two
+    // packages declare same-named nested members (gapbuffer's vs
+    // linkbuffer's `Operation.Ups` both lift as `Operation$Ups`), and the
+    // name-keyed singleton gate would construct whichever twin registered
+    // the name — so a nested object resolves its singleton BY CLASS ID.
     {
         const cls_fqn = blk: {
             const g = receiver.Class.borrow();
@@ -1755,7 +1742,16 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
                     break :blk null;
                 };
                 if (obj_name) |n| {
-                    switch (try host_globals.ensureObjectSingleton(self, n)) {
+                    const nested_cid: ?ir.ClassId = blk: {
+                        const mg = self.module.borrow();
+                        defer mg.deinit();
+                        break :blk mg.get().classIdByFqn(nested_fqn);
+                    };
+                    const res = if (nested_cid) |cid|
+                        try host_globals.ensureObjectSingletonById(self, cid)
+                    else
+                        try host_globals.ensureObjectSingleton(self, n);
+                    switch (res) {
                         .ok => |maybe| if (maybe) |v| {
                             if (v == .Instance) {
                                 def.deinit();
@@ -1771,6 +1767,22 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
                 return ok(.{ .Class = def });
             }
         }
+    }
+    // A nested object lifted as `Outer$Name`: resolve the mangled
+    // singleton (then class) for a qualified `Outer.Name` access. First
+    // access constructs the singleton through the gate.
+    const mangled = try std.fmt.allocPrint(allocator, "{s}${s}", .{ cls_name, name });
+    defer allocator.free(mangled);
+    switch (try host_globals.ensureObjectSingleton(self, mangled)) {
+        .ok => |maybe| if (maybe) |v| {
+            if (v == .Instance) return ok(v);
+        },
+        .err => |e| return errRes(e),
+    }
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(mangled)) |def| return ok(.{ .Class = def });
     }
     // Nested singleton object (lifted under its simple name) wins over
     // the class.

@@ -1230,7 +1230,29 @@ pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []con
         }
         return qp;
     }
-    return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
+    if (scopeTypeRename(b, ty.name.name, ty.span.file.int())) |renamed| return renamed;
+    // A bare check type this file's explicit import names (`import
+    // …Operation.Marker`; `x is Marker`) normalises to the imported class's
+    // canonical FQN, so the runtime compares class identity — the simple
+    // name alone cannot resolve a nested member two packages both declare
+    // (its lifted name is shared, so a name compare matches either twin).
+    // An enclosing class's own nested classifier still wins over the
+    // import (inner scope first), keeping the simple-name compare.
+    if (!enclosingDeclaresNestedClassifier(b, ty.name.name)) {
+        if (b.module.classIdExactImport(ty.name.name, ty.span.file)) |cid| {
+            if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].fqn;
+        }
+    }
+    return ty.name.name;
+}
+
+/// Whether any class in the enclosing-class chain declares a NESTED
+/// classifier named `name` — the scope where a bare check-type name binds
+/// before the file's imports are consulted.
+fn enclosingDeclaresNestedClassifier(b: *const FuncBuilder, name: []const u8) bool {
+    const oc = b.ownerClass() orelse return false;
+    const owner_id = b.module.classId(oc) orelse return false;
+    return b.module.classIdNestedIn(owner_id, name) != null;
 }
 
 /// The mangled per-file global for a bare `name` referenced from the file
@@ -10005,6 +10027,55 @@ test "lowers is-check to instance-of" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .InstanceOf);
+}
+
+test "bare is-check type normalises to the file's exact-import class FQN" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    // Two packages declare a nested `Marker` under a same-named outer class:
+    // both lift as `Operation$Marker`, so the bare simple name identifies
+    // neither. The file's explicit import names exactly one; the check type
+    // must carry that class's canonical FQN so the runtime compares identity.
+    _ = try m.reserveClassFqn(a, "Operation$Marker", "com.ga.Operation.Marker", "com.ga", false);
+    _ = try m.reserveClassFqn(a, "Operation$Marker", "com.gb.Operation.Marker", "com.gb", false);
+    {
+        var paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+        const segs = try a.alloc([]const u8, 4);
+        segs[0] = "com";
+        segs[1] = "ga";
+        segs[2] = "Operation";
+        segs[3] = "Marker";
+        try paths.append(a, .{ .fqn = try a.dupe(u8, "com.ga.Operation.Marker"), .segs = segs });
+        var inner_map = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+        try inner_map.put("Marker", paths);
+        try m.registry.import_aliases.put(span.FileId.from(0), inner_map);
+    }
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const ty = ast.TypeRef{
+        .name = .{ .name = "Marker", .span = dummySpan() },
+        .nullable = false,
+        .span = dummySpan(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    try testing.expectEqualStrings("com.ga.Operation.Marker", loweredCheckTypeName(&b, &ty));
+    // A file without the import keeps the bare simple name.
+    const ty2 = ast.TypeRef{
+        .name = .{ .name = "Marker", .span = span.Span.init(span.FileId.from(3), 0, 0) },
+        .nullable = false,
+        .span = span.Span.init(span.FileId.from(3), 0, 0),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
 }
 
 test "headCompatible: literal heads disprove scalar params only" {
