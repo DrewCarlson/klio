@@ -325,6 +325,16 @@ pub const FuncBuilder = struct {
     /// into it. This gives the IR's flat block model the slot
     /// semantics that mutable Kotlin locals need.
     mutable_homes: StringRegMap,
+    /// Per-scope undo journal for `mutables`/`mutable_homes`. A
+    /// block-scoped `var` must stop shadowing when its block ends: a
+    /// same-named class property written after the block would otherwise
+    /// Move into the dead local's home register instead of reaching the
+    /// field through SetField (reads already un-shadow via `scopes`, so
+    /// the leak split writes and reads of the same name onto different
+    /// storage). Entries record the pre-declaration state; `popScope`
+    /// restores it. The bottom (function) scope has no frame — its
+    /// declarations stay function-flat as before.
+    mutable_undo: std.ArrayList(std.ArrayList(MutableUndo)) = .empty,
     /// Names that are boxed into a shared `Value.Cell` because a
     /// nested lambda captures them (Kotlin `Ref` boxing). Their home
     /// reg holds the `Cell`; reads emit `CellGet`, writes `CellSet`,
@@ -703,6 +713,8 @@ pub const FuncBuilder = struct {
         self.loops.deinit(a);
         self.mutables.deinit();
         self.mutable_homes.deinit();
+        for (self.mutable_undo.items) |*u| u.deinit(a);
+        self.mutable_undo.deinit(a);
         self.boxed_vars.deinit();
         self.any_typed_locals.deinit();
         self.broad_coll_locals.deinit();
@@ -895,7 +907,23 @@ pub const FuncBuilder = struct {
         return self.object_init_locals.contains(name);
     }
 
+    /// Journal `name`'s current mutability state into the innermost scope
+    /// frame (once per scope) so `popScope` can restore it.
+    fn recordMutableUndo(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        if (self.mutable_undo.items.len == 0) return;
+        const top = &self.mutable_undo.items[self.mutable_undo.items.len - 1];
+        for (top.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) return;
+        }
+        try top.append(self.allocator, .{
+            .name = name,
+            .prev_home = self.mutable_homes.get(name),
+            .prev_mutable = self.mutables.contains(name),
+        });
+    }
+
     pub fn markMutable(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.recordMutableUndo(name);
         try self.mutables.put(name, {});
     }
     pub fn isMutable(self: *const FuncBuilder, name: []const u8) bool {
@@ -903,6 +931,7 @@ pub const FuncBuilder = struct {
     }
 
     pub fn setMutableHome(self: *FuncBuilder, name: []const u8, reg: Reg) Allocator.Error!void {
+        try self.recordMutableUndo(name);
         try self.mutable_homes.put(name, reg);
     }
     pub fn mutableHome(self: *const FuncBuilder, name: []const u8) ?Reg {
@@ -1716,6 +1745,7 @@ pub const FuncBuilder = struct {
     /// Push a fresh scope.
     pub fn pushScope(self: *FuncBuilder) Allocator.Error!void {
         try self.scopes.append(self.allocator, StringRegMap.init(self.allocator));
+        try self.mutable_undo.append(self.allocator, .empty);
     }
 
     /// Pop the current scope.
@@ -1726,6 +1756,25 @@ pub const FuncBuilder = struct {
         }
         if (self.scopes.items.len == 0) {
             try self.scopes.append(self.allocator, StringRegMap.init(self.allocator));
+        }
+        if (self.mutable_undo.pop()) |undos| {
+            var u = undos;
+            var i = u.items.len;
+            while (i > 0) {
+                i -= 1;
+                const e = u.items[i];
+                if (e.prev_home) |h| {
+                    try self.mutable_homes.put(e.name, h);
+                } else {
+                    _ = self.mutable_homes.remove(e.name);
+                }
+                if (e.prev_mutable) {
+                    try self.mutables.put(e.name, {});
+                } else {
+                    _ = self.mutables.remove(e.name);
+                }
+            }
+            u.deinit(self.allocator);
         }
     }
 
@@ -1893,6 +1942,14 @@ fn instDefOf(inst: *const ir.Inst) ?ir.Reg {
     return found;
 }
 
+/// One name's pre-declaration mutability state, restored when the scope
+/// that redeclared it pops (see `FuncBuilder.mutable_undo`).
+pub const MutableUndo = struct {
+    name: []const u8,
+    prev_home: ?Reg,
+    prev_mutable: bool,
+};
+
 pub const LoopFrame = struct {
     label: ?[]const u8,
     continue_target: BlockId,
@@ -2048,6 +2105,46 @@ test "loop frame lookup by label and innermost" {
     // Labeled lookup finds the matching outer frame.
     try testing.expectEqual(c0, b.loopFor("outer").?.continue_target);
     try testing.expect(b.loopFor("missing") == null);
+}
+
+test "a block-scoped var stops shadowing mutables when its scope pops" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    // A branch block declares `var x` over a class property of the same
+    // name: the mutable home must vanish when the block's scope pops, or a
+    // later bare-name write Moves into the dead local instead of emitting
+    // SetField on the property.
+    try b.pushScope();
+    const home = b.allocReg();
+    try b.setMutableHome("x", home);
+    try b.markMutable("x");
+    try testing.expectEqual(home, b.mutableHome("x").?);
+    try testing.expect(b.isMutable("x"));
+    try b.popScope();
+    try testing.expect(b.mutableHome("x") == null);
+    try testing.expect(!b.isMutable("x"));
+}
+
+test "an inner shadowing var restores the outer var's home on scope pop" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    try b.pushScope();
+    const outer_home = b.allocReg();
+    try b.setMutableHome("x", outer_home);
+    try b.markMutable("x");
+    try b.pushScope();
+    const inner_home = b.allocReg();
+    try b.setMutableHome("x", inner_home);
+    try testing.expectEqual(inner_home, b.mutableHome("x").?);
+    try b.popScope();
+    try testing.expectEqual(outer_home, b.mutableHome("x").?);
+    try testing.expect(b.isMutable("x"));
+    try b.popScope();
+    try testing.expect(b.mutableHome("x") == null);
 }
 
 test "finish carries tailrec and inline flags" {
