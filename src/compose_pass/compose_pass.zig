@@ -907,6 +907,33 @@ fn markerCall(b: B) Expr {
     return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
 }
 
+/// Guard a marker-defaulted param's skip-calculus probe with
+/// `if (p$arg !== marker()) { <probe> }`. A parameter that fell back to its
+/// default value is NOT probed: kotlinc's `$default`-mask path sets the dirty
+/// bits directly and never emits a `composer.changed()` for it, so probing it
+/// here would store an extra slot the compiler never stores (the slot-size
+/// validation tests count exactly these). The default's own composition-local
+/// / snapshot-state reads still invalidate the scope when they change, so
+/// skipping the probe does not lose recomposition. A defaulted param that the
+/// caller DID pass (`p$arg !== marker()`) is probed normally, matching the
+/// compiler's uncertain-bits path.
+fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt) Stmt {
+    const not_default = Expr{ .Binary = .{
+        .op = .IdentNeq,
+        .lhs = b.box(b.pathExpr(arg_name)),
+        .rhs = b.box(markerCall(b)),
+        .span = b.gen_span,
+    } };
+    const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    then_stmts[0] = probe;
+    return .{ .Expr = .{ .If = .{
+        .cond = b.box(not_default),
+        .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
+        .else_branch = null,
+        .span = b.gen_span,
+    } } };
+}
+
 /// `$dirty = $dirty or (if (<probe>) 2 else 0)` — one skip-calculus probe.
 fn dirtyOrProbe(b: B, probe: Expr) Stmt {
     const pick = Expr{ .If = .{
@@ -1101,11 +1128,17 @@ pub fn transformComposableFunction(
                 } });
                 continue;
             }
-            try out.append(a, dirtyOrProbe(b, b.callMember(
+            const probe = dirtyOrProbe(b, b.callMember(
                 b.pathExpr(composer_param),
                 "changed",
                 b.slice1(b.pathExpr(p.name.name)),
-            )));
+            ));
+            if (p.default != null and f.body != null) {
+                const arg_name = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
+                try out.append(a, dirtyProbeIfPassed(b, arg_name, probe));
+            } else {
+                try out.append(a, probe);
+            }
         }
     }
     // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping,
@@ -2812,8 +2845,14 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
     try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
 
+    // A DEFAULTED param's probe is guarded by `if (x$arg !== marker())` so a
+    // param that fell back to its default stores no `changed` slot.
+    const guard = stmts[3].Expr.If;
+    try testing.expect(guard.cond.Binary.op == .IdentNeq);
+    try testing.expectEqualStrings("x$arg", guard.cond.Binary.lhs.Path.segments[0].name);
+    const probe = guard.then_branch.Block.stmts[0];
     // The probe reads the RESOLVED value `x`, not the renamed argument.
-    try testing.expectEqualStrings("x", stmts[3].Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
+    try testing.expectEqualStrings("x", probe.Assign.value.Call.args[0].If.cond.Call.args[0].Path.segments[0].name);
     // The restart re-call passes the RENAMED param (marker flows through).
     const upd = stmts[5].Expr.Call;
     const lam = upd.args[0].Lambda;
