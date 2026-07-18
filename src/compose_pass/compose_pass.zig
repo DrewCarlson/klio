@@ -1007,7 +1007,16 @@ const Walker = struct {
 
     fn walkStmt(w: *Walker, s: *Stmt) std.mem.Allocator.Error!void {
         switch (s.*) {
-            .Expr => |*e| try w.walkExpr(e),
+            // A statement-position `if`/`when` discards its value, so an
+            // EXPRESSION-shaped branch (`if (c) parent { … } else parent
+            // { … }` — no braces) can be boxed into a Block and take the
+            // per-branch replaceable group like a braced branch. An
+            // expression-position conditional keeps the Block-only rule —
+            // its value must not be displaced.
+            .Expr => |*e| {
+                try w.walkExpr(e);
+                if (w.thread) w.wrapStatementConditional(e);
+            },
             .Assign => |*asg| {
                 try w.walkExpr(&asg.target);
                 try w.walkExpr(&asg.value);
@@ -1191,6 +1200,57 @@ const Walker = struct {
 
     /// Bracket a Block-shaped branch with
     /// `$composer.startReplaceGroup(<span key>)` / `endReplaceGroup()`.
+    /// Statement-position conditional: box each EXPRESSION-shaped branch
+    /// holding composable content into a Block, then bracket it with the
+    /// per-branch replaceable group (braced branches were already wrapped
+    /// by the expression walk). Recurses down `else if` chains — every
+    /// arm of a statement conditional is statement-position too.
+    fn wrapStatementConditional(w: *Walker, e: *Expr) void {
+        switch (e.*) {
+            .If => |*f| {
+                if (w.branchHasComposable(f.then_branch) or
+                    (if (f.else_branch) |eb| w.branchHasComposable(eb) else false))
+                {
+                    w.wrapBranchBoxed(f.then_branch);
+                    if (f.else_branch) |eb| {
+                        if (eb.* == .If) {
+                            w.wrapStatementConditional(eb);
+                        } else {
+                            w.wrapBranchBoxed(eb);
+                        }
+                    }
+                }
+            },
+            .When => |*wh| {
+                var any = false;
+                for (wh.branches) |*br| {
+                    if (w.branchHasComposable(&br.body)) any = true;
+                }
+                if (any) {
+                    for (wh.branches) |*br| w.wrapBranchBoxed(&br.body);
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// `wrapBranchInReplaceGroup`, boxing a non-Block branch into a
+    /// single-statement Block first. Idempotent for already-wrapped
+    /// blocks (their first stmt is the startReplaceGroup call).
+    fn wrapBranchBoxed(w: *Walker, branch: *Expr) void {
+        if (branch.* == .Block) {
+            if (branch.Block.stmts.len != 0 and
+                isComposerCallStmt(&branch.Block.stmts[0], "startReplaceGroup")) return;
+            w.wrapBranchInReplaceGroup(branch);
+            return;
+        }
+        const sp = exprSpanOf(branch);
+        const stmts = w.a.alloc(ast.Stmt, 1) catch @panic("oom");
+        stmts[0] = .{ .Expr = branch.* };
+        branch.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+        w.wrapBranchInReplaceGroup(branch);
+    }
+
     fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
         if (branch.* != .Block) return;
         const blk = &branch.Block;
