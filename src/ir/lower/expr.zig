@@ -3411,6 +3411,9 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         break :blk c;
     };
+    const prev_call_label = b.current_call_label;
+    b.current_call_label = helpers.calleeLabel(callee);
+    defer b.current_call_label = prev_call_label;
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
@@ -10115,4 +10118,62 @@ test "lowers postfix not-null assert" {
     defer freeFunc(func);
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .NotNullAssert);
+}
+
+test "trailing lambda's implicit label survives a call-shaped receiver" {
+    // `Stack().apply { … }`: lowering the receiver `Stack()` re-arms the
+    // ambient pending label with "Stack"; the argument lambda must still
+    // record "apply" so `return@apply` unwinds to the lambda, not into
+    // the `apply` frame itself. Arena-backed: lambda lowering hangs side
+    // tables off the module that outlive the builder.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var recv_segs = [_]ast.Ident{.{ .name = "Stack", .span = dummySpan() }};
+    var recv_callee = Expr{ .Path = .{ .segments = &recv_segs, .span = dummySpan() } };
+    var recv_call = Expr{ .Call = .{
+        .callee = &recv_callee,
+        .args = &.{},
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    var callee = Expr{ .Member = .{
+        .receiver = &recv_call,
+        .name = .{ .name = "apply", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    var args = [_]Expr{.{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } }};
+    var arg_names = [_]?[]const u8{null};
+    const e = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    // Arena-owned: no freeFunc — the arena reclaims the whole build.
+    _ = try b.finish("f", "f", build.typeUnit());
+    var found = false;
+    for (m.funcs.items) |*f| {
+        if (f.is_lambda) {
+            try testing.expectEqualStrings("apply", f.implicit_label orelse "");
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }

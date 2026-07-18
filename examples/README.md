@@ -22,6 +22,7 @@ Run any program with:
 | `compound_assign.kt`     | Compound assignment operators.                                   |
 | `do_while.kt`            | `do`/`while` loops.                                              |
 | `labeled_jumps.kt`       | Labeled `break` / `continue` / `return`.                         |
+| `labeled_return_scope.kt` | `return@apply` exits the block only — the scoped function still returns its receiver, including when the receiver is itself a constructor call and when the return crosses a nested inline lambda. |
 | `const_val.kt`           | `const val` and compile-time constants.                          |
 | `top_level_computed_val.kt` | Top-level `val` with a custom getter (no backing field) re-evaluating per read. |
 | `definite_assignment.kt` | Definite-assignment behavior for `val`.                          |

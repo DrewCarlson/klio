@@ -545,6 +545,15 @@ pub const FuncBuilder = struct {
     /// as its implicit label (`with(n) { … }` → the lambda's body Func
     /// gets `implicit_label = "with"`).
     pending_lambda_label: ?[]const u8 = null,
+    /// The enclosing call's simple name for the whole extent of its
+    /// lowering. `pending_lambda_label` is ambient state that a nested
+    /// call re-arms — lowering the receiver of `Stack().apply { … }`
+    /// overwrote "apply" with "Stack", so the argument lambda recorded
+    /// the wrong implicit label and `return@apply` unwound past it into
+    /// the `apply` frame (apply then returned Unit, not its receiver).
+    /// This field is saved/restored by `lowerCall` itself, so the
+    /// argument-run always labels lambdas with the call the user wrote.
+    current_call_label: ?[]const u8 = null,
     /// The lambda literal about to be lowered is a `suspend { … }`
     /// expression: its body `Func` is marked `is_suspend` so runtime
     /// overload dispatch can tell a suspend lambda value from a plain
