@@ -31,7 +31,11 @@ const runtime = @import("runtime");
 /// Unit-return, local-class init-block, and vararg-overload-resolution
 /// fixes held five consecutive runs at 1031-1050. The floor leaves
 /// saturation headroom like the implicit suite's does.
-const BASELINE: usize = 1020;
+// Ratchet RAISED 1020 -> 1100 after the cluster campaign's verified 1145
+// (this is the pass-count FLOOR future runs must meet or beat; raising it
+// tightens the gate). Margin below 1145 covers the documented ±flake band
+// and did-not-complete variance under load.
+const BASELINE: usize = 1100;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
