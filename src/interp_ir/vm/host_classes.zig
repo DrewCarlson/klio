@@ -569,6 +569,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .supertype_delegates = &.{},
         .delegate_forwarders = &.{},
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .is_local_runtime = true,
     });
 }
 

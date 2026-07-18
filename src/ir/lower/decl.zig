@@ -1067,6 +1067,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     const a = module.registry.allocator;
     const prev_real_fn = build.pushCurrentRealFn(f.name.name);
     defer build.popCurrentRealFn(prev_real_fn);
+    const local_class_mark = build.localClassScopeMark();
+    defer build.localClassScopeRestore(local_class_mark);
     const prev_owner = build.pushCurrentOwnerClass(owner_class);
     defer build.popCurrentOwnerClass(prev_owner);
     var b = try FuncBuilder.init(a, module);

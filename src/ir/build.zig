@@ -168,6 +168,37 @@ pub fn currentRealFn() ?[]const u8 {
     return current_real_fn;
 }
 
+/// LOCAL class names declared so far in the real function currently
+/// lowering (and its enclosing ones). A bare constructor call on one of
+/// these — from the declaring body or a nested lambda that captures the
+/// binding — must construct the local class, never a same-simple-name
+/// module class the index would resolve. Bounded; overflow entries are
+/// dropped (those names then simply lose the shadowing, as before).
+threadlocal var local_class_scope: [32][]const u8 = undefined;
+threadlocal var local_class_scope_len: usize = 0;
+
+pub fn pushLocalClassName(name: []const u8) void {
+    if (local_class_scope_len < local_class_scope.len) {
+        local_class_scope[local_class_scope_len] = name;
+        local_class_scope_len += 1;
+    }
+}
+
+pub fn localClassScopeMark() usize {
+    return local_class_scope_len;
+}
+
+pub fn localClassScopeRestore(mark: usize) void {
+    if (mark <= local_class_scope.len) local_class_scope_len = mark;
+}
+
+pub fn isLocalClassInScope(name: []const u8) bool {
+    for (local_class_scope[0..local_class_scope_len]) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
 /// The owner class of the REAL function whose body is lowering, visible to
 /// nested lambda builders (which carry no owner of their own) — the
 /// receiver-function-typed property flag resolves through it.
