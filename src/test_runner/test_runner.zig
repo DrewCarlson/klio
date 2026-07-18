@@ -402,7 +402,35 @@ fn failureDetail(st: *RunState, oc: interp_ir.CallOutcome) ?[]const u8 {
     };
 }
 
+/// Per-test wall cap in seconds from `KLIO_TEST_WALL_CAP` (0/unset = off).
+/// A wedged test (a genuine deadlock, a spinning virtual-clock loop) then
+/// fails with "test wall-clock deadline exceeded" instead of hanging every
+/// test after it in the class.
+fn wallCapSeconds() i64 {
+    const S = struct {
+        var cached: ?i64 = null;
+    };
+    if (S.cached) |v| return v;
+    const v: i64 = blk: {
+        const s = runtime.getenvSlice("KLIO_TEST_WALL_CAP") orelse break :blk 0;
+        break :blk std.fmt.parseInt(i64, s, 10) catch 0;
+    };
+    S.cached = v;
+    return v;
+}
+
+fn armWallDeadline() void {
+    const cap = wallCapSeconds();
+    if (cap <= 0) return;
+    ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap * 1000, .monotonic);
+}
+
+fn clearWallDeadline() void {
+    ir.eval.test_wall_deadline_ms.store(0, .monotonic);
+}
+
 fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
+    defer clearWallDeadline();
     for (st.plan.top) |t| {
         if (t.ignored) {
             try record(st, t.display, .skipped, null);
@@ -412,7 +440,9 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             try record(st, t.display, .failed, try st.gpa.dupe(u8, "test function not found in built module"));
             continue;
         };
+        armWallDeadline();
         const oc = try vm.callNoArg(fid);
+        clearWallDeadline();
         if (failureDetail(st, oc)) |d| {
             try record(st, t.display, .failed, d);
         } else {
@@ -431,6 +461,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                 continue;
             };
             // Fresh instance per test (JUnit semantics).
+            armWallDeadline();
             const inst = try vm.construct(cid);
             switch (inst) {
                 .ok => |receiver| {
@@ -445,14 +476,17 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                     if (detail == null) {
                         detail = failureDetail(st, try vm.callMethod(&receiver, m.name));
                     }
-                    // @AfterTest always runs; its failure surfaces only if the
-                    // test itself passed.
+                    // @AfterTest always runs (on a fresh deadline budget so a
+                    // timed-out test still tears down); its failure surfaces
+                    // only if the test itself passed.
+                    armWallDeadline();
                     for (ct.afters) |a| {
                         const ad = failureDetail(st, try vm.callMethod(&receiver, a));
                         if (ad) |d| {
                             if (detail == null) detail = d else st.gpa.free(d);
                         }
                     }
+                    clearWallDeadline();
                     if (detail) |d| try record(st, m.display, .failed, d) else try record(st, m.display, .passed, null);
                 },
                 .threw => |v| try record(st, m.display, .failed, describeThrow(st.gpa, v)),
