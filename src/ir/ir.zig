@@ -1110,6 +1110,12 @@ pub const Module = struct {
     /// (last bind wins), so a self re-invoke captured by name (the compose
     /// restart lambda) would run the SIBLING. Not serialized.
     pending_lambda_self_fn: ?SelfLocalFn = null,
+    /// Names of enclosing-scope locals with definite NON-callable evidence
+    /// (literal init / primitive declared type), carried into the lambda body
+    /// about to lower so a bare CALL there does not route through the captured
+    /// value (`var key = 0` beside the `key(...) {}` composable). Owned by the
+    /// receiving builder once consumed. Not serialized.
+    pending_lambda_nonfn_locals: ?std.StringHashMap(void) = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.

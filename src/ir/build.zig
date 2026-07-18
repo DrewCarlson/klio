@@ -435,6 +435,11 @@ pub const FuncBuilder = struct {
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: StringSet,
+    /// Locals (own or inherited from enclosing scopes) whose declared type
+    /// or literal initializer proves the binding is NOT callable (`var key
+    /// = 0`). A bare CALL of such a name never routes through the captured
+    /// value — the same-named function wins, as in Kotlin.
+    nonfn_locals: StringSet,
     /// Per local-fn NAME: one entry per same-named declaration, in decl
     /// order. Each overload's closure is additionally bound under a
     /// mangled name so a call site can select the right sibling — the
@@ -663,6 +668,7 @@ pub const FuncBuilder = struct {
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
+            .nonfn_locals = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
@@ -742,6 +748,7 @@ pub const FuncBuilder = struct {
         self.local_decl_recv_fn.deinit();
         self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
+        self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
         self.receiver_lambda_arity.deinit();
         self.context_fn_params.deinit();
@@ -1469,6 +1476,26 @@ pub const FuncBuilder = struct {
     pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
         var it = names.keyIterator();
         while (it.next()) |k| try self.local_ext_fns.put(k.*, {});
+    }
+    pub fn markNonFnLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.nonfn_locals.put(name, {});
+    }
+    /// A nearer declaration of the same name with callable evidence clears
+    /// the inherited mark.
+    pub fn clearNonFnLocal(self: *FuncBuilder, name: []const u8) void {
+        _ = self.nonfn_locals.remove(name);
+    }
+    pub fn isNonFnLocal(self: *const FuncBuilder, name: []const u8) bool {
+        return self.nonfn_locals.contains(name);
+    }
+    pub fn nonFnLocalNames(self: *const FuncBuilder) Allocator.Error!StringSet {
+        return cloneStringSet(self.allocator, &self.nonfn_locals);
+    }
+    /// Seed from an enclosing scope's set (transitive through nested
+    /// lambdas). Copies the names; the caller keeps ownership.
+    pub fn inheritNonFnLocals(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
+        var it = names.keyIterator();
+        while (it.next()) |k| try self.nonfn_locals.put(k.*, {});
     }
     /// The function being built declares its own type parameters
     /// (`fun <T : Comparable<T>> ...`). Comparisons inside such a body on

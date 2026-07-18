@@ -2362,6 +2362,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A lambda inside a local fn's body keeps that fn's self-identity (a
     // named local fn overrides this with its own before its body lowers).
     if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
+    // Non-callable-local evidence flows into the body (transitively — this
+    // builder's set already includes what it inherited).
+    b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -2453,6 +2456,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,
@@ -6959,7 +6963,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     else
         true;
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
-        b.module.funcId(name0) != null and local_fn_takes_call;
+        b.module.funcId(name0) != null and local_fn_takes_call and
+        // A captured local with definite NON-callable evidence (`var key = 0`
+        // beside the `key(...) {}` composable) never serves a CALL — the
+        // function wins, as in Kotlin.
+        !b.isNonFnLocal(name0);
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
         // Only a captured local *extension* function or a receiver-lambda param
