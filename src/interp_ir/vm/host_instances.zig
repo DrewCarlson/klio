@@ -396,6 +396,17 @@ fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const u8 {
     return mg.get().registry.override_cell_props.getKey(probe) orelse prop;
 }
 
+/// Whether `cls`'s `prop` is a recorded private SHADOW of a supertype's
+/// same-name stored property — a distinct cell whose store must leave the
+/// base's plain cell untouched.
+fn isPrivateShadowProp(self: *VmHost, cls: []const u8, prop: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().registry.private_shadow_props.getKey(probe) != null;
+}
+
 /// Evaluate `func` against `args`, returning its result. The module
 /// handle is borrowed for the call's duration.
 fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator.Error!EvalResult {
@@ -2798,10 +2809,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             const n: i64 = fv.Int;
                             fv = .{ .Long = n };
                         }
-                        retainFieldList(&fields, allocator, pp[k].name);
+                        // Dedup on the STORAGE key: a subclass's private
+                        // SHADOW of a base ctor property lives in its own
+                        // owner-mangled cell and must not displace the base's
+                        // plain cell (base-class code reads it by plain name).
+                        // An OVERRIDE cell keeps the old behavior — the
+                        // child's cell supersedes the plain one.
+                        const store_key = shadowFieldKey(self, cls_name, pp[k].name);
+                        retainFieldList(&fields, allocator, store_key);
+                        if (store_key.len != pp[k].name.len and !isPrivateShadowProp(self, cls_name, pp[k].name)) {
+                            retainFieldList(&fields, allocator, pp[k].name);
+                        }
                         // The instance owns one ref to each primary-ctor field.
                         if (runtime.reclaimEnabled()) fv.retain();
-                        try fields.append(allocator, .{ .name = shadowFieldKey(self, cls_name, pp[k].name), .value = fv });
+                        try fields.append(allocator, .{ .name = store_key, .value = fv });
                     }
                 }
                 dg.deinit();
