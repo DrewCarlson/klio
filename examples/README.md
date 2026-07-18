@@ -82,6 +82,7 @@ Run any program with:
 | `dsl_marker.kt`, `build_helpers.kt` | `@DslMarker` and builder-style DSLs.                 |
 | `dsl_dotted_head.kt`          | Dotted-head resolution inside receiver lambdas: a package-qualified head (`kotlin.math.*`) flattens to a global while a receiver-member dotted access walks `this`. |
 | `vararg_spread.kt`            | `vararg` and the spread operator.                           |
+| `map_view_add_unsupported.kt` | A MutableMap's keys/values/entries views write through for removal but throw UnsupportedOperationException from add/addAll. |
 | `deep_call_chain.kt`         | A 40-deep method-call chain (`sb.append(x).append(x)…`) — a type-checker regression guard: re-typing the receiver at each level was O(2^depth). |
 | `ctor_trailing_lambda.kt`   | Kotlin binds a trailing lambda to the LAST parameter whatever gap the named arguments leave: `Panel("p", n = 11) { … }` fills `content` and defaults `flag`. A constructor must agree with a function here — the constructor's named binder used to drop the block into the first free slot and shift everything after it. |
 | `trailing_lambda_member_defaults.kt` | A member/companion/object call with defaulted function-typed middle parameters binds the trailing lambda to the LAST parameter (`observe({}) { … }` fills `block`, defaults `writeObserver`) — the explicit-receiver member-call lowering must carry the trailing-lambda syntax bit. |
