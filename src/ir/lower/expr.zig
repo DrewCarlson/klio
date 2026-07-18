@@ -5010,17 +5010,19 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (b.localFnDecls(bare)) |decls| {
             local_fn_inapplicable = !anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names);
             // A LONE local fn reached from a NESTED body (its own body, or
-            // a local fn declared inside it): the PLAIN name binds only
-            // after the body lowers, so it is never in the nested scope
-            // chain — but the mangled overload cell binds BEFORE the body
-            // lowers exactly so nested calls can capture it. Route the
-            // call through the cell (`fun traverse` inside GapComposer's
-            // `movableContentReferenceFor` recursing into its encloser).
-            // Multi-overload sets select above; an inapplicable local
-            // keeps outward resolution.
+            // a local fn declared inside it): the mangled overload cell
+            // binds BEFORE the body lowers exactly so nested calls can
+            // capture it. Route the call through the cell (`fun traverse`
+            // inside GapComposer's `movableContentReferenceFor` recursing
+            // into its encloser). The PLAIN name cannot serve even when it
+            // IS a visible outer binding: a later same-named sibling
+            // declaration (a validator extension beside the composable)
+            // rebinds the shared plain-name slot, so a by-name capture
+            // runs the sibling. Multi-overload sets select above; an
+            // inapplicable local keeps outward resolution.
             if (decls.len == 1 and !local_fn_inapplicable and
-                b.resolve(bare) == null and !b.knowsOuter(bare) and
-                b.resolve(decls[0].mangled) == null and b.knowsOuter(decls[0].mangled))
+                b.resolve(bare) == null and
+                (b.resolve(decls[0].mangled) != null or b.knowsOuter(decls[0].mangled)))
             {
                 if (try lowerSelectedLocalOverloadCall(b, decls[0].mangled, args, ast_arg_names)) |r| return r;
             }
