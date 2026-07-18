@@ -182,9 +182,13 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         if (ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (ty.function) |ft| {
             if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);
+            b.clearNonFnLocal(p.name.name);
         }
         if (ty.function == null and helpers.isBroadCollectionTypeName(ty.name.name)) {
             try b.markBroadCollectionLocal(p.name.name);
+        }
+        if (ty.function == null and isDefiniteNonFnTypeName(ty.name.name)) {
+            try b.markNonFnLocal(p.name.name);
         }
     } else if (p.init) |*e| {
         // Literal initializers are recorded too: a call site uses them as
@@ -193,6 +197,14 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         switch (e.*) {
             .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
+            else => {},
+        }
+        // A literal init is definite NON-callable evidence that must also
+        // survive into nested lambda bodies: a captured `var key = 0` does
+        // not shadow the `key(...) {}` composable for a CALL.
+        switch (e.*) {
+            .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.markNonFnLocal(p.name.name),
+            .Lambda, .AnonFun => b.clearNonFnLocal(p.name.name),
             else => {},
         }
     }
@@ -263,6 +275,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         // must reach the first, not recurse into itself through the
         // shared plain-name self-cell. The closure lands in the cell
         // after it is built, below.
+        var mangled_name: []const u8 = undefined;
         const mangled_cell: Reg = mangled_blk: {
             const ov_tys = try b.allocator.alloc(?[]const u8, f.params.len);
             const ov_names = try b.allocator.alloc([]const u8, f.params.len);
@@ -277,6 +290,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             // Module-lifetime: the mangled name ships inside the AstLambda
             // instruction's captured-name list, read at runtime.
             const mangled = try std.fmt.allocPrint(b.module.func_name_index.allocator, "{s}$ovl{d}", .{ f.name.name, ordinal });
+            mangled_name = mangled;
             const null_v = try b.emitConst(.Null);
             const home = b.allocReg();
             try b.push(.{ .MakeCell = .{ .dst = home, .src = null_v } });
@@ -350,6 +364,13 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         // synthetic block above). Mirrors the top-level/member block-body
         // rule in `lowerFunctionBodyWithImplicitOwnerEnclosing`.
         b.module.pending_lambda_fn_block_body = f.body != null and f.body.? == .Block;
+        // The body (and any lambda nested in it) must route a bare
+        // self-reference through the mangled cell: the plain-name slot is
+        // rebound by a later same-named sibling declaration, so a self
+        // re-invoke captured by name would run the sibling.
+        b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
+        // Non-callable-local evidence flows into the body.
+        b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
@@ -1478,4 +1499,16 @@ test "safe member assign branches on null" {
     // Entry block branches; extra blocks were allocated for skip / do / join.
     try testing.expect(func.blocks.len >= 4);
     try testing.expect(func.blocks[0].terminator == .Branch);
+}
+
+/// Type names whose values are definitely not callable — a local declared
+/// with one never shadows a same-named function for a CALL.
+fn isDefiniteNonFnTypeName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "Int",    "Long",   "Short",  "Byte",  "Char",   "Boolean",
+        "Float",  "Double", "String", "UInt",  "ULong",  "UShort",
+        "UByte",  "Unit",
+    };
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }

@@ -274,3 +274,7 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `vararg_overload_binding.kt` | Non-final vararg binding (middle args absorbed, trailing defaults kept, named args past the vararg), List-vs-vararg overload selection, and the materialized Array type of a vararg param in its body. |
 | `property_shadowed_by_block_local.kt` | A branch-block `var` shadowing a same-named class property ends with its block: later bare-name writes reach the property (SetField), not the dead local's register, and reads/writes agree on the target. |
 | `member_extension_scope_priority.kt` | A member extension of an enclosing class is a closer-scope candidate than a same-named top-level extension: calls inside the class bind the member extension; outside, the top-level one. |
+| `spread_vararg_overload.kt` | A `*spread` call binds only a `vararg`-bearing overload — a zero-arg namesake never wins the pick and drops the elements. |
+| `local_fn_self_reference_shadow.kt` | A self-re-invoking lambda inside the first of two same-named local functions binds the enclosing function, not the later sibling that rebinds the plain name. |
+| `captured_var_shadows_fn_call.kt` | A captured non-callable `var` does not shadow a same-named function for a call made inside a nested lambda. |
+| `captured_counter_via_factory_lambda.kt` | A `var` referenced only inside an anonymous object built by a factory lambda still boxes; the object-method write reaches the enclosing scope. |
