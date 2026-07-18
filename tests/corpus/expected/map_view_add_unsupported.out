@@ -1,0 +1,5 @@
+keys.add: threw
+values.add: threw
+entries.addAll: threw
+after keys.remove size=1
+after values.remove size=0

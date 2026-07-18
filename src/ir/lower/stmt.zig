@@ -371,6 +371,12 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
         // Non-callable-local evidence flows into the body.
         b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+        // A bare `return` in an argument lambda nested in THIS local fn
+        // returns from the local fn, not from the enclosing real function.
+        // Push the local fn's name so such returns stamp it as their label,
+        // and (below) name the body func so the runtime unwind stops here.
+        const prev_real_fn = build.pushCurrentRealFn(f.name.name);
+        defer build.popCurrentRealFn(prev_real_fn);
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,
@@ -399,6 +405,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                     const pi = offset + i;
                     if (pi < bf.params.len) bf.params[pi].is_vararg = p.is_vararg;
                 }
+                // Carry the declared name so `frameMatchesLabel` stops a
+                // nested lambda's non-local return at this frame.
+                bf.name = f.name.name;
             }
         }
         const captured_names = lowered.captures;
@@ -1023,6 +1032,9 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         .dst = dst,
     } });
     try b.bind(c.name.name, dst);
+    // A nested lambda's bare `C(args)` must construct this local class
+    // through the captured binding, not a same-simple-name module class.
+    build.pushLocalClassName(c.name.name);
     return null;
 }
 

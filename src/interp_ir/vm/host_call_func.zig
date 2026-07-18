@@ -965,6 +965,13 @@ fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId)
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
+    // A statically-bound INSTANCE METHOD is not in the top-level overload
+    // set: the lowering resolved it by scope (a private member wins over
+    // every top-level namesake for a bare call in its class), and the
+    // simple-name candidates here are top-level functions/extensions. A
+    // re-pick would swap SnapshotStateMap's private `withCurrent` member
+    // for the unrelated `T : StateRecord`.withCurrent extension.
+    if (f.kind == .instance_method or f.kind == .member_extension) return null;
     const name = f.name;
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
@@ -1590,6 +1597,24 @@ fn namedPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []con
 /// target with its `this` receiver-supplied. Returns `null` when no sibling
 /// outscores the resolved func (or there is no overload set), leaving the
 /// caller's pick in place.
+/// Whether the candidate extension's declared receiver head names a class
+/// this program KNOWS and the value provably does not implement. Unknown
+/// heads (type params, aliases, function types) never disqualify.
+fn extRecvDisprovenByValue(self: *VmHost, ty: *const TypeRef, v: *const Value) bool {
+    var head = applicability.simpleName(ty.name);
+    head = std.mem.trimEnd(u8, head, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (head.len == 0 or std.mem.eql(u8, head, "Any")) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    if (v.* != .Instance) return false;
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(head) == null) return false;
+    }
+    return !host_call_member.receiverImplementsHead(self, v, head);
+}
+
 pub fn pickNamedOverloadId(
     self: *VmHost,
     module: *const Module,
@@ -1598,9 +1623,27 @@ pub fn pickNamedOverloadId(
     arg_names: []const ?[]const u8,
     recv_external: bool,
 ) ?FuncId {
+    return pickNamedOverloadIdRecv(self, module, func, args, arg_names, recv_external, null);
+}
+
+/// As `pickNamedOverloadId`, with the caller's implicit `this` value when
+/// the baked target is NOT an extension. A re-pick onto an EXTENSION
+/// candidate would prepend that receiver, so a candidate whose declared
+/// receiver names a class the value provably does not implement
+/// (`TestScope.runTest` against a plain test-class instance) is excluded.
+pub fn pickNamedOverloadIdRecv(
+    self: *VmHost,
+    module: *const Module,
+    func: FuncId,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+    recv_external: bool,
+    external_recv: ?*const Value,
+) ?FuncId {
     const f0 = funcAt(module, func) orelse return null;
     const candidates = module.funcsBySimpleName(f0.name);
     if (candidates.len < 2) return null;
+    const baked_is_ext = paramIsThis(f0.params);
 
     var shapes_buf: [24]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
@@ -1639,6 +1682,14 @@ pub fn pickNamedOverloadId(
     var best_low: ?FuncId = null;
     var best_low_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
+        if (!baked_is_ext) {
+            if (external_recv) |rv| {
+                if (funcAt(module, cand)) |cf| {
+                    if (paramIsThis(cf.params) and
+                        extRecvDisprovenByValue(self, &cf.params[0].ty, rv)) continue;
+                }
+            }
+        }
         const score = namedPoints(self, module, cand, shapes, scope);
         if (pno_trace) {
             const cf0 = funcAt(module, cand);

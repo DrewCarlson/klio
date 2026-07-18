@@ -2917,7 +2917,58 @@ pub const Module = struct {
         return false;
     }
 
-    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId, ctx_owner: ?[]const u8) ?FuncId {
+    /// Whether an EXTENSION candidate's declared receiver could be supplied
+    /// by the statically-known receiver context: the owner class's chain or
+    /// an enclosing class's. Consulted only when the call site's receiver
+    /// types are statically known (a plain method body) — a bare call there
+    /// can only reach an extension through `this`/outer instances, so a
+    /// declared receiver provably outside every chain disqualifies the
+    /// candidate (`TestScope.runTest` inside a plain test class). A
+    /// type-parameter, function-type, or unresolvable receiver head keeps
+    /// the candidate.
+    fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, owner: ?[]const u8) bool {
+        const dbg = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, f.name) else false;
+        if (dbg) std.debug.print("[extplaus] fid={d} fqn={s} recv_ty={s} owner={?s}\n", .{ id.int(), f.fqn, if (f.params.len != 0) f.params[0].ty.name else "-", owner });
+        if (f.params.len == 0) return true;
+        var head = applicability.simpleName(f.params[0].ty.name);
+        head = std.mem.trimEnd(u8, head, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (head.len == 0 or std.mem.eql(u8, head, "Any")) return true;
+        if (std.mem.startsWith(u8, head, "Function")) return true;
+        if (self.registry.func_type_params.get(id)) |tps| {
+            for (tps.items) |tp| {
+                if (std.mem.eql(u8, tp, head)) return true;
+            }
+        }
+        // The head must name a class this build knows, or nothing is provable.
+        if (self.classId(head) == null and !self.registry.class_super_names.contains(head)) return true;
+        var owner_cur: ?[]const u8 = owner orelse return false;
+        var hops: usize = 0;
+        while (owner_cur) |oc| : (hops += 1) {
+            if (hops > 16) break;
+            const oc_head = applicability.simpleName(oc);
+            if (std.mem.indexOfScalar(u8, oc_head, '$') != null) {
+                // A lifted nested class's mangled tail still names it.
+                if (std.mem.endsWith(u8, oc_head, head)) return true;
+            }
+            if (std.mem.eql(u8, oc_head, head)) return true;
+            if (self.registry.class_super_names.get(oc)) |chain| {
+                for (chain) |sup| {
+                    var sn = applicability.simpleName(sup);
+                    if (std.mem.indexOfScalar(u8, sn, '<')) |lt2| sn = sn[0..lt2];
+                    sn = std.mem.trimEnd(u8, sn, "?");
+                    if (std.mem.eql(u8, sn, head)) return true;
+                }
+            } else {
+                // Unknown chain: cannot disprove.
+                return true;
+            }
+            owner_cur = self.registry.enclosing_class.get(oc);
+        }
+        return false;
+    }
+
+    fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId, ctx_owner: ?[]const u8, receiver_known: bool) ?FuncId {
         const scope = applicability.ApplicabilityScope{
             .ctx = @constCast(@ptrCast(self)),
             .ext_is_subtype_name = evidenceSubtypeCb,
@@ -2943,6 +2994,7 @@ pub const Module = struct {
             const sv = self.sigViewForApplicability(id) orelse continue;
             const sc = applicability.applicable(&sv, args, scope) orelse continue;
             const is_ext = funcHasImplicitThis(f);
+            if (is_ext and receiver_known and !self.extReceiverPlausible(id, f, ctx_owner)) continue;
             const rung: u8 = if (sc.exact_arity)
                 (if (is_ext) 1 else 0)
             else if (sc.binding.trailing_lambda_param != null)
@@ -3069,7 +3121,7 @@ pub const Module = struct {
         return best;
     }
 
-    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape, ctx_owner: ?[]const u8) ?FuncId {
+    fn phaseBFallback(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId, want: usize, args: []const applicability.ArgShape, ctx_owner: ?[]const u8, receiver_known: bool) ?FuncId {
         // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
         // overload is not a source-level candidate (kotlinc hides it; it exists
         // only for binary compatibility). The index and `phaseBLadder` already
@@ -3080,7 +3132,11 @@ pub const Module = struct {
         // overload by name self-recurses.
         const fallback = blk: {
             const f = self.funcIdForBareCall(name, ctx_owner) orelse break :blk null;
-            if (self.funcById(f)) |ff| if (ff.low_priority) break :blk null;
+            if (self.funcById(f)) |ff| {
+                if (ff.low_priority) break :blk null;
+                if (funcHasImplicitThis(ff) and receiver_known and
+                    !self.extReceiverPlausible(f, ff, ctx_owner)) break :blk null;
+            }
             break :blk f;
         };
         const want_u32: u32 = @intCast(want);
@@ -3119,7 +3175,11 @@ pub const Module = struct {
             if (self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
         for (self.funcsBySimpleName(name)) |fid| {
-            if (self.funcById(fid)) |ff| if (ff.low_priority) continue;
+            if (self.funcById(fid)) |ff| {
+                if (ff.low_priority) continue;
+                if (funcHasImplicitThis(ff) and receiver_known and
+                    !self.extReceiverPlausible(fid, ff, ctx_owner)) continue;
+            }
             if (self.memberExtOutOfScope(fid, ctx_owner)) continue;
             if (!self.isNonExtFid(fid) and self.declArityOf(fid) == want_u32 and self.declSigCompatible(fid, args)) return fid;
         }
@@ -3270,9 +3330,9 @@ pub const Module = struct {
         // overload; otherwise the applicable() ladder ranks the body candidates,
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
-        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file, ctx.owner_class);
+        var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file, ctx.owner_class, ctx.receiver_known);
         if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
-            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args, ctx.owner_class);
+            heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args, ctx.owner_class, ctx.receiver_known);
         }
         // Prefer the same-name extension overload whose declared receiver
         // matches the enclosing extension's receiver.
@@ -3306,6 +3366,23 @@ pub const Module = struct {
         // FlowCollector extension, never the Job one the index may have
         // ranked first. Only an index pick with the SAME declared receiver
         // may still take precedence.
+        // A phase-B pick that is an EXTENSION whose declared receiver no
+        // statically-known receiver could supply is not Kotlin's target
+        // (`TestScope.runTest` inside a plain test class). Drop it to a
+        // deferred emit so the runtime resolves against real values, unless
+        // a plausible sibling can be re-picked below.
+        if (heur) |h| {
+            if (ctx.receiver_known and ctx.cast_pick == null) {
+                if (self.funcById(h)) |hf| {
+                    if (funcHasImplicitThis(hf) and !self.extReceiverPlausible(h, hf, ctx.owner_class)) {
+                        heur = null;
+                    }
+                }
+            }
+        }
+        if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[rescall] {s} heur={?d} idx={?d} recv_known={} owner={?s}\n", .{ name, if (heur) |h| h.int() else null, if (index_pick) |ip| ip.int() else null, ctx.receiver_known, ctx.owner_class });
+        }
         const target: ?FuncId = if (heur) |h| blk: {
             if (heur_recv_matched) {
                 const idx_also_matches = if (index_pick) |ip|
@@ -4410,6 +4487,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.hierarchy_methods.iterator();
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.member_method_fids.iterator();
+            while (it.next()) |e| try out.member_method_fids.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.private_shadow_props.keyIterator();

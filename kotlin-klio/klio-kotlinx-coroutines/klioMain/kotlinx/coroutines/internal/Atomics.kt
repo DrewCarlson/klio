@@ -9,6 +9,7 @@
 
 package kotlinx.coroutines.internal
 
+import kotlinx.coroutines.ThreadContextElement
 import kotlin.coroutines.CoroutineContext
 
 internal actual class LocalAtomicInt actual constructor(value: Int) {
@@ -47,6 +48,10 @@ internal actual class CommonThreadLocal<T> {
 internal actual fun <T> commonThreadLocal(name: Symbol): CommonThreadLocal<T> =
     CommonThreadLocal()
 
-// klio threads carry no `ThreadContextElement` capture machinery
-// today; nothing to snapshot or restore.
-internal actual fun threadContextElements(context: CoroutineContext): Any = 0
+internal actual fun threadContextElements(context: CoroutineContext): Any =
+    context.fold(0 as Any) { acc, element ->
+        if (element is ThreadContextElement<*>) {
+            val inCount = acc as? Int ?: 1
+            if (inCount == 0) element else inCount + 1
+        } else acc
+    }

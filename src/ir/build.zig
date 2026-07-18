@@ -168,6 +168,37 @@ pub fn currentRealFn() ?[]const u8 {
     return current_real_fn;
 }
 
+/// LOCAL class names declared so far in the real function currently
+/// lowering (and its enclosing ones). A bare constructor call on one of
+/// these — from the declaring body or a nested lambda that captures the
+/// binding — must construct the local class, never a same-simple-name
+/// module class the index would resolve. Bounded; overflow entries are
+/// dropped (those names then simply lose the shadowing, as before).
+threadlocal var local_class_scope: [32][]const u8 = undefined;
+threadlocal var local_class_scope_len: usize = 0;
+
+pub fn pushLocalClassName(name: []const u8) void {
+    if (local_class_scope_len < local_class_scope.len) {
+        local_class_scope[local_class_scope_len] = name;
+        local_class_scope_len += 1;
+    }
+}
+
+pub fn localClassScopeMark() usize {
+    return local_class_scope_len;
+}
+
+pub fn localClassScopeRestore(mark: usize) void {
+    if (mark <= local_class_scope.len) local_class_scope_len = mark;
+}
+
+pub fn isLocalClassInScope(name: []const u8) bool {
+    for (local_class_scope[0..local_class_scope_len]) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
 /// The owner class of the REAL function whose body is lowering, visible to
 /// nested lambda builders (which carry no owner of their own) — the
 /// receiver-function-typed property flag resolves through it.
@@ -310,6 +341,9 @@ pub const FuncBuilder = struct {
     outer_names: StringSet,
     capture_order: std.ArrayList([]const u8) = .empty,
     capture_regs: StringRegMap,
+    /// Capture names whose one-time entry-block `LoadCapture` has been
+    /// emitted (see `loadCaptureHoisted`).
+    capture_loads_emitted: StringSet,
     /// Loop context stack. Each frame names the loop's continue
     /// target (header / latch) and break target (exit). The frame's
     /// optional `label` matches an explicit `break@label` /
@@ -657,6 +691,7 @@ pub const FuncBuilder = struct {
             .next_reg = 0,
             .outer_names = StringSet.init(allocator),
             .capture_regs = StringRegMap.init(allocator),
+            .capture_loads_emitted = StringSet.init(allocator),
             .mutables = StringSet.init(allocator),
             .mutable_homes = StringRegMap.init(allocator),
             .boxed_vars = StringSet.init(allocator),
@@ -721,6 +756,7 @@ pub const FuncBuilder = struct {
         self.outer_names.deinit();
         self.capture_order.deinit(a);
         self.capture_regs.deinit();
+        self.capture_loads_emitted.deinit();
         self.loops.deinit(a);
         self.mutables.deinit();
         self.mutable_homes.deinit();
@@ -1037,6 +1073,28 @@ pub const FuncBuilder = struct {
         const r = self.allocReg();
         try self.capture_regs.put(name, r);
         return idx;
+    }
+
+    /// Load capture slot `idx` into its stable per-name register, ONCE, in
+    /// the ENTRY block — so the value dominates every use. Emitting the
+    /// load at the reference site and caching the register is unsound: the
+    /// first reference may sit in a conditional branch (the LHS of an
+    /// `?:`), and a later use on the other branch then reads a register no
+    /// executed path ever wrote.
+    pub fn loadCaptureHoisted(self: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
+        const idx = try self.recordCapture(name);
+        const dst = self.capture_regs.get(name).?;
+        if (!self.capture_loads_emitted.contains(name)) {
+            try self.capture_loads_emitted.put(name, {});
+            const b0 = &self.blocks.items[0];
+            const old = b0.insts;
+            const new = try self.allocator.alloc(Inst, old.len + 1);
+            @memcpy(new[0..old.len], old);
+            new[old.len] = .{ .LoadCapture = .{ .dst = dst, .idx = idx } };
+            if (old.len != 0) self.allocator.free(old);
+            b0.insts = new;
+        }
+        return dst;
     }
 
     /// True when a name names an outer-frame capture this builder is
@@ -1839,8 +1897,49 @@ pub const FuncBuilder = struct {
         self.cur = b;
     }
 
+    /// `KLIO_EMIT_TRACE=<name>`: report every Call/CallMember/
+    /// CallMemberOrGlobal instruction pushed for that simple name, with
+    /// the resolved target where the emission committed one. Cached once.
+    fn emitTraceWant() ?[]const u8 {
+        const S = struct {
+            var checked: bool = false;
+            var value: ?[]const u8 = null;
+        };
+        if (!S.checked) {
+            S.checked = true;
+            if (std.c.getenv("KLIO_EMIT_TRACE")) |v| S.value = std.mem.span(v);
+        }
+        return S.value;
+    }
+
     /// Append an instruction to the current block.
     pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
+        if (emitTraceWant()) |want| {
+            switch (inst) {
+                .Call => |c| {
+                    if (self.module.funcById(c.func)) |f| {
+                        if (std.mem.eql(u8, f.name, want)) std.debug.print("[emit] Call fqn={s} fid={d} in_fn={s}\n", .{ f.fqn, c.func.int(), currentRealFn() orelse "-" });
+                    }
+                },
+                .CallMember => |c| {
+                    if (c.name.int() < self.module.consts.items.len) {
+                        switch (self.module.consts.items[c.name.int()]) {
+                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" }),
+                            else => {},
+                        }
+                    }
+                },
+                .CallMemberOrGlobal => |c| {
+                    if (c.name.int() < self.module.consts.items.len) {
+                        switch (self.module.consts.items[c.name.int()]) {
+                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMemberOrGlobal name={s} func={?d} in_fn={s}\n", .{ n, if (c.func) |ff| ff.int() else null, currentRealFn() orelse "-" }),
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
         const cur = self.cur.int();
         const block = &self.blocks.items[cur];
         const old = block.insts;

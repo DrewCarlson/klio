@@ -23,6 +23,7 @@ Run any program with:
 | `do_while.kt`            | `do`/`while` loops.                                              |
 | `labeled_jumps.kt`       | Labeled `break` / `continue` / `return`.                         |
 | `labeled_return_scope.kt` | `return@apply` exits the block only — the scoped function still returns its receiver, including when the receiver is itself a constructor call and when the return crosses a nested inline lambda. |
+| `nonlocal_return_finally.kt` | A bare `return` in an argument lambda returns from the function the lambda is written in — a LOCAL fun included — and runs every `finally` the unwind crosses, through a non-spliced inline callee's real frame. |
 | `const_val.kt`           | `const val` and compile-time constants.                          |
 | `top_level_computed_val.kt` | Top-level `val` with a custom getter (no backing field) re-evaluating per read. |
 | `definite_assignment.kt` | Definite-assignment behavior for `val`.                          |
@@ -38,12 +39,15 @@ Run any program with:
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
 | `inner_outer_property.kt`  | An inner class reads the outer instance's overridden property (virtual getter dispatch), incl. an `AbstractMutableList` subclass. |
+| `private_base_accessor_inherited.kt` | An accessor-only property inherited from a private abstract base resolves on the subclass — the private base's accessors live under its qualified registry key, and the hierarchy walk follows it. |
+| `member_ext_property_not_instance_prop.kt` | A member-extension property (`private val Any?.x` inside a class) resolves through the extension surface for any receiver — it is not an instance property of the class and never shadows the read on subtype instances. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |
 | `local_fn_nested_recursion.kt` | A nested local function calling back into its enclosing local function (`fun inner` inside `fun step` invoking `step`), routed through the pre-bound overload cell; includes a `?.let` chain over the recursive result. |
 | `local_fn_overloads.kt`    | Same-named local functions as true overloads: call-site selection by arity and argument types, one overload calling its sibling (no self-recursion through the shared binding), selection from a nested lambda. |
 | `extension_property_delegates.kt` | Delegated extension properties (`val R.x by …`): bound-reference and top-level-var delegates, writes through `setValue`, a custom `getValue` operator receiving the `KProperty`, and bound property references (`obj::extVal`) reading through the delegate. |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |
 | `anon_object_setter.kt`    | An anonymous object overriding a `var` with a custom setter dispatches that setter on writes (the write-through `drawContext` pattern). |
+| `anon_object_captures_fn_named_local.kt` | A non-callable local whose name matches a top-level extension fn still value-captures into an anonymous object — `read.add(...)` in the object's lambda reads the captured list, the extension keeps serving calls. |
 | `enums.kt`, `enum_companion.kt`, `enum_entries_interface.kt` | Enum entries, ctor args, per-entry overrides, `entries`/`values()`, enum companions. |
 | `sealed_when.kt`, `sealed_when_exhaustive.kt` | Sealed hierarchies with exhaustive `when`.  |
 | `data_object.kt`           | `data object`.                                                 |
@@ -53,6 +57,7 @@ Run any program with:
 | `annotated_function_types.kt` | Type-use-site annotations on function types (`@Composable () -> Unit`): params, return types, nullable, receiver, generic args, typealias, property getter, and annotated lambda expressions. |
 | `plain_class_tostring.kt`  | Default and overridden `toString`.                             |
 | `ir_instance_identity.kt`  | Reference identity of instances.                               |
+| `collection_contract_equality.kt` | `==` dispatches on the LEFT operand: a native collection's equals is the collection contract, so `setOf(1) == MySet([1])` is true without an equals override on MySet (and stays identity-false the other way), nested Pairs included. |
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |
 | `when_binding.kt`          | `when` with a bound subject.                                    |
 | `qualified_this.kt`        | Qualified `this@Label` through inner/outer chains.             |
@@ -70,6 +75,9 @@ Run any program with:
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
 | `receiver_member_precedence.kt` | Implicit-receiver precedence for bare reads, writes, and calls: innermost receiver first, member over extension within one receiver, receiver member over top-level binding, inner-class nesting tower. |
+| `private_member_beats_extension.kt` | A bare call inside a class binds the class's OWN member — private inline included — over same-named top-level inline extensions, and never re-picks a top-level namesake at runtime; explicit-receiver calls still reach the extensions. |
+| `ext_needs_receiver_in_scope.kt` | A bare call in a plain method never binds an extension whose declared receiver no statically-known receiver supplies — the top-level namesake wins, named and positional forms alike; an explicit receiver still reaches the extension. |
+| `nested_it_through_member_hof.kt` | An `it` inside a `() -> R` block passed to a class/companion member captures the enclosing lambda's `it` — the member's declared signature supplies the block's zero arity, dropping the parser-injected `it`. |
 | `lexical_receiver_scope.kt`   | Lexical (creation-site) receiver scope for closures and anonymous functions: a no-receiver lambda writes the top-level var from inside a member dispatch; a `with`-created lambda keeps its receiver wherever it is invoked. |
 | `operator_overload_arith.kt`  | Operator overloading.                                       |
 | `tailrec.kt`                  | Direct and mutual tail-call optimization.                   |
@@ -77,8 +85,10 @@ Run any program with:
 | `dsl_marker.kt`, `build_helpers.kt` | `@DslMarker` and builder-style DSLs.                 |
 | `dsl_dotted_head.kt`          | Dotted-head resolution inside receiver lambdas: a package-qualified head (`kotlin.math.*`) flattens to a global while a receiver-member dotted access walks `this`. |
 | `vararg_spread.kt`            | `vararg` and the spread operator.                           |
+| `map_view_add_unsupported.kt` | A MutableMap's keys/values/entries views write through for removal but throw UnsupportedOperationException from add/addAll. |
 | `deep_call_chain.kt`         | A 40-deep method-call chain (`sb.append(x).append(x)…`) — a type-checker regression guard: re-typing the receiver at each level was O(2^depth). |
 | `ctor_trailing_lambda.kt`   | Kotlin binds a trailing lambda to the LAST parameter whatever gap the named arguments leave: `Panel("p", n = 11) { … }` fills `content` and defaults `flag`. A constructor must agree with a function here — the constructor's named binder used to drop the block into the first free slot and shift everything after it. |
+| `trailing_lambda_member_defaults.kt` | A member/companion/object call with defaulted function-typed middle parameters binds the trailing lambda to the LAST parameter (`observe({}) { … }` fills `block`, defaults `writeObserver`) — the explicit-receiver member-call lowering must carry the trailing-lambda syntax bit. |
 | `ctor_vs_factory.kt`         | A class with a same-named factory that fills a default parameter — a single-arg call (`Packed(3f)`) must pick the factory, not the value-class constructor. |
 | `ctor_default_companion.kt`  | A primary-constructor default value reading a companion-object member (`cap = DefaultCap`, like androidx `Stroke`) resolves against the companion, not a null `this`; a default reading a previous parameter resolves by name. |
 | `qualified_object.kt`        | A package-qualified reference to an `object` (`demo.Config`) resolves to the one singleton — identical to the bare name, with writes visible through both — not a separate class classifier. |
@@ -126,6 +136,8 @@ Run any program with:
 | `captured_counter_in_object_method.kt` | A captured outer `var` incremented (`++`) inside an anonymous object's method and inside a local class's method writes through to the declaration site, like a lambda capture. |
 | `local_class_init_block.kt` | A local class's `init { }` blocks run at construction — interleaved with property initializers in declaration order — and read/write the enclosing function's captured vars through shared cells. |
 | `local_fn_shadows_imported_class.kt` | A local `fun Test(a, b)` shadows an imported same-named class (`kotlin.test.Test`) at a bare call, including from inside a closure where the binding arrives as a capture. |
+| `local_class_shadows_nested.kt` | A local `data class Value` shadows a same-simple-name nested class of another owner at a bare constructor call — in the declaring body and from inside a nested lambda that captures the binding. |
+| `capture_load_across_branches.kt` | A captured name referenced on both arms of an elvis loads from the closure slot on whichever arm runs — the capture load is hoisted to the frame entry, never left in a not-taken branch. |
 | `local_var_shadows_fn_call.kt` | A local `var` initialized with a literal does not shadow a same-named function at a call site — an Int is not invokable, so the call binds the function. |
 | `captured_var_carrier.kt`     | A captured `var` mutated inside a lambda round-trips identically whether the closure is called directly, passed to a stdlib HOF (`forEach`/`fold`), spliced through an `inline` HOF, or captured across a `launch`/`suspend`. |
 | `receiver_across_suspend.kt`  | The enclosing-`this` (implicit receiver) chain survives a coroutine park: a member-extension body suspends at a `delay`, then after resume resolves a bare member of an *enclosing* receiver reachable only through the implicit-receiver chain. Interleaved `async` Owners each resolve their own enclosing receiver (innermost wins). |

@@ -182,6 +182,28 @@ fn lookupPairFunc(map: anytype, a: []const u8, b: []const u8) ?FuncId {
     return map.get(.{ .a = a, .b = b });
 }
 
+/// Accessor lookup for a HIERARCHY HOP: the simple key first, then the
+/// hop class's registered FQN key. A PRIVATE class registers its
+/// accessors under the FQN only (the shared simple slot must not let a
+/// private namesake capture unrelated dispatch), so an inherited getter
+/// from a private base (SnapshotMapSet's `size` behind
+/// SnapshotMapKeySet) resolves through the FQN alone.
+fn lookupPairFuncHop(self: *VmHost, map: anytype, cn: []const u8, b: []const u8) ?FuncId {
+    if (map.get(.{ .a = cn, .b = b })) |f| return f;
+    const fqn: ?[]const u8 = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        const d = cg.get().get(cn) orelse break :blk null;
+        const dg = d.borrow();
+        defer dg.deinit();
+        break :blk dg.get().fqn;
+    };
+    if (fqn) |f| {
+        if (!std.mem.eql(u8, f, cn)) return map.get(.{ .a = f, .b = b });
+    }
+    return null;
+}
+
 /// Look up an intrinsic by FQN: the pack-supplied bindings overlay
 /// first, then the stdlib default implementation.
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
@@ -381,8 +403,8 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
             seen.append(allocator, cn) catch return null;
             {
                 const pg = self.prog.borrow();
-                const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name) != null or
-                    lookupPairFunc(pg.get().instance_prop_setters, cn, name) != null;
+                const hit = lookupPairFuncHop(self, pg.get().instance_prop_getters, cn, name) != null or
+                    lookupPairFuncHop(self, pg.get().instance_prop_setters, cn, name) != null;
                 pg.deinit();
                 if (hit) return null;
             }
@@ -735,7 +757,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     const vfid = blk: {
                         const pg = self.prog.borrow();
                         defer pg.deinit();
-                        break :blk lookupPairFunc(pg.get().instance_prop_getters, cn, prop);
+                        break :blk lookupPairFuncHop(self, pg.get().instance_prop_getters, cn, prop);
                     };
                     if (vfid) |fid| {
                         // A private property never participates in override
@@ -1055,7 +1077,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             try seen.append(allocator, cn);
             {
                 const pg = self.prog.borrow();
-                const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name) != null;
+                const hit = lookupPairFuncHop(self, pg.get().instance_prop_getters, cn, name) != null;
                 pg.deinit();
                 if (hit) {
                     found = true;
@@ -2668,7 +2690,7 @@ fn resolveInstanceGetter(
         }
         {
             const pg = self.prog.borrow();
-            const hit = lookupPairFunc(pg.get().instance_prop_getters, cn, name);
+            const hit = lookupPairFuncHop(self, pg.get().instance_prop_getters, cn, name);
             // A PRIVATE property never participates in inheritance: a read
             // that may bind a private getter arrives scope-qualified
             // (`$sgetter$<owner>`) and resolves in that walk; the inherited
@@ -3150,7 +3172,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (mg.get().registry.class_super_names.get(owner)) |chain| {
                         for (chain) |cn| {
                             const pg = self.prog.borrow();
-                            const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
+                            const hit = lookupPairFuncHop(self, pg.get().instance_prop_setters, cn, real_name);
                             pg.deinit();
                             if (hit) |f| break :blk f;
                         }
@@ -3198,7 +3220,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 if (mg.get().registry.class_super_names.get(class_name)) |chain| {
                     for (chain) |cn| {
                         const pg = self.prog.borrow();
-                        const hit = lookupPairFunc(pg.get().instance_prop_setters, cn, real_name);
+                        const hit = lookupPairFuncHop(self, pg.get().instance_prop_setters, cn, real_name);
                         pg.deinit();
                         if (hit) |f| break :blk f;
                         // A stored override shadows any further-up accessor: an

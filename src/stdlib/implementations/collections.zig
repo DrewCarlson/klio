@@ -367,6 +367,26 @@ pub fn modCountFrozen(mc: ?ObjRef(u64)) bool {
     return (g.get().* & FROZEN_MOD_BIT) != 0;
 }
 
+/// A live `MutableMap` view (`keys` / `values` / `entries`) supports
+/// write-through removal but never insertion -- Kotlin's map views throw
+/// UnsupportedOperationException from `add` / `addAll`.
+fn mapViewAddGuard(a: Allocator, args: []const Value) Error!?EvalResult {
+    if (args.len == 0) return null;
+    const backing: ?*CollBackingRef.Cell = switch (args[0]) {
+        .Set => |x| x.backing,
+        .List => |x| x.backing,
+        else => null,
+    };
+    const cell = backing orelse return null;
+    const ref = CollBackingRef{ .cell = cell };
+    const g = ref.borrow();
+    defer g.deinit();
+    if (g.get().* == .map) {
+        return try thrown(a, "kotlin.UnsupportedOperationException", null);
+    }
+    return null;
+}
+
 fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResult {
     if (args.len == 0) return null;
     const read_only = switch (args[0]) {
@@ -3138,6 +3158,7 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
+    if (try mapViewAddGuard(a, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
@@ -5342,6 +5363,7 @@ pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
@@ -6346,6 +6368,7 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     // `addAll` bumps the counter even when the argument is empty (JVM
@@ -6540,6 +6563,7 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
