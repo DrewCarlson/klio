@@ -1810,8 +1810,49 @@ pub const FuncBuilder = struct {
         self.cur = b;
     }
 
+    /// `KLIO_EMIT_TRACE=<name>`: report every Call/CallMember/
+    /// CallMemberOrGlobal instruction pushed for that simple name, with
+    /// the resolved target where the emission committed one. Cached once.
+    fn emitTraceWant() ?[]const u8 {
+        const S = struct {
+            var checked: bool = false;
+            var value: ?[]const u8 = null;
+        };
+        if (!S.checked) {
+            S.checked = true;
+            if (std.c.getenv("KLIO_EMIT_TRACE")) |v| S.value = std.mem.span(v);
+        }
+        return S.value;
+    }
+
     /// Append an instruction to the current block.
     pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
+        if (emitTraceWant()) |want| {
+            switch (inst) {
+                .Call => |c| {
+                    if (self.module.funcById(c.func)) |f| {
+                        if (std.mem.eql(u8, f.name, want)) std.debug.print("[emit] Call fqn={s} fid={d} in_fn={s}\n", .{ f.fqn, c.func.int(), currentRealFn() orelse "-" });
+                    }
+                },
+                .CallMember => |c| {
+                    if (c.name.int() < self.module.consts.items.len) {
+                        switch (self.module.consts.items[c.name.int()]) {
+                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" }),
+                            else => {},
+                        }
+                    }
+                },
+                .CallMemberOrGlobal => |c| {
+                    if (c.name.int() < self.module.consts.items.len) {
+                        switch (self.module.consts.items[c.name.int()]) {
+                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMemberOrGlobal name={s} func={?d} in_fn={s}\n", .{ n, if (c.func) |ff| ff.int() else null, currentRealFn() orelse "-" }),
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
         const cur = self.cur.int();
         const block = &self.blocks.items[cur];
         const old = block.insts;

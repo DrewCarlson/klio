@@ -778,28 +778,6 @@ pub fn closureUserParamsChecked(self: *VmHost, info: anytype) struct { n: usize,
     return .{ .n = n, .stripped = stripped };
 }
 
-/// A ComposableLambdaImpl argument ranks by its wrapped `_block` closure's
-/// source arity: the wrapper's invoke family serves every arity, so the
-/// instance itself says nothing — but overload families keyed on the
-/// functional param's arity (`movableContentOf`'s five overloads) must
-/// still bind exactly, as they do for the raw literal the wrap replaced.
-pub fn composableLambdaBlockArity(self: *VmHost, v: *const Value) ?struct { n: u8, authoritative: bool } {
-    if (v.* != .Instance) return null;
-    const g = v.Instance.borrow();
-    defer g.deinit();
-    {
-        const cg = g.get().class.borrow();
-        defer cg.deinit();
-        if (!std.mem.eql(u8, cg.get().fqn, "androidx.compose.runtime.internal.ComposableLambdaImpl")) return null;
-    }
-    const blk = g.get().get("_block") orelse return null;
-    if (blk != .IrClosure) return null;
-    const info = self.closures.get(@intCast(blk.IrClosure.id)) orelse return null;
-    const up = closureUserParamsChecked(self, info);
-    const n = std.math.cast(u8, up.n) orelse return null;
-    return .{ .n = n, .authoritative = up.stripped };
-}
-
 /// Build an `ArgShape` describing one runtime value for the shared applicability
 /// scorer. Named args are not threaded into the positional `pickOverload`
 /// path, so `named` stays null here.
@@ -814,11 +792,6 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
         },
         .Function => |f| std.math.cast(u8, f.decl.params.len),
         .Class => 0,
-        .Instance => blk: {
-            const cli = composableLambdaBlockArity(self, v) orelse break :blk null;
-            arity_authoritative = cli.authoritative;
-            break :blk cli.n;
-        },
         else => null,
     };
     return .{
@@ -965,6 +938,13 @@ fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId)
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
+    // A statically-bound INSTANCE METHOD is not in the top-level overload
+    // set: the lowering resolved it by scope (a private member wins over
+    // every top-level namesake for a bare call in its class), and the
+    // simple-name candidates here are top-level functions/extensions. A
+    // re-pick would swap SnapshotStateMap's private `withCurrent` member
+    // for the unrelated `T : StateRecord`.withCurrent extension.
+    if (f.kind == .instance_method or f.kind == .member_extension) return null;
     const name = f.name;
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
