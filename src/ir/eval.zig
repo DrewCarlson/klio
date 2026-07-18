@@ -3963,6 +3963,36 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
     return .cont;
 }
 
+/// Whether a value can serve as the callee of a call: closures, function
+/// references, intrinsics, classes (constructor call), bound references, and
+/// instances whose class hierarchy declares `invoke`.
+fn valueInvocable(module: *const Module, callee_v: Value) bool {
+    return switch (callee_v) {
+        .Function, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
+        // A class value invoked bare is a constructor call.
+        .Class, .BoundInnerClass, .PropertyRef => true,
+        .Instance => |i| blk: {
+            {
+                const g = i.borrow();
+                defer g.deinit();
+                // A bound member/constructor reference synth
+                // (`val lit = Expr::Lit`) is a callable value.
+                if (g.get().get("__bound_name__") != null) break :blk true;
+            }
+            const g = i.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            const cls = cg.get().name;
+            if (module.registry.hierarchy_methods.get(cls)) |mset| {
+                break :blk mset.contains("invoke");
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, frame: *Frame, cvm: anytype, host: *H) Allocator.Error!Step {
         var callee_v = frame.read(cvm.callee);
@@ -3977,30 +4007,7 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
         defer allocator.free(arg_values);
         const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
         defer allocator.free(names);
-        const invocable = switch (callee_v) {
-            .Function, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
-            // A class value invoked bare is a constructor call.
-            .Class, .BoundInnerClass, .PropertyRef => true,
-            .Instance => |i| blk: {
-                {
-                    const g = i.borrow();
-                    defer g.deinit();
-                    // A bound member/constructor reference synth
-                    // (`val lit = Expr::Lit`) is a callable value.
-                    if (g.get().get("__bound_name__") != null) break :blk true;
-                }
-                const g = i.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                const cls = cg.get().name;
-                if (frame.module.registry.hierarchy_methods.get(cls)) |mset| {
-                    break :blk mset.contains("invoke");
-                }
-                break :blk false;
-            },
-            else => false,
-        };
+        const invocable = valueInvocable(frame.module, callee_v);
         // A callable whose DECLARED params definitely refute the runtime
         // args is not the target — Kotlin resolved the call to the
         // same-named enclosing member overload; fall to the member arm.
@@ -4924,7 +4931,22 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 .ok => |maybe| maybe,
                 .err => |e| return raiseStep(frame, e),
             };
-            if (global) |callee| {
+            if (global) |found_callee| {
+                var callee = found_callee;
+                // A CALL is not served by a non-callable name binding: a
+                // captured `var key = 0` beside the `key(...) { }` composable
+                // does not shadow the function for an invocation — Kotlin
+                // binds the function; the scoped-global walk merely found the
+                // nearer non-callable capture. Re-bind through the function
+                // index before invoking the value.
+                if (!valueInvocable(frame.module, callee)) {
+                    if (frame.module.funcId(name_str)) |fid| {
+                        if (host.lookupGlobalById(allocator, fid, null, false)) |fv| {
+                            orAudit("CallMemberOrGlobal", name_str, "noncallable_rebind", -1, null);
+                            callee = fv;
+                        }
+                    }
+                }
                 orAudit("CallMemberOrGlobal", name_str, if (by_id != null) "global_id" else "global", -1, null);
                 // Explicit call-site type args survive the deferred form;
                 // a typed value dispatch lets the host coerce unsigned
