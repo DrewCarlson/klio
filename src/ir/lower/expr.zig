@@ -2634,8 +2634,12 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
 }
 
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
-    const list = b.module.func_name_index.get(name) orelse
+    const ohtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const list = b.module.func_name_index.get(name) orelse {
+        if (ohtl_trace) std.debug.print("[ohtl] {s}: no func_name_index entry\n", .{name});
         return memberHostingTrailingLambda(b, name, user_arg_count);
+    };
+    if (ohtl_trace) std.debug.print("[ohtl] {s}: {d} candidates argc={d}\n", .{ name, list.items.len, user_arg_count });
     // With several same-named overloads that all host a trailing lambda
     // (`SnapshotStateList.withCurrent(block: T.() -> R)` and
     // `StateRecord.withCurrent(block: (r: T) -> R)`), declaration order is not
@@ -2646,9 +2650,19 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     // type; only fall back to declaration order when none matches.
     const recv_simple: ?[]const u8 = if (b.enclosingRecvTy()) |r| simpleTypeHead(r) else null;
     var fallback: ?FuncId = null;
+    // A candidate whose body has not been attached yet still answers the
+    // arity question — its SIGNATURE is what the lambda shape needs. A file
+    // lowered before the file that declares its callee (a user file whose
+    // package places it ahead of a pack's own sources) sees the callee
+    // body-less at this point; skipping it left the trailing receiver-lambda
+    // with a spurious implicit `it` bound to the invocation argument
+    // (`launch(Dispatchers.Default) { it }` read the StandaloneCoroutine).
+    // With-body candidates still outrank body-less ones: an `expect`
+    // declaration shadowed by its actual keeps losing to the real one.
+    var bodyless: ?FuncId = null;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        if (!f.hasBody()) continue;
+        if (ohtl_trace) std.debug.print("[ohtl] {s}: cand #{d} params={d} body={} last_ty={s} last_arity={?d}\n", .{ name, fid.int(), f.params.len, f.hasBody(), if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
         // Both shapes host a trailing lambda: an extension/member (leading
         // `this`) and a plain top-level fn — the offset generalizes.
         const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
@@ -2671,6 +2685,10 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
             }
             if (!gap_defaulted) continue;
         }
+        if (!f.hasBody()) {
+            if (bodyless == null) bodyless = fid;
+            continue;
+        }
         // Receiver match wins outright; otherwise remember the first valid
         // candidate as the declaration-order fallback.
         if (recv_simple) |rs| {
@@ -2680,6 +2698,7 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         if (fallback == null) fallback = fid;
     }
     if (fallback) |fid| return fid;
+    if (bodyless) |fid| return fid;
     // No top-level function serves the name at this arity: it may be a member.
     return memberHostingTrailingLambda(b, name, user_arg_count);
 }
@@ -10238,6 +10257,48 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         .qualified_path = null,
     };
     try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
+}
+
+test "trailing-lambda arity host accepts a signature-only candidate" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    // `launch(context, start, block)` as it looks to a file lowered BEFORE
+    // the file that declares it: the signature (params, function-typed
+    // tail) is lifted, but no body is attached yet. The arity host must
+    // still pick it — skipping it left the trailing receiver lambda with a
+    // spurious implicit `it` bound to the invocation's receiver argument.
+    const params = try a.alloc(ir.Param, 4);
+    params[0] = .{ .name = "this", .ty = .{ .name = "CoroutineScope", .nullable = false, .args = &.{} }, .default = null };
+    params[1] = .{ .name = "context", .ty = .{ .name = "CoroutineContext", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    params[2] = .{ .name = "start", .ty = .{ .name = "CoroutineStart", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    params[3] = .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null };
+    const id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = "launch",
+        .fqn = "kotlinx.coroutines.launch",
+        .package = "kotlinx.coroutines",
+        .params = params,
+        .return_ty = .{ .name = "Job", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = &.{}, // signature only: hasBody() == false
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "launch", .id = id });
+    try m.rebuildFuncNameIndex(a);
+    defer {
+        a.free(m.funcs.items[id.int()].params);
+        m.funcs.items[id.int()].params = &.{};
+    }
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    // `launch(Dispatchers.Default) { … }`: two user args, trailing lambda.
+    const picked = overloadHostingTrailingLambda(&b, "launch", 2);
+    try testing.expect(picked != null);
+    try testing.expectEqual(id.int(), picked.?.int());
 }
 
 test "headCompatible: literal heads disprove scalar params only" {
