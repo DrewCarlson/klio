@@ -3634,7 +3634,15 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                 // extension — otherwise the lowerer already prepended it.
                 const caller_this = frameThisParam(frame);
                 const recv_external = caller_this != null and !baked_is_ext;
-                if (host.pickNamedOverloadId(frame.module, call.func, arg_values, names, recv_external)) |picked| {
+                const recv_val: ?*const Value = if (recv_external) blk: {
+                    const ct_idx = caller_this orelse break :blk null;
+                    break :blk &frame.params.items[ct_idx];
+                } else null;
+                const named_pick: ?FuncId = if (comptime @hasDecl(H, "pickNamedOverloadIdRecv"))
+                    host.pickNamedOverloadIdRecv(frame.module, call.func, arg_values, names, recv_external, recv_val)
+                else
+                    host.pickNamedOverloadId(frame.module, call.func, arg_values, names, recv_external);
+                if (named_pick) |picked| {
                     eff_func = picked;
                     const picked_is_ext = bakedExt(frame.module, picked);
                     if (picked_is_ext and !baked_is_ext) {
