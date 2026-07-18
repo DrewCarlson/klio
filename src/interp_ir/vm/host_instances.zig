@@ -2201,6 +2201,10 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             defer mg.deinit();
             return self.callFunc(allocator, mg.get(), fid, effective.items);
         }
+        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+            std.debug.print("[ctor-arity-miss] class={s} fqn={s} n_primary={d} got={d}\n", .{ class_name, classDefFqn(class_def), n_primary, effective.items.len });
+            ir.eval.dumpFrameChainForDiagAlways();
+        }
         return .{ .err = try typeErr(allocator, "{s}() expects {d} args, got {d}", .{ class_name, n_primary, effective.items.len }) };
     }
 

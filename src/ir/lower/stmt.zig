@@ -1011,6 +1011,9 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         .dst = dst,
     } });
     try b.bind(c.name.name, dst);
+    // A nested lambda's bare `C(args)` must construct this local class
+    // through the captured binding, not a same-simple-name module class.
+    build.pushLocalClassName(c.name.name);
     return null;
 }
 

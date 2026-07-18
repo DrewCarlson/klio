@@ -5073,6 +5073,31 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (try lowerPathCall(b, expr, shadowed_by_class, class_competes)) |r| return r;
     }
 
+    // A LOCAL class declared in this function (or an enclosing one) shadows
+    // any same-simple-name module class for a bare constructor call. Its
+    // runtime `.Class` value is bound at the declaration; inside a nested
+    // lambda it arrives through the capture set. Route the call through
+    // that binding — the module-index class path below would construct an
+    // unrelated class (a nested class of another owner) instead.
+    if (callee.* == .Path and callee.Path.segments.len == 1) {
+        const nm0 = callee.Path.segments[0].name;
+        if (build.isLocalClassInScope(nm0) and b.resolve(nm0) == null and b.knowsOuter(nm0)) {
+            const callee_r = try resolveCapture(b, nm0);
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            orEmitAudit(b, "local_class_capture_ctor", "CallValue", nm0);
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = callee_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+
     // Path-callee with a registered class name. The indexed lookup binds
     // the class visible from the caller's package and imports, so a
     // cross-package simple-name collision constructs the right class.
