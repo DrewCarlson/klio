@@ -2722,9 +2722,17 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
         if (fallback == null) fallback = fid;
     }
     if (fallback) |fid| return fid;
+    // A member on the enclosing/receiver class outranks a SIGNATURE-ONLY
+    // top-level namesake: at pack bake the StateRecord.withCurrent extension
+    // is still body-less while SnapshotStateMap.mutate's call to its own
+    // private withCurrent lowers, and letting the extension's (r: T) -> R
+    // arity re-shape the member call's `{ this }` block made a fresh engine
+    // pack return the outer map from every mutate (the get_field-map
+    // family). A WITH-BODY top-level (the fallback above) still wins as
+    // before.
+    if (memberHostingTrailingLambda(b, name, user_arg_count)) |fid| return fid;
     if (bodyless) |fid| return fid;
-    // No top-level function serves the name at this arity: it may be a member.
-    return memberHostingTrailingLambda(b, name, user_arg_count);
+    return null;
 }
 
 /// Whether any argument in the call is passed by name.
