@@ -26,13 +26,28 @@ internal actual inline fun <T> withCoroutineContext(
     context: CoroutineContext,
     countOrElement: Any?,
     block: () -> T
-): T = block()
+): T {
+    val oldValue = kotlinx.coroutines.internal.updateThreadContext(context, countOrElement)
+    try {
+        return block()
+    } finally {
+        kotlinx.coroutines.internal.restoreThreadContext(context, oldValue)
+    }
+}
 
 internal actual inline fun <T> withContinuationContext(
     continuation: Continuation<*>,
     countOrElement: Any?,
     block: () -> T
-): T = block()
+): T {
+    val context = continuation.context
+    val oldValue = kotlinx.coroutines.internal.updateThreadContext(context, countOrElement)
+    try {
+        return block()
+    } finally {
+        kotlinx.coroutines.internal.restoreThreadContext(context, oldValue)
+    }
+}
 
 internal actual fun Continuation<*>.toDebugString(): String = toString()
 
