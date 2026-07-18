@@ -1,6 +1,8 @@
 // A coroutineScope whose body throws cancels its children and rethrows only
 // after they complete — including a child whose dispatched start task had not
-// run yet. The pump used to drop queued-but-unstarted launches when the scope
+// run yet. Such a child is cancelled BEFORE it starts, so its body (and any
+// try/finally in it) never executes: the "child cancelled" prints must NOT
+// appear. The pump used to drop queued-but-unstarted launches when the scope
 // body's drive exited, so the cancelled child never completed and the scope
 // (and every caller of it, e.g. runTest's teardown join) hung forever. A
 // callbackFlow terminal (`first`) exercises the same shape through

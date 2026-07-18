@@ -1,6 +1,4 @@
-child1 cancelled
 caught kotlin.RuntimeException: boom
-child2 cancelled
 caught CancellationException
 producer closed
 first=42
