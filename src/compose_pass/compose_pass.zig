@@ -860,7 +860,7 @@ fn transformDecl(
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (ret_composable and e.* == .Lambda) {
-                        try w.transformComposableLambda(&e.Lambda, ret_fn_params);
+                        try w.transformComposableLambda(&e.Lambda, ret_fn_params, null);
                         if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
@@ -1269,6 +1269,50 @@ const Walker = struct {
     /// Declared param count of that return function type (the header-less
     /// returned lambda keeps an `it` slot when it is 1).
     ret_fn_params: u8 = 0,
+    /// Stack of enclosing composable-lambda scopes that a `return@label` can
+    /// target. A non-local return (one that names a scope other than the
+    /// innermost) must close every group opened since that scope started, the
+    /// way the compiler emits `$composer.endToMarker($marker)`. Lazily created.
+    nlr_scopes: ?*std.ArrayList(NlrScope) = null,
+    /// Monotonic source of fresh marker-local names for this walk.
+    nlr_counter: usize = 0,
+
+    /// A `return@label` target: the enclosing composable lambda labelled
+    /// `label`, the local `marker_var` holding its start marker, and whether a
+    /// non-local return actually referenced it (so the marker capture is only
+    /// emitted when needed).
+    const NlrScope = struct {
+        label: []const u8,
+        marker_var: []const u8,
+        needs: bool,
+    };
+
+    fn nlrScopes(w: *Walker) *std.ArrayList(NlrScope) {
+        if (w.nlr_scopes) |s| return s;
+        const s = w.a.create(std.ArrayList(NlrScope)) catch @panic("oom");
+        s.* = .empty;
+        w.nlr_scopes = s;
+        return s;
+    }
+
+    /// If `label` names a non-innermost enclosing composable-lambda scope, mark
+    /// that scope as needing its start marker and return the marker-local name
+    /// to close groups back to; otherwise null (a local return closes its own
+    /// groups as it unwinds normally).
+    fn nlrReturnMarker(w: *Walker, label: ?Ident) ?[]const u8 {
+        const lbl = label orelse return null;
+        const scopes = w.nlr_scopes orelse return null;
+        var i: usize = scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, scopes.items[i].label, lbl.name)) {
+                if (i + 1 >= scopes.items.len) return null; // innermost: local
+                scopes.items[i].needs = true;
+                return scopes.items[i].marker_var;
+            }
+        }
+        return null;
+    }
 
     /// The composer reference for the current scope: the threaded `$composer`
     /// param, or the ambient intrinsic call in a getter.
@@ -1312,14 +1356,14 @@ const Walker = struct {
                 // carries the annotation itself.
                 if (p.init) |*ini| {
                     if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
-                        try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)));
+                        try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)), null);
                     } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
                         // No declared type: the literal's own header is the
                         // arity, and a headerless literal is `() -> Unit`
                         // (its parser-injected `it` never binds without an
                         // expected type).
                         const arity: u8 = if (ini.Lambda.implicit_it) 0 else @intCast(@min(ini.Lambda.params.len, 255));
-                        try w.transformComposableLambda(&ini.Lambda, arity);
+                        try w.transformComposableLambda(&ini.Lambda, arity, null);
                     } else {
                         try w.walkExpr(ini);
                     }
@@ -1411,7 +1455,7 @@ const Walker = struct {
                 if (f.body) |*fb| switch (fb.*) {
                     .Block => |*blk| try w.walkBlock(blk),
                     .Expr => |*e| if (w.ret_composable and e.* == .Lambda) {
-                        try w.transformComposableLambda(&e.Lambda, w.ret_fn_params);
+                        try w.transformComposableLambda(&e.Lambda, w.ret_fn_params, null);
                         if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(e);
                     } else {
                         try w.walkExpr(e);
@@ -1671,10 +1715,22 @@ const Walker = struct {
                     ((w.composable_vals != null and w.composable_vals.?.contains(name.?)) or
                         (w.locals != null and w.locals.?.contains(name.?)) or
                         (w.lambda_params != null and w.lambda_params.?.contains(name.?)));
+                // The trailing lambda may carry an explicit label
+                // (`InlineLinear outer@{ … }`), which the parser wraps in a
+                // `Labeled` node. Unwrap it to reach the lambda so the labeled
+                // form threads identically to the bare one.
                 const sink_last = c.args.len != 0 and
-                    c.args[c.args.len - 1] == .Lambda and (sink_applies or val_sink);
+                    trailingLambda(&c.args[c.args.len - 1]) != null and (sink_applies or val_sink);
                 for (c.args, 0..) |*arg, i| {
                     if (sink_last and i == c.args.len - 1) {
+                        const sink_lam = trailingLambda(arg).?;
+                        // The `return@label` target for this sink lambda: its
+                        // explicit `lbl@` label, or the callee name for the
+                        // implicit `return@Callee` form.
+                        const sink_label: ?[]const u8 = switch (arg.*) {
+                            .Labeled => |lb| lb.label.name,
+                            else => name,
+                        };
                         var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
                         // `movableContentOf` / `movableContentWithReceiverOf`
                         // are OVERLOADED on the lambda's parameter count
@@ -1693,7 +1749,7 @@ const Walker = struct {
                         // never to this one.
                         const is_mco = std.mem.eql(u8, name.?, "movableContentOf");
                         const is_mcwro = std.mem.eql(u8, name.?, "movableContentWithReceiverOf");
-                        if ((is_mco or is_mcwro) and arg.Lambda.implicit_it) {
+                        if ((is_mco or is_mcwro) and sink_lam.implicit_it) {
                             if (c.type_args.len != 0) {
                                 const ta: u8 = @intCast(@min(c.type_args.len, 255));
                                 exp = if (is_mcwro) ta - 1 else ta;
@@ -1712,9 +1768,9 @@ const Walker = struct {
                         // present.
                         var added_names: [8]?[]const u8 = @splat(null);
                         var added_n: usize = 0;
-                        if ((is_mco or is_mcwro) and w.lambda_params != null and !arg.Lambda.implicit_it) {
+                        if ((is_mco or is_mcwro) and w.lambda_params != null and !sink_lam.implicit_it) {
                             const ta_off: usize = if (is_mcwro) 1 else 0;
-                            for (arg.Lambda.params, 0..) |*lp2, pi| {
+                            for (sink_lam.params, 0..) |*lp2, pi| {
                                 const ti = pi + ta_off;
                                 if (ti >= c.type_args.len) break;
                                 const tref = &c.type_args[ti];
@@ -1730,7 +1786,7 @@ const Walker = struct {
                         defer for (added_names[0..added_n]) |an| {
                             if (an) |nme| _ = w.lambda_params.?.remove(nme);
                         };
-                        try w.transformComposableLambda(&arg.Lambda, exp);
+                        try w.transformComposableLambda(sink_lam, exp, sink_label);
                         // Wrap only content that actually COMPOSES: the
                         // name-keyed sink also catches sibling overloads'
                         // plain trailing lambdas (ComposeNode's update),
@@ -1870,13 +1926,31 @@ const Walker = struct {
                 try w.walkExpr(fr.iter);
                 try w.walkExpr(fr.body);
             },
-            .Return => |*r| if (r.value) |v| {
-                if (w.ret_composable and v.* == .Lambda) {
-                    try w.transformComposableLambda(&v.Lambda, w.ret_fn_params);
-                    if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(v);
-                } else {
-                    try w.walkExpr(v);
+            .Return => |*r| {
+                if (r.value) |v| {
+                    if (w.ret_composable and v.* == .Lambda) {
+                        try w.transformComposableLambda(&v.Lambda, w.ret_fn_params, null);
+                        if (emit_lambda_memo and w.wrap_ret_lambda) w.wrapInComposableLambdaInstance(v);
+                    } else {
+                        try w.walkExpr(v);
+                    }
                 }
+                // A non-local `return@label` unwinds past composable calls whose
+                // groups were opened after the target scope started; close them
+                // first with `$composer.endToMarker($marker)`, mirroring the
+                // compiler's epilogue. Emitted as `{ endToMarker(m); <return> }`.
+                if (w.thread) if (w.nlrReturnMarker(r.label)) |marker_var| {
+                    const ret_copy = try w.a.create(Expr);
+                    ret_copy.* = e.*;
+                    const stmts = try w.a.alloc(Stmt, 2);
+                    stmts[0] = .{ .Expr = w.b.callMember(
+                        w.composerRef(),
+                        "endToMarker",
+                        w.b.slice1(w.b.pathExpr(marker_var)),
+                    ) };
+                    stmts[1] = .{ .Expr = ret_copy.* };
+                    e.* = .{ .Block = .{ .stmts = stmts, .span = w.b.gen_span } };
+                };
             },
             .Throw => |*t| try w.walkExpr(t.value),
             .Labeled => |*l| try w.walkExpr(l.expr),
@@ -1926,7 +2000,7 @@ const Walker = struct {
     /// and thread its body. The plugin lowers a `@Composable (P…) -> R` to a
     /// `FunctionN<P…, Composer, Int, R>`; the engine's `invokeComposable` /
     /// composer invoke it with the composer and a changed flag.
-    fn transformComposableLambda(w: *Walker, lam: anytype, expected_params: ?u8) std.mem.Allocator.Error!void {
+    fn transformComposableLambda(w: *Walker, lam: anytype, expected_params: ?u8, label: ?[]const u8) std.mem.Allocator.Error!void {
         if (dbg_lambda) std.debug.print("[compose-pass] transform composable lambda ({d} params)\n", .{lam.params.len});
         // Idempotence: a lambda already carrying a trailing `$composer` param
         // (a shared node reached twice) is left alone.
@@ -1956,7 +2030,22 @@ const Walker = struct {
         // currentComposer) even when the enclosing scope was not.
         const saved = w.thread;
         w.thread = true;
+        // Register this lambda as a `return@label` target so a nested non-local
+        // return can close the groups it opened. The marker capture is prepended
+        // only if such a return is found while walking the body.
+        var marker_var: ?[]const u8 = null;
+        if (label) |lb| {
+            const scopes = w.nlrScopes();
+            w.nlr_counter += 1;
+            marker_var = std.fmt.allocPrint(w.a, "$klio_nlr_marker_{d}", .{w.nlr_counter}) catch @panic("oom");
+            try scopes.append(w.a, .{ .label = lb, .marker_var = marker_var.?, .needs = false });
+        }
         try w.walkBlock(&lam.body);
+        if (label != null) {
+            const scopes = w.nlr_scopes.?;
+            const sc = scopes.pop().?;
+            if (sc.needs) prependMarkerCapture(w, lam, marker_var.?);
+        }
         w.thread = saved;
         // A labeled early return (`return@run`) crossing a wrapped branch
         // bracket must close the replace-groups it exits; the content
@@ -1966,6 +2055,39 @@ const Walker = struct {
             var inj = EpilogueInjector{ .a = w.a, .b = w.b, .fn_name = "", .value_params = &.{}, .has_restart = false };
             try inj.stmts(lam.body.stmts);
         }
+    }
+
+    /// Prepend `val <marker_var> = <composer>.currentMarker` to a lambda body so
+    /// a nested non-local return can pass the captured marker to `endToMarker`.
+    fn prependMarkerCapture(w: *Walker, lam: anytype, marker_var: []const u8) void {
+        const prop = w.a.create(ast.Property) catch @panic("oom");
+        prop.* = .{
+            .mutable = false,
+            .name = w.b.ident(marker_var),
+            .receiver_type = null,
+            .ty = null,
+            .init = w.b.member(w.composerRef(), "currentMarker"),
+            .delegate = null,
+            .getter = null,
+            .setter = null,
+            .is_abstract = false,
+            .is_open = false,
+            .is_override = false,
+            .is_lateinit = false,
+            .is_const = false,
+            .is_inline = false,
+            .is_expect = false,
+            .is_actual = false,
+            .setter_visibility = null,
+            .visibility = .Public,
+            .annotations = &.{},
+            .span = w.b.gen_span,
+        };
+        const old = lam.body.stmts;
+        const stmts = w.a.alloc(Stmt, old.len + 1) catch @panic("oom");
+        stmts[0] = .{ .Decl = .{ .Property = prop } };
+        @memcpy(stmts[1..], old);
+        lam.body.stmts = stmts;
     }
 
     /// Append `($composer = <composer>, $changed = <childChanged>)` to a
@@ -2361,6 +2483,17 @@ fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
     return switch (callee.*) {
         .Path => |p| if (p.segments.len >= 1) p.segments[p.segments.len - 1].name else null,
         .Member => |m| m.name.name,
+        else => null,
+    };
+}
+
+/// A lambda literal argument, or a lambda wrapped in a `Labeled` node from an
+/// explicit `lbl@{ … }` trailing lambda. Returns the lambda payload pointer so
+/// the labeled form threads exactly like the bare one; null for a non-lambda arg.
+fn trailingLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
+    return switch (e.*) {
+        .Lambda => &e.Lambda,
+        .Labeled => |*l| if (l.expr.* == .Lambda) &l.expr.Lambda else null,
         else => null,
     };
 }
@@ -3007,4 +3140,111 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     try testing.expectEqual(@as(usize, 4), kcall.args.len);
     try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
     try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
+}
+
+test "a non-local return through a sink lambda closes groups via endToMarker" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    // Body: InlineLinear outer@{ InlineLinear { return@outer } }
+    // A `return@outer` from the inner sink lambda is non-local, so it must
+    // close the inner group before unwinding.
+    const ret = try a.create(Expr);
+    ret.* = .{ .Return = .{ .value = null, .label = dummyIdent("outer"), .span = gsp } };
+    const inner_body = try a.alloc(Stmt, 1);
+    inner_body[0] = .{ .Expr = ret.* };
+    var noparams_l: [0]Ident = .{};
+    var noptys_l: [0]?TypeRef = .{};
+    const inner_lam = try a.create(Expr);
+    inner_lam.* = .{ .Lambda = .{
+        .params = &noparams_l,
+        .param_tys = &noptys_l,
+        .body = .{ .stmts = inner_body, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } };
+    const il_segs = try a.alloc(Ident, 1);
+    il_segs[0] = dummyIdent("InlineLinear");
+    const inner_callee = try a.create(Expr);
+    inner_callee.* = .{ .Path = .{ .segments = il_segs, .span = gsp } };
+    const inner_args = try a.alloc(Expr, 1);
+    inner_args[0] = inner_lam.*;
+    const inner_names = try a.alloc(?[]const u8, 1);
+    inner_names[0] = null;
+    const inner_call = try a.create(Expr);
+    inner_call.* = .{ .Call = .{
+        .callee = inner_callee,
+        .args = inner_args,
+        .arg_names = inner_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } };
+
+    const outer_body = try a.alloc(Stmt, 1);
+    outer_body[0] = .{ .Expr = inner_call.* };
+    const outer_lam = try a.create(Expr);
+    outer_lam.* = .{ .Lambda = .{
+        .params = &noparams_l,
+        .param_tys = &noptys_l,
+        .body = .{ .stmts = outer_body, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } };
+    const outer_labeled = try a.create(Expr);
+    outer_labeled.* = .{ .Labeled = .{ .label = dummyIdent("outer"), .expr = outer_lam, .span = gsp } };
+    const ol_segs = try a.alloc(Ident, 1);
+    ol_segs[0] = dummyIdent("InlineLinear");
+    const outer_callee = try a.create(Expr);
+    outer_callee.* = .{ .Path = .{ .segments = ol_segs, .span = gsp } };
+    const outer_args = try a.alloc(Expr, 1);
+    outer_args[0] = outer_labeled.*;
+    const outer_names = try a.alloc(?[]const u8, 1);
+    outer_names[0] = null;
+    var body_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = outer_callee,
+        .args = outer_args,
+        .arg_names = outer_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } } }};
+    var noparams: [0]Param = .{};
+    const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
+
+    var sinks = std.StringHashMap(void).init(a);
+    try sinks.put("InlineLinear", {});
+    // `InlineLinear` is an inline function: its lambda is spliced, never
+    // wrapped in composableLambda — mirror that so the sink lambda stays raw.
+    var inline_fns = std.StringHashMap(void).init(a);
+    try inline_fns.put("InlineLinear", {});
+    active_inline_fns = &inline_fns;
+    defer active_inline_fns = null;
+    var ctx: u8 = 0;
+    const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
+
+    const ocall = wrappedBodyStmts(&out)[0].Expr.Call;
+    // The labeled trailing lambda is unwrapped and threaded.
+    const olam = ocall.args[0].Labeled.expr.Lambda;
+    try testing.expectEqual(@as(usize, 2), olam.params.len);
+    try testing.expectEqualStrings(composer_param, olam.params[0].name);
+    // The outer lambda body gains a leading `val <marker> = $composer.currentMarker`.
+    try testing.expect(olam.body.stmts[0] == .Decl);
+    const marker_prop = olam.body.stmts[0].Decl.Property;
+    try testing.expect(!marker_prop.mutable);
+    try testing.expect(marker_prop.init.? == .Member);
+    try testing.expectEqualStrings("currentMarker", marker_prop.init.?.Member.name.name);
+    const marker_name = marker_prop.name.name;
+    // The inner sink lambda's `return@outer` became `{ endToMarker(m); return }`.
+    const inner_lam_out = olam.body.stmts[1].Expr.Call.args[0].Lambda;
+    const wrapped = inner_lam_out.body.stmts[0].Expr;
+    try testing.expect(wrapped == .Block);
+    const cleanup = wrapped.Block.stmts[0].Expr.Call;
+    try testing.expectEqualStrings("endToMarker", cleanup.callee.Member.name.name);
+    try testing.expectEqualStrings(marker_name, cleanup.args[0].Path.segments[0].name);
+    try testing.expect(wrapped.Block.stmts[1].Expr == .Return);
 }
