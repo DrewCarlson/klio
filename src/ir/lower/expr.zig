@@ -1320,6 +1320,23 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (std.mem.eql(u8, name0, "Unit") and b.resolve("Unit") == null) {
             return b.emitConst(.Unit);
         }
+        // Splice hygiene for the suspend-implicit `coroutineContext`: inside a
+        // SPLICED inline-fn body (not an inline-argument lambda, whose source
+        // lives at the caller), the bare name means the intrinsic — the callee
+        // could not see a caller local/param that happens to share it. Without
+        // this, `currentCoroutineContext()` (body: bare `coroutineContext`)
+        // spliced into a function with a `coroutineContext` PARAMETER answered
+        // with the parameter.
+        if (std.mem.eql(u8, name0, "coroutineContext") and b.lambda_splice_resolve == null) {
+            if (b.inlineLambdaCallerDepth()) |base| {
+                if (b.resolveSpliceLocal(name0, base) == null) {
+                    const dst = b.allocReg();
+                    const n = try b.module.internConst(b.allocator, .{ .String = "coroutineContext" });
+                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+                    return dst;
+                }
+            }
+        }
         if (b.resolve(name0)) |r| {
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();

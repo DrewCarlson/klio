@@ -909,6 +909,19 @@ pub const FuncBuilder = struct {
         return self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1].caller_scope_depth;
     }
 
+    /// Resolve `name` only in scopes ABOVE `base` — the bindings the
+    /// innermost inline-fn splice created (its params/receiver). Null when
+    /// only caller scopes bind the name. Splice hygiene: a spliced body's
+    /// bare name must not capture a caller local the callee never saw.
+    pub fn resolveSpliceLocal(self: *const FuncBuilder, name: []const u8, base: usize) ?Reg {
+        var i = self.scopes.items.len;
+        while (i > base) {
+            i -= 1;
+            if (self.scopes.items[i].get(name)) |r| return r;
+        }
+        return null;
+    }
+
     /// Current scope count — the caller depth to record before an inline
     /// fn binds its parameters.
     pub fn scopeDepth(self: *const FuncBuilder) usize {

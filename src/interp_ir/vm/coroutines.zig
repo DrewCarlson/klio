@@ -2723,6 +2723,13 @@ ir.eval.resume_route = "inline-claim";
 /// klio's NATIVE suspensions (a channel waiter) do not pass through an
 /// interceptor at all, so for them the pump queue IS the dispatch: they keep
 /// using `coroutineResumeExternal` and run on a later pump turn.
+/// A Kotlin-level `Continuation.resumeWith` delivery is in flight on this
+/// thread. A PERSISTED target must then run on the caller's stack (the
+/// dispatcher running the resume decided this is its moment), not defer to a
+/// later pump turn — a `runTest` scheduler advance would otherwise go idle
+/// with the resumed coroutine still queued and never run it.
+threadlocal var kotlin_resume_delivery: bool = false;
+
 pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
     // KLIO_RESUME_TRACE: name the RESUMER — the route prints below show the
     // frames a delivery re-runs, but a double-delivery diagnosis needs to know
@@ -2732,6 +2739,9 @@ pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Val
         ir.eval.dumpFrameChainForDiagAlways();
     }
     if (try coroutineResumeInline(self, slot, value, out)) return;
+    const prev = kotlin_resume_delivery;
+    kotlin_resume_delivery = true;
+    defer kotlin_resume_delivery = prev;
     return coroutineResumeExternal(self, slot, value, out);
 }
 
@@ -2751,7 +2761,7 @@ pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Val
 /// body cannot spin unbounded.
 fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value: Value, out: Output) Allocator.Error!bool {
     if (!inlineResumeEnabled()) return false;
-    if (!persistResumeGateEnabled()) return false;
+    if (!persistResumeGateEnabled() and !kotlin_resume_delivery) return false;
     if (coroTop() == null) return false;
     if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
     if (persist_inline_resumes >= PERSIST_INLINE_BUDGET) return false;
