@@ -4434,6 +4434,10 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
+            var it = self.member_method_fids.iterator();
+            while (it.next()) |e| try out.member_method_fids.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
             var it = self.private_shadow_props.keyIterator();
             while (it.next()) |k| try out.private_shadow_props.put(k.*, {});
         }

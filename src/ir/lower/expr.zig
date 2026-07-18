@@ -3785,7 +3785,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             // Splice bailed: fall back to a plain member dispatch.
             const recv = try lowerReceiver(b, receiver);
-            const run = try lowerArgRun(b, args);
+            const bail_arity: ?[]const i16 = try classMemberArgArities(b, receiver, mname, args, ast_arg_names);
+            const run = try lowerArgRunWithArity(b, args, bail_arity);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = mname });
             const dst = b.allocReg();
@@ -4004,9 +4005,16 @@ fn lowerCallWithWritebackMember(
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
     const recv = try lowerReceiver(b, receiver);
+    const uarg_arity: ?[]const i16 = try classMemberArgArities(b, receiver, name.name, args, ast_arg_names);
     const arg_regs = try b.allocator.alloc(Reg, args.len);
     defer b.allocator.free(arg_regs);
-    for (args, arg_regs) |*a, *ar| ar.* = try lowerExpr(b, a);
+    for (args, arg_regs, 0..) |*a, *ar, i| {
+        if (uarg_arity) |ar_list| {
+            if (i < ar_list.len) b.pending_lambda_arity = ar_list[i];
+        }
+        ar.* = try lowerExpr(b, a);
+        b.pending_lambda_arity = -1;
+    }
     const args_start = try packContiguous(b, arg_regs);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
@@ -9371,6 +9379,36 @@ fn argStaticHead(b: *FuncBuilder, a: *const Expr) ?[]const u8 {
 
 /// The fallback member-call path: local-callable shadowing, super, cast-receiver
 /// static dispatch, and plain CallMember.
+/// Expected per-argument lambda arities for a member call whose RECEIVER is
+/// a class name (`Snapshot.withMutableSnapshot { … }`, explicit `.Companion`
+/// included): the lifted companion / class method registry resolves the
+/// member's declared signature statically. Null when nothing is provable —
+/// dynamic dispatch then proceeds exactly as before. The channel exists so
+/// a `() -> R` block drops its parser-injected `it` and an `it` inside
+/// captures the enclosing lambda's, instead of binding a null parameter.
+fn classMemberArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
+    if (receiver.* != .Path) return null;
+    const rsegs = receiver.Path.segments;
+    if (rsegs.len == 0) return null;
+    var rname = rsegs[rsegs.len - 1].name;
+    if (std.mem.eql(u8, rname, "Companion") and rsegs.len >= 2) rname = rsegs[rsegs.len - 2].name;
+    if (rname.len == 0 or !std.ascii.isUpper(rname[0])) return null;
+    if (b.resolve(rname) != null or b.knowsOuter(rname)) return null;
+    const a2 = b.allocator;
+    var probe_arity: usize = args.len;
+    while (probe_arity <= args.len + 3) : (probe_arity += 1) {
+        const comp_key = std.fmt.allocPrint(a2, "{s}$Companion$Companion\x00{s}\x00{d}", .{ rname, mname, probe_arity }) catch return null;
+        defer a2.free(comp_key);
+        const cls_key = std.fmt.allocPrint(a2, "{s}\x00{s}\x00{d}", .{ rname, mname, probe_arity }) catch return null;
+        defer a2.free(cls_key);
+        const fid = b.module.registry.member_method_fids.get(comp_key) orelse
+            b.module.registry.member_method_fids.get(cls_key) orelse continue;
+        const f = b.module.funcById(fid) orelse continue;
+        return try argFnArities(b, f, args, ast_arg_names, 1);
+    }
+    return null;
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -9646,7 +9684,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     }
 
     const recv = try lowerReceiver(b, receiver);
-    const run = try lowerArgRun(b, args);
+    // A class-named receiver (`Snapshot.withMutableSnapshot { … }`, or an
+    // explicit `.Companion`) resolves its member's declared signature
+    // statically through the lifted companion / class method registry, so
+    // each lambda argument learns its expected value arity — a `() -> R`
+    // block then drops its parser-injected `it` and an `it` inside
+    // captures the enclosing lambda's, instead of binding a spurious null
+    // parameter.
+    const uarg_arity: ?[]const i16 = try classMemberArgArities(b, receiver, name.name, args, ast_arg_names);
+    const run = try lowerArgRunWithArity(b, args, uarg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
