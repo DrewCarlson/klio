@@ -281,10 +281,18 @@ internal object KlioMainDispatcher : MainCoroutineDispatcher() {
     }
 }
 
+// The real upstream `Unconfined` object, aliased at file scope where the
+// bare name cannot collide with the `Dispatchers.Unconfined` property.
+// `isDispatchNeeded == false` is what makes a launch under it execute on
+// the caller's stack up to the first suspension, and `yield()` under it
+// return without suspending — the pump-backed KlioDispatcher advertised
+// dispatch-needed and queued the body instead, so nothing ran eagerly.
+private val klioUnconfined: CoroutineDispatcher = Unconfined
+
 public actual object Dispatchers {
     public actual val Default: CoroutineDispatcher get() = KlioDefaultDispatcher
     public actual val Main: MainCoroutineDispatcher get() = KlioMainDispatcher
-    public actual val Unconfined: CoroutineDispatcher get() = KlioDispatcher
+    public actual val Unconfined: CoroutineDispatcher get() = klioUnconfined
     public val IO: CoroutineDispatcher get() = KlioIoDispatcher
 }
 
