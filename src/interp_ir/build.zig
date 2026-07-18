@@ -2372,6 +2372,13 @@ fn buildModuleWithOverrides(
         for (c.members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
+            // A MEMBER-EXTENSION property (`private val Any?.exceptionOrNull`
+            // inside JobSupport) is part of the extension surface (registered
+            // with its owner below), never an instance property of the class:
+            // registering its accessor as an instance getter made the walk
+            // treat every subtype instance as shadowed by a "member" the
+            // private-inheritance rule then skipped, so the read missed.
+            if (p.receiver_type != null) continue;
             // An explicit backing field's initializer IS the property's
             // storage initializer.
             const storage_init: ?*const ast.Expr = if (p.init) |*init|
@@ -3580,6 +3587,10 @@ fn buildClassDef(
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
+        // A MEMBER-EXTENSION property belongs to the extension surface,
+        // never to the class's own property set (see the accessor
+        // registration loop's matching skip).
+        if (p.receiver_type != null) continue;
         const storage_init: ?*const ast.Expr = if (p.init) |*e|
             e
         else if (p.explicit_field) |ef|
@@ -3620,7 +3631,9 @@ fn buildClassDef(
         const upto = @min(pos, c.members.len);
         var count: usize = 0;
         for (c.members[0..upto]) |*m| {
-            if (m.* == .Property) count += 1;
+            // Mirror the body_props collection: member-extension properties
+            // are not body properties, so they do not shift init positions.
+            if (m.* == .Property and m.Property.receiver_type == null) count += 1;
         }
         init_block_positions[i] = count;
     }
