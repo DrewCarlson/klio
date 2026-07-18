@@ -3457,12 +3457,16 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
     }
 
-    // Names the object closes over that name a top-level *extension* fn
-    // must NOT be value-captured; drop them so the body resolves them
-    // through the global/member path. But a captured name that the object
-    // *overrides* (a member of its own class or a supertype, e.g. the
-    // crossinline `iterator` param behind `Iterable { … }`) shadows that
-    // member and must stay value-captured, or the override would recurse.
+    // A CALLABLE the object closes over whose name matches a top-level
+    // *extension* fn must NOT be value-captured; drop it so a bare call in
+    // the body resolves through the global/member path. But a captured
+    // name that the object *overrides* (a member of its own class or a
+    // supertype, e.g. the crossinline `iterator` param behind
+    // `Iterable { … }`) shadows that member and must stay value-captured,
+    // or the override would recurse. A NON-callable captured value stays
+    // captured regardless: it can never serve the extension call, and a
+    // value READ of the name (a local `val read` used as `read.add(x)`)
+    // must see the local — Kotlin scoping puts the local first.
     var anon_cap_set = StringSet.init(allocator);
     for (captured_names) |n| {
         var names_extension = false;
@@ -3477,7 +3481,11 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             }
         }
         mg.deinit();
-        if (!names_extension or own_members.contains(n)) try anon_cap_set.put(n, {});
+        const captured_callable = if (findCapture(capture_pairs, n)) |v| switch (v) {
+            .IrClosure, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
+            else => false,
+        } else false;
+        if (!names_extension or !captured_callable or own_members.contains(n)) try anon_cap_set.put(n, {});
     }
     if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
         std.debug.print("[ANON] site={s} captured=", .{synth_class_name});

@@ -45,6 +45,7 @@ Run any program with:
 | `extension_property_delegates.kt` | Delegated extension properties (`val R.x by …`): bound-reference and top-level-var delegates, writes through `setValue`, a custom `getValue` operator receiving the `KProperty`, and bound property references (`obj::extVal`) reading through the delegate. |
 | `anon_object_init.kt`      | Anonymous-object initialization: property initializers over the enclosing scope (top-level properties, object singletons, inline-HOF calls, captured locals), supertype ctor-arg expressions, init-block interleaving. |
 | `anon_object_setter.kt`    | An anonymous object overriding a `var` with a custom setter dispatches that setter on writes (the write-through `drawContext` pattern). |
+| `anon_object_captures_fn_named_local.kt` | A non-callable local whose name matches a top-level extension fn still value-captures into an anonymous object — `read.add(...)` in the object's lambda reads the captured list, the extension keeps serving calls. |
 | `enums.kt`, `enum_companion.kt`, `enum_entries_interface.kt` | Enum entries, ctor args, per-entry overrides, `entries`/`values()`, enum companions. |
 | `sealed_when.kt`, `sealed_when_exhaustive.kt` | Sealed hierarchies with exhaustive `when`.  |
 | `data_object.kt`           | `data object`.                                                 |
@@ -54,6 +55,7 @@ Run any program with:
 | `annotated_function_types.kt` | Type-use-site annotations on function types (`@Composable () -> Unit`): params, return types, nullable, receiver, generic args, typealias, property getter, and annotated lambda expressions. |
 | `plain_class_tostring.kt`  | Default and overridden `toString`.                             |
 | `ir_instance_identity.kt`  | Reference identity of instances.                               |
+| `collection_contract_equality.kt` | `==` dispatches on the LEFT operand: a native collection's equals is the collection contract, so `setOf(1) == MySet([1])` is true without an equals override on MySet (and stays identity-false the other way), nested Pairs included. |
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |
 | `when_binding.kt`          | `when` with a bound subject.                                    |
 | `qualified_this.kt`        | Qualified `this@Label` through inner/outer chains.             |
