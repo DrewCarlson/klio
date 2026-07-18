@@ -70,6 +70,12 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // tree) for a minute per occurrence.
     try map.put("kotlinx_coroutines_test_default_timeout", "10s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
+    // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
+    // deadlock-regression shape, the concurrent-mixing teardown stall) fails
+    // in place instead of eating the class's whole 480s budget — its
+    // classmates' passes stay counted. Generous enough for the compute-heavy
+    // benchmark tests under 8-way contention.
+    try map.put("KLIO_TEST_WALL_CAP", "90");
     return map;
 }
 
@@ -86,16 +92,40 @@ fn runKlio(
 ) !struct { term: std.process.Child.Term, stdout: []u8, stderr: []u8 } {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
-    const r = std.process.run(allocator, threaded.io(), .{
+    const io = threaded.io();
+    // `std.process.run` discards everything it buffered when the timeout
+    // fires, so a class that passed 100 tests and then wedged counted ZERO.
+    // This variant keeps the partial capture: on timeout the child is
+    // killed and whatever it already wrote is returned with term 124.
+    var child = std.process.spawn(io, .{
         .argv = argv,
         .environ_map = env,
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
     }) catch |e| {
-        if (e == error.Timeout) return .{ .term = .{ .exited = 124 }, .stdout = "", .stderr = "" };
         std.debug.print("compose_plugin_commontest: spawn {s} failed: {s}\n", .{ argv[0], @errorName(e) });
         return error.SpawnFailed;
     };
-    return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
+    defer child.kill(io);
+    var mrb: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(allocator, io, mrb.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer mr.deinit();
+    var timed_out = false;
+    while (mr.fill(64, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } })) |_| {} else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => timed_out = true,
+        else => |e| return e,
+    }
+    const term: std.process.Child.Term = if (timed_out) blk: {
+        child.kill(io);
+        break :blk .{ .exited = 124 };
+    } else try child.wait(io);
+    const stdout_slice = try mr.toOwnedSlice(0);
+    errdefer allocator.free(stdout_slice);
+    const stderr_slice = try mr.toOwnedSlice(1);
+    return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
 }
 
 fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !void {
@@ -146,6 +176,19 @@ fn passedLineCount(stdout: []const u8) usize {
     var it = std.mem.splitScalar(u8, stdout, '\n');
     while (it.next()) |line| {
         if (std.mem.endsWith(u8, line, " PASSED")) n += 1;
+    }
+    return n;
+}
+
+/// Streamed per-test lines (`[test] Class.name PASSED 12ms`, stderr,
+/// flushed as each test finishes) — the count that survives a killed
+/// child, whose end-of-run summary never printed.
+fn streamedPassedCount(stderr: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "[test] ") and
+            std.mem.indexOf(u8, line, " PASSED ") != null) n += 1;
     }
     return n;
 }
@@ -224,7 +267,12 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                     _ = phung.fetchAdd(1, .monotonic);
                     continue;
                 };
-                _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
+                // A completed run counts its end-of-run summary; a killed
+                // run's summary never printed, so its streamed per-test
+                // lines carry the count — only the wedged test is lost.
+                const summary_count = passedLineCount(r.stdout);
+                const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
+                _ = ppassed.fetchAdd(n_passed, .monotonic);
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
             }
         }

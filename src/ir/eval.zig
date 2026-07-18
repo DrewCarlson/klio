@@ -545,6 +545,19 @@ pub fn debugPrintFrames() void {
 /// loop. No effect when the env var is unset.
 var spin_interval_s: ?i64 = null;
 var spin_interval_read = false;
+
+/// Per-test wall-clock deadline (monotonic milliseconds), 0 = disarmed.
+/// The test runner arms it before each test phase and clears it after;
+/// the eval loop's counter gate checks it on every thread, so a wedged
+/// pump or a real-thread deadlock unwinds as a test failure instead of
+/// hanging the whole class. Deliberately NOT cleared on fire: a lenient
+/// dispatch arm that swallows the first error meets the deadline again
+/// at the next gate, so retry ladders cannot absorb it.
+pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
+
+pub fn nowMonotonicMs() i64 {
+    return @intCast(@divTrunc(runtime.clockMonotonicNanos(), std.time.ns_per_ms));
+}
 threadlocal var spin_last_dump: i64 = 0;
 threadlocal var spin_check_counter: u64 = 0;
 
@@ -2283,7 +2296,13 @@ fn runFrameInner(
         // Spin diagnostic (KLIO_SPIN_TRACE): cheap counter gate, then a
         // wall-clock check inside.
         spin_check_counter +%= 1;
-        if (spin_check_counter & 0xFFFF == 0) spinDumpMaybe();
+        if (spin_check_counter & 0xFFFF == 0) {
+            spinDumpMaybe();
+            const wall_dl = test_wall_deadline_ms.load(.monotonic);
+            if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+                return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+            }
+        }
         // GC safe point: at an opcode boundary all live Values are in registered
         // frames/globals (no host op mid-flight), so the collector can run.
         if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();

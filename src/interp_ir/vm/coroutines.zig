@@ -1959,6 +1959,17 @@ fn pumpLoop(
     var diag_loops: usize = 0;
     while (true) {
         diag_loops += 1;
+        // Per-test wall deadline: a deadlocked pump idles in this loop's
+        // sleep arms, never the eval loop, so the test runner's watchdog
+        // must fire here — checked cheaply per iteration (the loop already
+        // does map borrows and clock work each round).
+        if (diag_loops % 64 == 0) {
+            const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
+            if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
+                try pumpExit(self, out, persist);
+                return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
+            }
+        }
         if (coroTop()) |top| {
             top.root_tok = root_token.*;
             // A failure from an activation of this pump that ran inline on a
@@ -2188,6 +2199,17 @@ ir.eval.resume_route = "pump-ready";
         if (!persist and root_token.* != null) {
             idle_rounds += 1;
             if (idle_rounds == 3000) diagStalledPump(coroTop().?, root_token.*);
+            // Per-test wall deadline: a genuinely deadlocked pump (a parked
+            // root whose resumer never comes — the Recomposer deadlock-
+            // regression shape) idles HERE, not in the eval loop, so the
+            // test runner's watchdog must fire from this arm too.
+            {
+                const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
+                if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
+                    try pumpExit(self, out, persist);
+                    return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
+                }
+            }
             // Deadlock breaker: an activation belonging to an OUTER pump that
             // failed during an inline resume leaves its error stashed on that
             // pump (`resumeInlineOnce`), whose own loop is frozen beneath this
