@@ -263,6 +263,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         // must reach the first, not recurse into itself through the
         // shared plain-name self-cell. The closure lands in the cell
         // after it is built, below.
+        var mangled_name: []const u8 = undefined;
         const mangled_cell: Reg = mangled_blk: {
             const ov_tys = try b.allocator.alloc(?[]const u8, f.params.len);
             const ov_names = try b.allocator.alloc([]const u8, f.params.len);
@@ -277,6 +278,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             // Module-lifetime: the mangled name ships inside the AstLambda
             // instruction's captured-name list, read at runtime.
             const mangled = try std.fmt.allocPrint(b.module.func_name_index.allocator, "{s}$ovl{d}", .{ f.name.name, ordinal });
+            mangled_name = mangled;
             const null_v = try b.emitConst(.Null);
             const home = b.allocReg();
             try b.push(.{ .MakeCell = .{ .dst = home, .src = null_v } });
@@ -350,6 +352,11 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         // synthetic block above). Mirrors the top-level/member block-body
         // rule in `lowerFunctionBodyWithImplicitOwnerEnclosing`.
         b.module.pending_lambda_fn_block_body = f.body != null and f.body.? == .Block;
+        // The body (and any lambda nested in it) must route a bare
+        // self-reference through the mangled cell: the plain-name slot is
+        // rebound by a later same-named sibling declaration, so a self
+        // re-invoke captured by name would run the sibling.
+        b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
         const lowered = try lowerLambdaBodyCapturingKindWith(
             b.module,
             param_idents,

@@ -263,6 +263,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_own_recv = null;
         b.setRecvTy(rt);
     }
+    // The enclosing local `fun`'s identity (its own body, or a lambda nested
+    // inside it), so a bare self-reference binds through the mangled cell.
+    if (module.pending_lambda_self_fn) |slf| {
+        module.pending_lambda_self_fn = null;
+        b.setSelfLocalFn(slf);
+    }
     // A local `fun`'s BLOCK body returns Unit on fall-through, never the
     // tail statement's value (stashed by `lowerLocalFnDecl`; a lambda
     // literal keeps last-expression semantics). Consumed here, before any
