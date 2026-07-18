@@ -73,6 +73,7 @@ Run any program with:
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
 | `receiver_member_precedence.kt` | Implicit-receiver precedence for bare reads, writes, and calls: innermost receiver first, member over extension within one receiver, receiver member over top-level binding, inner-class nesting tower. |
+| `private_member_beats_extension.kt` | A bare call inside a class binds the class's OWN member — private inline included — over same-named top-level inline extensions, and never re-picks a top-level namesake at runtime; explicit-receiver calls still reach the extensions. |
 | `lexical_receiver_scope.kt`   | Lexical (creation-site) receiver scope for closures and anonymous functions: a no-receiver lambda writes the top-level var from inside a member dispatch; a `with`-created lambda keeps its receiver wherever it is invoked. |
 | `operator_overload_arith.kt`  | Operator overloading.                                       |
 | `tailrec.kt`                  | Direct and mutual tail-call optimization.                   |

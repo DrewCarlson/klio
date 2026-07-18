@@ -5648,6 +5648,34 @@ fn inlineTargetForBareCall(
             pick = better;
         }
     }
+    // The enclosing class's OWN applicable member outranks an inline
+    // EXTENSION whose declared receiver is not evidenced by the receiver
+    // chain: a bare `withCurrent { }` inside SnapshotStateMap (which
+    // declares a private inline member `withCurrent`) must bind the
+    // member, never splice the unrelated `T : StateRecord`.withCurrent
+    // extension onto the map. An extension whose receiver IS on the
+    // chain keeps the splice — the innermost receiver's extension is
+    // Kotlin's pick there.
+    if (pick) |pf| {
+        if (runtime.getenvSlice("KLIO_INLINE_PICK")) |w| {
+            if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-tail] {s} recv={s} hasOwn={} applicable={}\n", .{ nm, if (pf.receiver_type) |rt| rt.name.name else "-", b.hasOwnMember(nm), b.ownMemberApplicable(nm, args.len) });
+        }
+        if (pf.receiver_type != null and b.hasOwnMember(nm) and
+            b.ownMemberApplicable(nm, args.len))
+        {
+            const rt_name = pf.receiver_type.?.name.name;
+            var evidenced = false;
+            if (try narrowingRecvChain(b)) |ch| {
+                for (ch) |cn| {
+                    if (std.mem.eql(u8, cn, rt_name)) {
+                        evidenced = true;
+                        break;
+                    }
+                }
+            }
+            if (!evidenced) return null;
+        }
+    }
     inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);
     return pick;
 }

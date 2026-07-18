@@ -938,6 +938,13 @@ fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId)
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
+    // A statically-bound INSTANCE METHOD is not in the top-level overload
+    // set: the lowering resolved it by scope (a private member wins over
+    // every top-level namesake for a bare call in its class), and the
+    // simple-name candidates here are top-level functions/extensions. A
+    // re-pick would swap SnapshotStateMap's private `withCurrent` member
+    // for the unrelated `T : StateRecord`.withCurrent extension.
+    if (f.kind == .instance_method or f.kind == .member_extension) return null;
     const name = f.name;
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
