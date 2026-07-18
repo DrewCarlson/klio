@@ -43,4 +43,14 @@ fun main() {
     println(Tracker.Companion.observeStatic({}) { 3 })
     println(TrackerObject.observe({}) { 4 })
     println(Tracker().observe { 5 })
+    println(nestedObserve())
+}
+
+// The single-candidate applicability check must model the same rule: a
+// final callable arg binds the last parameter, so only the gap params
+// need defaults. A val-held observer plus nested calls exercised the
+// member-overload decline path.
+fun nestedObserve(): Int {
+    val ro: (Any) -> Unit = { }
+    return Tracker.observeStatic(ro) { Tracker.observeStatic(ro) { 8 } }
 }

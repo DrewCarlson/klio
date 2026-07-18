@@ -8,3 +8,6 @@ object ro=true wo=false
 4
 member ro=false wo=false
 5
+companion ro=true wo=false
+companion ro=true wo=false
+8
