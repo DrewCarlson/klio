@@ -49,6 +49,46 @@ internal fun __kxco_chanBindWatcher(slot: Long, cont: CancellableContinuation<Un
 // registered on the coroutine's Job for a waiter that no longer exists.
 internal fun __kxco_chanBindHandle(slot: Long, handle: DisposableHandle) {}
 
+// Host intrinsic: deliver a dispatched channel resume — the runnable body of
+// the task `__kxco_chanResumeRoute` handed to the waiter's dispatcher. The
+// host picks the stashed value up and resumes the parked waiter on this stack.
+internal fun __kxco_chanResumeNow(slot: Long) {}
+
+// Route a native channel waiter's resume the way resuming its INTERCEPTED
+// continuation would go upstream: through the waiter's own dispatcher. The
+// host calls this (by name) when a value is delivered to a parked
+// `send`/`receive`/iterator waiter, passing the coroutine scope captured when
+// the waiter parked. Returns the route taken:
+//   1 — the dispatcher accepted a task; it delivers via `__kxco_chanResumeNow`
+//       when the dispatcher runs it. This is what keeps a `runTest` waiter
+//       ordered with everything else on the virtual scheduler.
+//   2 — the dispatcher needs no dispatch (`Dispatchers.Unconfined`): the host
+//       resumes the waiter immediately on the delivering stack.
+//   0 — no dispatcher, or a klio pump-backed one (`KlioDispatcher`, Main,
+//       Default, IO): the host's pump/mailbox route IS that dispatcher's
+//       queue, so the pre-existing native route already dispatches correctly.
+internal fun __kxco_chanResumeRoute(scope: Any?, slot: Long): Int {
+    val context = (scope as? CoroutineScope)?.coroutineContext ?: return 0
+    val dispatcher = context[ContinuationInterceptor] as? CoroutineDispatcher ?: return 0
+    if (
+        dispatcher === KlioDispatcher ||
+        dispatcher === KlioMainDispatcher ||
+        dispatcher === KlioDefaultDispatcher ||
+        dispatcher === KlioIoDispatcher
+    ) {
+        return 0
+    }
+    if (!dispatcher.isDispatchNeeded(context)) return 2
+    dispatcher.dispatch(context, KlioChanResumeTask(slot))
+    return 1
+}
+
+private class KlioChanResumeTask(private val slot: Long) : Runnable {
+    override fun run() {
+        __kxco_chanResumeNow(slot)
+    }
+}
+
 // Make a native channel `send`/`receive`/iterator park cancellation-aware.
 // A native park bypasses `suspendCancellableCoroutine`, so the host calls this
 // as the coroutine parks: register a cancelling handler on the parking
@@ -93,6 +133,7 @@ internal fun __kxco_chanArmCancel(scope: Any?, channel: Any?, slot: Long) {
 @Suppress("UNUSED", "UNUSED_PARAMETER", "ConstantConditionIf")
 internal fun __kxco_keepChanCancelReachable(x: Boolean) {
     if (x) __kxco_chanArmCancel(null, null, 0L)
+    if (x) __kxco_chanResumeRoute(null, 0L)
 }
 
 public fun <T> runBlocking(

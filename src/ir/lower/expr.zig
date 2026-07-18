@@ -1928,7 +1928,10 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const name = m.name;
 
     if (m.safe) {
-        // `recv?.x` — null-guard.
+        // `recv?.x` — null-guard. An explicit `recv?.coroutineContext` is a
+        // literal member read exactly like the non-safe arm below: without the
+        // sentinel the runtime's suspend-implicit redirect served the AMBIENT
+        // coroutine's context instead of the receiver's own.
         const recv = try lowerReceiver(b, receiver);
         const null_r = try b.emitConst(.Null);
         const is_null = b.allocReg();
@@ -1943,7 +1946,11 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         try b.push(.{ .Move = .{ .dst = dst, .src = n } });
         b.terminate(.{ .Goto = join });
         b.switchTo(else_b);
-        const field = try b.module.internConst(b.allocator, .{ .String = name.name });
+        const field_name: []const u8 = if (std.mem.eql(u8, name.name, "coroutineContext"))
+            "$coroutineContext$explicit"
+        else
+            name.name;
+        const field = try b.module.internConst(b.allocator, .{ .String = field_name });
         const v = b.allocReg();
         try b.push(.{ .GetField = .{ .dst = v, .receiver = recv, .field = field } });
         try b.push(.{ .Move = .{ .dst = dst, .src = v } });

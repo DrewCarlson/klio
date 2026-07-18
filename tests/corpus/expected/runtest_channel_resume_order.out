@@ -1,0 +1,3 @@
+collector started, count=0
+after trySend+yield count=1
+done

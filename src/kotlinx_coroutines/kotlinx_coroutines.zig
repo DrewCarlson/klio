@@ -71,9 +71,16 @@ const ChannelState = struct {
     /// already-closed channel invokes immediately.
     close_handlers: Deque(Value),
 
-    const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData) };
-    const SendWaiter = struct { slot: i64, value: Value };
-    const RecvWaiter = struct { slot: i64, catching: bool };
+    /// Every waiter records the coroutine scope that parked (`scope`), so a
+    /// later delivery can resume it the way its own interceptor would: a
+    /// waiter whose context carries a dispatcher that needs dispatch (a
+    /// `TestDispatcher`, any custom dispatcher) gets its resume DISPATCHED
+    /// through that dispatcher's queue, keeping it ordered with every other
+    /// task on it — exactly what resuming the intercepted continuation does
+    /// upstream. `Unit` when no scope was active at park time.
+    const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData), scope: Value = .Unit };
+    const SendWaiter = struct { slot: i64, value: Value, scope: Value = .Unit };
+    const RecvWaiter = struct { slot: i64, catching: bool, scope: Value = .Unit };
     const Overflow = enum { suspend_, drop_oldest, drop_latest };
 
     fn init(capacity: usize, overflow: Overflow, rendezvous: bool) ChannelState {
@@ -189,6 +196,11 @@ const CoroutineRegistry = struct {
     /// completes immediately instead of parking — so it never outlives the
     /// suspension it guards.
     chan_delivered: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Resume values for channel deliveries routed through the waiter's own
+    /// Kotlin dispatcher (`__kxco_chanResumeRoute`): stashed here while the
+    /// dispatched runnable is in flight, consumed by `__kxco_chanResumeNow`
+    /// when the dispatcher runs it.
+    chan_pending_resume: std.AutoHashMapUnmanaged(i64, Value) = .empty,
 };
 
 var coro_reg_mutex: runtime.SpinMutex = .{};
@@ -216,14 +228,23 @@ fn gcMarkCoroReg(m: *runtime.gc.Marker) void {
     var it = coro_reg.channels.valueIterator();
     while (it.next()) |st| {
         for (st.buffer.items.items) |v| v.gcMark(m);
-        for (st.send_waiters.items.items) |w| w.value.gcMark(m);
-        for (st.receive_iter_waiters.items.items) |w| m.shade(&w.iter.cell.hdr);
+        for (st.send_waiters.items.items) |w| {
+            w.value.gcMark(m);
+            w.scope.gcMark(m);
+        }
+        for (st.receive_waiters.items.items) |w| w.scope.gcMark(m);
+        for (st.receive_iter_waiters.items.items) |w| {
+            m.shade(&w.iter.cell.hdr);
+            w.scope.gcMark(m);
+        }
         for (st.select_recv_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
         for (st.select_send_waiters.items.items) |sel| m.shade(&sel.cell.hdr);
         for (st.close_handlers.items.items) |h| h.gcMark(m);
     }
     var wit = coro_reg.chan_watchers.valueIterator();
     while (wit.next()) |w| w.gcMark(m);
+    var pit = coro_reg.chan_pending_resume.valueIterator();
+    while (pit.next()) |v| v.gcMark(m);
 }
 
 /// Empty the registry at the run boundary. The registry spine is
@@ -245,6 +266,7 @@ fn sweepRegistryAtRunBoundary() void {
     while (wit.next()) |w| w.release(regAllocator());
     coro_reg.chan_watchers.deinit(regAllocator());
     coro_reg.chan_delivered.deinit(regAllocator());
+    coro_reg.chan_pending_resume.deinit(regAllocator());
     coro_reg = .{};
 }
 
@@ -506,12 +528,99 @@ fn dropWatcher(ctx: *CallCtx, slot: i64) void {
     }
 }
 
+/// Take the stashed dispatched-resume value for `slot`, if the dispatched
+/// runnable has not consumed it yet.
+fn takePendingResume(slot: i64) ?Value {
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    if (coro_reg.chan_pending_resume.fetchRemove(slot)) |kv| return kv.value;
+    return null;
+}
+
 /// Resume a parked channel waiter with a normally-delivered value, then
 /// complete its cancellation watcher so the watcher child does not keep the
 /// parking coroutine's Job alive.
-fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value) void {
+///
+/// `scope` is the coroutine that parked (captured at park time). Upstream, a
+/// channel waiter is an intercepted continuation: its resume goes through its
+/// own dispatcher, keeping it ordered with everything else on that
+/// dispatcher's queue. klio's native park has no Kotlin continuation, so the
+/// routing decision is re-created here via `__kxco_chanResumeRoute`:
+///   1 — the waiter's dispatcher accepted a runnable; the delivery happens
+///       when it runs (`__kxco_chanResumeNow` picks the value up from the
+///       pending stash). A `runTest` body's waiter thereby resumes on the
+///       virtual scheduler IN ORDER with the tasks around it, instead of on
+///       the starved pump after the body finished.
+///   2 — the dispatcher needs no dispatch (`Unconfined`): run the waiter now,
+///       on this stack, exactly as `executeUnconfined` would.
+///   0 — no dispatcher / a pump-backed klio dispatcher: the pump queue IS the
+///       dispatch (the pre-existing route).
+fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void {
+    route: {
+        if (scope != .Instance) break :route;
+        const helper = ctx.host.lookupGlobalFunc("__kxco_chanResumeRoute") orelse break :route;
+        {
+            coro_reg_mutex.lock();
+            defer coro_reg_mutex.unlock();
+            coro_reg.chan_pending_resume.put(regAllocator(), slot, value) catch break :route;
+        }
+        const args = [_]Value{ scope, .{ .Long = slot } };
+        const res = ctx.host.invokeCallable(&helper, &args, ctx.out) catch {
+            _ = takePendingResume(slot);
+            break :route;
+        };
+        const code: i64 = switch (res) {
+            .ok => |v| switch (v) {
+                .Int => |i| @as(i64, i),
+                .Long => |l| l,
+                else => 0,
+            },
+            .err => 0,
+        };
+        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+            std.debug.print("[chan] resumeRoute slot={d} code={d}\n", .{ slot, code });
+        switch (code) {
+            1 => {
+                // Dispatched; the runnable delivers (it may already have, if
+                // the dispatcher ran it synchronously). The watcher completes
+                // now: the waiter irrevocably owns the value.
+                dropWatcher(ctx, slot);
+                return;
+            },
+            2 => {
+                const v = takePendingResume(slot) orelse {
+                    dropWatcher(ctx, slot);
+                    return;
+                };
+                ctx.host.coroutineResumeContinuation(slot, v, ctx.out);
+                dropWatcher(ctx, slot);
+                return;
+            },
+            else => {
+                _ = takePendingResume(slot);
+            },
+        }
+    }
     ctx.host.coroutineResumeSlotValue(slot, value);
     dropWatcher(ctx, slot);
+}
+
+/// `__kxco_chanResumeNow(slot)` — the dispatched channel delivery: the
+/// waiter's own dispatcher decided this is the moment its coroutine runs, so
+/// the resume happens exactly like a Kotlin `Continuation.resumeWith` on the
+/// caller's stack (inline when a pump on this thread holds the slot, the
+/// external route otherwise). A missing stash means the delivery already
+/// happened (an idempotent re-run); nothing to do.
+fn chanResumeNow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .ok = .Unit };
+    const slot: i64 = switch (ctx.args[0]) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .ok = .Unit },
+    };
+    const v = takePendingResume(slot) orelse return .{ .ok = .Unit };
+    ctx.host.coroutineResumeContinuation(slot, v, ctx.out);
+    return .{ .ok = .Unit };
 }
 
 fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Allocator.Error!Value {
@@ -663,8 +772,8 @@ fn offerSendToSelectSenders(ctx: *CallCtx, id: u64, chan: Value) bool {
 }
 
 const ChannelSendOutcome = union(enum) {
-    HandToReceiver: struct { slot: i64, value: Value, catching: bool },
-    HandToIter: i64,
+    HandToReceiver: struct { slot: i64, value: Value, catching: bool, scope: Value },
+    HandToIter: struct { slot: i64, scope: Value },
     Buffered,
     ParkOnSlot: i64,
 };
@@ -674,6 +783,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = ctx.args[0];
     const value: Value = if (ctx.args.len > 1) ctx.args[1] else .Unit;
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.send: bad receiver" } };
+    const park_scope = ctx.host.activeCoroScope() orelse Value.Unit;
     // If a receiver is parked, hand the value straight to it without
     // buffering. Otherwise the channel's capacity / overflow policy
     // decides: a rendezvous channel always parks the sender; a buffered
@@ -693,9 +803,9 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // `__pending__` field and resume with Bool(true).
         if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
-            outcome = .{ .HandToIter = w.slot };
+            outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
-            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
         } else if (state.select_recv_waiters.len() > 0) {
             // A registered `onReceive` select may take this value directly.
             // Offering calls `trySelect` (Kotlin), so it must run outside the
@@ -704,7 +814,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .Buffered; // tentative; reconsidered below
         } else if (state.rendezvous) {
             const slot = allocKxcoSlot();
-            try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+            try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value, .scope = park_scope });
             outcome = .{ .ParkOnSlot = slot };
         } else if (state.buffer.len() < state.capacity) {
             try state.buffer.pushBack(regAllocator(), value);
@@ -712,7 +822,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         } else switch (state.overflow) {
             .suspend_ => {
                 const slot = allocKxcoSlot();
-                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value, .scope = park_scope });
                 outcome = .{ .ParkOnSlot = slot };
             },
             .drop_oldest => {
@@ -736,10 +846,10 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
             if (state.closed) return .{ .err = .{ .Thrown = try closedSendExc(ctx.allocator) } };
             if (state.receive_waiters.popFront()) |w| {
-                fallback = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+                fallback = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
             } else if (state.rendezvous) {
                 const slot = allocKxcoSlot();
-                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value, .scope = park_scope });
                 fallback = .{ .ParkOnSlot = slot };
             } else if (state.buffer.len() < state.capacity) {
                 try state.buffer.pushBack(regAllocator(), value);
@@ -747,7 +857,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             } else switch (state.overflow) {
                 .suspend_ => {
                     const slot = allocKxcoSlot();
-                    try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+                    try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value, .scope = park_scope });
                     fallback = .{ .ParkOnSlot = slot };
                 },
                 .drop_oldest => {
@@ -764,11 +874,11 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (outcome) {
         .HandToReceiver => |h| {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            resumeWaiterNormal(ctx, h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val, h.scope);
             return .{ .ok = .Unit };
         },
-        .HandToIter => |slot| {
-            resumeWaiterNormal(ctx, slot, .{ .Bool = true });
+        .HandToIter => |h| {
+            resumeWaiterNormal(ctx, h.slot, .{ .Bool = true }, h.scope);
             return .{ .ok = .Unit };
         },
         .Buffered => return .{ .ok = .Unit },
@@ -781,7 +891,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 const ChannelTrySendOutcome = union(enum) {
-    HandToReceiver: struct { slot: i64, value: Value, catching: bool },
+    HandToReceiver: struct { slot: i64, value: Value, catching: bool, scope: Value },
     Success,
     Full,
     Closed,
@@ -803,9 +913,9 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .Closed;
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
-            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = .{ .Bool = true }, .catching = false } };
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = .{ .Bool = true }, .catching = false, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
-            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
         } else if (state.select_recv_waiters.len() > 0) {
             offer_to_selects = true;
             outcome = .Success; // tentative; reconsidered below
@@ -841,7 +951,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             if (state.closed) {
                 fb = .Closed;
             } else if (state.receive_waiters.popFront()) |w| {
-                fb = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+                fb = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
             } else if (state.rendezvous) {
                 fb = .Full;
             } else if (state.buffer.len() < state.capacity) {
@@ -860,7 +970,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         switch (fb) {
             .HandToReceiver => |h| {
                 const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-                resumeWaiterNormal(ctx, h.slot, resume_val);
+                resumeWaiterNormal(ctx, h.slot, resume_val, h.scope);
                 return .{ .ok = try channelResult(ctx, .success, .Unit) };
             },
             .Success => return .{ .ok = try channelResult(ctx, .success, .Unit) },
@@ -872,7 +982,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const result: Value = switch (outcome) {
         .HandToReceiver => |h| blk: {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            resumeWaiterNormal(ctx, h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val, h.scope);
             break :blk try channelResult(ctx, .success, .Unit);
         },
         .Success => try channelResult(ctx, .success, .Unit),
@@ -883,7 +993,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 const ChannelReceiveOutcome = union(enum) {
-    Got: struct { value: Value, resumed: ?i64 },
+    Got: struct { value: Value, resumed: ?i64, resumed_scope: Value = .Unit },
     Closed,
     ParkOnSlot: i64,
 };
@@ -903,6 +1013,7 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.receive expects a receiver" } };
     const recv = ctx.args[0];
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.receive: bad receiver" } };
+    const park_scope = ctx.host.activeCoroScope() orelse Value.Unit;
 
     var outcome: ChannelReceiveOutcome = undefined;
     {
@@ -914,23 +1025,27 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
             if (resumed_sender) |sw| {
                 try state.buffer.pushBack(regAllocator(), sw.value);
             }
-            outcome = .{ .Got = .{ .value = v, .resumed = if (resumed_sender) |sw| sw.slot else null } };
+            outcome = .{ .Got = .{
+                .value = v,
+                .resumed = if (resumed_sender) |sw| sw.slot else null,
+                .resumed_scope = if (resumed_sender) |sw| sw.scope else .Unit,
+            } };
         } else if (state.send_waiters.popFront()) |sw| {
             // A rendezvous channel never buffers: a parked sender's value
             // is handed directly to this receiver and the sender resumes.
-            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
+            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot, .resumed_scope = sw.scope } };
         } else if (state.closed) {
             outcome = .Closed;
         } else {
             const slot = allocKxcoSlot();
-            try state.receive_waiters.pushBack(regAllocator(), .{ .slot = slot, .catching = catching });
+            try state.receive_waiters.pushBack(regAllocator(), .{ .slot = slot, .catching = catching, .scope = park_scope });
             outcome = .{ .ParkOnSlot = slot };
         }
     }
 
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit, g.resumed_scope);
             // Freeing a buffer slot lets a registered `onSend` select proceed.
             _ = offerSendToSelectSenders(ctx, id, recv);
             if (catching) return .{ .ok = try channelResult(ctx, .success, g.value) };
@@ -967,6 +1082,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     var outcome: ChannelTryReceiveOutcome = .Closed;
     var resumed_slot: ?i64 = null;
+    var resumed_scope: Value = .Unit;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -976,12 +1092,14 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 if (resumed_sender) |sw| {
                     try state.buffer.pushBack(regAllocator(), sw.value);
                     resumed_slot = sw.slot;
+                    resumed_scope = sw.scope;
                 }
                 outcome = .{ .Got = v };
             } else if (state.send_waiters.popFront()) |sw| {
                 // A rendezvous channel buffers nothing; a parked sender's
                 // value is the element a `tryReceive` retrieves.
                 resumed_slot = sw.slot;
+                resumed_scope = sw.scope;
                 outcome = .{ .Got = sw.value };
             } else if (state.closed) {
                 outcome = .Closed;
@@ -990,7 +1108,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             }
         }
     }
-    if (resumed_slot) |slot| resumeWaiterNormal(ctx, slot, .Unit);
+    if (resumed_slot) |slot| resumeWaiterNormal(ctx, slot, .Unit, resumed_scope);
     // A retrieved element frees a buffer slot, letting a registered `onSend`
     // select proceed.
     if (outcome == .Got) _ = offerSendToSelectSenders(ctx, id, recv);
@@ -1031,24 +1149,24 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // parked `receive()` resumes with a `Result` failure that rethrows
         // the close cause at the suspension point.
         if (w.catching) {
-            resumeWaiterNormal(ctx, w.slot, try channelResult(ctx, .closed, .Unit));
+            resumeWaiterNormal(ctx, w.slot, try channelResult(ctx, .closed, .Unit), w.scope);
         } else {
             exc.retain();
             const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, exc) } };
-            resumeWaiterNormal(ctx, w.slot, failure);
+            resumeWaiterNormal(ctx, w.slot, failure, w.scope);
         }
     }
     // Iterator-style waiters resume with `Bool(false)` so the
     // for-loop hasNext() returns false and the loop exits.
     for (iters) |w| {
-        resumeWaiterNormal(ctx, w.slot, .{ .Bool = false });
+        resumeWaiterNormal(ctx, w.slot, .{ .Bool = false }, w.scope);
     }
     const send_exc = try closedSendExc(ctx.allocator);
     defer send_exc.release(ctx.allocator);
     for (sends) |sw| {
         send_exc.retain();
         const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
-        resumeWaiterNormal(ctx, sw.slot, failure);
+        resumeWaiterNormal(ctx, sw.slot, failure, sw.scope);
     }
     // A close makes every registered receive/send clause resolvable
     // (a closed result for `onReceiveCatching`, a failure otherwise). Offer
@@ -1203,7 +1321,7 @@ fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 
     const Outcome = union(enum) {
-        Got: struct { value: Value, resumed: ?i64 },
+        Got: struct { value: Value, resumed: ?i64, resumed_scope: Value = .Unit },
         Closed,
         NotReady,
     };
@@ -1215,17 +1333,19 @@ fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         if (state.buffer.popFront()) |v| {
             const resumed_sender = state.send_waiters.popFront();
             var resumed: ?i64 = null;
+            var resumed_scope: Value = .Unit;
             if (resumed_sender) |sw| {
                 try state.buffer.pushBack(regAllocator(), sw.value);
                 resumed = sw.slot;
+                resumed_scope = sw.scope;
             }
-            outcome = .{ .Got = .{ .value = v, .resumed = resumed } };
+            outcome = .{ .Got = .{ .value = v, .resumed = resumed, .resumed_scope = resumed_scope } };
         } else if (state.send_waiters.popFront()) |sw| {
             // Empty buffer (or rendezvous) but a sender is parked: take its
             // value directly and admit the sender, exactly as a plain
             // `receive` rendezvous does. Without this an `onReceive` select
             // would miss a parked sender and park forever.
-            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
+            outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot, .resumed_scope = sw.scope } };
         } else if (state.closed) {
             outcome = .Closed;
         } else {
@@ -1235,7 +1355,7 @@ fn channelSelectPollReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (outcome) {
         .Got => |g| {
             try holder.asPtr().define(regAllocator(), "value", g.value);
-            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit, g.resumed_scope);
             _ = offerSendToSelectSenders(ctx, id, ctx.args[0]);
             return .{ .ok = Value.newInt(0) };
         },
@@ -1255,8 +1375,8 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const value = ctx.args[1];
 
     const Outcome = union(enum) {
-        HandToIter: i64,
-        HandToReceiver: struct { slot: i64, value: Value, catching: bool },
+        HandToIter: struct { slot: i64, scope: Value },
+        HandToReceiver: struct { slot: i64, value: Value, catching: bool, scope: Value },
         OfferSelects,
         Buffered,
         Closed,
@@ -1271,9 +1391,9 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .Closed;
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
-            outcome = .{ .HandToIter = w.slot };
+            outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
-            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching } };
+            outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
         } else if (state.select_recv_waiters.len() > 0) {
             outcome = .OfferSelects;
         } else if (state.buffer.len() < state.capacity) {
@@ -1284,13 +1404,13 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     switch (outcome) {
-        .HandToIter => |slot| {
-            resumeWaiterNormal(ctx, slot, .{ .Bool = true });
+        .HandToIter => |h| {
+            resumeWaiterNormal(ctx, h.slot, .{ .Bool = true }, h.scope);
             return .{ .ok = Value.newInt(0) };
         },
         .HandToReceiver => |h| {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
-            resumeWaiterNormal(ctx, h.slot, resume_val);
+            resumeWaiterNormal(ctx, h.slot, resume_val, h.scope);
             return .{ .ok = Value.newInt(0) };
         },
         .OfferSelects => {
@@ -1376,11 +1496,12 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // a failed pull and the enqueue would buffer its value past a waiter
     // it never sees, parking this iterator forever.
     const Outcome = union(enum) {
-        Got: struct { value: Value, resumed: ?i64 },
+        Got: struct { value: Value, resumed: ?i64, resumed_scope: Value = .Unit },
         Closed,
         NoState,
         ParkOnSlot: i64,
     };
+    const park_scope = ctx.host.activeCoroScope() orelse Value.Unit;
     var outcome: Outcome = undefined;
     {
         coro_reg_mutex.lock();
@@ -1389,19 +1510,21 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             if (state.buffer.popFront()) |v| {
                 const resumed_sender = state.send_waiters.popFront();
                 var resumed: ?i64 = null;
+                var resumed_scope: Value = .Unit;
                 if (resumed_sender) |sw| {
                     try state.buffer.pushBack(regAllocator(), sw.value);
                     resumed = sw.slot;
+                    resumed_scope = sw.scope;
                 }
-                outcome = .{ .Got = .{ .value = v, .resumed = resumed } };
+                outcome = .{ .Got = .{ .value = v, .resumed = resumed, .resumed_scope = resumed_scope } };
             } else if (state.send_waiters.popFront()) |sw| {
                 // Rendezvous: hand the parked sender's value to the iterator.
-                outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot } };
+                outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot, .resumed_scope = sw.scope } };
             } else if (state.closed) {
                 outcome = .Closed;
             } else {
                 const slot = allocKxcoSlot();
-                try state.receive_iter_waiters.pushBack(regAllocator(), .{ .slot = slot, .iter = iter_inst });
+                try state.receive_iter_waiters.pushBack(regAllocator(), .{ .slot = slot, .iter = iter_inst, .scope = park_scope });
                 outcome = .{ .ParkOnSlot = slot };
             }
         } else {
@@ -1410,7 +1533,7 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit);
+            if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit, g.resumed_scope);
             try iter_inst.asPtr().define(regAllocator(), "__pending__", g.value);
             return .{ .ok = .{ .Bool = true } };
         },
@@ -1833,6 +1956,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_chanCancelWaiter", .f = channelCancelWaiter },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanBindWatcher", .f = channelBindWatcher },
     .{ .fqn = "kotlinx.coroutines.__kxco_chanBindHandle", .f = channelBindHandle },
+    .{ .fqn = "kotlinx.coroutines.__kxco_chanResumeNow", .f = chanResumeNow },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddReceiver", .f = channelSelectAddReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveReceiver", .f = channelSelectRemoveReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddSender", .f = channelSelectAddSender },
