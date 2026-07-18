@@ -39,6 +39,7 @@ Run any program with:
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |
 | `abstract_inner.kt`        | `abstract` classes, secondary constructors, inner classes.     |
 | `inner_outer_property.kt`  | An inner class reads the outer instance's overridden property (virtual getter dispatch), incl. an `AbstractMutableList` subclass. |
+| `private_base_accessor_inherited.kt` | An accessor-only property inherited from a private abstract base resolves on the subclass — the private base's accessors live under its qualified registry key, and the hierarchy walk follows it. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |
 | `local_fn_nested_recursion.kt` | A nested local function calling back into its enclosing local function (`fun inner` inside `fun step` invoking `step`), routed through the pre-bound overload cell; includes a `?.let` chain over the recursive result. |
 | `local_fn_overloads.kt`    | Same-named local functions as true overloads: call-site selection by arity and argument types, one overload calling its sibling (no self-recursion through the shared binding), selection from a nested lambda. |
