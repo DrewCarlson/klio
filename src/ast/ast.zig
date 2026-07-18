@@ -820,6 +820,11 @@ pub const Expr = union(enum) {
         /// annotation). Runtime overload dispatch reads these to match a
         /// lambda against a declared function-type parameter.
         param_tys: []?TypeRef = &.{},
+        /// Annotations written on the literal itself (`@Composable { … }`).
+        /// The expression form is a runtime no-op, but the compose pass
+        /// reads it to transform an annotated literal bound to an
+        /// untyped val.
+        annotations: []Annotation = &.{},
         body: Block,
         span: Span,
         /// True when the single `it` parameter was injected by the parser

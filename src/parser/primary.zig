@@ -100,15 +100,17 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             // Annotated expression: `@Composable { ... }`,
             // `@Suppress("UNCHECKED_CAST") (x as T)`,
             // `@OptIn(Api::class) Flags.enabled`. The annotation prefixes
-            // an expression; it is a runtime no-op here, so consume and
-            // discard the annotation set(s), then parse the expression
-            // that follows.
-            _ = file.parseAnnotations(p);
+            // an expression; it is a runtime no-op, but a function literal
+            // keeps its set so the compose pass can recognise an
+            // `@Composable { … }` bound to an untyped val.
+            const annos = file.parseAnnotations(p);
             support.skipNl(p);
             // A `{` after the annotations is a function literal; other
             // forms parse as ordinary primary expressions.
             if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
-                return control.parseLambdaLiteral(p);
+                var lam = control.parseLambdaLiteral(p);
+                if (lam != null and lam.? == .Lambda) lam.?.Lambda.annotations = annos;
+                return lam;
             }
             return parsePrimary(p);
         },

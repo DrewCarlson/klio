@@ -72,7 +72,8 @@ const USAGE =
     \\  --feature <pack>/<feature> Enable a pack feature (repeatable).
     \\
     \\Test options:
-    \\  --filter <substring>         Run only tests whose Class/method/file matches.
+    \\  --filter <substrings>        Run only tests whose Class/method/file matches
+    \\                               any of the comma-separated substrings.
     \\  --format <plain|json>        plain (default) or a machine-readable JSON summary.
     \\  --all / --feature <name>     Select which feature modules' tests to run.
     \\  --list                       List discovered @Test names without running them.

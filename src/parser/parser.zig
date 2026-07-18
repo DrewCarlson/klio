@@ -1284,6 +1284,20 @@ test "annotated_trailing_lambda_parses" {
     try testing.expect(call.args[0] == .Lambda);
 }
 
+test "annotated_lambda_literal_keeps_its_annotations" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "val content = @Composable { x() }\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const lam = out.file.decls[0].Property.init.?.Lambda;
+    try testing.expectEqual(@as(usize, 1), lam.annotations.len);
+    try testing.expectEqualStrings("Composable", lam.annotations[0].path[lam.annotations[0].path.len - 1].name);
+}
+
 test "consecutive_local_class_declarations" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

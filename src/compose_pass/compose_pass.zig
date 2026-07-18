@@ -1038,10 +1038,19 @@ const Walker = struct {
         switch (d.*) {
             .Property => |p| {
                 // `val content: @Composable () -> Unit = { … }` — the
-                // declared type makes the initializer lambda composable.
+                // declared type makes the initializer lambda composable —
+                // or `val content = @Composable { … }`, where the literal
+                // carries the annotation itself.
                 if (p.init) |*ini| {
                     if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
                         try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)));
+                    } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
+                        // No declared type: the literal's own header is the
+                        // arity, and a headerless literal is `() -> Unit`
+                        // (its parser-injected `it` never binds without an
+                        // expected type).
+                        const arity: u8 = if (ini.Lambda.implicit_it) 0 else @intCast(@min(ini.Lambda.params.len, 255));
+                        try w.transformComposableLambda(&ini.Lambda, arity);
                     } else {
                         try w.walkExpr(ini);
                     }
@@ -1053,6 +1062,9 @@ const Walker = struct {
                 // joins the scoped locals set: a bare `content()` threads.
                 const holds_composable = blk: {
                     if (p.ty != null and isComposableFnType(&p.ty.?)) break :blk true;
+                    if (p.init) |*ini2| {
+                        if (ini2.* == .Lambda and isComposable(ini2.Lambda.annotations)) break :blk true;
+                    }
                     // `val current by rememberUpdatedState(content)` — a
                     // DELEGATED val whose delegate call carries a value the
                     // walker already knows is composable reads back that
