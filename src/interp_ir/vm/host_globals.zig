@@ -181,6 +181,26 @@ pub fn noteObjectInFlight(self: *VmHost, name: []const u8, instance: Value) bool
     return false;
 }
 
+/// The instance already published for `name`'s class in the shared,
+/// handle-shared `singletons_by_id` registry, or null. The registry is the
+/// process-global store for `object` / companion singletons: unlike the
+/// `globals` env (which can be a transient per-coroutine scope), it is
+/// visible from every execution context, so it deduplicates a singleton
+/// across scope boundaries.
+fn singletonFromSharedRegistry(self: *VmHost, name: []const u8) ?Value {
+    const class_id = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classId(name) orelse return null;
+    };
+    const sg = self.singletons_by_id.borrow();
+    defer sg.deinit();
+    if (sg.get().get(class_id.int())) |v| {
+        if (v == .Instance) return v;
+    }
+    return null;
+}
+
 /// Resolve a registered `object` / companion singleton by its lifted
 /// global name, constructing it on first access. `.ok = null` when `name`
 /// is not a registered object (or is mid-construction on this thread with
@@ -203,6 +223,15 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         defer pg.deinit();
         break :blk pg.get().object_names.getKey(raw_name) orelse return .{ .ok = null };
     };
+    // Process-global fallback: `globals` may be a transient per-context
+    // scope (a coroutine frame's env is not the program root), so a
+    // singleton published into one scope's `globals` is invisible to the
+    // fast path of another. The id-keyed `singletons_by_id` registry is
+    // shared by handle across every context, so it is the authoritative
+    // store — consult it before (re)constructing, or the same `object` /
+    // companion is materialized once per scope and identity comparisons
+    // against it (e.g. `slot === Composer.Empty`) break.
+    if (singletonFromSharedRegistry(self, name)) |v| return .{ .ok = v };
     while (true) {
         {
             const g = self.globals.borrow();
@@ -357,6 +386,17 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             const bad = dg.get().is_interface or dg.get().is_abstract;
             dg.deinit();
             if (bad) return .{ .ok = null };
+        }
+    }
+    // Process-global fallback ahead of the per-context `globals` fast path:
+    // the id-keyed registry is shared by handle across every execution
+    // context, so it deduplicates the singleton even when it was first
+    // published into another scope's transient `globals` env.
+    {
+        const sg = self.singletons_by_id.borrow();
+        defer sg.deinit();
+        if (sg.get().get(class_id.int())) |v| {
+            if (v == .Instance) return .{ .ok = v };
         }
     }
     while (true) {
@@ -1846,4 +1886,53 @@ test "object init gate: unknown names resolve to null without state" {
     const g = fx.host.object_states.borrow();
     defer g.deinit();
     try testing.expect(g.get().count() == 0);
+}
+
+test "object singleton dedup: shared id registry serves a transient globals scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try HostFixture.init(a);
+
+    // Register class "O" -> id 7 so `classId("O")` resolves.
+    const id = ir.ClassId.from(7);
+    {
+        const mg = fx.host.module.borrowMut();
+        defer mg.deinit();
+        try mg.get().class_index.append(a, .{ .name = "O", .id = id });
+    }
+
+    // Publish an object instance ONLY into the shared, handle-shared
+    // `singletons_by_id` registry — never into `globals`. This mirrors a
+    // companion / `object` singleton that was first constructed under
+    // another execution context whose `globals` env is a transient
+    // per-coroutine scope, invisible to this context's fast path.
+    const cd = try primitiveClassDef(a, "O");
+    const inst_ref = try ObjRef(InstanceData).init(a, .{
+        .class = cd,
+        .fields = .empty,
+        .outer = null,
+        .identity = 4242,
+        .native_state = null,
+    });
+    {
+        const sg = fx.host.singletons_by_id.borrowMut();
+        defer sg.deinit();
+        try sg.get().put(id.int(), .{ .Instance = inst_ref });
+    }
+
+    // The registry must serve the SAME instance even though the current
+    // `globals` env has no "O" binding — otherwise a second instance is
+    // materialized per scope and `===` against the singleton breaks.
+    const got = singletonFromSharedRegistry(&fx.host, "O");
+    try testing.expect(got != null);
+    try testing.expect(got.? == .Instance);
+    {
+        const gg = got.?.Instance.borrow();
+        defer gg.deinit();
+        try testing.expectEqual(@as(u64, 4242), gg.get().identity);
+    }
+
+    // No class id, or no registry entry for the id, yields null.
+    try testing.expect(singletonFromSharedRegistry(&fx.host, "Unregistered") == null);
 }
