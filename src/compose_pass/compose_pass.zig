@@ -86,6 +86,14 @@ const ambient_composer_path = [_][]const u8{ "androidx", "compose", "runtime", "
 /// EQUAL across recompositions and its group skips.
 const composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambda" };
 const composable_lambda_instance_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "composableLambdaInstance" };
+/// `androidx.compose.runtime.internal.rememberComposableLambda(key, tracked,
+/// block)` — the modern memoization wrapper. Unlike `composableLambda`, which
+/// opens a movable child group, this stores the `ComposableLambdaImpl` in a
+/// `remember` SLOT of the current group, so it adds no child group. A group
+/// here would sit as an extra first child of an enclosing reusable group and
+/// hide the real content from `deactivateToEndGroup` (which deactivates the
+/// group's first child subtree).
+const remember_composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "rememberComposableLambda" };
 
 /// Whether a declaration's annotations include `@Composable`. Matches both the
 /// bare `Composable` and any dotted path ending in `Composable`.
@@ -1525,19 +1533,25 @@ const Walker = struct {
     }
 
     /// Replace a just-transformed composable lambda ARGUMENT with
-    /// `composableLambda($composer, <span key>, true, <lambda>)` — the
-    /// remembered instance the engine slots, so `composer.changed(content)`
+    /// `rememberComposableLambda(<span key>, true, <lambda>, $composer, 0)` —
+    /// the remembered instance the engine slots, so `composer.changed(content)`
     /// is false when the content is unchanged and the child group SKIPS.
     /// Threaded scope only ($composer must be in scope); entry-point sinks
     /// in plain scope stay raw (invokeComposable wraps the root itself).
     fn wrapInComposableLambda(w: *Walker, arg: *Expr) void {
         const key = positionalKey(exprSpanOf(arg));
-        const args = w.a.alloc(Expr, 4) catch @panic("oom");
-        args[0] = w.composerRef();
-        args[1] = w.b.intLit(key);
-        args[2] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
-        args[3] = arg.*;
-        arg.* = w.b.call(w.b.pathExprSegs(&composable_lambda_path), args);
+        // `rememberComposableLambda(key, tracked, block)` threaded with the
+        // composer pair: `rememberComposableLambda(key, true, block, $composer,
+        // 0)`. It remembers the `ComposableLambdaImpl` in a slot of the current
+        // group rather than opening a child group (the pre-1.5 `composableLambda`
+        // did the latter, whose stray group breaks `deactivateToEndGroup`).
+        const args = w.a.alloc(Expr, 5) catch @panic("oom");
+        args[0] = w.b.intLit(key);
+        args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        args[2] = arg.*;
+        args[3] = w.composerRef();
+        args[4] = w.b.intLit(0);
+        arg.* = w.b.call(w.b.pathExprSegs(&remember_composable_lambda_path), args);
     }
 
     /// A composable lambda RETURNED by a (non-composable) factory has no
@@ -2654,12 +2668,15 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
     // Column is composable too (allComposable) → gains its own (composer, changed).
     // The sink lambda is memoized — wrapped in
-    // `composableLambda($composer, key, true, <lambda>)` with the lambda last.
+    // `rememberComposableLambda(key, true, <lambda>, $composer, 0)`: the
+    // slot-based memoizer (no child group), block third, composer pair last.
     const memo = col.args[0].Call;
     const memo_path = memo.callee.Path;
-    try testing.expectEqualStrings("composableLambda", memo_path.segments[memo_path.segments.len - 1].name);
-    try testing.expectEqual(@as(usize, 4), memo.args.len);
-    const lam = memo.args[3].Lambda;
+    try testing.expectEqualStrings("rememberComposableLambda", memo_path.segments[memo_path.segments.len - 1].name);
+    try testing.expectEqual(@as(usize, 5), memo.args.len);
+    // The threaded composer pair trails the (key, tracked, block) triple.
+    try testing.expectEqualStrings(composer_param, memo.args[3].Path.segments[0].name);
+    const lam = memo.args[2].Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
     // ($composer, $changed), not appended after.
     try testing.expectEqual(@as(usize, 2), lam.params.len);
