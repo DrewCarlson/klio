@@ -311,6 +311,30 @@ test "anon_object_runs_parent_init_blocks" {
     try assertKlio("anon_parent_init", src, "start\nbase-init x\nbase-prop\nanon-init\ndone 1\n");
 }
 
+// Every superclass delegation in an anonymous object's constructor chain
+// receives the preceding class's primary-constructor arguments.
+test "anon_object_evaluates_transitive_parent_ctor_args" {
+    const src =
+        \\
+        \\open class Root(active: Boolean) {
+        \\    val state = if (active) "active" else "new"
+        \\    init { println("root " + state) }
+        \\}
+        \\open class Middle(enabled: Boolean, val label: String) : Root(enabled)
+        \\fun main() {
+        \\    val item = object : Middle(false, "ready") {}
+        \\    println(item.state)
+        \\    println(item.label)
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "anon_transitive_parent_ctor_args",
+        src,
+        "root new\nnew\nready\n",
+    );
+}
+
 // kotlinc-native: a throw inside an object initializer surfaces at the
 // access site as FileFailedToInitializeException with the user exception
 // as its cause; a second access throws the same wrapper without the cause
