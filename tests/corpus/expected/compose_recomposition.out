@@ -1,6 +1,6 @@
 Reader sees 0
 Sibling
 after compose: readerRuns=1 siblingRuns=1
-hasInvalidations=true
+hasPendingWork=true
 Reader sees 1
 after recompose: readerRuns=2 siblingRuns=1
