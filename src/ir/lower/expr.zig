@@ -542,6 +542,26 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+            // `::rec` referencing the ENCLOSING local fn from inside its own
+            // body (or a lambda nested in it): the plain name is unbound here
+            // — and a later same-named sibling would rebind it — so the
+            // reference loads the fn's own closure through its mangled cell,
+            // the same binding a bare self-call uses. Extension locals need a
+            // bound receiver and keep the member/property forms below.
+            if (b.selfLocalFn()) |slf| {
+                if (std.mem.eql(u8, slf.name, pr.name.name) and !b.isLocalExtFn(slf.mangled)) {
+                    const cell: ?Reg = if (b.resolve(slf.mangled)) |r|
+                        r
+                    else if (b.knowsOuter(slf.mangled))
+                        try resolveCapture(b, slf.mangled)
+                    else
+                        null;
+                    if (cell) |c| {
+                        try b.push(.{ .CellGet = .{ .dst = dst, .cell = c } });
+                        return dst;
+                    }
+                }
+            }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
             // A same-named enclosing member only shadows the global for `::name`
             // when it could actually be the referenced callable: if the use
