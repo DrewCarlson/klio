@@ -1,9 +1,9 @@
-Screen {
+Screen (gen=0) {
 Item first -> id 1
 Item second -> id 2
 }
 allocations after first compose = 2
-Screen {
+Screen (gen=1) {
 Item first -> id 1
 Item second -> id 2
 }
