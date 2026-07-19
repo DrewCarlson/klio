@@ -33,6 +33,13 @@ pub const StringData = struct {
     u16_len: u32,
     ascii: bool,
 
+    /// A Kotlin `String` is immutable: `bytes`/`u16_len`/`ascii` are set once at
+    /// construction and only ever read until teardown frees the bytes. Nothing
+    /// takes an exclusive borrow of a string cell, so its `ObjRef` reader lock
+    /// guards against a writer that never exists — this marker elides it (see
+    /// `objcell.LockFor`), removing the per-borrow atomic on every string read.
+    pub const objref_immutable = true;
+
     /// The cell owns its bytes (see `ObjRef.init`/`initOwned` for `[]const u8`),
     /// so teardown frees them — same contract the bare `[]const u8` payload had.
     pub fn gcFinalize(self: *StringData, a: std.mem.Allocator) void {
@@ -99,6 +106,10 @@ pub const StackFrame = struct {
 /// `frames` slice; each frame's `fqn` borrows the module.
 pub const StackTraceData = struct {
     frames: []StackFrame,
+
+    /// A captured stack trace is set once at throw time and only read
+    /// thereafter, so its cell is never write-locked; elide the reader lock.
+    pub const objref_immutable = true;
 
     pub fn gcFinalize(self: *StackTraceData, a: std.mem.Allocator) void {
         a.free(self.frames);
@@ -1129,6 +1140,11 @@ pub const SeqOp = union(enum) {
 /// Compiled regex + the original pattern source. The compiled engine is
 /// not in the Zig std; `engine` is an opaque host-provided handle.
 pub const RegexData = struct {
+    /// A compiled regex is immutable after construction (pattern, engine handle,
+    /// and option singletons are all fixed), so its cell is never write-locked;
+    /// elide the reader lock.
+    pub const objref_immutable = true;
+
     pattern: StringRef,
     /// Opaque compiled-regex handle owned by the host regex binding.
     engine: ?*anyopaque,
@@ -2357,7 +2373,19 @@ pub const Value = union(enum) {
                 structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
-            .IrClosure => |x| b.* == .IrClosure and x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures),
+            .IrClosure => |x| b.* == .IrClosure and blk: {
+                // The same materialised closure object.
+                if (x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures)) break :blk true;
+                // A non-capturing lambda literal is a singleton in Kotlin: two
+                // evaluations of the same literal (which klio gives distinct
+                // closure ids) are the same value. Compare by the literal's
+                // (module, body-function) identity when neither captures.
+                if (objcell.gc.closureSingletonHook) |h| {
+                    const sa = h(x.id);
+                    if (sa != 0 and sa == h(b.IrClosure.id)) break :blk true;
+                }
+                break :blk false;
+            },
             .Comparator => |x| b.* == .Comparator and
                 ObjRef([]ComparatorStep).ptrEq(x.steps, b.Comparator.steps) and
                 x.descending == b.Comparator.descending,

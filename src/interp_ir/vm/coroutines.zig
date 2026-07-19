@@ -2585,15 +2585,10 @@ fn inlineResumeEnabled() bool {
 /// they keep their pre-existing deferral (a persisted resume queues rather than
 /// running inline) and cannot be driven into an unbounded re-dispatch during
 /// `advanceUntilIdle`.
-var g_persist_resume_gate: ?bool = null;
+/// The persisted inline-resume path ships unconditionally with the compose
+/// plugin (the only compose path).
 fn persistResumeGateEnabled() bool {
-    if (g_persist_resume_gate) |v| return v;
-    const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
-        v.len != 0 and !std.mem.eql(u8, v, "0")
-    else
-        true;
-    g_persist_resume_gate = on;
-    return on;
+    return true;
 }
 
 /// Resume the activation parked on `slot` on the current stack. Returns false

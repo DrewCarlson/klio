@@ -349,12 +349,14 @@ pub fn gcRegisterVm(vm: *const Vm) void {
     // under refcount teardown too. Install them unconditionally (idempotent).
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
     runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
+    // All Vms share one closure side-table by handle clone; install it (and the
+    // liveness + non-capturing-lambda singleton-identity hooks) with it. The
+    // singleton-identity comparison must hold in every memory mode, so install
+    // unconditionally — the GC mark/sweep hooks are inert when GC is off.
+    root.gcInstallClosureHook(vm.closures);
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
     gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");
-    // All Vms share one closure side-table by handle clone; install the
-    // liveness hook with it so `Value.gcMark` can keep live closures' captures.
-    root.gcInstallClosureHook(vm.closures);
 }
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {

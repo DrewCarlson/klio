@@ -286,6 +286,17 @@ pub var markClosureHook: ?*const fn (id: u64, m: *Marker) void = null;
 /// pause, after the sweep, so the side-table is stable.
 pub var sweepClosureHook: ?*const fn (epoch: usize) void = null;
 
+/// Singleton identity of a closure id for Kotlin's non-capturing-lambda
+/// semantics: a stable non-zero value keyed on the closure's (module, body
+/// function) when it captures nothing, and 0 when it captures (so identity
+/// falls back to the closure id). A non-capturing lambda literal is a singleton
+/// in Kotlin — every evaluation yields the same instance — but klio materialises
+/// a fresh closure id per evaluation. `structuralEq` compares two closures by
+/// this identity so two evaluations of the same non-capturing literal compare
+/// equal (`===`/`==`) as they do in Kotlin. Set by `interp_ir`; null means the
+/// fallback id comparison. Installed in every memory mode, not only under GC.
+pub var closureSingletonHook: ?*const fn (id: u64) u64 = null;
+
 /// Marks the live Values reachable from a parked lazy-`sequence{}` builder
 /// continuation. The continuation is an `ir.eval.SuspendState` box held by a
 /// `Sequence`'s `Builder` source (an `*anyopaque` because `runtime` cannot

@@ -10,7 +10,11 @@ package com.jakewharton.mosaic
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
+import androidx.compose.runtime.ControlledComposition
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.snapshots.ObserverHandle
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlin.coroutines.EmptyCoroutineContext
 
 /** Drives one composition into a MosaicNode tree and renders it to text. */
 public class MosaicRenderer internal constructor(
@@ -18,6 +22,15 @@ public class MosaicRenderer internal constructor(
     private val recomposer: Recomposer,
     private val composition: Composition,
 ) {
+    /** State objects modified since the last recomposition. A snapshot apply
+     * observer records the committed writes here so [recomposeFrame] can hand
+     * them to the composition (the recomposer's own apply observer only runs
+     * while its coroutine loop is active, which this synchronous driver never
+     * starts). */
+    private val pendingModifications = HashSet<Any>()
+    private val applyObserver: ObserverHandle =
+        Snapshot.registerApplyObserver { changed, _ -> pendingModifications.addAll(changed) }
+
     /**
      * Render the current node tree to a plain-text frame — one line per row,
      * cells joined as characters. This reads the rendered canvas cells directly
@@ -41,9 +54,32 @@ public class MosaicRenderer internal constructor(
         return sb.toString()
     }
 
-    /** Apply pending state writes + recompose, then render the next frame. */
+    /** Apply pending state writes + recompose, then render the next frame.
+     * Drives the composition synchronously through the real upstream
+     * `ControlledComposition` API: publish the pending writes, invalidate the
+     * scopes that read them, recompose, and apply the resulting node changes. */
     public fun recomposeFrame(): String {
-        recomposer.recompose()
+        Snapshot.sendApplyNotifications()
+        if (pendingModifications.isNotEmpty()) {
+            val controlled = composition as ControlledComposition
+            controlled.recordModificationsOf(pendingModifications.toSet())
+            pendingModifications.clear()
+            // Recompose inside a read-observing snapshot (mirrors the recomposer's
+            // own `composing`): the read observer re-records the state each scope
+            // reads, so a later write reinvalidates it. Without it a recomposed
+            // scope loses its subscription and only the first write ever takes.
+            val snapshot = Snapshot.takeMutableSnapshot(
+                { value -> controlled.recordReadOf(value) },
+                { value -> controlled.recordWriteOf(value) },
+            )
+            val changed = try {
+                snapshot.enter { controlled.recompose() }
+            } finally {
+                snapshot.apply().check()
+                snapshot.dispose()
+            }
+            if (changed) controlled.applyChanges()
+        }
         return renderFrame()
     }
 
@@ -53,6 +89,7 @@ public class MosaicRenderer internal constructor(
 
     /** Tear down the composition. */
     public fun dispose() {
+        applyObserver.dispose()
         composition.dispose()
     }
 }
@@ -60,7 +97,7 @@ public class MosaicRenderer internal constructor(
 /** Compose [content] into a fresh MosaicNode tree and return a renderer for it. */
 public fun mosaicRenderer(content: @Composable () -> Unit): MosaicRenderer {
     val rootNode = BoxNode()
-    val recomposer = Recomposer()
+    val recomposer = Recomposer(EmptyCoroutineContext)
     val composition = Composition(MosaicNodeApplier(rootNode), recomposer)
     composition.setContent(content)
     return MosaicRenderer(rootNode, recomposer, composition)

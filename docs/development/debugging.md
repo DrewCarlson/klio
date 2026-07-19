@@ -142,7 +142,7 @@ KLIO_PUMP_DIAG=1 KLIO_RESUME_TRACE=1 kotlinx_coroutines_test_default_timeout=10s
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_COMPOSE_PLUGIN` | on by default; `0`/empty disables | Master gate for the `@Composable` lowering plugin: runs the compose pass, salts the image/pack cache key, and enables the persisted inline-resume path. The plugin + upstream engine runtime is the shipped compose path; there is no implicit-hook fallback, so `0` only turns the pass off for isolating a lowering issue | none |
+| `KLIO_COMPOSE_PLUGIN` | unconditional (no longer read) | The `@Composable` lowering plugin + upstream engine runtime is the only compose path — the pass always runs, salts the image/pack cache key, and enables the persisted inline-resume path. Retained as a no-op so old scripts that set it do not break | none |
 | `KLIO_COMPOSE_MEMO` | `0` off (default on; plugin only) | Whether composable-lambda arguments are wrapped in remembered `composableLambda` instances (matching kotlinc) | none |
 | `KLIO_COMPOSE_SKIP` | `0` off (default on; plugin only) | Whether restartable composables emit the skip calculus (the `$dirty` probes and skip branch); an A/B bisection switch | none |
 | `KLIO_COMPOSE_DBG` | set (plugin only) | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
@@ -321,14 +321,13 @@ KLIO_ERR_TRACE=1 KLIO_THROW_TRACE=1 KLIO_THROW_STACK=1 \
 usually the root cause), `[errtrace]` dumps the frame chain, and in
 `klio test` the failure detail becomes the fully rendered throwable.
 
-**Bisecting the compose plugin.** The plugin is on by default; bisect its
-two emissions, or turn the pass off entirely to isolate a lowering issue:
+**Bisecting the compose plugin.** The plugin always runs; bisect its two
+emissions:
 
 ```sh
-./zig-out/bin/klio run scene.kt                                # plugin (default)
+./zig-out/bin/klio run scene.kt                                # plugin (always on)
 KLIO_COMPOSE_MEMO=0 ./zig-out/bin/klio run scene.kt            # no lambda memoization
 KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt            # no skip calculus
-KLIO_COMPOSE_PLUGIN=0 ./zig-out/bin/klio run scene.kt          # pass off (composition will not run)
 ```
 
 Rebuild any baked pack between flips (the flag is part of the pack

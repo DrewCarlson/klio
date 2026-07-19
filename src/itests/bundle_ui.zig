@@ -131,7 +131,7 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-androidx-collection",
-        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-compose-ui",
     };
     const pack_files = [_][]const u8{
