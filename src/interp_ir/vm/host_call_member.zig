@@ -8531,6 +8531,34 @@ fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     return pg.get().instance_intrinsic_cache.get(key);
 }
 
+/// Simple name of the class that DECLARES `fid` in `module`'s class table,
+/// memoized per `(module, FuncId)`. An instance method's implicit-`this` bare
+/// call resolves against its declaring class's static member scope (Kotlin), so
+/// dispatch needs this static type; the this-param's nominal type is a
+/// placeholder that cannot serve it. `null` when no class owns the func.
+pub fn declaringClassSimpleName(self: *VmHost, module: *const Module, fid: FuncId) ?[]const u8 {
+    const key = root_mod.ProgramImage.FuncOwnerKey{ .module_p = @intFromPtr(module), .func_p = @intFromEnum(fid) };
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().func_owner_class_cache.get(key)) |hit| return hit;
+    }
+    var owner: ?[]const u8 = null;
+    for (module.classes.items) |*c| {
+        for (c.methods) |mfid| {
+            if (@intFromEnum(mfid) == @intFromEnum(fid)) {
+                owner = c.name;
+                break;
+            }
+        }
+        if (owner != null) break;
+    }
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().func_owner_class_cache.put(key, owner) catch {};
+    return owner;
+}
+
 /// Memoize the `instanceBindingProbe` outcome for `key`. `func == null` caches
 /// "no intrinsic" so the next call returns immediately without rebuilding the
 /// probe FQNs or walking the supertype chain. The `fqn` (the winning probe, or

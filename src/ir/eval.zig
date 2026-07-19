@@ -4754,12 +4754,30 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             if (cmg.static_recv) |sc| {
                 if (constStr(frame.module, sc)) |sname| break :blk sname;
             }
+            // Extension bodies resolve a bare call against the extension's
+            // DECLARED receiver type.
             switch (frame.func.kind) {
-                .top_level_extension, .member_extension => {},
+                .top_level_extension, .member_extension => {
+                    const idx = frameThisParam(frame) orelse break :blk null;
+                    break :blk frame.func.params[idx].ty.name;
+                },
+                .instance_method => {
+                    // A plain instance method resolves a bare (implicit-`this`)
+                    // call against its DECLARING class's static member scope,
+                    // the same way: a runtime subtype's own same-name overload
+                    // that the declaring type cannot see must not shadow the
+                    // statically-bound member. `AbstractMap.containsEntry`'s
+                    // `get(key)` binds `Map.get(K): V?`, never a
+                    // `PersistentCompositionLocalHashMap.get<T>(
+                    // CompositionLocal<T>)` the subtype introduces (a read-value
+                    // overload that breaks the structural map `equals`). The
+                    // this-param's nominal type is a placeholder for stdlib
+                    // methods, so the declaring class is found by identity
+                    // (memoized per function by the host).
+                    break :blk host.declaringClassSimpleName(frame.module, frame.func.id);
+                },
                 else => break :blk null,
             }
-            const idx = frameThisParam(frame) orelse break :blk null;
-            break :blk frame.func.params[idx].ty.name;
         };
         // A lowering-committed EXTENSION target: Kotlin selects extensions
         // statically, so the runtime walk may only let true MEMBERS shadow
@@ -5203,6 +5221,21 @@ fn frameThisParam(frame: *const Frame) ?usize {
     if (!frame.func.has_receiver_param) return null;
     if (frame.func.params.len != 0 and std.mem.eql(u8, frame.func.params[0].name, "this")) {
         return 0;
+    }
+    return null;
+}
+
+/// Simple name of the class that DECLARES `fid` as one of its methods, found
+/// by identity in `module`'s class table (the this-param's nominal type is a
+/// placeholder for stdlib methods, so it cannot serve here). Used to give an
+/// instance method's implicit-`this` call the static receiver type Kotlin
+/// resolves it against — its declaring class. `null` when no class owns it
+/// (a top-level / local function reached with an injected receiver).
+fn declaringClassName(module: *const Module, fid: ir.FuncId) ?[]const u8 {
+    for (module.classes.items) |*c| {
+        for (c.methods) |mfid| {
+            if (@intFromEnum(mfid) == @intFromEnum(fid)) return c.name;
+        }
     }
     return null;
 }
@@ -6602,6 +6635,11 @@ pub const NullHost = struct {
     pub fn companionWithMember(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?Value {
         _ = .{ self, allocator, receiver, name };
         return null;
+    }
+
+    pub fn declaringClassSimpleName(self: *NullHost, module: *const Module, fid: ir.FuncId) ?[]const u8 {
+        _ = self;
+        return declaringClassName(module, fid);
     }
 
     pub fn newInstance(self: *NullHost, allocator: Allocator, class: ClassId, args: []const Value) Allocator.Error!EvalResult {

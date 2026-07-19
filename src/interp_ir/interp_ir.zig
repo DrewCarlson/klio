@@ -246,6 +246,13 @@ pub const ProgramImage = struct {
     /// Both facts derive from the static class graph, so one probe here
     /// replaces the per-read getter BFS + linear slot scan.
     field_read_cache: std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
+    /// Declaring-class memo for an instance method's implicit-`this` static
+    /// receiver resolution: `(module, FuncId)` → the simple name of the class
+    /// whose `methods` list owns the FuncId (`null` = no owning class found).
+    /// Invariant per function, so one identity scan of the class table serves
+    /// every later bare call inside that method's body. The name pointer is
+    /// borrowed from the (image-lifetime) module IR, never duped.
+    func_owner_class_cache: std.AutoHashMap(FuncOwnerKey, ?[]const u8),
     allocator: Allocator,
 
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
@@ -254,6 +261,7 @@ pub const ProgramImage = struct {
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
     pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
+    pub const FuncOwnerKey = struct { module_p: usize, func_p: u32 };
     pub const FieldReadHit = struct {
         /// Custom getter to run, `NONE` when the read is a stored slot.
         getter: u32,
@@ -331,6 +339,7 @@ pub const ProgramImage = struct {
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
             .field_read_cache = std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .func_owner_class_cache = std.AutoHashMap(FuncOwnerKey, ?[]const u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -376,6 +385,7 @@ pub const ProgramImage = struct {
         self.cmg_global_cache.deinit();
         self.overload_cache.deinit();
         self.field_read_cache.deinit();
+        self.func_owner_class_cache.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {
