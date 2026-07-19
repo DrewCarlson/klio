@@ -116,6 +116,7 @@ Run any program with:
 | `super_property_setter.kt` | `super.prop = value` reaches the superclass accessor, so an overriding setter that writes through `super` does not re-enter itself. |
 | `stored_override_of_accessor.kt` | A field-backed `override var` overrides an inherited accessor property, so a write stores the field and never reaches the base's custom setter. |
 | `local_fun_arity_shadowing.kt` | A local function shadows an outer one by name only for calls it can take: `validate { … }` inside a no-arg local `validate()` resolves outward. |
+| `local_fun_type_shadowing.kt` | Same-arity shadowing resolves by parameter TYPE: a lambda argument cannot bind a local `validate(state: Int)`, so `validate { … }` inside it resolves outward to `Checker.validate(block)` instead of recursing. |
 | `labeled_this_in_object_literal.kt` | Inside an object literal written in a receiver lambda, `this@build` names the lambda's receiver, and a bare name the object does not own resolves against it. |
 | `delegated_var_reads_through.kt` | A `var x by D` local reads through the delegate on every read (including inside a string template and a lambda), rather than caching the value at the declaration. |
 | `atomic_named_compare_and_set.kt` | A named-argument call into a host-backed library member (`compareAndSet(expect = …, update = …)`) binds exactly as the positional form does. |
@@ -303,3 +304,6 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `local_fn_self_reference_shadow.kt` | A self-re-invoking lambda inside the first of two same-named local functions binds the enclosing function, not the later sibling that rebinds the plain name. |
 | `captured_var_shadows_fn_call.kt` | A captured non-callable `var` does not shadow a same-named function for a call made inside a nested lambda. |
 | `captured_counter_via_factory_lambda.kt` | A `var` referenced only inside an anonymous object built by a factory lambda still boxes; the object-method write reaches the enclosing scope. |
+| `captured_var_in_by_delegate_lambda.kt` | A `var` captured and mutated only inside the lambda of a `by`-delegate expression still boxes; the write lands back on the enclosing `var` instead of a transient copy. |
+| `captured_var_in_nested_local_fn.kt` | A `var` captured and mutated by a local `fun` declared inside a lambda still boxes; the increment is visible at the decl site and across the function's recursive calls. |
+| `map_subclass_value_get_dispatch.kt` | A `Map` subclass that adds its own value-returning `operator get` still compares structurally: `AbstractMap.equals` -> `containsEntry`'s bare `get(key)` binds `Map.get(K): V?` (the declaring class's static scope), never the subtype's `get(Key<T>): T`. |

@@ -933,7 +933,17 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
         },
         .Member => |m| {
             const recv = try lowerReceiver(b, m.receiver);
-            const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+            // Explicit `this.x = v` where the enclosing class declares `x` as a
+            // private SHADOW of a supertype's same-name stored property writes
+            // ITS OWN owner-mangled cell, matching the bare-name write and read.
+            const store_field_name: []const u8 = blk: {
+                if (m.receiver.* != .This or m.receiver.This.qualifier != null) break :blk m.name.name;
+                const oc = b.ownerClass() orelse break :blk m.name.name;
+                var kb: [256]u8 = undefined;
+                const probe = std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ oc, m.name.name }) catch break :blk m.name.name;
+                break :blk b.module.registry.private_shadow_props.getKey(probe) orelse m.name.name;
+            };
+            const field = try b.module.internConst(b.allocator, .{ .String = store_field_name });
             // `super.prop = v` lowers to a SetField on `this` (super is not a
             // value), so the setter search would find the OVERRIDING setter and
             // re-enter it. Carry the writing class so the runtime starts the

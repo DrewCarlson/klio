@@ -1626,11 +1626,18 @@ fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const T
         if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
-        // A runtime Instance carries its full hierarchy: require the
-        // positive proof. Non-instance receivers (erased lambdas, boxed
-        // primitives against interface bounds) stay undecided here — the
-        // strict prover owns those.
-        if (receiver.* == .Instance and !receiverImplementsHead(self, receiver, bn)) return true;
+        // Decide the bound for any receiver whose full type is known: an
+        // Instance carries its class chain, and a concrete builtin's
+        // `isRuntimeType` supertype set is authoritative (a `String` receiver
+        // is provably not a `Number`, so `<T : Number> T.f()` does not apply to
+        // it and the outer member wins). Only an erased function/lambda value
+        // against a functional-interface bound stays undecided — SAM conversion
+        // could satisfy it — so the strict prover owns those.
+        const decidable = switch (receiver.*) {
+            .Null, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => false,
+            else => true,
+        };
+        if (decidable and !receiverImplementsHead(self, receiver, bn)) return true;
     }
     return false;
 }
@@ -8529,6 +8536,34 @@ fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     const pg = self.prog.borrow();
     defer pg.deinit();
     return pg.get().instance_intrinsic_cache.get(key);
+}
+
+/// Simple name of the class that DECLARES `fid` in `module`'s class table,
+/// memoized per `(module, FuncId)`. An instance method's implicit-`this` bare
+/// call resolves against its declaring class's static member scope (Kotlin), so
+/// dispatch needs this static type; the this-param's nominal type is a
+/// placeholder that cannot serve it. `null` when no class owns the func.
+pub fn declaringClassSimpleName(self: *VmHost, module: *const Module, fid: FuncId) ?[]const u8 {
+    const key = root_mod.ProgramImage.FuncOwnerKey{ .module_p = @intFromPtr(module), .func_p = @intFromEnum(fid) };
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        if (pg.get().func_owner_class_cache.get(key)) |hit| return hit;
+    }
+    var owner: ?[]const u8 = null;
+    for (module.classes.items) |*c| {
+        for (c.methods) |mfid| {
+            if (@intFromEnum(mfid) == @intFromEnum(fid)) {
+                owner = c.name;
+                break;
+            }
+        }
+        if (owner != null) break;
+    }
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().func_owner_class_cache.put(key, owner) catch {};
+    return owner;
 }
 
 /// Memoize the `instanceBindingProbe` outcome for `key`. `func == null` caches
