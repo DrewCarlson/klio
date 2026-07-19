@@ -36,11 +36,16 @@ const runtime = @import("runtime");
 // handoff, non-local-return endToMarker). This is the pass-count FLOOR
 // future runs must meet or beat; raising it tightens the gate. Margin
 // below 1166 covers the ±flake band and did-not-complete variance.
-// RAISED 1150 -> 1190 after verified 1208 (the compose-defaulted-parameter
+// RAISED 1150 -> 1175 after verified 1208 (the compose-defaulted-parameter
 // named-argument binder fix wired the onReuse/onDeactivate/onRelease/onSet
 // callbacks a source call passes by name, which had silently fallen back to
-// their defaults). Margin below 1208 covers the ±flake band.
-const BASELINE: usize = 1190;
+// their defaults). Deliberately NOT 1190: single-run counts swing ~±40
+// because 3-5 compute-heavy/concurrent classes variably cross the 480s
+// per-class cap under 8-way contention and lose their tail passes (samples
+// 1179/1200/1208/1221). The floor must sit below the worst realistic
+// DNC run so a high-DNC run does not fail the ratchet spuriously; 1175
+// keeps meaningful regression detection with that margin.
+const BASELINE: usize = 1175;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
