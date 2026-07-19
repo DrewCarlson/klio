@@ -148,6 +148,44 @@ pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!vo
         .Decl => |d| switch (d) {
             .Property => |p| {
                 if (p.init) |*e| try collectPathIdents(e, out);
+                // A `by`-delegate lambda references (and may mutate) an outer
+                // capture just as an initializer does.
+                if (p.delegate) |e| try collectPathIdents(e, out);
+            },
+            // A nested local `fun` (declared inside a lambda) references —
+            // and may mutate — a captured outer `var` in its body; without
+            // scanning it the var is not seen as referenced here, so the
+            // enclosing lambda skips propagating its boxed status and the
+            // write lands on an unboxed capture copy (or hits an increment on
+            // the raw cell).
+            .Function => |f| {
+                if (f.body) |fb| switch (fb) {
+                    .Block => |blk| {
+                        for (blk.stmts) |*ss| try collectPathIdentsStmt(ss, out);
+                    },
+                    .Expr => |*ex| try collectPathIdents(ex, out),
+                };
+            },
+            // A nested local class's member / init-block bodies reference
+            // captured outer locals exactly as an anonymous object's do.
+            .Class => |*c| {
+                for (c.members) |*m| switch (m.*) {
+                    .Function => |*f| {
+                        if (f.body) |fb| switch (fb) {
+                            .Block => |blk| {
+                                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                            },
+                            .Expr => |ex| try collectPathIdents(&ex, out),
+                        };
+                    },
+                    .Property => |p| {
+                        if (p.init) |*pi| try collectPathIdents(pi, out);
+                    },
+                    else => {},
+                };
+                for (c.init_blocks) |*blk| {
+                    for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                }
             },
             else => {},
         },
@@ -852,6 +890,44 @@ test "compute boxed vars boxes a var captured in a by-delegate lambda" {
     var boxed = try computeBoxedVars(testing.allocator, &stmts);
     defer boxed.deinit();
     try testing.expect(boxed.contains("captured"));
+}
+
+test "collect path idents recurses into a nested local fun body" {
+    // { fun bump() { captured } }  — a lambda whose only reference to
+    // `captured` sits inside a nested local function. The scan must see it so
+    // the enclosing lambda propagates the var's boxed status.
+    var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
+    const refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
+    var fn_stmts = [_]Stmt{.{ .Expr = refexpr }};
+    _ = &refseg;
+    _ = &fn_stmts;
+    const func = ast.Function{
+        .name = .{ .name = "bump", .span = dummySpan() },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Block = .{ .stmts = &fn_stmts, .span = dummySpan() } },
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const fn_stmt = Stmt{ .Decl = .{ .Function = func } };
+    var out = StringSet.init(testing.allocator);
+    defer out.deinit();
+    try collectPathIdentsStmt(&fn_stmt, &out);
+    try testing.expect(out.contains("captured"));
 }
 
 test "names assigned in lambdas reports writes but not bare reads" {
