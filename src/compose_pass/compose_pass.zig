@@ -132,6 +132,18 @@ fn isRestartableComposable(f: *const Function) bool {
     return true;
 }
 
+/// A `@Composable` function annotated `@ExplicitGroupsComposable`: it emits its
+/// own groups explicitly, so the plugin threads the composer but inserts no
+/// automatic groups (no restart bracket — see `isRestartableComposable` — and
+/// no per-branch replace-groups).
+fn isExplicitGroups(f: *const Function) bool {
+    for (f.annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "ExplicitGroupsComposable")) return true;
+    }
+    return false;
+}
+
 /// A stable positional group key for a call site, derived from its span. The
 /// Compose plugin emits a compile-time constant here; a span hash plays the
 /// same role — identical across recompositions, distinct per source location.
@@ -1219,7 +1231,7 @@ pub fn transformThreadedComposable(
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
-    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
+    var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };
     const body = f.body orelse return signatureOnly(f, params);
     switch (body) {
         .Block => |blk| {
@@ -1288,6 +1300,16 @@ const Walker = struct {
     /// no `$composer` param. Composer references resolve through the
     /// `__compose_currentComposer` host intrinsic instead.
     ambient: bool = false,
+    /// The enclosing function is `@ExplicitGroupsComposable`: it manages its
+    /// own groups with explicit `startX`/`endX` composer calls, so the plugin
+    /// must NOT insert the automatic per-branch replace-groups it inserts for
+    /// ordinary composable bodies. Inserting them corrupts the group structure
+    /// (e.g. `ReusableContentHost`'s `if (active) content() else
+    /// deactivateToEndGroup()` — a branch bracket makes the `else` deactivate
+    /// path start a key-mismatched replace-group that deletes the reused
+    /// content's nodes). Reset to false inside a nested composable lambda,
+    /// which is its own (non-explicit) scope.
+    explicit_groups: bool = false,
     /// Whether the current scope is composable — a composable function body or a
     /// composable lambda body. Only there are @Composable calls threaded and
     /// `currentComposer` substituted. A non-composable body is still walked (to
@@ -1369,7 +1391,10 @@ const Walker = struct {
             // its value must not be displaced.
             .Expr => |*e| {
                 try w.walkExpr(e);
-                if (w.thread) w.wrapStatementConditional(e);
+                // An `@ExplicitGroupsComposable` body manages its own groups; the
+                // plugin must not add per-branch replace-groups to its statement
+                // conditionals (see `explicit_groups`).
+                if (w.thread and !w.explicit_groups) w.wrapStatementConditional(e);
             },
             .Assign => |*asg| {
                 try w.walkExpr(&asg.target);
@@ -1940,7 +1965,7 @@ const Walker = struct {
                 // be displaced by the bracket call. A `return` inside the
                 // branch skips the end call (kotlinc brackets returns too;
                 // acceptable gap, noted).
-                if (w.thread and (w.branchHasComposable(f.then_branch) or
+                if (w.thread and !w.explicit_groups and (w.branchHasComposable(f.then_branch) or
                     (if (f.else_branch) |eb2| w.branchHasComposable(eb2) else false)))
                 {
                     w.wrapBranchInReplaceGroup(f.then_branch);
@@ -2010,7 +2035,7 @@ const Walker = struct {
                 // composable content needs a slot-alignment bracket per
                 // branch, or a branch flip cannot replace its content
                 // atomically. Statement-shaped (Block) branches only.
-                if (w.thread and any_composable) {
+                if (w.thread and !w.explicit_groups and any_composable) {
                     for (wh.branches) |*br| w.wrapBranchInReplaceGroup(&br.body);
                 }
             },
@@ -2060,9 +2085,13 @@ const Walker = struct {
         lam.param_tys = new_tys;
         lam.implicit_it = false;
         // The lambda body IS composable: thread it (and substitute
-        // currentComposer) even when the enclosing scope was not.
+        // currentComposer) even when the enclosing scope was not. A composable
+        // lambda is its own scope, not the enclosing `@ExplicitGroupsComposable`
+        // function's — its branches take the automatic replace-groups again.
         const saved = w.thread;
+        const saved_eg = w.explicit_groups;
         w.thread = true;
+        w.explicit_groups = false;
         // Register this lambda as a `return@label` target so a nested non-local
         // return can close the groups it opened. The marker capture is prepended
         // only if such a return is found while walking the body.
@@ -2080,6 +2109,7 @@ const Walker = struct {
             if (sc.needs) prependMarkerCapture(w, lam, marker_var.?);
         }
         w.thread = saved;
+        w.explicit_groups = saved_eg;
         // A labeled early return (`return@run`) crossing a wrapped branch
         // bracket must close the replace-groups it exits; the content
         // lambda's restart group belongs to ComposableLambdaImpl, so only
@@ -3354,4 +3384,94 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     try testing.expectEqualStrings("endToMarker", cleanup.callee.Member.name.name);
     try testing.expectEqualStrings(marker_name, cleanup.args[0].Path.segments[0].name);
     try testing.expect(wrapped.Block.stmts[1].Expr == .Return);
+}
+
+var explicitGroupsAnno = [_]ast.Annotation{
+    .{
+        .use_site = null,
+        .path = &composablePath,
+        .type_args = &.{},
+        .args = &.{},
+        .arg_names = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    },
+    .{
+        .use_site = null,
+        .path = &explicitGroupsPath,
+        .type_args = &.{},
+        .args = &.{},
+        .arg_names = &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    },
+};
+var explicitGroupsPath = [_]Ident{dummyIdent("ExplicitGroupsComposable")};
+
+// A statement-position `if (cond) { Foo() }` in an @ExplicitGroupsComposable
+// body must NOT gain the per-branch replace-group the plugin inserts for
+// ordinary composables — the function manages its own groups. (Inserting one
+// makes `ReusableContentHost`'s deactivate/reactivate branches mis-key their
+// groups and delete the reused nodes.) A plain @Composable inline body with the
+// same shape DOES get the bracket.
+test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 40, 60);
+
+    // Build `if (true) { Foo() }` as a statement body. `buildIfFooBody` is
+    // re-run per fixture so the two transforms don't share mutated AST.
+    const S = struct {
+        fn buildBody(al: std.mem.Allocator, sp: Span) ![]Stmt {
+            const foo_segs = try al.alloc(Ident, 1);
+            foo_segs[0] = dummyIdent("Foo");
+            const foo_callee = try al.create(Expr);
+            foo_callee.* = .{ .Path = .{ .segments = foo_segs, .span = sp } };
+            const foo_call = try al.create(Expr);
+            foo_call.* = .{ .Call = .{
+                .callee = foo_callee,
+                .args = &.{},
+                .arg_names = &.{},
+                .type_args = &.{},
+                .is_infix = false,
+                .has_trailing_lambda = false,
+                .span = sp,
+            } };
+            const then_stmts = try al.alloc(Stmt, 1);
+            then_stmts[0] = .{ .Expr = foo_call.* };
+            const then_branch = try al.create(Expr);
+            then_branch.* = .{ .Block = .{ .stmts = then_stmts, .span = sp } };
+            const cond = try al.create(Expr);
+            cond.* = .{ .BoolLit = .{ .value = true, .span = sp } };
+            const if_expr = Expr{ .If = .{
+                .cond = cond,
+                .then_branch = then_branch,
+                .else_branch = null,
+                .span = sp,
+            } };
+            const body = try al.alloc(Stmt, 1);
+            body[0] = .{ .Expr = if_expr };
+            return body;
+        }
+    };
+
+    var ctx: u8 = 0;
+
+    // Explicit-groups: no bracket.
+    const eg_body = try S.buildBody(a, gsp);
+    var eg = emptyFn("EgHost", &.{}, .{ .Block = .{ .stmts = eg_body, .span = gsp } }, true);
+    eg.is_inline = true;
+    eg.annotations = &explicitGroupsAnno;
+    const eg_out = try transformThreadedComposable(a, &eg, allComposable, &ctx, null, null);
+    const eg_then = eg_out.body.?.Block.stmts[0].Expr.If.then_branch.Block.stmts;
+    // First (and only) statement is the Foo() call, NOT a startReplaceGroup.
+    try testing.expect(!isComposerCallStmt(&eg_then[0], "startReplaceGroup"));
+    try testing.expectEqualStrings("Foo", eg_then[0].Expr.Call.callee.Path.segments[0].name);
+
+    // Plain composable inline: the branch IS bracketed.
+    const plain_body = try S.buildBody(a, gsp);
+    var plain = emptyFn("PlainHost", &.{}, .{ .Block = .{ .stmts = plain_body, .span = gsp } }, true);
+    plain.is_inline = true;
+    const plain_out = try transformThreadedComposable(a, &plain, allComposable, &ctx, null, null);
+    const plain_then = plain_out.body.?.Block.stmts[0].Expr.If.then_branch.Block.stmts;
+    try testing.expect(isComposerCallStmt(&plain_then[0], "startReplaceGroup"));
 }
