@@ -45,7 +45,11 @@ const runtime = @import("runtime");
 // 1179/1200/1208/1221). The floor must sit below the worst realistic
 // DNC run so a high-DNC run does not fail the ratchet spuriously; 1175
 // keeps meaningful regression detection with that margin.
-const BASELINE: usize = 1175;
+// RAISED 1175 -> 1210 after verified 1252 (the image-loaded-base decl
+// fix: the plugin's base collectors now see an image-loaded base's
+// composables, a deterministic gain on the pack path the suite always
+// uses). Kept below the 1252 peak by the ~±40 DNC-variance margin.
+const BASELINE: usize = 1210;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
