@@ -448,6 +448,34 @@ test "cross-package class collision constructs the caller's class in either orde
     try expectFilesOutput("xpkg_cls_lib_first", &.{ xcls_lib, xcls_main }, want);
 }
 
+const xfn_lib =
+    \\package liba
+    \\internal fun make(block: () -> String): String = "liba:" + block()
+    \\
+;
+const xfn_main =
+    \\package appb
+    \\internal fun make(block: () -> String): String = "appb:" + block()
+    \\fun runIt(block: () -> String): String = block()
+    \\fun main() {
+    \\    println(make { "x" })
+    \\    println(runIt { make { "y" } })
+    \\}
+    \\
+;
+
+test "cross-package same-signature function twin never displaces the caller's own, even from a lambda" {
+    // Two packages each declare `internal fun make((){}->String)`; the call
+    // site in `appb` imports neither the other, so kotlinc binds `appb.make`
+    // for BOTH the direct call and the one nested in a `runIt { … }` lambda —
+    // whose frame carries no declared package, so the runtime overload re-pick
+    // must anchor scope to the lowering-resolved target's package, not let the
+    // identical-signature `liba.make` win on a first-seen tie. Order-independent.
+    const want = "appb:x\nappb:y\n";
+    try expectFilesOutput("xpkg_fn_main_first", &.{ xfn_main, xfn_lib }, want);
+    try expectFilesOutput("xpkg_fn_lib_first", &.{ xfn_lib, xfn_main }, want);
+}
+
 const xobj_ga_decl =
     \\package com.ga
     \\sealed class Operation(val n: Int) {

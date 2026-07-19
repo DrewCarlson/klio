@@ -5014,7 +5014,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // before falling back to the single global value baked in at
         // lower time.
         const cno_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file)) {
+        // The package the reference site resolves in. A synthesized lambda /
+        // closure frame carries no declared package, so `frame.func.package` is
+        // empty; the lowering-resolved base (`cmg.func`) settled scope already,
+        // and its declaring package is the reliable anchor for the overload
+        // re-pick's visibility filter — a same-name namesake in another package
+        // is not a resolution target here, and without the anchor an
+        // identical-signature cross-package twin can displace it.
+        const cno_pkg: []const u8 = if (frame.func.package.len != 0)
+            frame.func.package
+        else if (cmg.func) |bf|
+            (if (frame.module.funcById(bf)) |bfd| bfd.package else "")
+        else
+            "";
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, cno_pkg, cno_file)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
