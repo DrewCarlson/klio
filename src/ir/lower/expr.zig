@@ -6167,29 +6167,52 @@ fn headIsNumeric(h: []const u8) bool {
     return false;
 }
 
+/// A builtin scalar head — the only heads that definitely disprove one
+/// another (and that a lambda literal can never satisfy).
+fn headIsScalar(h: []const u8) bool {
+    if (headIsNumeric(h)) return true;
+    const scalars = [_][]const u8{ "Boolean", "String", "Char" };
+    for (scalars) |s| {
+        if (std.mem.eql(u8, h, s)) return true;
+    }
+    return false;
+}
+
+/// Whether declared head `d` denotes a function type. A parsed function
+/// type carries the synthetic tag `"<function>"` (see `ast.TypeRef`); a
+/// spelled-out `(P) -> R` or an erased `FunctionN` name also count.
+fn headIsFunctionType(d: []const u8) bool {
+    return std.mem.eql(u8, d, "<function>") or
+        std.mem.indexOf(u8, d, "->") != null or
+        std.mem.startsWith(u8, d, "Function");
+}
+
 /// Can an argument with static head `h` bind a parameter declared `d`?
 /// Disproof-only: `true` unless both sides are known and definitely
 /// incompatible (numeric literals coerce across the numeric family).
-fn headCompatible(h: []const u8, d_raw: []const u8) bool {
+///
+/// `strict` tightens the lambda case for OVERLOAD SELECTION: a `{ … }`
+/// argument matches only a function-typed parameter, so a `(…) -> R`
+/// sibling wins over a same-arity non-function one. When `false` (the
+/// applicability / shadow-or-fall-through decision) the lambda case is
+/// disproof-only: reject only a definite non-function scalar, since an
+/// unknown class name may be a function typealias.
+fn headCompatible(h: []const u8, d_raw: []const u8, strict: bool) bool {
     const d = std.mem.trimEnd(u8, d_raw, "?");
     if (std.mem.eql(u8, d, "Any") or std.mem.eql(u8, d, "Unit")) return true;
     if (d.len > 0 and d.len <= 2 and allUppercase(d)) return true;
-    const d_fn = std.mem.indexOf(u8, d, "->") != null or std.mem.startsWith(u8, d, "Function");
-    if (std.mem.eql(u8, h, "->")) return d_fn;
+    const d_fn = headIsFunctionType(d);
+    if (std.mem.eql(u8, h, "->")) {
+        if (d_fn) return true;
+        return if (strict) false else !headIsScalar(d);
+    }
     if (d_fn) return false;
     if (std.mem.eql(u8, h, d)) return true;
     if (headIsNumeric(h) and headIsNumeric(d)) return true;
     // The head is a definite literal kind; a differently-named declared
     // class stays unknown (could be a supertype) — only the builtin
     // scalar heads disprove each other.
-    const scalars = [_][]const u8{ "Boolean", "String", "Char" };
-    var h_scalar = headIsNumeric(h);
-    var d_scalar = headIsNumeric(d);
-    for (scalars) |s| {
-        if (std.mem.eql(u8, h, s)) h_scalar = true;
-        if (std.mem.eql(u8, d, s)) d_scalar = true;
-    }
-    return !(h_scalar and d_scalar);
+    return !(headIsScalar(h) and headIsScalar(d));
 }
 
 /// Statically select among same-named local-fn declarations: arity and
@@ -6206,21 +6229,45 @@ fn anyLocalFnOverloadApplicable(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) bool {
-    _ = b;
     outer: for (ovs) |*ov| {
         if (args.len < ov.n_required and !ov.has_vararg) continue;
         if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
-        for (args, 0..) |_, i| {
+        var bound = [_]bool{false} ** 64;
+        if (ov.param_tys.len > bound.len) continue;
+        var positional: usize = 0;
+        for (args, 0..) |*a, i| {
             const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            var pi: ?usize = null;
             if (supplied) |nm| {
                 var found = false;
-                for (ov.param_names) |pn| {
+                for (ov.param_names, 0..) |pn, k| {
                     if (std.mem.eql(u8, pn, nm)) {
+                        if (bound[k]) continue :outer;
+                        pi = k;
+                        bound[k] = true;
                         found = true;
                         break;
                     }
                 }
                 if (!found) continue :outer;
+            } else {
+                if (positional < ov.param_tys.len) {
+                    pi = positional;
+                    bound[positional] = true;
+                } else if (!ov.has_vararg) {
+                    continue :outer;
+                }
+                positional += 1;
+            }
+            // Type-head disproof per bound parameter, mirroring
+            // `selectLocalFnOverload`: a `validate { … }` (lambda arg) does not
+            // fit `fun validate(state: Int)`. Without this the local name was
+            // deemed applicable on arity alone and the call recursed into
+            // itself instead of falling through to the outer extension.
+            if (pi) |k| {
+                const d = ov.param_tys[k] orelse continue;
+                const h = staticArgHead(b, a) orelse continue;
+                if (!headCompatible(h, d, false)) continue :outer;
             }
         }
         return true;
@@ -6296,7 +6343,7 @@ fn selectLocalFnOverload(
             if (pi) |k| {
                 const d = ov.param_tys[k] orelse continue;
                 const h = staticArgHead(b, a) orelse continue;
-                if (!headCompatible(h, d)) continue :outer;
+                if (!headCompatible(h, d, true)) continue :outer;
             }
         }
         survivor = ov;
@@ -10423,25 +10470,38 @@ test "trailing-lambda arity host accepts a signature-only candidate" {
 test "headCompatible: literal heads disprove scalar params only" {
     // Literal Boolean disproves a String param — the local-fn overload
     // shape that recursed before selection existed.
-    try std.testing.expect(!headCompatible("Boolean", "String"));
-    try std.testing.expect(headCompatible("Boolean", "Boolean"));
+    try std.testing.expect(!headCompatible("Boolean", "String", true));
+    try std.testing.expect(headCompatible("Boolean", "Boolean", true));
     // Numeric literals coerce across the numeric family.
-    try std.testing.expect(headCompatible("Int", "Long"));
-    try std.testing.expect(headCompatible("Int", "Double"));
-    try std.testing.expect(!headCompatible("Int", "String"));
+    try std.testing.expect(headCompatible("Int", "Long", true));
+    try std.testing.expect(headCompatible("Int", "Double", true));
+    try std.testing.expect(!headCompatible("Int", "String", true));
     // A lambda binds only function-shaped or generic params.
-    try std.testing.expect(headCompatible("->", "() -> Unit"));
-    try std.testing.expect(headCompatible("->", "T"));
-    try std.testing.expect(!headCompatible("->", "String"));
-    try std.testing.expect(!headCompatible("String", "(Int) -> Int"));
+    try std.testing.expect(headCompatible("->", "() -> Unit", true));
+    try std.testing.expect(headCompatible("->", "T", true));
+    try std.testing.expect(!headCompatible("->", "String", true));
+    try std.testing.expect(!headCompatible("String", "(Int) -> Int", true));
+    // A parsed function type carries the synthetic `<function>` tag; a
+    // lambda binds it under either strictness. `expect(…, predicate:
+    // (Char) -> Boolean) { it == '-' }` regressed when the tag was not
+    // recognized and the local fn was deemed inapplicable.
+    try std.testing.expect(headCompatible("->", "<function>", true));
+    try std.testing.expect(headCompatible("->", "<function>", false));
     // A user class head never disproves another named type (supertypes
     // are unknown here); generic/Any params accept anything.
-    try std.testing.expect(headCompatible("MyThing", "Other"));
-    try std.testing.expect(headCompatible("String", "Any"));
-    try std.testing.expect(headCompatible("Int", "T"));
+    try std.testing.expect(headCompatible("MyThing", "Other", true));
+    try std.testing.expect(headCompatible("String", "Any", true));
+    try std.testing.expect(headCompatible("Int", "T", true));
+    // Disproof-only lambda case (applicability decision): a lambda may
+    // bind an unknown class name (a possible function typealias), so it
+    // is not ruled inapplicable — but a definite scalar still disproves.
+    try std.testing.expect(headCompatible("->", "MyPredicate", false));
+    try std.testing.expect(!headCompatible("->", "MyPredicate", true));
+    try std.testing.expect(!headCompatible("->", "String", false));
+    try std.testing.expect(!headCompatible("->", "Int", false));
     // Nullable params adjudicate under the underlying head.
-    try std.testing.expect(headCompatible("Boolean", "Boolean?"));
-    try std.testing.expect(!headCompatible("Boolean", "String?"));
+    try std.testing.expect(headCompatible("Boolean", "Boolean?", true));
+    try std.testing.expect(!headCompatible("Boolean", "String?", true));
 }
 
 test "lowers postfix not-null assert" {

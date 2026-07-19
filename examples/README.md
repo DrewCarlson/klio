@@ -116,6 +116,7 @@ Run any program with:
 | `super_property_setter.kt` | `super.prop = value` reaches the superclass accessor, so an overriding setter that writes through `super` does not re-enter itself. |
 | `stored_override_of_accessor.kt` | A field-backed `override var` overrides an inherited accessor property, so a write stores the field and never reaches the base's custom setter. |
 | `local_fun_arity_shadowing.kt` | A local function shadows an outer one by name only for calls it can take: `validate { … }` inside a no-arg local `validate()` resolves outward. |
+| `local_fun_type_shadowing.kt` | Same-arity shadowing resolves by parameter TYPE: a lambda argument cannot bind a local `validate(state: Int)`, so `validate { … }` inside it resolves outward to `Checker.validate(block)` instead of recursing. |
 | `labeled_this_in_object_literal.kt` | Inside an object literal written in a receiver lambda, `this@build` names the lambda's receiver, and a bare name the object does not own resolves against it. |
 | `delegated_var_reads_through.kt` | A `var x by D` local reads through the delegate on every read (including inside a string template and a lambda), rather than caching the value at the declaration. |
 | `atomic_named_compare_and_set.kt` | A named-argument call into a host-backed library member (`compareAndSet(expect = …, update = …)`) binds exactly as the positional form does. |
