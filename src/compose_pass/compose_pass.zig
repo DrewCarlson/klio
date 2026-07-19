@@ -1982,6 +1982,21 @@ const Walker = struct {
                 if (w.thread and !w.explicit_groups and (w.branchHasComposable(f.then_branch) or
                     (if (f.else_branch) |eb2| w.branchHasComposable(eb2) else false)))
                 {
+                    // A composable `if` with no `else` still needs a group in
+                    // the not-taken branch: without it the conditional's group
+                    // is absent when the condition is false and present when
+                    // true, so a flip shifts every following sibling and
+                    // `startReplaceGroup` deletes the sibling that moved into
+                    // its slot (kotlinc emits the same synthesized empty else).
+                    if (f.else_branch == null) {
+                        // Key the empty else off the `if`'s own span so each
+                        // conditional's else group is stable and distinct from
+                        // its then group (which keys off the then-branch span).
+                        const eb = w.a.create(Expr) catch @panic("oom");
+                        const empty = w.a.alloc(ast.Stmt, 0) catch @panic("oom");
+                        eb.* = .{ .Block = .{ .stmts = empty, .span = f.span } };
+                        f.else_branch = eb;
+                    }
                     w.wrapBranchInReplaceGroup(f.then_branch);
                     if (f.else_branch) |eb| w.wrapBranchInReplaceGroup(eb);
                 }
@@ -3479,16 +3494,25 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     eg.is_inline = true;
     eg.annotations = &explicitGroupsAnno;
     const eg_out = try transformThreadedComposable(a, &eg, allComposable, &ctx, null, null);
-    const eg_then = eg_out.body.?.Block.stmts[0].Expr.If.then_branch.Block.stmts;
+    const eg_if = eg_out.body.?.Block.stmts[0].Expr.If;
+    const eg_then = eg_if.then_branch.Block.stmts;
     // First (and only) statement is the Foo() call, NOT a startReplaceGroup.
     try testing.expect(!isComposerCallStmt(&eg_then[0], "startReplaceGroup"));
     try testing.expectEqualStrings("Foo", eg_then[0].Expr.Call.callee.Path.segments[0].name);
+    // No synthesized else either — it manages its own groups.
+    try testing.expect(eg_if.else_branch == null);
 
     // Plain composable inline: the branch IS bracketed.
     const plain_body = try S.buildBody(a, gsp);
     var plain = emptyFn("PlainHost", &.{}, .{ .Block = .{ .stmts = plain_body, .span = gsp } }, true);
     plain.is_inline = true;
     const plain_out = try transformThreadedComposable(a, &plain, allComposable, &ctx, null, null);
-    const plain_then = plain_out.body.?.Block.stmts[0].Expr.If.then_branch.Block.stmts;
-    try testing.expect(isComposerCallStmt(&plain_then[0], "startReplaceGroup"));
+    const plain_if = plain_out.body.?.Block.stmts[0].Expr.If;
+    try testing.expect(isComposerCallStmt(&plain_if.then_branch.Block.stmts[0], "startReplaceGroup"));
+    // A no-else composable `if` gains a synthesized empty else whose replace
+    // group keeps the conditional position-stable across a branch flip.
+    try testing.expect(plain_if.else_branch != null);
+    const plain_else = plain_if.else_branch.?.Block.stmts;
+    try testing.expect(isComposerCallStmt(&plain_else[0], "startReplaceGroup"));
+    try testing.expect(isComposerCallStmt(&plain_else[plain_else.len - 1], "endReplaceGroup"));
 }
