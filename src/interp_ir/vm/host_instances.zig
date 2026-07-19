@@ -2830,6 +2830,67 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
+    // A plain (non-property) primary-ctor parameter a member body reads is
+    // captured by Kotlin as a synthesized field. Seed each under its name when
+    // nothing else owns it: a property param (seeded above, own or inherited)
+    // or a same-class body property (seeded from its initializer below) holds
+    // the name instead, so skip those — else a duplicate/shadowing cell would
+    // displace the real property. Runs after the whole property pass so an
+    // inherited property (a base `val root` under a subclass's plain `root`
+    // param) is already present and wins.
+    {
+        var ci: usize = chain.items.len;
+        while (ci > 0) {
+            ci -= 1;
+            const cls_name = chain.items[ci].name;
+            const cls_args = chain.items[ci].args;
+            var cls_def = classDefByName(self, sideTableKey(chain.items[ci].fqn, cls_name));
+            var use_def = false;
+            if (cls_def) |d| {
+                if (classDefIsInterface(d)) {
+                    d.deinit();
+                    cls_def = null;
+                } else {
+                    use_def = true;
+                }
+            }
+            if (!use_def and std.mem.eql(u8, cls_name, class_name)) {
+                cls_def = class_def.clone();
+                use_def = true;
+            }
+            if (cls_def) |d| {
+                defer d.deinit();
+                const dg = d.borrow();
+                const pp = dg.get().primary_params;
+                var k: usize = 0;
+                while (k < pp.len and k < cls_args.len) : (k += 1) {
+                    if (pp[k].property != null) continue;
+                    const pnm = pp[k].name;
+                    var present = false;
+                    for (fields.items) |f| {
+                        if (std.mem.eql(u8, f.name, pnm)) {
+                            present = true;
+                            break;
+                        }
+                    }
+                    if (present) continue;
+                    var owned_by_body = false;
+                    for (dg.get().body_properties) |bp| {
+                        if (std.mem.eql(u8, bp.name, pnm)) {
+                            owned_by_body = true;
+                            break;
+                        }
+                    }
+                    if (owned_by_body) continue;
+                    const fv = cls_args[k];
+                    if (runtime.reclaimEnabled()) fv.retain();
+                    try fields.append(allocator, .{ .name = pnm, .value = fv });
+                }
+                dg.deinit();
+            }
+        }
+    }
+
     // Seed non-nullable primitive `var` fields with their type zero.
     {
         var cur: ?ObjRef(ClassDef) = class_def.clone();
