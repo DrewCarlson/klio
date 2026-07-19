@@ -506,6 +506,17 @@ fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
+    // Static-type-directed extension-property read. The lowerer emits this
+    // marker when a read's STATIC receiver type resolves `name` to an in-scope
+    // member-extension property rather than a member: Kotlin runs that getter,
+    // so the runtime object's same-named stored field must not shadow it.
+    // Resolve the extension directly; fall back to the ordinary read only when
+    // no extension applies (a defensive no-op the lowerer should not reach).
+    if (std.mem.startsWith(u8, name, "$extread$")) {
+        const prop = name["$extread$".len..];
+        if (try extensionPropRead(self, allocator, receiver, prop)) |v| return v;
+        return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+    }
     // Field-read memo, consulted before the whole ladder: entries exist
     // ONLY for (class, name) pairs that previously fell through every
     // earlier arm and resolved in `instanceField` as a custom getter or
@@ -2003,6 +2014,52 @@ fn resolveExtensionProp(
     name: []const u8,
 ) Allocator.Error!?FuncId {
     return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, false);
+}
+
+/// Resolve and evaluate a (member-)extension property getter for `receiver`,
+/// or a delegated extension property. Mirrors the extension arm of the field
+/// ladder (`resolveExtensionProp` + owner-`this` seeding) but is entered
+/// directly from the `$extread$` marker, so it never consults the
+/// stored-field / member-getter-shadow arms. Null when no extension applies.
+fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
+    const recv_simple: []const u8 = switch (receiver.*) {
+        .Instance => |i| className(i),
+        .Class => |c| blk: {
+            const g = c.borrow();
+            defer g.deinit();
+            break :blk lastSegment(g.get().name);
+        },
+        else => lastSegment(receiver.typeFqn()),
+    };
+    if (try resolveExtensionProp(self, allocator, receiver, recv_simple, name)) |fid| {
+        const mptr: *const Module = self.module.asPtr();
+        if (fid.int() >= mptr.funcCount()) return null;
+        // A companion extension's getter `this` is the class's companion
+        // instance; route the class value to it.
+        var getter_recv = receiver.*;
+        if (receiver.* == .Class) {
+            if (try companionInstanceForClass(self, recv_simple)) |comp| getter_recv = comp;
+        }
+        // A member-extension property's getter body has its declaring class's
+        // `this` in lexical scope; seed the getter frame with the owner
+        // instance from the enclosing chain.
+        var pushed_owner = false;
+        if (mptr.registry.member_ext_owner_class.get(fid)) |owner| {
+            if (try host_call_member.memberExtOwnerInstance(self, allocator, &getter_recv, owner)) |inst| {
+                ir.eval.pushEnclosing(&inst);
+                pushed_owner = true;
+            }
+        }
+        const r = try evalGetter(self, allocator, fid, getter_recv);
+        if (pushed_owner) ir.eval.popEnclosing();
+        return r;
+    }
+    if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
+        const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
+        const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+        return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+    }
+    return null;
 }
 
 /// The setter half of `resolveExtensionProp`: walks the same

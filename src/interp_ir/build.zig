@@ -1816,6 +1816,7 @@ fn buildModuleWithOverrides(
     {
         ir.lower.resetInlineMemberOwners();
         ir.lower.resetMemberPropAsts();
+        ir.lower.resetMemberExtPropRecv();
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
@@ -3377,7 +3378,17 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
 fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8) void {
     for (members) |*m| {
         switch (m.*) {
-            .Property => |p| ir.lower.registerMemberPropAst(a, owner, p),
+            .Property => |p| {
+                ir.lower.registerMemberPropAst(a, owner, p);
+                // A member-EXTENSION property (`private val Composition.parent`)
+                // is recorded under a dedicated key so a same-named plain member
+                // of the same class does not hide it: a read whose static
+                // receiver type matches the extension receiver resolves to the
+                // extension getter, not an accidental runtime stored field.
+                if (p.receiver_type) |rt| {
+                    ir.lower.registerMemberExtPropRecv(a, owner, p.name.name, rt.name.name);
+                }
+            },
             .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
             .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
             else => {},

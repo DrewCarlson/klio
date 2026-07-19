@@ -302,6 +302,39 @@ pub fn memberPropAst(owner: []const u8, name: []const u8) ?*const ast.Property {
     return m.get(key);
 }
 
+/// Member-EXTENSION property receiver-type heads by `owner\x1fname`. Distinct
+/// from `member_prop_asts` (first-registration-wins) because a class can
+/// declare BOTH a same-named member (e.g. `override val parent`) AND a
+/// member-extension property (`private val Composition.parent`); the member
+/// would otherwise hide the extension in that map. Used at a property-read
+/// site to detect that the receiver's STATIC type resolves the read to the
+/// in-scope extension getter rather than the runtime object's stored field.
+threadlocal var member_ext_prop_recv: ?std.StringHashMap([]const u8) = null;
+
+pub fn resetMemberExtPropRecv() void {
+    if (member_ext_prop_recv) |*m| m.deinit();
+    member_ext_prop_recv = std.StringHashMap([]const u8).init(std.heap.page_allocator);
+}
+
+/// Record that class `owner` declares a member-extension property `name`
+/// whose extension-receiver type head is `recv_head`.
+pub fn registerMemberExtPropRecv(a: std.mem.Allocator, owner: []const u8, name: []const u8, recv_head: []const u8) void {
+    if (member_ext_prop_recv == null) resetMemberExtPropRecv();
+    const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, name }) catch return;
+    const gop = member_ext_prop_recv.?.getOrPut(key) catch return;
+    if (gop.found_existing) return;
+    gop.value_ptr.* = recv_head;
+}
+
+/// The extension-receiver type head of the member-extension property `owner`
+/// declares under `name`, or null when `owner` declares no such extension.
+pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
+    const m = member_ext_prop_recv orelse return null;
+    var buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ owner, name }) catch return null;
+    return m.get(key);
+}
+
 /// Record that inline member fn `f` is declared directly on class `owner`.
 pub fn registerInlineMemberOwner(f: *const ast.Function, owner: []const u8) void {
     if (inline_member_owner == null) resetInlineMemberOwners();

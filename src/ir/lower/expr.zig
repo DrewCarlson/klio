@@ -2055,11 +2055,78 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
+    // Static-type-directed extension-property read. When the receiver's
+    // STATIC type resolves `name` to an in-scope member-extension property
+    // rather than a member of that type, Kotlin runs the extension getter —
+    // a same-named stored field the runtime object happens to carry is
+    // irrelevant. Emit an extension-read marker so dispatch resolves the
+    // extension property instead of that accidental field.
+    if (try staticExtPropReadField(b, receiver, name.name)) |marker| {
+        const recv = try lowerReceiver(b, receiver);
+        const dst = b.allocReg();
+        try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = marker } });
+        return dst;
+    }
+
     const recv = try lowerReceiver(b, receiver);
     const dst = b.allocReg();
     const field = try b.module.internConst(b.allocator, .{ .String = name.name });
     try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
     return dst;
+}
+
+/// The statically known type-head of a bare single-name receiver: a typed
+/// local/param, else an enclosing-class member (property / constructor-
+/// parameter property) walked over the owner's supertype chain. Null when the
+/// name has no statically known type here (an untyped local, an outer
+/// capture, or a name the enclosing class does not declare as a typed member).
+fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
+    // A local/param binding shadows an enclosing member of the same name.
+    if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
+    if (b.knowsOuter(recv_name)) return null;
+    const owner = b.ownerClass() orelse return null;
+    const heads = b.module.registry.class_prop_type_heads;
+    if (heads.get(.{ .a = owner, .b = recv_name })) |h| return h;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    for (chain) |cls| {
+        if (heads.get(.{ .a = cls, .b = recv_name })) |h| return h;
+    }
+    return null;
+}
+
+/// Whether `ty` (or a supertype) declares a member property named `name`.
+/// Keyed on `class_prop_type_heads`, which records member and constructor-
+/// parameter properties by declaring class.
+fn staticTypeDeclaresProp(b: *const FuncBuilder, ty: []const u8, name: []const u8) bool {
+    const heads = b.module.registry.class_prop_type_heads;
+    if (heads.get(.{ .a = ty, .b = name }) != null) return true;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(ty) orelse return false;
+    for (chain) |cls| {
+        if (heads.get(.{ .a = cls, .b = name }) != null) return true;
+    }
+    return false;
+}
+
+/// When a qualified read `recv.name` resolves — by the STATIC type of `recv`
+/// — to an in-scope member-extension property whose getter must win over any
+/// same-named stored field on the runtime object, return the interned
+/// `$extread$<name>` marker. Null when the ordinary field read applies.
+fn staticExtPropReadField(b: *FuncBuilder, receiver: *const Expr, name: []const u8) Allocator.Error!?ConstId {
+    const recv_name = switch (receiver.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
+        else => return null,
+    };
+    const static_ty = staticBareReceiverType(b, recv_name) orelse return null;
+    const owner = b.ownerClass() orelse return null;
+    // An in-scope member-extension property `name` on the enclosing class
+    // whose extension-receiver type the static type satisfies.
+    const ext_recv = inline_state.memberExtPropRecv(owner, name) orelse return null;
+    if (!b.module.classIsOrExtends(static_ty, ext_recv)) return null;
+    // A member of the static type outranks the extension (Kotlin); the
+    // ordinary field read is then correct.
+    if (staticTypeDeclaresProp(b, static_ty, name)) return null;
+    const marker = try std.fmt.allocPrint(b.allocator, "$extread${s}", .{name});
+    return try b.module.internConst(b.allocator, .{ .String = marker });
 }
 
 /// Intern the `super<Q>` qualifier (type ref) or `super@Q` label (ident).

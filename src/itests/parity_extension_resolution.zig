@@ -546,3 +546,49 @@ test "fn_typed_receiver_ext_bare_call_binds_top_level" {
     ;
     try assertKlio("fn_typed_recv_bare_call", src, "top:x\narmed\n");
 }
+
+test "member_ext_prop_over_ctor_field_by_static_type" {
+    // A member-extension property (`private val I.parent`) wins over a
+    // same-named stored constructor-property field of the runtime object
+    // when the read is made through the interface static type: Kotlin
+    // resolves member-vs-extension by the STATIC receiver type, and `I`
+    // declares no member `parent`. A read through the concrete static type
+    // `Impl`, whose member exists, still reads the field.
+    const src =
+        \\interface I
+        \\class Impl(val parent: String) : I
+        \\class Wrapper {
+        \\    private val I.parent: String
+        \\        get() = "ext-parent"
+        \\    fun viaInterface(obj: I): String = obj.parent
+        \\    fun viaConcrete(obj: Impl): String = obj.parent
+        \\}
+        \\fun main() {
+        \\    val impl = Impl("field-parent")
+        \\    println(Wrapper().viaInterface(impl))
+        \\    println(Wrapper().viaConcrete(impl))
+        \\}
+        \\
+    ;
+    try assertKlio("member_ext_prop_over_ctor_field", src, "ext-parent\nfield-parent\n");
+}
+
+test "member_ext_prop_over_ctor_field_enclosing_member_receiver" {
+    // The receiver is an enclosing constructor-property whose declared
+    // (interface) type carries no member `tag`; the read resolves through
+    // the in-scope member-extension property, not the runtime `Boxed` field.
+    const src =
+        \\interface Named
+        \\class Boxed(val tag: String) : Named
+        \\class Reader(val value: Named) {
+        \\    private val Named.tag: String
+        \\        get() = "ext-tag"
+        \\    fun read(): String = value.tag
+        \\}
+        \\fun main() {
+        \\    println(Reader(Boxed("field-tag")).read())
+        \\}
+        \\
+    ;
+    try assertKlio("member_ext_prop_enclosing_member_recv", src, "ext-tag\n");
+}
