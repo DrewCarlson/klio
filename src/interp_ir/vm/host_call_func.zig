@@ -945,34 +945,22 @@ fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
 }
 
 /// Whether `cand` is outside the baked target's overload set because it is
-/// declared in a different package the lowering-resolved base did not bind.
+/// declared in a different package, and the target — having no body — cannot
+/// score against it.
 ///
 /// The re-pick ranks the candidates the lowering could not tell apart from the
 /// argument SHAPES alone; it is not a second scope resolution. Lowering already
 /// settled scope (an explicit import outranks the caller's own package, which
-/// outranks a star/default import), so a same-simple-name PLAIN function in
-/// another package is not an overload of the committed target at all. When two
-/// packages each declare an `internal fun` of the same name and signature, the
-/// re-pick scores them equally and the tie-break keeps whichever it met first —
-/// so a different-package twin can silently displace the call site's own
-/// declaration. Excluding cross-package plain namesakes keeps the base's binding.
-///
-/// A BODYLESS target (an `expect` with no `actual` here, a header stub) has no
-/// signature to score, so any body-bearing namesake anywhere would win by
-/// default (`import p1.getStr` silently ran `p2.getStr`); exclude those too.
-///
-/// Top-level EXTENSIONS stay eligible across packages: their receiver type is
-/// the discriminator, and an imported extension is resolved by that, not by the
-/// declaring package.
+/// outranks a star/default import), so a same-simple-name function in another
+/// package is not an overload of the committed target at all. That normally does
+/// no harm, because the target scores too and defends its own binding — but a
+/// BODYLESS target (an `expect` with no `actual` here, a header stub) has no
+/// signature to score, so any body-bearing namesake anywhere in the program won
+/// by default: `import p1.getStr` silently ran `p2.getStr`.
 fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId) bool {
+    if (f.hasBody()) return false;
     const cf = funcAt(module, cand) orelse return false;
-    if (std.mem.eql(u8, cf.package, f.package)) return false;
-    // Different package than the base. A bodyless base cannot defend its
-    // binding, so exclude any cross-package namesake. A body-bearing base
-    // excludes only cross-package PLAIN functions — extensions narrow by
-    // receiver and remain candidates.
-    if (!f.hasBody()) return true;
-    return !paramIsThis(cf.params);
+    return !std.mem.eql(u8, cf.package, f.package);
 }
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
@@ -1694,12 +1682,6 @@ pub fn pickNamedOverloadIdRecv(
     var best_low: ?FuncId = null;
     var best_low_score: i32 = std.math.minInt(i32);
     for (candidates) |cand| {
-        // A same-simple-name PLAIN function in another package is not part of
-        // the lowering-resolved base's overload set (scope was already settled).
-        // Without this a different-package `internal fun` twin with an identical
-        // signature ties the base and, met first, displaces it on the named
-        // re-pick — the positional `pickOverload` applies the same exclusion.
-        if (cand.int() != func.int() and crossPackageNonCandidate(module, f0, cand)) continue;
         if (!baked_is_ext) {
             if (external_recv) |rv| {
                 if (funcAt(module, cand)) |cf| {
@@ -2154,18 +2136,6 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     const mg = self.module.borrow();
     defer mg.deinit();
     const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
-    // The package the reference site can SEE, for the visibility filter below.
-    // A lambda/closure frame carries no declared package, so `caller_pkg` is
-    // empty; the LEXICAL package is the one that owns the call-site FILE (where
-    // the bare call was written). Deriving it keeps a same-name declaration in
-    // an unrelated package (a different-package `internal fun` twin) from
-    // winning a bare call it is not a Kotlin resolution target for.
-    const scope_pkg: []const u8 = if (caller_pkg.len != 0)
-        caller_pkg
-    else if (caller_file) |cf|
-        (eff.packageOfFile(cf) orelse "")
-    else
-        "";
     // Only intercept genuine overload sets: a single top-level function
     // keeps the plain global-value path. The name index is the same
     // authority as `func_index` (every append pairs with a name-index
@@ -2227,11 +2197,11 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // pack's `max(Dp, Dp)` must not swallow `kotlin.math.max(Int,
             // Int)` just because the intrinsic carries no rankable body.
             // Extensions stay: receiver narrowing is their discriminator.
-            if (scope_pkg.len != 0 and
+            if (caller_pkg.len != 0 and
                 !(cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")))
             {
                 const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
-                if (eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile) == ir.Module.other_package_tier) continue;
+                if (eff.scopeTier(cf.fqn, cf.package, name, caller_pkg, cfile) == ir.Module.other_package_tier) continue;
             }
         }
         const pts = positionalPoints(self, eff, cand, shapes, scope);
