@@ -820,12 +820,31 @@ fn sweepClosuresThunk(epoch: usize) void {
     }
 }
 
+/// Singleton identity for a closure id: non-zero and stable per (module, body
+/// function) when the closure captures nothing (a Kotlin non-capturing-lambda
+/// singleton), 0 otherwise. `Value.structuralEq` compares two closures by this
+/// identity so two evaluations of the same non-capturing literal — which klio
+/// materialises as distinct closure ids — compare equal as they do in Kotlin.
+fn closureSingletonThunk(id: u64) u64 {
+    const sc = active_closures orelse return 0;
+    const info = sc.get(id) orelse return 0;
+    // A reclaimed slot's metadata is gone; a captured closure keeps per-instance
+    // identity (Kotlin makes only non-capturing lambdas singletons).
+    if (info.reclaimed or info.capture_names.len != 0) return 0;
+    const mod_bits: u64 = if (info.module) |m| @intFromPtr(m) else 0;
+    var h: u64 = 1469598103934665603;
+    h = (h ^ mod_bits) *% 1099511628211;
+    h = (h ^ info.body_func.int()) *% 1099511628211;
+    return h | 1;
+}
+
 /// Install the closure-liveness hook with this program's shared side-table.
 /// Idempotent across Vms (they share the spine).
 pub fn gcInstallClosureHook(closures: SharedClosures) void {
     active_closures = closures;
     runtime.gc.markClosureHook = markClosureThunk;
     runtime.gc.sweepClosureHook = sweepClosuresThunk;
+    runtime.gc.closureSingletonHook = closureSingletonThunk;
     // The lazy-`sequence{}` builder holds its parked continuation as an opaque
     // `*ir.eval.SuspendState` in a `Sequence`'s `Builder` source; wire the
     // mark/free hooks so the GC roots and reclaims those frames.

@@ -2357,7 +2357,19 @@ pub const Value = union(enum) {
                 structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
-            .IrClosure => |x| b.* == .IrClosure and x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures),
+            .IrClosure => |x| b.* == .IrClosure and blk: {
+                // The same materialised closure object.
+                if (x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures)) break :blk true;
+                // A non-capturing lambda literal is a singleton in Kotlin: two
+                // evaluations of the same literal (which klio gives distinct
+                // closure ids) are the same value. Compare by the literal's
+                // (module, body-function) identity when neither captures.
+                if (objcell.gc.closureSingletonHook) |h| {
+                    const sa = h(x.id);
+                    if (sa != 0 and sa == h(b.IrClosure.id)) break :blk true;
+                }
+                break :blk false;
+            },
             .Comparator => |x| b.* == .Comparator and
                 ObjRef([]ComparatorStep).ptrEq(x.steps, b.Comparator.steps) and
                 x.descending == b.Comparator.descending,
