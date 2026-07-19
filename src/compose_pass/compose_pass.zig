@@ -2131,12 +2131,28 @@ const Walker = struct {
     /// into the first omitted param. Named, the binder slots the pair exactly
     /// and the omitted params take their defaults.
     fn threadCall(w: *Walker, c: anytype, positional: bool) std.mem.Allocator.Error!void {
+        const had_trailing = c.has_trailing_lambda;
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
         new_args[c.args.len] = w.composerRef();
         new_args[c.args.len + 1] = w.b.intLit(0);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
+        // A trailing lambda bound the callee's last function-typed parameter,
+        // even across a defaulted middle parameter (`ExplicitStartReplaceGroup(
+        // key, insertGroup = true) { content }` binds the lambda to `content`,
+        // not `insertGroup`). Clearing `has_trailing_lambda` below and appending
+        // the composer pair strips that signal: the now-plain positional lambda
+        // would slide into the first open slot (`insertGroup`) and its `if
+        // (insertGroup)` sees a closure. Re-emit it by the callee's last
+        // parameter name so the binder rejoins it to `content` across the gap.
+        if (had_trailing and c.args.len != 0 and new_names[c.args.len - 1] == null) {
+            if (calleeSimpleName(c.callee)) |nm| {
+                if (active_sink_last_param) |lp| {
+                    if (lp.get(nm)) |pname| new_names[c.args.len - 1] = pname;
+                }
+            }
+        }
         if (!positional) {
             new_names[c.args.len] = composer_param;
             new_names[c.args.len + 1] = changed_param;
@@ -2885,6 +2901,58 @@ test "threadCall appends the composer pair as named args" {
     try testing.expectEqual(@as(usize, 2), c.args.len);
     try testing.expectEqualStrings(composer_param, c.arg_names[0].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[1].?);
+}
+
+test "threadCall re-names a trailing lambda across a defaulted gap" {
+    // `ExplicitStartReplaceGroup(key) { content }` — one positional arg then a
+    // trailing lambda binding the last param `content`, with a defaulted
+    // `insertGroup` in between. Threading appends the composer pair and clears
+    // `has_trailing_lambda`; the lambda must be re-emitted by name so it rejoins
+    // `content` rather than sliding into `insertGroup`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    var last_param = std.StringHashMap([]const u8).init(a);
+    try last_param.put("ExplicitStartReplaceGroup", "content");
+    active_sink_last_param = &last_param;
+    defer active_sink_last_param = null;
+
+    var callee_segs = [_]Ident{dummyIdent("ExplicitStartReplaceGroup")};
+    var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var args = [_]Expr{
+        .{ .IntLit = .{ .value = 42, .kind = .Int, .span = gsp } },
+        .{ .Lambda = .{
+            .params = &lam_params,
+            .param_tys = &lam_ptys,
+            .body = .{ .stmts = &.{}, .span = gsp },
+            .implicit_it = false,
+            .span = gsp,
+        } },
+    };
+    var arg_names = [_]?[]const u8{ null, null };
+    var call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } };
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx };
+    try w.threadCall(&call.Call, false);
+    const c = call.Call;
+    try testing.expectEqual(@as(usize, 4), c.args.len);
+    try testing.expect(c.arg_names[0] == null); // key stays positional
+    try testing.expectEqualStrings("content", c.arg_names[1].?); // lambda re-named
+    try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
+    try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
+    try testing.expect(!c.has_trailing_lambda);
 }
 
 test "non-composable callees are not threaded" {
