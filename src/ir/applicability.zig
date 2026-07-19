@@ -315,6 +315,25 @@ pub fn simpleName(name: []const u8) []const u8 {
     return name;
 }
 
+/// Synthetic suffix the `@Composable` lowering plugin appends to a defaulted
+/// parameter it moves into the body prologue (`p: T = D` becomes `p$arg: T =
+/// marker()`). A source-level named argument still names the ORIGINAL `p`, so
+/// binding a named call against the transformed signature must treat `p` and
+/// `p$arg` as the same parameter. `$` cannot begin a source identifier, so this
+/// never collides with a real parameter name.
+pub const composable_arg_suffix = "$arg";
+
+/// Whether a caller's named-argument label `arg_name` designates the parameter
+/// declared as `param_name` — the identity match, or the compose-plugin's
+/// defaulted-parameter rename (`param_name == arg_name ++ "$arg"`).
+pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
+    if (std.mem.eql(u8, param_name, arg_name)) return true;
+    return arg_name.len != 0 and
+        param_name.len == arg_name.len + composable_arg_suffix.len and
+        std.mem.startsWith(u8, param_name, arg_name) and
+        std.mem.endsWith(u8, param_name, composable_arg_suffix);
+}
+
 fn allAsciiUpper(s: []const u8) bool {
     for (s) |c| {
         if (!std.ascii.isUpper(c)) return false;
@@ -1138,7 +1157,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         const n = a.named orelse continue;
         var pos: ?usize = null;
         for (params, 0..) |p, pi| {
-            if (std.mem.eql(u8, p.name, n)) {
+            if (paramNameMatchesArg(p.name, n)) {
                 pos = pi;
                 break;
             }
@@ -1232,6 +1251,39 @@ fn oneParam(name: []const u8) [1]Param {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "paramNameMatchesArg: identity and the compose-default rename" {
+    // Identity.
+    try testing.expect(paramNameMatchesArg("onReuse", "onReuse"));
+    // The compose plugin renames a defaulted parameter `p` to `p$arg`; a
+    // source-level named argument still names the original `p`.
+    try testing.expect(paramNameMatchesArg("onReuse$arg", "onReuse"));
+    try testing.expect(paramNameMatchesArg("content$arg", "content"));
+    // No spurious matches: a different base, a bare suffix, or a caller name
+    // that already carries the suffix must not cross-bind.
+    try testing.expect(!paramNameMatchesArg("onReuse$arg", "onSet"));
+    try testing.expect(!paramNameMatchesArg("onReuse", "onReuse$arg"));
+    try testing.expect(!paramNameMatchesArg("$arg", ""));
+    try testing.expect(!paramNameMatchesArg("onReuse", "onSet"));
+    // The synthetic composer/changed named pair keeps its exact match (they
+    // are never defaulted, so no `$arg` form of them exists).
+    try testing.expect(paramNameMatchesArg("$composer", "$composer"));
+}
+
+test "applicableNamed: a named arg binds the compose-default-renamed parameter" {
+    // `f(onReuse = x, content = y)` against the transformed signature
+    // `f(onReuse$arg, content, ...)` must bind `onReuse` to `onReuse$arg`.
+    const params = [_]Param{
+        .{ .name = "onReuse$arg", .ty = tref("Function0"), .default = null },
+        .{ .name = "content", .ty = tref("Function0"), .default = null },
+    };
+    const sig = SigView{ .params = &params };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Function0", .is_lambda = true, .named = "onReuse" },
+        .{ .runtime_class = "Function0", .is_lambda = true, .named = "content" },
+    };
+    try testing.expect(applicable(&sig, &args, .{ .named = true }) != null);
 }
 
 test "applicable: exact head match scores 100" {

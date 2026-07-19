@@ -1731,7 +1731,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 if (i < arg_names.len) {
                     if (arg_names[i]) |arg_name| {
                         for (params, 0..) |p, pos| {
-                            if (std.mem.eql(u8, p.name, arg_name)) {
+                            if (applicability.paramNameMatchesArg(p.name, arg_name)) {
                                 slots[pos] = a;
                                 break;
                             }
