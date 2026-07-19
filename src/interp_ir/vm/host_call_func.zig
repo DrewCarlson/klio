@@ -1489,16 +1489,10 @@ fn composableEval(
     // `__compose_currentComposer` intrinsic (upstream's "implemented as an
     // intrinsic" contract), which reads this stack.
     if (composePluginEnabled()) {
-        if (f.params.len >= 2 and packed_args.items.len == f.params.len) {
-            const cpos = f.params.len - 2;
-            if (std.mem.eql(u8, f.params[cpos].name, "$composer") and
-                std.mem.eql(u8, f.params[cpos + 1].name, "$changed") and
-                packed_args.items[cpos] == .Instance)
-            {
-                compose.pushComposer(packed_args.items[cpos]);
-                defer compose.popComposer();
-                return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
-            }
+        if (compose.threadedComposerArg(f.params, packed_args.items)) |c| {
+            compose.pushComposer(c);
+            defer compose.popComposer();
+            return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
         }
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
     }

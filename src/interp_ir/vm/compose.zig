@@ -80,6 +80,28 @@ pub fn currentComposer() ?Value {
     return composer_stack.items[composer_stack.items.len - 1];
 }
 
+/// The threaded `$composer` argument to publish as the ambient composer for a
+/// pass-lowered `@Composable` call, or null when the call is not a threaded
+/// composable (so the caller pushes nothing).
+///
+/// The plugin ABI ends a composable's parameter list with the synthetic
+/// `$composer, $changed` pair. `args` are the call arguments right-aligned with
+/// `params`: for a free function or value call they map 1:1 (`args.len ==
+/// params.len`); for a member method `params` carries an extra leading `this`
+/// receiver param while `args` is receiver-excluded (`args.len == params.len -
+/// 1`). In both shapes the `$composer` value is the second-to-last argument. It
+/// must be an `Instance` (the real Composer) — a defaulted/absent composer is
+/// not a stack entry.
+pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value {
+    if (params.len < 2 or args.len < 2) return null;
+    if (args.len != params.len and args.len != params.len - 1) return null;
+    if (!std.mem.eql(u8, params[params.len - 2].name, "$composer")) return null;
+    if (!std.mem.eql(u8, params[params.len - 1].name, "$changed")) return null;
+    const composer = args[args.len - 2];
+    if (composer != .Instance) return null;
+    return composer;
+}
+
 /// Clear the composer stack at a run boundary (a leaked composer across runs is
 /// a bug, but the synchronous `Composition` always pops in a `finally`).
 pub fn resetAtRunBoundary() void {
@@ -209,6 +231,53 @@ test "hostBindings registers the composer-stack intrinsics" {
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_pushComposer") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_popComposer") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_currentComposer") != null);
+}
+
+test "threadedComposerArg finds the composer for free, value, and member call shapes" {
+    const composer = Value{ .Instance = undefined };
+    const dummy_ty = ir.TypeRef{ .name = "Any", .nullable = false, .args = &.{} };
+    const mk = struct {
+        fn p(name: []const u8, ty: ir.TypeRef) ir.Param {
+            return .{ .name = name, .ty = ty, .default = null };
+        }
+    }.p;
+    const p_this = mk("this", dummy_ty);
+    const p_composer = mk("$composer", dummy_ty);
+    const p_changed = mk("$changed", dummy_ty);
+    const p_x = mk("x", dummy_ty);
+
+    // Free/value call: args map 1:1 with params, composer is second-to-last.
+    {
+        const params = [_]ir.Param{ p_x, p_composer, p_changed };
+        const args = [_]Value{ Value.newInt(7), composer, Value.newInt(1) };
+        const got = threadedComposerArg(&params, &args);
+        try testing.expect(got != null and got.? == .Instance);
+    }
+    // Member call: params carry the leading `this`, args are receiver-excluded.
+    {
+        const params = [_]ir.Param{ p_this, p_composer, p_changed };
+        const args = [_]Value{ composer, Value.newInt(1) };
+        const got = threadedComposerArg(&params, &args);
+        try testing.expect(got != null and got.? == .Instance);
+    }
+    // Not a threaded composable: no synthetic tail.
+    {
+        const params = [_]ir.Param{ p_x, p_x };
+        const args = [_]Value{ Value.newInt(1), Value.newInt(2) };
+        try testing.expect(threadedComposerArg(&params, &args) == null);
+    }
+    // A non-Instance composer arg (defaulted/absent) is not pushed.
+    {
+        const params = [_]ir.Param{ p_composer, p_changed };
+        const args = [_]Value{ .{ .Null = {} }, Value.newInt(1) };
+        try testing.expect(threadedComposerArg(&params, &args) == null);
+    }
+    // Wrong arity (neither 1:1 nor receiver-excluded) is rejected.
+    {
+        const params = [_]ir.Param{ p_this, p_x, p_composer, p_changed };
+        const args = [_]Value{ composer, Value.newInt(1) };
+        try testing.expect(threadedComposerArg(&params, &args) == null);
+    }
 }
 
 test "argsHash is stable, order-sensitive, and value-sensitive" {

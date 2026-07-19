@@ -23,6 +23,7 @@ const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
 const host_fields = @import("host_fields.zig");
+const compose = @import("compose.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -8309,6 +8310,24 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+
+    // A pass-threaded `@Composable` member method re-invoked during recompose
+    // (`this.Child($composer, $changed)`) must publish its threaded composer as
+    // the ambient composer for the call, exactly like the free-function
+    // (`composableEval`) and value-call paths: a `@Composable` property getter
+    // reached from the body (e.g. `currentRecomposeScope`) reads it through the
+    // `__compose_currentComposer` intrinsic. Initial composition masks the miss
+    // because the enclosing composable's composer is still on the stack; a
+    // restart re-invocation runs the invalidated scope directly with an empty
+    // stack. A member `f.params` carries the receiver as an explicit leading
+    // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
+    // handles that alignment.
+    const threaded_composer: ?Value = if (host_call_func.composePluginEnabled())
+        compose.threadedComposerArg(f.params, args)
+    else
+        null;
+    if (threaded_composer) |c| compose.pushComposer(c);
+    defer if (threaded_composer != null) compose.popComposer();
 
     // Non-final vararg (a vararg before trailing defaulted / named-only params):
     // the prepend + trailing-collapse path cannot bind it — the vararg must

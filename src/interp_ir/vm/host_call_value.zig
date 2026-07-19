@@ -724,15 +724,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // `$composer` argument as the ambient composer, exactly like the
         // named-call path: a `@Composable` property getter reached from the
         // body reads it via `__compose_currentComposer`.
-        if (host_call_func.composePluginEnabled() and
-            func.params.len >= 2 and call_args.items.len == func.params.len)
-        {
-            const cpos = func.params.len - 2;
-            if (std.mem.eql(u8, func.params[cpos].name, "$composer") and
-                std.mem.eql(u8, func.params[cpos + 1].name, "$changed") and
-                call_args.items[cpos] == .Instance)
-            {
-                compose.pushComposer(call_args.items[cpos]);
+        if (host_call_func.composePluginEnabled()) {
+            if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+                compose.pushComposer(c);
                 defer compose.popComposer();
                 return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
             }
