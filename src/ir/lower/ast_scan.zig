@@ -168,6 +168,11 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
             .Decl => |d| switch (d) {
                 .Property => |p| {
                     if (p.init) |*e| try scanLambdaRefsExpr(e, out);
+                    // A `by`-delegate expression (`val x by derivedStateOf { v++ }`)
+                    // holds the lambda that captures — and may mutate — an outer
+                    // `var`; without scanning it the var is never boxed and the
+                    // write lands on a transient capture copy.
+                    if (p.delegate) |e| try scanLambdaRefsExpr(e, out);
                 },
                 .Function => |f| {
                     if (f.body) |fb| switch (fb) {
@@ -386,6 +391,8 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
         .Decl => |d| switch (d) {
             .Property => |p| {
                 if (p.init) |*e| try assignedInLambdasExpr(e, out);
+                // A `by`-delegate lambda can mutate a captured outer name too.
+                if (p.delegate) |e| try assignedInLambdasExpr(e, out);
             },
             .Function => |f| {
                 if (f.body) |fb| switch (fb) {
@@ -760,6 +767,91 @@ test "compute boxed vars keeps only captured var decls" {
     defer boxed.deinit();
     try testing.expect(boxed.contains("captured"));
     try testing.expect(!boxed.contains("untouched"));
+}
+
+test "compute boxed vars boxes a var captured in a by-delegate lambda" {
+    // var captured = 0
+    // val answer by delegateFn { captured }   // lambda lives in the delegate
+    const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var prop_captured = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "captured", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = lit0,
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+
+    // Delegate: `delegateFn { captured }` — a Call whose trailing lambda
+    // references the outer `captured` var.
+    var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
+    var refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
+    var lambda_stmts = [_]Stmt{.{ .Expr = refexpr }};
+    var lambda = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var calleeseg = [_]ast.Ident{.{ .name = "delegateFn", .span = dummySpan() }};
+    var callee = Expr{ .Path = .{ .segments = &calleeseg, .span = dummySpan() } };
+    var call_args = [_]Expr{lambda};
+    var call_arg_names = [_]?[]const u8{null};
+    var delegate = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &call_args,
+        .arg_names = &call_arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = dummySpan(),
+    } };
+
+    var prop_answer = ast.Property{
+        .mutable = false,
+        .name = .{ .name = "answer", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = null,
+        .delegate = &delegate,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+
+    var stmts = [_]Stmt{
+        .{ .Decl = .{ .Property = &prop_captured } },
+        .{ .Decl = .{ .Property = &prop_answer } },
+    };
+    _ = &refexpr;
+    _ = &lambda;
+    var boxed = try computeBoxedVars(testing.allocator, &stmts);
+    defer boxed.deinit();
+    try testing.expect(boxed.contains("captured"));
 }
 
 test "names assigned in lambdas reports writes but not bare reads" {

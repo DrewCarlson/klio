@@ -304,4 +304,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `local_fn_self_reference_shadow.kt` | A self-re-invoking lambda inside the first of two same-named local functions binds the enclosing function, not the later sibling that rebinds the plain name. |
 | `captured_var_shadows_fn_call.kt` | A captured non-callable `var` does not shadow a same-named function for a call made inside a nested lambda. |
 | `captured_counter_via_factory_lambda.kt` | A `var` referenced only inside an anonymous object built by a factory lambda still boxes; the object-method write reaches the enclosing scope. |
+| `captured_var_in_by_delegate_lambda.kt` | A `var` captured and mutated only inside the lambda of a `by`-delegate expression still boxes; the write lands back on the enclosing `var` instead of a transient copy. |
 | `map_subclass_value_get_dispatch.kt` | A `Map` subclass that adds its own value-returning `operator get` still compares structurally: `AbstractMap.equals` -> `containsEntry`'s bare `get(key)` binds `Map.get(K): V?` (the declaring class's static scope), never the subtype's `get(Key<T>): T`. |
