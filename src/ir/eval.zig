@@ -5014,7 +5014,19 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // before falling back to the single global value baked in at
         // lower time.
         const cno_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file)) {
+        // A synthesized lambda/closure frame carries no declared package, so
+        // the overload re-pick runs with an empty caller scope and a same-name
+        // CROSS-PACKAGE twin can win a first-seen tie (the wrong same-signature
+        // `internal fun` binds). The lowering-resolved target (`cmg.func`)
+        // already settled scope; pass its package as a fallback anchor so the
+        // re-pick can exclude the out-of-scope twin. Only consulted when the
+        // frame package is empty, so the ordinary packaged-caller path is
+        // untouched.
+        const cno_anchor: []const u8 = if (frame.func.package.len == 0)
+            (if (cmg.func) |bf| (if (frame.module.funcById(bf)) |bfd| bfd.package else "") else "")
+        else
+            "";
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -6772,9 +6784,10 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId) Allocator.Error!MaybeValueResult {
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
         _ = caller_pkg;
         _ = caller_file;
+        _ = synth_anchor_pkg;
         _ = .{ self, allocator, module, name, args, arg_names, ctor_name };
         return .{ .ok = null };
     }

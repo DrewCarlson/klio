@@ -2130,12 +2130,22 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
     defer mg.deinit();
     const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
+    // The package the visibility filter scopes against. For an ordinary
+    // packaged caller this is `caller_pkg`, so the filter and the dispatch
+    // below behave exactly as before. Only when the caller frame is a
+    // synthesized closure with no package does the anchor (the
+    // lowering-resolved target's package, supplied by the evaluator) fill in —
+    // otherwise the empty scope leaves a same-name cross-package twin free to
+    // win the tie.
+    const scope_pkg: []const u8 = if (caller_pkg.len != 0) caller_pkg else synth_anchor_pkg;
+    const anchored = caller_pkg.len == 0 and synth_anchor_pkg.len != 0;
+    var excluded_xpkg = false;
     // Only intercept genuine overload sets: a single top-level function
     // keeps the plain global-value path. The name index is the same
     // authority as `func_index` (every append pairs with a name-index
@@ -2197,11 +2207,14 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // pack's `max(Dp, Dp)` must not swallow `kotlin.math.max(Int,
             // Int)` just because the intrinsic carries no rankable body.
             // Extensions stay: receiver narrowing is their discriminator.
-            if (caller_pkg.len != 0 and
+            if (scope_pkg.len != 0 and
                 !(cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")))
             {
                 const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
-                if (eff.scopeTier(cf.fqn, cf.package, name, caller_pkg, cfile) == ir.Module.other_package_tier) continue;
+                if (eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile) == ir.Module.other_package_tier) {
+                    excluded_xpkg = true;
+                    continue;
+                }
             }
         }
         const pts = positionalPoints(self, eff, cand, shapes, scope);
@@ -2264,7 +2277,14 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         trace.emit("global-overload {s} -> fid={d} (of {d} candidates)", .{ name, func.int(), candidates.len });
     }
 
-    const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, false);
+    // `func` is the scope-correct pick this call already resolved by argument
+    // shapes. Normally `callFuncTyped` re-picks the overload again — harmless
+    // for a packaged caller. But when the anchor excluded a cross-package twin
+    // (a synthesized empty-package frame), that re-pick runs without scope and
+    // would re-cross to the twin; dispatch `func` exactly to hold the pick.
+    // The narrow condition keeps every ordinary call on the re-pick path.
+    const exact_dispatch = anchored and excluded_xpkg;
+    const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, exact_dispatch);
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = e },
