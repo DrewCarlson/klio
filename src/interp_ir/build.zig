@@ -468,6 +468,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer sink_arity.deinit();
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
+        var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
+        defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
         var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
@@ -478,6 +480,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseFactories(&factories, bsp);
             try composeBaseSinkArity(&sink_arity, bsp);
             try composeBaseComposableProps(&comp_props, bsp);
+            try composeBaseComposableGetterProps(&comp_getter_props, bsp);
             try composeBaseInlineFns(&inline_fns, bsp);
             try composeBaseSinkLastParam(&sink_last_param, bsp);
         }
@@ -491,6 +494,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
+        compose_pass.active_composable_getter_props = &comp_getter_props;
+        defer compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = &inline_fns;
         defer compose_pass.active_inline_fns = null;
         compose_pass.active_sink_last_param = &sink_last_param;
@@ -4116,6 +4121,12 @@ fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) 
 
 fn composeBaseComposableProps(props: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
     for (base.lifted_decls) |*d| try composeBaseComposablePropDecl(props, d);
+}
+
+fn composeBaseComposableGetterProps(props: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
+    for (base.lifted_decls) |*d| {
+        try compose_pass.collectComposableGetterPropsInto(props, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {

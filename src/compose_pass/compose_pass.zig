@@ -469,6 +469,45 @@ fn collectComposablePropsInto(set: *std.StringHashMap(void), decls: []const ast.
     };
 }
 
+/// Names of PROPERTIES whose read invokes a `@Composable` getter — the property
+/// carries `@Composable` on its declaration or on its `get()` accessor
+/// (`currentComposer`, `currentRecomposeScope`, `currentCompositeKeyHashCode`).
+/// Reading one composes: it participates in the composition and its containing
+/// lambda is composable content. Consulted by `branchHasComposable` so a content
+/// lambda that ONLY reads such a property (making no composable call) is still
+/// detected as composable and memoized into a stable `ComposableLambdaImpl`.
+pub var active_composable_getter_props: ?*const std.StringHashMap(void) = null;
+
+/// A property whose read invokes a `@Composable` getter: the `@Composable`
+/// annotation sits on the property declaration or on its `get()` accessor.
+fn isComposableGetterProp(p: *const ast.Property) bool {
+    if (isComposable(p.annotations)) return true;
+    if (p.getter) |g| return isComposable(g.annotations);
+    return false;
+}
+
+/// Collect the names of `@Composable`-getter properties (top level + members)
+/// across the decls. Caller owns the map.
+pub fn collectComposableGetterProps(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectComposableGetterPropsInto(&set, decls);
+    return set;
+}
+
+pub fn collectComposableGetterPropsInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Property => |p| {
+            if (isComposableGetterProp(p)) try set.put(p.name.name, {});
+        },
+        .Class => |*c| try collectComposableGetterPropsInto(set, c.members),
+        .Object => |*o| try collectComposableGetterPropsInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Collect `sink name -> composable-lambda param count` for sinks whose
 /// composable parameter declares at least one value parameter. Caller owns.
 pub fn collectComposableSinkArity(
@@ -1617,6 +1656,23 @@ const Walker = struct {
                 };
                 return false;
             },
+            .Path => |p| {
+                // A bare read of a `@Composable`-getter property
+                // (`currentRecomposeScope`, `currentCompositeKeyHashCode`)
+                // composes: the containing lambda is composable content even
+                // when it makes no composable CALL.
+                if (p.segments.len >= 1 and active_composable_getter_props != null and
+                    active_composable_getter_props.?.contains(p.segments[p.segments.len - 1].name))
+                    return true;
+                return false;
+            },
+            .Member => |m| {
+                // `receiver.currentCompositeKeyHashCode` — a composable-getter
+                // read through an explicit receiver.
+                if (active_composable_getter_props != null and
+                    active_composable_getter_props.?.contains(m.name.name)) return true;
+                return w.branchHasComposable(m.receiver);
+            },
             else => return false,
         }
     }
@@ -2760,6 +2816,106 @@ test "isComposable detects the annotation" {
     const pf = emptyFn("plain", &noargs, null, false);
     try testing.expect(isComposable(cf.annotations));
     try testing.expect(!isComposable(pf.annotations));
+}
+
+fn noComposable(_: *anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn getterProp(name: []const u8, getter: ?*ast.Accessor, comp_on_decl: bool) ast.Property {
+    return .{
+        .mutable = false,
+        .name = dummyIdent(name),
+        .receiver_type = null,
+        .ty = null,
+        .init = null,
+        .delegate = null,
+        .getter = getter,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = if (comp_on_decl) &composableAnno else &.{},
+        .span = Span.init(span_mod.FileId.from(0), 0, 0),
+    };
+}
+
+test "a @Composable getter property is collected and detected as composable content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    // `val currentRecomposeScope: … @Composable get() { … }`
+    var comp_getter = ast.Accessor{
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Block = .{ .stmts = &.{}, .span = gsp } },
+        .visibility = null,
+        .is_inline = false,
+        .annotations = &composableAnno,
+        .span = gsp,
+    };
+    var plain_getter = ast.Accessor{
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Block = .{ .stmts = &.{}, .span = gsp } },
+        .visibility = null,
+        .is_inline = false,
+        .annotations = &.{},
+        .span = gsp,
+    };
+    var crs = getterProp("currentRecomposeScope", &comp_getter, false);
+    var plain = getterProp("ordinaryProp", &plain_getter, false);
+    var decls = [_]ast.Decl{ .{ .Property = &crs }, .{ .Property = &plain } };
+
+    var set = try collectComposableGetterProps(a, &decls);
+    defer set.deinit();
+    try testing.expect(set.contains("currentRecomposeScope"));
+    try testing.expect(!set.contains("ordinaryProp"));
+
+    // A content lambda that ONLY reads such a property (no composable call) is
+    // detected as composable content once the getter-prop set is installed.
+    active_composable_getter_props = &set;
+    defer active_composable_getter_props = null;
+
+    // { record(currentRecomposeScope) } — `record` is not composable, so the
+    // only signal is the getter-property argument read.
+    var crs_ref = [_]Ident{dummyIdent("currentRecomposeScope")};
+    var rec_callee_segs = [_]Ident{dummyIdent("record")};
+    var rec_callee = Expr{ .Path = .{ .segments = &rec_callee_segs, .span = gsp } };
+    var rec_args = [_]Expr{.{ .Path = .{ .segments = &crs_ref, .span = gsp } }};
+    var rec_names = [_]?[]const u8{null};
+    var lam_stmts = [_]Stmt{.{ .Expr = .{ .Call = .{
+        .callee = &rec_callee,
+        .args = &rec_args,
+        .arg_names = &rec_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } } }};
+    const lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &lam_stmts, .span = gsp },
+        .implicit_it = false,
+        .span = gsp,
+    } };
+
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = noComposable, .oracle_ctx = &ctx };
+    try testing.expect(w.branchHasComposable(&lam));
+
+    // With the set cleared, the same lambda reads as non-composable.
+    active_composable_getter_props = null;
+    try testing.expect(!w.branchHasComposable(&lam));
 }
 
 test "walker replaces currentComposer with the threaded composer inside a nested call" {
