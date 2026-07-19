@@ -668,3 +668,84 @@ test "an unimplemented expect reports itself, not a same-named function elsewher
         "`p1.render` is an `expect` with no `actual`",
     );
 }
+
+// Two classes sharing a simple name in different packages, each a subtype of a
+// common supertype and each carrying its OWN same-named top-level extension
+// that reads a package-private field. klio stores an extension's receiver as
+// its simple name, so both `Slot.mark` extensions read as receiver `Slot` and
+// either looks applicable to a `Slot` receiver — the sibling twin then runs
+// against a field it lacks. The runtime receiver's actual class FQN decides:
+// a `left.Slot` object binds `left`'s extension, never `right`'s.
+test "a runtime receiver picks its own package's same-name extension twin" {
+    try expectFilesOutput(
+        "ext_twin_runtime_class",
+        &.{
+            \\package base
+            \\interface Slotted
+            ,
+            \\package left
+            \\import base.Slotted
+            \\class Slot : Slotted { val leftMark: String = "left-mark" }
+            ,
+            \\package right
+            \\import base.Slotted
+            \\class Slot : Slotted { val rightMark: String = "right-mark" }
+            ,
+            \\package leftext
+            \\import left.Slot
+            \\fun Slot.mark(): String = leftMark
+            ,
+            \\package rightext
+            \\import right.Slot
+            \\fun Slot.mark(): String = rightMark
+            ,
+            \\import left.Slot
+            \\import leftext.mark
+            \\fun main() {
+            \\    val s: Slot = Slot()
+            \\    println(s.mark())
+            \\}
+        },
+        "left-mark\n",
+    );
+}
+
+// The same twin conflict reached through an ERASED static receiver: the
+// receiver comes from an expression-body factory whose inferred return type is
+// not tracked to the call site (the shape the compose engine hits, where
+// `SlotStorage.asGapBufferSlotTable()` yields an untyped receiver). Neither
+// twin is refuted statically, so both survive to the runtime pick; the actual
+// class `right.Slot` must still bind `right`'s extension, not `left.Slot.mark`.
+test "an erased-type receiver still binds its runtime class's extension twin" {
+    try expectFilesOutput(
+        "ext_twin_erased_static",
+        &.{
+            \\package base
+            \\interface Slotted
+            ,
+            \\package left
+            \\import base.Slotted
+            \\class Slot : Slotted { val leftMark: String = "left-mark" }
+            ,
+            \\package right
+            \\import base.Slotted
+            \\class Slot : Slotted { val rightMark: String = "right-mark" }
+            \\fun makeSlot() = Slot()
+            ,
+            \\package leftext
+            \\import left.Slot
+            \\fun Slot.mark(): String = leftMark
+            ,
+            \\package rightext
+            \\import right.Slot
+            \\fun Slot.mark(): String = rightMark
+            ,
+            \\import right.makeSlot
+            \\import rightext.mark
+            \\fun main() {
+            \\    println(makeSlot().mark())
+            \\}
+        },
+        "right-mark\n",
+    );
+}

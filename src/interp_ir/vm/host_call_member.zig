@@ -23,6 +23,7 @@ const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
 const host_fields = @import("host_fields.zig");
+const compose = @import("compose.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -8310,6 +8311,24 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
 
+    // A pass-threaded `@Composable` member method re-invoked during recompose
+    // (`this.Child($composer, $changed)`) must publish its threaded composer as
+    // the ambient composer for the call, exactly like the free-function
+    // (`composableEval`) and value-call paths: a `@Composable` property getter
+    // reached from the body (e.g. `currentRecomposeScope`) reads it through the
+    // `__compose_currentComposer` intrinsic. Initial composition masks the miss
+    // because the enclosing composable's composer is still on the stack; a
+    // restart re-invocation runs the invalidated scope directly with an empty
+    // stack. A member `f.params` carries the receiver as an explicit leading
+    // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
+    // handles that alignment.
+    const threaded_composer: ?Value = if (host_call_func.composePluginEnabled())
+        compose.threadedComposerArg(f.params, args)
+    else
+        null;
+    if (threaded_composer) |c| compose.pushComposer(c);
+    defer if (threaded_composer != null) compose.popComposer();
+
     // Non-final vararg (a vararg before trailing defaulted / named-only params):
     // the prepend + trailing-collapse path cannot bind it — the vararg must
     // consume the mid-list positional args at its own position while the
@@ -9606,6 +9625,111 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
     }
 }
 
+/// Resolve an extension candidate's declared receiver-type simple name to a
+/// fully-qualified class, in the candidate's OWN declaration-file scope: its
+/// non-wildcard imports first, then its declaring package, then its wildcard
+/// imports. Returns the canonical FQN of the resolved class, or null when the
+/// name resolves to no known class (a generic / `Any` / builtin receiver, or
+/// a name klio cannot place). Two same-simple-name receivers declared against
+/// classes in different packages resolve to DISTINCT FQNs here — the key to
+/// telling cross-package extension twins apart from the runtime receiver.
+fn resolveExtReceiverFqn(allocator: Allocator, mod: *const Module, c: *const Candidate) ?[]const u8 {
+    if (c.func.params.len == 0) return null;
+    const nm = std.mem.trimEnd(u8, c.func.params[0].ty.name, "?");
+    // An already-qualified receiver reference resolves directly.
+    if (std.mem.indexOfScalar(u8, nm, '.') != null) {
+        if (mod.classIdByFqn(nm)) |cid| return mod.classFqnById(cid);
+    }
+    const simple = simpleName(nm);
+    const ds = mod.decl_span.get(c.fid.int()) orelse return null;
+    const file = ds.file;
+    // Named imports of this leaf (file-scoped) take precedence.
+    for (mod.importAliasPathsIn(file, simple)) |p| {
+        if (mod.classIdByFqn(p.fqn)) |cid| return mod.classFqnById(cid);
+    }
+    // The candidate's own package.
+    if (c.func.package.len != 0) {
+        const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ c.func.package, simple }) catch return null;
+        defer if (runtime.freeScratch()) allocator.free(cand);
+        if (mod.classIdByFqn(cand)) |cid| return mod.classFqnById(cid);
+    }
+    // Wildcard imports of the file.
+    if (mod.registry.import_wildcards.get(file)) |list| {
+        for (list.items) |pkg| {
+            const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, simple }) catch return null;
+            defer if (runtime.freeScratch()) allocator.free(cand);
+            if (mod.classIdByFqn(cand)) |cid| return mod.classFqnById(cid);
+        }
+    }
+    return null;
+}
+
+/// When the surviving extension candidates include cross-package twins whose
+/// declared receiver types share a simple name but resolve to different
+/// classes, the RUNTIME receiver's actual class decides which twin Kotlin
+/// binds. klio stores the receiver type as its simple name, so a
+/// `gapbuffer.SlotTable` receiver and a `linkbuffer.SlotTable` receiver both
+/// read as `SlotTable` and either same-named extension looks applicable — the
+/// wrong twin then runs against fields it lacks (`unresolved global root`).
+/// When the runtime object's class FQN exactly equals one twin's resolved
+/// receiver FQN, every OTHER same-simple-name candidate resolving to a
+/// different concrete class is inapplicable: drop it. A no-op unless a genuine
+/// same-name twin conflict exists AND the runtime class picks a winner, so an
+/// ordinary single-receiver-type overload set (every candidate resolving to
+/// the same FQN, or to none) is left untouched.
+fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: *std.ArrayList(Candidate)) void {
+    if (receiver.* != .Instance) return;
+    if (candidates.items.len < 2) return;
+    const recv_fqn: []const u8 = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const n = candidates.items.len;
+    const fqns = allocator.alloc(?[]const u8, n) catch return;
+    defer allocator.free(fqns);
+    for (candidates.items, 0..) |*c, i| fqns[i] = resolveExtReceiverFqn(allocator, mod, c);
+    const remove = allocator.alloc(bool, n) catch return;
+    defer allocator.free(remove);
+    for (remove) |*r| r.* = false;
+    var any_removed = false;
+    for (candidates.items, 0..) |*c, i| {
+        if (c.func.params.len == 0) continue;
+        const simple_i = simpleName(std.mem.trimEnd(u8, c.func.params[0].ty.name, "?"));
+        // Does candidate i's same-simple-name group contain a sibling whose
+        // resolved receiver FQN is EXACTLY the runtime class?
+        var exact_present = false;
+        for (candidates.items, 0..) |*o, j| {
+            if (o.func.params.len == 0) continue;
+            const simple_j = simpleName(std.mem.trimEnd(u8, o.func.params[0].ty.name, "?"));
+            if (!std.mem.eql(u8, simple_i, simple_j)) continue;
+            const fj = fqns[j] orelse continue;
+            if (std.mem.eql(u8, fj, recv_fqn)) {
+                exact_present = true;
+                break;
+            }
+        }
+        if (!exact_present) continue;
+        const fi = fqns[i] orelse continue; // unresolvable → undecidable, keep
+        if (!std.mem.eql(u8, fi, recv_fqn)) {
+            remove[i] = true;
+            any_removed = true;
+        }
+    }
+    if (!any_removed) return;
+    var filtered: std.ArrayList(Candidate) = .empty;
+    for (candidates.items, 0..) |cc, i| {
+        if (!remove[i]) filtered.append(allocator, cc) catch {};
+    }
+    candidates.deinit(allocator);
+    candidates.* = filtered;
+}
+
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     if (missTraceWant(name)) {
@@ -9977,6 +10101,15 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                 candidates = filtered;
             }
         }
+    }
+
+    // Cross-package same-simple-name extension twins: the runtime receiver's
+    // actual class FQN, not the shared receiver simple name, decides which
+    // twin binds. Runs after the scope tiers so it only adjudicates a residual
+    // genuine twin conflict.
+    if (candidates.items.len > 1) {
+        narrowSameNameExtensionTwins(self, allocator, receiver, &candidates);
+        if (candidates.items.len == 0) return null;
     }
 
     // Unique-exact-arity pick — only when every supplied argument can
