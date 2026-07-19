@@ -861,3 +861,28 @@ test "unit_valued_member_read_is_a_hit" {
     ;
     try assertKlio("unit_member_read", src, "kotlin.Unit\n");
 }
+
+test "local_fn_self_callable_ref_recurses" {
+    // `::visit` inside `visit`'s own body denotes the local fn itself: the
+    // reference loads its closure through the mangled self-cell (a bare
+    // self-call's binding), not a property of the forEach element. Without
+    // this the reference lowered to an unbound property ref and the runtime
+    // read `.visit` on each element.
+    const src =
+        \\class Node(val id: Int, val kids: List<Node>)
+        \\fun preorder(root: Node): List<Int> {
+        \\    val out = mutableListOf<Int>()
+        \\    fun visit(n: Node) {
+        \\        out.add(n.id)
+        \\        n.kids.forEach(::visit)
+        \\    }
+        \\    visit(root)
+        \\    return out
+        \\}
+        \\fun main() {
+        \\    println(preorder(Node(1, listOf(Node(2, emptyList()), Node(3, emptyList())))))
+        \\}
+        \\
+    ;
+    try assertKlio("local_fn_self_callable_ref", src, "[1, 2, 3]\n");
+}

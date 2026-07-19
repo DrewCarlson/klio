@@ -577,6 +577,12 @@ const PairFuncEntry = struct { a: []const u8, b: []const u8, func: FuncId };
 const PairStrEntry = struct { a: []const u8, b: []const u8, v: []const u8 };
 const NameFuncs = struct { name: []const u8, funcs: []const FuncId };
 const NameOptFuncs = struct { name: []const u8, slots: []const ?FuncId };
+/// A class name paired with the argument labels of its super-constructor call
+/// (`: Base(objects = 2)` -> `[ "objects" ]`, positional args -> `null`). Kept
+/// parallel to `parent_ctor_args` so an image-loaded class binds a named
+/// super-constructor argument to the matching base parameter instead of
+/// positionally (which would drop it onto an earlier defaulted parameter).
+const NameArgNames = struct { name: []const u8, arg_names: []const ?[]const u8 };
 
 const FileEntry = struct { path: []const u8, source: []const u8 };
 
@@ -763,6 +769,7 @@ const BuiltImage = struct {
     instance_prop_setters: []PairFuncEntry,
     instance_prop_private: []PairFuncEntry = &.{},
     parent_ctor_args: []NameFuncs,
+    parent_ctor_arg_names: []NameArgNames = &.{},
     init_blocks: []NameFuncs,
     top_level_props: []build.NameFunc,
     extension_props: []PairFuncEntry,
@@ -1488,6 +1495,7 @@ fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator
     out.instance_prop_setters = try pairFuncToSlice(a, &b.instance_prop_setters);
     out.instance_prop_private = try pairFuncToSlice(a, &b.instance_prop_private);
     out.parent_ctor_args = try nameFuncsToSlice(a, &b.parent_ctor_args);
+    out.parent_ctor_arg_names = try nameArgNamesToSlice(a, &b.parent_ctor_arg_names);
     out.init_blocks = try nameFuncsToSlice(a, &b.init_blocks);
     out.top_level_props = b.top_level_props.items;
     out.extension_props = try pairFuncToSlice(a, &b.extension_props);
@@ -1603,6 +1611,16 @@ fn nameFuncsToSlice(a: Allocator, m: *const std.StringHashMap([]FuncId)) Allocat
     var i: usize = 0;
     while (it.next()) |entry| : (i += 1) {
         out[i] = .{ .name = entry.key_ptr.*, .funcs = entry.value_ptr.* };
+    }
+    return out;
+}
+
+fn nameArgNamesToSlice(a: Allocator, m: *const std.StringHashMap([]const ?[]const u8)) Allocator.Error![]NameArgNames {
+    var out = try a.alloc(NameArgNames, m.count());
+    var it = m.iterator();
+    var i: usize = 0;
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{ .name = entry.key_ptr.*, .arg_names = entry.value_ptr.* };
     }
     return out;
 }
@@ -2241,6 +2259,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     for (img.instance_prop_setters) |entry| try out.instance_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.instance_prop_private) |entry| try out.instance_prop_private.put(.{ .a = entry.a, .b = entry.b }, entry.func);
     for (img.parent_ctor_args) |entry| try out.parent_ctor_args.put(entry.name, @constCast(entry.funcs));
+    for (img.parent_ctor_arg_names) |entry| try out.parent_ctor_arg_names.put(entry.name, entry.arg_names);
     for (img.init_blocks) |entry| try out.init_blocks.put(entry.name, @constCast(entry.funcs));
     try out.top_level_props.appendSlice(a, img.top_level_props);
     for (img.extension_props) |entry| {

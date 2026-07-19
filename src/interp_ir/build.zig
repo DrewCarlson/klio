@@ -468,18 +468,27 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer sink_arity.deinit();
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
+        var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
+        defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
         var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
         defer sink_last_param.deinit();
+        var sink_content_reach = try compose_pass.collectComposableSinkContentReach(allocator, decls.items);
+        defer sink_content_reach.deinit();
         if (base) |bsp| {
-            try composeBaseNames(&names, bsp);
-            try composeBaseSinks(&sinks, bsp);
-            try composeBaseFactories(&factories, bsp);
-            try composeBaseSinkArity(&sink_arity, bsp);
-            try composeBaseComposableProps(&comp_props, bsp);
-            try composeBaseInlineFns(&inline_fns, bsp);
-            try composeBaseSinkLastParam(&sink_last_param, bsp);
+            // Decode once: an image-loaded base leaves `lifted_decls` empty, so
+            // every collector below must read the decoded section instead.
+            const base_decls = try composeBaseDecls(allocator, bsp);
+            try composeBaseNames(&names, base_decls);
+            try composeBaseSinks(&sinks, base_decls);
+            try composeBaseFactories(&factories, base_decls);
+            try composeBaseSinkArity(&sink_arity, base_decls);
+            try composeBaseComposableProps(&comp_props, base_decls);
+            try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
+            try composeBaseInlineFns(&inline_fns, base_decls);
+            try composeBaseSinkLastParam(&sink_last_param, base_decls);
+            try composeBaseSinkContentReach(&sink_content_reach, base_decls);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -491,10 +500,14 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
+        compose_pass.active_composable_getter_props = &comp_getter_props;
+        defer compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = &inline_fns;
         defer compose_pass.active_inline_fns = null;
         compose_pass.active_sink_last_param = &sink_last_param;
         defer compose_pass.active_sink_last_param = null;
+        compose_pass.active_sink_content_reach = &sink_content_reach;
+        defer compose_pass.active_sink_content_reach = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -1816,6 +1829,7 @@ fn buildModuleWithOverrides(
     {
         ir.lower.resetInlineMemberOwners();
         ir.lower.resetMemberPropAsts();
+        ir.lower.resetMemberExtPropRecv();
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
@@ -3377,7 +3391,17 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
 fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8) void {
     for (members) |*m| {
         switch (m.*) {
-            .Property => |p| ir.lower.registerMemberPropAst(a, owner, p),
+            .Property => |p| {
+                ir.lower.registerMemberPropAst(a, owner, p);
+                // A member-EXTENSION property (`private val Composition.parent`)
+                // is recorded under a dedicated key so a same-named plain member
+                // of the same class does not hide it: a read whose static
+                // receiver type matches the extension receiver resolves to the
+                // extension getter, not an accidental runtime stored field.
+                if (p.receiver_type) |rt| {
+                    ir.lower.registerMemberExtPropRecv(a, owner, p.name.name, rt.name.name);
+                }
+            },
             .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
             .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
             else => {},
@@ -4049,23 +4073,46 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
     // A non-inline base function never runs from its AST body (its lowered IR
     // does); strip those bodies so the baked image and the resident forest drop
     // the dead statement trees while keeping the metadata dispatch reads.
-    prune.stripDeadBodies(@constCast(base.lifted_decls));
+    prune.stripDeadBodies(@constCast(base.lifted_decls), composePluginEnabled());
 
     return base;
 }
 
 /// Whether the `@Composable` lowering plugin is enabled (KLIO_COMPOSE_PLUGIN).
-/// Any non-empty value other than "0" turns it on. Default off: the
-/// implicit-composer runtime hook stays the shipped path.
+/// Default on: the plugin is the shipped compose path. `KLIO_COMPOSE_PLUGIN=0`
+/// (or empty) turns it off.
 fn composePluginEnabled() bool {
-    const v = runtime.getenvSlice("KLIO_COMPOSE_PLUGIN") orelse return false;
+    const v = runtime.getenvSlice("KLIO_COMPOSE_PLUGIN") orelse return true;
     return v.len != 0 and !std.mem.eql(u8, v, "0");
 }
 
 /// Add the simple names of every `@Composable` function in the baked base
 /// (pack composables the user calls) to the plugin oracle set.
-fn composeBaseNames(names: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| try composeBaseNameDecl(names, d);
+/// The base's lifted decls for the compose-plugin collectors. A freshly-built
+/// base carries the full forest in `lifted_decls`; an image-loaded base leaves
+/// that empty (the forest decodes lazily per-decl) and holds the per-decl
+/// `lifted_decl_section`/`lifted_decl_offsets` instead. The plugin collectors
+/// below need the whole base surface, so decode every section decl here — an
+/// image-loaded base otherwise reports zero base composables/sinks, and a
+/// composable lambda passed to a base sink (`setContent { … }`, `key(…) { … }`)
+/// never gets `$composer` threaded (`startRestartGroup on Nothing`). Returns
+/// `base.lifted_decls` unchanged for a fresh base (no allocation).
+fn composeBaseDecls(allocator: Allocator, base: *const StdlibBase) Allocator.Error![]const Decl {
+    if (base.lifted_decls.len != 0) return base.lifted_decls;
+    if (base.lifted_decl_section.len == 0 or base.lifted_decl_offsets.len == 0) return &.{};
+    const out = try allocator.alloc(Decl, base.lifted_decl_offsets.len);
+    var n: usize = 0;
+    for (base.lifted_decl_offsets) |off| {
+        if (image.decodeLiftedDecl(allocator, base.lifted_decl_section, off)) |d| {
+            out[n] = d;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+fn composeBaseNames(names: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try composeBaseNameDecl(names, d);
 }
 
 fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
@@ -4079,32 +4126,44 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
 
 /// Add the names of baked-base functions with a `@Composable`-typed lambda
 /// parameter (composable-lambda sinks the user's composable calls pass into).
-fn composeBaseSinks(sinks: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| try composeBaseSinkDecl(sinks, d);
+fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try composeBaseSinkDecl(sinks, d);
 }
 
-fn composeBaseFactories(factories: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| try composeBaseFactoryDecl(factories, d);
+fn composeBaseFactories(factories: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try composeBaseFactoryDecl(factories, d);
 }
 
-fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| {
+fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| {
         try compose_pass.collectSinkLastParamInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
-fn composeBaseInlineFns(set: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| {
+fn composeBaseSinkContentReach(set: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| {
+        try compose_pass.collectSinkContentReachInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
+}
+
+fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| {
         try compose_pass.collectInlineFnNamesInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
-fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try composeBaseSinkArityDecl(arity, d);
 }
 
-fn composeBaseComposableProps(props: *std.StringHashMap(void), base: *const StdlibBase) Allocator.Error!void {
-    for (base.lifted_decls) |*d| try composeBaseComposablePropDecl(props, d);
+fn composeBaseComposableProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try composeBaseComposablePropDecl(props, d);
+}
+
+fn composeBaseComposableGetterProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| {
+        try compose_pass.collectComposableGetterPropsInto(props, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
@@ -4283,6 +4342,11 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
     try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
+    // Parallel to `parent_ctor_args`: without this a class inherited from the
+    // base loses its super-constructor argument labels, so a named super-ctor
+    // argument that skips an earlier defaulted parameter (`Operation(objects =
+    // 2)`) binds positionally onto the wrong parameter.
+    try copyStrMap([]const ?[]const u8, &out.parent_ctor_arg_names, &base.parent_ctor_arg_names);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
     try copyPairMap(&out.extension_props, &base.extension_props);

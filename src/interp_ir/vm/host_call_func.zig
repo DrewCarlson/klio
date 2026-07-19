@@ -1469,7 +1469,7 @@ pub fn composePluginEnabled() bool {
     const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
         v.len != 0 and !std.mem.eql(u8, v, "0")
     else
-        false;
+        true;
     g_compose_plugin = on;
     return on;
 }

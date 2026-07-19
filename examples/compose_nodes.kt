@@ -6,14 +6,19 @@
 //   - `key { }` reorders a node while its remembered state follows the key.
 
 import androidx.compose.runtime.AbstractApplier
-import androidx.compose.runtime.Applier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.ComposeNode
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.cancelAndJoin
 
 // A minimal node tree the applier renders into.
 class TestNode(val kind: String) {
@@ -106,50 +111,72 @@ fun printTree(root: TestNode, label: String) {
     print(sb.toString())
 }
 
+var frameTime = 0L
+
+/** Publish pending state writes and dispatch frames until the recomposer is
+ * idle, so a recomposition provoked by a write has completed on return. */
+suspend fun settle(recomposer: Recomposer, clock: BroadcastFrameClock) {
+    Snapshot.sendApplyNotifications()
+    while (recomposer.hasPendingWork) {
+        yield()
+        frameTime += 16_666_666L
+        clock.sendFrame(frameTime)
+        yield()
+    }
+}
+
 fun main() {
-    val root = TestNode("Root")
-    val applier = TestApplier(root)
-    val recomposer = Recomposer()
-    val composition = Composition(applier, recomposer)
+    val clock = BroadcastFrameClock()
+    runBlocking(clock) {
+        val recomposer = Recomposer(coroutineContext)
+        val runner = launch { recomposer.runRecomposeAndApplyChanges() }
+        yield()
 
-    val label = mutableStateOf("hello")
-    val showOptional = mutableStateOf(true)
-    val order = mutableStateOf(listOf("a", "b", "c"))
+        val root = TestNode("Root")
+        val applier = TestApplier(root)
+        val composition = Composition(applier, recomposer)
 
-    composition.setContent {
-        Box {
-            Text(label.value)
-            if (showOptional.value) Text("optional")
-            for (id in order.value) {
-                key(id) {
-                    val born = remember { births++ }
-                    Text(id + "#" + born)
+        val label = mutableStateOf("hello")
+        val showOptional = mutableStateOf(true)
+        val order = mutableStateOf(listOf("a", "b", "c"))
+
+        composition.setContent {
+            Box {
+                Text(label.value)
+                if (showOptional.value) Text("optional")
+                for (id in order.value) {
+                    key(id) {
+                        val born = remember { births++ }
+                        Text(id + "#" + born)
+                    }
                 }
             }
         }
+        printTree(root, "initial")
+
+        // 1. Property update in place: the label node's text changes, no new nodes.
+        label.value = "world"
+        settle(recomposer, clock)
+        printTree(root, "after label -> world")
+
+        // 2a. Conditional remove: the optional node drops out of the tree.
+        showOptional.value = false
+        settle(recomposer, clock)
+        printTree(root, "after hide optional")
+
+        // 2b. Conditional insert: it comes back (a fresh node).
+        showOptional.value = true
+        settle(recomposer, clock)
+        printTree(root, "after show optional")
+
+        // 3. Reorder via key{}: nodes move; remembered birth order follows the key.
+        order.value = listOf("c", "a", "b")
+        settle(recomposer, clock)
+        printTree(root, "after reorder c,a,b")
+
+        composition.dispose()
+        recomposer.close()
+        runner.cancelAndJoin()
+        println("disposed; root children = " + root.children.size)
     }
-    printTree(root, "initial")
-
-    // 1. Property update in place: the label node's text changes, no new nodes.
-    label.value = "world"
-    recomposer.recompose()
-    printTree(root, "after label -> world")
-
-    // 2a. Conditional remove: the optional node drops out of the tree.
-    showOptional.value = false
-    recomposer.recompose()
-    printTree(root, "after hide optional")
-
-    // 2b. Conditional insert: it comes back (a fresh node).
-    showOptional.value = true
-    recomposer.recompose()
-    printTree(root, "after show optional")
-
-    // 3. Reorder via key{}: nodes move; remembered birth order follows the key.
-    order.value = listOf("c", "a", "b")
-    recomposer.recompose()
-    printTree(root, "after reorder c,a,b")
-
-    composition.dispose()
-    println("disposed; root children = " + root.children.size)
 }

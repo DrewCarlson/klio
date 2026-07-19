@@ -34,24 +34,54 @@ const Expr = ast.Expr;
 /// lowered IR func, calls dispatch by `FuncId`, and only class members are read
 /// back through `MethodDef.decl`. Inline functions (spliced) and class members
 /// keep their full signatures.
-pub fn stripDeadBodies(decls: []Decl) void {
-    for (decls) |*d| pruneDecl(d, true);
+///
+/// `keep_composable_sigs` (set when the `@Composable` lowering plugin is
+/// enabled) preserves the signature — params + annotations + return type — of a
+/// top-level `@Composable` function, or one taking a `@Composable`-typed lambda
+/// parameter: the plugin's oracle reads those from the baked base's lifted
+/// decls to thread downstream calls (`CompositionLocalProvider`, `ComposeNode`,
+/// `movableContentOf`). Their bodies are still dropped; only the signature must
+/// survive.
+pub fn stripDeadBodies(decls: []Decl, keep_composable_sigs: bool) void {
+    for (decls) |*d| pruneDecl(d, true, keep_composable_sigs);
 }
 
-fn pruneDecl(d: *Decl, top_level: bool) void {
+fn pruneDecl(d: *Decl, top_level: bool, keep_composable_sigs: bool) void {
     switch (d.*) {
-        .Function => |*f| pruneFunction(f, top_level),
+        .Function => |*f| pruneFunction(f, top_level, keep_composable_sigs),
         .Class => |*c| {
-            for (c.members) |*m| pruneDecl(m, false);
+            for (c.members) |*m| pruneDecl(m, false, keep_composable_sigs);
         },
         .Object => |*o| {
-            for (o.members) |*m| pruneDecl(m, false);
+            for (o.members) |*m| pruneDecl(m, false, keep_composable_sigs);
         },
         .Property, .TypeAlias => {},
     }
 }
 
-fn pruneFunction(f: *Function, top_level: bool) void {
+/// An annotation path ending in `Composable` (bare or dotted). Mirrors
+/// `compose_pass.isComposable` without a module dependency.
+fn annotationsHaveComposable(annotations: []const ast.Annotation) bool {
+    for (annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "Composable")) return true;
+    }
+    return false;
+}
+
+/// The compose plugin's oracle needs this function's signature: it is
+/// `@Composable`, or it declares a `@Composable`-typed lambda parameter (a
+/// sink downstream composable calls pass into).
+fn composeOracleNeedsSig(f: *const Function) bool {
+    if (annotationsHaveComposable(f.annotations)) return true;
+    for (f.params) |p| {
+        if (p.ty.function != null and annotationsHaveComposable(p.ty.annotations)) return true;
+    }
+    return false;
+}
+
+fn pruneFunction(f: *Function, top_level: bool, keep_composable_sigs: bool) void {
+    const keep_sig = keep_composable_sigs and composeOracleNeedsSig(f);
     if (f.body) |*body| {
         // Keep inline bodies (spliced into user code at lower time) and any body
         // that materialises an anonymous object at runtime.
@@ -64,7 +94,9 @@ fn pruneFunction(f: *Function, top_level: bool) void {
         // Drop the statements; keep `body != null` so dispatch still treats the
         // method as concrete.
         f.body = .{ .Block = .{ .stmts = &.{}, .span = sp } };
-        if (top_level) {
+        // The compose oracle reads a composable's params + annotations from the
+        // baked base; keep the signature for those (body still dropped above).
+        if (top_level and !keep_sig) {
             f.receiver_type = null;
             f.type_params = &.{};
             f.where_bounds = &.{};
@@ -265,7 +297,7 @@ fn tIntStmt() Stmt {
 test "non-inline body is stripped, span preserved" {
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(42, 99) } }, false);
-    pruneFunction(&f, true);
+    pruneFunction(&f, true, false);
     // Body kept (concrete sentinel) but statements dropped.
     try testing.expect(f.body != null);
     try testing.expect(f.body.? == .Block);
@@ -278,7 +310,7 @@ test "non-inline body is stripped, span preserved" {
 
 test "expression body is stripped, its span preserved" {
     var f = tFn(.{ .Expr = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = tSpan(7, 13) } } }, false);
-    pruneFunction(&f, true);
+    pruneFunction(&f, true, false);
     try testing.expect(f.body.? == .Block);
     try testing.expectEqual(@as(usize, 0), f.body.?.Block.stmts.len);
     try testing.expectEqual(@as(u32, 7), f.body.?.Block.span.start);
@@ -288,7 +320,7 @@ test "expression body is stripped, its span preserved" {
 test "inline body is left intact" {
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, true);
-    pruneFunction(&f, true);
+    pruneFunction(&f, true, false);
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
 }
 
@@ -304,13 +336,49 @@ test "object-bearing body is left intact" {
     } };
     var stmts = [_]Stmt{.{ .Expr = obj }};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
-    pruneFunction(&f, true);
+    pruneFunction(&f, true, false);
     // Must keep the statements: the runtime materialises the object from them.
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
 }
 
 test "abstract body (null) stays null" {
     var f = tFn(null, false);
-    pruneFunction(&f, true);
+    pruneFunction(&f, true, false);
     try testing.expect(f.body == null);
+}
+
+test "a @Composable function keeps its signature when composable sigs are kept" {
+    // The compose plugin's oracle reads the base's composable signatures from
+    // the lifted decls; stripping params + annotations there (as the default
+    // prune does) makes a downstream call to the function un-threadable.
+    var stmts = [_]Stmt{tIntStmt()};
+    var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
+    var composable_path = [_]ast.Ident{tIdent("Composable")};
+    var anns = [_]ast.Annotation{.{ .use_site = null, .path = &composable_path, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = tSpan(0, 0) }};
+    f.annotations = &anns;
+    var params = [_]ast.Param{.{
+        .name = tIdent("content"),
+        .ty = .{ .name = tIdent("Function0"), .nullable = false, .span = tSpan(0, 0), .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = tSpan(0, 0),
+    }};
+    f.params = &params;
+    pruneFunction(&f, true, true);
+    // Body statements dropped, but the signature survives for the oracle.
+    try testing.expectEqual(@as(usize, 0), f.body.?.Block.stmts.len);
+    try testing.expectEqual(@as(usize, 1), f.annotations.len);
+    try testing.expectEqual(@as(usize, 1), f.params.len);
+    try testing.expect(annotationsHaveComposable(f.annotations));
+}
+
+test "a plain function still drops its signature even when composable sigs are kept" {
+    var stmts = [_]Stmt{tIntStmt()};
+    var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
+    pruneFunction(&f, true, true);
+    try testing.expectEqual(@as(usize, 0), f.params.len);
+    try testing.expectEqual(@as(usize, 0), f.annotations.len);
 }
