@@ -191,6 +191,27 @@ const SpinRwLock = struct {
     }
 };
 
+/// A zero-cost stand-in for `SpinRwLock` used by cells whose payload is
+/// immutable for its whole lifetime (it opts in with `pub const
+/// objref_immutable = true`). Such a cell is never write-locked — nothing
+/// ever takes an exclusive borrow — so the reader lock only ever guards
+/// against a writer that cannot exist. Sharing immutable data across threads
+/// needs no synchronization, so every operation is a no-op and the atomic
+/// read-lock traffic (a `cmpxchg`/`fetchSub` on every borrow) disappears.
+const NoopRwLock = struct {
+    inline fn lockShared(_: *NoopRwLock) void {}
+    inline fn unlockShared(_: *NoopRwLock) void {}
+    inline fn lockExclusive(_: *NoopRwLock) void {}
+    inline fn unlockExclusive(_: *NoopRwLock) void {}
+};
+
+/// The lock type a cell over `T` uses: the no-op lock when `T` declares
+/// itself immutable (`pub const objref_immutable = true`), else the real
+/// reader/writer spin lock.
+fn LockFor(comptime T: type) type {
+    return if (isContainer(T) and @hasDecl(T, "objref_immutable") and T.objref_immutable) NoopRwLock else SpinRwLock;
+}
+
 /// Exclusive spin lock. Zig 0.16's std has no blocking `Thread.Mutex`
 /// (synchronization moved behind the `Io` interface), so this is a small
 /// spin lock over `std.atomic.Value` with the same `spinLoopHint`/
@@ -291,7 +312,7 @@ pub fn ControlBlock(comptime T: type) type {
         /// fixed offset via `@fieldParentPtr("hdr", header)`.
         hdr: gc.GcHeader,
         refcount: std.atomic.Value(usize),
-        lock: SpinRwLock,
+        lock: LockFor(T),
         data: T,
         allocator: std.mem.Allocator,
     };

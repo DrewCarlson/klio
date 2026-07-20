@@ -33,6 +33,13 @@ pub const StringData = struct {
     u16_len: u32,
     ascii: bool,
 
+    /// A Kotlin `String` is immutable: `bytes`/`u16_len`/`ascii` are set once at
+    /// construction and only ever read until teardown frees the bytes. Nothing
+    /// takes an exclusive borrow of a string cell, so its `ObjRef` reader lock
+    /// guards against a writer that never exists — this marker elides it (see
+    /// `objcell.LockFor`), removing the per-borrow atomic on every string read.
+    pub const objref_immutable = true;
+
     /// The cell owns its bytes (see `ObjRef.init`/`initOwned` for `[]const u8`),
     /// so teardown frees them — same contract the bare `[]const u8` payload had.
     pub fn gcFinalize(self: *StringData, a: std.mem.Allocator) void {
