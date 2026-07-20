@@ -10,8 +10,14 @@ import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionContext
 import androidx.compose.runtime.ComposeNode
 import androidx.compose.runtime.Recomposer
+import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCompositionContext
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.cancelAndJoin
 
 class Node(val kind: String) {
     var text: String = ""
@@ -60,41 +66,64 @@ fun Label(t: String) {
     )
 }
 
+var frameTime = 0L
+
+/** Publish pending state writes and dispatch frames until the recomposer is
+ * idle, so a recomposition provoked by a write has completed on return. */
+suspend fun settle(recomposer: Recomposer, clock: BroadcastFrameClock) {
+    Snapshot.sendApplyNotifications()
+    while (recomposer.hasPendingWork) {
+        yield()
+        frameTime += 16_666_666L
+        clock.sendFrame(frameTime)
+        yield()
+    }
+}
+
 fun main() {
-    val recomposer = Recomposer()
-    val count = mutableStateOf(0)
+    val clock = BroadcastFrameClock()
+    runBlocking(clock) {
+        val recomposer = Recomposer(coroutineContext)
+        val runner = launch { recomposer.runRecomposeAndApplyChanges() }
+        yield()
 
-    // Parent composition into its own node tree.
-    val parentRoot = Node("ParentRoot")
-    val parent = Composition(NodeApplier(parentRoot), recomposer)
+        val count = mutableStateOf(0)
 
-    var childContext: CompositionContext? = null
-    parent.setContent {
-        childContext = rememberCompositionContext()
-        Label("parent")
+        // Parent composition into its own node tree.
+        val parentRoot = Node("ParentRoot")
+        val parent = Composition(NodeApplier(parentRoot), recomposer)
+
+        var childContext: CompositionContext? = null
+        parent.setContent {
+            childContext = rememberCompositionContext()
+            Label("parent")
+        }
+
+        // A child composition reparented to the parent's context — its own node
+        // tree, but driven by the same recomposer.
+        val childRoot = Node("ChildRoot")
+        val child = Composition(NodeApplier(childRoot), childContext!!)
+        child.setContent {
+            Label("child=" + count.value)
+        }
+
+        println("initial:")
+        println("  parent: " + parentRoot.dump())
+        println("  child:  " + childRoot.dump())
+
+        // Only the child read `count`. A write invalidates only the child; the
+        // parent's recomposer recomposes it (proof it tracks the reparented
+        // subcomposition).
+        count.value = 42
+        settle(recomposer, clock)
+        println("after count=42 + recompose:")
+        println("  parent: " + parentRoot.dump())
+        println("  child:  " + childRoot.dump())
+
+        child.dispose()
+        parent.dispose()
+        recomposer.close()
+        runner.cancelAndJoin()
+        println("disposed; child children=" + childRoot.children.size)
     }
-
-    // A child composition reparented to the parent's context — its own node tree,
-    // but driven by the same recomposer.
-    val childRoot = Node("ChildRoot")
-    val child = Composition(NodeApplier(childRoot), childContext!!)
-    child.setContent {
-        Label("child=" + count.value)
-    }
-
-    println("initial:")
-    println("  parent: " + parentRoot.dump())
-    println("  child:  " + childRoot.dump())
-
-    // Only the child read `count`. A write invalidates only the child; the parent's
-    // recomposer recomposes it (proof it tracks the reparented subcomposition).
-    count.value = 42
-    recomposer.recompose()
-    println("after count=42 + recompose:")
-    println("  parent: " + parentRoot.dump())
-    println("  child:  " + childRoot.dump())
-
-    child.dispose()
-    parent.dispose()
-    println("disposed; child children=" + childRoot.children.size)
 }
