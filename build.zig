@@ -239,7 +239,6 @@ const itests_files = [_]Itest{
     // child `klio test` against the ENGINE pack with the `@Composable` lowering
     // plugin — THE compose conformance gate.
     .{ .name = "compose_plugin_commontest", .needs_exe = true, .dirs = &.{
-        "kotlin-klio/klio-compose-runtime",
         "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-coroutines",
