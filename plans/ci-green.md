@@ -119,7 +119,26 @@ failure/cancelled. Runs on `ubuntu-latest`, Zig 0.16 Debug harness: `unit tests`
   pattern matches the running command's OWN shell and self-kills it (cost real
   time twice). Kill stale procs by PID only.
 
-## Landed (pushed, origin/main @ 65665357)
+## In-flight (as of 3f3541df pushed)
+
+- **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.
+  Pushed 3f3541df (wall-cap fail-fast + coroutine barrier fix + serialization chain
+  fix) to rerun; the wall-cap now makes a hanging shard fail fast WITH a frame/pump
+  dump in the log instead of cancelling its siblings. Awaiting the rerun's failure set.
+- **bounded_type_param** (host_call_member.zig, uncommitted): parity_lambdas 45/45 green
+  post-fix; stdlib_commontest regression gate running. Commit once stdlib matches baseline.
+- **with_timeout_or_null** (delegated, worktree agent a423043a): timeout expiry must
+  cancel the block's longer delay; deep pump-engine fix. Root diagnosis handed over.
+- **private_shadow_field_distinct_cells / _var_writes_own_cell** (DESIGNED, deferred):
+  `InstanceData.fields` (runtime/class.zig:371) is a FLAT name-keyed list; get/set/define
+  stop at first name match, so a private `x` in Base and Derived share ONE cell (Derived's
+  ctor overwrites Base's). Fix needs per-declaring-class private cells + declaring-class-
+  aware field access (the reading method's owner selects the cell). Bounded but touches the
+  core field path; do as a focused change/subagent after the broad CI set is known.
+
+## Landed (pushed, origin/main @ 3f3541df)
 
 - Compose cutover complete; two e2e coroutine bugs; corpus memory bound (not cap raise);
-  itest serialization. Details in memory `klio-compose-plugin-triage` and this file.
+  itest serialization + chain-pollution fix; wall-cap hang tooling (frame + pump-stall
+  dumps); coroutine same-thread-ancestor barrier deadlock fix (coroutine_scope_block).
+  Details in memory `klio-compose-plugin-triage` and this file.

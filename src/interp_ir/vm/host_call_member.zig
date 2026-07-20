@@ -1626,11 +1626,18 @@ fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const T
         if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
-        // A runtime Instance carries its full hierarchy: require the
-        // positive proof. Non-instance receivers (erased lambdas, boxed
-        // primitives against interface bounds) stay undecided here — the
-        // strict prover owns those.
-        if (receiver.* == .Instance and !receiverImplementsHead(self, receiver, bn)) return true;
+        // Decide the bound for any receiver whose full type is known: an
+        // Instance carries its class chain, and a concrete builtin's
+        // `isRuntimeType` supertype set is authoritative (a `String` receiver
+        // is provably not a `Number`, so `<T : Number> T.f()` does not apply to
+        // it and the outer member wins). Only an erased function/lambda value
+        // against a functional-interface bound stays undecided — SAM conversion
+        // could satisfy it — so the strict prover owns those.
+        const decidable = switch (receiver.*) {
+            .Null, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => false,
+            else => true,
+        };
+        if (decidable and !receiverImplementsHead(self, receiver, bn)) return true;
     }
     return false;
 }
