@@ -54,7 +54,6 @@ interpreter:
 | `KLIO_BARE_TRACE=<fn>` | static: how the bare call resolved at lowering (`[bare]`) |
 | `KLIO_MISS_TRACE=<fn>` | dynamic: which runtime dispatch tail missed for that name (`[member-miss]`, `[extfb]`, ...) |
 | `KLIO_NU_TRACE=<fn>` | candidate/visibility detail for hard dispatch cases (`[mev]`, `[strictext]`, ...) |
-| `KLIO_COMPOSE_PLUGIN` | unconditional (no longer read): the `@Composable` lowering plugin + engine runtime is the only compose path |
 | `KLIO_COMPOSE_MEMO=0` / `KLIO_COMPOSE_SKIP=0` | bisect the plugin's lambda-memoization / skip-calculus emission |
 | `kotlinx_coroutines_test_default_timeout=10s` | cap runTest's 60s default timeout (dots-to-underscores env alias for the property) |
 

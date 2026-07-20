@@ -1,10 +1,8 @@
 //! Run the upstream Compose runtime's own test suite through `klio test`
-//! against the installed ENGINE pack with the `@Composable` lowering plugin
-//! (`KLIO_COMPOSE_PLUGIN=1`).
+//! against the installed ENGINE pack with the `@Composable` lowering plugin.
 //!
-//! The conformance signal for the plugin path that replaces the implicit
-//! composer hook: the same test classes as `compose_runtime_commontest`, but
-//! the `androidx.compose.runtime` id resolves to the real upstream
+//! THE compose conformance gate: the `androidx.compose.runtime` id resolves to
+//! the real upstream
 //! gapbuffer/linkbuffer engine (`klio-compose-runtime-engine`) and every
 //! composable lowers through `compose_pass` — $composer/$changed threading,
 //! restart groups, marker defaults. At cutover this suite becomes THE compose
