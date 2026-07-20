@@ -2184,6 +2184,8 @@ reports any divergence between the two modes.</p>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>HangingTest.kt
 </code></pre></div>
 <h2 id="compose-plugin">Compose plugin<a class="headerlink" href="#compose-plugin" title="Permanent link">&para;</a></h2>
+<p>The <code>@Composable</code> lowering plugin + upstream engine runtime is the only compose
+path — it always runs. These knobs bisect its two emissions.</p>
 <table>
 <thead>
 <tr>
@@ -2195,26 +2197,20 @@ reports any divergence between the two modes.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>KLIO_COMPOSE_PLUGIN</code></td>
-<td><code>1</code> on; <code>0</code>/empty/unset off</td>
-<td>Master gate for the <code>@Composable</code> lowering plugin: runs the compose pass, salts the image/pack cache key, stands the implicit-composer runtime hook down, and enables the persisted inline-resume path</td>
-<td>none</td>
-</tr>
-<tr>
 <td><code>KLIO_COMPOSE_MEMO</code></td>
-<td><code>0</code> off (default on; plugin only)</td>
+<td><code>0</code> off (default on)</td>
 <td>Whether composable-lambda arguments are wrapped in remembered <code>composableLambda</code> instances (matching kotlinc)</td>
 <td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_COMPOSE_SKIP</code></td>
-<td><code>0</code> off (default on; plugin only)</td>
+<td><code>0</code> off (default on)</td>
 <td>Whether restartable composables emit the skip calculus (the <code>$dirty</code> probes and skip branch); an A/B bisection switch</td>
 <td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_COMPOSE_DBG</code></td>
-<td>set (plugin only)</td>
+<td>set</td>
 <td>One activation summary line (oracle sizes) plus group-emission debug inside the pass</td>
 <td><code>[compose-pass]</code></td>
 </tr>
@@ -2226,12 +2222,9 @@ reports any divergence between the two modes.</p>
 </tr>
 </tbody>
 </table>
-<p>Packs bake the lowering result: a pack built with the plugin on is a
-different artifact from one built with it off (the cache key
-includes the flag), so rebuild the engine pack after flipping
-<code>KLIO_COMPOSE_PLUGIN</code>.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nv">KLIO_COMPOSE_PLUGIN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">      </span><span class="c1"># plugin lowering</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">KLIO_COMPOSE_PLUGIN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># bisect the skip calculus</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">      </span><span class="c1"># plugin lowering</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">KLIO_COMPOSE_MEMO</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># no lambda memoization</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># bisect the skip calculus</span>
 </code></pre></div>
 <h2 id="compose-ui-and-skia">Compose UI and Skia<a class="headerlink" href="#compose-ui-and-skia" title="Permanent link">&para;</a></h2>
 <table>
@@ -2758,12 +2751,11 @@ error with no trace, or a teardown masks the original throw:</p>
 <p><code>[throw-trace]</code> names every throw as it happens (first one is
 usually the root cause), <code>[errtrace]</code> dumps the frame chain, and in
 <code>klio test</code> the failure detail becomes the fully rendered throwable.</p>
-<p><strong>A/B-ing the compose plugin.</strong> Compare implicit-hook and plugin
-lowering, then bisect the plugin's two emissions:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">                                </span><span class="c1"># implicit hook</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">KLIO_COMPOSE_PLUGIN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">          </span><span class="c1"># plugin</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="nv">KLIO_COMPOSE_PLUGIN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_COMPOSE_MEMO</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># no lambda memoization</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="nv">KLIO_COMPOSE_PLUGIN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># no skip calculus</span>
+<p><strong>Bisecting the compose plugin.</strong> The plugin always runs; bisect its two
+emissions:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">                                </span><span class="c1"># plugin (always on)</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">KLIO_COMPOSE_MEMO</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">            </span><span class="c1"># no lambda memoization</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">            </span><span class="c1"># no skip calculus</span>
 </code></pre></div>
 <p>Rebuild any baked pack between flips (the flag is part of the pack
 cache key), and add <code>KLIO_COMPOSE_DBG=1</code> to confirm the pass
