@@ -4068,7 +4068,7 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
     // A non-inline base function never runs from its AST body (its lowered IR
     // does); strip those bodies so the baked image and the resident forest drop
     // the dead statement trees while keeping the metadata dispatch reads.
-    prune.stripDeadBodies(@constCast(base.lifted_decls));
+    prune.stripDeadBodies(@constCast(base.lifted_decls), composePluginEnabled());
 
     return base;
 }
