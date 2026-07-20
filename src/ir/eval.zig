@@ -3891,6 +3891,28 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             return .cont;
         }
         const recv = frame.read(cm.receiver);
+        // Statically-resolved dispatch: the lowerer proved this call
+        // monomorphic and baked its target, so go straight to it — no
+        // name lookup, applicability walk, or FQN scan. A `null` return
+        // (target vanished) falls through to the name-based path, so a
+        // stale bake degrades rather than miscalls.
+        if (cm.resolved) |fid| {
+            if (comptime @hasDecl(H, "invokeResolvedMember")) {
+                recv.retain();
+                defer recv.release(allocator);
+                const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
+                defer allocator.free(ra);
+                if (try host.invokeResolvedMember(allocator, &recv, fid, ra)) |res| {
+                    switch (res) {
+                        .ok => |rv| {
+                            try frame.write(cm.dst, rv);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
+        }
         // Fast path: a range iterator's `hasNext()`/`next()`. The universal
         // `for (x in range)` desugaring calls these once per element; the
         // inline handler avoids the member-dispatch hashmap probes that

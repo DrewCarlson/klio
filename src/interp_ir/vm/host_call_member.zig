@@ -8312,6 +8312,17 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
 /// Invoke an already-resolved user method by `FuncId`: prepend the receiver,
 /// pad defaults, pack varargs, and run the body. Shared by the cold resolve
 /// path (`irMethodWalk`) and the inline-cache fast path.
+/// Direct dispatch to a lowering-resolved monomorphic member target
+/// (`Inst.CallMember.resolved`): invoke `fid` on `receiver` with no name
+/// resolution, applicability walk, or FQN scan. Returns `null` only if the
+/// target vanished (unresolvable fid); the caller then falls back to the
+/// name-based path, so a stale bake can never miscall — it degrades to the
+/// existing dispatch. Positional args only (the lowerer bakes `resolved`
+/// solely for name-arg-free calls).
+pub fn invokeResolvedMember(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    return invokeMethodFuncId(self, allocator, receiver, fid, args);
+}
+
 fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
     const mg = self.module.borrow();
     defer mg.deinit();

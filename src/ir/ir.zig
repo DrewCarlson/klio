@@ -334,6 +334,14 @@ pub const Inst = union(enum) {
         /// touches the member walk (unlike `static_recv`, whose meaning is
         /// the extension-BODY receiver).
         declared_recv: ?ConstId = null,
+        /// A lowering-resolved, provably-monomorphic dispatch target. When set,
+        /// the runtime calls it directly and skips all name-based resolution
+        /// (the `funcsBySimpleName` walk, the applicability/subtype filters, the
+        /// simple-name-from-FQN scans). Only set where the target cannot vary at
+        /// runtime — a builtin receiver whose static type is known, a final
+        /// member — so direct dispatch stays sound. Null keeps the virtual
+        /// name-based path.
+        resolved: ?FuncId = null,
     },
     /// Instantiate a class.
     NewInstance: struct {

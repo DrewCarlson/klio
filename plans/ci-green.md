@@ -119,7 +119,40 @@ failure/cancelled. Runs on `ubuntu-latest`, Zig 0.16 Debug harness: `unit tests`
   pattern matches the running command's OWN shell and self-kills it (cost real
   time twice). Kill stale procs by PID only.
 
-## In-flight (as of 3f3541df pushed)
+## Status @ 4d0dd896 (pushed; CI rerunning)
+
+Deterministic test failures FIXED + integrated + verified on main (unit green,
+stdlib held 1020/1276 throughout):
+- `coroutine_scope_block` — same-thread frozen-ancestor barrier deadlock (3f3541df).
+- `with_timeout_or_null` — withTimeout gate ran on the enclosing pump's queue while
+  the block runs on a nested pump; routed the gate onto the block's own pump so both
+  timers share one queue, earliest fires (deb89aae; parity_coroutines_realistic 22/22).
+- `private_shadow_field_distinct_cells`/`_var` — a shadowed private field's READ
+  misfired an anon-object fallback; gated on `!classDeclaresStoredProp` + mangle
+  explicit `this.x` (863c2723; parity_inheritance_dispatch 13/13).
+- `bounded_type_param_ext_requires_bound` — type-param bound now enforced for any
+  decidable receiver (56195e89; parity_lambdas 45/45).
+
+INFRASTRUCTURE (root-caused via CI annotations, since logs are 403-admin-gated):
+- **git exit 128** was a non-fatal WARNING from `actions/checkout submodules:
+  recursive` choking on the empty `update = none` vendor trees at clone time.
+  Replaced with an explicit `git submodule update --init --recursive` run step
+  (cleanly skips update=none). ci.yml + harness-release.yml (4d0dd896).
+- **CI never populated the compose-runtime / androidx-collection upstream
+  submodules** (only kotlin) — so compose_plugin_commontest + androidx_collection_
+  commontest found NO sources and fell below baseline. Added cached populate steps
+  (init-compose + init-androidx scripts). This is likely a MAJOR cause of the shard
+  failures. WATCH: compose_plugin_commontest (weight 90, shards=1) now RUNS in CI —
+  if it exceeds the 30-min shard budget on the 4-vCPU runner, give it `shards: 2`.
+
+Local shard-0 repro passes even under `taskset -c 0-3` (4 vCPU), so the shard
+failures were NOT simple core-count contention — they were the missing compose/
+androidx sources + the deterministic bugs above. Remaining unknown until CI reports:
+whether the other commontest baselines (ktor 292-fail debt, io, coroutines,
+serialization, datetime, atomicfu) hold under CI. Gating coroutines_commontest
+locally now (the with_timeout pump change is high-blast-radius).
+
+## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.
   Pushed 3f3541df (wall-cap fail-fast + coroutine barrier fix + serialization chain
