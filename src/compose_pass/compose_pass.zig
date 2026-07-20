@@ -372,6 +372,57 @@ pub fn collectSinkLastParamInto(set: *std.StringHashMap([]const u8), decls: []co
     };
 }
 
+/// Fewest value arguments a sink call needs for its trailing lambda to bind the
+/// callee's last (composable-content) parameter: the count of non-defaulted
+/// params before it, plus one for the lambda. Keyed by bare name and minimised
+/// across overloads (installed by the build driver, module decls + baked base).
+/// `threadCall` consults it so a call that provides FEWER args than this binds a
+/// smaller, non-content overload of the same name (`ComposeNode(::Factory) {
+/// update }`) and its trailing lambda is left positional rather than re-named to
+/// a sibling overload's `content` parameter.
+pub var active_sink_content_reach: ?*const std.StringHashMap(u8) = null;
+
+pub fn collectComposableSinkContentReach(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(u8) {
+    var set = std.StringHashMap(u8).init(a);
+    try collectSinkContentReachInto(&set, decls);
+    return set;
+}
+
+/// `params` is `[]const Param` (a function) or `[]const ClassParam` (a primary
+/// constructor); both carry `.ty`, `.default`, `.is_vararg`.
+fn sinkContentReach(params: anytype) ?u8 {
+    if (params.len == 0) return null;
+    const lp = &params[params.len - 1];
+    if (lp.ty.function == null or !isComposable(lp.ty.annotations)) return null;
+    var required: u8 = 0;
+    for (params[0 .. params.len - 1]) |*p| {
+        if (p.default == null and !p.is_vararg) required += 1;
+    }
+    return required + 1;
+}
+
+fn putMinReach(set: *std.StringHashMap(u8), name: []const u8, reach: u8) std.mem.Allocator.Error!void {
+    const gop = try set.getOrPut(name);
+    if (!gop.found_existing or reach < gop.value_ptr.*) gop.value_ptr.* = reach;
+}
+
+pub fn collectSinkContentReachInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (sinkContentReach(f.params)) |r| try putMinReach(set, f.name.name, r);
+        },
+        .Class => |*c| {
+            if (sinkContentReach(c.primary_params)) |r| try putMinReach(set, c.name.name, r);
+            try collectSinkContentReachInto(set, c.members);
+        },
+        .Object => |*o| try collectSinkContentReachInto(set, o.members),
+        else => {},
+    };
+}
+
 /// Names of INLINE functions in the compile universe. A composable call is
 /// legal inside a lambda argument only when the callee inlines it (the body
 /// splices into the composable caller) or the parameter is composable (the
@@ -2261,7 +2312,25 @@ const Walker = struct {
         // would slide into the first open slot (`insertGroup`) and its `if
         // (insertGroup)` sees a closure. Re-emit it by the callee's last
         // parameter name so the binder rejoins it to `content` across the gap.
-        if (had_trailing and c.args.len != 0 and new_names[c.args.len - 1] == null) {
+        //
+        // But only when the call ACTUALLY reaches the composable-content sink
+        // overload. `active_sink_last_param` is keyed by bare name and conflates
+        // overloads: `ComposeNode(::Factory) { update }` binds the non-sink
+        // `(factory, update)` overload whose trailing lambda already sits at its
+        // correct positional slot, while the map records the sibling `(factory,
+        // update, content)` overload's `content` param. Renaming to `content=`
+        // there misbinds the call — the update lambda and the appended composer
+        // pair are dropped and `$composer` arrives as Unit. `active_sink_content_
+        // reach[name]` is the fewest value arguments any sink overload needs for
+        // the trailing lambda to bind `content` (non-defaulted params before it,
+        // plus the lambda). A call with fewer args than that binds a smaller,
+        // non-content overload, so leave its trailing lambda positional.
+        const reach: u8 = if (active_sink_content_reach) |m|
+            (if (calleeSimpleName(c.callee)) |nm| (m.get(nm) orelse 0) else 0)
+        else
+            0;
+        const reaches_content = reach == 0 or c.args.len >= reach;
+        if (had_trailing and reaches_content and c.args.len != 0 and new_names[c.args.len - 1] == null) {
             if (calleeSimpleName(c.callee)) |nm| {
                 if (active_sink_last_param) |lp| {
                     if (lp.get(nm)) |pname| new_names[c.args.len - 1] = pname;
@@ -3171,6 +3240,97 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
     try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
     try testing.expect(!c.has_trailing_lambda);
+}
+
+test "threadCall leaves a non-content overload's trailing lambda positional" {
+    // `ComposeNode(::factory) { update }` — one positional arg then a trailing
+    // lambda. The name `ComposeNode` maps to the content sink's `content` param
+    // (reach 3: factory, update, content), but this 2-arg call binds the smaller
+    // `(factory, update)` overload whose trailing lambda IS `update`, already at
+    // its correct slot. It must stay positional — re-naming it `content=` would
+    // misbind the call.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+
+    var last_param = std.StringHashMap([]const u8).init(a);
+    try last_param.put("ComposeNode", "content");
+    active_sink_last_param = &last_param;
+    defer active_sink_last_param = null;
+    var reach = std.StringHashMap(u8).init(a);
+    try reach.put("ComposeNode", 3);
+    active_sink_content_reach = &reach;
+    defer active_sink_content_reach = null;
+
+    var callee_segs = [_]Ident{dummyIdent("ComposeNode")};
+    var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
+    var lam_params: [0]Ident = .{};
+    var lam_ptys: [0]?TypeRef = .{};
+    var args = [_]Expr{
+        .{ .IntLit = .{ .value = 7, .kind = .Int, .span = gsp } },
+        .{ .Lambda = .{
+            .params = &lam_params,
+            .param_tys = &lam_ptys,
+            .body = .{ .stmts = &.{}, .span = gsp },
+            .implicit_it = false,
+            .span = gsp,
+        } },
+    };
+    var arg_names = [_]?[]const u8{ null, null };
+    var call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = gsp,
+    } };
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx };
+    try w.threadCall(&call.Call, false);
+    const c = call.Call;
+    try testing.expectEqual(@as(usize, 4), c.args.len);
+    try testing.expect(c.arg_names[0] == null); // factory stays positional
+    try testing.expect(c.arg_names[1] == null); // update lambda stays positional (NOT `content`)
+    try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
+    try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
+    try testing.expect(!c.has_trailing_lambda);
+}
+
+test "collectComposableSinkContentReach counts non-defaulted params before content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    const b = B{ .a = a, .gen_span = gsp };
+
+    // `content: @Composable () -> Unit` — a composable-lambda type.
+    var fn_ty_ref = ast.FunctionTypeRef{
+        .receiver = null,
+        .params = &.{},
+        .ret = b.typeRef("Unit"),
+        .is_suspend = false,
+        .span = gsp,
+    };
+    var comp_path = [_]Ident{dummyIdent("Composable")};
+    var comp_ann = [_]ast.Annotation{.{ .use_site = null, .path = &comp_path, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = gsp }};
+    var comp_fn_ty = b.typeRef("Function0");
+    comp_fn_ty.function = &fn_ty_ref;
+    comp_fn_ty.annotations = &comp_ann;
+
+    // Foo(a, b = default, content): reach = 2 (a non-defaulted, b defaulted) + 1.
+    const p_a = b.param("a", b.typeRef("Int"));
+    var p_b = b.param("b", b.typeRef("Int"));
+    p_b.default = b.box(b.intLit(0));
+    const p_content = b.param("content", comp_fn_ty);
+    var foo_params = [_]Param{ p_a, p_b, p_content };
+    const foo = emptyFn("Foo", &foo_params, .{ .Block = .{ .stmts = &.{}, .span = gsp } }, false);
+    var decls = [_]ast.Decl{.{ .Function = foo }};
+    var reach = try collectComposableSinkContentReach(a, &decls);
+    defer reach.deinit();
+    try testing.expectEqual(@as(u8, 2), reach.get("Foo").?);
 }
 
 test "non-composable callees are not threaded" {

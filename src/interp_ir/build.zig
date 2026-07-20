@@ -474,6 +474,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer inline_fns.deinit();
         var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
         defer sink_last_param.deinit();
+        var sink_content_reach = try compose_pass.collectComposableSinkContentReach(allocator, decls.items);
+        defer sink_content_reach.deinit();
         if (base) |bsp| {
             // Decode once: an image-loaded base leaves `lifted_decls` empty, so
             // every collector below must read the decoded section instead.
@@ -486,6 +488,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
             try composeBaseSinkLastParam(&sink_last_param, base_decls);
+            try composeBaseSinkContentReach(&sink_content_reach, base_decls);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -503,6 +506,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_inline_fns = null;
         compose_pass.active_sink_last_param = &sink_last_param;
         defer compose_pass.active_sink_last_param = null;
+        compose_pass.active_sink_content_reach = &sink_content_reach;
+        defer compose_pass.active_sink_content_reach = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -4132,6 +4137,12 @@ fn composeBaseFactories(factories: *std.StringHashMap(void), base_decls: []const
 fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectSinkLastParamInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
+}
+
+fn composeBaseSinkContentReach(set: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| {
+        try compose_pass.collectSinkContentReachInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
