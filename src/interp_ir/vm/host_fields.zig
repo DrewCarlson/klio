@@ -738,9 +738,13 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 // `iterator { parent... }` in `MutableSetWrapper`'s anon iterator,
                 // where `parent` shadows `SetWrapper.parent`), the owner-mangled
                 // `rest` misses. The captured receiver's OWN class supplies the
-                // right key.
+                // right key. This ONLY applies when the lexical `owner` does not
+                // itself declare a stored `prop`: a bare read in a base-class
+                // method (`Base.baseRead` reading its own private `x`) is
+                // lexically bound to the base's cell and must ignore a subclass's
+                // same-name shadow even when the runtime receiver is that subclass.
                 const rcn = className(receiver.Instance);
-                if (!std.mem.eql(u8, rcn, owner)) {
+                if (!std.mem.eql(u8, rcn, owner) and !classDeclaresStoredProp(self, owner, prop)) {
                     if (std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ rcn, prop }) catch null) |rk| {
                         defer allocator.free(rk);
                         const rc_shadow = blk: {

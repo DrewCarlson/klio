@@ -2088,6 +2088,24 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
+    // Explicit `this.x` where the enclosing class declares `x` as a private
+    // SHADOW of a supertype's same-name stored property reads ITS OWN
+    // owner-mangled cell, matching the bare-name read and the shadow write.
+    if (receiver.* == .This and receiver.This.qualifier == null) {
+        if (b.ownerClass()) |owner| {
+            var kb: [256]u8 = undefined;
+            if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ owner, name.name })) |probe| {
+                if (b.module.registry.private_shadow_props.getKey(probe)) |key| {
+                    const trecv = try lowerReceiver(b, receiver);
+                    const tdst = b.allocReg();
+                    const tfield = try b.module.internConst(b.allocator, .{ .String = key });
+                    try b.push(.{ .GetField = .{ .dst = tdst, .receiver = trecv, .field = tfield } });
+                    return tdst;
+                }
+            } else |_| {}
+        }
+    }
+
     const recv = try lowerReceiver(b, receiver);
     const dst = b.allocReg();
     const field = try b.module.internConst(b.allocator, .{ .String = name.name });
