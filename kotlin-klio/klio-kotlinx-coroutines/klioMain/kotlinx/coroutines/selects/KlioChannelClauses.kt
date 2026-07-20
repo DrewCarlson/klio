@@ -25,6 +25,7 @@ internal fun __kxco_chanSelectRemoveSender(channel: Any, select: Any) {}
 internal fun __kxco_chanSelectPollReceive(channel: Any, holder: KlioClauseHolder): Int = 2
 // Returns 0 = sent, 1 = closed, 2 = full.
 internal fun __kxco_chanSelectPollSend(channel: Any, value: Any?): Int = 2
+internal fun __kxco_chanCloseCause(channel: Any): Throwable? = null
 
 // A tiny mutable cell the receive poll writes the taken value into (the
 // value may be `null`, so a return value cannot signal "got" by itself).
@@ -88,9 +89,9 @@ public val <E> ReceiveChannel<E>.onReceiveCatching: SelectClause1<ChannelResult<
 @Suppress("UNCHECKED_CAST")
 private fun klioProcessReceiveCatching(clauseObject: Any, ignored: Any?, result: Any?): Any? {
     if (result is KlioClauseHolder) return ChannelResult.success(result.value as Any?)
-    if (result === KLIO_CLOSED) return ChannelResult.closed<Any?>(null)
+    if (result === KLIO_CLOSED) return ChannelResult.closed<Any?>(__kxco_chanCloseCause(clauseObject))
     if (result == null && (clauseObject as ReceiveChannel<*>).isClosedForReceive)
-        return ChannelResult.closed<Any?>(null)
+        return ChannelResult.closed<Any?>(__kxco_chanCloseCause(clauseObject))
     return ChannelResult.success(result)
 }
 
@@ -132,7 +133,9 @@ private fun klioProcessSend(clauseObject: Any, param: Any?, result: Any?): Any? 
 }
 
 private fun closedReceiveException(channel: Any): Throwable =
-    kotlinx.coroutines.channels.ClosedReceiveChannelException("Channel was closed")
+    __kxco_chanCloseCause(channel)
+        ?: kotlinx.coroutines.channels.ClosedReceiveChannelException("Channel was closed")
 
 private fun closedSendException(channel: Any): Throwable =
-    kotlinx.coroutines.channels.ClosedSendChannelException("Channel was closed")
+    __kxco_chanCloseCause(channel)
+        ?: kotlinx.coroutines.channels.ClosedSendChannelException("Channel was closed")

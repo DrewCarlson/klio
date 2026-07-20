@@ -25,3 +25,12 @@ id = "stdlib"
 
 [[test]]
 root = "upstream/kotlinx-coroutines-core/common/test"
+
+# Shared commonTest infrastructure; the platform actuals for it are
+# klio-authored (klioTestUtils/) — real threads, runBlocking-backed
+# runTest, no platform skip annotations.
+[[test]]
+root = "upstream/test-utils/common/src"
+
+[[test]]
+root = "klioTestUtils"

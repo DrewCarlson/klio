@@ -15,6 +15,10 @@ package kotlinx.coroutines
 import kotlin.coroutines.*
 
 internal fun __kxco_spawn(block: () -> Unit) {}
+// Schedule a `withTimeout` cancellation gate. Distinct from `__kxco_spawn`
+// so the host re-homes the gate onto the pump of the undispatched block it
+// cancels (they share one timer queue), letting the earliest deadline fire.
+internal fun __kxco_spawnTimeout(block: () -> Unit) {}
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 internal fun __kxco_newSlot(): Long = 0L
@@ -64,22 +68,19 @@ internal fun __kxco_chanResumeNow(slot: Long) {}
 //       ordered with everything else on the virtual scheduler.
 //   2 — the dispatcher needs no dispatch (`Dispatchers.Unconfined`): the host
 //       resumes the waiter immediately on the delivering stack.
-//   0 — no dispatcher, or a klio pump-backed one (`KlioDispatcher`, Main,
-//       Default, IO): the host's pump/mailbox route IS that dispatcher's
-//       queue, so the pre-existing native route already dispatches correctly.
+//   3 — a klio pump-backed dispatcher accepted a task; unlike the external
+//       route, its task shares the owning pump and needs no scheduler marker.
+//   0 — no dispatcher, or a worker dispatcher (Default, IO): the host's
+//       pump/mailbox route is that dispatcher's queue.
 internal fun __kxco_chanResumeRoute(scope: Any?, slot: Long): Int {
     val context = (scope as? CoroutineScope)?.coroutineContext ?: return 0
     val dispatcher = context[ContinuationInterceptor] as? CoroutineDispatcher ?: return 0
-    if (
-        dispatcher === KlioDispatcher ||
-        dispatcher === KlioMainDispatcher ||
-        dispatcher === KlioDefaultDispatcher ||
-        dispatcher === KlioIoDispatcher
-    ) {
+    if (dispatcher === KlioDefaultDispatcher || dispatcher === KlioIoDispatcher) {
         return 0
     }
     if (!dispatcher.isDispatchNeeded(context)) return 2
     dispatcher.dispatch(context, KlioChanResumeTask(slot))
+    if (dispatcher === KlioDispatcher || dispatcher === KlioMainDispatcher) return 3
     return 1
 }
 
@@ -222,7 +223,7 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)
@@ -262,7 +263,7 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)
@@ -301,7 +302,7 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)
