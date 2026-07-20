@@ -119,6 +119,79 @@ unit + coroutines + collections + dispatch itests + stdlib 1020/1276 + a compose
 spot-check before expanding. Start with the narrowest provably-safe slice (builtin
 receiver, single candidate, no named args) and measure the dispatch-cost drop.
 
+## Session progress + the CI-representative profile
+
+The CI test path runs the `.safe` profile (JIT OFF, GC), NOT `.fast` (`klio run`).
+Re-profiled every bench under `KLIO_OPT=safe` — the representative picture:
+
+- **Dispatch / name-resolution ~18–35%** (workload-dependent): `findScalarLast`
+  10.9% (`lastIndexOfScalar('.')`, the FQN→simple-name scan used pervasively in the
+  resolution logic — `simpleName` is called all over `host_call_member`), `eqlBytes`,
+  the `getIndex`/`hash`/`mix`/`final` map-probe cluster, `callMemberInnerStatic`.
+- **Refcount / borrow atomics ~9–13%**: every boxed-value access takes the cell
+  `SpinRwLock` (`cmpxchgWeak`/`fetchSub`) plus `clone`'s `fetchAdd`.
+- **Eval loop ~40–68% on numeric** (`execArmBinOp`/`write`/`read`/`execInst`) — the
+  64-byte `Value` store/load dominates `write` (17% on numeric).
+- **Allocation only ~5% on the CI path** (memset 1.48% JIT-off; it was mostly the
+  JIT frame path). Under the GC backend allocations aren't freed, so *pooling is
+  moot* — the lever is reducing allocation count/size, not churn.
+
+### LANDED this session
+
+1. **Immutable-cell reader-lock elision** (`objcell.LockFor` + `objref_immutable`
+   marker). A cell whose payload never mutates after construction is never
+   write-locked, so its reader/writer spin lock only guards a writer that cannot
+   exist — a comptime no-op lock removes the per-borrow `cmpxchg`/`fetchSub`.
+   Marked: `StringData`, `ClassDef`, `StackTraceData`, `RegexData`. Verified: the
+   String commontest sweep is 0-failure and eager on/off identical; the strings
+   profile's `fetchSub` (was 5.95%) drops out of the top and `cmpxchgWeak` 4.57%→1.88%.
+### TRIED + REVERTED
+
+- **Per-callsite monomorphic member inline cache** (`Inst.CallMember.ic`). Built,
+  verified correct (unit + coro checksum), race-free (CAS-claim; `fid` before
+  `class` with release), guard sound (unambiguous + unscoped + no same-name
+  extension + no field shadow) — but REVERTED: flat on every available benchmark
+  (coro, collections, and an OOP dispatch microbench all within ±noise, ic on vs
+  `KLIO_IC=0`), and its dispatch-leaf effect was inside profiling noise. Two reasons:
+  (1) instance-method resolution is ALREADY memoized by the `instance_method_cache`
+  hashmap, so a per-callsite cache only saves the key build + `prog` borrow + probe;
+  (2) the profiled `findScalarLast`/`getIndex` dispatch cost is NOT user-instance
+  resolution (which is cached) — it is EXTENSION and BUILTIN dispatch
+  (`extensionFnFallback`, builtin type matching), which the instance ic does not
+  touch. The real lever for the profiled name-lookup cost is caching/baking the
+  extension + builtin dispatch, not user-instance methods. (Infra kept: the inert
+  `Inst.CallMember.resolved` field + `invokeResolvedMember` fast-path remain for a
+  future lowering-time extension bake.)
+
+### DEFERRED (sized, with the blocking reason — not deferred for mere breadth)
+
+- **Thread-liveness-gated lock elision for MUTABLE cells (~10%).** Elide the spin
+  lock whenever no other OS thread is live (true for virtual-time coroutines and all
+  single-threaded tests — the CI-heavy path; the dispatcher pool is lazy so this is
+  reachable). Blocked by a real, narrow heap-corruption hole: an intrinsic that holds
+  a reader borrow across a callback that spawns a real thread mutating the same cell
+  (`coll.forEach { launch { coll.mutate() } }`) — a no-op reader can't be seen by the
+  cross-thread writer. Needs either an audit proving no intrinsic holds a borrow
+  across a spawn point, or a borrow that a concurrent writer can still observe.
+- **Module-cell lock elision (biggest single: `self.module.borrow()` on every
+  dispatch).** The module IS read-only at runtime (runtime state lives in `prog`;
+  local-class registration writes `self.classes`, a separate cell), BUT `Module`
+  carries mutable lowering-scratch fields and runtime local-class lowering exists, so
+  a blanket immutable mark is unsafe. Needs splitting the immutable IR from the
+  lowering scratch first (a real refactor), then the elision is a one-line marker.
+- **`Value` 64→~24-32B (boxing List/Map/Set/Array/Range/Exception).** The single
+  cross-cutting lever: halves `write`/`read`/`memset`/copy and the cache footprint
+  everywhere. Invasive (touches every value construction/access); its own effort.
+- **Register coalescing (reduce `n_locals`).** `allocReg` is a monotonic counter, so
+  `n_locals` = every SSA temp ever allocated, not max-live — inflating every frame's
+  regs buffer (memset + alloc + cache) under all backends. A liveness pass shrinks it,
+  but closures/JIT/resume all index regs by number, so it is a careful compiler pass.
+- **Lowering-time `resolved` bake for extension calls (bytecode prereq).** Extensions
+  are statically dispatched in Kotlin, so a unique-extension resolve at the explicit-
+  receiver `CallMember` build is provably safe to bake into `resolved` (read-only at
+  runtime, unlike the inline cache). Needs lowering-time receiver-type inference +
+  member-shadow proof; the runtime infra (`resolved` + fast-path) already exists.
+
 ## Method
 
 1. Confirm premise: the CI-slow suites (coroutines_commontest baseline 220, compose,
