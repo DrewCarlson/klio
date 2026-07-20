@@ -744,7 +744,19 @@ pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: b
         for (ft.params) |*p| try args.append(allocator, try loweredTypeRef(allocator, p, own_names));
         try args.append(allocator, try loweredTypeRef(allocator, &ft.ret, own_names));
     } else {
-        head = if (own_names) try allocator.dupe(u8, ty.name.name) else ty.name.name;
+        // A reference to a file-private/internal classifier whose simple name
+        // collides across the combined image is lifted under a `$f{fid}`
+        // mangle (see the reuse-gate rename in `interp_ir/build.zig`). Resolve
+        // the reference to that mangled name — keyed by the reference's own
+        // span file — so a param/return/generic-arg type stays consistent with
+        // the mangled decl and its type-alias registration. Matches the
+        // supertype-name lowering, which already applies this rename. A
+        // qualified reference (`Outer.Inner`) keeps its written name.
+        const resolved = if (ty.qualified_path == null)
+            (build.fileTypeRename(ty.name.name, ty.span.file.int()) orelse ty.name.name)
+        else
+            ty.name.name;
+        head = if (own_names) try allocator.dupe(u8, resolved) else resolved;
         for (ty.type_args) |*ta| try args.append(allocator, try loweredTypeArg(allocator, ta, own_names));
     }
     if (ty.definitely_non_null) try args.append(allocator, try markerRef(allocator, "#non-null", own_names));
