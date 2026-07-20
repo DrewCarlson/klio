@@ -1159,7 +1159,7 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-coroutines" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-atomicfu" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-io" }),
-        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime-engine" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-androidx-collection" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-mosaic" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui" }),
