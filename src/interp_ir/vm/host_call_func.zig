@@ -1463,15 +1463,12 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
 /// pass threads the real `$composer` through composable bodies, so the implicit
 /// composer hook must stand down entirely — otherwise it re-brackets every
 /// composable call and recurses without bound.
-var g_compose_plugin: ?bool = null;
+/// The `@Composable` lowering plugin + upstream engine runtime is the only
+/// compose path; there is no implicit-composer fallback to switch to, so this
+/// is unconditionally true. Kept as a predicate because the compose threading
+/// sites read it and the image/pack cache key salts on it.
 pub fn composePluginEnabled() bool {
-    if (g_compose_plugin) |v| return v;
-    const on = if (runtime.getenvSlice("KLIO_COMPOSE_PLUGIN")) |v|
-        v.len != 0 and !std.mem.eql(u8, v, "0")
-    else
-        true;
-    g_compose_plugin = on;
-    return on;
+    return true;
 }
 
 fn composableEval(
