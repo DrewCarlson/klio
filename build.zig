@@ -681,10 +681,9 @@ pub fn build(b: *std.Build) void {
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
                     // The parity harness caches one base snapshot per (load-mode,
                     // pack-mask) combination and never evicts, so the ceiling
-                    // rises as the in-repo pack set grows — and the upstream
-                    // compose engine base is heavier than the retired klio shim.
-                    // Give the parity suites headroom over the 6 GB default cap.
-                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "10485760");
+                    // rises as the in-repo pack set grows. Give the parity suites
+                    // headroom over the 6 GB default watchdog cap.
+                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
                     run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
                     run_t.step.dependOn(&base_images_install.step);
                     run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
@@ -733,10 +732,9 @@ pub fn build(b: *std.Build) void {
         // point them at the baked dependency bases like the parity itests.
         if (runs_programs) {
             // The parity harness caches one base snapshot per (load-mode,
-            // pack-mask) combo without eviction, and the upstream compose engine
-            // base is heavier than the retired klio shim, so give the corpus
-            // runners headroom over the 6 GB default RSS watchdog cap.
-            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "10485760");
+            // pack-mask) combo without eviction, so give the corpus runners
+            // headroom over the 6 GB default RSS watchdog cap.
+            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
             run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
             run_t.step.dependOn(&base_images_install.step);
             run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
