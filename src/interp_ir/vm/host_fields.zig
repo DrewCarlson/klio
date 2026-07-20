@@ -3339,6 +3339,25 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk false;
             };
             if (!has_own and !is_own_member) {
+                // Interface-delegation forwarding for writes: a `var` the
+                // delegated interface declares routes the write to the delegate
+                // object (`class Scope(s) : MutableState by s` — `scope.value = x`
+                // writes `s.value = x`). Mirrors the read-path forwarding; without
+                // it the write would fabricate an own backing field, diverging the
+                // delegator from its delegate.
+                const deleg_target: ?Value = blk: {
+                    const g = inst.borrow();
+                    defer g.deinit();
+                    for (g.get().fields.items) |f| {
+                        if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+                        const iface = f.name["__delegate__".len..];
+                        if (host_call_member.delegatedInterfaceDeclares(self, allocator, inst, iface, real_name) == true) {
+                            break :blk f.value;
+                        }
+                    }
+                    break :blk null;
+                };
+                if (deleg_target) |d| return setField(self, allocator, &d, real_name, value);
                 if (try setCompanionParentWalk(self, allocator, inst, real_name, value)) |r| return r;
                 const outer: ?Value = blk: {
                     const g = inst.borrow();
