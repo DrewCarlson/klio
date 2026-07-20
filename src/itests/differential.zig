@@ -77,13 +77,23 @@ fn runOne(gpa: std.mem.Allocator, io: std.Io, file: []const u8, mode: parity.Loa
 /// cross-program global state (inline-fn tables, receiver guard stacks) is
 /// backed by page_allocator, not this arena.
 fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
+    // Bound the parity base cache: the corpus spans many pack masks and each
+    // base is a full stdlib+packs clone, so an unbounded cache (the default)
+    // accumulates one clone per mask on top of the fixed base-image working set.
+    // A small LRU bound frees evicted bases' arenas back to the OS; 2 is the
+    // divergence working set — the two load modes compared for the current
+    // program. (e2e sets the same bound; differential previously set none.)
+    parity.base_cache_max = 2;
+
     var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer run_arena.deinit();
 
     var failures: usize = 0;
     var pack_programs: usize = 0;
     for (files) |file| {
-        _ = run_arena.reset(.retain_capacity);
+        // Free the per-program peak (a big compose program's rebuilt packs + VM)
+        // back to the OS instead of retaining it for the rest of the corpus.
+        _ = run_arena.reset(.{ .retain_with_limit = 64 * 1024 * 1024 });
         const ra = run_arena.allocator();
         const src = std.Io.Dir.cwd().readFileAlloc(io, file, ra, .unlimited) catch |e| {
             std.debug.print("differential SKIP {s}: read failed ({s})\n", .{ file, @errorName(e) });

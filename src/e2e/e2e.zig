@@ -35,7 +35,7 @@ fn runCorpus(jit_on: bool) !void {
     // which otherwise retains its own full stdlib clone. Bound the dependency-
     // base cache so the process holds a handful at a time instead of all of
     // them (each is rebuilt on demand if evicted).
-    parity.base_cache_max = 4;
+    parity.base_cache_max = 2;
 
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer list_arena.deinit();
@@ -186,7 +186,7 @@ test "function-JIT recursion matches the interpreter" {
     jit.setFuncEnabledForTest(true);
     defer jit.setEnabledForTest(false);
     defer jit.setFuncEnabledForTest(false);
-    parity.base_cache_max = 4;
+    parity.base_cache_max = 2;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
