@@ -45,14 +45,17 @@ jobs:
             step: itest -Ditest-shard=4/5
             shard: itest4
     steps:
-      # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
-      # interpreter consumes at runtime) are submodules; without them every
-      # pack-using test fails with unresolved kotlinx/ktor globals. The
-      # `kotlin` submodule is `update = none` (the full repo is ~5GB), so the
-      # recursive checkout skips it; it is populated sparsely below.
+      # Submodules are populated explicitly below, NOT by actions/checkout's
+      # recursive fetch. The vendored `update = none` trees (kotlin, compose,
+      # androidx-collection, mosaic) are sparse, script-populated checkouts that
+      # do not exist at clone time; letting the checkout action fetch submodules
+      # recursively makes git exit 128 on those empty gitlinks. A plain
+      # `git submodule update --init --recursive` fetches the regular kotlinx +
+      # ktor trees and cleanly skips the `update = none` ones (no 128).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
+
+      - name: fetch vendored submodules (kotlinx + ktor)
+        run: git submodule update --init --recursive
 
       - name: install zig 0.16.0
         run: |
@@ -74,6 +77,27 @@ jobs:
       - name: populate kotlin submodule (if not cached)
         if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
         run: ./scripts/init-kotlin-submodule.sh
+
+      # The compose runtime + androidx.collection packs read their upstream
+      # sources (and the compose conformance suite reads its commonTest files)
+      # from these `update = none` submodules, populated as treeless, sparse,
+      # shallow checkouts of the pinned compose-multiplatform-core tag. Without
+      # them compose_plugin_commontest and androidx_collection_commontest find
+      # no sources and fall below their baselines.
+      - name: cache compose + androidx-collection upstream sources
+        id: compose-src-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            kotlin-klio/klio-compose-runtime/upstream
+            kotlin-klio/klio-androidx-collection/upstream
+          key: compose-src-${{ hashFiles('.gitmodules') }}-v1.11.1
+
+      - name: populate compose + androidx-collection submodules (if not cached)
+        if: steps.compose-src-cache.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/init-compose-submodule.sh
+          ./scripts/init-androidx-collection-submodule.sh
 
       # Both zig caches: the global cache (package fetches like the vendored
       # zstd tarball, compiled artifacts) and the project-local .zig-cache
