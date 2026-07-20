@@ -4331,6 +4331,11 @@ fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!Buil
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
     try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
+    // Parallel to `parent_ctor_args`: without this a class inherited from the
+    // base loses its super-constructor argument labels, so a named super-ctor
+    // argument that skips an earlier defaulted parameter (`Operation(objects =
+    // 2)`) binds positionally onto the wrong parameter.
+    try copyStrMap([]const ?[]const u8, &out.parent_ctor_arg_names, &base.parent_ctor_arg_names);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
     try copyPairMap(&out.extension_props, &base.extension_props);
