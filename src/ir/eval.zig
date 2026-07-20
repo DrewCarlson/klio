@@ -2300,6 +2300,11 @@ fn runFrameInner(
             spinDumpMaybe();
             const wall_dl = test_wall_deadline_ms.load(.monotonic);
             if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+                // A caught hang should say WHERE it looped, not just that it did.
+                // Dump the live frame chain (innermost first, with file:line) so
+                // the culprit function/recursion is named at the abort point.
+                std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+                dumpFrameChainForDiagAlways();
                 return errResult(.{ .Type = "test wall-clock deadline exceeded" });
             }
         }
@@ -3879,6 +3884,18 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
+/// Kill-switch for the lowering-time static dispatch bake (`KLIO_BAKE_OFF=1`
+/// routes every `resolved` CallMember back through the name-based walk). Resolved
+/// once; a benign first-use race computes the same value. For A/B measurement and
+/// as a safety escape hatch.
+var bake_disabled: ?bool = null;
+fn bakeDisabled() bool {
+    if (bake_disabled) |v| return v;
+    const v = if (runtime.getenvSlice("KLIO_BAKE_OFF")) |s| std.mem.eql(u8, s, "1") else false;
+    bake_disabled = v;
+    return v;
+}
+
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
         if (fastSubscript(allocator, frame, cm)) |rv| {
@@ -3886,6 +3903,30 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             return .cont;
         }
         const recv = frame.read(cm.receiver);
+        // Statically-resolved dispatch: the lowerer proved this call
+        // monomorphic and baked its target, so go straight to it — no
+        // name lookup, applicability walk, or FQN scan. A `null` return
+        // (target vanished) falls through to the name-based path, so a
+        // stale bake degrades rather than miscalls.
+        if (cm.resolved) |fid| {
+            if (comptime @hasDecl(H, "invokeResolvedMember")) {
+                if (!bakeDisabled()) {
+                recv.retain();
+                defer recv.release(allocator);
+                const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
+                defer allocator.free(ra);
+                if (try host.invokeResolvedMember(allocator, &recv, fid, ra)) |res| {
+                    switch (res) {
+                        .ok => |rv| {
+                            try frame.write(cm.dst, rv);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+                }
+            }
+        }
         // Fast path: a range iterator's `hasNext()`/`next()`. The universal
         // `for (x in range)` desugaring calls these once per element; the
         // inline handler avoids the member-dispatch hashmap probes that

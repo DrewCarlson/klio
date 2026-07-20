@@ -3298,6 +3298,10 @@ fn buildModuleWithOverrides(
     // Rebuild the name index so funcId lookups see every registered stub.
     try module.rebuildFuncNameIndex(a);
 
+    // Static dispatch bake: resolve provably-monomorphic explicit-receiver
+    // member calls to their target at lower time (see `bakeStaticMemberCalls`).
+    bakeStaticMemberCalls(module, a);
+
     return .{
         .module = module_ref,
         .classes = classes,
@@ -3331,6 +3335,204 @@ fn buildModuleWithOverrides(
         .delegated_body_props = delegated_body_props,
         .allocator = allocator,
     };
+}
+
+// -------------------------------------------------------------------------
+// Static dispatch bake (lowering-time).
+// -------------------------------------------------------------------------
+
+/// Resolve provably-monomorphic explicit-receiver member calls to their target
+/// at lower time. For each `recv.name(args)` in this module's own funcs, when
+/// `name` denotes exactly ONE body-bearing top-level extension / member-extension
+/// and NO class in this module declares a member of that name (Kotlin binds a
+/// member over an extension), the call cannot resolve to anything else at run
+/// time — so its target is settled here, in `Inst.CallMember.resolved`, and the
+/// VM dispatches straight through it, skipping the name-based member-dispatch
+/// ladder + candidate walk. This is the static-dispatch step a bytecode VM
+/// needs: the target is resolved once, at build time, not per call.
+///
+/// Soundness is checked, not assumed: `KLIO_BAKE_ASSERT` runs the full name
+/// walk and flags any callsite whose walk winner differs from the baked target
+/// (a builtin-member or cross-module shadow this static gate did not model). The
+/// runtime fast-path additionally falls back to the walk when a member-extension
+/// owner is unreachable, so a conservative bake degrades rather than miscalls.
+fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
+    var member_names = std.StringHashMap(void).init(a);
+    defer member_names.deinit();
+    for (module.classes.items) |*c| {
+        for (c.methods) |mfid| {
+            const mf = module.funcById(mfid) orelse continue;
+            member_names.put(mf.name, {}) catch {};
+        }
+    }
+
+    var baked: usize = 0;
+    var seen: usize = 0;
+    for (module.funcs.items) |*f| {
+        for (f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                switch (inst.*) {
+                    .CallMember => |*cm| {
+                        seen += 1;
+                        if (cm.resolved != null) continue;
+                        // The `resolved` fast-path dispatches positionally (it
+                        // does not forward `arg_names`), so a named-argument call
+                        // must keep the name-based path that binds by label.
+                        if (hasNamedArg(cm.arg_names)) continue;
+                        const name = switch (module.consts.items[cm.name.int()]) {
+                            .String => |s| s,
+                            else => continue,
+                        };
+                        // A member declared with this name binds ahead of any
+                        // extension (Kotlin's member-over-extension rule). A member
+                        // method is virtual, so it is baked only when the receiver's
+                        // static type is a FINAL class — one that can never be
+                        // subclassed, so the method cannot be overridden anywhere,
+                        // even open-world (a serialized bake stays correct for every
+                        // consumer). Otherwise the name is an extension surface.
+                        if (member_names.contains(name)) {
+                            if (finalReceiverMethod(module, cm.declared_recv, name, cm.n_args)) |mfid| {
+                                cm.resolved = mfid;
+                                baked += 1;
+                            }
+                            continue;
+                        }
+                        cm.resolved = uniqueMemberTarget(module, name, cm.n_args) orelse continue;
+                        baked += 1;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    if (runtime.getenvSlice("KLIO_BAKE_STATS") != null and seen != 0) {
+        std.debug.print("[bake-stats] module funcs={d} callmembers={d} baked={d}\n", .{ module.funcs.items.len, seen, baked });
+    }
+}
+
+/// The single body-bearing top-level extension / member-extension named `name`,
+/// or null when zero or more than one exists. A CallMember's target must take an
+/// explicit receiver (`params[0].name == "this"`); uniqueness among those makes
+/// `recv.name(...)` unambiguous independent of the runtime receiver.
+fn hasNamedArg(arg_names: []const ?ir.ConstId) bool {
+    for (arg_names) |n| if (n != null) return true;
+    return false;
+}
+
+/// The FuncId a `recv.name(<n_args>)` MEMBER call resolves to when the receiver's
+/// static type (`declared_recv`) is a FINAL user class, or null. A final class
+/// can never be subclassed, so the method cannot be overridden anywhere — the
+/// dispatch is monomorphic even open-world, which makes it safe to bake (unlike a
+/// method on an open/abstract class, where a subtype override would diverge from a
+/// serialized target). The receiver being a resolvable user class also guarantees
+/// the runtime value is an instance of that class, never a builtin with a
+/// same-named member.
+fn finalReceiverMethod(module: *ir.Module, declared_recv: ?ir.ConstId, name: []const u8, n_args: u32) ?ir.FuncId {
+    const did = declared_recv orelse return null;
+    var h = switch (module.consts.items[did.int()]) {
+        .String => |s| s,
+        else => return null,
+    };
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| h = h[i + 1 ..];
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    h = std.mem.trimEnd(u8, h, "?");
+    if (h.len == 0) return null;
+    const cid = module.classId(h) orelse return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    const c = &module.classes.items[cid.int()];
+    const m = resolveMethodInHierarchy(module, cid, name, n_args, 0) orelse return null;
+    // Condition 1 — the RECEIVER class is final (not `open`, not
+    // abstract/interface/sealed): it can never be subclassed, so `recv` is
+    // exactly `C` and the resolved method is the unique target regardless of its
+    // own modifiers.
+    if (!c.is_open and !c.is_abstract) return m;
+    // Condition 2 — the receiver class is open, but the resolved METHOD is itself
+    // un-overridable: neither `open` nor `override` (an `override` is open by
+    // default). Trusted only for a freshly-lowered func — an image-decoded base
+    // method does not carry `is_open` (it is not serialized), so it stays on the
+    // walk rather than risk a false "final".
+    if (m.int() >= module.func_header_offsets.len) {
+        const mf = module.funcById(m) orelse return null;
+        if (!mf.is_open and !mf.is_override) return m;
+    }
+    return null;
+}
+
+/// First body-bearing, arity-compatible method named `name` in class `cid`'s
+/// resolution order (own methods, then supertypes) — the target `recv.name()`
+/// binds for a receiver of exactly `cid`. `null` when unresolved.
+fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u8, n_args: u32, depth: u8) ?ir.FuncId {
+    if (depth > 32) return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    const c = &module.classes.items[cid.int()];
+    for (c.methods) |mfid| {
+        const mf = module.funcById(mfid) orelse continue;
+        if (!std.mem.eql(u8, mf.name, name)) continue;
+        // A member method carries the receiver as a synthesized leading `this`
+        // param (like an extension), so `extAcceptsArity` scores the value params.
+        if (!(mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this"))) continue;
+        if (!mf.hasBody()) continue;
+        if (!extAcceptsArity(mf, n_args)) continue;
+        return mfid;
+    }
+    for (c.supertypes) |sid| {
+        if (resolveMethodInHierarchy(module, sid, name, n_args, depth + 1)) |m| return m;
+    }
+    return null;
+}
+
+/// Whether an extension / member-extension `f` (whose `params[0]` is the
+/// receiver) could bind a positional call of `n_args` value arguments: at least
+/// its required (non-default, non-vararg) value params are supplied, and no more
+/// than its declared value params unless it ends in a vararg. Deliberately
+/// permissive at the boundary — used only to decide whether ONE candidate is
+/// uniquely selected by arity, so over-counting a rival merely declines the bake.
+fn extAcceptsArity(f: *const ir.Func, n_args: u32) bool {
+    if (f.params.len == 0) return false;
+    const vps = f.params[1..]; // skip the receiver `this`
+    var required: u32 = 0;
+    var has_vararg = false;
+    for (vps) |*p| {
+        if (p.is_vararg) {
+            has_vararg = true;
+        } else if (!p.has_default) {
+            required += 1;
+        }
+    }
+    if (n_args < required) return false;
+    if (!has_vararg and n_args > vps.len) return false;
+    return true;
+}
+
+/// The single body-bearing top-level extension / member-extension named `name`
+/// that a `recv.name(<n_args args>)` call must dispatch to, or null when zero or
+/// more than one qualify. A CallMember's target takes an explicit receiver
+/// (`params[0].name == "this"`); when several such candidates share the name,
+/// the callsite's fixed arity selects among them (Kotlin overloads that differ
+/// in arity) — a unique arity-compatible candidate is still statically
+/// determined. If two remain arity-compatible (same arity, distinguished only by
+/// receiver/argument type) the pick needs runtime types, so the call is left to
+/// the name path.
+fn uniqueMemberTarget(module: *ir.Module, name: []const u8, n_args: u32) ?ir.FuncId {
+    var only: ?ir.FuncId = null; // sole candidate regardless of arity
+    var candidates: u32 = 0;
+    var arity_hit: ?ir.FuncId = null; // sole arity-compatible candidate
+    var arity_hits: u32 = 0;
+    for (module.funcsBySimpleName(name)) |fid| {
+        const f = module.funcById(fid) orelse continue;
+        if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        if (!f.hasBody()) continue;
+        candidates += 1;
+        only = fid;
+        if (extAcceptsArity(f, n_args)) {
+            arity_hits += 1;
+            arity_hit = fid;
+        }
+    }
+    if (candidates == 0) return null;
+    if (candidates == 1) return only; // unique by name — arity irrelevant
+    if (arity_hits == 1) return arity_hit; // unique by arity among the overloads
+    return null;
 }
 
 // -------------------------------------------------------------------------

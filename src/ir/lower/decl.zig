@@ -510,6 +510,7 @@ pub fn lowerClassWithExtras(
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
         .is_interface = c.is_interface,
+        .is_open = c.is_open,
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
@@ -1398,6 +1399,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     func.low_priority = isLowPriorityOverload(f);
     func.is_expect = f.is_expect;
     func.is_override = f.is_override;
+    func.is_open = f.is_open;
     // A leading `this` injected via `implicit_params` is a synthesized
     // dispatch/extension receiver, distinguishing it from a user param
     // that merely spells its name `this`.

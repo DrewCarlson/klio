@@ -584,6 +584,12 @@ fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void
                 // Dispatched; the runnable delivers (it may already have, if
                 // the dispatcher ran it synchronously). The watcher completes
                 // now: the waiter irrevocably owns the value.
+                //
+                // The waiter's dispatcher (a `runTest` `TestCoroutineScheduler`)
+                // orders this resume on ITS queue, not the pump's ready queue,
+                // so mark the owning pump: its dispatched resumes (a `yield`)
+                // must keep the inline shortcut rather than defer to `drv.ready`.
+                ctx.host.markSlotOwnerSchedulerBacked(slot);
                 dropWatcher(ctx, slot);
                 return;
             },

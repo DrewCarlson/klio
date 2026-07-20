@@ -520,8 +520,26 @@ const VirtualClock = struct {
         }
     }
 
-    /// The minimum floor across every registered pump *other* than `id`.
-    /// `null` when no other pump has a finite floor: the caller is free to
+    /// True if `clock_id` belongs to a pump on the CURRENT thread's
+    /// interceptor stack. Same-thread pumps are strictly nested: a lower one
+    /// is a frozen ancestor of the caller (a `coroutineScope`/`withTimeout`/
+    /// nested-`runBlocking` boundary), never concurrent with it. A frozen
+    /// pump cannot run to post a cross-pump resume that preempts another's
+    /// timer, so it must not hold the barrier against a same-thread pump
+    /// driving above it — otherwise the ancestor's stale floor deadlocks the
+    /// child's virtual-clock advance (each waits for the other forever).
+    /// `coro_stack` is thread-local, so this reads only this thread's pumps.
+    fn onCurrentThreadStack(clock_id: u64) bool {
+        if (clock_id == UNREGISTERED) return false;
+        for (coro_stack.items) |*p| {
+            if (p.clock_id == clock_id) return true;
+        }
+        return false;
+    }
+
+    /// The minimum floor across every registered pump *other* than `id` and
+    /// other than this thread's frozen ancestors (see `onCurrentThreadStack`).
+    /// `null` when no such pump has a finite floor: the caller is free to
     /// advance to its own timer.
     fn minOtherFloor(id: u64) ?i64 {
         mutex.lock();
@@ -529,6 +547,7 @@ const VirtualClock = struct {
         var m: ?i64 = null;
         for (slots.items) |s| {
             if (s.id == id) continue;
+            if (onCurrentThreadStack(s.id)) continue;
             if (s.floor == INDEFINITE) continue;
             if (m == null or s.floor < m.?) m = s.floor;
         }
@@ -542,6 +561,24 @@ const VirtualClock = struct {
     fn mayFire(id: u64, t: i64) bool {
         const other = minOtherFloor(id) orelse return true;
         return other >= t;
+    }
+
+    /// Diagnostic: the shared clock, the unsettled-pool count, and every
+    /// registered pump's published floor. A caught pump hang uses this to
+    /// tell whether an advance is barrier-blocked (a sibling floor below the
+    /// timer) or gate-blocked (an unsettled pool task).
+    fn dumpState() void {
+        mutex.lock();
+        defer mutex.unlock();
+        std.debug.print("[PUMP] vclock now={d} pool_unsettled={d} slots={d}:", .{ now, pool_unsettled, slots.items.len });
+        for (slots.items) |s| {
+            if (s.floor == INDEFINITE) {
+                std.debug.print(" clk{d}=INDEF", .{s.id});
+            } else {
+                std.debug.print(" clk{d}={d}", .{ s.id, s.floor });
+            }
+        }
+        std.debug.print("\n", .{});
     }
 
     /// Clear every registered pump at a run boundary. Pumps unregister
@@ -739,6 +776,12 @@ pub const CooperativeInterceptor = struct {
     /// This pump's root activation while it is parked; an inline resume never
     /// steals it (the pump publishes the root's value and stops on it).
     root_tok: ?u64 = null,
+    /// Set once a native channel delivery to one of this pump's waiters routed
+    /// through an external dispatcher's queue (`__kxco_chanResumeRoute` code 1 —
+    /// a `runTest` `TestCoroutineScheduler`). Such a pump orders its dispatched
+    /// resumes on that scheduler, not `drv.ready`, so the inline-resume FIFO
+    /// deferral (`ownerReadyPending`) must stay off for it.
+    scheduler_backed: bool = false,
     /// A failure raised by an activation this pump owns that ran INLINE (on a
     /// resumer's stack, outside the drive loop). The loop cannot see it there,
     /// so it is left here and raised on the next turn, exactly as if the loop
@@ -1975,6 +2018,8 @@ fn pumpLoop(
         if (diag_loops % 64 == 0) {
             const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
             if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
+                std.debug.print("[wall-cap] pump wall-clock deadline exceeded — stalled pump state follows:\n", .{});
+                if (coroTop()) |t| diagStalledPump(self, t, root_token.*, true);
                 try pumpExit(self, out, persist);
                 return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
             }
@@ -2207,7 +2252,7 @@ ir.eval.resume_route = "pump-ready";
         //     resume arrives locally or through the mailbox above.
         if (!persist and root_token.* != null) {
             idle_rounds += 1;
-            if (idle_rounds == 3000) diagStalledPump(coroTop().?, root_token.*);
+            if (idle_rounds == 3000) diagStalledPump(self, coroTop().?, root_token.*, false);
             // Per-test wall deadline: a genuinely deadlocked pump (a parked
             // root whose resumer never comes — the Recomposer deadlock-
             // regression shape) idles HERE, not in the eval loop, so the
@@ -2215,6 +2260,8 @@ ir.eval.resume_route = "pump-ready";
             {
                 const wall_dl = ir.eval.test_wall_deadline_ms.load(.monotonic);
                 if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
+                    std.debug.print("[wall-cap] pump wall-clock deadline exceeded (parked root) — stalled pump state follows:\n", .{});
+                    diagStalledPump(self, coroTop().?, root_token.*, true);
                     try pumpExit(self, out, persist);
                     return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
                 }
@@ -2344,20 +2391,37 @@ pub fn pumpDiagEnabled() bool {
 /// One-shot stderr dump of a blocking pump that has idled for several
 /// seconds with its root still parked - the shape of a lost resume.
 /// Gated on `KLIO_PUMP_DIAG`; a diagnosis aid, never load-bearing.
-fn diagStalledPump(top: *CooperativeInterceptor, root_tok: ?u64) void {
-    if (!pumpDiagEnabled()) return;
+fn diagStalledPump(self: *VmIntrinsicHost, top: *CooperativeInterceptor, root_tok: ?u64, force: bool) void {
+    if (!force and !pumpDiagEnabled()) return;
     std.debug.print("[PUMP] stalled root_tok={?d} parked={d} ready={d} launched={d} pumps={d}\n", .{
         root_tok, top.parked.count(), top.ready.items.len, top.launched.items.len, coro_stack.items.len,
     });
     // EVERY interceptor on this thread: a cancelled-but-uncompleted
     // coroutine's body can be parked in a NESTED pump the top-only view
-    // never shows.
+    // never shows. Name the parked frames (innermost first) so a caught
+    // hang says WHERE each stuck coroutine is suspended, not just how deep.
+    VirtualClock.dumpState();
+    const mg = self.module.borrow();
+    defer mg.deinit();
     for (coro_stack.items, 0..) |*drv, di| {
+        std.debug.print("[PUMP] pump[{d}] clk={d} vnow={d} mode={s}\n", .{
+            di, drv.clock_id, drv.virtual_now, @tagName(drv.mode),
+        });
         var pit = drv.parked.iterator();
         while (pit.next()) |e| {
-            std.debug.print("[PUMP] pump[{d}] parked tok={d} wake={d} frames={d}\n", .{
+            std.debug.print("[PUMP] pump[{d}] parked tok={d} wake={d} frames={d}:", .{
                 di, e.key_ptr.*, e.value_ptr.wake_at, e.value_ptr.state.frames.items.len,
             });
+            const st = &e.value_ptr.state;
+            var k: usize = 0;
+            while (k < st.frames.items.len and k < 12) : (k += 1) {
+                const snap = st.frames.items[k];
+                const m: *const ir.Module = snap.module orelse mg.get();
+                const f = m.funcById(snap.func);
+                const nm = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "?";
+                std.debug.print(" {s}", .{nm});
+            }
+            std.debug.print("\n", .{});
         }
     }
     var it = top.slot_to_token.iterator();
@@ -2662,17 +2726,46 @@ pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, ou
     return resumeInlineOnce(self, slot, value, out);
 }
 
-/// Does a Wall-mode (`runBlocking`) pump on this thread that owns `slot` already
-/// have other ready coroutines queued? Used to keep an inline resume from
-/// jumping that event loop's FIFO queue. A Virtual (`runTest`) pump is exempt —
-/// its scheduler drives inline and orders channel deliveries elsewhere.
+/// Mark the pump on this thread that owns `slot` as driven by an external
+/// dispatcher (a `runTest` `TestCoroutineScheduler`): a native channel delivery
+/// to one of its waiters routed through that dispatcher's own queue
+/// (`__kxco_chanResumeRoute` code 1) rather than the pump's ready queue. Such a
+/// pump orders its dispatched resumes elsewhere, so the inline shortcut must NOT
+/// defer them to `drv.ready` — doing so strands them until the scheduler idles.
+/// Falls back to the innermost pump when the slot is not bound to a pump yet.
+pub fn markSlotOwnerSchedulerBacked(slot: i64) void {
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const drv = &coro_stack.items[i];
+        if (drv.slot_to_token.get(slot) != null) {
+            drv.scheduler_backed = true;
+            return;
+        }
+    }
+    if (coro_stack.items.len != 0) coro_stack.items[coro_stack.items.len - 1].scheduler_backed = true;
+}
+
+/// Does a pump on this thread that owns `slot` have a live parked coroutine
+/// queued ready that this resume must fall behind? A dispatched resume (a
+/// `yield`, a pump-backed channel delivery) runs its dispatcher's FIFO queue in
+/// post order, so it must not jump a coroutine already made ready — this holds
+/// under BOTH time modes for a plain pump. A `scheduler_backed` pump (`runTest`)
+/// keeps the inline shortcut: it orders its dispatched resumes on the
+/// `TestCoroutineScheduler`, not `drv.ready`. Stale `ready` tokens (already
+/// resumed inline, no `parked` entry) never count.
 fn ownerReadyPending(slot: i64) bool {
     var i: usize = coro_stack.items.len;
     while (i > 0) {
         i -= 1;
         const drv = &coro_stack.items[i];
-        if (drv.slot_to_token.get(slot) != null)
-            return drv.mode == .Wall and drv.ready.items.len > 0;
+        if (drv.slot_to_token.get(slot) != null) {
+            if (drv.scheduler_backed) return false;
+            for (drv.ready.items) |rtok| {
+                if (drv.parked.contains(rtok)) return true;
+            }
+            return false;
+        }
     }
     return false;
 }
