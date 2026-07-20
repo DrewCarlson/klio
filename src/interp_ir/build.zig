@@ -4074,10 +4074,10 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
 }
 
 /// Whether the `@Composable` lowering plugin is enabled (KLIO_COMPOSE_PLUGIN).
-/// Any non-empty value other than "0" turns it on. Default off: the
-/// implicit-composer runtime hook stays the shipped path.
+/// Default on: the plugin is the shipped compose path. `KLIO_COMPOSE_PLUGIN=0`
+/// (or empty) turns it off.
 fn composePluginEnabled() bool {
-    const v = runtime.getenvSlice("KLIO_COMPOSE_PLUGIN") orelse return false;
+    const v = runtime.getenvSlice("KLIO_COMPOSE_PLUGIN") orelse return true;
     return v.len != 0 and !std.mem.eql(u8, v, "0");
 }
 
