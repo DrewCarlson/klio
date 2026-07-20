@@ -2042,9 +2042,21 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
     return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
+/// Per-program wall cap (ms) for the in-process itest harnesses: a spinning
+/// program then fails "test wall-clock deadline exceeded" and names itself
+/// instead of hanging the binary for minutes. Default 60s (a legit in-process
+/// program runs in seconds); `KLIO_ITEST_WALL_CAP` overrides (seconds; 0 = off).
+fn itestWallCapMs() i64 {
+    const s = runtime.getenvSlice("KLIO_ITEST_WALL_CAP") orelse return 60_000;
+    const secs = std.fmt.parseInt(i64, s, 10) catch return 60_000;
+    return if (secs <= 0) 0 else secs * 1000;
+}
+
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
+    interp_ir.armTestWallDeadlineMs(itestWallCapMs());
+    defer interp_ir.clearTestWallDeadline();
     return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 

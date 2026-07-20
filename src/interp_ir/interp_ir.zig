@@ -1339,6 +1339,24 @@ pub fn isCancellationException(v: *const Value) bool {
     }
 }
 
+/// Arm the eval-loop wall-clock deadline so an in-process program that spins in
+/// the eval loop aborts with "test wall-clock deadline exceeded" instead of
+/// hanging the whole test binary. For the in-process itest harnesses only (the
+/// CLI runs `Vm.run` directly and is never capped). Catches infinite loops in
+/// the eval loop; a pure deadlock blocked off the eval loop is not covered.
+/// `cap_ms <= 0` disarms.
+pub fn armTestWallDeadlineMs(cap_ms: i64) void {
+    if (cap_ms <= 0) {
+        ir.eval.test_wall_deadline_ms.store(0, .monotonic);
+        return;
+    }
+    ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap_ms, .monotonic);
+}
+
+pub fn clearTestWallDeadline() void {
+    ir.eval.test_wall_deadline_ms.store(0, .monotonic);
+}
+
 const testing = std.testing;
 
 test {
