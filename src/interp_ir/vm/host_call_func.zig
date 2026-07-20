@@ -1488,68 +1488,16 @@ fn composableEval(
     // param of its own; the pass compiles its composer references to the
     // `__compose_currentComposer` intrinsic (upstream's "implemented as an
     // intrinsic" contract), which reads this stack.
-    if (composePluginEnabled()) {
-        if (compose.threadedComposerArg(f.params, packed_args.items)) |c| {
-            compose.pushComposer(c);
-            defer compose.popComposer();
-            return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
-        }
+    // The `@Composable` lowering plugin has already rewritten composition into
+    // the body; run it directly and publish the threaded `$composer` argument as
+    // the ambient composer so a `@Composable` property getter reached from this
+    // body (compiled to the `__compose_currentComposer` intrinsic) reads it.
+    if (compose.threadedComposerArg(f.params, packed_args.items)) |c| {
+        compose.pushComposer(c);
+        defer compose.popComposer();
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
     }
-    if (!compose.isComposable(f))
-        return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
-    const composer = compose.currentComposer() orelse
-        return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
-
-    const key_val = Value.newLong(@bitCast(compose.callSiteKey()));
-    switch (try host_call_member.callMember(self, allocator, &composer, "startGroup", &.{key_val})) {
-        .err => |e| {
-            discardArgs(allocator, packed_args);
-            return .{ .err = e };
-        },
-        .ok => {},
-    }
-    const args_hash = Value.newLong(compose.argsHash(packed_args.items));
-    const run = switch (try host_call_member.callMember(self, allocator, &composer, "shouldRunGroup", &.{args_hash})) {
-        .err => |e| {
-            _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
-            discardArgs(allocator, packed_args);
-            return .{ .err = e };
-        },
-        .ok => |v| v == .Bool and v.Bool,
-    };
-    var res: EvalResult = .{ .ok = .{ .Unit = {} } };
-    if (run) {
-        res = try ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
-        // Cache the return value on the group so a later pass that skips this
-        // group (args unchanged, not invalidated) can hand back the same value
-        // — a value-returning @Composable (`collectAsState`, a passthrough)
-        // must not collapse to Unit when skipped.
-        if (res == .ok) {
-            switch (try host_call_member.callMember(self, allocator, &composer, "setGroupReturn", &.{res.ok})) {
-                .err => |e| {
-                    _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
-                    return .{ .err = e };
-                },
-                .ok => {},
-            }
-        }
-    } else {
-        discardArgs(allocator, packed_args);
-        // Reuse the cached return value from when this group last composed.
-        switch (try host_call_member.callMember(self, allocator, &composer, "groupReturn", &.{})) {
-            .err => |e| {
-                _ = host_call_member.callMember(self, allocator, &composer, "endGroup", &.{}) catch {};
-                return .{ .err = e };
-            },
-            .ok => |v| res = .{ .ok = v },
-        }
-    }
-    switch (try host_call_member.callMember(self, allocator, &composer, "endGroup", &.{})) {
-        .err => |e| return .{ .err = e },
-        .ok => {},
-    }
-    return res;
+    return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
 }
 
 /// Per-candidate `SigView` for the shared applicability scorer on the NAMED

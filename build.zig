@@ -236,19 +236,8 @@ const itests_files = [_]Itest{
     }, .weight = 40 },
     // The upstream Compose runtime's own test suite (CompositionTests,
     // RestartTests, MovableContentTests, the snapshot suites) run through a
-    // child `klio test` against the installed compose-runtime pack. The
-    // conformance signal for the implicit-composer hook.
-    .{ .name = "compose_runtime_commontest", .needs_exe = true, .dirs = &.{
-        "kotlin-klio/klio-compose-runtime",
-        "kotlin-klio/klio-androidx-collection",
-        "kotlin-klio/klio-kotlinx-coroutines",
-        "kotlin-klio/klio-kotlinx-atomicfu",
-        "kotlin-klio/klio-kotlin-test",
-    }, .weight = 90 },
-    // The same upstream suite against the ENGINE pack with the `@Composable`
-    // lowering plugin (KLIO_COMPOSE_PLUGIN=1) — the conformance signal for
-    // the plugin path replacing the implicit hook, and the whole compose
-    // gate once the cutover lands.
+    // child `klio test` against the ENGINE pack with the `@Composable` lowering
+    // plugin — THE compose conformance gate.
     .{ .name = "compose_plugin_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-compose-runtime",
         "kotlin-klio/klio-compose-runtime-engine",
