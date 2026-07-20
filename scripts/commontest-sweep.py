@@ -162,21 +162,87 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     return target, passed, fails
 
 
-def sweep(binary, run_targets, all_targets, support, provider, texts, eager, jobs):
+def _dedup(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, eager):
+    """Run EVERY run-target in one directory as a SINGLE `klio test` child:
+    compile the directory's files (and cross-dir providers) ONCE, then discover
+    tests in each target via repeated `--only-file`. This amortizes the
+    per-child sibling re-lowering (~40 files, ~7s) across every file in the
+    directory instead of paying it once per file. It matches the canonical
+    itest, which likewise compiles all files together and runs their tests in
+    one process; the sweep only split per-file for parallelism. Returns the
+    directory's aggregate pass count and the flat failed-test list."""
+    dir_all = [t for t in all_targets if os.path.dirname(t) == tdir]
+    cross = []
+    for t in dir_targets:
+        cross += cross_dir_providers(t, provider, texts)
+    compile_files = _dedup(list(support) + dir_all + cross)
+    argv = [binary, "test"] + [f"--only-file={t}" for t in dir_targets] + compile_files
+    env = dict(os.environ, HOME=CHILD_HOME)
+    if eager:
+        env["KLIO_EAGER"] = "1"
+    else:
+        env.pop("KLIO_EAGER", None)
+    if os.environ.get("KLIO_SWEEP_DEBUG"):
+        print("ARGV", "\n".join(argv), file=sys.stderr)
+    try:
+        p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800, env=env)
+    except subprocess.TimeoutExpired:
+        return tdir, -1, [("__TIMEOUT__", "")]
+    passed = None
+    m = re.search(rb"(\d+) passed,", p.stdout)
+    if m:
+        passed = int(m.group(1))
+    fails, lines = [], p.stdout.splitlines()
+    for i, line in enumerate(lines):
+        fm = re.match(rb"\s*(\S+) FAILED", line)
+        if fm:
+            reason = lines[i + 1].strip().decode(errors="replace")[:160] if i + 1 < len(lines) else ""
+            fails.append((fm.group(1).decode(errors="replace"), reason))
+    if passed is None:
+        return tdir, -1, fails or [("__NO_SUMMARY__", p.stderr[-160:].decode(errors="replace"))]
+    return tdir, passed, fails
+
+
+def sweep(binary, run_targets, all_targets, support, provider, texts, eager, jobs, batch=True):
     # Sibling context always comes from ALL targets: a `--filter` narrows
     # which files RUN, never which files compile alongside them — a
     # filtered child missing its same-directory siblings loses their
     # helper declarations (`Sortable`, `assertAlmostEquals`) and fails
     # differently than the full suite.
+    #
+    # `batch` (default) groups run-targets by directory and runs each directory
+    # in one child (compile-once). `--no-batch` restores one child per file
+    # (per-file hang isolation; slower).
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = {
-            ex.submit(run_one, binary, t, support, all_targets, provider, texts, eager): t
-            for t in run_targets
-        }
-        for f in concurrent.futures.as_completed(futs):
-            target, passed, fails = f.result()
-            results[target] = (passed, fails)
+        if batch:
+            by_dir = {}
+            for t in run_targets:
+                by_dir.setdefault(os.path.dirname(t), []).append(t)
+            futs = {
+                ex.submit(run_dir, binary, d, ts, support, all_targets, provider, texts, eager): d
+                for d, ts in by_dir.items()
+            }
+            for f in concurrent.futures.as_completed(futs):
+                d, passed, fails = f.result()
+                results[d] = (passed, fails)
+        else:
+            futs = {
+                ex.submit(run_one, binary, t, support, all_targets, provider, texts, eager): t
+                for t in run_targets
+            }
+            for f in concurrent.futures.as_completed(futs):
+                target, passed, fails = f.result()
+                results[target] = (passed, fails)
     return results
 
 
@@ -199,6 +265,9 @@ def main():
     ap.add_argument("--eager", choices=["off", "on", "both"], default="off")
     ap.add_argument("--jobs", type=int, default=default_jobs())
     ap.add_argument("--home", default=None, help="child HOME (pack install scratch)")
+    ap.add_argument("--no-batch", action="store_true",
+                    help="one child per file (per-file hang isolation) instead of "
+                         "the default per-directory compile-once batching")
     args = ap.parse_args()
     if args.home:
         global CHILD_HOME
@@ -217,7 +286,8 @@ def main():
     modes = {"off": [False], "on": [True], "both": [False, True]}[args.eager]
     per_mode = {}
     for eager in modes:
-        results = sweep(args.binary, matched, targets, support, provider, texts, eager, args.jobs)
+        results = sweep(args.binary, matched, targets, support, provider, texts, eager,
+                        args.jobs, batch=not args.no_batch)
         per_mode[eager] = results
         label = "eager-on" if eager else "eager-off"
         lines = render(results, args.passes)

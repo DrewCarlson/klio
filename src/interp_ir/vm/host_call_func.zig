@@ -1459,10 +1459,6 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
 /// run), which is how a sibling that did not read the changed state avoids
 /// re-running. Plain calls, or a `@Composable` invoked with no active composer
 /// (e.g. directly from `main`), run the body unwrapped.
-/// Cached `KLIO_COMPOSE_PLUGIN` gate. When the lowering plugin is enabled the
-/// pass threads the real `$composer` through composable bodies, so the implicit
-/// composer hook must stand down entirely — otherwise it re-brackets every
-/// composable call and recurses without bound.
 /// The `@Composable` lowering plugin + upstream engine runtime is the only
 /// compose path; there is no implicit-composer fallback to switch to, so this
 /// is unconditionally true. Kept as a predicate because the compose threading

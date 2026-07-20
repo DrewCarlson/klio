@@ -444,12 +444,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         try imports.appendSlice(allocator, f.imports);
     }
 
-    // `@Composable` lowering plugin (KLIO_COMPOSE_PLUGIN): rewrite composable
-    // functions to thread the composer per the Compose plugin ABI, so upstream's
-    // real Composer/SlotTable runs. Off by default — the implicit-composer
-    // runtime hook stays the shipped path and `main` is unaffected. The oracle
-    // spans this module's decls plus the baked base (pack composables the user
-    // calls, e.g. `Text`).
+    // `@Composable` lowering plugin: rewrite composable functions to thread the
+    // composer per the Compose plugin ABI, so upstream's real Composer/SlotTable
+    // runs. This is the only compose path. The oracle spans this module's decls
+    // plus the baked base (pack composables the user calls, e.g. `Text`).
     if (composePluginEnabled()) {
         // A/B gate for the skip emission (pace/correctness bisection).
         if (runtime.getenvSlice("KLIO_COMPOSE_SKIP")) |v| {

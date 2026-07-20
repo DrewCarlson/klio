@@ -140,21 +140,19 @@ KLIO_PUMP_DIAG=1 KLIO_RESUME_TRACE=1 kotlinx_coroutines_test_default_timeout=10s
 
 ## Compose plugin
 
+The `@Composable` lowering plugin + upstream engine runtime is the only compose
+path — it always runs. These knobs bisect its two emissions.
+
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_COMPOSE_PLUGIN` | unconditional (no longer read) | The `@Composable` lowering plugin + upstream engine runtime is the only compose path — the pass always runs, salts the image/pack cache key, and enables the persisted inline-resume path. Retained as a no-op so old scripts that set it do not break | none |
-| `KLIO_COMPOSE_MEMO` | `0` off (default on; plugin only) | Whether composable-lambda arguments are wrapped in remembered `composableLambda` instances (matching kotlinc) | none |
-| `KLIO_COMPOSE_SKIP` | `0` off (default on; plugin only) | Whether restartable composables emit the skip calculus (the `$dirty` probes and skip branch); an A/B bisection switch | none |
-| `KLIO_COMPOSE_DBG` | set (plugin only) | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
+| `KLIO_COMPOSE_MEMO` | `0` off (default on) | Whether composable-lambda arguments are wrapped in remembered `composableLambda` instances (matching kotlinc) | none |
+| `KLIO_COMPOSE_SKIP` | `0` off (default on) | Whether restartable composables emit the skip calculus (the `$dirty` probes and skip branch); an A/B bisection switch | none |
+| `KLIO_COMPOSE_DBG` | set | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
 
-Packs bake the lowering result: a pack built with the plugin on is a
-different artifact from one built with it off (the cache key
-includes the flag), so rebuild the engine pack after flipping
-`KLIO_COMPOSE_PLUGIN`.
-
 ```sh
-./zig-out/bin/klio run scene.kt      # plugin lowering (default)
+./zig-out/bin/klio run scene.kt      # plugin lowering
+KLIO_COMPOSE_MEMO=0 ./zig-out/bin/klio run scene.kt   # no lambda memoization
 KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt   # bisect the skip calculus
 ```
 

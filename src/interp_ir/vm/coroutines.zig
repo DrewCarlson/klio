@@ -2577,16 +2577,11 @@ fn inlineResumeEnabled() bool {
     return runtime.getenvSlice("KLIO_NO_INLINE_RESUME") == null;
 }
 
-/// Cached `KLIO_COMPOSE_PLUGIN` gate for the persisted inline-resume path.
-/// That path (`resumePersistedOnTop`) exists solely so the Compose recomposer,
-/// parked inside a `withContext`/`coroutineScope` frame, can wake and settle
-/// synchronously while a test-scheduler advance is in progress. Outside the
-/// compose plugin it stands down: the coroutine suites never set the flag, so
-/// they keep their pre-existing deferral (a persisted resume queues rather than
-/// running inline) and cannot be driven into an unbounded re-dispatch during
-/// `advanceUntilIdle`.
-/// The persisted inline-resume path ships unconditionally with the compose
-/// plugin (the only compose path).
+/// The persisted inline-resume path (`resumePersistedOnTop`) lets the Compose
+/// recomposer, parked inside a `withContext`/`coroutineScope` frame, wake and
+/// settle synchronously while a test-scheduler advance is in progress. It ships
+/// unconditionally now (the plugin is the only compose path); the coroutine
+/// suites hold at baseline with it on.
 fn persistResumeGateEnabled() bool {
     return true;
 }

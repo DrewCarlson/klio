@@ -24,18 +24,61 @@ upstream stdlib lives under `kotlin/libraries/stdlib`, klio-authored actuals and
 kotlinx packs under `kotlin-klio/`, test fixtures under `tests/fixtures/`, and baked
 end-to-end expected output under `tests/corpus/expected/`.
 
+Local klio data home — USE IT for pack development:
+
+`klio run`/`bake-image` load the compose/kotlinx/etc. libraries from the
+**installed** pack in the klio data home (`packs/`, `cache/`, `registry/`,
+`stubs/`), which **shadows the `kotlin-klio/` source**. So editing pack Kotlin
+(e.g. `kotlin-klio/klio-compose-ui-core/…`) has NO effect until you rebuild and
+reinstall that pack — a stale installed pack silently hides your change (and made
+a whole perf investigation measure old code once). The data home defaults to the
+shared `~/.klio`, so a rebuild there also clobbers other clones/workstreams.
+
+`KLIO_HOME` overrides the data home. For all local pack work, point it at the
+repo-local gitignored `.klio-local/`:
+- `scripts/klio-local.sh <args>` — runs klio with `KLIO_HOME=$PWD/.klio-local`
+  (e.g. `scripts/klio-local.sh run app.kt`). Installed packs there shadow the
+  embedded copies; unbuilt packs fall back to embedded.
+- `scripts/install-local-packs.sh` — (re)builds every shipped pack from source
+  into `.klio-local`, so source edits take effect. Re-run after editing pack
+  Kotlin. A single pack: `scripts/klio-local.sh pack build <dir> && scripts/klio-local.sh pack install target/packs/<id>.klio-pack`.
+
+Pack sources come from sparse `update = none` submodules under
+`kotlin-klio/*/upstream` (+ `kotlin/`); if a checkout is empty a pack builds
+missing-source. Populate them with `scripts/bootstrap.sh --packs` or the
+per-lib `scripts/init-*-submodule.sh`.
+
 When changing behavior, match Kotlin semantics exactly and fix the real root
 cause. Verify per-module in isolation with `python3 scripts/zigcheck.py <module>`.
 
-Verification speed — follow the playbook in `plans/verification-speed-plan.md`:
-Debug harness (`zig build klio-harness -Dharness-optimize=Debug`, ~16s, installs
-as `zig-out/bin/klio-harness-Debug`) for edit-repro loops;
-`scripts/commontest-sweep.py BIN --filter <File> --eager both` for targeted
-stdlib-test checks (~16s); `zig build itest-<suite>` for one suite;
-`scripts/gate.sh` for the full pre-commit gate. Never build `itest-bin` (all ~56
-binaries) during iteration; never use `--watch -fincremental` (broken for this
-graph — see the plan); prune the GC-less cache with `scripts/prune-zig-cache.sh`
-when it grows.
+Verification speed — DEFAULT to the harness + sweep, NOT `zig build itest-*`.
+Full playbook in `plans/verification-speed-plan.md`. The path that must be used:
+
+- **Commontest correctness (the default for any stdlib/library check):** build the
+  ReleaseSafe harness ONCE (`zig build klio-harness`, installs
+  `zig-out/bin/klio-harness`; a no-op rebuild is ~1s, a one-edit rebuild is the
+  cost of one whole-program link) and drive it with
+  `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness [--filter <File>] [--eager both]`.
+  A targeted single-file check is ~10-20s; a full stdlib sweep is a couple of
+  minutes (a few genuinely compute-heavy tests — deep recursion, big benchmark
+  loops — set that floor, not the tooling). The sweep batches per directory by
+  default (compile the directory's ~40 files ONCE, run each — this removes the
+  per-file sibling re-lowering that dominated on limited-core CI); `--no-batch`
+  restores one child per file for per-file hang isolation.
+- **`zig build itest-<suite>` RECOMPILES the entire itest binary every invocation**
+  (single-core whole-program LLVM, minutes). It is for the CI/pre-commit gate
+  ONLY — NEVER reach for it to iterate or spot-check. If you catch yourself
+  running it more than once, switch to the harness + sweep.
+- **Edit-repro loop (one bug, one program):** the Debug harness
+  (`zig build klio-harness -Dharness-optimize=Debug`, ~16s rebuild, installs
+  `zig-out/bin/klio-harness-Debug`). Its interpreter is ~4x slower per run, so it
+  is for single repros — NEVER sweep a suite on it (a full sweep on Debug is ~5x
+  slower than on the ReleaseSafe harness).
+- **Full pre-commit gate:** `scripts/gate.sh` (`--no-sweep` skips the slow tail).
+
+Never build `itest-bin` (all ~56 binaries) during iteration; never use
+`--watch -fincremental` (broken for this graph — see the plan); prune the GC-less
+cache with `scripts/prune-zig-cache.sh` when it grows.
 
 Debugging knobs:
 
@@ -54,7 +97,6 @@ interpreter:
 | `KLIO_BARE_TRACE=<fn>` | static: how the bare call resolved at lowering (`[bare]`) |
 | `KLIO_MISS_TRACE=<fn>` | dynamic: which runtime dispatch tail missed for that name (`[member-miss]`, `[extfb]`, ...) |
 | `KLIO_NU_TRACE=<fn>` | candidate/visibility detail for hard dispatch cases (`[mev]`, `[strictext]`, ...) |
-| `KLIO_COMPOSE_PLUGIN` | unconditional (no longer read): the `@Composable` lowering plugin + engine runtime is the only compose path |
 | `KLIO_COMPOSE_MEMO=0` / `KLIO_COMPOSE_SKIP=0` | bisect the plugin's lambda-memoization / skip-calculus emission |
 | `kotlinx_coroutines_test_default_timeout=10s` | cap runTest's 60s default timeout (dots-to-underscores env alias for the property) |
 
