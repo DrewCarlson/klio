@@ -16,6 +16,14 @@ const Value = value_mod.Value;
 
 /// A declared Kotlin class as the interpreter sees it at runtime.
 pub const ClassDef = struct {
+    /// A class definition is built once and, after two-phase linking backpatches
+    /// `parent`/`interfaces`/`enum_entries` at single-threaded startup, is
+    /// immutable — the dispatch path already reads it lock-free. Nothing takes an
+    /// exclusive borrow of a class cell (lazily-initialized bits like `companion`
+    /// live in their own nested cells with their own locks), so its reader lock is
+    /// pure overhead; elide it (see `objcell.LockFor`).
+    pub const objref_immutable = true;
+
     name: []const u8,
     fqn: []const u8,
     /// Runtime-retained annotation class names applied to this declaration.

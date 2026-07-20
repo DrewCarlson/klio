@@ -107,6 +107,10 @@ pub const StackFrame = struct {
 pub const StackTraceData = struct {
     frames: []StackFrame,
 
+    /// A captured stack trace is set once at throw time and only read
+    /// thereafter, so its cell is never write-locked; elide the reader lock.
+    pub const objref_immutable = true;
+
     pub fn gcFinalize(self: *StackTraceData, a: std.mem.Allocator) void {
         a.free(self.frames);
     }
@@ -1136,6 +1140,11 @@ pub const SeqOp = union(enum) {
 /// Compiled regex + the original pattern source. The compiled engine is
 /// not in the Zig std; `engine` is an opaque host-provided handle.
 pub const RegexData = struct {
+    /// A compiled regex is immutable after construction (pattern, engine handle,
+    /// and option singletons are all fixed), so its cell is never write-locked;
+    /// elide the reader lock.
+    pub const objref_immutable = true;
+
     pattern: StringRef,
     /// Opaque compiled-regex handle owned by the host regex binding.
     engine: ?*anyopaque,
