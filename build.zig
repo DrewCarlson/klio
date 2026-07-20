@@ -629,6 +629,16 @@ pub fn build(b: *std.Build) void {
     // greedy over descending declared weights, so it is deterministic for a
     // given suite list.
     const shards = ItestShards.fromOption(b);
+    // Serialize the run steps attached to `itest` within a shard. Each
+    // commontest suite spawns a per-core worker pool of child `klio test`
+    // processes; running several suites concurrently oversubscribes the CI
+    // runner many-fold and starves compute-heavy suites below their ratchets
+    // (io_commontest passes ~1120 alone but ~370 when it shares a shard). Chain
+    // each included run step after the previous so exactly one suite runs at a
+    // time with the full core count. Shards still run in parallel across CI
+    // jobs, so wall-clock stays fanned out. (Targeted `itest-<name>` steps and
+    // the fast `test` step are unaffected — only the shard-attached chain.)
+    var prev_itest_run: ?*std.Build.Step = null;
     for (mod_list) |m| {
         if (!m.tested) continue;
         if (std.mem.eql(u8, m.name, "itests")) {
@@ -694,7 +704,11 @@ pub fn build(b: *std.Build) void {
                     b.fmt("{s}#{d}", .{ spec.name, slice_i })
                 else
                     spec.name;
-                if (shards.includes(slice_name)) itest_step.dependOn(&run_t.step);
+                if (shards.includes(slice_name)) {
+                    if (prev_itest_run) |p| run_t.step.dependOn(p);
+                    prev_itest_run = &run_t.step;
+                    itest_step.dependOn(&run_t.step);
+                }
                 one.dependOn(&run_t.step);
                 }
                 // Also install the raw test binary so it can be looped from a
@@ -744,7 +758,11 @@ pub fn build(b: *std.Build) void {
         // as the integration suite; keep them off the fast `test` step. A
         // named step (`zig build itest-e2e`) supports targeted iteration.
         if (runs_programs) {
-            if (shards.includes(m.name)) itest_step.dependOn(&run_t.step);
+            if (shards.includes(m.name)) {
+                if (prev_itest_run) |p| run_t.step.dependOn(p);
+                prev_itest_run = &run_t.step;
+                itest_step.dependOn(&run_t.step);
+            }
             const one = b.step(
                 b.fmt("itest-{s}", .{m.name}),
                 b.fmt("Run the {s} module test", .{m.name}),
