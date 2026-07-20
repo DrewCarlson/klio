@@ -13,9 +13,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.ComposeNode
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.ControlledComposition
 import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshots.ObserverHandle
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlin.coroutines.EmptyCoroutineContext
 
 // ----- color -----
 
@@ -564,6 +568,15 @@ class UiRenderer internal constructor(
 ) {
     private val hits = ArrayList<HitRegion>()
 
+    /** State objects modified since the last recomposition. A snapshot apply
+     * observer records the committed writes here so [recomposeDisplayList] can
+     * hand them to the composition (the recomposer's own apply observer only runs
+     * while its coroutine loop is active, which this synchronous harness never
+     * starts). */
+    private val pendingModifications = HashSet<Any>()
+    private val applyObserver: ObserverHandle =
+        Snapshot.registerApplyObserver { changed, _ -> pendingModifications.addAll(changed) }
+
     /** The key handler of the focused node (set by clicking a node with an
      * `onKey` modifier); key input is delivered here. Re-resolved after every
      * recomposition from [focusAnchorX]/[focusAnchorY] so it always points at the
@@ -612,9 +625,32 @@ class UiRenderer internal constructor(
         return renderDisplayListToPng(path, width * scale, height * scale, list.encoded())
     }
 
-    /** Recompose after a state write, then return the next frame's display list. */
+    /** Recompose after a state write, then return the next frame's display list.
+     * Drives the composition synchronously through the real upstream
+     * `ControlledComposition` API: publish the pending writes, invalidate the
+     * scopes that read them, recompose, and apply the resulting node changes. */
     fun recomposeDisplayList(scale: Int): String {
-        recomposer.recompose()
+        Snapshot.sendApplyNotifications()
+        if (pendingModifications.isNotEmpty()) {
+            val controlled = composition as ControlledComposition
+            controlled.recordModificationsOf(pendingModifications.toSet())
+            pendingModifications.clear()
+            // Recompose inside a read-observing snapshot (mirrors the recomposer's
+            // own `composing`): the read observer re-records the state each scope
+            // reads, so a later write reinvalidates it. Without it a recomposed
+            // scope loses its subscription and only the first write ever takes.
+            val snapshot = Snapshot.takeMutableSnapshot(
+                { value -> controlled.recordReadOf(value) },
+                { value -> controlled.recordWriteOf(value) },
+            )
+            val changed = try {
+                snapshot.enter { controlled.recompose() }
+            } finally {
+                snapshot.apply().check()
+                snapshot.dispose()
+            }
+            if (changed) controlled.applyChanges()
+        }
         return displayList(scale)
     }
 
@@ -688,6 +724,7 @@ class UiRenderer internal constructor(
     }
 
     fun dispose() {
+        applyObserver.dispose()
         composition.dispose()
     }
 }
@@ -760,7 +797,7 @@ fun uiRenderer(width: Int, height: Int, content: @Composable () -> Unit): UiRend
     val root = LayoutNode()
     root.arrangement = "Box"
     root.modifier = Modifier.None.fillMaxSize()
-    val recomposer = Recomposer()
+    val recomposer = Recomposer(EmptyCoroutineContext)
     val composition = Composition(LayoutNodeApplier(root), recomposer)
     composition.setContent(content)
     return UiRenderer(root, width, height, recomposer, composition)
