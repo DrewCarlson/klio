@@ -476,7 +476,7 @@ pub fn classPrimaryParams(a: Allocator, c: *const ast.Class) Allocator.Error![]P
             // Preserve the lowered parameter type (notably a `Function{N}`
             // head for a `T.() -> R` param) so an argument lambda can read
             // its expected arity and drop a synthetic `it`.
-            .ty = try loweredTypeRef(a, &p.ty, false),
+            .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
             .default = null,
             .is_property = p.property != null,
             .is_vararg = p.is_vararg,
@@ -733,6 +733,22 @@ pub fn loweredTypeName(allocator: Allocator, ty: *const ast.TypeRef) Allocator.E
 /// `own_names` every string is duped into `allocator` so the result can
 /// be deep-freed (the phase-1 declared-signature record); body params
 /// borrow the AST names like the rest of the lowered IR.
+/// Rewrite ONLY the top-level head of a lowered parameter type to the file-
+/// scoped `$f{fid}` mangle of a file-private/internal classifier, keyed by the
+/// source reference's own span file (the same rename supertype-name lowering
+/// applies). A member param typed as a file-private `typealias` — kotlinx's
+/// `private typealias Node = LockFreeLinkedListNode` — then carries the mangled
+/// name the type-alias registration holds, so applicability can relate the alias
+/// to its target. Scoped to the head (not generic arguments / function-type
+/// shapes) and to nominal, non-qualified references, so it cannot disturb the
+/// structural type an overload's symbol index reads.
+fn renameParamHead(ty: ir.TypeRef, src: *const ast.TypeRef) ir.TypeRef {
+    if (src.function != null or src.qualified_path != null) return ty;
+    var out = ty;
+    out.name = build.fileTypeRename(ty.name, src.span.file.int()) orelse ty.name;
+    return out;
+}
+
 pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: bool) Allocator.Error!ir.TypeRef {
     var args: std.ArrayList(ir.TypeRef) = .empty;
     errdefer args.deinit(allocator);
@@ -744,19 +760,7 @@ pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: b
         for (ft.params) |*p| try args.append(allocator, try loweredTypeRef(allocator, p, own_names));
         try args.append(allocator, try loweredTypeRef(allocator, &ft.ret, own_names));
     } else {
-        // A reference to a file-private/internal classifier whose simple name
-        // collides across the combined image is lifted under a `$f{fid}`
-        // mangle (see the reuse-gate rename in `interp_ir/build.zig`). Resolve
-        // the reference to that mangled name — keyed by the reference's own
-        // span file — so a param/return/generic-arg type stays consistent with
-        // the mangled decl and its type-alias registration. Matches the
-        // supertype-name lowering, which already applies this rename. A
-        // qualified reference (`Outer.Inner`) keeps its written name.
-        const resolved = if (ty.qualified_path == null)
-            (build.fileTypeRename(ty.name.name, ty.span.file.int()) orelse ty.name.name)
-        else
-            ty.name.name;
-        head = if (own_names) try allocator.dupe(u8, resolved) else resolved;
+        head = if (own_names) try allocator.dupe(u8, ty.name.name) else ty.name.name;
         for (ty.type_args) |*ta| try args.append(allocator, try loweredTypeArg(allocator, ta, own_names));
     }
     if (ty.definitely_non_null) try args.append(allocator, try markerRef(allocator, "#non-null", own_names));
@@ -1368,7 +1372,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         // matching keeps reading only the head name + nullability.
         try params.append(a, .{
             .name = p.name.name,
-            .ty = try loweredTypeRef(a, &p.ty, false),
+            .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
             .default = null,
             .is_property = false,
             .is_vararg = p.is_vararg,
