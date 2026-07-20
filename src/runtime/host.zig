@@ -81,6 +81,9 @@ pub const IntrinsicHost = struct {
         coroutine_has_driver: ?*const fn (ctx: *anyopaque) bool = null,
         /// Spawn a child coroutine. `null` => default (run eagerly).
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
+        /// Schedule a `withTimeout` cancellation gate (`invokeOnTimeout`).
+        /// `null` => default (run eagerly, like a launch with no pump).
+        coroutine_spawn_timeout: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
         /// Mark the pump owning `slot` as driven by an external dispatcher (a
@@ -185,6 +188,15 @@ pub const IntrinsicHost = struct {
     pub fn coroutineLaunch(self: IntrinsicHost, block: *const Value, scope: *const Value, out: Output) !?RuntimeError {
         if (self.vtable.coroutine_launch) |f| return f(self.ctx, block, scope, out);
         const r = try self.invokeCallableWithThis(block, &.{}, scope, out);
+        return switch (r) {
+            .ok => null,
+            .err => |e| e,
+        };
+    }
+
+    pub fn coroutineSpawnTimeout(self: IntrinsicHost, block: *const Value, out: Output) !?RuntimeError {
+        if (self.vtable.coroutine_spawn_timeout) |f| return f(self.ctx, block, out);
+        const r = try self.invokeCallable(block, &.{}, out);
         return switch (r) {
             .ok => null,
             .err => |e| e,

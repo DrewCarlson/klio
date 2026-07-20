@@ -15,6 +15,10 @@ package kotlinx.coroutines
 import kotlin.coroutines.*
 
 internal fun __kxco_spawn(block: () -> Unit) {}
+// Schedule a `withTimeout` cancellation gate. Distinct from `__kxco_spawn`
+// so the host re-homes the gate onto the pump of the undispatched block it
+// cancels (they share one timer queue), letting the earliest deadline fire.
+internal fun __kxco_spawnTimeout(block: () -> Unit) {}
 internal fun __kxco_delayMillis(millis: Long) {}
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 internal fun __kxco_newSlot(): Long = 0L
@@ -222,7 +226,7 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)
@@ -262,7 +266,7 @@ internal object KlioDefaultDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)
@@ -301,7 +305,7 @@ internal object KlioIoDispatcher : CoroutineDispatcher(), Delay {
         context: CoroutineContext
     ): DisposableHandle {
         val gate = TimeoutGate(block)
-        __kxco_spawn {
+        __kxco_spawnTimeout {
             if (!gate.isDisposed()) {
                 val slot = __kxco_newSlot()
                 gate.bindSlot(slot)

@@ -1780,6 +1780,20 @@ fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
+/// `__kxco_spawnTimeout { … }` — schedule a `withTimeout` cancellation gate.
+/// Distinct from `__kxco_spawn` so the gate can be re-homed onto the pump of
+/// the undispatched block it cancels, sharing that block's timer queue.
+fn spawnTimeoutBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__kxco_spawnTimeout: expected the timeout block as the first arg" } };
+    }
+    const lam = ctx.args[0];
+    if (try ctx.host.coroutineSpawnTimeout(&lam, ctx.out)) |e| {
+        return .{ .err = e };
+    }
+    return .{ .ok = .Unit };
+}
+
 /// `__kxco_dispatch { … }` — post a `Dispatchers.Default` runnable onto
 /// the shared dispatcher worker pool (the CPU-bounded view). The body,
 /// its captures, and any value it returns cross threads; each shared
@@ -1945,6 +1959,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_schedulerEnqueue", .f = schedulerEnqueue },
     .{ .fqn = "kotlinx.coroutines.__kxco_schedulerDrainCount", .f = schedulerDrainCount },
     .{ .fqn = "kotlinx.coroutines.__kxco_spawn", .f = spawnLaunchBlock },
+    .{ .fqn = "kotlinx.coroutines.__kxco_spawnTimeout", .f = spawnTimeoutBlock },
     .{ .fqn = "kotlinx.coroutines.__kxco_dispatch", .f = dispatchCoroutine },
     .{ .fqn = "kotlinx.coroutines.internal.synchronizedImpl", .f = synchronizedImpl },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_systemProp", .f = kxcoSystemProp },

@@ -335,6 +335,10 @@ pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *cons
     return coroutines.coroutineLaunch(self, block, scope, out);
 }
 
+pub fn coroutineSpawnTimeout(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    return coroutines.coroutineSpawnTimeout(self, block, out);
+}
+
 pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
     coroutines.coroutineArmSlot(self, slot);
 }

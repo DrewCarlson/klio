@@ -764,6 +764,17 @@ pub const CooperativeInterceptor = struct {
     ready: std.ArrayList(u64),
     /// Child `launch` blocks queued during the active scope.
     launched: std.ArrayList(Value),
+    /// `withTimeout` timeout-gate blocks (`invokeOnTimeout`) scheduled on
+    /// THIS pump while its body was executing. A gate cancels the timed
+    /// block, so it must share the block's timer queue — but the block runs
+    /// as its OWN nested pump (an undispatched `startCoroutineUnintercepted…`
+    /// split). `coroutineStartRootOrSuspended` claims a parent's pending
+    /// gates and, once it sees the block actually suspend, commits them onto
+    /// the block's (child) pump so the earliest deadline across the two
+    /// timers fires first. A gate no nested block claims (e.g. a bare
+    /// `select { onTimeout(…) }`) is promoted into `launched` by the pump
+    /// loop and runs on this pump as an ordinary timer.
+    timeout_launched: std.ArrayList(Value),
     /// Set by `__kxco_parkSlot` immediately before the activation
     /// unwinds with an indefinite suspend; consumed by the next
     /// `interceptSuspend` to bind that token to the slot.
@@ -808,6 +819,7 @@ pub const CooperativeInterceptor = struct {
             .parked = std.AutoHashMap(u64, ParkedEntry).init(allocator),
             .ready = .empty,
             .launched = .empty,
+            .timeout_launched = .empty,
             .pending_slot = null,
             .slot_to_token = std.AutoHashMap(i64, u64).init(allocator),
             .token_resume_value = std.AutoHashMap(u64, Value).init(allocator),
@@ -826,6 +838,7 @@ pub const CooperativeInterceptor = struct {
             for (e.scope_delta) |v| v.gcMark(m);
         }
         for (self.launched.items) |v| v.gcMark(m);
+        for (self.timeout_launched.items) |v| v.gcMark(m);
         var rit = self.token_resume_value.valueIterator();
         while (rit.next()) |v| v.gcMark(m);
     }
@@ -848,6 +861,8 @@ pub const CooperativeInterceptor = struct {
         // references do not leak when the interceptor is torn down.
         if (runtime.reclaimEnabled()) for (self.launched.items) |b| b.release(self.allocator);
         self.launched.deinit(self.allocator);
+        if (runtime.reclaimEnabled()) for (self.timeout_launched.items) |b| b.release(self.allocator);
+        self.timeout_launched.deinit(self.allocator);
         self.slot_to_token.deinit();
         self.token_resume_value.deinit();
     }
@@ -1034,6 +1049,33 @@ pub const CooperativeInterceptor = struct {
     pub fn enqueueLaunch(self: *CooperativeInterceptor, block: Value) Allocator.Error!void {
         if (runtime.reclaimEnabled()) block.retain();
         try self.launched.append(self.allocator, block);
+    }
+
+    /// Seam: queue a `withTimeout` timeout-gate block (see `timeout_launched`).
+    /// The queue owns one reference until the block is claimed and re-homed.
+    pub fn enqueueTimeout(self: *CooperativeInterceptor, block: Value) Allocator.Error!void {
+        if (runtime.reclaimEnabled()) block.retain();
+        try self.timeout_launched.append(self.allocator, block);
+    }
+
+    /// Take the pending timeout-gate blocks (owned by `allocator`). Each
+    /// carries the reference the enqueue took; the caller re-homes it onto
+    /// another pump's `launched` or `timeout_launched` (keeping the retain)
+    /// or releases it.
+    pub fn drainTimeouts(self: *CooperativeInterceptor, allocator: Allocator) Allocator.Error![]Value {
+        const out = try self.timeout_launched.toOwnedSlice(allocator);
+        self.timeout_launched = .empty;
+        return out;
+    }
+
+    /// Move any timeout-gate blocks no nested pump claimed into `launched`,
+    /// so the ordinary drain runs them on THIS pump as plain timers (the
+    /// bare `select { onTimeout(…) }` path, with no undispatched block to
+    /// share a timer queue with). Keeps each block's enqueue reference.
+    pub fn promoteTimeouts(self: *CooperativeInterceptor) Allocator.Error!void {
+        if (self.timeout_launched.items.len == 0) return;
+        for (self.timeout_launched.items) |b| try self.launched.append(self.allocator, b);
+        self.timeout_launched.clearRetainingCapacity();
     }
 
     /// Seam: next ready token, if any.
@@ -1799,6 +1841,19 @@ fn park(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Er
     return parkInto(top, allocator, st, scope_base);
 }
 
+/// Return `withTimeout` timeout gates claimed for a child pump back to the
+/// enclosing pump (the one directly beneath the child just pushed). Used when
+/// the timed block does NOT suspend on its own pump — a synchronous completion
+/// or a synchronous throw — so the gate is drained (and no-ops on its disposed
+/// state) by the enclosing pump rather than firing at a finished block. Each
+/// Value keeps the reference its enqueue took; the enclosing pump releases it.
+fn handBackTimeoutsToParent(timeouts: []const Value) void {
+    if (timeouts.len == 0) return;
+    if (coro_stack.items.len < 2) return; // no enclosing pump (nothing enqueued one)
+    const parent = &coro_stack.items[coro_stack.items.len - 2];
+    for (timeouts) |g| parent.launched.append(parent.allocator, g) catch {};
+}
+
 /// Park into a SPECIFIC pump. An activation resumed inline runs on whatever
 /// stack resumed it, which may sit under a nested pump; it still belongs to the
 /// pump it was parked in, and must go back there — `coroTop()` would hand it to
@@ -2074,6 +2129,12 @@ fn pumpLoop(
         //     cancelled child's stale timer) and dies with the pump,
         //     exactly as upstream `runBlocking` returns without it.
         if (!persist and root_token.* == null) break;
+
+        // 0b'. Any `withTimeout` timeout gate no nested block claimed (a bare
+        //      `select { onTimeout(…) }`, whose `invokeOnTimeout` has no
+        //      undispatched body to share a timer queue with) runs as an
+        //      ordinary timer on THIS pump: promote it into the launch queue.
+        try (coroTop().?).promoteTimeouts();
 
         // 0c. While this pump still has work to run at the current virtual
         //     instant — a queued launch to start, or a coroutine already
@@ -2526,6 +2587,20 @@ pub fn coroutineHasDriver() bool {
 /// ByteChannel write side.
 pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
+    // A `withTimeout` schedules its cancellation gate on the ENCLOSING pump
+    // (`invokeOnTimeout` runs before the block starts undispatched), then runs
+    // the block as its OWN nested pump here. The gate and the block share one
+    // logical timer queue — the gate cancels the block — so claim the gate off
+    // the enclosing pump and re-home it onto the block's (child) pump below.
+    // Drained before the push so the enclosing pump's own loop never promotes
+    // it first.
+    var pending_timeouts: []Value = &.{};
+    if (coroTop()) |parent| {
+        if (parent.timeout_launched.items.len != 0)
+            pending_timeouts = try parent.drainTimeouts(a);
+    }
+    defer a.free(pending_timeouts);
+
     try coroPush(a);
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
@@ -2542,14 +2617,33 @@ pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Valu
     var root_token: ?u64 = null;
     const root_scope_base = scope_depth;
     switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
-        .ok => |v| root_value = v,
+        .ok => |v| {
+            root_value = v;
+            // Completed without suspending: the timeout is moot. Hand the gate
+            // back to the enclosing pump, which drains it after the block's
+            // coroutine completion disposes it (a no-op) — exactly as before
+            // this re-homing, and without firing a timeout at a finished block.
+            handBackTimeoutsToParent(pending_timeouts);
+        },
         .err => |e| switch (e) {
-            .Suspended => |st| root_token = try park(a, st, root_scope_base),
+            .Suspended => |st| {
+                root_token = try park(a, st, root_scope_base);
+                // The block genuinely suspended: commit the gate onto its pump
+                // so the earliest of the two deadlines (timeout vs. the block's
+                // own `delay`/await) fires first. Each Value keeps the reference
+                // its enqueue took; the child pump releases it when drained.
+                if (pending_timeouts.len != 0) {
+                    const top = coroTop().?;
+                    for (pending_timeouts) |g| try top.launched.append(top.allocator, g);
+                }
+            },
             .Throw => |v| {
+                handBackTimeoutsToParent(pending_timeouts);
                 try pumpExit(self, out, true);
                 return .{ .err = .{ .Thrown = v } };
             },
             else => {
+                handBackTimeoutsToParent(pending_timeouts);
                 try pumpExit(self, out, true);
                 return .{ .err = mapDriverErr(a, e) };
             },
@@ -2572,6 +2666,24 @@ pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *cons
         return null;
     }
     // No active runBlocking — run the child eagerly.
+    const r = try intrinsic_host.invokeCallable(self, block, &.{}, out);
+    return switch (r) {
+        .ok => null,
+        .err => |e| e,
+    };
+}
+
+/// `withTimeout`'s `invokeOnTimeout` schedules its cancellation gate through
+/// this. The gate belongs with the block it cancels, which runs as its own
+/// nested pump (the undispatched split); queue the gate on a distinct list so
+/// `coroutineStartRootOrSuspended` can move it onto that pump and let the
+/// earliest of the two deadlines fire first. A gate scheduled with no
+/// enclosing pump runs eagerly, exactly like a bare launch.
+pub fn coroutineSpawnTimeout(self: *VmIntrinsicHost, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    if (coroTop()) |top| {
+        try top.enqueueTimeout(block.*);
+        return null;
+    }
     const r = try intrinsic_host.invokeCallable(self, block, &.{}, out);
     return switch (r) {
         .ok => null,
