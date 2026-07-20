@@ -2649,10 +2649,42 @@ pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, ou
     // go back on the pump queue, which is where they ran before.
     if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
     if (inline_turn_resumes >= INLINE_TURN_BUDGET) return false;
+    // Dispatcher FIFO on a `runBlocking` event loop: if the pump owning this
+    // slot already has other ready coroutines queued, the inline shortcut would
+    // jump ahead of them. Upstream's event-loop dispatcher runs queued resumes
+    // in the order they were posted, so a `yield` (or any dispatched resume)
+    // must fall behind a coroutine a native channel/StateFlow waiter already
+    // made ready. Defer to the queue — `coroutineResumeExternal` appends behind
+    // the ready work, and the Wall pump's own loop drains it in order.
+    //
+    // Scoped to Wall pumps (`runBlocking`): a Virtual pump (`runTest`) drives
+    // its body through inline resumes with no pump turn, and routes native
+    // channel deliveries through the scheduler's own dispatch queue
+    // (`__kxco_chanResumeRoute`), so deferring there would strand the resume
+    // (including a teardown cancel) with nothing to drain it. The inline
+    // shortcut also stays sound whenever the ready queue is empty (it then IS
+    // the next task), preserving the fast path and the compose recomposition
+    // chain, which resumes into an empty queue.
+    if (ownerReadyPending(slot)) return false;
     inline_turn_resumes += 1;
     inline_depth += 1;
     defer inline_depth -= 1;
     return resumeInlineOnce(self, slot, value, out);
+}
+
+/// Does a Wall-mode (`runBlocking`) pump on this thread that owns `slot` already
+/// have other ready coroutines queued? Used to keep an inline resume from
+/// jumping that event loop's FIFO queue. A Virtual (`runTest`) pump is exempt —
+/// its scheduler drives inline and orders channel deliveries elsewhere.
+fn ownerReadyPending(slot: i64) bool {
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const drv = &coro_stack.items[i];
+        if (drv.slot_to_token.get(slot) != null)
+            return drv.mode == .Wall and drv.ready.items.len > 0;
+    }
+    return false;
 }
 
 /// Is `slot` held by a pump on this thread and parked (not this pump's root)?
