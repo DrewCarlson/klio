@@ -2300,6 +2300,11 @@ fn runFrameInner(
             spinDumpMaybe();
             const wall_dl = test_wall_deadline_ms.load(.monotonic);
             if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+                // A caught hang should say WHERE it looped, not just that it did.
+                // Dump the live frame chain (innermost first, with file:line) so
+                // the culprit function/recursion is named at the abort point.
+                std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+                dumpFrameChainForDiagAlways();
                 return errResult(.{ .Type = "test wall-clock deadline exceeded" });
             }
         }

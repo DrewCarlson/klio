@@ -24,7 +24,15 @@ failure/cancelled. Runs on `ubuntu-latest`, Zig 0.16 Debug harness: `unit tests`
 
 2. **Genuine pre-existing interpreter bugs** (reproduce alone, `KLIO_COMPOSE_PLUGIN=0`
    too — not compose):
-   - [IN PROGRESS] `parity_lambdas_and_dispatch.bounded_type_param_ext_requires_bound`:
+   - [FIXED, gating stdlib] `parity_lambdas_and_dispatch.bounded_type_param_ext_requires_bound`:
+     FIX = `receiverViolatesTypeParamBound` (host_call_member.zig) only enforced the
+     type-param bound for `.Instance` receivers; broadened to any decidable receiver
+     (Instance + concrete builtins, whose `isRuntimeType` supertype set is authoritative),
+     excluding only erased function/lambda values (`.Function/.IrClosure/.Intrinsic/
+     .BoundMethod/.BoundUserMethod`, undecidable vs a functional-interface bound via SAM).
+     Verified: all 45 parity_lambdas tests pass (10s, binary-direct). The earlier 31-min
+     "spin" was a stale/racy partial build, NOT the fix's logic. Gating on stdlib both
+     shards (1020/1276) before commit. ORIGINAL (superseded):
      `class Outer{fun halve()="outer-member"}; fun <T:Number> T.halve()="number-ext";
      with(Outer()){with("str"){halve()}}` prints `number-ext`, expects `outer-member`
      (String does not satisfy `T:Number`, so the outer member must win). ROOT CAUSE
@@ -41,6 +49,23 @@ failure/cancelled. Runs on `ubuntu-latest`, Zig 0.16 Debug harness: `unit tests`
      bound too (not just the strict path) — or make both paths consult
      `func_type_param_bounds` for a bounded receiver type param. Verify: itest-parity_lambdas_and_dispatch
      green + stdlib both shards still 1020/1276 (dispatch is highest-blast-radius).
+   - [FIXED] `parity_coroutines_realistic.coroutine_scope_block` +
+     `with_timeout_or_null_...`: both HUNG (genuine spin/stall, >150s). Root-caused
+     via the new pump stall dump (frame names + barrier state): `coroutineScope`/
+     `withTimeoutOrNull` push a NESTED pump (pump[1]) on the SAME thread's
+     `coro_stack` above the `runBlocking` pump (pump[0], parked indefinitely waiting
+     for the scope). pump[1] holds the real `delay` timers (wake=2,3) but the global
+     virtual-clock barrier (`VirtualClock.mayFire`/`minOtherFloor`) refused to let it
+     advance because pump[0]'s stale finite floor sat below the timer — and pump[0],
+     frozen beneath pump[1], can never advance or post a cross-pump resume. Cross-pump
+     deadlock. FIX (coroutines.zig `minOtherFloor` + `onCurrentThreadStack`): the
+     barrier exists to order pumps racing on DIFFERENT threads; same-thread pumps are
+     strictly nested frozen ancestors and must be excluded from the floor comparison.
+     `coro_stack` is thread-local, so a slot whose `clock_id` is in this thread's stack
+     is a frozen ancestor and is skipped. Cross-thread gating (Dispatchers.Default) is
+     unchanged. Also: both pump wall-deadline sites + the eval-loop deadline now dump
+     the stalled state (parked-token frame names + `VirtualClock` slots/floors) so a
+     caught hang names WHERE and WHY, per the user's request.
    - [TODO] `parity_inheritance_dispatch.private_shadow_field_distinct_cells` +
      `private_shadow_var_writes_own_cell`.
    - [TODO] `ktor_server` routing: GET returns non-200. Coroutine divergence — with

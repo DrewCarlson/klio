@@ -705,8 +705,14 @@ pub fn build(b: *std.Build) void {
                 else
                     spec.name;
                 if (shards.includes(slice_name)) {
-                    if (prev_itest_run) |p| run_t.step.dependOn(p);
-                    prev_itest_run = &run_t.step;
+                    // Serialize only under an explicit shard (CI): chaining the
+                    // run steps otherwise leaks into the targeted `itest-<name>`
+                    // step (which depends on the same run step) so a single named
+                    // run pulls the whole suite.
+                    if (shards.active()) {
+                        if (prev_itest_run) |p| run_t.step.dependOn(p);
+                        prev_itest_run = &run_t.step;
+                    }
                     itest_step.dependOn(&run_t.step);
                 }
                 one.dependOn(&run_t.step);
@@ -759,8 +765,10 @@ pub fn build(b: *std.Build) void {
         // named step (`zig build itest-e2e`) supports targeted iteration.
         if (runs_programs) {
             if (shards.includes(m.name)) {
-                if (prev_itest_run) |p| run_t.step.dependOn(p);
-                prev_itest_run = &run_t.step;
+                if (shards.active()) {
+                    if (prev_itest_run) |p| run_t.step.dependOn(p);
+                    prev_itest_run = &run_t.step;
+                }
                 itest_step.dependOn(&run_t.step);
             }
             const one = b.step(
@@ -848,6 +856,13 @@ const ItestShards = struct {
     fn includes(self: *const ItestShards, name: []const u8) bool {
         const sel = self.selected orelse return true;
         return sel.contains(name);
+    }
+
+    /// True when an explicit `-Ditest-shard=K/N` was given (the CI path). Only
+    /// then do the shard's run steps serialize into a chain; the default `itest`
+    /// and targeted `itest-<name>` steps must not inherit that chain.
+    fn active(self: *const ItestShards) bool {
+        return self.selected != null;
     }
 
     fn badShardOption(raw: []const u8) noreturn {
