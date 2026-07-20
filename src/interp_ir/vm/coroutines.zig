@@ -739,6 +739,12 @@ pub const CooperativeInterceptor = struct {
     /// This pump's root activation while it is parked; an inline resume never
     /// steals it (the pump publishes the root's value and stops on it).
     root_tok: ?u64 = null,
+    /// Set once a native channel delivery to one of this pump's waiters routed
+    /// through an external dispatcher's queue (`__kxco_chanResumeRoute` code 1 —
+    /// a `runTest` `TestCoroutineScheduler`). Such a pump orders its dispatched
+    /// resumes on that scheduler, not `drv.ready`, so the inline-resume FIFO
+    /// deferral (`ownerReadyPending`) must stay off for it.
+    scheduler_backed: bool = false,
     /// A failure raised by an activation this pump owns that ran INLINE (on a
     /// resumer's stack, outside the drive loop). The loop cannot see it there,
     /// so it is left here and raised on the next turn, exactly as if the loop
@@ -2662,17 +2668,46 @@ pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, ou
     return resumeInlineOnce(self, slot, value, out);
 }
 
-/// Does a Wall-mode (`runBlocking`) pump on this thread that owns `slot` already
-/// have other ready coroutines queued? Used to keep an inline resume from
-/// jumping that event loop's FIFO queue. A Virtual (`runTest`) pump is exempt —
-/// its scheduler drives inline and orders channel deliveries elsewhere.
+/// Mark the pump on this thread that owns `slot` as driven by an external
+/// dispatcher (a `runTest` `TestCoroutineScheduler`): a native channel delivery
+/// to one of its waiters routed through that dispatcher's own queue
+/// (`__kxco_chanResumeRoute` code 1) rather than the pump's ready queue. Such a
+/// pump orders its dispatched resumes elsewhere, so the inline shortcut must NOT
+/// defer them to `drv.ready` — doing so strands them until the scheduler idles.
+/// Falls back to the innermost pump when the slot is not bound to a pump yet.
+pub fn markSlotOwnerSchedulerBacked(slot: i64) void {
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const drv = &coro_stack.items[i];
+        if (drv.slot_to_token.get(slot) != null) {
+            drv.scheduler_backed = true;
+            return;
+        }
+    }
+    if (coro_stack.items.len != 0) coro_stack.items[coro_stack.items.len - 1].scheduler_backed = true;
+}
+
+/// Does a pump on this thread that owns `slot` have a live parked coroutine
+/// queued ready that this resume must fall behind? A dispatched resume (a
+/// `yield`, a pump-backed channel delivery) runs its dispatcher's FIFO queue in
+/// post order, so it must not jump a coroutine already made ready — this holds
+/// under BOTH time modes for a plain pump. A `scheduler_backed` pump (`runTest`)
+/// keeps the inline shortcut: it orders its dispatched resumes on the
+/// `TestCoroutineScheduler`, not `drv.ready`. Stale `ready` tokens (already
+/// resumed inline, no `parked` entry) never count.
 fn ownerReadyPending(slot: i64) bool {
     var i: usize = coro_stack.items.len;
     while (i > 0) {
         i -= 1;
         const drv = &coro_stack.items[i];
-        if (drv.slot_to_token.get(slot) != null)
-            return drv.mode == .Wall and drv.ready.items.len > 0;
+        if (drv.slot_to_token.get(slot) != null) {
+            if (drv.scheduler_backed) return false;
+            for (drv.ready.items) |rtok| {
+                if (drv.parked.contains(rtok)) return true;
+            }
+            return false;
+        }
     }
     return false;
 }

@@ -83,6 +83,11 @@ pub const IntrinsicHost = struct {
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
+        /// Mark the pump owning `slot` as driven by an external dispatcher (a
+        /// `runTest` `TestCoroutineScheduler`): a channel delivery to one of its
+        /// waiters routed through that dispatcher, not the pump queue. `null` =>
+        /// no-op.
+        mark_slot_owner_scheduler_backed: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         /// Push / pop the active coroutine scope around an undispatched
         /// block run inline in the caller's activation
         /// (`startCoroutineUninterceptedOrReturn`). `null` => no-op.
@@ -204,6 +209,10 @@ pub const IntrinsicHost = struct {
 
     pub fn coroutineResumeSlotValue(self: IntrinsicHost, slot: i64, value: Value) void {
         if (self.vtable.coroutine_resume_slot_value) |f| f(self.ctx, slot, value);
+    }
+
+    pub fn markSlotOwnerSchedulerBacked(self: IntrinsicHost, slot: i64) void {
+        if (self.vtable.mark_slot_owner_scheduler_backed) |f| f(self.ctx, slot);
     }
 
     pub fn activeCoroScope(self: IntrinsicHost) ?Value {

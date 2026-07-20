@@ -466,6 +466,10 @@ fn ivCoroutinePopScope(ctx: *anyopaque) void {
 fn ivCoroutineResumeSlotValue(ctx: *anyopaque, slot: i64, value: Value) void {
     intrinsic_host.coroutineResumeSlotValue(ip(ctx), slot, value);
 }
+fn ivMarkSlotOwnerSchedulerBacked(ctx: *anyopaque, slot: i64) void {
+    _ = ctx;
+    intrinsic_host.markSlotOwnerSchedulerBacked(slot);
+}
 fn ivActiveCoroScope(ctx: *anyopaque) ?Value {
     return intrinsic_host.activeCoroScope(ip(ctx));
 }
@@ -527,6 +531,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_push_scope = ivCoroutinePushScope,
     .coroutine_pop_scope = ivCoroutinePopScope,
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
+    .mark_slot_owner_scheduler_backed = ivMarkSlotOwnerSchedulerBacked,
     .active_coro_scope = ivActiveCoroScope,
     .lookup_global_func = ivLookupGlobalFunc,
     .coroutine_resume_external = ivCoroutineResumeExternal,

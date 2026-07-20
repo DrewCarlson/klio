@@ -357,6 +357,10 @@ pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value)
     coroutines.coroutineResumeSlotValue(self, slot, value);
 }
 
+pub fn markSlotOwnerSchedulerBacked(slot: i64) void {
+    coroutines.markSlotOwnerSchedulerBacked(slot);
+}
+
 pub fn activeCoroScope(self: *VmIntrinsicHost) ?Value {
     _ = self;
     return coroutines.activeCoroScope();
