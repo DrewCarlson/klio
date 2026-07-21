@@ -1515,11 +1515,18 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const key_block = ctx.args[1];
     const has_value_transform = ctx.args.len == 3;
     var entries: std.ArrayList(MapPair) = .empty;
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     for (items) |v| {
+        runtime.keepaliveRestore(loop_keepalive);
+        runtime.keepalivePushPairs(entries.items);
         const key = switch (try invoke(ctx, &key_block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
+        runtime.keepalivePush(key);
         // The value is `valueTransform(v)` (owned) or the element itself
         // (borrowed — the map takes its own ref). key is owned either way.
         var value = v;
@@ -1532,9 +1539,11 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             };
             value_owned = true;
         }
+        runtime.keepalivePush(value);
         if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
+                key.release(a);
                 if (!value_owned) value.retain();
             }
             entries.items[i].value = value;
@@ -3771,22 +3780,34 @@ pub fn mergedPullOne(
     iter_left: *?Value,
     iter_right: *?Value,
 ) Error!union(enum) { value: Value, done, err: RuntimeError } {
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    if (iter_left.*) |v| runtime.keepalivePush(v);
+    if (iter_right.*) |v| runtime.keepalivePush(v);
     if (iter_left.* == null) {
         const li = (try host.invokeMethod(&mz.left.asPtr().*, "iterator", &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: receiver lacks iterator()" } };
         switch (li) {
-            .ok => |v| iter_left.* = v,
+            .ok => |v| {
+                iter_left.* = v;
+                runtime.keepalivePush(v);
+            },
             .err => |e| return .{ .err = e },
         }
         const ri = (try host.invokeMethod(&mz.right.asPtr().*, "iterator", &.{}, out)) orelse
             return .{ .err = .{ .Type = "zip: argument lacks iterator()" } };
         switch (ri) {
-            .ok => |v| iter_right.* = v,
+            .ok => |v| {
+                iter_right.* = v;
+                runtime.keepalivePush(v);
+            },
             .err => |e| return .{ .err = e },
         }
     }
     const lit = iter_left.*.?;
     const rit = iter_right.*.?;
+    runtime.keepalivePush(lit);
+    runtime.keepalivePush(rit);
     const lh = (try host.invokeMethod(&lit, "hasNext", &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks hasNext" } };
     switch (lh) {
@@ -3804,11 +3825,13 @@ pub fn mergedPullOne(
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    runtime.keepalivePush(av);
     const bv = switch ((try host.invokeMethod(&rit, "next", &.{}, out)) orelse
         return .{ .err = .{ .Type = "zip: iterator lacks next" } }) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
+    runtime.keepalivePush(bv);
     if (mz.transform) |t| {
         return switch (try seqCall(host, t.asPtr(), &.{ av, bv }, out)) {
             .value => |v| .{ .value = v },
@@ -3863,7 +3886,11 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             // generator never materialises past the consumer's demand.
             while (true) {
                 if (takeCapReached(seq.ops, st.taken)) break;
-                const step = try host.builderStep(bstate, out);
+                const output_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(output.items);
+                const stepped = host.builderStep(bstate, out);
+                runtime.keepaliveRestore(output_keepalive);
+                const step = try stepped;
                 const item = switch (step) {
                     .value => |val| val,
                     .done => break,
@@ -3898,7 +3925,11 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             while (true) {
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const candidate = if (cur) |v| v else blk: {
-                    const r = switch (try seqCall(host, gen.next.asPtr(), &.{}, out)) {
+                    const output_keepalive = runtime.keepaliveMark();
+                    runtime.keepalivePushSlice(output.items);
+                    const called = seqCall(host, gen.next.asPtr(), &.{}, out);
+                    runtime.keepaliveRestore(output_keepalive);
+                    const r = switch (try called) {
                         .value => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -3917,7 +3948,11 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 if (max) |m| {
                     if (output.items.len >= m) break;
                 }
-                const nxt = switch (try seqCall(host, gen.next.asPtr(), &.{candidate}, out)) {
+                const output_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(output.items);
+                const called = seqCall(host, gen.next.asPtr(), &.{candidate}, out);
+                runtime.keepaliveRestore(output_keepalive);
+                const nxt = switch (try called) {
                     .value => |v| v,
                     .err => |e| return .{ .err = e },
                 };
@@ -3930,7 +3965,13 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 .value => |v| v,
                 .err => |e| return .{ .err = e },
             };
+            const iter_keepalive = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(iter_keepalive);
+            runtime.keepalivePush(iter);
             while (true) {
+                const loop_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(output.items);
+                defer runtime.keepaliveRestore(loop_keepalive);
                 if (takeCapReached(seq.ops, st.taken)) break;
                 const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
                     return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
@@ -3992,7 +4033,11 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             const bstate = try freshBuilderState(host, a, bstate0);
             try pinBuilderState(a, bstate);
             while (true) {
-                const step = try host.builderStep(bstate, out);
+                const items_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(items.items);
+                const stepped = host.builderStep(bstate, out);
+                runtime.keepaliveRestore(items_keepalive);
+                const step = try stepped;
                 switch (step) {
                     .value => |val| try items.append(a, val),
                     .done => break,
@@ -4017,7 +4062,11 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             } else null;
             while (items.items.len < limit) {
                 const candidate = if (cur) |v| v else blk: {
-                    const r = switch (try seqCall(host, gen.next.asPtr(), &.{}, out)) {
+                    const items_keepalive = runtime.keepaliveMark();
+                    runtime.keepalivePushSlice(items.items);
+                    const called = seqCall(host, gen.next.asPtr(), &.{}, out);
+                    runtime.keepaliveRestore(items_keepalive);
+                    const r = switch (try called) {
                         .value => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -4025,7 +4074,11 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                     break :blk r;
                 };
                 try items.append(a, candidate);
-                const nxt = switch (try seqCall(host, gen.next.asPtr(), &.{candidate}, out)) {
+                const items_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(items.items);
+                const called = seqCall(host, gen.next.asPtr(), &.{candidate}, out);
+                runtime.keepaliveRestore(items_keepalive);
+                const nxt = switch (try called) {
                     .value => |v| v,
                     .err => |e| return .{ .err = e },
                 };
@@ -4038,7 +4091,13 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 .value => |v| v,
                 .err => |e| return .{ .err = e },
             };
+            const iter_keepalive = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(iter_keepalive);
+            runtime.keepalivePush(iter);
             while (true) {
+                const loop_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(items.items);
+                defer runtime.keepaliveRestore(loop_keepalive);
                 const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
                     return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
                 const has = switch (hn) {
@@ -4058,7 +4117,11 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
             var lit: ?Value = null;
             var rit: ?Value = null;
             while (true) {
-                switch (try mergedPullOne(a, host, out, mz, &lit, &rit)) {
+                const items_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(items.items);
+                const pulled = mergedPullOne(a, host, out, mz, &lit, &rit);
+                runtime.keepaliveRestore(items_keepalive);
+                switch (try pulled) {
                     .value => |item| try items.append(a, item),
                     .done => break,
                     .err => |e| return .{ .err = e },
@@ -4453,13 +4516,13 @@ pub fn coll_list_last_index(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.sum")) {
+    if (ctx.args.len == 0) return typeErr("Iterable.sum requires a receiver");
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "Iterable.sum")) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const g = it.borrow();
-    defer g.deinit();
-    return sumValues(a, g.get().items, "List.sum");
+    defer if (runtime.freeScratch()) a.free(items);
+    return sumValues(a, items, "Iterable.sum");
 }
 
 /// Sum a numeric element slice, returning the Kotlin result type for the
@@ -4926,7 +4989,7 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
-    defer if (runtime.freeScratch()) a.free(xs);
+            defer if (runtime.freeScratch()) a.free(xs);
             try out.appendSlice(a, xs);
         },
         else => try out.append(a, arg),
@@ -6704,7 +6767,7 @@ pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    defer if (runtime.freeScratch()) a.free(items);
+        defer if (runtime.freeScratch()) a.free(items);
         const block = ctx.args[1];
         var n: i64 = 0;
         for (items) |v| {
@@ -7222,7 +7285,7 @@ pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    defer if (runtime.freeScratch()) a.free(xs);
+        defer if (runtime.freeScratch()) a.free(xs);
         try items.appendSlice(a, xs);
     }
     switch (other) {
@@ -7231,7 +7294,7 @@ pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
                 .items => |x| x,
                 .err => |e| return e,
             };
-    defer if (runtime.freeScratch()) a.free(xs);
+            defer if (runtime.freeScratch()) a.free(xs);
             try items.appendSlice(a, xs);
         },
         else => try items.append(a, other),
@@ -7980,6 +8043,18 @@ test "list sum mixes int and double" {
     const r = try coll_list_sum(&c);
     try testing.expect(r == .ok and r.ok == .Double);
     try testing.expectEqual(@as(f64, 3.5), r.ok.Double);
+}
+
+test "iterable sum accepts an array-backed iterable" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const array = try makeArray(a, &.{ .{ .UByte = 200 }, .{ .UByte = 200 } }, null);
+    const args = [_]Value{array};
+    var c = h.ctx(&args);
+    const r = try coll_list_sum(&c);
+    try testing.expect(r == .ok and r.ok == .UInt);
+    try testing.expectEqual(@as(u32, 400), r.ok.UInt);
 }
 
 test "primitive companion const for Int" {
