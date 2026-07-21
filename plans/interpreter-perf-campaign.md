@@ -331,10 +331,16 @@ unchanged from the 5 pre-existing):
   ~1058 sites but was UNSOUND for the serialized base image: it baked methods of `open`
   classes, which a consumer could override — reverted in favour of the final-class gate.
 
-  Next coverage step (not yet done): per-method final-ness — a non-`open` method inside an
-  `open` class is also un-overridable. `ir.Func` carries `is_override`; add the method's
-  own `open` flag and bake `!method.is_open` members too (the runtime `MethodDef` already
-  serializes per-method `is_open`).
+- **Per-method final-ness on an OPEN receiver class** — LANDED. Even when the receiver
+  class is `open`, a method that is itself final (neither `open` nor `override` — an
+  `override` is open-by-default) can never be overridden, so `recv.name()` resolving to it
+  is monomorphic. Added `is_open` to `ir.Func` (threaded from the AST; NOT serialized —
+  read only for a freshly-lowered func, whose flag is trustworthy, so no format change).
+  `finalReceiverMethod` now bakes when EITHER the receiver class is final (condition 1) OR
+  the resolved method is a fresh final func (condition 2); an image-decoded base method
+  stays on the walk. `~923` sites. Validated: stdlib sweep unchanged (5 pre-existing),
+  examples byte-identical. `final override` is conservatively left on the walk (`ast.Function`
+  has no `is_final`, so it is indistinguishable from a plain `override`).
 
 ## Method
 

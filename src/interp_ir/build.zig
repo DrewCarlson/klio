@@ -3440,10 +3440,22 @@ fn finalReceiverMethod(module: *ir.Module, declared_recv: ?ir.ConstId, name: []c
     const cid = module.classId(h) orelse return null;
     if (cid.int() >= module.classes.items.len) return null;
     const c = &module.classes.items[cid.int()];
-    // Final = not `open` and not abstract/interface/sealed (the latter three fold
-    // into `is_abstract` at lowering).
-    if (c.is_open or c.is_abstract) return null;
-    return resolveMethodInHierarchy(module, cid, name, n_args, 0);
+    const m = resolveMethodInHierarchy(module, cid, name, n_args, 0) orelse return null;
+    // Condition 1 — the RECEIVER class is final (not `open`, not
+    // abstract/interface/sealed): it can never be subclassed, so `recv` is
+    // exactly `C` and the resolved method is the unique target regardless of its
+    // own modifiers.
+    if (!c.is_open and !c.is_abstract) return m;
+    // Condition 2 — the receiver class is open, but the resolved METHOD is itself
+    // un-overridable: neither `open` nor `override` (an `override` is open by
+    // default). Trusted only for a freshly-lowered func — an image-decoded base
+    // method does not carry `is_open` (it is not serialized), so it stays on the
+    // walk rather than risk a false "final".
+    if (m.int() >= module.func_header_offsets.len) {
+        const mf = module.funcById(m) orelse return null;
+        if (!mf.is_open and !mf.is_override) return m;
+    }
+    return null;
 }
 
 /// First body-bearing, arity-compatible method named `name` in class `cid`'s
