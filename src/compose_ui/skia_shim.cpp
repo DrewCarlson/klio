@@ -57,6 +57,21 @@
 #include "include/ports/SkFontMgr_empty.h"
 #endif
 
+// Windowing-backend capability marker, baked into the shim's data section so
+// `klio bundle` can read it by a byte scan (works for the host and for a
+// cross-target shim) and fail fast when a windowed Compose UI program would
+// otherwise ship against the stub backend — which cannot open a window and
+// exits silently. The values track the backend #if selection further down.
+#if defined(KLIO_SDL)
+extern "C" const char klio_win_backend_tag[] = "klio-win-backend:sdl";
+#elif defined(_WIN32)
+extern "C" const char klio_win_backend_tag[] = "klio-win-backend:win32";
+#elif defined(__APPLE__) && defined(KLIO_COCOA)
+extern "C" const char klio_win_backend_tag[] = "klio-win-backend:cocoa";
+#else
+extern "C" const char klio_win_backend_tag[] = "klio-win-backend:stub";
+#endif
+
 // Optional GPU (Ganesh + EGL) backend — off by default. When built with -DKLIO_GPU
 // (and linked against libskia_ganesh_ext + libEGL), klio_skia_new_gpu returns a
 // GPU-backed surface; otherwise it returns null and callers fall back to raster.

@@ -320,6 +320,23 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
             io.printStderr(gpa, "error: this is a UI bundle but no Skia backend library was found for {s}; build it (zig build skia-lib) or set KLIO_SKIA_LIB\n", .{target});
             return 1;
         };
+        // A windowed Compose UI program (one that calls runApp) needs a real
+        // window backend; a shim built without one (the stub) still renders
+        // offscreen but its `winOpen` returns null, so the app would open no
+        // window and exit silently. Fail fast. Offscreen-only bundles
+        // (uiRenderer -> PNG) don't open a window, so they're exempt.
+        if (programOpensWindow(user.texts)) {
+            switch (skiaWindowSupport(shim_bytes.?)) {
+                .ok => {},
+                .stub => {
+                    io.printStderr(gpa, "error: this Compose UI program opens a window (runApp), but the Skia backend for {s} has no windowing support (it renders offscreen only, so the app would open no window and exit silently).\n  {s}\n", .{ target, rebuildHint(target) });
+                    return 1;
+                },
+                .unknown => {
+                    io.printStderr(gpa, "warning: cannot confirm the Skia backend for {s} supports a window (no capability marker); if the bundle opens no window, {s}\n", .{ target, rebuildHint(target) });
+                },
+            }
+        }
     }
 
     var icon_bytes: ?[]const u8 = null;
@@ -614,6 +631,48 @@ pub fn shimFileName(target: []const u8) []const u8 {
     if (std.mem.startsWith(u8, target, "macos")) return "libklio_skia.dylib";
     if (std.mem.startsWith(u8, target, "windows")) return "klio_skia.dll";
     return "libklio_skia.so";
+}
+
+/// Whether the program opens a window: it references `runApp`, the single
+/// windowing entrypoint in `klio.compose.ui` (offscreen `uiRenderer` bundles
+/// don't). A source scan is enough — runApp is the only window entry.
+fn programOpensWindow(texts: [][]const u8) bool {
+    for (texts) |t| {
+        if (std.mem.indexOf(u8, t, "runApp") != null) return true;
+    }
+    return false;
+}
+
+const ShimWindowSupport = enum { ok, stub, unknown };
+
+/// Read the shim's baked windowing-backend marker (`skia_shim.cpp`
+/// `klio_win_backend_tag`) by a byte scan — works for the host shim and a
+/// cross-target one alike. `stub` means the backend cannot open a window;
+/// `unknown` means the marker is absent (a shim predating the marker).
+fn skiaWindowSupport(shim: []const u8) ShimWindowSupport {
+    const marker = "klio-win-backend:";
+    const idx = std.mem.indexOf(u8, shim, marker) orelse return .unknown;
+    const start = idx + marker.len;
+    var end = start;
+    while (end < shim.len and isTagChar(shim[end])) : (end += 1) {}
+    const kind = shim[start..end];
+    if (std.mem.eql(u8, kind, "stub")) return .stub;
+    return .ok;
+}
+
+fn isTagChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+}
+
+/// The actionable "rebuild the backend" hint for the target's OS.
+fn rebuildHint(target: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, target, "macos")) {
+        return "rebuild the backend with `zig build skia-lib -Dskia -Dcocoa -Dgpu`, or use a UI-enabled klio build.";
+    }
+    if (std.mem.startsWith(u8, target, "windows")) {
+        return "rebuild the backend with a Win32 windowing build of the Skia shim, or use a UI-enabled klio build.";
+    }
+    return "rebuild the backend with `zig build skia-lib -Dskia` after installing libsdl2-dev (or `scripts/fetch-sdl.sh` + `-Dsdl-static`), or use a UI-enabled klio build.";
 }
 
 /// Whether the whole-program image bake is attempted (default yes;
@@ -958,6 +1017,21 @@ test "parseInclude splits path:mount" {
 test "defaultMount is main-relative, else basename" {
     try std.testing.expectEqualStrings("assets/a.txt", defaultMount("app/assets/a.txt", "app/main.kt"));
     try std.testing.expectEqualStrings("a.txt", defaultMount("elsewhere/a.txt", "app/main.kt"));
+}
+
+test "skiaWindowSupport reads the backend marker" {
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("....klio-win-backend:cocoa\x00..."));
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("klio-win-backend:sdl"));
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("x klio-win-backend:win32 y"));
+    try std.testing.expectEqual(ShimWindowSupport.stub, skiaWindowSupport("junk klio-win-backend:stub junk"));
+    try std.testing.expectEqual(ShimWindowSupport.unknown, skiaWindowSupport("a plain dylib with no marker"));
+}
+
+test "programOpensWindow detects runApp, not offscreen uiRenderer" {
+    var windowed = [_][]const u8{"fun main() { runApp(80, 52, 8, \"t\", -1) { } }"};
+    try std.testing.expect(programOpensWindow(&windowed));
+    var offscreen = [_][]const u8{"fun main() { val ui = uiRenderer(16, 10) { }; ui.savePng(\"x\", 8) }"};
+    try std.testing.expect(!programOpensWindow(&offscreen));
 }
 
 test "defaultOutput strips .kt and appends .exe on windows" {

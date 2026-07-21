@@ -255,6 +255,17 @@ the bundling `klio` (`zig build skia-lib`) or at `KLIO_SKIA_LIB`. The
 library name is per-OS: `libklio_skia.so` (Linux), `libklio_skia.dylib`
 (macOS), `klio_skia.dll` (Windows).
 
+A program that opens a window (`runApp`) needs a backend built with a
+real windowing layer. A shim built without one — the *stub* backend,
+which still renders offscreen — cannot open a window, so such a bundle
+would launch and exit silently. Bundling catches this and fails fast:
+the shim carries a backend marker (`cocoa`, `sdl`, `win32`, or `stub`)
+that the bundler reads and refuses to ship a windowed program against a
+stub. Build a windowing backend with `zig build skia-lib -Dskia -Dcocoa
+-Dgpu` (macOS) or `-Dskia` with `libsdl2-dev` (Linux). Offscreen-only
+bundles (`uiRenderer` → PNG, no `runApp`) are exempt — the stub renders
+them fine.
+
 ```sh
 $ klio bundle counter.kt -o counter
 bundled counter (42.3 MB, ui): stdlib + androidx.collection + androidx.compose.runtime + klio.compose.ui + kotlinx.atomicfu + kotlinx.coroutines + skia backend
@@ -411,6 +422,11 @@ Bundle-time errors:
 - `error: this is a UI bundle but no Skia backend library was found for <target>; build it (zig build skia-lib) or set KLIO_SKIA_LIB`
   — a UI bundle needs the rendering backend to embed; build it or
   point `KLIO_SKIA_LIB` at one.
+- `error: this Compose UI program opens a window (runApp), but the Skia backend for <target> has no windowing support ...`
+  — the shim was built without a windowing layer (the stub backend), so
+  a windowed app would open no window and exit silently. Rebuild the
+  backend with `zig build skia-lib -Dskia -Dcocoa -Dgpu` (macOS) or
+  `-Dskia` + `libsdl2-dev` (Linux), or use a UI-enabled klio build.
 - `error: the macos-arm64 stub is not a code-signed Mach-O and cannot be bundled`
   — an arm64 macOS stub must carry the linker's ad-hoc signature (its
   `__TEXT`/`__LINKEDIT` layout is read to re-sign); the provided stub
