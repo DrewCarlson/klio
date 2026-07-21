@@ -14,10 +14,16 @@ import klio.compose.ui.uiRenderer
 
 fun main() {
     val count = mutableStateOf(0)
+    val hovered = mutableStateOf(false)
 
     val ui = uiRenderer(20, 16) {
         Column(Modifier.None.background(Color.Gray).padding(1)) {
-            Button("ADD", Modifier.None.background(Color.Blue)) {
+            Button(
+                "ADD",
+                Modifier.None
+                    .background(if (hovered.value) Color.Blue else Color.Blue)
+                    .onHover { hovered.value = it },
+            ) {
                 count.value = count.value + 1
             }
             Text("N " + count.value, Color.Black, Modifier.None.padding(1))
@@ -33,6 +39,13 @@ fun main() {
     println(ui.click(3, 3))
     println("--- after click #2 ---")
     println(ui.click(3, 3))
+
+    // Moving within the same hover region again does not write new state. The
+    // renderer returns the already-recorded frame instead of rebuilding it.
+    val hoverFrame = ui.hover(3, 3, 1)
+    val repeatedHoverFrame = ui.hover(3, 3, 1)
+    println("--- unchanged hover reused frame ---")
+    println(hoverFrame === repeatedHoverFrame)
 
     ui.dispose()
 }

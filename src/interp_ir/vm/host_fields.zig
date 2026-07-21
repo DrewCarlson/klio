@@ -482,9 +482,9 @@ pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *
 /// fallbacks discard it while probing the next receiver. Recognizable by its
 /// prefix, so a static `.Unimplemented` literal is never freed. No-op unless a
 /// freeing backend is active.
-fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
+pub fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
     if (!runtime.freeScratch()) return;
-    if (e == .Unimplemented and std.mem.indexOf(u8, e.Unimplemented, "Vm::get_field") != null) {
+    if (e == .Unimplemented and std.mem.startsWith(u8, e.Unimplemented, "Vm::get_field")) {
         allocator.free(e.Unimplemented);
     }
 }
@@ -3765,4 +3765,10 @@ test "containsStr / matchAny membership" {
     try testing.expect(!containsStr(&xs, "c"));
     try testing.expect(matchAny("members", &.{ "x", "members" }));
     try testing.expect(!matchAny("nope", &.{ "x", "members" }));
+}
+
+test "discarded field probes release their owned miss message" {
+    const msg = try testing.allocator.dupe(u8, "Vm::get_field `x` on `T`");
+    freeFieldMiss(testing.allocator, .{ .Unimplemented = msg });
+    freeFieldMiss(testing.allocator, .{ .Unimplemented = "nested: Vm::get_field is static" });
 }

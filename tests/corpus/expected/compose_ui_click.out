@@ -16,3 +16,5 @@ rect 1 1 13 7 FF2196F3
 text 2 7 5 FFFFFFFF ADD
 text 2 14 5 FF000000 N 2
 
+--- unchanged hover reused frame ---
+true

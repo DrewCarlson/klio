@@ -4598,11 +4598,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (got == .ok) {
             const pv = got.ok;
             if (pv == .Instance) {
-                const r = try callValueRec(self, allocator, &pv, args);
-                pv.release(allocator);
-                return r;
+                defer pv.release(allocator);
+                return try callValueRec(self, allocator, &pv, args);
             }
             pv.release(allocator);
+        } else {
+            host_fields.freeFieldMiss(allocator, got.err);
         }
     }
 
@@ -4778,7 +4779,7 @@ fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
     if (!runtime.freeScratch()) return;
     if (r == .err and r.err == .Unimplemented) {
         const m = r.err.Unimplemented;
-        if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+        if (std.mem.startsWith(u8, m, "Vm::call_member")) allocator.free(m);
     }
 }
 
@@ -10887,7 +10888,14 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
 
     // Class-hierarchy method walk for a class-qualified lowered name.
     if (receiver.* == .Instance) {
-        if (try instanceMethodWalkNamed(self, allocator, receiver, name, args, null)) |r| return r;
+        const fallback = instanceMethodWalkNamed(self, allocator, receiver, name, args, null) catch |alloc_err| {
+            freeDispatchMiss(allocator, primary);
+            return alloc_err;
+        };
+        if (fallback) |r| {
+            freeDispatchMiss(allocator, primary);
+            return r;
+        }
     }
     return primary;
 }
@@ -12244,6 +12252,12 @@ test "compareValuesBuiltin orders scalars and strings" {
     const b = try runtime.strInit(testing.allocator, "abd");
     defer b.deinit();
     try testing.expectEqual(Ordering.lt, compareValuesBuiltin(&.{ .String = a }, &.{ .String = b }).?);
+}
+
+test "discarded member probes release their owned miss message" {
+    const msg = try testing.allocator.dupe(u8, "Vm::call_member `f` on `T`");
+    freeDispatchMiss(testing.allocator, .{ .err = .{ .Unimplemented = msg } });
+    freeDispatchMiss(testing.allocator, .{ .err = .{ .Unimplemented = "nested: Vm::call_member is static" } });
 }
 
 test {

@@ -773,9 +773,9 @@ fn funcReturnRegType(module: *const Module, func: *const Func) RegType {
     // Seed `.unknown` before inferring so a recursive (or mutually recursive)
     // callee re-entering here sees the in-progress entry and stops, instead of
     // looping forever; the real result overwrites it below.
-    ret_type_cache.put(std.heap.page_allocator, key, .unknown) catch {};
-    const inferred = inferScalarReturnType(std.heap.page_allocator, module, func) orelse .unknown;
-    ret_type_cache.put(std.heap.page_allocator, key, inferred) catch {};
+    ret_type_cache.put(metadata_allocator, key, .unknown) catch {};
+    const inferred = inferScalarReturnType(metadata_allocator, module, func) orelse .unknown;
+    ret_type_cache.put(metadata_allocator, key, inferred) catch {};
     return inferred;
 }
 
@@ -3413,6 +3413,14 @@ pub fn setFuncEnabledForTest(on: bool) void {
 
 threadlocal var states: std.AutoHashMapUnmanaged(usize, *FuncJit) = .empty;
 
+/// Small JIT bookkeeping and compiler data must be packed by a general-purpose
+/// allocator. `page_allocator` rounds every FuncJit/count/attempt allocation up
+/// to an OS page; a broad framework such as Compose touches thousands of cold
+/// functions and otherwise retains several pages for each one before compiling
+/// even a single native unit. Executable buffers still use the W^X mmap path in
+/// `jit.finalize`.
+const metadata_allocator = runtime.slab.allocator;
+
 /// Total compiled native units (loops + function bodies) cached on this thread.
 /// Bounds the per-thread cache so a long-running process — or a worker that runs
 /// many programs in the in-process test harness — does not retain compiled code
@@ -3442,9 +3450,10 @@ fn clearStates() void {
     var it = states.valueIterator();
     while (it.next()) |s| {
         s.*.deinit();
-        std.heap.page_allocator.destroy(s.*);
+        metadata_allocator.destroy(s.*);
     }
-    states.clearAndFree(std.heap.page_allocator);
+    states.clearAndFree(metadata_allocator);
+    ret_type_cache.clearAndFree(metadata_allocator);
     compiled_units = 0;
 }
 
@@ -3468,7 +3477,7 @@ pub fn resetForTest() void {
 }
 
 fn forFunc(func: *const Func) ?*FuncJit {
-    const a = std.heap.page_allocator;
+    const a = metadata_allocator;
     const key = @intFromPtr(func);
     if (func.blocks.len == 0) return null;
     const fp = @intFromPtr(func.blocks.ptr);
@@ -3838,7 +3847,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         fj.func_count += 1;
         if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
-        const compiled = tryCompileFunc(std.heap.page_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
+        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
         if (compiled == null) return null;
         if (debugEnabled()) std.debug.print("[jit] compiled function {s}\n", .{func.name});
         fj.func_jit = compiled;
@@ -3852,11 +3861,11 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
     }
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;
-    defer if (heap_slots) |hs| std.heap.page_allocator.free(hs);
+    defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
         stack_slots[0..cl.n_slots]
     else blk: {
-        heap_slots = std.heap.page_allocator.alloc(i64, cl.n_slots) catch return null;
+        heap_slots = metadata_allocator.alloc(i64, cl.n_slots) catch return null;
         break :blk heap_slots.?;
     };
     return runFunc(cl, regs.items, params, slots, tramp, user);
@@ -3874,7 +3883,7 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
-        const compiled = tryCompile(std.heap.page_allocator, module, func, cur, regs.items, resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
+        const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
         if (compiled == null) {
             // A transient bail (an object register snapshot held null) is worth
             // retrying a few times; a permanent bail is cached immediately.
@@ -3904,15 +3913,23 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
     // stack buffer; the rare larger loop falls back to a freed heap allocation.
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;
-    defer if (heap_slots) |hs| std.heap.page_allocator.free(hs);
+    defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
         stack_slots[0..cl.n_slots]
     else blk: {
-        heap_slots = std.heap.page_allocator.alloc(i64, cl.n_slots) catch return null;
+        heap_slots = metadata_allocator.alloc(i64, cl.n_slots) catch return null;
         break :blk heap_slots.?;
     };
     return switch (runLoop(cl, regs.items, slots, tramp, user)) {
         .resume_at => |res| res,
         .bail => null,
     };
+}
+
+test "JIT metadata uses packed storage and resets pointer-keyed caches" {
+    const testing = std.testing;
+    try testing.expect(metadata_allocator.vtable != std.heap.page_allocator.vtable);
+    try ret_type_cache.put(metadata_allocator, 1, .i32);
+    resetForTest();
+    try testing.expectEqual(@as(usize, 0), ret_type_cache.count());
 }
