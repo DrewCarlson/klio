@@ -14,11 +14,17 @@
 #   5. build                 zig build -> zig-out/bin/klio
 #   6. packs (opt-in)        build + install the shipped library packs into ~/.klio
 #
+# The Compose-UI window/GPU backend is enabled automatically: macOS builds the
+# Cocoa window + Metal surface (-Dcocoa -Dgpu); Linux builds the Ganesh GL/EGL
+# surface (-Dgpu) when a display is attached (DISPLAY / WAYLAND_DISPLAY) and
+# stays headless-raster otherwise. Pass --headless to force a headless build.
+#
 # Usage:
-#   scripts/bootstrap.sh                 # full setup + debug build
+#   scripts/bootstrap.sh                 # full setup + build (auto window/GPU backend)
 #   scripts/bootstrap.sh --release       # build with -Doptimize=ReleaseFast
 #   scripts/bootstrap.sh --packs         # also install the shipped packs into ~/.klio
-#   scripts/bootstrap.sh --no-skia       # skip the Skia backend (headless-only build)
+#   scripts/bootstrap.sh --headless      # build without the window/GPU backend
+#   scripts/bootstrap.sh --no-skia       # skip the Skia backend entirely
 #   scripts/bootstrap.sh --no-build      # set up sources only, don't compile
 set -euo pipefail
 
@@ -28,9 +34,10 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 DO_SKIA=1
 DO_BUILD=1
 DO_PACKS=0
+DO_GPU=1
 BUILD_ARGS=()
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,11 +45,25 @@ while [ $# -gt 0 ]; do
         --no-skia) DO_SKIA=0 ;;
         --no-build) DO_BUILD=0 ;;
         --packs) DO_PACKS=1 ;;
+        --headless|--no-gpu) DO_GPU=0 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
     shift
 done
+
+# Host os/arch in the naming fetch-skia.sh / build.zig use (macos-arm64, etc.).
+case "$(uname -s)" in
+    Linux) HOST_OS=linux ;;
+    Darwin) HOST_OS=macos ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) HOST_OS=windows ;;
+    *) HOST_OS=unknown ;;
+esac
+case "$(uname -m)" in
+    x86_64|amd64) HOST_ARCH=x64 ;;
+    aarch64|arm64) HOST_ARCH=arm64 ;;
+    *) HOST_ARCH=unknown ;;
+esac
 
 step() { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
@@ -89,9 +110,40 @@ else
 fi
 
 # --- 5. build --------------------------------------------------------------
+# Window/GPU backend flags for the Skia shim, chosen per platform. These options
+# are only registered by build.zig when the shim is built, so pass them only when
+# Skia is on and its libs are actually present (else zig errors on -Dcocoa/-Dgpu).
+gpu_args=()
+skia_lib="third_party/skia/${HOST_OS}-${HOST_ARCH}/out/Release-${HOST_OS}-${HOST_ARCH}/libskia.a"
+[ "$HOST_OS" = windows ] && skia_lib="${skia_lib%.a}.lib"
+if [ "$DO_GPU" -eq 1 ] && [ "$DO_SKIA" -eq 1 ] && [ -f "$skia_lib" ]; then
+    case "$HOST_OS" in
+        macos)
+            # Cocoa window + Metal surface. Metal falls back to raster at runtime
+            # if bring-up fails, so this is always safe to enable on macOS.
+            gpu_args=(-Dcocoa -Dgpu)
+            ;;
+        linux)
+            # The SDL window backend auto-links when libSDL2 is present; add the
+            # Ganesh GL/EGL GPU surface only with a display attached (it falls
+            # back to raster if the GL/EGL libs are missing regardless).
+            if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+                gpu_args=(-Dgpu)
+            fi
+            ;;
+    esac
+fi
+
 if [ "$DO_BUILD" -eq 1 ]; then
-    step "build (zig build ${BUILD_ARGS[*]:-})"
-    zig build "${BUILD_ARGS[@]}"
+    step "build (zig build ${BUILD_ARGS[*]:-} ${gpu_args[*]:-})"
+    if [ "${#gpu_args[@]}" -gt 0 ]; then
+        note "window/GPU backend: ${gpu_args[*]}"
+    elif [ "$DO_GPU" -eq 0 ]; then
+        note "window/GPU backend: disabled (--headless)"
+    elif [ "$DO_SKIA" -eq 1 ] && [ "$HOST_OS" = linux ]; then
+        note "window/GPU backend: headless (no DISPLAY/WAYLAND_DISPLAY detected)"
+    fi
+    zig build "${BUILD_ARGS[@]}" "${gpu_args[@]}"
     note "built zig-out/bin/klio"
 else
     step "build -- skipped (--no-build)"

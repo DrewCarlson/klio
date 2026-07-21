@@ -241,9 +241,13 @@ zig build test
 ```
 
 `bootstrap.sh` is idempotent — every phase is a no-op when already
-satisfied, so it is safe to re-run to repair a partial setup or pick up a
-moved submodule pin. The individual steps it runs, if you prefer to run
-them by hand:
+satisfied, so it is safe to re-run to repair a partial setup, widen a stale
+sparse checkout, or pick up a moved submodule pin. It also selects the
+Compose-UI window/GPU backend automatically: the Cocoa window + Metal surface
+on macOS, and the Ganesh GL/EGL surface on Linux when a display is attached
+(`DISPLAY`/`WAYLAND_DISPLAY`), staying headless-raster otherwise. Pass
+`--headless` to force a headless build. The individual steps it runs, if you
+prefer to run them by hand:
 
 ```sh
 git submodule update --init --recursive    # kotlinx + ktor vendor sources
@@ -251,7 +255,7 @@ git submodule update --init --recursive    # kotlinx + ktor vendor sources
 ./scripts/init-compose-submodule.sh         # compose-multiplatform-core (sparse)
 ./scripts/init-androidx-collection-submodule.sh
 ./scripts/fetch-skia.sh                     # Compose-UI Skia backend (host target)
-zig build
+zig build -Dcocoa -Dgpu                     # macOS window + Metal (drop the flags for headless)
 ```
 
 Zig 0.16.0+ is required (pinned in `build.zig.zon`).
