@@ -214,13 +214,42 @@ arg-sig, context) key, and that key is insufficient to distinguish the coroutine
 member-ext overloads/contexts — so it serves wrong fids broadly and hangs the machinery.
 NOT merged (left in worktree `agent-a98a7b41b750ea981`, revertable).
 
-CONCLUSION: a *runtime* cache cannot safely capture member-extension resolution in the
-coroutine core. The ~9% is locked behind correctness that needs **lowering-time static
-resolution** — resolve the extension by the receiver's STATIC type at the `CallMember`
-build (Kotlin dispatches extensions statically), proving the target at compile time where
-the type context is known, and bake it into `Inst.CallMember.resolved` (read-only at
-runtime; the runtime infra already exists). That is the correct large follow-up; the
-runtime-cache path is a dead end here.
+CONCLUSION (runtime cache): a *runtime* cache cannot safely capture member-extension
+resolution in the coroutine core — a dead end.
+
+### THEN TRIED — lowering-time static extension bake (correct, validated, but FLAT)
+
+Built the correct approach with a SAFE two-phase methodology (worktree agent): a
+post-lowering `bakeMemberExtCallSites()` pass resolves a `recv.name()` call to a UNIQUE
+member-extension (name maps to exactly one function module-wide, owned by the callsite's
+lexical enclosing-class chain, receiver-type conformant or unambiguous) and stores it in
+`Inst.CallMember.resolved`. Phase 1 kept the walk driving dispatch while asserting
+`baked_fid == walk_fid` (`KLIO_BAKE_ASSERT`); Phase 2 (`invokeResolvedMember`) dispatches
+the baked fid, replaying the member-ext owner-find + `pushEnclosing`, falling back to the
+walk if the owner is unreachable (verify-on-hit).
+
+RESULT: **correctness is a clean GO** — 33 callsites bake, **0 mismatches** across 1803
+matches (coro bench + channel/async/flow/stdlib programs), checksums and outputs
+byte-identical ON/OFF, `nextChild` walk-hits 1462→0. But **NO measurable perf win**
+(coro bench ON 10590ms vs OFF 10673ms = 0.8%, noise; `findScalarLast` unchanged).
+
+ROOT CAUSE (redirects the whole dispatch front): `findScalarLast` is **not** in the
+candidate-resolution walk that baking eliminates — it is in `receiverImplementsType` /
+hierarchy-conformance checks (`subtypeDepth`, `applicSubtypeCb`) that compare type names
+via `simpleName`, and these run in BOTH the walk AND the baked owner-find
+(`memberExtOwnerInstance`). Skipping the resolution scan leaves the conformance-check cost
+intact. NOT merged (correct + validated + revertable in worktree
+`agent-a9cd16d0b092e74c3`; adds an IR field + image-version bump for no current benefit).
+
+### THE ACTUAL DISPATCH LEVER (next, if pursued)
+
+Make type-conformance checks IDENTITY-based, not name-based: `receiverImplementsType` /
+`subtypeDepth` / `applicSubtypeCb` compare class SIMPLE NAMES (`simpleName` →
+`findScalarLast`) when they could compare resolved class-cell identities / precomputed
+supertype-id sets. This is where the ~10% `findScalarLast` actually lives, and it helps
+EVERY dispatch (member walk, extension walk, owner-find) — not just the baked path.
+Care: two classes can share a simple name (the builtin-vs-user clash rule), so the
+identity comparison must resolve to the exact class, not the name.
 
 ## Method
 
