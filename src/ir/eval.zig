@@ -436,6 +436,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
         for (f.enclosing_this.items) |e| e.v.gcMark(m);
+        f.pending_finally.gcMark(m);
         markFrameClosure(f.closure_id, m);
     }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
@@ -450,11 +451,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         var i = head;
         while (i < items.len) : (i += 1) {
             const snap = items[i];
-            for (snap.regs) |v| v.gcMark(m);
-            for (snap.params) |v| v.gcMark(m);
-            for (snap.captures) |v| v.gcMark(m);
-            for (snap.enclosing_this) |e| e.v.gcMark(m);
-            markFrameClosure(snap.closure_id, m);
+            gcMarkSnapshot(snap, m);
         }
     }
 }
@@ -479,11 +476,19 @@ pub fn gcInstallFrameRoot() void {
     runtime.gc.registerThreadRoot(&frame_troot);
 }
 
-/// Unlink this thread's frame-chain root node at its exit seam.
+/// Unlink this thread's frame-chain root node at its exit seam and release the
+/// libc-backed register buffers cached by this thread.  Big-stack test and
+/// intrinsic workers are short-lived, so process-lifetime pooling would leak
+/// one cache per completed worker.
 pub fn gcUninstallFrameRoot() void {
-    if (!frame_troot_inited) return;
-    runtime.gc.unregisterThreadRoot(&frame_troot);
-    frame_troot_inited = false;
+    if (frame_troot_inited) {
+        runtime.gc.unregisterThreadRoot(&frame_troot);
+        frame_troot_inited = false;
+    }
+    if (runtime.gc.gc_enabled and regs_pool.items.len > 0) {
+        drainRegsPool(std.heap.c_allocator);
+        regs_pool.deinit(std.heap.c_allocator);
+    }
 }
 
 /// Capture the live call stack (innermost-first) as `StackFrame`s. Each entry
@@ -984,6 +989,22 @@ pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry 
     return out.toOwnedSlice(allocator);
 }
 
+fn traceEnclosingEntries(label: []const u8, entries: []const EnclosingEntry) void {
+    std.debug.print("[{s}]", .{label});
+    for (entries, 0..) |e, i| {
+        if (e.v == .Instance) {
+            const ig = e.v.Instance.borrow();
+            const cg = ig.get().class.borrow();
+            std.debug.print(" [{d}]{s}/{s}", .{ i, cg.get().name, @tagName(e.kind) });
+            cg.deinit();
+            ig.deinit();
+        } else {
+            std.debug.print(" [{d}]{s}/{s}", .{ i, @tagName(e.v), @tagName(e.kind) });
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 /// Backing allocator for a frame's `enclosing_this` chain. The chain is
 /// frame-scoped (created and torn down with the frame, or copied verbatim into
 /// a `FrameSnapshot` on suspend), so it is backed by the same per-call
@@ -1064,6 +1085,41 @@ pub const TryFrame = struct {
     finally_done: ?BlockId,
 };
 
+const PendingRethrow = struct { key: BlockId, exc: Value, depth: usize };
+const PendingReturn = struct { key: BlockId, val: Value };
+const PendingUnwind = struct { key: BlockId, err: EvalError, depth: usize };
+
+/// Control flow paused while a `finally` body runs. It belongs to the active
+/// frame so the GC can trace it, and moves into/out of a frame snapshot when
+/// that finally body suspends.
+const PendingFinallyState = struct {
+    rethrow: ?PendingRethrow = null,
+    return_value: ?PendingReturn = null,
+    unwind: ?PendingUnwind = null,
+
+    fn payloadOfError(err: EvalError) ?Value {
+        return switch (err) {
+            .Throw => |v| v,
+            .NonLocalReturn => |v| v,
+            .LabeledReturn => |lr| lr.value,
+            else => null,
+        };
+    }
+
+    fn gcMark(self: PendingFinallyState, marker: *runtime.gc.Marker) void {
+        if (self.rethrow) |p| p.exc.gcMark(marker);
+        if (self.return_value) |p| p.val.gcMark(marker);
+        if (self.unwind) |p| if (payloadOfError(p.err)) |v| v.gcMark(marker);
+    }
+
+    fn release(self: *PendingFinallyState, allocator: Allocator) void {
+        if (self.rethrow) |p| p.exc.release(allocator);
+        if (self.return_value) |p| p.val.release(allocator);
+        if (self.unwind) |p| if (payloadOfError(p.err)) |v| v.release(allocator);
+        self.* = .{};
+    }
+};
+
 /// One paused `evalWithCaptures` activation. Enough to re-enter the
 /// block loop exactly where it left off.
 pub const FrameSnapshot = struct {
@@ -1076,7 +1132,9 @@ pub const FrameSnapshot = struct {
     block: BlockId,
     /// Index of the *next* instruction to run within `block.insts`.
     inst_idx: usize,
-    regs: []Value,
+    /// Register values needed after the suspension point. The resume path
+    /// always recreates the full register file, filling dead slots with Unit.
+    regs: SnapshotRegisters,
     params: []Value,
     captures: []Value,
     /// The frame's enclosing-`this` chain (innermost last) at the suspension
@@ -1087,6 +1145,7 @@ pub const FrameSnapshot = struct {
     /// recovered from process-global state the resuming thread happens to hold.
     enclosing_this: []EnclosingEntry,
     try_stack: []TryFrame,
+    pending_finally: PendingFinallyState = .{},
     is_lambda: bool,
     /// Register the resumed value is written into before execution
     /// continues (the destination of the suspending call site).
@@ -1097,6 +1156,295 @@ pub const FrameSnapshot = struct {
     /// slot or sweep its capture store.
     closure_id: ?u64 = null,
 };
+
+const SavedReg = struct {
+    id: u32,
+    value: Value,
+};
+
+pub const SnapshotRegisters = union(enum) {
+    dense: []Value,
+    sparse: []SavedReg,
+
+    fn byteLen(self: SnapshotRegisters) usize {
+        return switch (self) {
+            .dense => |values| values.len * @sizeOf(Value),
+            .sparse => |entries| entries.len * @sizeOf(SavedReg),
+        };
+    }
+
+    pub fn ptrIdentity(self: SnapshotRegisters) usize {
+        return switch (self) {
+            .dense => |values| @intFromPtr(values.ptr),
+            .sparse => |entries| @intFromPtr(entries.ptr),
+        };
+    }
+
+    fn savedLen(self: SnapshotRegisters) usize {
+        return switch (self) {
+            .dense => |values| values.len,
+            .sparse => |entries| entries.len,
+        };
+    }
+
+    fn isDense(self: SnapshotRegisters) bool {
+        return self == .dense;
+    }
+};
+
+const SuspendLiveKey = struct {
+    func: *const Func,
+    block: u32,
+    inst_idx: usize,
+};
+
+/// Per-thread because evaluation and its suspend/resume chain stay on one
+/// mutator until an explicit dispatcher handoff. Each site is analysed once;
+/// the cache is cleared at the program boundary before its Func pointers can
+/// expire.
+threadlocal var suspend_live_cache: std.AutoHashMapUnmanaged(SuspendLiveKey, []u32) = .empty;
+threadlocal var suspend_stats_enabled: ?bool = null;
+threadlocal var suspend_stats_total: usize = 0;
+threadlocal var suspend_stats_dense: usize = 0;
+threadlocal var suspend_stats_slots: usize = 0;
+threadlocal var suspend_stats_saved: usize = 0;
+threadlocal var suspend_stats_params: usize = 0;
+threadlocal var suspend_stats_captures: usize = 0;
+threadlocal var suspend_stats_receivers: usize = 0;
+
+fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usize, captures: usize, receivers: usize) void {
+    const enabled = suspend_stats_enabled orelse blk: {
+        const on = runtime.getenvSlice("KLIO_SUSPEND_STATS") != null;
+        suspend_stats_enabled = on;
+        break :blk on;
+    };
+    if (!enabled) return;
+    suspend_stats_total += 1;
+    suspend_stats_dense += @intFromBool(dense);
+    suspend_stats_slots += total;
+    suspend_stats_saved += saved;
+    suspend_stats_params += params;
+    suspend_stats_captures += captures;
+    suspend_stats_receivers += receivers;
+    if (suspend_stats_total % 50_000 == 0) {
+        std.debug.print("[suspend-stats] snapshots={d} dense={d} slots={d} saved={d} params={d} captures={d} receivers={d}\n", .{
+            suspend_stats_total,
+            suspend_stats_dense,
+            suspend_stats_slots,
+            suspend_stats_saved,
+            suspend_stats_params,
+            suspend_stats_captures,
+            suspend_stats_receivers,
+        });
+    }
+}
+
+pub fn resetSuspendLivenessCache() void {
+    const a = std.heap.c_allocator;
+    var it = suspend_live_cache.valueIterator();
+    while (it.next()) |ids| a.free(ids.*);
+    suspend_live_cache.deinit(a);
+    suspend_live_cache = .empty;
+    suspend_stats_enabled = null;
+    suspend_stats_total = 0;
+    suspend_stats_dense = 0;
+    suspend_stats_slots = 0;
+    suspend_stats_saved = 0;
+    suspend_stats_params = 0;
+    suspend_stats_captures = 0;
+    suspend_stats_receivers = 0;
+}
+
+const RegUseDef = struct {
+    uses: []bool,
+    defs: []bool,
+
+    fn visit(self: *RegUseDef, reg: Reg, is_def: bool) void {
+        const i = reg.int();
+        if (i >= self.uses.len) return;
+        if (is_def) self.defs[i] = true else self.uses[i] = true;
+    }
+
+    fn clear(self: *RegUseDef) void {
+        @memset(self.uses, false);
+        @memset(self.defs, false);
+    }
+};
+
+fn blockSuccessorLive(func: *const Func, block: *const ir.Block, reg: usize, live_in: []const bool, n_regs: usize) bool {
+    const liveAt = struct {
+        fn get(bits: []const bool, n: usize, bid: BlockId, r: usize, n_blocks: usize) bool {
+            const bi = bid.int();
+            return bi < n_blocks and bits[bi * n + r];
+        }
+    }.get;
+    return switch (block.terminator) {
+        .Goto => |bid| liveAt(live_in, n_regs, bid, reg, func.blocks.len),
+        .Branch => |br| liveAt(live_in, n_regs, br.t, reg, func.blocks.len) or
+            liveAt(live_in, n_regs, br.f, reg, func.blocks.len),
+        .Switch => |sw| blk: {
+            if (liveAt(live_in, n_regs, sw.default, reg, func.blocks.len)) break :blk true;
+            for (sw.arms) |arm| {
+                if (liveAt(live_in, n_regs, arm.target, reg, func.blocks.len)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// Registers whose current values can be read after `inst_idx` in `block`.
+/// This is ordinary backwards dataflow over the complete normal CFG. A frame
+/// with active catch/finally state deliberately uses a dense snapshot instead:
+/// exceptional successors are represented by the runtime try stack rather than
+/// explicit CFG edges, so retaining all registers there is the exact fallback.
+fn suspendLiveRegs(func: *const Func, block: BlockId, inst_idx: usize) Allocator.Error![]const u32 {
+    const key: SuspendLiveKey = .{ .func = func, .block = block.int(), .inst_idx = inst_idx };
+    if (suspend_live_cache.get(key)) |ids| return ids;
+
+    const a = std.heap.c_allocator;
+    const n_blocks = func.blocks.len;
+    const n_regs: usize = func.n_locals;
+    if (block.int() >= n_blocks or n_regs == 0) {
+        const empty = try a.alloc(u32, 0);
+        try suspend_live_cache.put(a, key, empty);
+        return empty;
+    }
+
+    const cells = std.math.mul(usize, n_blocks, n_regs) catch return error.OutOfMemory;
+    const use = try a.alloc(bool, cells);
+    defer a.free(use);
+    const defs = try a.alloc(bool, cells);
+    defer a.free(defs);
+    const live_in = try a.alloc(bool, cells);
+    defer a.free(live_in);
+    const live_out = try a.alloc(bool, cells);
+    defer a.free(live_out);
+    @memset(use, false);
+    @memset(defs, false);
+    @memset(live_in, false);
+    @memset(live_out, false);
+
+    const inst_uses = try a.alloc(bool, n_regs);
+    defer a.free(inst_uses);
+    const inst_defs = try a.alloc(bool, n_regs);
+    defer a.free(inst_defs);
+    var ud = RegUseDef{ .uses = inst_uses, .defs = inst_defs };
+
+    for (func.blocks, 0..) |*blk, bi| {
+        const base = bi * n_regs;
+        for (blk.insts) |*inst| {
+            ud.clear();
+            ir.visitInstRegs(inst, &ud, RegUseDef.visit);
+            for (0..n_regs) |r| {
+                if (ud.uses[r] and !defs[base + r]) use[base + r] = true;
+                if (ud.defs[r]) defs[base + r] = true;
+            }
+        }
+        ud.clear();
+        ir.visitTerminatorRegs(&blk.terminator, &ud, RegUseDef.visit);
+        for (0..n_regs) |r| {
+            if (ud.uses[r] and !defs[base + r]) use[base + r] = true;
+            if (ud.defs[r]) defs[base + r] = true;
+        }
+    }
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var bi = n_blocks;
+        while (bi > 0) {
+            bi -= 1;
+            const blk = &func.blocks[bi];
+            const base = bi * n_regs;
+            for (0..n_regs) |r| {
+                const out = blockSuccessorLive(func, blk, r, live_in, n_regs);
+                const in = use[base + r] or (out and !defs[base + r]);
+                if (live_out[base + r] != out) {
+                    live_out[base + r] = out;
+                    changed = true;
+                }
+                if (live_in[base + r] != in) {
+                    live_in[base + r] = in;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    const live = try a.dupe(bool, live_out[block.int() * n_regs ..][0..n_regs]);
+    defer a.free(live);
+    const site_block = &func.blocks[block.int()];
+    ud.clear();
+    ir.visitTerminatorRegs(&site_block.terminator, &ud, RegUseDef.visit);
+    for (0..n_regs) |r| {
+        if (ud.defs[r]) live[r] = false;
+        if (ud.uses[r]) live[r] = true;
+    }
+    const insts = site_block.insts;
+    var i = insts.len;
+    const stop = @min(inst_idx, insts.len);
+    while (i > stop) {
+        i -= 1;
+        ud.clear();
+        ir.visitInstRegs(&insts[i], &ud, RegUseDef.visit);
+        for (0..n_regs) |r| {
+            if (ud.defs[r]) live[r] = false;
+            if (ud.uses[r]) live[r] = true;
+        }
+    }
+
+    var ids: std.ArrayListUnmanaged(u32) = .empty;
+    errdefer ids.deinit(a);
+    for (live, 0..) |is_live, r| {
+        if (is_live) try ids.append(a, @intCast(r));
+    }
+    const owned = try ids.toOwnedSlice(a);
+    errdefer a.free(owned);
+    try suspend_live_cache.put(a, key, owned);
+    return owned;
+}
+
+fn snapshotRegisters(
+    allocator: Allocator,
+    func: *const Func,
+    block: BlockId,
+    next_inst: usize,
+    resume_reg: ?Reg,
+    regs: []const Value,
+    sparse_ok: bool,
+) Allocator.Error!SnapshotRegisters {
+    if (sparse_ok) {
+        const live_ids = try suspendLiveRegs(func, block, next_inst);
+        var count: usize = 0;
+        for (live_ids) |id| {
+            if (id >= regs.len) continue;
+            if (resume_reg) |rr| if (id == rr.int()) continue;
+            count += 1;
+        }
+        if (count * @sizeOf(SavedReg) < regs.len * @sizeOf(Value)) {
+            const entries = try allocator.alloc(SavedReg, count);
+            errdefer allocator.free(entries);
+            var out: usize = 0;
+            for (live_ids) |id| {
+                if (id >= regs.len) continue;
+                if (resume_reg) |rr| if (id == rr.int()) continue;
+                entries[out] = .{ .id = id, .value = regs[id] };
+                out += 1;
+            }
+            if (runtime.gc.gc_enabled and runtime.gc.external_accounting) {
+                runtime.gc.noteExternalBytes(entries.len * @sizeOf(SavedReg));
+            }
+            return .{ .sparse = entries };
+        }
+    }
+
+    const values = try allocator.dupe(Value, regs);
+    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) {
+        runtime.gc.noteExternalBytes(values.len * @sizeOf(Value));
+    }
+    return .{ .dense = values };
+}
 
 /// Layer 1 — a parked activation: a stack of frame snapshots
 /// (outermost first, innermost last) plus the token the interceptor
@@ -1166,7 +1514,10 @@ pub const SuspendState = struct {
 /// under the arena.
 fn retainSnapshotValues(snap: FrameSnapshot) void {
     if (!runtime.reclaimEnabled()) return;
-    for (snap.regs) |v| v.retain();
+    switch (snap.regs) {
+        .dense => |values| for (values) |v| v.retain(),
+        .sparse => |entries| for (entries) |entry| entry.value.retain(),
+    }
     for (snap.params) |v| v.retain();
     for (snap.captures) |v| v.retain();
 }
@@ -1185,10 +1536,14 @@ pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) voi
 }
 
 fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
-    for (snap.regs) |v| v.gcMark(m);
+    switch (snap.regs) {
+        .dense => |values| for (values) |v| v.gcMark(m),
+        .sparse => |entries| for (entries) |entry| entry.value.gcMark(m),
+    }
     for (snap.params) |v| v.gcMark(m);
     for (snap.captures) |v| v.gcMark(m);
     for (snap.enclosing_this) |e| e.v.gcMark(m);
+    snap.pending_finally.gcMark(m);
     markFrameClosure(snap.closure_id, m);
 }
 
@@ -1211,9 +1566,14 @@ pub fn freeSuspendStateOpaque(cont: *anyopaque, allocator: Allocator) void {
 /// Release what `retainSnapshotValues` retained (the drop-without-resume
 /// path). Mirrors the retain set exactly.
 fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
-    for (snap.regs) |v| v.release(allocator);
+    switch (snap.regs) {
+        .dense => |values| for (values) |v| v.release(allocator),
+        .sparse => |entries| for (entries) |entry| entry.value.release(allocator),
+    }
     for (snap.params) |v| v.release(allocator);
     for (snap.captures) |v| v.release(allocator);
+    var pending = snap.pending_finally;
+    pending.release(allocator);
 }
 
 /// Free the dupe'd slice buffers a snapshot owns. These are raw host arrays
@@ -1223,8 +1583,13 @@ fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
 /// where `free` would rewind a bump pointer, leaves them.
 fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
     if (!runtime.freeScratch()) return;
-    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalFreed((snap.regs.len + snap.params.len + snap.captures.len) * @sizeOf(Value));
-    allocator.free(snap.regs);
+    if (runtime.gc.gc_enabled and runtime.gc.external_accounting) {
+        runtime.gc.noteExternalFreed(snap.regs.byteLen() + (snap.params.len + snap.captures.len) * @sizeOf(Value));
+    }
+    switch (snap.regs) {
+        .dense => |values| allocator.free(values),
+        .sparse => |entries| allocator.free(entries),
+    }
     allocator.free(snap.params);
     allocator.free(snap.captures);
     allocator.free(snap.enclosing_this);
@@ -1286,6 +1651,7 @@ const Frame = struct {
     /// `EvalResult` by value on every instruction (its `.ok` is always the
     /// ignored `.Unit`). Read by the dispatch loop only on `.raised`.
     step_err: ?EvalError = null,
+    pending_finally: PendingFinallyState = .{},
     /// Source span of the statement this frame is currently executing, set by
     /// the `Trace` instruction the lowerer emits per statement. Read when a
     /// throw captures the call stack so each frame reports its in-progress
@@ -1381,6 +1747,7 @@ const Frame = struct {
                 for (self.params.items) |v| v.release(self.allocator);
                 for (self.captures.items) |v| v.release(self.allocator);
             }
+            self.pending_finally.release(self.allocator);
         }
         releaseRegs(self.allocator, &self.regs);
         self.params.deinit(self.allocator);
@@ -1762,7 +2129,23 @@ pub fn resumeContinuation(
         // resumeRaw call sites).
         if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
             const loc = funcFirstLoc(func);
-            std.debug.print("[resume-frame] {s}#{d} ({s}:{d}) at={d}:{d} throw={} via={s} id={x}\n", .{ func.name, func.id.int(), loc.path, loc.line, snap.block.int(), snap.inst_idx, pending_throw_from_inner != null, resume_route, @intFromPtr(snap.regs.ptr) });
+            std.debug.print("[resume-frame] {s}#{d} ({s}:{d}) at={d}:{d} throw={} pending={}/{}/{} caps={d} enc={d} via={s} id={x}\n", .{
+                func.name,
+                func.id.int(),
+                loc.path,
+                loc.line,
+                snap.block.int(),
+                snap.inst_idx,
+                pending_throw_from_inner != null,
+                snap.pending_finally.rethrow != null,
+                snap.pending_finally.return_value != null,
+                snap.pending_finally.unwind != null,
+                snap.captures.len,
+                snap.enclosing_this.len,
+                resume_route,
+                snap.regs.ptrIdentity(),
+            });
+            traceEnclosingEntries("resume-enclosing", snap.enclosing_this);
         }
         var params: std.ArrayList(Value) = .empty;
         try params.appendSlice(allocator, snap.params);
@@ -1770,6 +2153,7 @@ pub fn resumeContinuation(
         try caps.appendSlice(allocator, snap.captures);
         var frame = try Frame.newWithCaptures(allocator, m, func, params, caps);
         frame.closure_id = snap.closure_id;
+        frame.pending_finally = snap.pending_finally;
         defer frame.deinit();
         gcPushFrame(&frame);
         defer gcPopFrame(&frame);
@@ -1782,8 +2166,17 @@ pub fn resumeContinuation(
         // receivers resolved before the park resolve identically after it.
         try frame.activateChainFrom(snap.enclosing_this);
         defer frame.deactivateChain();
-        frame.regs.clearRetainingCapacity();
-        try frame.regs.appendSlice(regsAlloc(allocator), snap.regs);
+        switch (snap.regs) {
+            .sparse => |entries| {
+                for (entries) |entry| {
+                    if (entry.id < frame.regs.items.len) frame.regs.items[entry.id] = entry.value;
+                }
+            },
+            .dense => |values| {
+                frame.regs.clearRetainingCapacity();
+                try frame.regs.appendSlice(regsAlloc(allocator), values);
+            },
+        }
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
         // "resume by throwing `e` at the suspension point". Only the
         // innermost (suspending) frame sees the raw failure Result;
@@ -1923,127 +2316,135 @@ fn LoopTramp(comptime H: type) type {
         /// stay inline in `call`: they fire once per JIT'd loop iteration, and
         /// outlining them too cost ~3% throughput for no extra depth.
         noinline fn bulkySite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
-        if (site.is_field_set) {
-            const recv = lc.frame.regs.items[site.recv_reg];
-            if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
-                lc.pending_deopt_inst = site.inst;
-                return jit_loop.deoptCode(site.block);
-            }
-            const v = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
-            const g = recv.Instance.borrowMut();
-            if (site.field_idx < g.get().fields.items.len) {
-                const old = g.get().fields.items[site.field_idx].value;
-                g.get().fields.items[site.field_idx].value = v;
-                g.deinit();
-                old.release(lc.allocator);
-            } else {
-                g.deinit();
-                lc.pending_deopt_inst = site.inst;
-                return jit_loop.deoptCode(site.block);
-            }
-            return 0;
-        }
-        // Object collection subscript: read element `recv[idx]` directly (no
-        // `get` dispatch) and write it into the register. Out-of-range or an
-        // unsupported container deopts; the interpreter re-runs the subscript
-        // (a side-effect-free read) and raises the proper exception on OOB.
-        if (site.is_obj_index) {
-            const recv = lc.frame.regs.items[site.recv_reg];
-            const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-            const idx: i64 = switch (idx_v) {
-                .Int => |x| x,
-                .Long => |x| x,
-                else => {
+            if (site.is_field_set) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
-                },
-            };
-            if (jit_loop.liveElementAt(recv, idx)) |v| {
-                v.retain();
-                lc.frame.write(Reg.from(site.dst_reg), v) catch {
-                    lc.pending = .{ .Type = "out of memory in JIT subscript" };
-                    return jit_loop.throwCode(site.block);
+                }
+                const v = switch (cl.reg_types[site.src_reg]) {
+                    .object => lc.frame.regs.items[site.src_reg],
+                    .null_ => Value.Null,
+                    else => jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]),
                 };
+                const g = recv.Instance.borrowMut();
+                if (site.field_idx < g.get().fields.items.len) {
+                    const old = g.get().fields.items[site.field_idx].value;
+                    g.get().fields.items[site.field_idx].value = v;
+                    g.deinit();
+                    old.release(lc.allocator);
+                } else {
+                    g.deinit();
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                }
                 return 0;
             }
-            lc.pending_deopt_inst = site.inst;
-            return jit_loop.deoptCode(site.block);
-        }
-        // Invoke a loop-invariant callable value; the result is discarded.
-        if (site.is_call_value) {
-            if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
-            if (site.span) |sp| lc.frame.cur_span = sp;
-            const callee = lc.frame.regs.items[site.recv_reg];
-            var argbuf2: [3]Value = undefined;
-            var k2: usize = 0;
-            while (k2 < site.n_args) : (k2 += 1) {
-                const ar = @as(usize, site.args_reg) + k2;
-                argbuf2[k2] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
-            }
-            const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
-                lc.pending = .{ .Type = "out of memory in JIT value call" };
-                return jit_loop.throwCode(site.block);
-            };
-            switch (r) {
-                .ok => return 0,
-                .err => |e| {
-                    lc.pending = e;
-                    return jit_loop.throwCode(site.block);
-                },
-            }
-        }
-        // Map store `map[key] = value`; result discarded.
-        if (site.is_map_set) {
-            if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
-            if (site.span) |sp| lc.frame.cur_span = sp;
-            const m = lc.frame.regs.items[site.recv_reg];
-            const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-            const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
-            var names: [2]?[]const u8 = .{ null, null };
-            const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
-                lc.pending = .{ .Type = "out of memory in JIT map store" };
-                return jit_loop.throwCode(site.block);
-            };
-            switch (r) {
-                .ok => return 0,
-                .err => |e| {
-                    lc.pending = e;
-                    return jit_loop.throwCode(site.block);
-                },
-            }
-        }
-        // Map load `map[key]` -> nullable scalar (value slot + flag slot).
-        if (site.is_map_get) {
-            if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
-            if (site.span) |sp| lc.frame.cur_span = sp;
-            const m = lc.frame.regs.items[site.recv_reg];
-            const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-            var names: [1]?[]const u8 = .{null};
-            const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
-                lc.pending = .{ .Type = "out of memory in JIT map load" };
-                return jit_loop.throwCode(site.block);
-            };
-            switch (r) {
-                .ok => |v| {
-                    if (v == .Null) {
-                        tctx.slots[site.dst_reg] = 0;
-                        tctx.slots[site.map_flag_slot] = 1;
-                    } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
-                        tctx.slots[site.dst_reg] = sv;
-                        tctx.slots[site.map_flag_slot] = 0;
-                    } else {
-                        // Value is not the cached scalar kind: deopt and re-read.
+            // Object collection subscript: read element `recv[idx]` directly (no
+            // `get` dispatch) and write it into the register. Out-of-range or an
+            // unsupported container deopts; the interpreter re-runs the subscript
+            // (a side-effect-free read) and raises the proper exception on OOB.
+            if (site.is_obj_index) {
+                const recv = lc.frame.regs.items[site.recv_reg];
+                const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const idx: i64 = switch (idx_v) {
+                    .Int => |x| x,
+                    .Long => |x| x,
+                    else => {
                         lc.pending_deopt_inst = site.inst;
                         return jit_loop.deoptCode(site.block);
-                    }
+                    },
+                };
+                if (jit_loop.liveElementAt(recv, idx)) |v| {
+                    v.retain();
+                    lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT subscript" };
+                        return jit_loop.throwCode(site.block);
+                    };
                     return 0;
-                },
-                .err => |e| {
-                    lc.pending = e;
-                    return jit_loop.throwCode(site.block);
-                },
+                }
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
             }
-        }
+            // Invoke a loop-invariant callable value; the result is discarded.
+            if (site.is_call_value) {
+                if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const callee = lc.frame.regs.items[site.recv_reg];
+                var argbuf2: [3]Value = undefined;
+                var k2: usize = 0;
+                while (k2 < site.n_args) : (k2 += 1) {
+                    const ar = @as(usize, site.args_reg) + k2;
+                    argbuf2[k2] = switch (cl.reg_types[ar]) {
+                        .object => lc.frame.regs.items[ar],
+                        .null_ => .Null,
+                        else => jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]),
+                    };
+                }
+                const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT value call" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
+            // Map store `map[key] = value`; result discarded.
+            if (site.is_map_set) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                var names: [2]?[]const u8 = .{ null, null };
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map store" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => return 0,
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
+            // Map load `map[key]` -> nullable scalar (value slot + flag slot).
+            if (site.is_map_get) {
+                if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const m = lc.frame.regs.items[site.recv_reg];
+                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                var names: [1]?[]const u8 = .{null};
+                const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT map load" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (r) {
+                    .ok => |v| {
+                        if (v == .Null) {
+                            tctx.slots[site.dst_reg] = 0;
+                            tctx.slots[site.map_flag_slot] = 1;
+                        } else if (jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v)) |sv| {
+                            tctx.slots[site.dst_reg] = sv;
+                            tctx.slots[site.map_flag_slot] = 0;
+                        } else {
+                            // Value is not the cached scalar kind: deopt and re-read.
+                            lc.pending_deopt_inst = site.inst;
+                            return jit_loop.deoptCode(site.block);
+                        }
+                        return 0;
+                    },
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+            }
             return null;
         }
 
@@ -2065,10 +2466,36 @@ fn LoopTramp(comptime H: type) type {
                 };
                 return 0;
             }
-            // Object-vs-null test: write a boolean to the dst slot.
+            if (site.is_load_global) {
+                if (site.span) |sp| lc.frame.cur_span = sp;
+                const loaded = lc.host.lookupGlobalThrowing(lc.allocator, site.name) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT global read" };
+                    return jit_loop.throwCode(site.block);
+                };
+                switch (loaded) {
+                    .ok => |maybe| if (maybe) |v| {
+                        v.retain();
+                        lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                            lc.pending = .{ .Type = "out of memory in JIT global read" };
+                            return jit_loop.throwCode(site.block);
+                        };
+                        return 0;
+                    },
+                    .err => |e| {
+                        lc.pending = e;
+                        return jit_loop.throwCode(site.block);
+                    },
+                }
+                lc.pending_deopt_inst = site.inst;
+                return jit_loop.deoptCode(site.block);
+            }
+            // Boxed structural/reference comparison: write a boolean to the
+            // scalar destination while both values remain GC-rooted in regs.
             if (site.is_null_check) {
-                const is_null = lc.frame.regs.items[site.recv_reg] == .Null;
-                const r = if (site.neg) !is_null else is_null;
+                const lhs = if (cl.reg_types[site.recv_reg] == .null_) Value.Null else lc.frame.regs.items[site.recv_reg];
+                const rhs = if (cl.reg_types[site.src_reg] == .null_) Value.Null else lc.frame.regs.items[site.src_reg];
+                const equal = if (site.identity) Value.referenceEq(&lhs, &rhs) else Value.structuralEq(&lhs, &rhs);
+                const r = if (site.neg) !equal else equal;
                 tctx.slots[site.dst_reg] = if (r) 1 else 0;
                 return 0;
             }
@@ -2121,7 +2548,11 @@ fn LoopTramp(comptime H: type) type {
             var k: usize = 0;
             while (k < site.n_args) : (k += 1) {
                 const ar = @as(usize, site.args_reg) + k;
-                argbuf[k] = jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]);
+                argbuf[k] = switch (cl.reg_types[ar]) {
+                    .object => lc.frame.regs.items[ar],
+                    .null_ => .Null,
+                    else => jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]),
+                };
             }
             // Native recursion: a compiled body calling a compiled (scalar)
             // callee runs its body directly — no interpreter frame, no dispatch.
@@ -2161,7 +2592,7 @@ fn LoopTramp(comptime H: type) type {
                 const recv = lc.frame.regs.items[site.recv_reg];
                 // A varying boxed receiver may be a different class this iteration;
                 // deopt unless it matches the class the return type was resolved for.
-                if (site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                if (site.recv_class != 0 and site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
                 }
@@ -2193,11 +2624,19 @@ fn LoopTramp(comptime H: type) type {
             switch (res) {
                 .ok => |v| {
                     if (site.has_result) {
-                        const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
-                            lc.pending = .{ .Type = "JIT-compiled call returned a non-scalar result" };
-                            return jit_loop.throwCode(site.block);
-                        };
-                        tctx.slots[site.dst_reg] = s;
+                        if (cl.reg_types[site.dst_reg] == .object) {
+                            v.retain();
+                            lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                                lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                                return jit_loop.throwCode(site.block);
+                            };
+                        } else {
+                            const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
+                                lc.pending_deopt_inst = site.inst;
+                                return jit_loop.deoptCode(site.block);
+                            };
+                            tctx.slots[site.dst_reg] = s;
+                        }
                     }
                     return 0;
                 },
@@ -2258,15 +2697,9 @@ fn runFrameInner(
     var cur = cur_in;
     var resume_idx = resume_idx_in;
     var resume_throw = resume_throw_in;
-    // `depth` is the try-stack height to restore before re-raising: the
-    // finally body may push (and not pop) its own try-frames, which must not
-    // intercept the re-raised exception.
-    var pending_rethrow: ?struct { key: BlockId, exc: Value, depth: usize } = null;
-    var pending_return: ?struct { key: BlockId, val: Value } = null;
-    // A non-local return (`LabeledReturn` / `NonLocalReturn`) traversing this
-    // frame's finally blocks on its way out; same replay discipline as
-    // `pending_rethrow`.
-    var pending_unwind: ?struct { key: BlockId, err: EvalError, depth: usize } = null;
+    // Pending throw/return state lives on `frame`: a finally body may suspend,
+    // and the frame snapshot must carry both its continuation point and the
+    // control flow that caused the finally to run.
     const func: *const Func = frame.func;
     // Lazy IR: materialise a deferred function's blocks before the dispatch
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
@@ -2462,19 +2895,29 @@ fn runFrameInner(
                             state.pending_resume_reg = null;
                             break :blk rr;
                         } else instDst(inst);
+                        const saved_regs = try snapshotRegisters(
+                            allocator,
+                            frame.func,
+                            cur,
+                            idx + 1,
+                            resume_reg,
+                            frame.regs.items,
+                            try_stack.items.len == 0,
+                        );
+                        noteSuspendSnapshot(
+                            saved_regs.isDense(),
+                            frame.regs.items.len,
+                            saved_regs.savedLen(),
+                            frame.params.items.len,
+                            frame.captures.items.len,
+                            frame.enclosing_this.items.len,
+                        );
                         const snap: FrameSnapshot = .{
                             .func = frame.func.id,
                             .module = frame.module_arc,
                             .block = cur,
                             .inst_idx = idx + 1,
-                            .regs = blk: {
-                                // Suspension snapshots are the dominant
-                                // allocation of deep suspended chains;
-                                // advance the collector's trigger (see
-                                // acquireRegs).
-                                if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(frame.regs.items.len * @sizeOf(Value));
-                                break :blk try allocator.dupe(Value, frame.regs.items);
-                            },
+                            .regs = saved_regs,
                             .params = blk: {
                                 if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.items.len + frame.captures.items.len) * @sizeOf(Value));
                                 break :blk try allocator.dupe(Value, frame.params.items);
@@ -2482,16 +2925,34 @@ fn runFrameInner(
                             .captures = try allocator.dupe(Value, frame.captures.items),
                             .enclosing_this = try allocator.dupe(EnclosingEntry, frame.enclosing_this.items),
                             .try_stack = try allocator.dupe(TryFrame, try_stack.items),
+                            .pending_finally = frame.pending_finally,
                             .is_lambda = frame.func.is_lambda,
                             .resume_reg = resume_reg,
                             .closure_id = frame.closure_id,
                         };
+                        if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+                            std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} pending={}/{}/{} caps={d} enc={d}\n", .{
+                                frame.func.name,
+                                frame.func.id.int(),
+                                cur.int(),
+                                idx + 1,
+                                frame.pending_finally.rethrow != null,
+                                frame.pending_finally.return_value != null,
+                                frame.pending_finally.unwind != null,
+                                frame.captures.items.len,
+                                frame.enclosing_this.items.len,
+                            });
+                            traceEnclosingEntries("suspend-enclosing", frame.enclosing_this.items);
+                        }
                         // The snapshot now holds the only references that will
                         // survive this frame's teardown (its regs are released
                         // as the stack unwinds; its params/captures alias caller
                         // regs / closure captures the unwind also releases).
                         retainSnapshotValues(snap);
                         try state.frames.append(allocator, snap);
+                        // Ownership of the pending control-flow payload moved
+                        // into `snap`; frame teardown must not release it.
+                        frame.pending_finally = .{};
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),
@@ -2501,12 +2962,13 @@ fn runFrameInner(
         if (unwound) |e| {
             // Mid-block non-local return -- route through the armed finally
             // blocks only (never a catch), then keep unwinding.
+            frame.pending_finally.release(allocator);
             var routed = false;
             while (try_stack.pop()) |tf| {
                 if (tf.finally_entry) |fin| {
                     if (std.meta.eql(fin, cur)) continue;
                     const key = tf.finally_done orelse fin;
-                    pending_unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
+                    frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
                     break;
@@ -2517,6 +2979,7 @@ fn runFrameInner(
         }
         if (thrown) |exc| {
             // Mid-block throw — same try-stack walk as Terminator.Throw.
+            frame.pending_finally.release(allocator);
             var routed = false;
             while (try_stack.pop()) |tf| {
                 // A throw raised inside this frame's own finally body must not
@@ -2534,7 +2997,7 @@ fn runFrameInner(
                     break;
                 } else if (tf.finally_entry) |fin| {
                     const key = tf.finally_done orelse fin;
-                    pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                    frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
                     break;
@@ -2546,7 +3009,7 @@ fn runFrameInner(
             continue;
         }
         // Symmetric try-stack pop on normal flow through finally.
-        if (term == .Goto and pending_rethrow == null and pending_return == null and pending_unwind == null) {
+        if (term == .Goto and frame.pending_finally.rethrow == null and frame.pending_finally.return_value == null and frame.pending_finally.unwind == null) {
             const done_for = frame.block(cur).finally_done_for;
             const pos: ?usize = if (done_for) |body|
                 rpositionByBody(try_stack.items, body)
@@ -2569,13 +3032,13 @@ fn runFrameInner(
         }
         // Finally exit with a pending return: replay the return through
         // any outer finally, otherwise complete it. The key pinned in
-        // `pending_return` is the *done sentinel* — the synthesized exit
+        // `pending_finally.return_value` is the *done sentinel* — the synthesized exit
         // block of the user finally body, so an `if`/`when` inside the
         // finally still resolves here once its join reaches the sentinel.
-        if (pending_return) |pr| {
+        if (frame.pending_finally.return_value) |pr| {
             if (std.meta.eql(pr.key, cur) and term == .Goto) {
                 const v = pr.val;
-                pending_return = null;
+                frame.pending_finally.return_value = null;
                 var chosen: ?struct { i: usize, jump: BlockId, key: BlockId } = null;
                 var i: usize = try_stack.items.len;
                 while (i > 0) {
@@ -2588,14 +3051,15 @@ fn runFrameInner(
                 }
                 if (chosen) |c| {
                     try_stack.shrinkRetainingCapacity(c.i);
-                    pending_return = .{ .key = c.key, .val = v };
+                    frame.pending_finally.return_value = .{ .key = c.key, .val = v };
                     cur = c.jump;
                     continue;
                 }
                 return ok(v);
             }
             if (std.meta.eql(pr.key, cur) and isReturnLike(term)) {
-                pending_return = null;
+                pr.val.release(allocator);
+                frame.pending_finally.return_value = null;
             }
         }
         // Finally re-throw: if we entered the current block as a finally
@@ -2603,10 +3067,10 @@ fn runFrameInner(
         // Goto (no `return` / `throw` swallowed the pending exception),
         // re-raise the saved exception through the enclosing try-stack
         // just like a fresh throw.
-        if (pending_rethrow) |pr| {
+        if (frame.pending_finally.rethrow) |pr| {
             if (std.meta.eql(pr.key, cur) and term == .Goto) {
                 const exc = pr.exc;
-                pending_rethrow = null;
+                frame.pending_finally.rethrow = null;
                 // Drop any try-frames the finally body pushed (and did not pop)
                 // so they cannot intercept the re-raised exception.
                 if (try_stack.items.len > pr.depth) try_stack.shrinkRetainingCapacity(pr.depth);
@@ -2619,7 +3083,7 @@ fn runFrameInner(
                         break;
                     } else if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
                         break;
@@ -2633,21 +3097,22 @@ fn runFrameInner(
             // A `return` / `throw` inside finally clears the pending
             // re-throw (Kotlin: finally's exit replaces the original).
             if (std.meta.eql(pr.key, cur) and isReturnLike(term)) {
-                pending_rethrow = null;
+                pr.exc.release(allocator);
+                frame.pending_finally.rethrow = null;
             }
         }
         // Finally exit with a pending non-local return: replay it through any
         // outer finally, otherwise resume the unwind out of this frame.
-        if (pending_unwind) |pu| {
+        if (frame.pending_finally.unwind) |pu| {
             if (std.meta.eql(pu.key, cur) and term == .Goto) {
                 const e = pu.err;
-                pending_unwind = null;
+                frame.pending_finally.unwind = null;
                 if (try_stack.items.len > pu.depth) try_stack.shrinkRetainingCapacity(pu.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
                     if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        pending_unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
+                        frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
                         break;
@@ -2659,9 +3124,14 @@ fn runFrameInner(
             // A `return` / `throw` inside the finally replaces the pending
             // non-local return.
             if (std.meta.eql(pu.key, cur) and isReturnLike(term)) {
-                pending_unwind = null;
+                if (PendingFinallyState.payloadOfError(pu.err)) |v| v.release(allocator);
+                frame.pending_finally.unwind = null;
             }
         }
+        // A return/throw written inside a finally replaces the control flow
+        // that entered it, even when the finally spans several IR blocks and
+        // the exit is not its synthesized done sentinel.
+        if (isReturnLike(term)) frame.pending_finally.release(allocator);
         switch (term) {
             .Goto => |next| cur = next,
             .Branch => |br| {
@@ -2694,7 +3164,7 @@ fn runFrameInner(
                 }
                 if (chosen) |c| {
                     try_stack.shrinkRetainingCapacity(c.i);
-                    pending_return = .{ .key = c.key, .val = v };
+                    frame.pending_finally.return_value = .{ .key = c.key, .val = v };
                     cur = c.jump;
                     continue;
                 }
@@ -2705,7 +3175,7 @@ fn runFrameInner(
                 v.retain();
                 const e = EvalError{ .NonLocalReturn = v };
                 if (nearestFinally(try_stack, cur)) |c| {
-                    pending_unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
+                    frame.pending_finally.unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
                     cur = c.jump;
                     continue;
                 }
@@ -2720,7 +3190,7 @@ fn runFrameInner(
                 v.retain();
                 const e = EvalError{ .LabeledReturn = .{ .label = lr.label, .value = v } };
                 if (nearestFinally(try_stack, cur)) |c| {
-                    pending_unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
+                    frame.pending_finally.unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
                     cur = c.jump;
                     continue;
                 }
@@ -2755,7 +3225,7 @@ fn runFrameInner(
                         break;
                     } else if (tf.finally_entry) |fin| {
                         const key = tf.finally_done orelse fin;
-                        pending_rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
                         routed = true;
                         break;
@@ -3133,781 +3603,781 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCellSet(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
     _ = host;
-        const v = frame.read(cs.value);
-        v.retain();
-        switch (frame.read(cs.cell)) {
-            .Cell => |c| {
-                const g = c.borrowMut();
-                defer g.deinit();
-                const old = g.get().*;
-                g.get().* = v;
-                if (runtime.reclaimEnabled()) old.release(allocator);
-            },
-            else => {
-                try frame.write(cs.cell, v);
-            },
-        }
+    const v = frame.read(cs.value);
+    v.retain();
+    switch (frame.read(cs.cell)) {
+        .Cell => |c| {
+            const g = c.borrowMut();
+            defer g.deinit();
+            const old = g.get().*;
+            g.get().* = v;
+            if (runtime.reclaimEnabled()) old.release(allocator);
+        },
+        else => {
+            try frame.write(cs.cell, v);
+        },
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u: anytype, host: *H) Allocator.Error!Step {
-        const v = frame.read(u.operand);
-        // Builtin scalar fast path: outside any class scope a scalar's
-        // unary operators are its builtin members and no extension can
-        // shadow them, so the string-keyed probe below (a full member
-        // dispatch per `i++` in every counting loop) is semantically
-        // dead. Inside a class scope a MEMBER EXTENSION operator can
-        // apply (`operator fun Int.unaryPlus()` in a DSL builder —
-        // kotlinc resolves `+1` to it), so any enclosing instance
-        // keeps the probe.
-        const enclosing_possible = frame.enclosing_this.items.len != 0 or
-            (frame.params.items.len > 0 and frame.params.items[0] == .Instance);
-        if (!enclosing_possible) {
-            switch (v) {
-                .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
-                    switch (try applyUnop(allocator, u.op, &v)) {
-                        .ok => |out| {
-                            try frame.write(u.dst, out);
-                            return .cont;
-                        },
-                        .err => {},
-                    }
-                },
-                else => {},
-            }
+    const v = frame.read(u.operand);
+    // Builtin scalar fast path: outside any class scope a scalar's
+    // unary operators are its builtin members and no extension can
+    // shadow them, so the string-keyed probe below (a full member
+    // dispatch per `i++` in every counting loop) is semantically
+    // dead. Inside a class scope a MEMBER EXTENSION operator can
+    // apply (`operator fun Int.unaryPlus()` in a DSL builder —
+    // kotlinc resolves `+1` to it), so any enclosing instance
+    // keeps the probe.
+    const enclosing_possible = frame.enclosing_this.items.len != 0 or
+        (frame.params.items.len > 0 and frame.params.items[0] == .Instance);
+    if (!enclosing_possible) {
+        switch (v) {
+            .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .UInt, .ULong, .UShort, .UByte => {
+                switch (try applyUnop(allocator, u.op, &v)) {
+                    .ok => |out| {
+                        try frame.write(u.dst, out);
+                        return .cont;
+                    },
+                    .err => {},
+                }
+            },
+            else => {},
         }
-        const method = switch (u.op) {
-            .Neg => "unaryMinus",
-            .Plus => "unaryPlus",
-            .Inc => "inc",
-            .Dec => "dec",
-        };
-        // User-class operator dispatch for unary +/-/inc/dec on an
-        // Instance always wins.
-        if (v == .Instance) {
-            switch (try host.callMember(allocator, &v, method, &.{})) {
-                .ok => |rv| {
-                    try frame.write(u.dst, rv);
-                    return .cont;
-                },
-                .err => |e| return raiseStep(frame, e),
-            }
-        }
-        // Member-extension operator on a primitive receiver. The
-        // calling frame's `this` carries the enclosing class —
-        // surface it as enclosing-this so the extension-fallback
-        // visibility filter accepts the member-ext owner.
-        var pushed_enclosing = false;
-        if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
-            pushEnclosingAccess(&frame.params.items[0]);
-            pushed_enclosing = true;
-        }
-        const extension_result = try host.callMember(allocator, &v, method, &.{});
-        if (pushed_enclosing) popEnclosing();
-        switch (extension_result) {
+    }
+    const method = switch (u.op) {
+        .Neg => "unaryMinus",
+        .Plus => "unaryPlus",
+        .Inc => "inc",
+        .Dec => "dec",
+    };
+    // User-class operator dispatch for unary +/-/inc/dec on an
+    // Instance always wins.
+    if (v == .Instance) {
+        switch (try host.callMember(allocator, &v, method, &.{})) {
             .ok => |rv| {
                 try frame.write(u.dst, rv);
                 return .cont;
             },
-            .err => |e| switch (e) {
-                .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
-                else => return raiseStep(frame, e),
-            },
-        }
-        switch (try applyUnop(allocator, u.op, &v)) {
-            .ok => |out| try frame.write(u.dst, out),
             .err => |e| return raiseStep(frame, e),
         }
+    }
+    // Member-extension operator on a primitive receiver. The
+    // calling frame's `this` carries the enclosing class —
+    // surface it as enclosing-this so the extension-fallback
+    // visibility filter accepts the member-ext owner.
+    var pushed_enclosing = false;
+    if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
+        pushEnclosingAccess(&frame.params.items[0]);
+        pushed_enclosing = true;
+    }
+    const extension_result = try host.callMember(allocator, &v, method, &.{});
+    if (pushed_enclosing) popEnclosing();
+    switch (extension_result) {
+        .ok => |rv| {
+            try frame.write(u.dst, rv);
+            return .cont;
+        },
+        .err => |e| switch (e) {
+            .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+            else => return raiseStep(frame, e),
+        },
+    }
+    switch (try applyUnop(allocator, u.op, &v)) {
+        .ok => |out| try frame.write(u.dst, out),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, bo: anytype, host: *H) Allocator.Error!Step {
-        var l = frame.read(bo.lhs);
-        var r = frame.read(bo.rhs);
-        // A boxed capture is transparent to every operator: the Cell
-        // is a carrier (an anon-object method's captured outer `var`),
-        // never a user value — `result == null` must compare the
-        // content.
-        while (l == .Cell) {
-            const cg = l.Cell.borrow();
-            l = cg.get().*;
-            cg.deinit();
+    var l = frame.read(bo.lhs);
+    var r = frame.read(bo.rhs);
+    // A boxed capture is transparent to every operator: the Cell
+    // is a carrier (an anon-object method's captured outer `var`),
+    // never a user value — `result == null` must compare the
+    // content.
+    while (l == .Cell) {
+        const cg = l.Cell.borrow();
+        l = cg.get().*;
+        cg.deinit();
+    }
+    while (r == .Cell) {
+        const cg = r.Cell.borrow();
+        r = cg.get().*;
+        cg.deinit();
+    }
+    // StringConcat over a Value.Instance routes the instance
+    // through toString so user-defined overrides fire.
+    if (bo.op == .StringConcat) {
+        const ls = switch (try stringify(H, allocator, host, &l)) {
+            .ok => |s| s,
+            .err => |e| return raiseStep(frame, e),
+        };
+        const rs = switch (try stringify(H, allocator, host, &r)) {
+            .ok => |s| s,
+            .err => |e| return raiseStep(frame, e),
+        };
+        const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
+        // `ls`/`rs` are owned renderings (stringify/renderValue allocate
+        // a private copy); `combined` is adopted by the StringRef cell.
+        // Free the two now-dead pieces under a freeing allocator.
+        if (runtime.freeScratch()) {
+            allocator.free(ls);
+            allocator.free(rs);
         }
-        while (r == .Cell) {
-            const cg = r.Cell.borrow();
-            r = cg.get().*;
-            cg.deinit();
-        }
-        // StringConcat over a Value.Instance routes the instance
-        // through toString so user-defined overrides fire.
-        if (bo.op == .StringConcat) {
-            const ls = switch (try stringify(H, allocator, host, &l)) {
-                .ok => |s| s,
-                .err => |e| return raiseStep(frame, e),
+        try frame.write(bo.dst, .{ .String = try runtime.strInitOwned(allocator, combined) });
+        return .cont;
+    }
+    // Collection `+` / `-` operators are stdlib operator
+    // functions on the left collection.
+    if ((bo.op == .Add or bo.op == .Sub) and switch (l) {
+        .Map, .List, .Set, .Sequence, .Range => true,
+        else => false,
+    }) {
+        // A compound assign (`xs += y`) onto a mutable collection
+        // dispatches the in-place `plusAssign` / `minusAssign`
+        // (Kotlin prefers `MutableCollection.plusAssign`), so the
+        // collection stays mutable. A read-only collection (or a
+        // plain `xs + y`) takes the `plus` / `minus` path below,
+        // producing a fresh read-only result.
+        if (bo.compound) {
+            const mutable = switch (l) {
+                .List => |c| c.mutable,
+                .Set => |c| c.mutable,
+                .Map => |c| c.mutable,
+                else => false,
             };
-            const rs = switch (try stringify(H, allocator, host, &r)) {
-                .ok => |s| s,
-                .err => |e| return raiseStep(frame, e),
-            };
-            const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
-            // `ls`/`rs` are owned renderings (stringify/renderValue allocate
-            // a private copy); `combined` is adopted by the StringRef cell.
-            // Free the two now-dead pieces under a freeing allocator.
-            if (runtime.freeScratch()) {
-                allocator.free(ls);
-                allocator.free(rs);
-            }
-            try frame.write(bo.dst, .{ .String = try runtime.strInitOwned(allocator, combined) });
-            return .cont;
-        }
-        // Collection `+` / `-` operators are stdlib operator
-        // functions on the left collection.
-        if ((bo.op == .Add or bo.op == .Sub) and switch (l) {
-            .Map, .List, .Set, .Sequence, .Range => true,
-            else => false,
-        }) {
-            // A compound assign (`xs += y`) onto a mutable collection
-            // dispatches the in-place `plusAssign` / `minusAssign`
-            // (Kotlin prefers `MutableCollection.plusAssign`), so the
-            // collection stays mutable. A read-only collection (or a
-            // plain `xs + y`) takes the `plus` / `minus` path below,
-            // producing a fresh read-only result.
-            if (bo.compound) {
-                const mutable = switch (l) {
-                    .List => |c| c.mutable,
-                    .Set => |c| c.mutable,
-                    .Map => |c| c.mutable,
-                    else => false,
-                };
-                if (mutable) {
-                    const assign = if (bo.op == .Add) "plusAssign" else "minusAssign";
-                    switch (try host.callMember(allocator, &l, assign, &.{r})) {
-                        .ok => {
-                            l.retain();
-                            try frame.write(bo.dst, l);
-                            return .cont;
-                        },
-                        .err => |e| return raiseStep(frame, e),
-                    }
+            if (mutable) {
+                const assign = if (bo.op == .Add) "plusAssign" else "minusAssign";
+                switch (try host.callMember(allocator, &l, assign, &.{r})) {
+                    .ok => {
+                        l.retain();
+                        try frame.write(bo.dst, l);
+                        return .cont;
+                    },
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
-            const method = if (bo.op == .Add) "plus" else "minus";
-            switch (try host.callMember(allocator, &l, method, &.{r})) {
-                .ok => |rv| {
-                    try frame.write(bo.dst, rv);
-                    return .cont;
-                },
-                .err => |e| return raiseStep(frame, e),
-            }
         }
-        // Arrays define `+` (`plus`) but no `-`.
-        if (bo.op == .Add and l == .Array) {
-            switch (try host.callMember(allocator, &l, "plus", &.{r})) {
-                .ok => |rv| {
-                    try frame.write(bo.dst, rv);
-                    return .cont;
-                },
-                .err => |e| return raiseStep(frame, e),
-            }
+        const method = if (bo.op == .Add) "plus" else "minus";
+        switch (try host.callMember(allocator, &l, method, &.{r})) {
+            .ok => |rv| {
+                try frame.write(bo.dst, rv);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
         }
-        // Referential identity (`===` / `!==`): pure pointer
-        // identity, never a user `equals` dispatch.
-        if (bo.op == .IdentEq or bo.op == .IdentNeq) {
-            const same = Value.referenceEq(&l, &r);
-            const b = if (bo.op == .IdentNeq) !same else same;
-            try frame.write(bo.dst, .{ .Bool = b });
+    }
+    // Arrays define `+` (`plus`) but no `-`.
+    if (bo.op == .Add and l == .Array) {
+        switch (try host.callMember(allocator, &l, "plus", &.{r})) {
+            .ok => |rv| {
+                try frame.write(bo.dst, rv);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
+    // Referential identity (`===` / `!==`): pure pointer
+    // identity, never a user `equals` dispatch.
+    if (bo.op == .IdentEq or bo.op == .IdentNeq) {
+        const same = Value.referenceEq(&l, &r);
+        const b = if (bo.op == .IdentNeq) !same else same;
+        try frame.write(bo.dst, .{ .Bool = b });
+        return .cont;
+    }
+    // COROUTINE_SUSPENDED and Result have no user `equals`
+    // surface: any equality against them is structural /
+    // identity, never a `call_member("equals")` dispatch.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        (l == .CoroutineSuspended or r == .CoroutineSuspended or l == .Result or r == .Result))
+    {
+        const eq = Value.structuralEq(&l, &r);
+        const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
+        try frame.write(bo.dst, .{ .Bool = b });
+        return .cont;
+    }
+    // `x == null` / `x != null` is a null check, never a user `equals`
+    // dispatch (Kotlin compares against the null literal by identity).
+    // Without this, every `?.` safe-call's null guard dispatched
+    // `x.equals(null)` — a full member resolution per access.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        (l == .Null or r == .Null))
+    {
+        const both_null = l == .Null and r == .Null;
+        const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
+        try frame.write(bo.dst, .{ .Bool = b });
+        return .cont;
+    }
+    // Collection `==` / `!=`: compare element/entry-wise so a user
+    // `equals` override fires (bare structural equality treats a
+    // non-data Instance by identity, so `setOf(P)==setOf(P)`, map value
+    // equality, and nested collections would be wrong).
+    // Set/Map `==` / `!=`: compare element/entry-wise so a user
+    // `equals` override fires (bare structural equality treats a
+    // non-data Instance by identity, so `setOf(P)==setOf(P)` and map
+    // value equality would be wrong). Restricted to a Set/Map operand:
+    // List equality already dispatches element `equals` via
+    // `collectionsEqualHostAware` and its array/sublist views need the
+    // established path.
+    // A native-collection LEFT operand against a user Instance also
+    // routes here: Kotlin dispatches `a.equals(b)` on the LEFT, and a
+    // native Set/List/Map's equals is the collection contract — the
+    // instance need not override `equals` for `setOf(x) == wrapper`.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        ((isSetOrMap(&l) and isSetOrMap(&r)) or
+            ((isSetOrMap(&l) or l == .List) and r == .Instance) or
+            (l == .Pair and r == .Pair) or (l == .Triple and r == .Triple)))
+    {
+        if (comptime @hasDecl(H, "deepValueEquals")) {
+            const eq = try host.deepValueEquals(allocator, &l, &r);
+            const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
+            try frame.write(bo.dst, .{ .Bool = if (neg) !eq else eq });
             return .cont;
         }
-        // COROUTINE_SUSPENDED and Result have no user `equals`
-        // surface: any equality against them is structural /
-        // identity, never a `call_member("equals")` dispatch.
-        if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-            (l == .CoroutineSuspended or r == .CoroutineSuspended or l == .Result or r == .Result))
-        {
-            const eq = Value.structuralEq(&l, &r);
+    }
+    if (operatorMethod(bo.op)) |method| {
+        if (l == .Instance or r == .Instance) {
+            // `a == b` dispatches `a.equals(b)`, but a builtin
+            // collection carries only structural equality; when the
+            // left operand is a builtin and the right is a user
+            // Instance (a class implementing Set/List/Map with its own
+            // `equals`), dispatch on the Instance instead. Structural
+            // equality is symmetric, so the result is identical and a
+            // builtin receiver need not implement `equals(Instance)`.
+            const swap = (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and l != .Instance and r == .Instance;
+            const recv_ptr = if (swap) &r else &l;
+            const arg_val = if (swap) l else r;
+            // Strict extension dispatch: an operator extension whose
+            // declared receiver doesn't accept `l` is not a candidate
+            // (kotlinc drops it), so `Unimplemented` surfaces and the
+            // `<op>Assign` fallback below can fire — `config += other`
+            // on a type declaring only `plusAssign` must not bind a
+            // receiver-incompatible `plus` like `String?.plus(Any?)`.
+            var result: Value = undefined;
+            switch (try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
+                .ok => |v| result = v,
+                .err => |e| switch (e) {
+                    // `a OP= b` lowers to `a = a.OP(b)`, but the
+                    // type may declare only the in-place form.
+                    .Unimplemented => {
+                        if (l == .Instance and compoundAssignMethod(bo.op) != null) {
+                            const assign = compoundAssignMethod(bo.op).?;
+                            switch (try host.callMember(allocator, &l, assign, &.{r})) {
+                                .ok => {},
+                                .err => |e2| return raiseStep(frame, e2),
+                            }
+                            result = l;
+                        } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
+                            // No user `equals` surface: Kotlin's
+                            // default is structural/identity equality
+                            // (`!=` negates it below).
+                            const boxed = bo.op == .BoxedEq or bo.op == .BoxedNotEq;
+                            result = .{ .Bool = if (boxed)
+                                Value.structuralEqBoxed(&l, &r)
+                            else
+                                Value.structuralEq(&l, &r) };
+                        } else {
+                            return raiseStep(frame, e);
+                        }
+                    },
+                    else => return raiseStep(frame, e),
+                },
+            }
+            // compareTo wrappers need to be reduced to a Bool.
+            const final_val: Value = switch (bo.op) {
+                .Less => .{ .Bool = if (valueToI64(&result)) |i| i < 0 else false },
+                .LessEq => .{ .Bool = if (valueToI64(&result)) |i| i <= 0 else false },
+                .Greater => .{ .Bool = if (valueToI64(&result)) |i| i > 0 else false },
+                .GreaterEq => .{ .Bool = if (valueToI64(&result)) |i| i >= 0 else false },
+                // `!=`: negate the `equals` result.
+                .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
+                else => result,
+            };
+            try frame.write(bo.dst, final_val);
+            return .cont;
+        }
+    }
+    // A `..` / `..<` over operands the i64-backed `Range` value cannot
+    // represent — floating point (`ClosedFloatingPointRange`), strings,
+    // or any other `Comparable` (`ClosedRange` via `Comparable.rangeTo`)
+    // — routes to the stdlib `rangeTo`/`rangeUntil` operator. Integer,
+    // Char and unsigned operands are handled by `applyBinop` below.
+    if ((bo.op == .RangeTo or bo.op == .RangeUntil) and
+        (l == .Double or l == .Float or r == .Double or r == .Float or
+            l == .String or r == .String or l == .Instance or r == .Instance))
+    {
+        const method = if (bo.op == .RangeUntil) "rangeUntil" else "rangeTo";
+        switch (try host.callMember(allocator, &l, method, &.{r})) {
+            .ok => |rv| {
+                try frame.write(bo.dst, rv);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
+    // Builtin-collection equality whose ELEMENTS include user
+    // instances (a windowed tail yields the raw RingBuffer — a
+    // List on the JVM): pure structural comparison cannot
+    // dispatch the element's `equals`, so ask the host for an
+    // element-wise compare before falling back.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        (l == .List or r == .List))
+    {
+        if (host.collectionsEqualHostAware(allocator, &l, &r)) |eq| {
             const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
             try frame.write(bo.dst, .{ .Bool = b });
             return .cont;
         }
-        // `x == null` / `x != null` is a null check, never a user `equals`
-        // dispatch (Kotlin compares against the null literal by identity).
-        // Without this, every `?.` safe-call's null guard dispatched
-        // `x.equals(null)` — a full member resolution per access.
-        if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-            (l == .Null or r == .Null))
-        {
-            const both_null = l == .Null and r == .Null;
-            const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
-            try frame.write(bo.dst, .{ .Bool = b });
-            return .cont;
-        }
-        // Collection `==` / `!=`: compare element/entry-wise so a user
-        // `equals` override fires (bare structural equality treats a
-        // non-data Instance by identity, so `setOf(P)==setOf(P)`, map value
-        // equality, and nested collections would be wrong).
-        // Set/Map `==` / `!=`: compare element/entry-wise so a user
-        // `equals` override fires (bare structural equality treats a
-        // non-data Instance by identity, so `setOf(P)==setOf(P)` and map
-        // value equality would be wrong). Restricted to a Set/Map operand:
-        // List equality already dispatches element `equals` via
-        // `collectionsEqualHostAware` and its array/sublist views need the
-        // established path.
-        // A native-collection LEFT operand against a user Instance also
-        // routes here: Kotlin dispatches `a.equals(b)` on the LEFT, and a
-        // native Set/List/Map's equals is the collection contract — the
-        // instance need not override `equals` for `setOf(x) == wrapper`.
-        if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-            ((isSetOrMap(&l) and isSetOrMap(&r)) or
-                ((isSetOrMap(&l) or l == .List) and r == .Instance) or
-                (l == .Pair and r == .Pair) or (l == .Triple and r == .Triple)))
-        {
-            if (comptime @hasDecl(H, "deepValueEquals")) {
-                const eq = try host.deepValueEquals(allocator, &l, &r);
-                const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
-                try frame.write(bo.dst, .{ .Bool = if (neg) !eq else eq });
-                return .cont;
-            }
-        }
-        if (operatorMethod(bo.op)) |method| {
-            if (l == .Instance or r == .Instance) {
-                // `a == b` dispatches `a.equals(b)`, but a builtin
-                // collection carries only structural equality; when the
-                // left operand is a builtin and the right is a user
-                // Instance (a class implementing Set/List/Map with its own
-                // `equals`), dispatch on the Instance instead. Structural
-                // equality is symmetric, so the result is identical and a
-                // builtin receiver need not implement `equals(Instance)`.
-                const swap = (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and l != .Instance and r == .Instance;
-                const recv_ptr = if (swap) &r else &l;
-                const arg_val = if (swap) l else r;
-                // Strict extension dispatch: an operator extension whose
-                // declared receiver doesn't accept `l` is not a candidate
-                // (kotlinc drops it), so `Unimplemented` surfaces and the
-                // `<op>Assign` fallback below can fire — `config += other`
-                // on a type declaring only `plusAssign` must not bind a
-                // receiver-incompatible `plus` like `String?.plus(Any?)`.
-                var result: Value = undefined;
-                switch (try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
-                    .ok => |v| result = v,
-                    .err => |e| switch (e) {
-                        // `a OP= b` lowers to `a = a.OP(b)`, but the
-                        // type may declare only the in-place form.
-                        .Unimplemented => {
-                            if (l == .Instance and compoundAssignMethod(bo.op) != null) {
-                                const assign = compoundAssignMethod(bo.op).?;
-                                switch (try host.callMember(allocator, &l, assign, &.{r})) {
-                                    .ok => {},
-                                    .err => |e2| return raiseStep(frame, e2),
-                                }
-                                result = l;
-                            } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
-                                // No user `equals` surface: Kotlin's
-                                // default is structural/identity equality
-                                // (`!=` negates it below).
-                                const boxed = bo.op == .BoxedEq or bo.op == .BoxedNotEq;
-                                result = .{ .Bool = if (boxed)
-                                    Value.structuralEqBoxed(&l, &r)
-                                else
-                                    Value.structuralEq(&l, &r) };
-                            } else {
-                                return raiseStep(frame, e);
-                            }
-                        },
-                        else => return raiseStep(frame, e),
-                    },
-                }
-                // compareTo wrappers need to be reduced to a Bool.
-                const final_val: Value = switch (bo.op) {
-                    .Less => .{ .Bool = if (valueToI64(&result)) |i| i < 0 else false },
-                    .LessEq => .{ .Bool = if (valueToI64(&result)) |i| i <= 0 else false },
-                    .Greater => .{ .Bool = if (valueToI64(&result)) |i| i > 0 else false },
-                    .GreaterEq => .{ .Bool = if (valueToI64(&result)) |i| i >= 0 else false },
-                    // `!=`: negate the `equals` result.
-                    .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
-                    else => result,
-                };
-                try frame.write(bo.dst, final_val);
-                return .cont;
-            }
-        }
-        // A `..` / `..<` over operands the i64-backed `Range` value cannot
-        // represent — floating point (`ClosedFloatingPointRange`), strings,
-        // or any other `Comparable` (`ClosedRange` via `Comparable.rangeTo`)
-        // — routes to the stdlib `rangeTo`/`rangeUntil` operator. Integer,
-        // Char and unsigned operands are handled by `applyBinop` below.
-        if ((bo.op == .RangeTo or bo.op == .RangeUntil) and
-            (l == .Double or l == .Float or r == .Double or r == .Float or
-                l == .String or r == .String or l == .Instance or r == .Instance))
-        {
-            const method = if (bo.op == .RangeUntil) "rangeUntil" else "rangeTo";
-            switch (try host.callMember(allocator, &l, method, &.{r})) {
-                .ok => |rv| {
-                    try frame.write(bo.dst, rv);
-                    return .cont;
-                },
-                .err => |e| return raiseStep(frame, e),
-            }
-        }
-        // Builtin-collection equality whose ELEMENTS include user
-        // instances (a windowed tail yields the raw RingBuffer — a
-        // List on the JVM): pure structural comparison cannot
-        // dispatch the element's `equals`, so ask the host for an
-        // element-wise compare before falling back.
-        if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-            (l == .List or r == .List))
-        {
-            if (host.collectionsEqualHostAware(allocator, &l, &r)) |eq| {
-                const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
-                try frame.write(bo.dst, .{ .Bool = b });
-                return .cont;
-            }
-        }
-        switch (try applyBinop(allocator, bo.op, &l, &r)) {
-            .ok => |out| try frame.write(bo.dst, out),
-            .err => |e| return raiseStep(frame, e),
-        }
+    }
+    switch (try applyBinop(allocator, bo.op, &l, &r)) {
+        .ok => |out| try frame.write(bo.dst, out),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(gf.receiver);
-        const name = constStr(frame.module, gf.field) orelse
-            return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
-        // Keep the executing function's receiver reachable as the
-        // enclosing `this` while the field/property is resolved. Inside
-        // a lambda the receiver rides the closure's captured `this`
-        // slot rather than params[0] (`placeable.mainAxisSize` in a
-        // `repeat { }` body needs the enclosing item as the
-        // member-extension property's owner) — `callerThisValue`
-        // resolves both forms.
-        var pushed_enclosing = false;
-        if (callerThisValue(frame)) |ct_v| {
-            var ct = ct_v;
-            const same = recv == .Instance and ct == .Instance and
-                ObjRef(InstanceData).ptrEq(ct.Instance, recv.Instance);
-            if (!same) {
-                pushEnclosingAccess(&ct);
-                pushed_enclosing = true;
-            }
+    const recv = frame.read(gf.receiver);
+    const name = constStr(frame.module, gf.field) orelse
+        return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
+    // Keep the executing function's receiver reachable as the
+    // enclosing `this` while the field/property is resolved. Inside
+    // a lambda the receiver rides the closure's captured `this`
+    // slot rather than params[0] (`placeable.mainAxisSize` in a
+    // `repeat { }` body needs the enclosing item as the
+    // member-extension property's owner) — `callerThisValue`
+    // resolves both forms.
+    var pushed_enclosing = false;
+    if (callerThisValue(frame)) |ct_v| {
+        var ct = ct_v;
+        const same = recv == .Instance and ct == .Instance and
+            ObjRef(InstanceData).ptrEq(ct.Instance, recv.Instance);
+        if (!same) {
+            pushEnclosingAccess(&ct);
+            pushed_enclosing = true;
         }
-        const got = host.getField(allocator, &recv, name);
-        if (pushed_enclosing) popEnclosing();
-        switch (try got) {
-            // host.getField returns a borrowed field value; the register owns its ref.
-            .ok => |v| {
-                v.retain();
-                try frame.write(gf.dst, v);
-            },
-            .err => |e| return raiseStep(frame, e),
-        }
+    }
+    const got = host.getField(allocator, &recv, name);
+    if (pushed_enclosing) popEnclosing();
+    switch (try got) {
+        // host.getField returns a borrowed field value; the register owns its ref.
+        .ok => |v| {
+            v.retain();
+            try frame.write(gf.dst, v);
+        },
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Frame, sf: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(sf.receiver);
-        const v = frame.read(sf.value);
-        const name = constStr(frame.module, sf.field) orelse
-            return raiseStep(frame, .{ .Type = "SetField: name not a string const" });
-        const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(frame.module, c) else null;
-        switch (try host.setFieldFrom(allocator, &recv, name, v, super_owner)) {
-            .ok => {},
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(sf.receiver);
+    const v = frame.read(sf.value);
+    const name = constStr(frame.module, sf.field) orelse
+        return raiseStep(frame, .{ .Type = "SetField: name not a string const" });
+    const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(frame.module, c) else null;
+    switch (try host.setFieldFrom(allocator, &recv, name, v, super_owner)) {
+        .ok => {},
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: *Frame, cf: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(cf.receiver);
-        const v = frame.read(cf.value);
-        const name = constStr(frame.module, cf.field) orelse
-            return raiseStep(frame, .{ .Type = "CompoundField: name not a string const" });
-        const cur = switch (try host.getField(allocator, &recv, name)) {
-            .ok => |fv| fv,
-            .err => |e| return raiseStep(frame, e),
-        };
-        // A collection-typed property compound-assigns in place: Kotlin
-        // dispatches `<op>Assign` on the field value and never reassigns
-        // the property. A mutable collection mutates; a read-only view
-        // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
-        // from its `add`. Either way there is NO write-back to the
-        // (read-only) property.
-        const is_collection = switch (cur) {
-            .List, .Set, .Map => true,
-            else => false,
-        };
-        const assign = compoundAssignMethod(cf.op);
-        if (is_collection and assign != null) {
-            switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
-                .ok => {},
-                .err => |e| return raiseStep(frame, e),
-            }
-            return .cont;
-        }
-        // A user instance may declare the in-place operator
-        // (`operator fun plusAssign`); prefer it, mutating in place with no
-        // write-back. Fall through to read-modify-write only when the type
-        // has no `<op>Assign`.
-        if (cur == .Instance and assign != null) {
-            switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
-                .ok => return .cont,
-                .err => |e| switch (e) {
-                    .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
-                    else => return raiseStep(frame, e),
-                },
-            }
-        }
-        // Read-modify-write: compute `cur.<op>(value)` and reassign the
-        // property. Scalars and strings combine via `applyBinop`; a user
-        // type with only the binary operator (`operator fun plus`) routes
-        // through `callMember`.
-        const combined: Value = blk: {
-            if (cur == .Instance) {
-                if (operatorMethod(cf.op)) |method| {
-                    switch (try host.callMember(allocator, &cur, method, &.{v})) {
-                        .ok => |rv| break :blk rv,
-                        .err => |e| return raiseStep(frame, e),
-                    }
-                }
-            }
-            switch (try applyBinop(allocator, cf.op, &cur, &v)) {
-                .ok => |rv| break :blk rv,
-                .err => |e| return raiseStep(frame, e),
-            }
-        };
-        // `combined` is an owned value (applyBinop / a user operator both
-        // hand back a fresh reference); `setField` retains its own copy, so
-        // drop ours now to balance.
-        const r = try host.setField(allocator, &recv, name, combined);
-        combined.release(allocator);
-        switch (r) {
+    const recv = frame.read(cf.receiver);
+    const v = frame.read(cf.value);
+    const name = constStr(frame.module, cf.field) orelse
+        return raiseStep(frame, .{ .Type = "CompoundField: name not a string const" });
+    const cur = switch (try host.getField(allocator, &recv, name)) {
+        .ok => |fv| fv,
+        .err => |e| return raiseStep(frame, e),
+    };
+    // A collection-typed property compound-assigns in place: Kotlin
+    // dispatches `<op>Assign` on the field value and never reassigns
+    // the property. A mutable collection mutates; a read-only view
+    // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
+    // from its `add`. Either way there is NO write-back to the
+    // (read-only) property.
+    const is_collection = switch (cur) {
+        .List, .Set, .Map => true,
+        else => false,
+    };
+    const assign = compoundAssignMethod(cf.op);
+    if (is_collection and assign != null) {
+        switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
             .ok => {},
             .err => |e| return raiseStep(frame, e),
         }
+        return .cont;
+    }
+    // A user instance may declare the in-place operator
+    // (`operator fun plusAssign`); prefer it, mutating in place with no
+    // write-back. Fall through to read-modify-write only when the type
+    // has no `<op>Assign`.
+    if (cur == .Instance and assign != null) {
+        switch (try host.callMember(allocator, &cur, assign.?, &.{v})) {
+            .ok => return .cont,
+            .err => |e| switch (e) {
+                .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
+                else => return raiseStep(frame, e),
+            },
+        }
+    }
+    // Read-modify-write: compute `cur.<op>(value)` and reassign the
+    // property. Scalars and strings combine via `applyBinop`; a user
+    // type with only the binary operator (`operator fun plus`) routes
+    // through `callMember`.
+    const combined: Value = blk: {
+        if (cur == .Instance) {
+            if (operatorMethod(cf.op)) |method| {
+                switch (try host.callMember(allocator, &cur, method, &.{v})) {
+                    .ok => |rv| break :blk rv,
+                    .err => |e| return raiseStep(frame, e),
+                }
+            }
+        }
+        switch (try applyBinop(allocator, cf.op, &cur, &v)) {
+            .ok => |rv| break :blk rv,
+            .err => |e| return raiseStep(frame, e),
+        }
+    };
+    // `combined` is an owned value (applyBinop / a user operator both
+    // hand back a fresh reference); `setField` retains its own copy, so
+    // drop ours now to balance.
+    const r = try host.setField(allocator, &recv, name, combined);
+    combined.release(allocator);
+    switch (r) {
+        .ok => {},
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!Step {
-        // Monomorphic fast path: a plain top-level user function (single
-        // overload, has body, non-extension, no varargs / defaults / type
-        // params / native binding) called positionally at exact arity needs
-        // none of the overload re-resolution, extension-receiver handling,
-        // reified-type binding, or redundant arg copying below. Dispatch it
-        // straight to the body with the arg buffer transferred as params.
-        if (comptime @hasDecl(H, "callFuncFast")) {
-            if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
-                if (frame.module.funcById(call.func)) |cf| {
-                    var plan = cf.fast_call;
-                    if (plan == 0) {
-                        plan = host.fastCallPlan(frame.module, call.func);
-                        @constCast(cf).fast_call = plan;
+    // Monomorphic fast path: a plain top-level user function (single
+    // overload, has body, non-extension, no varargs / defaults / type
+    // params / native binding) called positionally at exact arity needs
+    // none of the overload re-resolution, extension-receiver handling,
+    // reified-type binding, or redundant arg copying below. Dispatch it
+    // straight to the body with the arg buffer transferred as params.
+    if (comptime @hasDecl(H, "callFuncFast")) {
+        if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
+            if (frame.module.funcById(call.func)) |cf| {
+                var plan = cf.fast_call;
+                if (plan == 0) {
+                    plan = host.fastCallPlan(frame.module, call.func);
+                    @constCast(cf).fast_call = plan;
+                }
+                // `plan - 2` is the eligible arity; a positional, exact-arity
+                // call dispatches straight to the body.
+                if (plan >= 2 and plan - 2 == call.n_args) {
+                    const buf = try readArgRun(allocator, frame, call.args, call.n_args);
+                    const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                    switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
+                        .ok => |result| try frame.write(call.dst, result),
+                        .err => |e| return raiseStep(frame, e),
                     }
-                    // `plan - 2` is the eligible arity; a positional, exact-arity
-                    // call dispatches straight to the body.
-                    if (plan >= 2 and plan - 2 == call.n_args) {
-                        const buf = try readArgRun(allocator, frame, call.args, call.n_args);
-                        const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
-                        switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
-                            .ok => |result| try frame.write(call.dst, result),
-                            .err => |e| return raiseStep(frame, e),
-                        }
-                        return .cont;
-                    }
+                    return .cont;
                 }
             }
         }
-        var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
-        defer allocator.free(arg_values);
-        var names = try resolveArgNames(allocator, frame.module, call.arg_names);
-        defer allocator.free(names);
-        var ta: std.ArrayList([]const u8) = .empty;
-        defer ta.deinit(allocator);
-        for (call.type_args) |c| {
-            try ta.append(allocator, constStr(frame.module, c) orelse "");
+    }
+    var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
+    defer allocator.free(arg_values);
+    var names = try resolveArgNames(allocator, frame.module, call.arg_names);
+    defer allocator.free(names);
+    var ta: std.ArrayList([]const u8) = .empty;
+    defer ta.deinit(allocator);
+    for (call.type_args) |c| {
+        try ta.append(allocator, constStr(frame.module, c) orelse "");
+    }
+
+    const bakedExt = struct {
+        fn f(m: *const Module, id: FuncId) bool {
+            const ff = m.funcById(id) orelse return false;
+            const fp = ff.params;
+            return fp.len > 0 and std.mem.eql(u8, fp[0].name, "this");
         }
+    }.f;
+    const baked_is_ext = bakedExt(frame.module, call.func);
 
-        const bakedExt = struct {
-            fn f(m: *const Module, id: FuncId) bool {
-                const ff = m.funcById(id) orelse return false;
-                const fp = ff.params;
-                return fp.len > 0 and std.mem.eql(u8, fp[0].name, "this");
-            }
-        }.f;
-        const baked_is_ext = bakedExt(frame.module, call.func);
-
-        // Named-argument overload re-resolution. The lowerer baked the
-        // call to a positional-arity heuristic FuncId; a named call may
-        // really target a sibling overload (Kotlin resolves named calls
-        // by parameter name). The receiver is reachable here, so an
-        // implicit extension receiver can be supplied before dispatch.
-        var eff_func = call.func;
-        if (!call.exact) {
-            var any_named = false;
-            for (names) |n| {
-                if (n != null) any_named = true;
-            }
-            if (any_named) {
-                // The implicit extension receiver is in scope (a bare
-                // call inside an extension/method body) but absent from
-                // `args` only when the baked target is not itself an
-                // extension — otherwise the lowerer already prepended it.
-                const caller_this = frameThisParam(frame);
-                const recv_external = caller_this != null and !baked_is_ext;
-                const recv_val: ?*const Value = if (recv_external) blk: {
-                    const ct_idx = caller_this orelse break :blk null;
-                    break :blk &frame.params.items[ct_idx];
-                } else null;
-                const named_pick: ?FuncId = if (comptime @hasDecl(H, "pickNamedOverloadIdRecv"))
-                    host.pickNamedOverloadIdRecv(frame.module, call.func, arg_values, names, recv_external, recv_val)
-                else
-                    host.pickNamedOverloadId(frame.module, call.func, arg_values, names, recv_external);
-                if (named_pick) |picked| {
-                    eff_func = picked;
-                    const picked_is_ext = bakedExt(frame.module, picked);
-                    if (picked_is_ext and !baked_is_ext) {
-                        if (caller_this) |ct_idx| {
-                            // Supply the enclosing `this` as the leading
-                            // (unnamed) receiver argument the chosen
-                            // extension overload expects.
-                            const recv = frame.params.items[ct_idx];
-                            const na = try allocator.alloc(Value, arg_values.len + 1);
-                            na[0] = recv;
-                            @memcpy(na[1..], arg_values);
-                            // `arg_values`/`names` are owned by the
-                            // single `defer allocator.free(...)` above;
-                            // free the original buffers before replacing
-                            // the pointers so each is freed exactly once.
-                            allocator.free(arg_values);
-                            arg_values = na;
-                            const nn = try allocator.alloc(?[]const u8, names.len + 1);
-                            nn[0] = null;
-                            @memcpy(nn[1..], names);
-                            allocator.free(names);
-                            names = nn;
-                        }
-                    }
-                }
-            }
+    // Named-argument overload re-resolution. The lowerer baked the
+    // call to a positional-arity heuristic FuncId; a named call may
+    // really target a sibling overload (Kotlin resolves named calls
+    // by parameter name). The receiver is reachable here, so an
+    // implicit extension receiver can be supplied before dispatch.
+    var eff_func = call.func;
+    if (!call.exact) {
+        var any_named = false;
+        for (names) |n| {
+            if (n != null) any_named = true;
         }
-
-        // Invoking an extension / member-extension function from
-        // inside a method: keep the caller's instance `this`
-        // reachable as the enclosing receiver.
-        const callee_fn: ?*const Func = frame.module.funcById(eff_func);
-        const callee_is_ext = callee_fn != null and callee_fn.?.params.len > 0 and
-            std.mem.eql(u8, callee_fn.?.params[0].name, "this");
-        var pushed_enclosing = false;
-        if (callee_is_ext) {
+        if (any_named) {
+            // The implicit extension receiver is in scope (a bare
+            // call inside an extension/method body) but absent from
+            // `args` only when the baked target is not itself an
+            // extension — otherwise the lowerer already prepended it.
             const caller_this = frameThisParam(frame);
-            if (caller_this) |ct_idx| {
-                const p = frame.params.items[ct_idx];
-                if (p == .Instance) {
-                    const same = arg_values.len > 0 and arg_values[0] == .Instance and
-                        ObjRef(InstanceData).ptrEq(p.Instance, arg_values[0].Instance);
-                    if (!same) {
-                        // A member-extension's body has its declaring
-                        // class's `this` in lexical scope (the
-                        // dispatch receiver); a plain extension's body
-                        // does not — the push is then dispatch
-                        // visibility only.
-                        if (callee_fn.?.kind == .member_extension) {
-                            pushEnclosing(&frame.params.items[ct_idx]);
-                        } else {
-                            pushEnclosingAccess(&frame.params.items[ct_idx]);
-                        }
-                        pushed_enclosing = true;
+            const recv_external = caller_this != null and !baked_is_ext;
+            const recv_val: ?*const Value = if (recv_external) blk: {
+                const ct_idx = caller_this orelse break :blk null;
+                break :blk &frame.params.items[ct_idx];
+            } else null;
+            const named_pick: ?FuncId = if (comptime @hasDecl(H, "pickNamedOverloadIdRecv"))
+                host.pickNamedOverloadIdRecv(frame.module, call.func, arg_values, names, recv_external, recv_val)
+            else
+                host.pickNamedOverloadId(frame.module, call.func, arg_values, names, recv_external);
+            if (named_pick) |picked| {
+                eff_func = picked;
+                const picked_is_ext = bakedExt(frame.module, picked);
+                if (picked_is_ext and !baked_is_ext) {
+                    if (caller_this) |ct_idx| {
+                        // Supply the enclosing `this` as the leading
+                        // (unnamed) receiver argument the chosen
+                        // extension overload expects.
+                        const recv = frame.params.items[ct_idx];
+                        const na = try allocator.alloc(Value, arg_values.len + 1);
+                        na[0] = recv;
+                        @memcpy(na[1..], arg_values);
+                        // `arg_values`/`names` are owned by the
+                        // single `defer allocator.free(...)` above;
+                        // free the original buffers before replacing
+                        // the pointers so each is freed exactly once.
+                        allocator.free(arg_values);
+                        arg_values = na;
+                        const nn = try allocator.alloc(?[]const u8, names.len + 1);
+                        nn[0] = null;
+                        @memcpy(nn[1..], names);
+                        allocator.free(names);
+                        names = nn;
                     }
                 }
             }
         }
-        if (call.trailing_lambda) {
-            if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(true);
+    }
+
+    // Invoking an extension / member-extension function from
+    // inside a method: keep the caller's instance `this`
+    // reachable as the enclosing receiver.
+    const callee_fn: ?*const Func = frame.module.funcById(eff_func);
+    const callee_is_ext = callee_fn != null and callee_fn.?.params.len > 0 and
+        std.mem.eql(u8, callee_fn.?.params[0].name, "this");
+    var pushed_enclosing = false;
+    if (callee_is_ext) {
+        const caller_this = frameThisParam(frame);
+        if (caller_this) |ct_idx| {
+            const p = frame.params.items[ct_idx];
+            if (p == .Instance) {
+                const same = arg_values.len > 0 and arg_values[0] == .Instance and
+                    ObjRef(InstanceData).ptrEq(p.Instance, arg_values[0].Instance);
+                if (!same) {
+                    // A member-extension's body has its declaring
+                    // class's `this` in lexical scope (the
+                    // dispatch receiver); a plain extension's body
+                    // does not — the push is then dispatch
+                    // visibility only.
+                    if (callee_fn.?.kind == .member_extension) {
+                        pushEnclosing(&frame.params.items[ct_idx]);
+                    } else {
+                        pushEnclosingAccess(&frame.params.items[ct_idx]);
+                    }
+                    pushed_enclosing = true;
+                }
+            }
         }
-        const res = host.callFuncTyped(allocator, frame.module, eff_func, arg_values, names, ta.items, call.exact);
-        if (call.trailing_lambda) {
-            if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(false);
-        }
-        if (pushed_enclosing) popEnclosing();
-        switch (try res) {
-            .ok => |result| try frame.write(call.dst, result),
-            .err => |e| return raiseStep(frame, e),
-        }
+    }
+    if (call.trailing_lambda) {
+        if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(true);
+    }
+    const res = host.callFuncTyped(allocator, frame.module, eff_func, arg_values, names, ta.items, call.exact);
+    if (call.trailing_lambda) {
+        if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(false);
+    }
+    if (pushed_enclosing) popEnclosing();
+    switch (try res) {
+        .ok => |result| try frame.write(call.dst, result),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
-        const callee_v = frame.read(cv.callee);
-        var arg_values_list: std.ArrayList(Value) = .empty;
-        defer arg_values_list.deinit(allocator);
-        {
-            const tmp = try readArgRun(allocator, frame, cv.args, cv.n_args);
-            defer allocator.free(tmp);
-            try arg_values_list.appendSlice(allocator, tmp);
-        }
-        var names_list: std.ArrayList(?[]const u8) = .empty;
-        defer names_list.deinit(allocator);
-        {
-            const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
-            defer allocator.free(tmp);
-            try names_list.appendSlice(allocator, tmp);
-        }
-        // Receiver-typed lambda bare invocation: prepend the calling
-        // frame's `this` when the closure expects a leading `this`.
-        const caller_this = callerThisValue(frame);
-        if (host.callableReceiverShape(&callee_v)) |shape| {
-            if (shape.first_is_this and arg_values_list.items.len + 1 == shape.n_params) {
-                if (caller_this) |ct| {
-                    try arg_values_list.insert(allocator, 0, ct);
-                    try names_list.insert(allocator, 0, null);
-                }
-            }
-        }
-        // Receiver lambda whose `this` arrives via a captured slot.
-        if (host.closureNeedsThisCapture(&callee_v)) {
+    const callee_v = frame.read(cv.callee);
+    var arg_values_list: std.ArrayList(Value) = .empty;
+    defer arg_values_list.deinit(allocator);
+    {
+        const tmp = try readArgRun(allocator, frame, cv.args, cv.n_args);
+        defer allocator.free(tmp);
+        try arg_values_list.appendSlice(allocator, tmp);
+    }
+    var names_list: std.ArrayList(?[]const u8) = .empty;
+    defer names_list.deinit(allocator);
+    {
+        const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
+        defer allocator.free(tmp);
+        try names_list.appendSlice(allocator, tmp);
+    }
+    // Receiver-typed lambda bare invocation: prepend the calling
+    // frame's `this` when the closure expects a leading `this`.
+    const caller_this = callerThisValue(frame);
+    if (host.callableReceiverShape(&callee_v)) |shape| {
+        if (shape.first_is_this and arg_values_list.items.len + 1 == shape.n_params) {
             if (caller_this) |ct| {
-                host.overrideClosureThis(&callee_v, &ct);
+                try arg_values_list.insert(allocator, 0, ct);
+                try names_list.insert(allocator, 0, null);
             }
         }
-        // No caller-`this` push here: a closure's body resolves bare
-        // names against its creation-time receiver chain (lexical
-        // scope); a receiver-typed lambda gets its subject through the
-        // receiver-split / `this`-capture binding above. Pushing the
-        // dynamic caller's `this` would hand the body a receiver it
-        // never lexically saw.
-        const result = blk: {
-            // Explicit call-site type args reach the host so an
-            // unsigned element-type argument can coerce integral
-            // literals before the intrinsic (`arrayOf<ULong>(1u)`).
-            if (cv.type_args.len != 0) {
-                var ta_buf: [4][]const u8 = undefined;
-                const n_ta = @min(cv.type_args.len, ta_buf.len);
-                for (cv.type_args[0..n_ta], ta_buf[0..n_ta]) |cid, *slot| {
-                    slot.* = constStr(frame.module, cid) orelse "";
-                }
-                break :blk host.callValueNamedTyped(allocator, &callee_v, arg_values_list.items, names_list.items, ta_buf[0..n_ta]);
-            }
-            break :blk host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
-        };
-        switch (try result) {
-            .ok => |rv| {
-                var out = rv;
-                // A stdlib container creator dispatched as an
-                // intrinsic value records its call-site type-argument
-                // heads on the built container.
-                if (cv.type_args.len != 0 and callee_v == .Intrinsic) {
-                    var ta: std.ArrayList([]const u8) = .empty;
-                    defer ta.deinit(allocator);
-                    for (cv.type_args) |c| {
-                        try ta.append(allocator, constStr(frame.module, c) orelse "");
-                    }
-                    runtime.attachDeclaredElemTypes(callee_v.Intrinsic.fqn, ta.items, &out);
-                }
-                try frame.write(cv.dst, out);
-            },
-            .err => |e| return raiseStep(frame, e),
+    }
+    // Receiver lambda whose `this` arrives via a captured slot.
+    if (host.closureNeedsThisCapture(&callee_v)) {
+        if (caller_this) |ct| {
+            host.overrideClosureThis(&callee_v, &ct);
         }
+    }
+    // No caller-`this` push here: a closure's body resolves bare
+    // names against its creation-time receiver chain (lexical
+    // scope); a receiver-typed lambda gets its subject through the
+    // receiver-split / `this`-capture binding above. Pushing the
+    // dynamic caller's `this` would hand the body a receiver it
+    // never lexically saw.
+    const result = blk: {
+        // Explicit call-site type args reach the host so an
+        // unsigned element-type argument can coerce integral
+        // literals before the intrinsic (`arrayOf<ULong>(1u)`).
+        if (cv.type_args.len != 0) {
+            var ta_buf: [4][]const u8 = undefined;
+            const n_ta = @min(cv.type_args.len, ta_buf.len);
+            for (cv.type_args[0..n_ta], ta_buf[0..n_ta]) |cid, *slot| {
+                slot.* = constStr(frame.module, cid) orelse "";
+            }
+            break :blk host.callValueNamedTyped(allocator, &callee_v, arg_values_list.items, names_list.items, ta_buf[0..n_ta]);
+        }
+        break :blk host.callValueNamed(allocator, &callee_v, arg_values_list.items, names_list.items);
+    };
+    switch (try result) {
+        .ok => |rv| {
+            var out = rv;
+            // A stdlib container creator dispatched as an
+            // intrinsic value records its call-site type-argument
+            // heads on the built container.
+            if (cv.type_args.len != 0 and callee_v == .Intrinsic) {
+                var ta: std.ArrayList([]const u8) = .empty;
+                defer ta.deinit(allocator);
+                for (cv.type_args) |c| {
+                    try ta.append(allocator, constStr(frame.module, c) orelse "");
+                }
+                runtime.attachDeclaredElemTypes(callee_v.Intrinsic.fqn, ta.items, &out);
+            }
+            try frame.write(cv.dst, out);
+        },
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
-        const callee_v = frame.read(cs.callee);
-        var arg_values: std.ArrayList(Value) = .empty;
-        defer arg_values.deinit(allocator);
-        var effective_names: std.ArrayList(?[]const u8) = .empty;
-        defer effective_names.deinit(allocator);
-        const in_names = try resolveArgNames(allocator, frame.module, cs.arg_names);
-        defer allocator.free(in_names);
-        for (cs.parts, 0..) |part, i| {
-            const v = frame.read(part.reg);
-            const name: ?[]const u8 = if (i < in_names.len) in_names[i] else null;
-            if (part.is_spread) {
-                switch (try spreadItems(allocator, &v)) {
-                    .ok => |items| {
-                        defer allocator.free(items);
-                        for (items) |item| {
-                            try arg_values.append(allocator, item);
-                            try effective_names.append(allocator, null);
-                        }
-                    },
-                    .err => |e| return raiseStep(frame, e),
-                }
-            } else {
-                try arg_values.append(allocator, v);
-                try effective_names.append(allocator, name);
-            }
-        }
-        if (cs.member) |mid| {
-            const mname = constStr(frame.module, mid) orelse
-                return raiseStep(frame, .{ .Type = "CallSpread: member not a string const" });
-            // The receiver is borrowed for the call's whole duration;
-            // pin it across dispatch (the body may drop other refs).
-            callee_v.retain();
-            defer callee_v.release(allocator);
-            switch (try host.callMemberNamed(allocator, &callee_v, mname, arg_values.items, effective_names.items)) {
-                .ok => |rv| try frame.write(cs.dst, rv),
+    const callee_v = frame.read(cs.callee);
+    var arg_values: std.ArrayList(Value) = .empty;
+    defer arg_values.deinit(allocator);
+    var effective_names: std.ArrayList(?[]const u8) = .empty;
+    defer effective_names.deinit(allocator);
+    const in_names = try resolveArgNames(allocator, frame.module, cs.arg_names);
+    defer allocator.free(in_names);
+    for (cs.parts, 0..) |part, i| {
+        const v = frame.read(part.reg);
+        const name: ?[]const u8 = if (i < in_names.len) in_names[i] else null;
+        if (part.is_spread) {
+            switch (try spreadItems(allocator, &v)) {
+                .ok => |items| {
+                    defer allocator.free(items);
+                    for (items) |item| {
+                        try arg_values.append(allocator, item);
+                        try effective_names.append(allocator, null);
+                    }
+                },
                 .err => |e| return raiseStep(frame, e),
-            }
-        } else if (cs.candidates != null) {
-            const name_id = cs.name orelse
-                return raiseStep(frame, .{ .Type = "CallSpread: bounded call has no name" });
-            const name = constStr(frame.module, name_id) orelse
-                return raiseStep(frame, .{ .Type = "CallSpread: name not a string const" });
-            const caller_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
-            const overload = switch (try host.callNamedOverload(
-                allocator,
-                frame.module,
-                cs.candidates,
-                name,
-                arg_values.items,
-                effective_names.items,
-                false,
-                frame.func.package,
-                caller_file,
-                "",
-            )) {
-                .ok => |maybe| maybe,
-                .err => |e| return raiseStep(frame, e),
-            };
-            if (overload) |rv| {
-                try frame.write(cs.dst, rv);
-            } else {
-                const msg = try std.fmt.allocPrint(allocator, "unresolved spread overload `{s}`", .{name});
-                return raiseStep(frame, .{ .Type = msg });
             }
         } else {
-            switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
-                .ok => |rv| try frame.write(cs.dst, rv),
-                .err => |e| return raiseStep(frame, e),
-            }
+            try arg_values.append(allocator, v);
+            try effective_names.append(allocator, name);
         }
+    }
+    if (cs.member) |mid| {
+        const mname = constStr(frame.module, mid) orelse
+            return raiseStep(frame, .{ .Type = "CallSpread: member not a string const" });
+        // The receiver is borrowed for the call's whole duration;
+        // pin it across dispatch (the body may drop other refs).
+        callee_v.retain();
+        defer callee_v.release(allocator);
+        switch (try host.callMemberNamed(allocator, &callee_v, mname, arg_values.items, effective_names.items)) {
+            .ok => |rv| try frame.write(cs.dst, rv),
+            .err => |e| return raiseStep(frame, e),
+        }
+    } else if (cs.candidates != null) {
+        const name_id = cs.name orelse
+            return raiseStep(frame, .{ .Type = "CallSpread: bounded call has no name" });
+        const name = constStr(frame.module, name_id) orelse
+            return raiseStep(frame, .{ .Type = "CallSpread: name not a string const" });
+        const caller_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
+        const overload = switch (try host.callNamedOverload(
+            allocator,
+            frame.module,
+            cs.candidates,
+            name,
+            arg_values.items,
+            effective_names.items,
+            false,
+            frame.func.package,
+            caller_file,
+            "",
+        )) {
+            .ok => |maybe| maybe,
+            .err => |e| return raiseStep(frame, e),
+        };
+        if (overload) |rv| {
+            try frame.write(cs.dst, rv);
+        } else {
+            const msg = try std.fmt.allocPrint(allocator, "unresolved spread overload `{s}`", .{name});
+            return raiseStep(frame, .{ .Type = msg });
+        }
+    } else {
+        switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
+            .ok => |rv| try frame.write(cs.dst, rv),
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Frame, csup: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(csup.receiver);
-        recv.retain();
-        defer recv.release(allocator);
-        const owner_str = constStr(frame.module, csup.owner_class) orelse
-            return raiseStep(frame, .{ .Type = "CallSuper: owner not a string const" });
-        const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
-        const name_str = constStr(frame.module, csup.name) orelse
-            return raiseStep(frame, .{ .Type = "CallSuper: name not a string const" });
-        const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
-        defer allocator.free(arg_values);
-        const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
-        defer allocator.free(names);
-        switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
-            .ok => |rv| try frame.write(csup.dst, rv),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(csup.receiver);
+    recv.retain();
+    defer recv.release(allocator);
+    const owner_str = constStr(frame.module, csup.owner_class) orelse
+        return raiseStep(frame, .{ .Type = "CallSuper: owner not a string const" });
+    const qual_str: ?[]const u8 = if (csup.qualifier) |id| constStr(frame.module, id) else null;
+    const name_str = constStr(frame.module, csup.name) orelse
+        return raiseStep(frame, .{ .Type = "CallSuper: name not a string const" });
+    const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
+    defer allocator.free(arg_values);
+    const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
+    defer allocator.free(names);
+    switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
+        .ok => |rv| try frame.write(csup.dst, rv),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
@@ -3925,19 +4395,19 @@ fn bakeDisabled() bool {
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
-        if (fastSubscript(allocator, frame, cm)) |rv| {
-            try frame.write(cm.dst, rv);
-            return .cont;
-        }
-        const recv = frame.read(cm.receiver);
-        // Statically-resolved dispatch: the lowerer proved this call
-        // monomorphic and baked its target, so go straight to it — no
-        // name lookup, applicability walk, or FQN scan. A `null` return
-        // (target vanished) falls through to the name-based path, so a
-        // stale bake degrades rather than miscalls.
-        if (cm.resolved) |fid| {
-            if (comptime @hasDecl(H, "invokeResolvedMember")) {
-                if (!bakeDisabled()) {
+    if (fastSubscript(allocator, frame, cm)) |rv| {
+        try frame.write(cm.dst, rv);
+        return .cont;
+    }
+    const recv = frame.read(cm.receiver);
+    // Statically-resolved dispatch: the lowerer proved this call
+    // monomorphic and baked its target, so go straight to it — no
+    // name lookup, applicability walk, or FQN scan. A `null` return
+    // (target vanished) falls through to the name-based path, so a
+    // stale bake degrades rather than miscalls.
+    if (cm.resolved) |fid| {
+        if (comptime @hasDecl(H, "invokeResolvedMember")) {
+            if (!bakeDisabled()) {
                 recv.retain();
                 defer recv.release(allocator);
                 const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
@@ -3951,154 +4421,185 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                         .err => |e| return raiseStep(frame, e),
                     }
                 }
+            }
+        }
+    }
+    // Fast path: a range iterator's `hasNext()`/`next()`. The universal
+    // `for (x in range)` desugaring calls these once per element; the
+    // inline handler avoids the member-dispatch hashmap probes that
+    // otherwise dominate tight integer loops.
+    if (recv == .RangeIter) {
+        if (constStr(frame.module, cm.name)) |nm| {
+            if (rangeIterFast(allocator, &recv, nm, cm.n_args)) |r| {
+                switch (r) {
+                    .ok => |rv| {
+                        try frame.write(cm.dst, rv);
+                        return .cont;
+                    },
+                    .err => |e| return raiseStep(frame, e),
                 }
             }
         }
-        // Fast path: a range iterator's `hasNext()`/`next()`. The universal
-        // `for (x in range)` desugaring calls these once per element; the
-        // inline handler avoids the member-dispatch hashmap probes that
-        // otherwise dominate tight integer loops.
-        if (recv == .RangeIter) {
-            if (constStr(frame.module, cm.name)) |nm| {
-                if (rangeIterFast(allocator, &recv, nm, cm.n_args)) |r| {
-                    switch (r) {
-                        .ok => |rv| {
-                            try frame.write(cm.dst, rv);
-                            return .cont;
-                        },
-                        .err => |e| return raiseStep(frame, e),
-                    }
-                }
-            }
+    }
+    // A method borrows its receiver for the call's whole duration.
+    // Pin it: the dispatched body may, via the coroutine machinery,
+    // drop every other reference to the receiver (e.g. a job
+    // completing inside `runBlocking.joinBlocking`), and the register
+    // read is only a borrow. Retain across the dispatch so the
+    // receiver outlives the call regardless. No-op under the arena.
+    recv.retain();
+    defer recv.release(allocator);
+    const name_str = constStr(frame.module, cm.name) orelse
+        return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
+    const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
+    defer allocator.free(arg_values);
+    const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
+    defer allocator.free(names);
+    // Keep the caller's instance `this` reachable while the
+    // `recv.member(...)` dispatch resolves (the member-extension
+    // visibility filter consults the chain); the callee's own
+    // lexical scope is its dispatch receiver, so the entry is
+    // access-only.
+    var pushed_enclosing = false;
+    if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
+        const pi = frame.params.items[0].Instance;
+        const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
+        if (!same) {
+            pushEnclosingAccess(&frame.params.items[0]);
+            pushed_enclosing = true;
         }
-        // A method borrows its receiver for the call's whole duration.
-        // Pin it: the dispatched body may, via the coroutine machinery,
-        // drop every other reference to the receiver (e.g. a job
-        // completing inside `runBlocking.joinBlocking`), and the register
-        // read is only a borrow. Retain across the dispatch so the
-        // receiver outlives the call regardless. No-op under the arena.
-        recv.retain();
-        defer recv.release(allocator);
-        const name_str = constStr(frame.module, cm.name) orelse
-            return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
-        const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
-        defer allocator.free(arg_values);
-        const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
-        defer allocator.free(names);
-        // Keep the caller's instance `this` reachable while the
-        // `recv.member(...)` dispatch resolves (the member-extension
-        // visibility filter consults the chain); the callee's own
-        // lexical scope is its dispatch receiver, so the entry is
-        // access-only.
-        var pushed_enclosing = false;
-        if (frame.params.items.len > 0 and frame.params.items[0] == .Instance) {
-            const pi = frame.params.items[0].Instance;
-            const same = recv == .Instance and ObjRef(InstanceData).ptrEq(pi, recv.Instance);
-            if (!same) {
-                pushEnclosingAccess(&frame.params.items[0]);
-                pushed_enclosing = true;
-            }
-        }
-        const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
-        const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
-        const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
-            H.setTrailingMemberCall(true)
-        else
-            false;
-        const tl_touched = cm.trailing_lambda;
-        const res = if (static_recv) |sname|
-            host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
-        else if (declared_recv != null)
-            host.callMemberNamedDeclared(allocator, &recv, name_str, arg_values, names, declared_recv)
-        else
-            host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
-        if (tl_touched) {
-            if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
-        }
-        if (pushed_enclosing) popEnclosing();
-        switch (try res) {
-            .ok => |rv| try frame.write(cm.dst, rv),
-            .err => |e| return raiseStep(frame, e),
-        }
+    }
+    const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
+    const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+    const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+        H.setTrailingMemberCall(true)
+    else
+        false;
+    const tl_touched = cm.trailing_lambda;
+    const res = if (static_recv) |sname|
+        host.callMemberNamedStatic(allocator, &recv, name_str, arg_values, names, sname)
+    else if (declared_recv != null)
+        host.callMemberNamedDeclared(allocator, &recv, name_str, arg_values, names, declared_recv)
+    else
+        host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
+    if (tl_touched) {
+        if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
+    }
+    if (pushed_enclosing) popEnclosing();
+    switch (try res) {
+        .ok => |rv| try frame.write(cm.dst, rv),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, frame: *Frame, cmv: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(cmv.receiver);
-        recv.retain();
-        defer recv.release(allocator);
-        const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
-        defer allocator.free(user_args);
-        const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
-        defer allocator.free(names);
-        const name_str = constStr(frame.module, cmv.name) orelse
-            return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
-        var fb = frame.read(cmv.fallback);
-        // A boxed capture holds the callable in a cell (a captured local fn's
-        // shared binding); classify and invoke the CONTENT — the sibling
-        // CallValueOrMember arm unwraps identically. Without this a captured
-        // `fun MockViewValidator.Composition()` fallback read as `.Cell`,
-        // was judged non-invocable, and the member miss surfaced.
-        if (fb == .Cell) {
-            const cg = fb.Cell.borrow();
-            fb = cg.get().*;
+    const recv = frame.read(cmv.receiver);
+    recv.retain();
+    defer recv.release(allocator);
+    const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
+    defer allocator.free(user_args);
+    const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
+    defer allocator.free(names);
+    const name_str = constStr(frame.module, cmv.name) orelse
+        return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
+    var fb = frame.read(cmv.fallback);
+    // A boxed capture holds the callable in a cell (a captured local fn's
+    // shared binding); classify and invoke the CONTENT — the sibling
+    // CallValueOrMember arm unwraps identically. Without this a captured
+    // `fun MockViewValidator.Composition()` fallback read as `.Cell`,
+    // was judged non-invocable, and the member miss surfaced.
+    if (fb == .Cell) {
+        const cg = fb.Cell.borrow();
+        fb = cg.get().*;
+        cg.deinit();
+    }
+    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
+        const rcls: []const u8 = if (recv == .Instance) blk: {
+            const g = recv.Instance.borrow();
+            const cg = g.get().class.borrow();
+            const n = cg.get().name;
             cg.deinit();
+            g.deinit();
+            break :blk n;
+        } else @tagName(recv);
+        std.debug.print("[pb] in={s}#{d} recv={s} fb={s}\n", .{ frame.func.name, frame.func.id.int(), rcls, @tagName(fb) });
+    }
+    // The local/captured fallback only wins when the receiver has no
+    // such member AND the fallback is actually invocable (a function
+    // value or callable reference). A same-named non-callable local
+    // (e.g. a captured `info` next to `logger.info(...)`) must not
+    // shadow the real member.
+    const fb_invocable = switch (fb) {
+        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
+        // A class value is its constructor (`::Char` bound to an
+        // `Int.() -> Char` param): invocable, receiver becomes the
+        // first positional argument below.
+        .Class => true,
+        // A bound/unbound callable reference (`Long::toByte`,
+        // `recv::method`) is a `$bound_ref$<name>` synth instance: it
+        // is invocable, so `recv.refParam()` invokes the reference
+        // with `recv` as its receiver rather than dispatching a member
+        // named `refParam` on `recv`.
+        .Instance => isBoundRefInstance(&fb) or host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
+        else => false,
+    };
+    // A local callable whose declared arity provably cannot take
+    // the supplied args is not the primary candidate — Kotlin
+    // resolves the member/extension instead
+    // (`subList(..).sortDescending()` next to a
+    // `sortDescending: TArray.(Int, Int) -> Unit` param must
+    // dispatch the extension, not Null-pad the local). The proof
+    // is conservative (closure shapes without a DeclSig can hide
+    // defaults), so a canonical member MISS still falls back to
+    // invoking the local.
+    const fb_misfit = fb_invocable and
+        (host.callableAcceptsCall(&fb, &recv, user_args, names) orelse true) == false;
+    // A receiver whose STATIC type is an unbounded type parameter has no
+    // members to shadow the local: Kotlin compiles the body once against
+    // the bound (`Any?`), so `receiver.block()` inside
+    // `fun <T, R> with(receiver: T, block: T.() -> R)` always binds the
+    // `block` PARAMETER. Consulting the runtime class instead let a
+    // same-named member hijack it — `with(node) { … }` on a node owning a
+    // `block` field ran that field and skipped the whole with-body.
+    const members_visible = !cmv.recv_erased and host.hostHasMember(&recv, name_str);
+    if (fb_invocable and (!fb_misfit or cmv.recv_erased) and !members_visible) {
+        orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
+        if (fb == .Class) {
+            // Constructors take no receiver: `65.f()` with
+            // `f = ::Char` is `Char(65)`.
+            const adapted = try allocator.alloc(Value, user_args.len + 1);
+            defer allocator.free(adapted);
+            adapted[0] = recv;
+            @memcpy(adapted[1..], user_args);
+            const nn = try allocator.alloc(?[]const u8, names.len + 1);
+            defer allocator.free(nn);
+            nn[0] = null;
+            @memcpy(nn[1..], names);
+            switch (try host.callValueNamed(allocator, &fb, adapted, nn)) {
+                .ok => |rv| try frame.write(cmv.dst, rv),
+                .err => |e| return raiseStep(frame, e),
+            }
+        } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+            .ok => |rv| try frame.write(cmv.dst, rv),
+            .err => |e| return raiseStep(frame, e),
         }
-        if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
-            const rcls: []const u8 = if (recv == .Instance) blk: {
-                const g = recv.Instance.borrow();
-                const cg = g.get().class.borrow();
-                const n = cg.get().name;
-                cg.deinit();
-                g.deinit();
-                break :blk n;
-            } else @tagName(recv);
-            std.debug.print("[pb] in={s}#{d} recv={s} fb={s}\n", .{ frame.func.name, frame.func.id.int(), rcls, @tagName(fb) });
-        }
-        // The local/captured fallback only wins when the receiver has no
-        // such member AND the fallback is actually invocable (a function
-        // value or callable reference). A same-named non-callable local
-        // (e.g. a captured `info` next to `logger.info(...)`) must not
-        // shadow the real member.
-        const fb_invocable = switch (fb) {
-            .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
-            // A class value is its constructor (`::Char` bound to an
-            // `Int.() -> Char` param): invocable, receiver becomes the
-            // first positional argument below.
-            .Class => true,
-            // A bound/unbound callable reference (`Long::toByte`,
-            // `recv::method`) is a `$bound_ref$<name>` synth instance: it
-            // is invocable, so `recv.refParam()` invokes the reference
-            // with `recv` as its receiver rather than dispatching a member
-            // named `refParam` on `recv`.
-            .Instance => isBoundRefInstance(&fb) or host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
-            else => false,
-        };
-        // A local callable whose declared arity provably cannot take
-        // the supplied args is not the primary candidate — Kotlin
-        // resolves the member/extension instead
-        // (`subList(..).sortDescending()` next to a
-        // `sortDescending: TArray.(Int, Int) -> Unit` param must
-        // dispatch the extension, not Null-pad the local). The proof
-        // is conservative (closure shapes without a DeclSig can hide
-        // defaults), so a canonical member MISS still falls back to
-        // invoking the local.
-        const fb_misfit = fb_invocable and
-            (host.callableAcceptsCall(&fb, &recv, user_args, names) orelse true) == false;
-        // A receiver whose STATIC type is an unbounded type parameter has no
-        // members to shadow the local: Kotlin compiles the body once against
-        // the bound (`Any?`), so `receiver.block()` inside
-        // `fun <T, R> with(receiver: T, block: T.() -> R)` always binds the
-        // `block` PARAMETER. Consulting the runtime class instead let a
-        // same-named member hijack it — `with(node) { … }` on a node owning a
-        // `block` field ran that field and skipped the whole with-body.
-        const members_visible = !cmv.recv_erased and host.hostHasMember(&recv, name_str);
-        if (fb_invocable and !fb_misfit and !members_visible) {
-            orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
+    } else {
+        orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
+        const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
+        const member_missed = r == .err and r.err == .Unimplemented and
+            std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null;
+        // The member exists by name but no overload serves this call
+        // (arity/type). When the same-named local is an invocable
+        // function value, it is the intended target — Kotlin resolves
+        // `up.update()` to a `Up.() -> Unit` param over the 2-arg member
+        // `update(value, block)`. Discard the member miss and invoke the
+        // value (its receiver is the call receiver).
+        if (member_missed and fb_invocable) {
+            freeDispatchMissMsg(allocator, r.err.Unimplemented);
+            orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
             if (fb == .Class) {
-                // Constructors take no receiver: `65.f()` with
-                // `f = ::Char` is `Char(65)`.
                 const adapted = try allocator.alloc(Value, user_args.len + 1);
                 defer allocator.free(adapted);
                 adapted[0] = recv;
@@ -4115,42 +4616,11 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
                 .ok => |rv| try frame.write(cmv.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
-        } else {
-            orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
-            const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
-            const member_missed = r == .err and r.err == .Unimplemented and
-                std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null;
-            // The member exists by name but no overload serves this call
-            // (arity/type). When the same-named local is an invocable
-            // function value, it is the intended target — Kotlin resolves
-            // `up.update()` to a `Up.() -> Unit` param over the 2-arg member
-            // `update(value, block)`. Discard the member miss and invoke the
-            // value (its receiver is the call receiver).
-            if (member_missed and fb_invocable) {
-                freeDispatchMissMsg(allocator, r.err.Unimplemented);
-                orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
-                if (fb == .Class) {
-                    const adapted = try allocator.alloc(Value, user_args.len + 1);
-                    defer allocator.free(adapted);
-                    adapted[0] = recv;
-                    @memcpy(adapted[1..], user_args);
-                    const nn = try allocator.alloc(?[]const u8, names.len + 1);
-                    defer allocator.free(nn);
-                    nn[0] = null;
-                    @memcpy(nn[1..], names);
-                    switch (try host.callValueNamed(allocator, &fb, adapted, nn)) {
-                        .ok => |rv| try frame.write(cmv.dst, rv),
-                        .err => |e| return raiseStep(frame, e),
-                    }
-                } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
-                    .ok => |rv| try frame.write(cmv.dst, rv),
-                    .err => |e| return raiseStep(frame, e),
-                }
-            } else switch (r) {
-                .ok => |rv| try frame.write(cmv.dst, rv),
-                .err => |e| return raiseStep(frame, e),
-            }
+        } else switch (r) {
+            .ok => |rv| try frame.write(cmv.dst, rv),
+            .err => |e| return raiseStep(frame, e),
         }
+    }
     return .cont;
 }
 
@@ -4186,491 +4656,495 @@ fn valueInvocable(module: *const Module, callee_v: Value) bool {
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, frame: *Frame, cvm: anytype, host: *H) Allocator.Error!Step {
-        var callee_v = frame.read(cvm.callee);
-        // A boxed capture holds the callable in a cell; classify the
-        // CONTENT (a captured local fn in a `var` slot is invokable).
-        if (callee_v == .Cell) {
-            const cg = callee_v.Cell.borrow();
-            callee_v = cg.get().*;
-            cg.deinit();
+    var callee_v = frame.read(cvm.callee);
+    // A boxed capture holds the callable in a cell; classify the
+    // CONTENT (a captured local fn in a `var` slot is invokable).
+    if (callee_v == .Cell) {
+        const cg = callee_v.Cell.borrow();
+        callee_v = cg.get().*;
+        cg.deinit();
+    }
+    const arg_values = try readArgRun(allocator, frame, cvm.args, cvm.n_args);
+    defer allocator.free(arg_values);
+    const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
+    defer allocator.free(names);
+    const invocable = valueInvocable(frame.module, callee_v);
+    // A callable whose DECLARED params definitely refute the runtime
+    // args is not the target — Kotlin resolved the call to the
+    // same-named enclosing member overload; fall to the member arm.
+    const refuted = invocable and (comptime @hasDecl(H, "closureParamsDisproven")) and
+        host.closureParamsDisproven(&callee_v, arg_values);
+    if (invocable and !refuted) {
+        if (orAuditOn()) {
+            const name_str = constStr(frame.module, cvm.name) orelse "?";
+            orAudit("CallValueOrMember", name_str, "value", -1, null);
         }
-        const arg_values = try readArgRun(allocator, frame, cvm.args, cvm.n_args);
-        defer allocator.free(arg_values);
-        const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
-        defer allocator.free(names);
-        const invocable = valueInvocable(frame.module, callee_v);
-        // A callable whose DECLARED params definitely refute the runtime
-        // args is not the target — Kotlin resolved the call to the
-        // same-named enclosing member overload; fall to the member arm.
-        const refuted = invocable and (comptime @hasDecl(H, "closureParamsDisproven")) and
-            host.closureParamsDisproven(&callee_v, arg_values);
-        if (invocable and !refuted) {
-            if (orAuditOn()) {
-                const name_str = constStr(frame.module, cvm.name) orelse "?";
-                orAudit("CallValueOrMember", name_str, "value", -1, null);
-            }
-            // The member-fallback receiver is also the call site's
-            // innermost implicit receiver; a receiver-typed closure
-            // invoked bare binds it as dispatch context.
-            const recv_ctx = frame.read(cvm.this_recv);
-            const r = if (comptime @hasDecl(H, "callValueNamedRecvCtx"))
-                try host.callValueNamedRecvCtx(allocator, &callee_v, &recv_ctx, arg_values, names)
-            else
-                try host.callValueNamed(allocator, &callee_v, arg_values, names);
-            switch (r) {
-                .ok => |rv| try frame.write(cvm.dst, rv),
-                .err => |e| return raiseStep(frame, e),
-            }
-        } else {
-            const recv = frame.read(cvm.this_recv);
-            const name_str = constStr(frame.module, cvm.name) orelse
-                return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
-            orAudit("CallValueOrMember", name_str, "member", 0, &recv);
-            switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
-                .ok => |rv| try frame.write(cvm.dst, rv),
-                .err => |e| return raiseStep(frame, e),
-            }
+        // The member-fallback receiver is also the call site's
+        // innermost implicit receiver; a receiver-typed closure
+        // invoked bare binds it as dispatch context.
+        const recv_ctx = frame.read(cvm.this_recv);
+        const r = if (comptime @hasDecl(H, "callValueNamedRecvCtx"))
+            try host.callValueNamedRecvCtx(allocator, &callee_v, &recv_ctx, arg_values, names)
+        else
+            try host.callValueNamed(allocator, &callee_v, arg_values, names);
+        switch (r) {
+            .ok => |rv| try frame.write(cvm.dst, rv),
+            .err => |e| return raiseStep(frame, e),
         }
+    } else {
+        const recv = frame.read(cvm.this_recv);
+        const name_str = constStr(frame.module, cvm.name) orelse
+            return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
+        orAudit("CallValueOrMember", name_str, "member", 0, &recv);
+        switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
+            .ok => |rv| try frame.write(cvm.dst, rv),
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *Frame, ni: anytype, host: *H) Allocator.Error!Step {
-        const arg_values = try readArgRun(allocator, frame, ni.args, ni.n_args);
-        defer allocator.free(arg_values);
-        const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
-        defer allocator.free(names);
-        // A bare `Inner(args)` inside a member of the enclosing
-        // class is `this@Outer.Inner(args)`: pass the frame's own
-        // `this` — a method's `this` param or a lambda's `this`
-        // capture — as the outer hint for the construction dispatch.
-        // The host's outer selection is class-keyed, so a receiver
-        // lambda whose `this` slot was overridden with an unrelated
-        // subject falls through to the enclosing-receiver chain.
-        var outer_hint: ?Value = callerThisValue(frame);
-        const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
-        const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
-            .ok => |v| v,
-            .err => |e| return raiseStep(frame, e),
+    const arg_values = try readArgRun(allocator, frame, ni.args, ni.n_args);
+    defer allocator.free(arg_values);
+    const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
+    defer allocator.free(names);
+    // A bare `Inner(args)` inside a member of the enclosing
+    // class is `this@Outer.Inner(args)`: pass the frame's own
+    // `this` — a method's `this` param or a lambda's `this`
+    // capture — as the outer hint for the construction dispatch.
+    // The host's outer selection is class-keyed, so a receiver
+    // lambda whose `this` slot was overridden with an unrelated
+    // subject falls through to the enclosing-receiver chain.
+    var outer_hint: ?Value = callerThisValue(frame);
+    const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
+    const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
+        .ok => |v| v,
+        .err => |e| return raiseStep(frame, e),
+    };
+    if (result == .Instance) {
+        const inst_ref = result.Instance;
+        const needs_outer = blk: {
+            const g = inst_ref.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk cg.get().is_inner and g.get().outer == null;
         };
-        if (result == .Instance) {
-            const inst_ref = result.Instance;
-            const needs_outer = blk: {
-                const g = inst_ref.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                break :blk cg.get().is_inner and g.get().outer == null;
-            };
-            if (needs_outer and outer_hint != null) {
-                // The instance's `outer` is an owned field (its teardown
-                // releases it); `outer_hint` is the caller's borrow, so
-                // retain before storing. No-op under the arena.
-                outer_hint.?.retain();
-                const g = inst_ref.borrowMut();
-                defer g.deinit();
-                g.get().outer = outer_hint.?;
-            }
+        if (needs_outer and outer_hint != null) {
+            // The instance's `outer` is an owned field (its teardown
+            // releases it); `outer_hint` is the caller's borrow, so
+            // retain before storing. No-op under the arena.
+            outer_hint.?.retain();
+            const g = inst_ref.borrowMut();
+            defer g.deinit();
+            g.get().outer = outer_hint.?;
         }
-        try frame.write(ni.dst, result);
+    }
+    try frame.write(ni.dst, result);
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmInstanceOf(comptime H: type, allocator: Allocator, frame: *Frame, io: anytype, host: *H) Allocator.Error!Step {
     _ = allocator;
-        const v = frame.read(io.src);
-        const is = host.instanceOf(&v, io.ty);
-        try frame.write(io.dst, .{ .Bool = is });
+    const v = frame.read(io.src);
+    const is = host.instanceOf(&v, io.ty);
+    try frame.write(io.dst, .{ .Bool = is });
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCtxScope(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
-        if (comptime !@hasDecl(H, "ctxPush")) {
-            try frame.write(cs.dst, .Null);
-            return .cont;
-        }
-        const mark = host.ctxStackLen();
-        var i: u32 = 0;
-        while (i < cs.n_ctx) : (i += 1) {
-            const v = frame.read(Reg.from(cs.ctx_args.int() + i));
-            try host.ctxPush(v);
-        }
-        var block = frame.read(cs.block);
-        const res = host.callValue(allocator, &block, &.{});
-        host.ctxStackTruncate(mark);
-        switch (try res) {
-            .ok => |rv| try frame.write(cs.dst, rv),
-            .err => |e| return raiseStep(frame, e),
-        }
+    if (comptime !@hasDecl(H, "ctxPush")) {
+        try frame.write(cs.dst, .Null);
+        return .cont;
+    }
+    const mark = host.ctxStackLen();
+    var i: u32 = 0;
+    while (i < cs.n_ctx) : (i += 1) {
+        const v = frame.read(Reg.from(cs.ctx_args.int() + i));
+        try host.ctxPush(v);
+    }
+    var block = frame.read(cs.block);
+    const res = host.callValue(allocator, &block, &.{});
+    host.ctxStackTruncate(mark);
+    switch (try res) {
+        .ok => |rv| try frame.write(cs.dst, rv),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *Frame, cc: anytype, host: *H) Allocator.Error!Step {
-        if (comptime !@hasDecl(H, "ctxPush")) {
-            try frame.write(cc.dst, .Null);
-            return .cont;
-        }
-        const mark = host.ctxStackLen();
-        var i: u32 = 0;
-        while (i < cc.n_ctx) : (i += 1) {
-            const v = frame.read(Reg.from(cc.args.int() + i));
-            try host.ctxPush(v);
-        }
-        const call_n = cc.n_args - cc.n_ctx;
-        const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + cc.n_ctx), call_n);
-        defer allocator.free(call_args);
-        var callee_v = frame.read(cc.callee);
-        const res = host.callValue(allocator, &callee_v, call_args);
-        host.ctxStackTruncate(mark);
-        switch (try res) {
-            .ok => |rv| try frame.write(cc.dst, rv),
-            .err => |e| return raiseStep(frame, e),
-        }
+    if (comptime !@hasDecl(H, "ctxPush")) {
+        try frame.write(cc.dst, .Null);
+        return .cont;
+    }
+    const mark = host.ctxStackLen();
+    var i: u32 = 0;
+    while (i < cc.n_ctx) : (i += 1) {
+        const v = frame.read(Reg.from(cc.args.int() + i));
+        try host.ctxPush(v);
+    }
+    const call_n = cc.n_args - cc.n_ctx;
+    const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + cc.n_ctx), call_n);
+    defer allocator.free(call_args);
+    var callee_v = frame.read(cc.callee);
+    const res = host.callValue(allocator, &callee_v, call_args);
+    host.ctxStackTruncate(mark);
+    switch (try res) {
+        .ok => |rv| try frame.write(cc.dst, rv),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, cast: anytype, host: *H) Allocator.Error!Step {
-        const v = frame.read(cast.src);
-        if (host.instanceOf(&v, cast.ty)) {
-            v.retain();
-            try frame.write(cast.dst, v);
-        } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
-            v.retain();
-            try frame.write(cast.dst, v);
-        } else if (cast.safe) {
-            try frame.write(cast.dst, .Null);
-        } else {
-            // A failed cast raises without passing through the
-            // `Throw` terminator, so trace it here too or
-            // KLIO_THROW_TRACE never sees ClassCastExceptions.
-            if (envVarSet("KLIO_THROW_TRACE")) {
-                std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
-            }
-            const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
-            const exc = Value{ .Exception = .{
-                .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
-                .message = try runtime.strInitOwned(allocator, msg),
-                .cause = null,
-            } };
-            return raiseStep(frame, .{ .Throw = exc });
+    const v = frame.read(cast.src);
+    if (host.instanceOf(&v, cast.ty)) {
+        v.retain();
+        try frame.write(cast.dst, v);
+    } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
+        v.retain();
+        try frame.write(cast.dst, v);
+    } else if (cast.safe) {
+        try frame.write(cast.dst, .Null);
+    } else {
+        // A failed cast raises without passing through the
+        // `Throw` terminator, so trace it here too or
+        // KLIO_THROW_TRACE never sees ClassCastExceptions.
+        if (envVarSet("KLIO_THROW_TRACE")) {
+            std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
         }
+        const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
+        const exc = Value{ .Exception = .{
+            .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
+            .message = try runtime.strInitOwned(allocator, msg),
+            .cause = null,
+        } };
+        return raiseStep(frame, .{ .Throw = exc });
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmLambda(comptime H: type, allocator: Allocator, frame: *Frame, lam: anytype, host: *H) Allocator.Error!Step {
-        const cap_values = try readRegSlice(allocator, frame, lam.captures);
-        defer allocator.free(cap_values);
-        switch (try host.buildClosure(allocator, frame.module, lam.body_func, cap_values)) {
-            .ok => |v| try frame.write(lam.dst, v),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const cap_values = try readRegSlice(allocator, frame, lam.captures);
+    defer allocator.free(cap_values);
+    switch (try host.buildClosure(allocator, frame.module, lam.body_func, cap_values)) {
+        .ok => |v| try frame.write(lam.dst, v),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmAstLambda(comptime H: type, allocator: Allocator, frame: *Frame, al: anytype, host: *H) Allocator.Error!Step {
-        const cap_values = try readRegSlice(allocator, frame, al.captures);
-        defer allocator.free(cap_values);
-        switch (try host.buildAstLambdaWithFlagFuncid(allocator, frame.module, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
-            .ok => |v| try frame.write(al.dst, v),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const cap_values = try readRegSlice(allocator, frame, al.captures);
+    defer allocator.free(cap_values);
+    switch (try host.buildAstLambdaWithFlagFuncid(allocator, frame.module, al.params, &al.body_ast, al.captured_names, cap_values, al.absorb_return, al.body_func)) {
+        .ok => |v| try frame.write(al.dst, v),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, frame: *Frame, rc: anytype, host: *H) Allocator.Error!Step {
-        const cap_values = try readRegSlice(allocator, frame, rc.captures);
-        defer allocator.free(cap_values);
-        switch (try host.registerClassCaptured(allocator, rc.class.get(), rc.captured_names, cap_values)) {
-            .ok => {},
-            .err => |e| return raiseStep(frame, e),
-        }
-        // Bind the declaration name to the registered class value so a call
-        // to the local class in scope constructs it (shadowing a same-named
-        // top-level function). Only hosts that model a class table produce a
-        // value; others leave the slot at its default.
-        if (rc.dst) |d| {
-            if (@hasDecl(H, "localClassValue")) {
-                switch (try host.localClassValue(allocator, rc.class.get().name.name)) {
-                    .ok => |maybe| if (maybe) |v| try frame.write(d, v),
-                    .err => |e| return raiseStep(frame, e),
-                }
+    const cap_values = try readRegSlice(allocator, frame, rc.captures);
+    defer allocator.free(cap_values);
+    switch (try host.registerClassCaptured(allocator, rc.class.get(), rc.captured_names, cap_values)) {
+        .ok => {},
+        .err => |e| return raiseStep(frame, e),
+    }
+    // Bind the declaration name to the registered class value so a call
+    // to the local class in scope constructs it (shadowing a same-named
+    // top-level function). Only hosts that model a class table produce a
+    // value; others leave the slot at its default.
+    if (rc.dst) |d| {
+        if (@hasDecl(H, "localClassValue")) {
+            switch (try host.localClassValue(allocator, rc.class.get().name.name)) {
+                .ok => |maybe| if (maybe) |v| try frame.write(d, v),
+                .err => |e| return raiseStep(frame, e),
             }
         }
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmBuildObject(comptime H: type, allocator: Allocator, frame: *Frame, bobj: anytype, host: *H) Allocator.Error!Step {
-        const cap_values = try readRegSlice(allocator, frame, bobj.captures);
-        defer allocator.free(cap_values);
-        switch (try host.buildObject(allocator, bobj.ast.get(), bobj.captured_names, cap_values, bobj.scope_renames)) {
-            .ok => |v| try frame.write(bobj.dst, v),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const cap_values = try readRegSlice(allocator, frame, bobj.captures);
+    defer allocator.free(cap_values);
+    switch (try host.buildObject(allocator, bobj.ast.get(), bobj.captured_names, cap_values, bobj.scope_renames)) {
+        .ok => |v| try frame.write(bobj.dst, v),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, stg: anytype, host: *H) Allocator.Error!Step {
-        const name_str = constStr(frame.module, stg.name) orelse
-            return raiseStep(frame, .{ .Type = "StoreToThisOrGlobal: name not a string const" });
-        const v = frame.read(stg.value);
-        // Kotlin scoping for a bare-name write mirrors the read side:
-        // the innermost implicit receiver owning a *property* of this
-        // name takes the write; only when no receiver owns one does
-        // the write land on the top-level binding (pinned by the
-        // `bare_write_*` kotlinc parity fixtures). An assignment LHS
-        // can only resolve to a property or variable — a member
-        // *function* of the name never captures the write.
-        var routed = false;
-        {
-            // `consult_param = true`: the implicit receiver owning the
-            // written property may be the frame's `this` *parameter* (a
-            // bare `receiveType = …` inside an interface/extension method),
-            // not a capture — matching the read side. A bare write also
-            // resolves to an extension-property *setter* (`var T.x set(…)`)
-            // declared on the receiver's type or a supertype, not only a
-            // stored member; `setField` dispatches both.
-            const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
-            defer allocator.free(cands);
-            for (cands) |c| {
-                if (c.v != .Instance) continue;
-                if (!host.hostHasProperty(&c.v, name_str) and
-                    !host.hostHasExtPropSetter(allocator, &c.v, name_str)) continue;
-                orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
-                switch (try host.setField(allocator, &c.v, name_str, v)) {
-                    .ok => {},
-                    .err => |e| return raiseStep(frame, e),
-                }
-                routed = true;
-                break;
-            }
-        }
-        if (!routed) {
-            orAudit("StoreToThisOrGlobal", name_str, "global", -1, null);
-            switch (try host.storeGlobal(allocator, name_str, v)) {
+    const name_str = constStr(frame.module, stg.name) orelse
+        return raiseStep(frame, .{ .Type = "StoreToThisOrGlobal: name not a string const" });
+    const v = frame.read(stg.value);
+    // Kotlin scoping for a bare-name write mirrors the read side:
+    // the innermost implicit receiver owning a *property* of this
+    // name takes the write; only when no receiver owns one does
+    // the write land on the top-level binding (pinned by the
+    // `bare_write_*` kotlinc parity fixtures). An assignment LHS
+    // can only resolve to a property or variable — a member
+    // *function* of the name never captures the write.
+    var routed = false;
+    {
+        // `consult_param = true`: the implicit receiver owning the
+        // written property may be the frame's `this` *parameter* (a
+        // bare `receiveType = …` inside an interface/extension method),
+        // not a capture — matching the read side. A bare write also
+        // resolves to an extension-property *setter* (`var T.x set(…)`)
+        // declared on the receiver's type or a supertype, not only a
+        // stored member; `setField` dispatches both.
+        const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
+        defer allocator.free(cands);
+        const cands_keepalive = pinImplicitCandidates(cands);
+        defer runtime.keepaliveRestore(cands_keepalive);
+        for (cands) |c| {
+            if (c.v != .Instance) continue;
+            if (!host.hostHasProperty(&c.v, name_str) and
+                !host.hostHasExtPropSetter(allocator, &c.v, name_str)) continue;
+            orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
+            switch (try host.setField(allocator, &c.v, name_str, v)) {
                 .ok => {},
                 .err => |e| return raiseStep(frame, e),
             }
+            routed = true;
+            break;
         }
+    }
+    if (!routed) {
+        orAudit("StoreToThisOrGlobal", name_str, "global", -1, null);
+        switch (try host.storeGlobal(allocator, name_str, v)) {
+            .ok => {},
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, lt: anytype, host: *H) Allocator.Error!Step {
-        const name_str = constStr(frame.module, lt.name) orelse
-            return raiseStep(frame, .{ .Type = "LoadFromThisOrGlobal: name not a string const" });
-        var resolved: ?Value = null;
-        {
-            // `consult_param = true`: in a method / extension body the
-            // implicit receiver is the frame's `this` *parameter*, not
-            // a capture slot.
-            const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
-            defer allocator.free(cands);
-            // Per-candidate probes are member-only (`getMemberField`):
-            // a candidate must not "resolve" a global or an outer
-            // receiver's member and shadow a receiver further out —
-            // the walk's own order decides precedence, and the global
-            // tiers below decide the fallback. A probe hit is a hit
-            // even when the member's value IS `Unit` (`var u: Unit`):
-            // the strict probe reports misses as errors, never as a
-            // spurious `Unit`.
-            for (cands) |c| {
-                switch (try host.getMemberField(allocator, &c.v, name_str)) {
-                    .ok => |v| {
-                        orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
-                        resolved = v;
-                        break;
-                    },
-                    // Only the dispatch-miss sentinel (`Unimplemented`)
-                    // means "this candidate has no such member" — discard
-                    // its `Vm::get_field` message and walk to the next
-                    // candidate / global tier. Any other error is a member
-                    // that resolved and whose accessor actually ran: a
-                    // throw from a delegated property's `getValue`
-                    // (`NoSuchElementException` on a missing map key), a
-                    // `CalleeFailed`, a `StackOverflow`. Those propagate —
-                    // swallowing them would mask the throw and fall through
-                    // to a spurious `unresolved global`.
-                    .err => |e| {
-                        if (e == .Unimplemented) {
-                            freeMissErr(allocator, e);
-                        } else {
-                            return raiseStep(frame, e);
-                        }
-                    },
-                }
-            }
-        }
-        // The scope-qualified form carries the lexical owner only for
-        // the getter reads above; the global fallback uses the bare
-        // name.
-        const bare_name = stripScopeGetter(name_str);
-        // A lowering-resolved identity binds that exact declaration;
-        // the name string remains the unresolved-shape fallback. A
-        // runtime-scoped shadowing capture (a closed-over callable
-        // materialized as a scoped-global layer) outranks the static
-        // pick, mirroring the call form's shadow gate.
-        const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
-            !host.isShadowingCapture(bare_name))
-            host.lookupGlobalById(allocator, lt.func, lt.class, false)
-        else
-            null;
-        var v: Value = undefined;
-        if (resolved) |rv| {
-            v = rv;
-        } else if (by_id) |gv| {
-            orAudit("LoadFromThisOrGlobal", bare_name, "global_id", -1, null);
-            v = gv;
-        } else {
-            switch (try host.lookupGlobalThrowing(allocator, bare_name)) {
-                .ok => |maybe| {
-                    if (maybe) |gv| {
-                        orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
-                        v = gv;
+    const name_str = constStr(frame.module, lt.name) orelse
+        return raiseStep(frame, .{ .Type = "LoadFromThisOrGlobal: name not a string const" });
+    var resolved: ?Value = null;
+    {
+        // `consult_param = true`: in a method / extension body the
+        // implicit receiver is the frame's `this` *parameter*, not
+        // a capture slot.
+        const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
+        defer allocator.free(cands);
+        const cands_keepalive = pinImplicitCandidates(cands);
+        defer runtime.keepaliveRestore(cands_keepalive);
+        // Per-candidate probes are member-only (`getMemberField`):
+        // a candidate must not "resolve" a global or an outer
+        // receiver's member and shadow a receiver further out —
+        // the walk's own order decides precedence, and the global
+        // tiers below decide the fallback. A probe hit is a hit
+        // even when the member's value IS `Unit` (`var u: Unit`):
+        // the strict probe reports misses as errors, never as a
+        // spurious `Unit`.
+        for (cands) |c| {
+            switch (try host.getMemberField(allocator, &c.v, name_str)) {
+                .ok => |v| {
+                    orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
+                    resolved = v;
+                    break;
+                },
+                // Only the dispatch-miss sentinel (`Unimplemented`)
+                // means "this candidate has no such member" — discard
+                // its `Vm::get_field` message and walk to the next
+                // candidate / global tier. Any other error is a member
+                // that resolved and whose accessor actually ran: a
+                // throw from a delegated property's `getValue`
+                // (`NoSuchElementException` on a missing map key), a
+                // `CalleeFailed`, a `StackOverflow`. Those propagate —
+                // swallowing them would mask the throw and fall through
+                // to a spurious `unresolved global`.
+                .err => |e| {
+                    if (e == .Unimplemented) {
+                        freeMissErr(allocator, e);
                     } else {
-                        // A top-level `val` declared with only a custom getter
-                        // has no global binding; re-run its 0-arg getter, as
-                        // the plain LoadGlobal tail does — a receiver-context
-                        // read of `currentRecomposeScope` must resolve exactly
-                        // like a top-level one.
-                        if (comptime @hasDecl(H, "callFunc")) {
-                            if (frame.module.registry.top_level_prop_getters.get(bare_name)) |getter_fid| {
-                                switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
-                                    .ok => |gv2| {
-                                        orAudit("LoadFromThisOrGlobal", bare_name, "toplevel_getter", -1, null);
-                                        try frame.write(lt.dst, gv2);
-                                        return .cont;
-                                    },
-                                    .err => |e| return raiseStep(frame, e),
-                                }
-                            }
-                        }
-                        const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
-                        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
-                            if (std.mem.eql(u8, w, bare_name)) {
-                                std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
-                                    bare_name,
-                                    name_str,
-                                    if (lt.func) |f| f.int() else null,
-                                    if (lt.class) |c| c.int() else null,
-                                    host.isShadowingCapture(bare_name),
-                                    if (frame.cur_span) |sp| sp.file.int() else 0,
-                                    if (frame.cur_span) |sp| sp.start else 0,
-                                    frame.func.name,
-                                });
-                            }
-                        }
-                        dumpFrameChainForDiag();
-                        return raiseStep(frame, .{ .Unbound = msg });
+                        return raiseStep(frame, e);
                     }
                 },
-                .err => |e| return raiseStep(frame, e),
             }
         }
-        // A boxed capture surfaced by the member walk (an anon-object
-        // method's captured outer `var` lands in the instance's capture
-        // env as a shared Cell) reads through the cell.
-        if (v == .Cell) {
-            const cg = v.Cell.borrow();
-            v = cg.get().*;
-            cg.deinit();
+    }
+    // The scope-qualified form carries the lexical owner only for
+    // the getter reads above; the global fallback uses the bare
+    // name.
+    const bare_name = stripScopeGetter(name_str);
+    // A lowering-resolved identity binds that exact declaration;
+    // the name string remains the unresolved-shape fallback. A
+    // runtime-scoped shadowing capture (a closed-over callable
+    // materialized as a scoped-global layer) outranks the static
+    // pick, mirroring the call form's shadow gate.
+    const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
+        !host.isShadowingCapture(bare_name))
+        host.lookupGlobalById(allocator, lt.func, lt.class, false)
+    else
+        null;
+    var v: Value = undefined;
+    if (resolved) |rv| {
+        v = rv;
+    } else if (by_id) |gv| {
+        orAudit("LoadFromThisOrGlobal", bare_name, "global_id", -1, null);
+        v = gv;
+    } else {
+        switch (try host.lookupGlobalThrowing(allocator, bare_name)) {
+            .ok => |maybe| {
+                if (maybe) |gv| {
+                    orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
+                    v = gv;
+                } else {
+                    // A top-level `val` declared with only a custom getter
+                    // has no global binding; re-run its 0-arg getter, as
+                    // the plain LoadGlobal tail does — a receiver-context
+                    // read of `currentRecomposeScope` must resolve exactly
+                    // like a top-level one.
+                    if (comptime @hasDecl(H, "callFunc")) {
+                        if (frame.module.registry.top_level_prop_getters.get(bare_name)) |getter_fid| {
+                            switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
+                                .ok => |gv2| {
+                                    orAudit("LoadFromThisOrGlobal", bare_name, "toplevel_getter", -1, null);
+                                    try frame.write(lt.dst, gv2);
+                                    return .cont;
+                                },
+                                .err => |e| return raiseStep(frame, e),
+                            }
+                        }
+                    }
+                    const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
+                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                        if (std.mem.eql(u8, w, bare_name)) {
+                            std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
+                                bare_name,
+                                name_str,
+                                if (lt.func) |f| f.int() else null,
+                                if (lt.class) |c| c.int() else null,
+                                host.isShadowingCapture(bare_name),
+                                if (frame.cur_span) |sp| sp.file.int() else 0,
+                                if (frame.cur_span) |sp| sp.start else 0,
+                                frame.func.name,
+                            });
+                        }
+                    }
+                    dumpFrameChainForDiag();
+                    return raiseStep(frame, .{ .Unbound = msg });
+                }
+            },
+            .err => |e| return raiseStep(frame, e),
         }
-        v.retain();
-        try frame.write(lt.dst, v);
+    }
+    // A boxed capture surfaced by the member walk (an anon-object
+    // method's captured outer `var` lands in the instance's capture
+    // env as a shared Cell) reads through the cell.
+    if (v == .Cell) {
+        const cg = v.Cell.borrow();
+        v = cg.get().*;
+        cg.deinit();
+    }
+    v.retain();
+    try frame.write(lt.dst, v);
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmIndex(comptime H: type, allocator: Allocator, frame: *Frame, ix: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(ix.receiver);
-        const i = frame.read(ix.index);
-        if (fastIndexGet(&recv, &i)) |rv| {
-            try frame.write(ix.dst, rv);
-            return .cont;
-        }
-        switch (try host.callMember(allocator, &recv, "get", &.{i})) {
-            .ok => |rv| try frame.write(ix.dst, rv),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(ix.receiver);
+    const i = frame.read(ix.index);
+    if (fastIndexGet(&recv, &i)) |rv| {
+        try frame.write(ix.dst, rv);
+        return .cont;
+    }
+    switch (try host.callMember(allocator, &recv, "get", &.{i})) {
+        .ok => |rv| try frame.write(ix.dst, rv),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmIndexSet(comptime H: type, allocator: Allocator, frame: *Frame, ixs: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(ixs.receiver);
-        const i = frame.read(ixs.index);
-        const v = frame.read(ixs.value);
-        if (fastIndexSet(allocator, &recv, &i, v)) {
-            return .cont;
-        }
-        switch (try host.callMember(allocator, &recv, "set", &.{ i, v })) {
-            .ok => {},
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(ixs.receiver);
+    const i = frame.read(ixs.index);
+    const v = frame.read(ixs.value);
+    if (fastIndexSet(allocator, &recv, &i, v)) {
+        return .cont;
+    }
+    switch (try host.callMember(allocator, &recv, "set", &.{ i, v })) {
+        .ok => {},
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmNewList(comptime H: type, allocator: Allocator, frame: *Frame, nl: anytype, host: *H) Allocator.Error!Step {
     _ = host;
-        const items = try readArgRun(allocator, frame, nl.args, nl.n_args);
-        var list: std.ArrayList(Value) = .empty;
-        try list.appendSlice(allocator, items);
-        allocator.free(items);
-        // The list owns one reference to each element (its teardown
-        // releases them); `readArgRun` handed back borrows of the source
-        // registers, so retain each. No-op under the arena fast path.
-        if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-        try frame.write(nl.dst, .{ .List = .{
-            .items = try ValueList.init(allocator, list),
-            .mutable = false,
-            .enum_entries = false,
-            .backing = null,
-        } });
+    const items = try readArgRun(allocator, frame, nl.args, nl.n_args);
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(allocator, items);
+    allocator.free(items);
+    // The list owns one reference to each element (its teardown
+    // releases them); `readArgRun` handed back borrows of the source
+    // registers, so retain each. No-op under the arena fast path.
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
+    try frame.write(nl.dst, .{ .List = .{
+        .items = try ValueList.init(allocator, list),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    } });
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmQualifiedThis(comptime H: type, allocator: Allocator, frame: *Frame, qt: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(qt.receiver);
-        const qual_str = constStr(frame.module, qt.qualifier) orelse
-            return raiseStep(frame, .{ .Type = "QualifiedThis: qualifier not a string const" });
-        switch (try host.qualifiedThis(allocator, &recv, qual_str)) {
-            .ok => |v| {
-                v.retain();
-                try frame.write(qt.dst, v);
-            },
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(qt.receiver);
+    const qual_str = constStr(frame.module, qt.qualifier) orelse
+        return raiseStep(frame, .{ .Type = "QualifiedThis: qualifier not a string const" });
+    switch (try host.qualifiedThis(allocator, &recv, qual_str)) {
+        .ok => |v| {
+            v.retain();
+            try frame.write(qt.dst, v);
+        },
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmPropertyRef(comptime H: type, allocator: Allocator, frame: *Frame, pr: anytype, host: *H) Allocator.Error!Step {
     _ = host;
-        const name_str = constStr(frame.module, pr.name) orelse
-            return raiseStep(frame, .{ .Type = "PropertyRef: name not a string const" });
-        try frame.write(pr.dst, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name_str) } });
+    const name_str = constStr(frame.module, pr.name) orelse
+        return raiseStep(frame, .{ .Type = "PropertyRef: name not a string const" });
+    try frame.write(pr.dst, .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name_str) } });
     return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmMemberRef(comptime H: type, allocator: Allocator, frame: *Frame, mr: anytype, host: *H) Allocator.Error!Step {
-        const recv = frame.read(mr.receiver);
-        const name_str = constStr(frame.module, mr.name) orelse
-            return raiseStep(frame, .{ .Type = "MemberRef: name not a string const" });
-        switch (try host.memberRef(allocator, &recv, name_str)) {
-            .ok => |v| try frame.write(mr.dst, v),
-            .err => |e| return raiseStep(frame, e),
-        }
+    const recv = frame.read(mr.receiver);
+    const name_str = constStr(frame.module, mr.name) orelse
+        return raiseStep(frame, .{ .Type = "MemberRef: name not a string const" });
+    switch (try host.memberRef(allocator, &recv, name_str)) {
+        .ok => |v| try frame.write(mr.dst, v),
+        .err => |e| return raiseStep(frame, e),
+    }
     return .cont;
 }
 
@@ -4774,6 +5248,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // innermost receiver is the coroutine, not the declaring class).
         const rcands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(rcands);
+        const rcands_keepalive = pinImplicitCandidates(rcands);
+        defer runtime.keepaliveRestore(rcands_keepalive);
         for (rcands) |c| {
             if (c.v != .Null and c.v != .Unit and host.hostHasMember(&c.v, name_str)) {
                 is_ctor_name = false;
@@ -4808,6 +5284,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     if (!is_ctor_name and !shadow_capture and !skip_member) {
         const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands);
+        const cands_keepalive = pinImplicitCandidates(cands);
+        defer runtime.keepaliveRestore(cands_keepalive);
         single_cand = cands.len == 1;
         // Inside an extension body, the implicit `this` has the
         // extension's DECLARED receiver type, and Kotlin resolves a bare
@@ -5028,6 +5506,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     if (resolved == null and if (runtime.getenvSlice("KLIO_NU_TRACE")) |w| std.mem.eql(u8, name_str, w) else false) {
         const cands2 = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands2);
+        const cands_keepalive = pinImplicitCandidates(cands2);
+        defer runtime.keepaliveRestore(cands_keepalive);
         const dbg_srt: []const u8 = blk: {
             if (cmg.static_recv) |sc| {
                 if (constStr(frame.module, sc)) |sname| break :blk sname;
@@ -5131,6 +5611,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // class) may bind by id here; a receiverless value invocation
             // of an extension misbinds every parameter.
             const by_id_func: ?FuncId = blk: {
+                if (cmg.candidates != null) break :blk null;
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
@@ -5367,20 +5848,21 @@ fn callerThisValue(frame: *const Frame) ?Value {
 // -------------------------------------------------------------------------
 
 /// Recover the implicit receiver for an `*OrGlobal` instruction:
-/// `captures[this_idx]` if in range, else `Null`. When `consult_param` is
-/// set and the capture slot did not yield an instance receiver, fall back
-/// to the frame's `this` *parameter* (the call form needs this; the bare
-/// read/write forms carry the receiver in the capture slot only).
+/// The synthesized `this` parameter when this frame has one; otherwise
+/// `captures[this_idx]` if in range, else `Null`. A method/init/extension
+/// frame's receiver parameter is authoritative: its capture slot can hold an
+/// unrelated boxed local at the same numeric index, and treating that Cell as
+/// `this` both misresolves the bare name and leaves the real receiver behind it.
 fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) Value {
-    var this_val: Value = if (this_idx < frame.captures.items.len)
+    if (consult_param) {
+        if (frameThisParam(frame)) |idx| {
+            if (idx < frame.params.items.len) return frame.params.items[idx];
+        }
+    }
+    const this_val: Value = if (this_idx < frame.captures.items.len)
         frame.captures.items[this_idx]
     else
         Value.Null;
-    if (consult_param and (this_val == .Null or this_val == .Unit)) {
-        if (frameThisParam(frame)) |idx| {
-            if (idx < frame.params.items.len) this_val = frame.params.items[idx];
-        }
-    }
     return this_val;
 }
 
@@ -5391,6 +5873,16 @@ const ImplicitCandidate = struct {
     v: Value,
     depth: u16,
 };
+
+/// Candidate walks are assembled in host scratch memory, but probing a
+/// property/getter or member can re-enter interpreted code and collect. Keep
+/// every receiver alive for the whole walk, including transient Cell and
+/// companion candidates that are not independently present in a frame.
+fn pinImplicitCandidates(cands: []const ImplicitCandidate) usize {
+    const mark = runtime.keepaliveMark();
+    for (cands) |c| runtime.keepalivePush(c.v);
+    return mark;
+}
 
 /// The ordered implicit-receiver candidates a bare name is resolved
 /// against, innermost first: the frame's own implicit `this` (when
@@ -7053,6 +7545,46 @@ test "eval_branch" {
     const v = try eval(testing.allocator, &m, &func, .empty);
     try testing.expect(v == .ok);
     try testing.expect(v.ok == .Int and v.ok.Int == 1);
+}
+
+test "suspend liveness keeps only values read on reachable resume paths" {
+    resetSuspendLivenessCache();
+    defer resetSuspendLivenessCache();
+
+    const entry_insts = [_]Inst{
+        .{ .Const = .{ .dst = .from(0), .value = .from(0) } },
+        .{ .Const = .{ .dst = .from(1), .value = .from(1) } },
+        .{ .Move = .{ .dst = .from(2), .src = .from(0) } },
+        .{ .Const = .{ .dst = .from(3), .value = .from(2) } },
+    };
+    const blocks = [_]ir.Block{
+        .{
+            .id = .from(0),
+            .insts = @constCast(&entry_insts),
+            .terminator = .{ .Branch = .{ .cond = .from(2), .t = .from(1), .f = .from(2) } },
+        },
+        .{ .id = .from(1), .insts = &.{}, .terminator = .{ .Return = .from(0) } },
+        .{ .id = .from(2), .insts = &.{}, .terminator = .{ .Return = .from(1) } },
+    };
+    const func: Func = .{
+        .id = .from(0),
+        .name = "resumePaths",
+        .fqn = "test.resumePaths",
+        .params = &.{},
+        .return_ty = .{ .name = "Int", .nullable = false, .args = &.{} },
+        .n_locals = 4,
+        .blocks = @constCast(&blocks),
+        .entry = .from(0),
+        .is_suspend = true,
+    };
+
+    // Resuming before the move needs both branch results, but neither the
+    // move's destination nor the dead fourth register.
+    const before_move = try suspendLiveRegs(&func, .from(0), 2);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, before_move);
+    // At the terminator the branch condition is also live.
+    const before_term = try suspendLiveRegs(&func, .from(0), entry_insts.len);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, before_term);
 }
 
 test "enclosing chain tags subjects and projects innermost-first" {
