@@ -2,13 +2,18 @@
 
 ## Status
 
-FULL LINUX SUPPORT LANDED and gated (`zig build itest-bundle_smoke`,
+LINUX AND macOS SUPPORT LANDED and gated (`zig build itest-bundle_smoke`,
 `itest-bundle_ui`, `itest-bundle_cross`; `bundle_smoke` in
-`scripts/gate.sh`). Windows/macOS are clean drop-ins: their probe
-positions and patcher call sites are marked extension points in
-`src/cli/bundle_boot.zig`, the Cocoa/Win32 icon entries exist in
-`skia_shim.cpp`, and the release workflow already carries their shim
-jobs. User docs: `docs/BUNDLE.md`.
+`scripts/gate.sh`). macOS bundles strip the stub's linker signature,
+place the overlay in its stead, extend `__LINKEDIT`, and re-sign ad hoc
+(`src/cli/macho_sign.zig`); the boot probe reads the trailer at
+`LC_CODE_SIGNATURE.dataoff - 72` and falls back to `EOF - 72` for
+unsigned x86_64 / ELF. All three itest suites pass on macos-arm64
+(headless, UI with shim extraction, cross). Windows remains a drop-in:
+its probe position and PE patcher call sites are marked extension points
+in `src/cli/bundle_boot.zig`, the Win32 icon entries exist in
+`skia_shim.cpp`, and the release workflow already carries its shim job.
+User docs: `docs/BUNDLE.md`.
 
 Landed (in commit order):
 
@@ -74,13 +79,18 @@ Deviations from the letter of the design (rationale):
   bare frames; `scripts/zigcheck.py`'s module graph caught up with
   compose_pass/compose_ui.
 
+macOS landed: `src/cli/macho_sign.zig` (native thin-Mach-O parse,
+`__LINKEDIT` extension, ad-hoc SHA-256 CodeDirectory over the overlay,
+exec-segment fields for arm64), the `LC_CODE_SIGNATURE`-aware trailer
+probe, the `--app-dir` emitter (`Info.plist` + `MacOS/<name>` +
+`Resources/icon.icns` from the PNG). `codesign --verify` passes on the
+output; a developer re-signing with a real identity keeps the trailer at
+`dataoff - 72`; a tampered signed bundle is refused by the kernel.
+
 Remaining for Windows (M6): `src/cli/pe_patch.zig` (GUI-subsystem flip +
 checksum, icon resource), the cert-table-aware trailer probe (seam in
 `bundle_boot.probeSelfInner`), `GetModuleFileNameW` self-path, Win32
-backend verification, CI job. Remaining for macOS (M7):
-`src/cli/macho_sign.zig` (__LINKEDIT extension + ad-hoc CodeDirectory),
-the `LC_CODE_SIGNATURE`-aware probe (same seam), `--app-dir` emitter,
-Cocoa verification. Follow-ons noted, not committed: IR-level
+backend verification, CI job. Follow-ons noted, not committed: IR-level
 tree-shaking of unreferenced pack decls; AppImage layering.
 
 The original design (all decisions committed) follows. It supersedes the
