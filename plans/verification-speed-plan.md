@@ -90,12 +90,27 @@ Two standing traps this re-confirmed:
 
 ## Root causes still open (in impact order)
 
-1. **Per-child sibling re-lowering** (commontest): each child re-parses and
-   re-lowers every same-directory sibling (~40 files in `collections/`) —
-   ~7 s of the 7.9 s child. Fixes: extend the baked-image fast path to
-   cover sibling sets (relax `canExtendBase` — known open item), or batch
-   children per directory (one process compiles siblings once, runs each
-   target's tests with successive `--only-file` filters).
+1. **Per-child sibling re-lowering** (commontest) — ADDRESSED (2026-07-21) by
+   directory batching in `commontest-sweep.py`. Each child re-parsed and
+   re-lowered every same-directory sibling (~40 files, ~7 s of the 7.9 s child);
+   `sweep()` now groups run-targets by directory and runs each directory in ONE
+   child (`run_dir`): compile the directory's files once, discover tests via a
+   repeated `--only-file` per target (the harness already supports the multi-file
+   form). This matches the canonical itest (which likewise compiles all files
+   together) — verified IDENTICAL failure set to the per-file sweep across the
+   full stdlib suite. `--no-batch` restores per-file children for hang isolation.
+
+   Measured caveat: on a 32-core box the full-suite wall barely moved (172 s →
+   168 s) because a few genuinely compute-heavy tests set the floor there —
+   `DeepRecursiveTest.testBadClass` alone runs ~150 s interpreted (the ~300x
+   raw-interpreter cost), and parallelism already hides the sibling redundancy.
+   The batching win is on **limited-core CI** (4 vCPU), where the per-file
+   redundancy cannot be parallelized away and each of ~40 files in a directory
+   otherwise re-lowers the same siblings serially. The remaining full-suite floor
+   is the compute-heavy tests, i.e. the raw-interpreter perf campaign — not the
+   verification loop. The alternative fix (relax `canExtendBase` to cover sibling
+   sets) is no longer needed for the sweep, but would still help any single-file
+   run that re-lowers siblings.
 2. **Whole-program LLVM rebuild on one edit** (83 s ReleaseSafe, single
    core). Mitigated by the Debug playbook. `--watch -fincremental` was
    tried and is BROKEN for this graph (zig 0.16.0): the incremental-built
@@ -117,6 +132,11 @@ Two standing traps this re-confirmed:
 
 ## Log
 
+- 2026-07-21: directory batching in `commontest-sweep.py` (root cause #1);
+  strengthened the AGENTS.md playbook to make harness+sweep the default and flag
+  `zig build itest-<suite>` as CI-only (it recompiles the whole itest binary —
+  minutes — every run). Re-confirmed the full-suite dev-box floor is a few
+  compute-heavy tests (`DeepRecursiveTest` ~150 s), not the loop.
 - 2026-07-04: plan created; directive recorded in session memory.
 - 2026-07-13: root-caused the gate's real cost to the slab allocator's
   empty-slab thrash (an mmap + 16 K-cell threading pass + munmap per
