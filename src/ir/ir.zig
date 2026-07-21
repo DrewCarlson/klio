@@ -925,9 +925,15 @@ pub const Func = struct {
     /// Carries the source `open` modifier. A method that is neither `open` nor
     /// `override` (an `override` is open-by-default) cannot be overridden, so a
     /// `recv.name()` call resolving to it is monomorphic even when the receiver
-    /// CLASS is `open` — the static dispatch bake reads this. NOT serialized (the
-    /// bake only trusts it for freshly-lowered funcs, never image-decoded ones).
+    /// CLASS is `open` — the static dispatch bake reads this. Serialized with the
+    /// func header (like every field), so the bake trusts it on an image-decoded
+    /// base method as well as a freshly-lowered one.
     is_open: bool = false,
+    /// Carries the source `final` modifier. Meaningful on an `override` member:
+    /// `final override fun` seals the method against any further override, so it
+    /// is monomorphic despite `is_override`. Redundant (but honored) on a plain
+    /// member. The static dispatch bake reads this alongside `is_open`.
+    is_final: bool = false,
     /// Resolved fully-qualified candidate names for each source-level
     /// annotation on this function (e.g. `kotlin.test.Test`), so a test
     /// runner can discover `@Test`/`@Ignore`/etc. without re-parsing.

@@ -3440,28 +3440,51 @@ fn finalReceiverMethod(module: *ir.Module, declared_recv: ?ir.ConstId, name: []c
     const cid = module.classId(h) orelse return null;
     if (cid.int() >= module.classes.items.len) return null;
     const c = &module.classes.items[cid.int()];
-    const m = resolveMethodInHierarchy(module, cid, name, n_args, 0) orelse return null;
+    const found = resolveMethodInHierarchy(module, cid, name, n_args, 0) orelse return null;
+    // A method DECLARED on an interface is always overridable in Kotlin — an
+    // interface member is implicitly `open`, whether it is abstract or carries a
+    // default body, and its `is_open` flag does not record that. Any implementer
+    // (open-world) may override it, so `recv.name()` is not monomorphic even when
+    // the flag looks final. Never bake such a target.
+    const decl_class = &module.classes.items[found.cls.int()];
+    if (decl_class.is_interface) return null;
     // Condition 1 — the RECEIVER class is final (not `open`, not
     // abstract/interface/sealed): it can never be subclassed, so `recv` is
     // exactly `C` and the resolved method is the unique target regardless of its
     // own modifiers.
-    if (!c.is_open and !c.is_abstract) return m;
-    // Condition 2 — the receiver class is open, but the resolved METHOD is itself
-    // un-overridable: neither `open` nor `override` (an `override` is open by
-    // default). Trusted only for a freshly-lowered func — an image-decoded base
-    // method does not carry `is_open` (it is not serialized), so it stays on the
-    // walk rather than risk a false "final".
-    if (m.int() >= module.func_header_offsets.len) {
-        const mf = module.funcById(m) orelse return null;
-        if (!mf.is_open and !mf.is_override) return m;
-    }
+    if (!c.is_open and !c.is_abstract) return found.fid;
+    // Condition 2 — the receiver class is open/abstract, but the resolved METHOD
+    // is a class member that is itself un-overridable, so `recv.name()` is
+    // monomorphic whatever `recv`'s runtime type. The final-ness flags are
+    // serialized with the func header, so this holds for an image-decoded base
+    // method as well as a freshly-lowered one.
+    const mf = module.funcById(found.fid) orelse return null;
+    if (methodCannotBeOverridden(mf)) return found.fid;
     return null;
 }
 
+/// A class member that Kotlin forbids any subclass from overriding: not `open`,
+/// and either not an `override` at all or an explicit `final override` (a bare
+/// `override` is open by default and may be overridden further down). A plain
+/// member with no `open`/`override` is final; a redundant `final` on it is
+/// honored. Such a method is the unique target of `recv.name()` regardless of
+/// the receiver's runtime type, so the call may be statically dispatched.
+/// Caller must have already excluded interface-declared methods (implicitly
+/// open, which this flag-only check cannot see).
+fn methodCannotBeOverridden(mf: *const ir.Func) bool {
+    if (mf.is_open) return false;
+    if (mf.is_override and !mf.is_final) return false;
+    return true;
+}
+
+const ResolvedMethod = struct { fid: ir.FuncId, cls: ir.ClassId };
+
 /// First body-bearing, arity-compatible method named `name` in class `cid`'s
-/// resolution order (own methods, then supertypes) — the target `recv.name()`
-/// binds for a receiver of exactly `cid`. `null` when unresolved.
-fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u8, n_args: u32, depth: u8) ?ir.FuncId {
+/// resolution order (own methods, then supertypes), paired with the class that
+/// declares it — the target `recv.name()` binds for a receiver of exactly `cid`.
+/// `null` when unresolved. The declaring class lets the caller tell an
+/// interface member (always overridable) from a class member.
+fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u8, n_args: u32, depth: u8) ?ResolvedMethod {
     if (depth > 32) return null;
     if (cid.int() >= module.classes.items.len) return null;
     const c = &module.classes.items[cid.int()];
@@ -3473,7 +3496,7 @@ fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u
         if (!(mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this"))) continue;
         if (!mf.hasBody()) continue;
         if (!extAcceptsArity(mf, n_args)) continue;
-        return mfid;
+        return .{ .fid = mfid, .cls = cid };
     }
     for (c.supertypes) |sid| {
         if (resolveMethodInHierarchy(module, sid, name, n_args, depth + 1)) |m| return m;

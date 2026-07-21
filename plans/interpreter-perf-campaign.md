@@ -339,8 +339,38 @@ unchanged from the 5 pre-existing):
   `finalReceiverMethod` now bakes when EITHER the receiver class is final (condition 1) OR
   the resolved method is a fresh final func (condition 2); an image-decoded base method
   stays on the walk. `~923` sites. Validated: stdlib sweep unchanged (5 pre-existing),
-  examples byte-identical. `final override` is conservatively left on the walk (`ast.Function`
-  has no `is_final`, so it is indistinguishable from a plain `override`).
+  examples byte-identical.
+
+- **`final override` + serialized final-ness + interface soundness** — LANDED. Three
+  coupled changes that finish the final-ness lane and close a latent hole:
+  - `final override` now bakes. Added `is_final` to `ast.Function` (parser sets it from
+    the `final` modifier, previously discarded) and to `ir.Func`; `methodCannotBeOverridden`
+    treats a method as final when `!is_open && (!is_override || is_final)`. A bare `override`
+    is open-by-default and stays virtual; `final override` is sealed and bakes. Example
+    `final_override_dispatch.kt`.
+  - Base-func trust. `ir.Func`'s final-ness flags are in fact serialized with the header
+    (the reflective `encodeValue(ir.Func, …)` covers every field — the earlier "NOT
+    serialized" note was wrong), so condition 2 no longer restricts to freshly-lowered
+    funcs: a genuinely-final base (image-decoded) class method bakes too. `ir.Func` gained
+    a field, so image `FORMAT_VERSION` 22 → 23.
+  - Interface exclusion (soundness). A method DECLARED on an interface is implicitly `open`
+    in Kotlin — a default body is always overridable — but its `is_open` flag does not
+    record that. The prior condition-2 (fresh-only) would bake such a method; it stayed
+    correct ONLY because the tree-walker's resolved fast-path falls back to the virtual
+    walk when the baked target's owner-replay returns null (verified: a baked interface
+    default on a receiver that overrides it runs the override at runtime, not the baked
+    fid). A static/bytecode dispatch has no such fallback, so this defeats the goal.
+    `resolveMethodInHierarchy` now returns the declaring class and `finalReceiverMethod`
+    refuses any interface-declared target — the bake is soundly static, not walk-rescued.
+    Example `interface_default_dispatch.kt` (a default overridden by one implementer,
+    inherited by another; `baked=0`, dispatch stays virtual and correct).
+
+  Net coverage: `final override` adds real fresh-func sites; the base-class-final path is
+  sound but currently near-zero in the example corpus (the common base "open" types are
+  interfaces, now correctly excluded — the earlier base-condition-2 fires were all
+  `Composer.changed`, an interface default). Validated: units green (incl. e2e goldens +
+  differential for the two new examples), stdlib sweep unchanged (5 pre-existing),
+  279/279 examples byte-identical bake on/off.
 
 ## Method
 
