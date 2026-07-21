@@ -50,6 +50,13 @@ recursion, and rides on the loop tier. Executable memory is managed
 W^X — pages are never writable and executable at once, using
 `MAP_JIT` and per-thread write protection on macOS.
 
+Per-function counters, compile attempts, inferred return types, and compiler
+scratch use the runtime's packed slab allocator. They must not use the OS page
+allocator: macOS rounds each small allocation to a 16 KB page, and a framework
+that first-touches thousands of cold functions would otherwise reserve several
+pages per function without producing native code. Only finalized executable
+buffers use the dedicated W^X mapping path.
+
 The JIT is strictly additive: any IR shape the compiler does not
 support falls back to the interpreter with identical semantics. The
 parity and stdlib-commontest suites are the gate that the compiled
@@ -77,6 +84,12 @@ over the runtime object heap (`ObjRef`/`ControlBlock` cells).
 Under `--opt off` the collector is not installed and the process
 uses a never-free arena — useful for short-lived scripts and for
 isolating GC effects when debugging.
+
+Raw host scratch is outside the traced object graph. Probe strings, temporary
+argument arrays, and discarded dispatch diagnostics therefore have explicit
+ownership and must be freed when a fallback consumes or rejects them. The
+`KLIO_GC_ALLOC=leaktrack` diagnostic can group outstanding raw allocations by
+native stack or by the active intrinsic FQN.
 
 The full design, including the root-completeness analysis, is in
 `plans/GC.md`; the JIT design record is `plans/JIT-DESIGN.md`.

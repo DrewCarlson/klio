@@ -232,6 +232,15 @@ in a live window is also open (material-ripple is vendored).
   | --- | --- | --- | --- | --- |
   | Debug | 158 MB | 0.21 s | 12.3 s | 49 MB |
   | ReleaseFast | **54 MB** | **0.03 s** | **1.5 s** | **35 MB** |
+- **Interactive input no longer builds a backlog or rebuilds unchanged hover
+  frames.** The window loop keeps the display list returned by click, key,
+  hover, and resize dispatch instead of discarding it and recording the same
+  frame again. Consecutive pointer-motion events are coalesced to the latest
+  position while preserving their order relative to clicks, keys, and resize
+  events. A hover handler that performs no new snapshot write returns the cached
+  display list. Together with the packed JIT metadata and dispatch-miss ownership
+  fixes, the dashboard's ten-click ReleaseFast run fell from 17.92 s to 1.35 s;
+  100 clicks hold peak RSS at 170.92 MB versus 170.89 MB before any click.
 
 **Open:** slim custom Skia build (the +112 MB is Skia's fixed working set, not klio) →
 lazy stdlib load (baseline ~35 MB) → shrink the evaluator per-call frame → drop the

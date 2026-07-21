@@ -27,6 +27,39 @@ Tooling:
   worker-thread concurrency. A CONDITIONAL borrow (only when no worker threads are
   live) is the safe form — revisit.
 
+## Compose interaction regression: fixed
+
+The ReleaseFast dashboard exposed two interpreter-wide allocation faults:
+
+- `jit_loop.forFunc` created each cold function's state, block counters, attempt
+  counters, return-type entries, and compile scratch with `page_allocator`.
+  macOS reserves at least one 16 KB page per allocation, so first-touching the
+  thousands of functions behind a Compose click consumed several pages per
+  function even when no native unit was emitted. The same mmap/munmap traffic
+  dominated click CPU time. JIT metadata now uses `runtime.slab.allocator`;
+  finalized executable code remains on the W^X mapping path.
+- The trailing-lambda property probe in member dispatch and the named-method
+  fallback discarded owned `Vm::get_field` / `Vm::call_member` miss messages.
+  Compose performs thousands of these speculative probes per recomposition, so
+  the raw strings accumulated outside the traced object graph. Both discard
+  sites now release the miss through the shared ownership helpers.
+
+Warm ReleaseFast measurements use the headless dashboard at 120 x 72 layout
+units, scale 8, clicking its primary action repeatedly:
+
+| Clicks | Before elapsed | After elapsed | After peak RSS |
+| ---: | ---: | ---: | ---: |
+| 0 | 2.59 s | 0.25 s | 170.89 MB |
+| 10 | 17.92 s | 1.35 s | 170.90 MB |
+| 100 | not run | 11.37 s | 170.92 MB |
+| 500 | not run | 56.54 s | 176.62 MB |
+
+Before the fixes, one click added about 115 MB in the fast profile and the app
+quickly approached 500 MB. The 500-click check now stays within 5.8 MB of the
+zero-click RSS; the macOS peak-footprint counter differs by one 16 KB page. GC
+live-cell histograms remain flat, confirming that the regression was raw host/JIT
+storage, not retained Compose state.
+
 ## Candidate levers (to confirm by profiling, ranked by expected leverage)
 
 - **Coroutine pump per-round cost.** The pump loop (`coroutines.zig` pumpLoop) does

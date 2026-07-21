@@ -567,6 +567,8 @@ class UiRenderer internal constructor(
     private val composition: Composition,
 ) {
     private val hits = ArrayList<HitRegion>()
+    private var lastDisplayList: String? = null
+    private var lastDisplayScale = 0
 
     /** State objects modified since the last recomposition. A snapshot apply
      * observer records the committed writes here so [recomposeDisplayList] can
@@ -611,7 +613,12 @@ class UiRenderer internal constructor(
     }
 
     /** The current frame's display list text (the deterministic render artifact). */
-    fun displayList(scale: Int): String = build(scale).encoded()
+    fun displayList(scale: Int): String {
+        val encoded = build(scale).encoded()
+        lastDisplayList = encoded
+        lastDisplayScale = scale
+        return encoded
+    }
 
     fun displayList(): String = displayList(1)
 
@@ -713,13 +720,23 @@ class UiRenderer internal constructor(
             h(region.contains(px, py))
             any = true
         }
-        return if (any) recomposeDisplayList(scale) else displayList(scale)
+        if (!any) {
+            val last = lastDisplayList
+            return if (last != null && lastDisplayScale == scale) last else displayList(scale)
+        }
+        Snapshot.sendApplyNotifications()
+        if (pendingModifications.isEmpty()) {
+            val last = lastDisplayList
+            return if (last != null && lastDisplayScale == scale) last else displayList(scale)
+        }
+        return recomposeDisplayList(scale)
     }
 
     /** Resize the canvas to [newWidth] x [newHeight] layout units and re-render. */
     fun resize(newWidth: Int, newHeight: Int, scale: Int): String {
         width = if (newWidth > 0) newWidth else width
         height = if (newHeight > 0) newHeight else height
+        lastDisplayList = null
         return displayList(scale)
     }
 
@@ -754,36 +771,51 @@ fun runApp(
     var frame = 0
     var running = true
     var dirty = true
+    var displayList = ui.displayList(scale)
     // Invoked by the windowing backend during a live resize (while the modal drag
     // blocks this loop) so the UI relayouts and redraws in realtime; w/h in points.
     val onResize: (Int, Int) -> Unit = { w, h ->
-        ui.resize(w / scale, h / scale, scale)
-        __composeui_winRender(handle, ui.displayList(scale))
+        displayList = ui.resize(w / scale, h / scale, scale)
+        __composeui_winRender(handle, displayList)
     }
     while (running && (maxFrames < 0 || frame < maxFrames)) {
         // Present only when the frame changed. Rendering every iteration paces the
         // whole loop to vsync (nextDrawable blocks), which would gate event
         // processing behind the render throttle and delay input after a burst.
         if (dirty) {
-            __composeui_winRender(handle, ui.displayList(scale))
+            __composeui_winRender(handle, displayList)
             dirty = false
         }
         // Block for one event, then drain any others without rendering between them,
         // so a backlog (e.g. moves accumulated during a resize) processes at once and
         // the resulting state is drawn in a single frame.
         var ev = __composeui_winPoll(handle, 100, onResize)
+        var pendingHoverX = -1
+        var pendingHoverY = -1
         while (true) {
             val type = (ev shr 32).toInt()
             val a = ((ev shr 16) and 0xFFFF).toInt()
             val b = (ev and 0xFFFF).toInt()
+            if (type != 4 && pendingHoverX >= 0) {
+                displayList = ui.hover(pendingHoverX, pendingHoverY, scale)
+                pendingHoverX = -1
+                pendingHoverY = -1
+                dirty = true
+            }
             when (type) {
                 2 -> running = false                             // close
-                1 -> { ui.click(a / scale, b / scale, scale); dirty = true }   // a=x, b=y
-                3 -> { ui.key(a, b, scale); dirty = true }                      // a=char, b=keysym
-                4 -> { ui.hover(a / scale, b / scale, scale); dirty = true }    // a=x, b=y
-                5 -> { ui.resize(a / scale, b / scale, scale); dirty = true }   // a=w, b=h
+                1 -> { displayList = ui.click(a / scale, b / scale, scale); dirty = true } // a=x, b=y
+                3 -> { displayList = ui.key(a, b, scale); dirty = true }                    // a=char, b=keysym
+                4 -> { pendingHoverX = a / scale; pendingHoverY = b / scale }               // a=x, b=y
+                5 -> { displayList = ui.resize(a / scale, b / scale, scale); dirty = true } // a=w, b=h
             }
-            if (type == 0 || !running) break
+            if (type == 0 || !running) {
+                if (pendingHoverX >= 0) {
+                    displayList = ui.hover(pendingHoverX, pendingHoverY, scale)
+                    dirty = true
+                }
+                break
+            }
             ev = __composeui_winPoll(handle, 0, onResize)  // drain remaining, non-blocking
         }
         frame += 1
