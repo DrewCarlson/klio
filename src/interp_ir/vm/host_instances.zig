@@ -1843,6 +1843,9 @@ fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
 /// Returns the constructed instance value, or `null` to fall through to
 /// the primary-ctor path.
 fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
+    const ctor_keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ctor_keepalive);
+    runtime.keepalivePushSlice(args);
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
@@ -1906,7 +1909,11 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
                     while (thunk_args.items.len < entry.param_count) {
                         try thunk_args.append(allocator, .Null);
                     }
-                    switch (try evalThunk(self, func, thunk_args.items)) {
+                    const full_keepalive = runtime.keepaliveMark();
+                    runtime.keepalivePushSlice(full_args.items);
+                    const evaluated = evalThunk(self, func, thunk_args.items);
+                    runtime.keepaliveRestore(full_keepalive);
+                    switch (try evaluated) {
                         .ok => |v| try full_args.append(allocator, v),
                         .err => |e| return EvalResult{ .err = e },
                     }
@@ -1914,6 +1921,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
             }
         }
     }
+    runtime.keepalivePushSlice(full_args.items);
 
     // Evaluate the delegation args.
     var target_args: std.ArrayList(Value) = .empty;
@@ -1923,13 +1931,18 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
         switch (fr) {
             .err => |e| return EvalResult{ .err = e },
             .ok => |func| {
-                switch (try evalThunk(self, func, full_args.items)) {
+                const target_keepalive = runtime.keepaliveMark();
+                runtime.keepalivePushSlice(target_args.items);
+                const evaluated = evalThunk(self, func, full_args.items);
+                runtime.keepaliveRestore(target_keepalive);
+                switch (try evaluated) {
                     .ok => |v| try target_args.append(allocator, v),
                     .err => |e| return EvalResult{ .err = e },
                 }
             },
         }
     }
+    runtime.keepalivePushSlice(target_args.items);
 
     var inst_v: Value = undefined;
     if (entry.is_super) {
@@ -1952,6 +1965,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
             .err => |e| return EvalResult{ .err = e },
         }
     }
+    runtime.keepalivePush(inst_v);
 
     // Body block.
     if (entry.body) |body_fid| {
@@ -2636,6 +2650,8 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     const class_name = classDefName(class_def);
     const class_fqn = classDefFqn(class_def);
     const identity = nextInstanceId(self);
+    const ctor_keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ctor_keepalive);
 
     // Build the parent ctor-arg chain top-down. Each entry carries the
     // resolved FQN alongside the written name, so every per-class side
@@ -2649,6 +2665,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     {
         const owned = try allocator.dupe(Value, args);
         try chain.append(allocator, .{ .name = ir_name, .fqn = class_fqn, .args = owned });
+        runtime.keepalivePushSlice(owned);
     }
     var cur_class = ir_name;
     var cur_fqn: ?[]const u8 = class_fqn;
@@ -2673,6 +2690,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                 switch (try evalThunk(self, func, cur_args)) {
                                     .ok => |v| {
                                         if (idx == 0) throwable_message = v else if (idx == 1) throwable_cause = v;
+                                        runtime.keepalivePush(v);
                                     },
                                     .err => |e| return .{ .err = e },
                                 }
@@ -2705,7 +2723,11 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     return .{ .err = e };
                 },
                 .ok => |func| {
-                    switch (try evalThunk(self, func, cur_args)) {
+                    const parent_keepalive = runtime.keepaliveMark();
+                    runtime.keepalivePushSlice(parent_args.items);
+                    const evaluated = evalThunk(self, func, cur_args);
+                    runtime.keepaliveRestore(parent_keepalive);
+                    switch (try evaluated) {
                         .ok => |v| parent_args.append(allocator, v) catch {},
                         .err => |e| {
                             parent_args.deinit(allocator);
@@ -2768,6 +2790,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         // it. The packed buffer is a dead full allocation once duped.
         const chain_args = try allocator.dupe(Value, packed_parent);
         try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = chain_args });
+        runtime.keepalivePushSlice(chain_args);
         if (runtime.freeScratch()) allocator.free(packed_parent);
         cur_class = pname;
         cur_fqn = pref.fqn;
