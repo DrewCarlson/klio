@@ -108,9 +108,31 @@ if [ "$DO_PACKS" -eq 1 ]; then
     KLIO="./zig-out/bin/klio"
     [ -x "$KLIO" ] || die "packs need the klio binary; drop --no-build or build first"
 
+    # Not every kotlin-klio/ dir is a standalone installable pack. Some are
+    # source-providers for another pack and declare the same pack id, so
+    # installing them clobbers the real pack. klio-compose-runtime holds the
+    # upstream commonMain + klioMain that klio-compose-runtime-engine consumes
+    # via ../klio-compose-runtime/...; both declare id "androidx.compose.runtime",
+    # and the engine variant is the complete one. Skip the source-provider.
+    skip_pack_dir() {
+        case "$1" in
+            kotlin-klio/klio-compose-runtime) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
     pack_dirs=()
+    seen_ids=""
     for d in kotlin-klio/*/; do
-        [ -f "${d}klio.toml" ] && pack_dirs+=("${d%/}")
+        d="${d%/}"
+        [ -f "$d/klio.toml" ] || continue
+        skip_pack_dir "$d" && continue
+        id="$(sed -nE 's/^id = "([^"]+)".*/\1/p' "$d/klio.toml" | head -1)"
+        if [ -n "$id" ] && printf '%s\n' "$seen_ids" | grep -qxF "$id"; then
+            warn "pack id '$id' is produced by more than one dir; install order decides the winner -- exclude one in skip_pack_dir()"
+        fi
+        seen_ids="${seen_ids}${id}"$'\n'
+        pack_dirs+=("$d")
     done
     remaining=("${pack_dirs[@]}")
 
