@@ -85,7 +85,6 @@ pub fn dumpSleepCounts() void {
     });
 }
 
-
 /// Cross-thread wakeup primitive shared between a `runBlocking` driver
 /// and any worker threads it has dispatched via `__kxco_dispatch`
 /// (real-thread `Dispatchers.Default`). Workers post resume entries
@@ -336,14 +335,14 @@ const PersistedParked = struct {
     fn put(slot: i64, state: SuspendState, scope_delta: []Value) Allocator.Error!void {
         if (pumpDiagEnabled()) {
             std.debug.print("[tok] persist slot={d} frames={d}:", .{ slot, state.frames.items.len });
-            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, fr.regs.ptrIdentity() });
             var seg = state.tails;
             while (seg) |t| : (seg = t.next) {
                 std.debug.print(" |tail", .{});
                 var i = t.head;
                 while (i < t.frames.items.len) : (i += 1) {
                     const fr2 = &t.frames.items[i];
-                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, fr2.regs.ptrIdentity() });
                 }
             }
             std.debug.print("\n", .{});
@@ -936,14 +935,14 @@ pub const CooperativeInterceptor = struct {
         state.token = token;
         if (pumpDiagEnabled()) {
             std.debug.print("[tok] adopt tok={d} frames={d}:", .{ token, state.frames.items.len });
-            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+            for (state.frames.items) |*fr| std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, fr.regs.ptrIdentity() });
             var seg = state.tails;
             while (seg) |t| : (seg = t.next) {
                 std.debug.print(" |tail", .{});
                 var i = t.head;
                 while (i < t.frames.items.len) : (i += 1) {
                     const fr2 = &t.frames.items[i];
-                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, @intFromPtr(fr2.regs.ptr) });
+                    std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr2.func.int(), fr2.block.int(), fr2.inst_idx, fr2.regs.ptrIdentity() });
                 }
             }
             std.debug.print("\n", .{});
@@ -1757,7 +1756,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
                 g.get().cont = null;
                 g.deinit();
             }
-ir.eval.resume_route = "yield-rotate";
+            ir.eval.resume_route = "yield-rotate";
             r = try intrinsic_host.resumeRaw(self, old, .Unit, out);
             // `resumeContinuation` freed `old.frames`; free the box itself.
             a.destroy(old);
@@ -1841,19 +1840,6 @@ fn park(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Er
     return parkInto(top, allocator, st, scope_base);
 }
 
-/// Return `withTimeout` timeout gates claimed for a child pump back to the
-/// enclosing pump (the one directly beneath the child just pushed). Used when
-/// the timed block does NOT suspend on its own pump — a synchronous completion
-/// or a synchronous throw — so the gate is drained (and no-ops on its disposed
-/// state) by the enclosing pump rather than firing at a finished block. Each
-/// Value keeps the reference its enqueue took; the enclosing pump releases it.
-fn handBackTimeoutsToParent(timeouts: []const Value) void {
-    if (timeouts.len == 0) return;
-    if (coro_stack.items.len < 2) return; // no enclosing pump (nothing enqueued one)
-    const parent = &coro_stack.items[coro_stack.items.len - 2];
-    for (timeouts) |g| parent.launched.append(parent.allocator, g) catch {};
-}
-
 /// Park into a SPECIFIC pump. An activation resumed inline runs on whatever
 /// stack resumed it, which may sit under a nested pump; it still belongs to the
 /// pump it was parked in, and must go back there — `coroTop()` would hand it to
@@ -1887,7 +1873,7 @@ fn parkInto(pump: *CooperativeInterceptor, allocator: Allocator, st: *SuspendSta
             var i = t.head;
             while (i < t.frames.items.len) : (i += 1) {
                 const fr = &t.frames.items[i];
-                std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, @intFromPtr(fr.regs.ptr) });
+                std.debug.print(" #{d}@{d}:{d}/{x}", .{ fr.func.int(), fr.block.int(), fr.inst_idx, fr.regs.ptrIdentity() });
             }
         }
         std.debug.print("\n", .{});
@@ -1958,7 +1944,7 @@ pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Valu
         },
     }
 
-    if (try pumpLoop(self, scope, out, persist, &root_token, &root_value)) |err_result| {
+    if (try pumpLoop(self, scope, out, persist, !persist, &root_token, &root_value)) |err_result| {
         return err_result;
     }
     try pumpExit(self, out, persist);
@@ -1993,7 +1979,7 @@ pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output)
             },
         },
     }
-    if (try pumpLoop(self, &unit, out, false, &root_token, &root_value)) |err_result| {
+    if (try pumpLoop(self, &unit, out, false, true, &root_token, &root_value)) |err_result| {
         return err_result;
     }
     try pumpExit(self, out, false);
@@ -2023,7 +2009,7 @@ pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value
     // re-captures the restored delta).
     const root_scope_base = activeScopeDepth();
     restoreScopeDelta(scope_delta);
-ir.eval.resume_route = "driveResumed";
+    ir.eval.resume_route = "driveResumed";
     switch (try intrinsic_host.resumeRaw(self, &state, value, out)) {
         .ok => |v| root_value = v,
         .err => |e| switch (e) {
@@ -2040,7 +2026,7 @@ ir.eval.resume_route = "driveResumed";
         },
     }
     const scope = activeCoroScope() orelse Value.Unit;
-    if (try pumpLoop(self, &scope, out, true, &root_token, &root_value)) |_| {
+    if (try pumpLoop(self, &scope, out, true, false, &root_token, &root_value)) |_| {
         return;
     }
     try pumpExit(self, out, true);
@@ -2058,6 +2044,7 @@ fn pumpLoop(
     scope: *const Value,
     out: Output,
     persist: bool,
+    stop_on_root_completion: bool,
     root_token: *?u64,
     root_value: *?Value,
 ) Allocator.Error!?RuntimeEvalResult {
@@ -2128,7 +2115,7 @@ fn pumpLoop(
         //     is outside its job tree (an orphaned daemon launch, a
         //     cancelled child's stale timer) and dies with the pump,
         //     exactly as upstream `runBlocking` returns without it.
-        if (!persist and root_token.* == null) break;
+        if (stop_on_root_completion and root_token.* == null) break;
 
         // 0b'. Any `withTimeout` timeout gate no nested block claimed (a bare
         //      `select { onTimeout(…) }`, whose `invokeOnTimeout` has no
@@ -2210,7 +2197,7 @@ fn pumpLoop(
                 const scope_base = activeScopeDepth();
                 restoreScopeDelta(entry.scope_delta);
                 coroStackAllocator().free(entry.scope_delta);
-ir.eval.resume_route = "pump-ready";
+                ir.eval.resume_route = "pump-ready";
                 switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
                     .ok => |v| {
                         if (root_token.* != null and root_token.*.? == tok) {
@@ -2587,26 +2574,35 @@ pub fn coroutineHasDriver() bool {
 /// ByteChannel write side.
 pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
     const a = self.allocator;
-    // A `withTimeout` schedules its cancellation gate on the ENCLOSING pump
-    // (`invokeOnTimeout` runs before the block starts undispatched), then runs
-    // the block as its OWN nested pump here. The gate and the block share one
-    // logical timer queue — the gate cancels the block — so claim the gate off
-    // the enclosing pump and re-home it onto the block's (child) pump below.
-    // Drained before the push so the enclosing pump's own loop never promotes
-    // it first.
-    var pending_timeouts: []Value = &.{};
-    if (coroTop()) |parent| {
-        if (parent.timeout_launched.items.len != 0)
-            pending_timeouts = try parent.drainTimeouts(a);
+    const unit: Value = .Unit;
+    const scope_v: *const Value = if (scope) |s| s else &unit;
+
+    // Inside an existing driver, undispatched start runs only the synchronous
+    // prefix. A real suspension is parked directly onto the enclosing pump and
+    // reported to the Kotlin caller; the parent then continues and the parked
+    // tail resumes in ordinary queue order. This is the defining
+    // startCoroutineUninterceptedOrReturn boundary.
+    if (coroTop() != null) {
+        const scope_base = activeScopeDepth();
+        var guard = ActiveScopeGuard.enter(scope_v);
+        defer guard.leave();
+        switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
+            .ok => |v| return .{ .ok = v },
+            .err => |e| switch (e) {
+                .Suspended => |st| {
+                    guard.pushed = false;
+                    _ = try park(a, st, scope_base);
+                    return .{ .ok = Value.CoroutineSuspended };
+                },
+                else => return .{ .err = mapDriverErr(a, e) },
+            },
+        }
     }
-    defer a.free(pending_timeouts);
 
     try coroPush(a);
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
     defer active_scope_stack.shrinkRetainingCapacity(@min(scope_depth, active_scope_stack.items.len));
-    const unit: Value = .Unit;
-    const scope_v: *const Value = if (scope) |s| s else &unit;
     const guard = ActiveScopeGuard.enter(scope_v);
     defer guard.leave();
 
@@ -2617,39 +2613,20 @@ pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Valu
     var root_token: ?u64 = null;
     const root_scope_base = scope_depth;
     switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
-        .ok => |v| {
-            root_value = v;
-            // Completed without suspending: the timeout is moot. Hand the gate
-            // back to the enclosing pump, which drains it after the block's
-            // coroutine completion disposes it (a no-op) — exactly as before
-            // this re-homing, and without firing a timeout at a finished block.
-            handBackTimeoutsToParent(pending_timeouts);
-        },
+        .ok => |v| root_value = v,
         .err => |e| switch (e) {
-            .Suspended => |st| {
-                root_token = try park(a, st, root_scope_base);
-                // The block genuinely suspended: commit the gate onto its pump
-                // so the earliest of the two deadlines (timeout vs. the block's
-                // own `delay`/await) fires first. Each Value keeps the reference
-                // its enqueue took; the child pump releases it when drained.
-                if (pending_timeouts.len != 0) {
-                    const top = coroTop().?;
-                    for (pending_timeouts) |g| try top.launched.append(top.allocator, g);
-                }
-            },
+            .Suspended => |st| root_token = try park(a, st, root_scope_base),
             .Throw => |v| {
-                handBackTimeoutsToParent(pending_timeouts);
                 try pumpExit(self, out, true);
                 return .{ .err = .{ .Thrown = v } };
             },
             else => {
-                handBackTimeoutsToParent(pending_timeouts);
                 try pumpExit(self, out, true);
                 return .{ .err = mapDriverErr(a, e) };
             },
         },
     }
-    if (try pumpLoop(self, scope_v, out, true, &root_token, &root_value)) |err_result| {
+    if (try pumpLoop(self, scope_v, out, true, true, &root_token, &root_value)) |err_result| {
         return err_result;
     }
     try pumpExit(self, out, true);
@@ -2906,7 +2883,7 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
         const scope_base = activeScopeDepth();
         restoreScopeDelta(entry.scope_delta);
         coroStackAllocator().free(entry.scope_delta);
-ir.eval.resume_route = "inline-claim";
+        ir.eval.resume_route = "inline-claim";
         switch (try intrinsic_host.resumeRaw(self, &entry.state, value, out)) {
             .ok => {},
             .err => |e| switch (e) {
