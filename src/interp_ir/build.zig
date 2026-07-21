@@ -3384,13 +3384,14 @@ fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
                             else => continue,
                         };
                         // A member declared with this name binds ahead of any
-                        // extension (Kotlin's member-over-extension rule), so the
-                        // call is not provably the extension. A `static_recv` /
-                        // `declared_recv` only steers overload selection among
-                        // MULTIPLE candidates; with a single candidate (below) the
-                        // pick is fixed regardless, so those callsites bake too.
+                        // extension (Kotlin's member-over-extension rule). Member
+                        // methods are also VIRTUAL — a subtype can override, and a
+                        // serialized bake (e.g. into the stdlib base image) would
+                        // freeze the wrong target for an overriding consumer — so
+                        // they are left to the walk. Only statically-dispatched
+                        // extensions / member-extensions are baked here.
                         if (member_names.contains(name)) continue;
-                        cm.resolved = uniqueMemberTarget(module, name) orelse continue;
+                        cm.resolved = uniqueMemberTarget(module, name, cm.n_args) orelse continue;
                         baked += 1;
                     },
                     else => {},
@@ -3412,16 +3413,58 @@ fn hasNamedArg(arg_names: []const ?ir.ConstId) bool {
     return false;
 }
 
-fn uniqueMemberTarget(module: *ir.Module, name: []const u8) ?ir.FuncId {
-    var found: ?ir.FuncId = null;
+/// Whether an extension / member-extension `f` (whose `params[0]` is the
+/// receiver) could bind a positional call of `n_args` value arguments: at least
+/// its required (non-default, non-vararg) value params are supplied, and no more
+/// than its declared value params unless it ends in a vararg. Deliberately
+/// permissive at the boundary — used only to decide whether ONE candidate is
+/// uniquely selected by arity, so over-counting a rival merely declines the bake.
+fn extAcceptsArity(f: *const ir.Func, n_args: u32) bool {
+    if (f.params.len == 0) return false;
+    const vps = f.params[1..]; // skip the receiver `this`
+    var required: u32 = 0;
+    var has_vararg = false;
+    for (vps) |*p| {
+        if (p.is_vararg) {
+            has_vararg = true;
+        } else if (!p.has_default) {
+            required += 1;
+        }
+    }
+    if (n_args < required) return false;
+    if (!has_vararg and n_args > vps.len) return false;
+    return true;
+}
+
+/// The single body-bearing top-level extension / member-extension named `name`
+/// that a `recv.name(<n_args args>)` call must dispatch to, or null when zero or
+/// more than one qualify. A CallMember's target takes an explicit receiver
+/// (`params[0].name == "this"`); when several such candidates share the name,
+/// the callsite's fixed arity selects among them (Kotlin overloads that differ
+/// in arity) — a unique arity-compatible candidate is still statically
+/// determined. If two remain arity-compatible (same arity, distinguished only by
+/// receiver/argument type) the pick needs runtime types, so the call is left to
+/// the name path.
+fn uniqueMemberTarget(module: *ir.Module, name: []const u8, n_args: u32) ?ir.FuncId {
+    var only: ?ir.FuncId = null; // sole candidate regardless of arity
+    var candidates: u32 = 0;
+    var arity_hit: ?ir.FuncId = null; // sole arity-compatible candidate
+    var arity_hits: u32 = 0;
     for (module.funcsBySimpleName(name)) |fid| {
         const f = module.funcById(fid) orelse continue;
         if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
         if (!f.hasBody()) continue;
-        if (found != null) return null; // ambiguous
-        found = fid;
+        candidates += 1;
+        only = fid;
+        if (extAcceptsArity(f, n_args)) {
+            arity_hits += 1;
+            arity_hit = fid;
+        }
     }
-    return found;
+    if (candidates == 0) return null;
+    if (candidates == 1) return only; // unique by name — arity irrelevant
+    if (arity_hits == 1) return arity_hit; // unique by arity among the overloads
+    return null;
 }
 
 // -------------------------------------------------------------------------
