@@ -181,6 +181,12 @@ pub const Function = struct {
     is_open: bool,
     /// Declared with the `override` modifier.
     is_override: bool,
+    /// Declared with the `final` modifier. Meaningful on an `override` member
+    /// (`final override fun`), where it seals the method against any further
+    /// override — otherwise an `override` is open by default. Redundant but
+    /// legal on a plain member. Defaults to false so the many synthesized
+    /// `Function` nodes need not spell it.
+    is_final: bool = false,
     /// Declared with the `abstract` modifier. When set the function may have
     /// `body: None` and must live on an `abstract class` / `interface`.
     is_abstract: bool,

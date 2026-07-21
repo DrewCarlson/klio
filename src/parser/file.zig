@@ -484,7 +484,10 @@ pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlag
                 } else if (std.mem.eql(u8, t, "actual")) {
                     flags.is_actual = true;
                     _ = support.bump(p);
-                } else if (std.mem.eql(u8, t, "final") or std.mem.eql(u8, t, "external")) {
+                } else if (std.mem.eql(u8, t, "final")) {
+                    flags.is_final = true;
+                    _ = support.bump(p);
+                } else if (std.mem.eql(u8, t, "external")) {
                     _ = support.bump(p);
                 } else {
                     return flags;

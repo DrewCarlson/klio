@@ -180,6 +180,7 @@ pub const ModifierFlags = struct {
     is_sealed: bool = false,
     is_open: bool = false,
     is_override: bool = false,
+    is_final: bool = false,
     is_abstract: bool = false,
     is_inner: bool = false,
     is_lateinit: bool = false,

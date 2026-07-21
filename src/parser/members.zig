@@ -97,6 +97,7 @@ pub fn parseFun(p: *Parser, flags: ModifierFlags) ?Function {
         .body = body,
         .is_open = flags.is_open or flags.is_abstract,
         .is_override = flags.is_override,
+        .is_final = flags.is_final,
         .is_abstract = flags.is_abstract,
         .is_operator = flags.is_operator,
         .is_inline = flags.is_inline,
