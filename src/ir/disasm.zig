@@ -48,11 +48,11 @@ fn classify(inst: *const Inst) ?Kind {
     return switch (inst.*) {
         .Call => .direct,
         .NewInstance => .direct,
-        .CallMemberOrGlobal => |c| if (c.func != null or c.class != null) .dyn_bound else .dyn_unbound,
+        .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
+        .CallSpread => |c| if (c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallMember,
         .CallValue,
         .CallValueWithThis,
-        .CallSpread,
         .CallSuper,
         .CallValueOrMember,
         .CallMemberOrValue,
@@ -138,11 +138,24 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
                 try w.print("        [DYN-bound -> {s}#{d}]", .{ funcName(m, f), f.int() });
             } else if (c.class) |cl| {
                 try w.print("        [DYN-bound -> class {s}]", .{className(m, cl)});
+            } else if (c.candidates) |ids| {
+                try w.print("        [DYN-bounded {d} candidates]", .{ids.len});
             } else {
                 try w.print("        [DYN-unbound '{s}']", .{constStr(m, c.name)});
             }
         },
         .CallValue => |c| try w.print("r{d} <- CallValue r{d} (n={d})        [DYN value]", .{ reg(c.dst), reg(c.callee), c.n_args }),
+        .CallSpread => |c| {
+            try w.print("r{d} <- CallSpread r{d} (parts={d})", .{ reg(c.dst), reg(c.callee), c.parts.len });
+            if (c.member) |mid| {
+                try w.print("        [DYN member '{s}']", .{constStr(m, mid)});
+            } else if (c.candidates) |ids| {
+                const name = if (c.name) |nid| constStr(m, nid) else "<missing-name>";
+                try w.print("        [DYN-bounded '{s}' {d} candidates]", .{ name, ids.len });
+            } else {
+                try w.writeAll("        [DYN value]");
+            }
+        },
         .NewInstance => |c| {
             try w.print("r{d} <- NewInstance {s}#{d} ", .{ reg(c.dst), className(m, c.class), c.class.int() });
             try argRun(w, c.args, c.n_args);

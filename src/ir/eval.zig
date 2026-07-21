@@ -3854,6 +3854,33 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
                 .ok => |rv| try frame.write(cs.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
+        } else if (cs.candidates != null) {
+            const name_id = cs.name orelse
+                return raiseStep(frame, .{ .Type = "CallSpread: bounded call has no name" });
+            const name = constStr(frame.module, name_id) orelse
+                return raiseStep(frame, .{ .Type = "CallSpread: name not a string const" });
+            const caller_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
+            const overload = switch (try host.callNamedOverload(
+                allocator,
+                frame.module,
+                cs.candidates,
+                name,
+                arg_values.items,
+                effective_names.items,
+                false,
+                frame.func.package,
+                caller_file,
+                "",
+            )) {
+                .ok => |maybe| maybe,
+                .err => |e| return raiseStep(frame, e),
+            };
+            if (overload) |rv| {
+                try frame.write(cs.dst, rv);
+            } else {
+                const msg = try std.fmt.allocPrint(allocator, "unresolved spread overload `{s}`", .{name});
+                return raiseStep(frame, .{ .Type = msg });
+            }
         } else {
             switch (try host.callValueNamed(allocator, &callee_v, arg_values.items, effective_names.items)) {
                 .ok => |rv| try frame.write(cs.dst, rv),
@@ -5085,7 +5112,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             (if (cmg.func) |bf| (if (frame.module.funcById(bf)) |bfd| bfd.package else "") else "")
         else
             "";
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -5121,10 +5148,22 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 host.lookupGlobalById(allocator, by_id_func, cmg.class, is_ctor_name)
             else
                 null;
-            const global = if (by_id != null) by_id else switch (try host.lookupGlobalThrowing(allocator, name_str)) {
-                .ok => |maybe| maybe,
-                .err => |e| return raiseStep(frame, e),
-            };
+            // A bounded candidate set is authoritative. Once lowering has
+            // supplied it, a miss may not widen back to an unrelated
+            // same-simple-name global; only a runtime shadowing capture keeps
+            // the lexical name lookup. Host-only/incomplete-header symbols
+            // carry null and retain legacy lookup until their declarations
+            // are complete enough to rank.
+            const allow_name_global = cmg.candidates == null or shadow_capture;
+            const global = if (by_id != null)
+                by_id
+            else if (allow_name_global)
+                switch (try host.lookupGlobalThrowing(allocator, name_str)) {
+                    .ok => |maybe| maybe,
+                    .err => |e| return raiseStep(frame, e),
+                }
+            else
+                null;
             if (global) |found_callee| {
                 var callee = found_callee;
                 // A CALL is not served by a non-callable name binding: a
@@ -5133,7 +5172,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 // binds the function; the scoped-global walk merely found the
                 // nearer non-callable capture. Re-bind through the function
                 // index before invoking the value.
-                if (!valueInvocable(frame.module, callee)) {
+                if (!valueInvocable(frame.module, callee) and cmg.candidates == null) {
                     if (frame.module.funcId(name_str)) |fid| {
                         if (host.lookupGlobalById(allocator, fid, null, false)) |fv| {
                             orAudit("CallMemberOrGlobal", name_str, "noncallable_rebind", -1, null);
@@ -6863,11 +6902,11 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, candidates: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
         _ = caller_pkg;
         _ = caller_file;
         _ = synth_anchor_pkg;
-        _ = .{ self, allocator, module, name, args, arg_names, ctor_name };
+        _ = .{ self, allocator, module, candidates, name, args, arg_names, ctor_name };
         return .{ .ok = null };
     }
 

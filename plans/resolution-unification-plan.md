@@ -134,6 +134,60 @@ boundary** (unknown receivers are real in lazy mode, per the two-modes design).
 
 ## Open work, in order
 
+### Architecture checkpoint (2026-07-21)
+
+An adversarial review of the current lowerer, evaluator, VM dispatch paths, image
+format, recent static-bake commits, and the JIT/bytecode plans found one ordering
+error in the migration: `Module.resolveCall` already computes a scoped
+`candidate_set`, but deferred emission discarded it. `CallMemberOrGlobal` then
+reconstructed candidates from the program-wide simple-name index at runtime. That
+made the runtime a second resolver and allowed a correct lowering-time scope decision
+to widen again.
+
+The first correction is now in the tree:
+
+- `CallMemberOrGlobal.candidates` carries the package/import-scoped `FuncId` set.
+  A non-null set is authoritative, including an empty set; runtime overload ranking
+  may use runtime value shapes only within that set and may not fall back to every
+  declaration sharing the simple name.
+- `null` has one explicit meaning: no complete, rankable Kotlin declaration set
+  exists for the symbol, so the host-only/incomplete-header compatibility boundary
+  may still resolve it. P10 removes this state by giving every host callable a
+  complete declaration.
+- The image format and IR disassembly expose this representation (`DYN-bounded N
+  candidates`), so packs preserve it and dispatch audits can distinguish a bounded
+  deferred site from a bare-name probe.
+- `CallSpread` follows the same rule. A bare overloaded spread call carries only
+  the `vararg` declarations from its winning package/import tier; after flattening,
+  runtime value shapes select within that set and dispatch the chosen `FuncId`
+  exactly. This replaces `funcIdForSpreadCall`'s former first-candidate execution
+  for bounded calls. Empty spreads are valid zero-element varargs, and the shared
+  applicability engine now models that binding directly.
+
+This establishes the exact/virtual/deferred contract in data, but does not finish it.
+The next implementation order is:
+
+1. Complete `DeclSig` registration for constructors and every class-member header
+   before any method body lowers. The current incremental member tables lose
+   same-name/same-arity overloads and cannot resolve forward private calls.
+2. Add owner-scoped member candidate sets and one `resolveMemberCall` entry point
+   using `applicability.zig`. Exact private/final calls become `Call(FuncId)`;
+   overridable calls become `CallVirtual(MethodSlotId)`.
+3. Give each override family a stable method slot. Runtime virtual dispatch becomes
+   `(receiver class, slot) -> FuncId`, with no method-name or program-wide function
+   search.
+4. Move explicit-receiver resolution into expression lowering. Keep the current
+   post-lowering bake only as a measured migration aid, then delete it once every
+   baked site is produced directly as exact or virtual IR.
+5. Finish P10's host declaration manifest, after which
+   `CallMemberOrGlobal.candidates == null` and runtime global lookup by simple name
+   are invalid states for Kotlin calls.
+
+The concrete correctness canary for item 1 is a class containing two private
+same-name, same-arity overloads (`pick(Int)` and `pick(String)`). Today the
+declaration-order map keeps one `FuncId`, so both calls can reach that sibling. The
+fix is the complete owner-scoped overload index, not another arity/name exception.
+
 0. **P10 — the no-holes symbol table (intrinsics become symbols). THE PRIORITY.**
    The direct order (2026-07-04): get resolution and execution in line with the
    official Kotlin compiler so building on KLIO starts from a correct base — stop
@@ -1161,4 +1215,3 @@ commit constraint is relaxed.
 - **Negative tests:** abstract instantiation diagnoses; a user class named
   `Error`/`Exception`/`Random` constructs via its own declaration; named args on a
   function-typed value diagnose rather than silently drop.
-

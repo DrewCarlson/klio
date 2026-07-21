@@ -519,24 +519,30 @@ pub const ProgramImage = struct {
         return f.params.len;
     }
 
-    /// Whether every value parameter of `f` is typed by one of the func's
-    /// own declared type parameters (`fun <T : Comparable<T>> minOf(a: T,
-    /// b: T)`). The registry's `func_type_params` carries the declared
-    /// type-parameter names.
+    fn typeUsesTypeParam(ty: *const ir.TypeRef, type_params: []const []const u8) bool {
+        var head = ty.name;
+        if (std.mem.startsWith(u8, head, "in#")) head = head["in#".len..];
+        if (std.mem.startsWith(u8, head, "out#")) head = head["out#".len..];
+        for (type_params) |tp| {
+            if (std.mem.eql(u8, head, tp)) return true;
+        }
+        for (ty.args) |*arg| {
+            if (typeUsesTypeParam(arg, type_params)) return true;
+        }
+        return false;
+    }
+
+    /// Whether every value parameter of `f` depends on one of the function's
+    /// own declared type parameters. This includes structural uses such as
+    /// `Comparator<in T>`, not only a bare `T` head. The registry's
+    /// `func_type_params` carries the declared type-parameter names.
     fn funcHasGenericSig(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
         const tps = module.registry.func_type_params.get(fid) orelse return false;
         if (tps.items.len == 0) return false;
         const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (f.params.len == off) return false;
         for (f.params[off..]) |*p| {
-            var is_tp = false;
-            for (tps.items) |tp| {
-                if (std.mem.eql(u8, p.ty.name, tp)) {
-                    is_tp = true;
-                    break;
-                }
-            }
-            if (!is_tp) return false;
+            if (!typeUsesTypeParam(&p.ty, tps.items)) return false;
         }
         return true;
     }
@@ -1503,6 +1509,44 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     }
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+}
+
+test "linkResolvedForms keeps a structurally generic overload body" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.blocks);
+            if (f.params.len != 0) a.free(f.params);
+        }
+        m.deinit(a);
+    }
+
+    const fqn = "kotlin.comparisons.choose";
+    const generic = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
+    const concrete = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
+    var comparator_args = [_]ir.TypeRef{.{ .name = "in#T", .nullable = false, .args = &.{} }};
+    const gp = @constCast(m.funcById(generic).?.params);
+    gp[0].ty = .{ .name = "T", .nullable = false, .args = &.{} };
+    gp[1].ty = .{ .name = "T", .nullable = false, .args = &.{} };
+    gp[1].is_vararg = true;
+    gp[2].ty = .{ .name = "Comparator", .nullable = false, .args = &comparator_args };
+    var type_params: std.ArrayList([]const u8) = .empty;
+    try type_params.append(a, "T");
+    try m.registry.func_type_params.put(generic, type_params);
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        try bg.get().register(fqn, linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+
+    try testing.expect(prog.resolvedNativeForm(generic) == null);
+    try testing.expect(prog.resolvedNativeForm(concrete) != null);
 }
 
 test "a bodyless expect never links to a same-named function in another package" {

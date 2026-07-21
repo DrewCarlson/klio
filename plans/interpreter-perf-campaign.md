@@ -304,7 +304,21 @@ cost is the walk's OWN per-candidate `simpleName`/`resolveExtReceiverFqn`/scorin
 memoizing the conformance BFS does not touch. (This change was subsequently reverted to
 keep the deliverable focused on static dispatch.)
 
-### Lowering-time static dispatch bake — BUILT, CORRECT, bytecode-VM-ready, small wall win
+### Lowering-time static dispatch bake: built, correct migration slice, small wall win
+
+> **Architecture correction (2026-07-21):** the bake is behavior-preserving
+> migration scaffolding, not the final bytecode dispatch representation. It runs
+> after lowering, discovers targets through partial name/arity indexes, and the
+> resolved evaluator path can fall back to the virtual name walk when receiver-owner
+> replay misses. A bytecode VM cannot rely on that fallback. The durable model is
+> produced by the resolver itself: `Call(FuncId)` for exact calls,
+> `CallVirtual(MethodSlotId)` for overrideable calls, and
+> `CallMemberOrGlobal(candidate_set)` only for a genuinely unknown receiver. The
+> first deferred-call correction now preserves an authoritative scoped `FuncId` set
+> in IR and forbids runtime widening to the program-wide simple-name index. Bare
+> spread calls preserve the winning tier's vararg-only set as well, then select and
+> invoke one exact `FuncId` after flattening. The bake remains useful for coverage
+> measurement until direct exact/virtual emission subsumes it.
 
 `bakeStaticMemberCalls` (`interp_ir/build.zig`, run at each module's lowering finalize, so
 it serializes into packs) sets `Inst.CallMember.resolved` for every explicit-receiver call
@@ -315,8 +329,10 @@ replay a member-extension's owner-find, falling back to the walk when the owner 
 unreachable), skipping the whole `callMemberInnerStatic` ladder + `extensionFnFallback`
 walk. `KLIO_BAKE_OFF=1` is the kill-switch; `KLIO_BAKE_STATS=1` reports coverage.
 
-This IS the static-dispatch prerequisite for a bytecode VM: the target is resolved ONCE, at
-build time, not re-resolved per call. Coverage: ~787 callsites of ~14k in a coro program.
+This demonstrated that a build-time target can bypass the name walk and supplied a
+coverage oracle for the migration. It is not the bytecode contract because a baked
+target can still fall back to runtime name dispatch. Coverage: ~787 callsites of ~14k
+in a coro program.
 
 Measured (ReleaseFast, coro bench, median of N; `klio run`/itests re-lower from source so the
 bake applies everywhere):
@@ -331,9 +347,11 @@ resolution is ALREADY memoized (`instance_method_cache`), so its remaining win i
 
 CONCLUSION: member dispatch is a modest slice of interpreter cost (the coro bench is
 dominated by the coroutine pump, the 64-byte `Value` load/store in the eval loop, and
-allocation — see the profile above). The static-dispatch mechanism is worth keeping for
-bytecode-VM-readiness independent of the tree-walker wall win; the larger PERF levers remain
-the deferred list (Value 64->32B, register coalescing, the eval loop), not dispatch.
+allocation; see the profile above). Keep the bake as a migration/coverage tool while
+the resolver grows exact and slot-based virtual IR. That resolved IR, not a fast path
+with a name-walk fallback, is the bytecode-VM prerequisite. The larger performance
+levers remain the deferred list (Value 64->32B, register coalescing, the eval loop),
+not dispatch.
 
 ### Coverage broadenings (the static-dispatch goal, not perf)
 
