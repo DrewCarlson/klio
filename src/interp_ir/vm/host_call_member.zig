@@ -480,6 +480,17 @@ fn newInstanceById(self: *VmHost, allocator: Allocator, class: ir.ClassId, args:
     return self.newInstance(allocator, class, args, outer_hint);
 }
 
+fn reconstructDataClass(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), args: []const Value) Allocator.Error!EvalResult {
+    const class_def = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    var callee: Value = .{ .Class = class_def };
+    defer callee.deinit(allocator);
+    return host_call_value.callValue(self, allocator, &callee, args);
+}
+
 fn getFieldRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return self.getField(allocator, receiver, name);
 }
@@ -1871,15 +1882,25 @@ fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []cons
 // `hostHasMember`.
 // -------------------------------------------------------------------------
 
+/// Canonical pointer identity for a dispatch-cache method name. Runtime
+/// callable references carry collected String storage, so their raw byte
+/// address must never enter a program-lifetime cache key.
+fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    return pg.get().memberNameIdentity(name);
+}
+
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     if (receiver.* != .Instance) return false;
+    const name_p = memberNameIdentity(self, name) orelse return hostHasMemberUncached(self, receiver, name);
     const key: root_mod.ProgramImage.MemberHasKey = .{
         .class_p = blk: {
             const g = receiver.Instance.borrow();
             defer g.deinit();
             break :blk g.get().class.identity();
         },
-        .name_p = @intFromPtr(name.ptr),
+        .name_p = name_p,
     };
     {
         const pg = self.prog.borrow();
@@ -1895,7 +1916,7 @@ pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bo
     return result;
 }
 
-fn cmgGlobalKey(receiver: *const Value, func_p: usize, name: []const u8, args: []const Value) ?root_mod.ProgramImage.CmgGlobalKey {
+fn cmgGlobalKey(self: *VmHost, receiver: *const Value, func_p: usize, name: []const u8, args: []const Value) ?root_mod.ProgramImage.CmgGlobalKey {
     if (receiver.* != .Instance) return null;
     // The arg-type signature keys the entry: a global miss on `f(String)` must
     // not skip the member dispatch of a sibling `f(Int)`. A non-primitive arg
@@ -1903,10 +1924,11 @@ fn cmgGlobalKey(receiver: *const Value, func_p: usize, name: []const u8, args: [
     const sig = methodArgSig(args) orelse return null;
     const g = receiver.Instance.borrow();
     defer g.deinit();
+    const name_p = memberNameIdentity(self, name) orelse return null;
     return .{
         .func_p = func_p,
         .class_p = g.get().class.identity(),
-        .name_p = @intFromPtr(name.ptr),
+        .name_p = name_p,
         .sig = sig,
     };
 }
@@ -1914,7 +1936,7 @@ fn cmgGlobalKey(receiver: *const Value, func_p: usize, name: []const u8, args: [
 /// True when this `(enclosing func, receiver class, name, arg-sig)` was recorded
 /// as resolving to a global — the member-dispatch passes can be skipped.
 pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) bool {
-    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return false;
+    const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return false;
     const pg = self.prog.borrow();
     defer pg.deinit();
     return pg.get().cmg_global_cache.contains(key);
@@ -1923,7 +1945,7 @@ pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name:
 /// Record that this call resolved to a global with a single implicit-receiver
 /// candidate, so a repeat skips the member passes.
 pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
-    const key = cmgGlobalKey(receiver, func_p, name, args) orelse return;
+    const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().cmg_global_cache.put(key, {}) catch {};
@@ -3550,7 +3572,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // never depends on it (it only directs the extension fallback, which the
     // ext-cache probe below guards separately).
     if (receiver.* == .Instance) {
-        if (instanceMethodKeyScoped(receiver, name, args, static_recv, null)) |k| {
+        if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, null)) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
@@ -4944,7 +4966,7 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
     // rebuilding the probe FQNs or walking the supertype chain. Only a
     // primitive-arg call is keyed (`instanceMethodKey`); anything else falls
     // through to the full probe below.
-    const ib_key = instanceMethodKey(receiver, name, args);
+    const ib_key = instanceMethodKey(self, receiver, name, args);
     if (ib_key) |k| {
         if (instanceIntrinsicCacheGet(self, k)) |entry| {
             const func = entry.func orelse return null;
@@ -7492,14 +7514,10 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
         }
     }
     if (is_data and !has_user_override and std.mem.eql(u8, name, "copy")) {
-        var class_name2: []const u8 = undefined;
-        var class_fqn2: []const u8 = undefined;
         var n_params: usize = undefined;
         {
             const g = inst.borrow();
             const cg = g.get().class.borrow();
-            class_name2 = cg.get().name;
-            class_fqn2 = cg.get().fqn;
             n_params = cg.get().primary_params.len;
             cg.deinit();
             g.deinit();
@@ -7518,15 +7536,7 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             }
             cg.deinit();
             g.deinit();
-            // The receiver's ClassDef carries the FQN: copy() rebuilds
-            // the SAME class, never a same-simple-name one from another
-            // package.
-            const mg2 = self.module.borrow();
-            const cid_opt = mg2.get().classIdByFqn(class_fqn2) orelse mg2.get().classId(class_name2);
-            mg2.deinit();
-            if (cid_opt) |cid| {
-                return try newInstanceById(self, allocator, cid, new_args.items, null);
-            }
+            return try reconstructDataClass(self, allocator, inst, new_args.items);
         }
     }
     if ((is_data or is_value) and !has_user_override and args.len == 1 and std.mem.eql(u8, name, "equals")) {
@@ -8364,6 +8374,16 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+        if (std.mem.eql(u8, want, f.name)) {
+            std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} args=", .{ f.fqn, fid.int(), f.params.len, receiver.typeFqn() });
+            for (args) |a| switch (a) {
+                .Int => |v| std.debug.print(" Int({d})", .{v}),
+                else => std.debug.print(" {s}", .{@tagName(a)}),
+            };
+            std.debug.print("\n", .{});
+        }
+    }
 
     // A pass-threaded `@Composable` member method re-invoked during recompose
     // (`this.Child($composer, $changed)`) must publish its threaded composer as
@@ -8515,8 +8535,8 @@ fn methodArgSig(args: []const Value) ?u64 {
     return if (v == 0) 1 else v;
 }
 
-fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
-    return instanceMethodKeyScoped(receiver, name, args, null, null);
+fn instanceMethodKey(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value) ?root_mod.ProgramImage.InstanceMethodKey {
+    return instanceMethodKeyScoped(self, receiver, name, args, null, null);
 }
 
 /// Scope-aware cache key. A `static_recv`/`declared_recv`-directed call
@@ -8526,7 +8546,7 @@ fn instanceMethodKey(receiver: *const Value, name: []const u8, args: []const Val
 /// self-recurses), nor vice versa. Folding the scope names into `sig` keeps
 /// both resolutions cached under distinct keys; resolution is a pure function
 /// of (class, name, arg-sig, scope), so each entry stays sound.
-fn instanceMethodKeyScoped(receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
+fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
     if (receiver.* != .Instance) return null;
     var sig = methodArgSig(args) orelse return null;
     if (static_recv != null or declared_recv != null) {
@@ -8541,9 +8561,10 @@ fn instanceMethodKeyScoped(receiver: *const Value, name: []const u8, args: []con
     const inst = receiver.Instance;
     const g = inst.borrow();
     defer g.deinit();
+    const name_p = memberNameIdentity(self, name) orelse return null;
     return .{
         .class_p = g.get().class.identity(),
-        .name_p = @intFromPtr(name.ptr),
+        .name_p = name_p,
         .n_args = @intCast(args.len),
         .sig = sig,
     };
@@ -8642,7 +8663,7 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // `instanceMethodKeyScoped`): its resolution depends on the static receiver
     // type, so it caches apart from the ordinary call's entry — never served
     // one, never serves one.
-    const key = instanceMethodKeyScoped(receiver, name, args, static_recv, null);
+    const key = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
@@ -8920,9 +8941,11 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name) and
         !(try userToplevelExtNamedExists(self, allocator, receiver, name));
     if (cacheable) {
+        const name_p = memberNameIdentity(self, name) orelse
+            return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
         const key: root_mod.ProgramImage.MemberResolveKey = .{
             .type_p = @intFromPtr(type_fqn.ptr),
-            .name_p = @intFromPtr(name.ptr),
+            .name_p = name_p,
             .args_empty = args.len == 0,
         };
         const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
@@ -9837,7 +9860,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     // bare-name probe, can resolve the same names differently).
     const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
         if (!strict_ext and static_recv == null and declared_recv == null)
-            instanceMethodKey(receiver, name, args)
+            instanceMethodKey(self, receiver, name, args)
         else
             null;
     if (cache_key) |k| {
@@ -10904,15 +10927,11 @@ fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: 
     const inst = receiver.Instance;
     var is_data = false;
     var n_params: usize = 0;
-    var class_name: []const u8 = undefined;
-    var class_fqn: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         is_data = cg.get().is_data;
         n_params = cg.get().primary_params.len;
-        class_name = cg.get().name;
-        class_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
@@ -10953,14 +10972,7 @@ fn copyNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, args: 
         cg.deinit();
         g.deinit();
     }
-    // Same FQN-keyed rebuild as the positional `copy` path.
-    const mg2 = self.module.borrow();
-    const cid_opt = mg2.get().classIdByFqn(class_fqn) orelse mg2.get().classId(class_name);
-    mg2.deinit();
-    if (cid_opt) |cid| {
-        return try newInstanceById(self, allocator, cid, new_args.items, null);
-    }
-    return null;
+    return try reconstructDataClass(self, allocator, inst, new_args.items);
 }
 
 fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
@@ -11418,6 +11430,20 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
             if (seen.contains(dedup_key)) continue;
             try seen.put(dedup_key, {});
             if (ir_class) |irc| {
+                if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                    if (std.mem.eql(u8, want, name)) {
+                        std.debug.print("[mwalk-class] {s} methods={d} supers=", .{ irc.fqn, irc.methods.len });
+                        for (irc.supertypes, 0..) |sid, si| {
+                            if (si != 0) std.debug.print(",", .{});
+                            if (@intFromEnum(sid) < mod.classes.items.len) {
+                                std.debug.print("{s}", .{mod.classes.items[@intFromEnum(sid)].fqn});
+                            } else {
+                                std.debug.print("#{d}", .{@intFromEnum(sid)});
+                            }
+                        }
+                        std.debug.print("\n", .{});
+                    }
+                }
                 // Among the applicable same-named overloads declared by THIS
                 // class, pick the best by argument-type score — not merely the
                 // first. Two overloads that differ only in one parameter's type
@@ -11430,6 +11456,17 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
+                            if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                                if (std.mem.eql(u8, want, name)) {
+                                    const defaults = funcDefaults(self, &f);
+                                    std.debug.print("[mwalk] class={s} fid={d} params=", .{ irc.fqn, fid.int() });
+                                    for (f.params, 0..) |p, pi| {
+                                        if (pi != 0) std.debug.print(",", .{});
+                                        std.debug.print("{s}{s}", .{ p.name, if (paramHasDefault(defaults, pi)) "=" else "" });
+                                    }
+                                    std.debug.print("\n", .{});
+                                }
+                            }
                             // A member EXTENSION found among the class's own
                             // methods binds the dispatch receiver as its
                             // EXTENSION receiver (params[0]). When the receiver
@@ -11600,14 +11637,14 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const dot = std.mem.lastIndexOfScalar(u8, receiver.Intrinsic.fqn, '.');
             const simple = if (dot) |i| receiver.Intrinsic.fqn[i + 1 ..] else receiver.Intrinsic.fqn;
             if (isUnsignedArrayName(simple)) return .{ .ok = try syntheticClassFromFqn(allocator, receiver.Intrinsic.fqn) };
-            return .{ .ok = receiver.* };
+            return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
         }
         if (receiver.* == .Function) {
             if (isUnsignedArrayName(receiver.Function.decl.name.name)) {
                 const fqn = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{receiver.Function.decl.name.name});
                 return .{ .ok = try syntheticClassFromFqn(allocator, fqn) };
             }
-            return .{ .ok = receiver.* };
+            return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
         }
         // A builtin throwable carries its dynamic class in its `fqn` field;
         // the static `typeFqn` would collapse every one to `kotlin.Throwable`.
@@ -11616,11 +11653,8 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             defer g.deinit();
             return .{ .ok = try syntheticClassFromFqn(allocator, g.get().bytes) };
         }
-        // `value::class` — the runtime KClass of a plain (non-callable) value.
-        switch (receiver.*) {
-            .IrClosure, .BoundMethod, .BoundUserMethod => return .{ .ok = receiver.* },
-            else => return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) },
-        }
+        // `value::class` — the runtime KClass of a plain value or callable.
+        return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
     }
     // `recv::method` produces a callable wrapper backed by a synthetic
     // Instance carrying `__bound_receiver__` + `__bound_name__`; the
