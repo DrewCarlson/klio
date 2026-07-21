@@ -255,7 +255,8 @@ git submodule update --init --recursive    # kotlinx + ktor vendor sources
 ./scripts/init-compose-submodule.sh         # compose-multiplatform-core (sparse)
 ./scripts/init-androidx-collection-submodule.sh
 ./scripts/fetch-skia.sh                     # Compose-UI Skia backend (host target)
-zig build -Dcocoa -Dgpu                     # macOS window + Metal (drop the flags for headless)
+zig build                                   # macOS: Cocoa window + Metal backend by default
+                                            #   (-Dcocoa=false -Dgpu=false for headless; on linux add -Dgpu with a display)
 ```
 
 Zig 0.16.0+ is required (pinned in `build.zig.zon`).

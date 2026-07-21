@@ -116,30 +116,38 @@ fi
 gpu_args=()
 skia_lib="third_party/skia/${HOST_OS}-${HOST_ARCH}/out/Release-${HOST_OS}-${HOST_ARCH}/libskia.a"
 [ "$HOST_OS" = windows ] && skia_lib="${skia_lib%.a}.lib"
-if [ "$DO_GPU" -eq 1 ] && [ "$DO_SKIA" -eq 1 ] && [ -f "$skia_lib" ]; then
-    case "$HOST_OS" in
-        macos)
-            # Cocoa window + Metal surface. Metal falls back to raster at runtime
-            # if bring-up fails, so this is always safe to enable on macOS.
-            gpu_args=(-Dcocoa -Dgpu)
-            ;;
-        linux)
-            # The SDL window backend auto-links when libSDL2 is present; add the
-            # Ganesh GL/EGL GPU surface only with a display attached (it falls
-            # back to raster if the GL/EGL libs are missing regardless).
-            if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-                gpu_args=(-Dgpu)
-            fi
-            ;;
-    esac
+if [ "$DO_SKIA" -eq 1 ] && [ -f "$skia_lib" ]; then
+    if [ "$DO_GPU" -eq 1 ]; then
+        case "$HOST_OS" in
+            macos)
+                # Cocoa window + Metal surface. This is also build.zig's macOS
+                # default, so it is explicit-but-redundant; kept for the log line.
+                gpu_args=(-Dcocoa -Dgpu)
+                ;;
+            linux)
+                # The SDL window backend auto-links when libSDL2 is present; add
+                # the Ganesh GL/EGL GPU surface only with a display attached (it
+                # falls back to raster if the GL/EGL libs are missing regardless).
+                if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+                    gpu_args=(-Dgpu)
+                fi
+                ;;
+        esac
+    else
+        # --headless: build.zig defaults the macOS Cocoa/Metal backend on, so
+        # turn it off explicitly for an offscreen-only shim.
+        case "$HOST_OS" in
+            macos) gpu_args=(-Dcocoa=false -Dgpu=false) ;;
+        esac
+    fi
 fi
 
 if [ "$DO_BUILD" -eq 1 ]; then
     step "build (zig build ${BUILD_ARGS[*]:-} ${gpu_args[*]:-})"
-    if [ "${#gpu_args[@]}" -gt 0 ]; then
-        note "window/GPU backend: ${gpu_args[*]}"
-    elif [ "$DO_GPU" -eq 0 ]; then
+    if [ "$DO_GPU" -eq 0 ]; then
         note "window/GPU backend: disabled (--headless)"
+    elif [ "${#gpu_args[@]}" -gt 0 ]; then
+        note "window/GPU backend: ${gpu_args[*]}"
     elif [ "$DO_SKIA" -eq 1 ] && [ "$HOST_OS" = linux ]; then
         note "window/GPU backend: headless (no DISPLAY/WAYLAND_DISPLAY detected)"
     fi
