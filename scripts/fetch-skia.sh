@@ -50,8 +50,13 @@ ASSET="Skia-${SKIA_TAG}-${OS}-Release-${ARCH}.zip"
 URL="https://github.com/${REPO}/releases/download/${SKIA_TAG}/${ASSET}"
 EXT="a"; [ "${OS}" = "windows" ] && EXT="lib"
 MAIN="${DEST}/out/Release-${OS}-${ARCH}/libskia.${EXT}"
+# The prebuilt's public module headers (skunicode/skparagraph/skresources/svg/
+# skottie) transitively `#include "src/..."` internal headers, so the archive's
+# headers-only src/ tree is required to compile the shim. Use one such header as
+# the completeness sentinel: a checkout with libskia but no src/ is incomplete.
+SENTINEL="${DEST}/src/base/SkUTF.h"
 
-if [ -f "${MAIN}" ]; then
+if [ -f "${MAIN}" ] && [ -f "${SENTINEL}" ]; then
     echo "skia already present for ${OS}-${ARCH} at ${DEST}; nothing to do"
     exit 0
 fi
@@ -64,8 +69,10 @@ echo "downloading ${ASSET} ..."
 curl -fsSL -o "${TMP}/skia.zip" "${URL}"
 
 echo "extracting headers + libs into ${DEST} ..."
-# include/ + modules/ (headers) and out/ (the static libs); skip the archive's
-# Skia source tree.
-unzip -q -o "${TMP}/skia.zip" "include/*" "modules/*" "out/*" -d "${DEST}"
+# include/ + modules/ (public headers), out/ (the static libs), and src/ (the
+# archive's headers-only internal tree, ~1.4MB — no .cpp). src/ is required:
+# the module public headers `#include "src/..."` internal headers, so a checkout
+# without it fails to compile the shim ('src/base/SkUTF.h' file not found).
+unzip -q -o "${TMP}/skia.zip" "include/*" "modules/*" "out/*" "src/*" -d "${DEST}"
 
 echo "skia ${SKIA_TAG} (${OS}-${ARCH}) ready at ${DEST}"

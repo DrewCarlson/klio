@@ -229,12 +229,29 @@ src/
 
 ## Building from source
 
+After a fresh clone, one script does all setup — submodules, the sparse
+upstream checkouts, the Skia backend prebuilt, and the build:
+
 ```sh
-git submodule update --init --recursive   # kotlinx + ktor vendor sources
-./scripts/init-kotlin-submodule.sh         # upstream Kotlin stdlib (sparse)
-zig build
+./scripts/bootstrap.sh                 # full setup + build
+./scripts/bootstrap.sh --release       # build with -Doptimize=ReleaseFast
+./scripts/bootstrap.sh --packs         # also install the shipped packs into ~/.klio
 zig build test
 ./zig-out/bin/klio run examples/showcase.kt
+```
+
+`bootstrap.sh` is idempotent — every phase is a no-op when already
+satisfied, so it is safe to re-run to repair a partial setup or pick up a
+moved submodule pin. The individual steps it runs, if you prefer to run
+them by hand:
+
+```sh
+git submodule update --init --recursive    # kotlinx + ktor vendor sources
+./scripts/init-kotlin-submodule.sh          # upstream Kotlin stdlib (sparse)
+./scripts/init-compose-submodule.sh         # compose-multiplatform-core (sparse)
+./scripts/init-androidx-collection-submodule.sh
+./scripts/fetch-skia.sh                     # Compose-UI Skia backend (host target)
+zig build
 ```
 
 Zig 0.16.0+ is required (pinned in `build.zig.zon`).
