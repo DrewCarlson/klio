@@ -302,6 +302,35 @@ allocation — see the profile above). The static-dispatch mechanism is worth ke
 bytecode-VM-readiness independent of the tree-walker wall win; the larger PERF levers remain
 the deferred list (Value 64->32B, register coalescing, the eval loop), not dispatch.
 
+### Coverage broadenings (the static-dispatch goal, not perf)
+
+The bake resolves callsites at lower time — the bytecode-VM prerequisite — so widening
+its coverage advances that goal even where it is perf-neutral. Landed, each validated
+behavior-preserving (examples byte-identical bake on/off; full stdlib sweep failure set
+unchanged from the 5 pre-existing):
+
+- **Uniquely-named extensions / member-extensions** — the original bake. `~750` sites.
+- **Arity-selected extension overloads** — when a name has several ext/member-ext
+  candidates differing in arity, the callsite's fixed arg count selects one statically
+  (`resume()` vs `resume(value)`). Same-arity overloads (type-distinguished) stay on the
+  walk. `~770` sites.
+
+**Member methods — measured (+288 sites → ~1058) but NOT landed (open-world hazard).**
+A `recv.name()` member call is monomorphic when exactly one user class declares `name`
+(no override in the closed program) and the receiver's static type (`declared_recv`)
+resolves to a user class (so the runtime receiver is never a builtin with a same-named
+member). This is sound for the WHOLE-PROGRAM re-lower (klio run / itests, which re-lower
+everything). It is NOT sound for a SERIALIZED bake: the stdlib base image is built through
+`bakeStaticMemberCalls`, its member-method bakes freeze at base-build time, and its
+internal callsites are not re-baked on extend — so a consumer that overrides a stdlib
+`open` method would mis-dispatch through the base's stale bake. Extensions are immune
+(statically dispatched, never overridden). To land member methods soundly, bake only
+methods of a provably-final class: add `is_open`/`is_sealed` to `ir.Class` (thread from
+the AST through `lowerClass`, mirroring the runtime `ClassDef` which already carries them)
+and gate the bake on a final, non-abstract, non-interface class — a final class can never
+be subclassed, so its methods are open-world monomorphic. Sketch kept; do this next to
+extend member-call static dispatch.
+
 ## Method
 
 1. Confirm premise: the CI-slow suites (coroutines_commontest baseline 220, compose,
