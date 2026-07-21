@@ -192,6 +192,36 @@ Re-profiled every bench under `KLIO_OPT=safe` — the representative picture:
   runtime, unlike the inline cache). Needs lowering-time receiver-type inference +
   member-shadow proof; the runtime infra (`resolved` + fast-path) already exists.
 
+### TRIED + NOT MERGED — runtime member-extension dispatch cache (the real `findScalarLast` fix)
+
+Data (coro bench, JIT-off): `findScalarLast` 10.8%, of which **83% is in
+`extensionFnFallback`** — the extension candidate walk. The top-level extension cache
+(`extMethodCacheGet`, keyed by receiver+name+args) already skips the walk, but the hot
+uncached calls are **member-extension WINNERS** (`pushed_owner`): `nextChild` (294) and
+`notifyCompletion` (147), JobSupport coroutine internals. Member-ext resolution is
+uncached because it depends on the enclosing-`this` context (visible member-ext owners)
+AND establishes a side-effect (`pushEnclosing(owner)` before running the body).
+
+A full, careful implementation was built (context-key = enclosing-chain-class hash +
+ref-site file, folded into the ext-cache key with a tag bit; a shared `dispatchExtWinner`
+so fast/slow paths dispatch identically; **verify-on-hit** = fall back to the walk if the
+cached owner is not reachable). It **FAILED the fragility gate catastrophically**:
+`coroutines_commontest` went 220 → **27 passed, 60 failed, 135 did-not-complete (hangs)**.
+Root cause of the failure: coroutine-core member-extensions share their owner type (many
+member-exts on `JobSupport`), so verify-on-hit (owner-reachable) almost always passes and
+does NOT catch a wrong-fid; correctness then rests entirely on the (receiver, name,
+arg-sig, context) key, and that key is insufficient to distinguish the coroutine
+member-ext overloads/contexts — so it serves wrong fids broadly and hangs the machinery.
+NOT merged (left in worktree `agent-a98a7b41b750ea981`, revertable).
+
+CONCLUSION: a *runtime* cache cannot safely capture member-extension resolution in the
+coroutine core. The ~9% is locked behind correctness that needs **lowering-time static
+resolution** — resolve the extension by the receiver's STATIC type at the `CallMember`
+build (Kotlin dispatches extensions statically), proving the target at compile time where
+the type context is known, and bake it into `Inst.CallMember.resolved` (read-only at
+runtime; the runtime infra already exists). That is the correct large follow-up; the
+runtime-cache path is a dead end here.
+
 ## Method
 
 1. Confirm premise: the CI-slow suites (coroutines_commontest baseline 220, compose,
