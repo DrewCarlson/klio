@@ -602,6 +602,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#platform-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform behavior
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#cross-target-bundles" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1716,6 +1727,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#platform-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform behavior
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#cross-target-bundles" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1775,20 +1797,26 @@
 
 <h1 id="bundling-programs">Bundling programs<a class="headerlink" href="#bundling-programs" title="Permanent link">&para;</a></h1>
 <p><code>klio bundle</code> packages a Kotlin program — with its baked dependency
-image, embedded resources, and (for Compose programs) the Skia/SDL2
-rendering backend — into one self-contained Linux executable. The
+image, embedded resources, and (for Compose programs) the Skia
+rendering backend — into one self-contained native executable. The
 result runs on a machine with no klio, no Kotlin, no toolchain, and
 no <code>~/.klio</code>. It serves both program classes klio runs:</p>
 <ul>
 <li><strong>CLI tools and servers</strong> — headless programs using the stdlib and
   packs (kotlinx, ktor).</li>
 <li><strong>Compose UI desktop apps</strong> — the real androidx Compose engine over
-  the Skia backend, windowed via SDL2.</li>
+  the Skia backend, windowed through the platform's native layer
+  (SDL2 on Linux, Cocoa/Metal on macOS).</li>
 </ul>
+<p>Linux and macOS are supported today. Windows is planned; its stub
+builds and its window backend exist, but the PE overlay placement is
+not wired yet.</p>
 <p>No compiler or linker is ever invoked. Bundling is file surgery: the
-running <code>klio</code> binary is copied as the runtime stub, the payload is
-appended in an aligned overlay, and a 72-byte trailer is written at
-the end.</p>
+target's <code>klio</code> binary is copied as the runtime stub, the payload is
+placed in an aligned overlay, and a 72-byte trailer marks it. The
+exact placement of that overlay is per-OS (see
+<a href="#platform-behavior">Platform behavior</a>), but the format and the boot
+path are identical everywhere.</p>
 <h2 id="quick-start">Quick start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h2>
 <p>Save this to <code>hello.kt</code>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
@@ -1811,25 +1839,29 @@ the release step.</p>
 <h2 id="command-reference">Command reference<a class="headerlink" href="#command-reference" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>klio bundle &lt;main.kt | project-dir&gt; [options]
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  -o, --output &lt;path&gt;        Output executable (default: source basename)
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>  --target &lt;target&gt;          linux-x64 (default: host), linux-arm64
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  --ui | --headless          Force the flavor. Default: auto-detected — the
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>                             pack fixpoint selecting any androidx.compose.ui*
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>                             pack (or klio.compose.ui) marks the bundle UI.
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>  --include &lt;path[:mount]&gt;   Embed a file or directory into the bundle&#39;s
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>                             resource table (repeatable). Mount defaults to
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>                             the path relative to the source file&#39;s directory.
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>  --name &lt;string&gt;            App display name (window title default).
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>                             Default: output basename.
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>  --icon &lt;png&gt;               App icon source (single square PNG); applied as
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>                             the window icon when the first window opens.
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>  --feature &lt;pack&gt;/&lt;feat&gt;    Enable a pack feature, baked into the bundle
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>                             (same meaning as `klio run --feature`).
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>  --stub &lt;path&gt;              Explicit stub binary (skips self-copy/fetch).
-<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>  --desktop-dir &lt;dir&gt;        Also emit &lt;name&gt;.desktop + the icon PNG for
-<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>                             GUI-first Linux distribution.
-<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>  --dry-run                  Print the resolved pack set, flavor, sections,
-<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>                             and projected size without writing.
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  -o, --output &lt;path&gt;        Output executable (default: source basename;
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>                             `.exe` appended for windows targets)
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  --target &lt;target&gt;          Host target by default; one of linux-x64,
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>                             linux-arm64, macos-x64, macos-arm64,
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>                             windows-x64, windows-arm64
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>  --ui | --headless          Force the flavor. Default: auto-detected — the
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>                             pack fixpoint selecting any androidx.compose.ui*
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>                             pack (or klio.compose.ui) marks the bundle UI.
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>  --include &lt;path[:mount]&gt;   Embed a file or directory into the bundle&#39;s
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>                             resource table (repeatable). Mount defaults to
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>                             the path relative to the source file&#39;s directory.
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>  --name &lt;string&gt;            App display name (window title default).
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>                             Default: output basename.
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>  --icon &lt;png&gt;               App icon source (single square PNG); applied as
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>                             the window icon and in the .app/.desktop metadata.
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>  --feature &lt;pack&gt;/&lt;feat&gt;    Enable a pack feature, baked into the bundle
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>                             (same meaning as `klio run --feature`).
+<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>  --stub &lt;path&gt;              Explicit stub binary (skips self-copy/fetch).
+<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>  --desktop-dir &lt;dir&gt;        Also emit &lt;name&gt;.desktop + the icon PNG for
+<a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>                             GUI-first Linux distribution.
+<a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>  --app-dir &lt;dir&gt;            Also emit &lt;name&gt;.app around the bundle for macOS.
+<a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>  --dry-run                  Print the resolved pack set, flavor, sections,
+<a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>                             and projected size without writing.
 </code></pre></div>
 <p>Every flag also accepts the <code>--flag=value</code> form.</p>
 <p>A feature-gated pack surface is enabled the same way as at run time,
@@ -1870,8 +1902,11 @@ release build (<code>zig build -Doptimize=ReleaseFast</code>, stripped):</p>
 <p>A bundle starts faster than <code>klio run</code> runs the same file: the
 program is baked as a whole-program IR image that boot mmaps straight
 out of the executable and runs, with zero parsing or lowering.</p>
+<p>macOS bundles are the same shape (stub-dominated); the ad-hoc code
+signature adds the CodeDirectory's page hashes (~0.8% of the file, 32
+bytes per 4 KiB) on top.</p>
 <p>A default <code>zig build</code> produces a Debug binary, so bundles made with
-it are dev-sized (about 227 MB). Build the bundling <code>klio</code> with
+it are dev-sized (hundreds of MB). Build the bundling <code>klio</code> with
 <code>-Doptimize=ReleaseFast</code> (and <code>strip</code> it) for release-sized output.</p>
 <h2 id="embedded-resources">Embedded resources<a class="headerlink" href="#embedded-resources" title="Permanent link">&para;</a></h2>
 <p><code>--include &lt;path[:mount]&gt;</code> embeds a file or a whole directory into
@@ -1981,36 +2016,115 @@ the only bundle-mode CLI affordance:</p>
 <p>A program whose pack fixpoint selects any <code>androidx.compose.ui*</code> pack
 (or <code>klio.compose.ui</code>) bundles as UI automatically; <code>--ui</code> and
 <code>--headless</code> force it. A UI bundle embeds the Skia rendering backend
-(<code>libklio_skia.so</code>, zstd-compressed). Bundling one requires the
-backend library next to the bundling <code>klio</code> (<code>zig build skia-lib</code>) or
-at <code>KLIO_SKIA_LIB</code>.</p>
+(zstd-compressed). Bundling one requires the backend library next to
+the bundling <code>klio</code> (<code>zig build skia-lib</code>) or at <code>KLIO_SKIA_LIB</code>. The
+library name is per-OS: <code>libklio_skia.so</code> (Linux), <code>libklio_skia.dylib</code>
+(macOS), <code>klio_skia.dll</code> (Windows).</p>
+<p>A program that opens a window (<code>runApp</code>) needs a backend built with a
+real windowing layer. A shim built without one — the <em>stub</em> backend,
+which still renders offscreen — cannot open a window, so such a bundle
+would launch and exit silently. Bundling catches this and fails fast:
+the shim carries a backend marker (<code>cocoa</code>, <code>sdl</code>, <code>win32</code>, or <code>stub</code>)
+that the bundler reads and refuses to ship a windowed program against a
+stub. Build a windowing backend with <code>zig build skia-lib -Dskia -Dcocoa
+-Dgpu</code> (macOS) or <code>-Dskia</code> with <code>libsdl2-dev</code> (Linux). Offscreen-only
+bundles (<code>uiRenderer</code> → PNG, no <code>runApp</code>) are exempt — the stub renders
+them fine.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>counter.kt<span class="w"> </span>-o<span class="w"> </span>counter
 <a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>bundled<span class="w"> </span>counter<span class="w"> </span><span class="o">(</span><span class="m">42</span>.3<span class="w"> </span>MB,<span class="w"> </span>ui<span class="o">)</span>:<span class="w"> </span>stdlib<span class="w"> </span>+<span class="w"> </span>androidx.collection<span class="w"> </span>+<span class="w"> </span>androidx.compose.runtime<span class="w"> </span>+<span class="w"> </span>klio.compose.ui<span class="w"> </span>+<span class="w"> </span>kotlinx.atomicfu<span class="w"> </span>+<span class="w"> </span>kotlinx.coroutines<span class="w"> </span>+<span class="w"> </span>skia<span class="w"> </span>backend
-<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>$<span class="w"> </span>./counter<span class="w">     </span><span class="c1"># opens the window; no klio, no SDL2 install</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>$<span class="w"> </span>./counter<span class="w">     </span><span class="c1"># opens the window; no klio and no rendering install needed</span>
 </code></pre></div>
 <p>On first launch the shim is extracted to a content-addressed per-user
-cache (<code>$XDG_CACHE_HOME/klio/shim/&lt;blake3-16&gt;/libklio_skia.so</code>,
-default <code>~/.cache/...</code>) via temp file + atomic rename — concurrent
-first launches are safe, upgrades and co-installed bundles coexist,
-and later launches skip the write. If the cache directory is
-unwritable the shim falls back to the system temp dir; if that also
-fails the program runs headless with one stderr line.</p>
-<p>The release shim links SDL2 statically (<code>scripts/fetch-sdl.sh</code> +
-<code>zig build skia-lib -Dsdl-static</code>), so end users need no SDL2
-install; statically-linked SDL still dlopens the host's X11/Wayland
-client libraries at runtime, so one shim covers both display servers.
-Dev builds keep dynamic SDL2. <code>libstdc++</code>/<code>glibc</code> remain dynamic —
-present on every desktop Linux distribution.</p>
+cache via temp file + atomic rename — concurrent first launches are
+safe, upgrades and co-installed bundles coexist, and later launches
+skip the write. The cache directory is per-OS:</p>
+<ul>
+<li>Linux: <code>$XDG_CACHE_HOME/klio/shim/&lt;blake3-16&gt;/libklio_skia.so</code>
+  (default <code>~/.cache/...</code>).</li>
+<li>macOS: <code>~/Library/Caches/klio/shim/&lt;blake3-16&gt;/libklio_skia.dylib</code>.</li>
+<li>Windows: <code>%LOCALAPPDATA%\klio\shim\&lt;blake3-16&gt;\klio_skia.dll</code> (planned).</li>
+</ul>
+<p>If the cache directory is unwritable the shim falls back to the system
+temp dir; if that also fails the program runs headless with one stderr
+line.</p>
+<p>The Linux release shim links SDL2 statically (<code>scripts/fetch-sdl.sh</code> +
+<code>zig build skia-lib -Dsdl-static</code>), so end users need no SDL2 install;
+statically-linked SDL still dlopens the host's X11/Wayland client
+libraries at runtime, so one shim covers both display servers. Dev
+builds keep dynamic SDL2. <code>libstdc++</code>/<code>glibc</code> remain dynamic — present
+on every desktop Linux distribution.</p>
+<p>The macOS shim uses the Cocoa window layer and the Metal GPU path
+(with a CPU raster fallback), linking only system frameworks
+(AppKit, Metal, QuartzCore, …) — nothing for the end user to install.</p>
 <h3 id="desktop-integration">Desktop integration<a class="headerlink" href="#desktop-integration" title="Permanent link">&para;</a></h3>
-<p>A bare executable does not reliably double-click on stock GNOME. The
-bundle itself stays a plain executable (terminal-first); for
-GUI-first distribution, <code>--desktop-dir &lt;out&gt;</code> additionally emits
-<code>&lt;name&gt;.desktop</code> plus the icon PNG for the user (or a package) to
-install under <code>~/.local/share/applications</code>.</p>
+<ul>
+<li><strong>Linux</strong>: a bare executable does not reliably double-click on
+  stock GNOME. The bundle itself stays a plain executable
+  (terminal-first); <code>--desktop-dir &lt;out&gt;</code> additionally emits
+  <code>&lt;name&gt;.desktop</code> plus the icon PNG for the user (or a package) to
+  install under <code>~/.local/share/applications</code>.</li>
+<li><strong>macOS</strong>: <code>--app-dir &lt;out&gt;</code> wraps the bundle in
+  <code>&lt;name&gt;.app/Contents/</code> (<code>Info.plist</code>, <code>MacOS/&lt;name&gt;</code> = the bundle,
+  <code>Resources/icon.icns</code> generated from <code>--icon</code>) so it double-clicks
+  and shows a name/icon in the Dock. The inner binary is the
+  ad-hoc-signed bundle; the <code>.app</code> itself is not sealed. For
+  distribution, seal it with your identity:
+  <code>codesign --deep -f -s "Developer ID Application: …" &lt;name&gt;.app</code> —
+  the bundle payload and its trailer survive re-signing (see
+  <a href="#platform-behavior">Platform behavior</a>).</li>
+</ul>
+<h2 id="platform-behavior">Platform behavior<a class="headerlink" href="#platform-behavior" title="Permanent link">&para;</a></h2>
+<p>The bundle format and boot path are identical on every target; only
+where the overlay sits in the host binary format differs.</p>
+<ul>
+<li>
+<p><strong>Linux (ELF)</strong> — the payload is a plain overlay appended after the
+  linked image, with the trailer at <code>EOF - 72</code>. No signature exists
+  to disturb; the AppImage ecosystem is precedent for large appended
+  overlays.</p>
+</li>
+<li>
+<p><strong>macOS (Mach-O)</strong> — a Mach-O cannot simply carry trailing data:
+  the arm64 kernel refuses a binary whose bytes extend past its code
+  signature, and such a binary cannot be re-signed. So <code>klio bundle</code>
+  strips the stub's own signature, places the overlay where it was,
+  extends the <code>__LINKEDIT</code> segment to cover it, and writes a fresh
+  ad-hoc SHA-256 code signature over the whole image. The trailer
+  lands immediately before the new signature, at
+  <code>LC_CODE_SIGNATURE.dataoff - 72</code>, which is where boot reads it. This
+  is done natively (no host <code>codesign</code>), so a Linux host can
+  cross-assemble a signed macOS bundle. Results:</p>
+</li>
+<li>The bundle runs on Apple Silicon and Intel Macs with no extra
+    steps, and <code>codesign --verify</code> reports it valid.</li>
+<li>A developer re-signing with a real identity
+    (<code>codesign -f -s "Developer ID" app</code>) replaces only the signature
+    blob; the payload and trailer stay put and the bundle still boots.</li>
+<li>Because the payload is inside the signature's coverage, the OS
+    enforces integrity: a tampered signed bundle is rejected by the
+    kernel (the process is killed on the modified page) rather than
+    reaching the blake3 check. The blake3 payload hash is the tamper
+    defense on ELF/PE, where the OS enforces nothing.</li>
+<li>
+<p>Gatekeeper only inspects quarantined downloads. A locally
+    produced bundle runs directly; a distributed one should be signed
+    with a real identity and notarized (your release process, not
+    klio's).</p>
+</li>
+<li>
+<p><strong>Windows (PE)</strong> — planned. The payload will append after the image
+  with the trailer at <code>EOF - 72</code>, the GUI/console subsystem flip and
+  icon resource patched before the append, and Authenticode's
+  certificate table appended after it, so <code>signtool</code> works on a
+  finished bundle.</p>
+</li>
+</ul>
+<p>Binary packers (UPX) hide overlays — do not pack bundles.</p>
 <h2 id="cross-target-bundles">Cross-target bundles<a class="headerlink" href="#cross-target-bundles" title="Permanent link">&para;</a></h2>
-<p><code>--target</code> selects <code>linux-x64</code> or <code>linux-arm64</code>. Same-target bundling
-is always offline (the stub is the running executable). Cross-target
-bundling resolves the target's stub (and shim, for UI) in this order:</p>
+<p><code>--target</code> selects the output platform (default: the host). Same-target
+bundling is always offline — the stub is the running executable.
+Cross-target bundling resolves the target's stub (and, for UI, its
+shim) in this order:</p>
 <ol>
 <li><code>--stub &lt;path&gt;</code> explicit.</li>
 <li><code>KLIO_STUB_DIR</code>: <code>&lt;dir&gt;/&lt;target&gt;/klio</code> (CI / air-gapped).</li>
@@ -2019,13 +2133,22 @@ bundling resolves the target's stub (and shim, for UI) in this order:</p>
    version, verified against the sha256 manifest baked into release
    binaries, then cached. Offline after the first fetch. Dev builds
    carry no manifest and refuse to fetch:
-   <code>error: no cached stub for linux-arm64 (klio 0.1.0); connect once to fetch it, or pass --stub &lt;path&gt;</code></li>
+   <code>error: no cached stub for macos-arm64 (klio 0.1.0); connect once to fetch it, or pass --stub &lt;path&gt;</code></li>
 </ol>
+<p>Cross-assembly is pure byte surgery, so any host can target any OS —
+including the macOS ad-hoc signature, which is written natively rather
+than by shelling to <code>codesign</code>. The one thing that does not
+cross-compile is the Skia shim (a per-OS C++/ABI build), so a UI
+bundle for another OS needs that OS's shim artifact resolved alongside
+its stub.</p>
 <p>The stub must be the same klio version as the bundler — enforced, not
 advised.</p>
 <h2 id="bundle-format">Bundle format<a class="headerlink" href="#bundle-format" title="Permanent link">&para;</a></h2>
-<p>A bundle is the unmodified stub executable, padding to a 16384-byte
-boundary, a payload area, and a 72-byte trailer at EOF:</p>
+<p>A bundle is the unmodified stub, padding to a 16384-byte boundary, a
+payload area, and a 72-byte trailer. The trailer's position is per-OS
+(<code>EOF - 72</code> on ELF/PE; <code>LC_CODE_SIGNATURE.dataoff - 72</code> on the
+re-signed Mach-O), and boot reads it from the right place for the host
+binary format.</p>
 <ul>
 <li><strong>Sections</strong>: <code>manifest</code> (encoded <code>BundleManifest</code>),
   <code>program-image</code> (deps + program lowered as one module and baked,
@@ -2047,16 +2170,25 @@ boundary, a payload area, and a 72-byte trailer at EOF:</p>
   version with an actionable error. A bundle is only ever assembled
   by the same-version binary that boots it.</li>
 <li><strong>Determinism</strong>: two <code>klio bundle</code> runs over identical inputs (same
-  sources, packs, features, flags) produce byte-identical output. The
-  bundler adds no timestamps.</li>
+  sources, packs, features, output name) produce byte-identical
+  output. The bundler adds no timestamps, and the macOS signature is a
+  deterministic function of the signed bytes.</li>
 </ul>
-<p>Binary packers (UPX) hide overlays — do not pack bundles.</p>
 <h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&para;</a></h2>
 <p>Bundle-time errors:</p>
 <ul>
 <li><code>error: this is a UI bundle but no Skia backend library was found for &lt;target&gt;; build it (zig build skia-lib) or set KLIO_SKIA_LIB</code>
   — a UI bundle needs the rendering backend to embed; build it or
   point <code>KLIO_SKIA_LIB</code> at one.</li>
+<li><code>error: this Compose UI program opens a window (runApp), but the Skia backend for &lt;target&gt; has no windowing support ...</code>
+  — the shim was built without a windowing layer (the stub backend), so
+  a windowed app would open no window and exit silently. Rebuild the
+  backend with <code>zig build skia-lib -Dskia -Dcocoa -Dgpu</code> (macOS) or
+  <code>-Dskia</code> + <code>libsdl2-dev</code> (Linux), or use a UI-enabled klio build.</li>
+<li><code>error: the macos-arm64 stub is not a code-signed Mach-O and cannot be bundled</code>
+  — an arm64 macOS stub must carry the linker's ad-hoc signature (its
+  <code>__TEXT</code>/<code>__LINKEDIT</code> layout is read to re-sign); the provided stub
+  is not a normal <code>klio</code> binary.</li>
 <li><code>error: the program redeclares a name from its dependency base and cannot bundle; rename the declaration</code>
   — a top-level declaration in the program collides with one in the
   stdlib/pack base; bundling requires the extendable base.</li>
@@ -2073,7 +2205,8 @@ boundary, a payload area, and a 72-byte trailer at EOF:</p>
   (also raised on an image-format mismatch). Rebundle.</li>
 <li><code>error: bundle payload hash mismatch (file truncated or modified); rebundle</code>
   — the blake3 payload check failed: the file was truncated,
-  patched, or corrupted in transit.</li>
+  patched, or corrupted in transit. On macOS a tampered signed bundle
+  is instead killed by the OS before this check runs.</li>
 <li><code>error: bundle host binding `&lt;symbol&gt;` does not resolve in this runtime; rebundle with a matching klio</code>
   — a pack's native binding recorded in the manifest is unknown to
   the stub; a version-skewed stub.</li>
