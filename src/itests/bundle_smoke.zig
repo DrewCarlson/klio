@@ -13,6 +13,7 @@
 //! bundles run under a second, empty HOME.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("runtime");
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -331,18 +332,33 @@ test "stdin passes through to readLine" {
 test "corrupted payload refuses with the hash-mismatch message" {
     const c = try ctx();
     const bundle_path = try bundleProgram(c, "examples/hello.kt", "hello_corrupt", &.{});
-    // Flip one byte inside the payload area (just before the trailer).
+    // Flip one byte inside the payload area. The trailer sits at EOF-72 on
+    // ELF but at LC_CODE_SIGNATURE.dataoff-72 on a re-signed Mach-O (the
+    // signature follows it), so locate the trailer by its magic and corrupt
+    // a byte in the first section — the blake3 payload hash covers it on
+    // every target.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(c.io, bundle_path, c.a, .unlimited);
-    bytes[bytes.len - 72 - 100] ^= 0x40;
+    const tpos = std.mem.lastIndexOf(u8, bytes, "KBND\x00KL1") orelse return error.NoTrailer;
+    const payload_off = std.mem.readInt(u64, bytes[tpos + 8 ..][0..8], .little);
+    bytes[@intCast(payload_off + 16)] ^= 0x40;
     try std.Io.Dir.cwd().writeFile(c.io, .{ .sub_path = bundle_path, .data = bytes });
 
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
     const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
-    try std.testing.expectEqual(@as(u32, 1), got.code);
-    try std.testing.expectEqualStrings(
-        "error: bundle payload hash mismatch (file truncated or modified); rebundle\n",
-        got.stderr,
-    );
+    if (builtin.target.os.tag == .macos) {
+        // The payload is inside the ad-hoc code signature's coverage, so the
+        // kernel rejects the tampered page when boot maps it — the process is
+        // killed before the blake3 check can report. OS-enforced integrity
+        // supersedes the payload hash here; it must not run the program.
+        try std.testing.expect(got.code != 0);
+        try std.testing.expect(!std.mem.eql(u8, got.stdout, "2\n"));
+    } else {
+        try std.testing.expectEqual(@as(u32, 1), got.code);
+        try std.testing.expectEqualStrings(
+            "error: bundle payload hash mismatch (file truncated or modified); rebundle\n",
+            got.stderr,
+        );
+    }
 }
 
 test "KLIO_BUNDLE_INSPECT prints the manifest and exits 0" {

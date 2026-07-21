@@ -35,6 +35,7 @@ const pack_cache = @import("pack_cache.zig");
 const stdlib_image = @import("stdlib_image.zig");
 const bundle = @import("bundle.zig");
 const shim_extract = @import("shim_extract.zig");
+const macho_sign = @import("macho_sign.zig");
 
 /// Memoized probe result for the process.
 const ProbeState = union(enum) {
@@ -65,11 +66,12 @@ fn probeSelf() ?bf.Trailer {
 }
 
 /// Read the trailer candidate from the platform-specific tail position.
-/// Linux (ELF): plain overlay append, `EOF - 72`. Windows (PE): `EOF - 72`
-/// with a certificate-table-aware retry once Authenticode support lands
-/// (extension point). macOS (Mach-O): `LC_CODE_SIGNATURE.dataoff - 72`
-/// once the ad-hoc signer lands (extension point); until then the plain
-/// EOF probe serves unsigned x86_64 binaries.
+/// Linux (ELF): plain overlay append, `EOF - 72`. macOS (Mach-O): the
+/// bundler strips the stub's signature and re-signs over the overlay, so
+/// the trailer sits at `LC_CODE_SIGNATURE.dataoff - 72`; an unsigned x86_64
+/// stub falls back to the plain EOF probe. Windows (PE): `EOF - 72` with a
+/// certificate-table-aware retry once Authenticode support lands
+/// (extension point).
 fn probeSelfInner() ?bf.Trailer {
     const path = selfExePathZ() orelse return null;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
@@ -78,13 +80,47 @@ fn probeSelfInner() ?bf.Trailer {
     const end = std.c.lseek(fd, 0, std.c.SEEK.END);
     if (end <= bf.TRAILER_LEN) return null;
     const file_len: u64 = @intCast(end);
+
+    // macOS: the trailer precedes the code-signature blob. Read the Mach-O
+    // header to find LC_CODE_SIGNATURE.dataoff and probe at dataoff - 72.
+    if (builtin.os.tag == .macos) {
+        if (machoTrailerPos(fd)) |pos| {
+            if (readTrailerAt(fd, pos, file_len)) |t| {
+                probe_file_len = file_len;
+                return t;
+            }
+        }
+    }
+
+    // Plain EOF - 72 (ELF; unsigned Mach-O; PE without a cert table).
+    const t = readTrailerAt(fd, file_len - bf.TRAILER_LEN, file_len) orelse return null;
+    probe_file_len = file_len;
+    return t;
+}
+
+/// Read and validate a trailer candidate at `pos`.
+fn readTrailerAt(fd: c_int, pos: u64, file_len: u64) ?bf.Trailer {
+    if (pos + bf.TRAILER_LEN > file_len) return null;
     var tail: [bf.TRAILER_LEN]u8 = undefined;
-    const n = std.c.pread(fd, &tail, tail.len, @intCast(file_len - bf.TRAILER_LEN));
+    const n = std.c.pread(fd, &tail, tail.len, @intCast(pos));
     if (n != tail.len) return null;
     const t = bf.Trailer.decode(&tail) orelse return null;
     if (!t.consistent(file_len)) return null;
-    probe_file_len = file_len;
     return t;
+}
+
+/// The Mach-O trailer position (`LC_CODE_SIGNATURE.dataoff - 72`), or null
+/// when the running binary is not a signed thin Mach-O.
+var macho_head_buf: [256 * 1024]u8 = undefined;
+fn machoTrailerPos(fd: c_int) ?u64 {
+    var hdr: [32]u8 = undefined;
+    if (std.c.pread(fd, &hdr, hdr.len, 0) != hdr.len) return null;
+    if (std.mem.readInt(u32, hdr[0..4], .little) != 0xfeedfacf) return null;
+    const sizeofcmds = std.mem.readInt(u32, hdr[20..24], .little);
+    const need: usize = 32 + @as(usize, sizeofcmds);
+    if (need > macho_head_buf.len) return null;
+    if (std.c.pread(fd, &macho_head_buf, need, 0) != @as(isize, @intCast(need))) return null;
+    return macho_sign.trailerOffset(macho_head_buf[0..need]);
 }
 
 var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;

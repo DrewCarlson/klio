@@ -32,6 +32,7 @@ const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 const stdlib_image = @import("stdlib_image.zig");
 const project = @import("project.zig");
+const macho_sign = @import("macho_sign.zig");
 
 /// Parsed `klio bundle` command line.
 pub const Options = struct {
@@ -46,6 +47,7 @@ pub const Options = struct {
     stub: ?[]const u8 = null,
     dry_run: bool = false,
     desktop_dir: ?[]const u8 = null,
+    app_dir: ?[]const u8 = null,
     feature_specs: std.ArrayList([]const u8) = .empty,
 };
 
@@ -68,6 +70,7 @@ const USAGE =
     \\  --feature <pack>/<feat>    Enable a pack feature (repeatable)
     \\  --stub <path>              Explicit stub binary (skips self-copy/fetch)
     \\  --desktop-dir <dir>        Also emit <name>.desktop + icon PNG (linux)
+    \\  --app-dir <dir>            Also emit <name>.app around the bundle (macos)
     \\  --dry-run                  Print the resolved pack set, flavor, sections,
     \\                             and projected size without writing
     \\
@@ -98,6 +101,8 @@ pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {
             opts.stub = v orelse return usageErr(gpa, "--stub requires a path");
         } else if (flagValue(args, &i, null, "--desktop-dir")) |v| {
             opts.desktop_dir = v orelse return usageErr(gpa, "--desktop-dir requires a directory");
+        } else if (flagValue(args, &i, null, "--app-dir")) |v| {
+            opts.app_dir = v orelse return usageErr(gpa, "--app-dir requires a directory");
         } else if (flagValue(args, &i, null, "--feature")) |v| {
             const val = v orelse return usageErr(gpa, "--feature requires a `<pack>/<feature>` value");
             opts.feature_specs.append(gpa, val) catch return 2;
@@ -315,6 +320,23 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
             io.printStderr(gpa, "error: this is a UI bundle but no Skia backend library was found for {s}; build it (zig build skia-lib) or set KLIO_SKIA_LIB\n", .{target});
             return 1;
         };
+        // A windowed Compose UI program (one that calls runApp) needs a real
+        // window backend; a shim built without one (the stub) still renders
+        // offscreen but its `winOpen` returns null, so the app would open no
+        // window and exit silently. Fail fast. Offscreen-only bundles
+        // (uiRenderer -> PNG) don't open a window, so they're exempt.
+        if (programOpensWindow(user.texts)) {
+            switch (skiaWindowSupport(shim_bytes.?)) {
+                .ok => {},
+                .stub => {
+                    io.printStderr(gpa, "error: this Compose UI program opens a window (runApp), but the Skia backend for {s} has no windowing support (it renders offscreen only, so the app would open no window and exit silently).\n  {s}\n", .{ target, rebuildHint(target) });
+                    return 1;
+                },
+                .unknown => {
+                    io.printStderr(gpa, "warning: cannot confirm the Skia backend for {s} supports a window (no capability marker); if the bundle opens no window, {s}\n", .{ target, rebuildHint(target) });
+                },
+            }
+        }
     }
 
     var icon_bytes: ?[]const u8 = null;
@@ -378,24 +400,56 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         io.printStderr(gpa, "error: cannot read stub `{s}`\n", .{stub_path});
         return 1;
     };
-    const tail = (w.finish(stub_bytes.len, &perr) catch return 1) orelse {
+
+    // macOS targets: the payload cannot simply trail the linker's code
+    // signature (the arm64 kernel refuses trailing data past it and the
+    // binary cannot be re-signed). Strip the stub's own signature, put the
+    // overlay in its place, and re-sign ad hoc; the trailer then sits at
+    // LC_CODE_SIGNATURE.dataoff - 72. Cross-assembling a macOS bundle from
+    // another host works — it is pure byte surgery. An unsigned x86_64 stub
+    // keeps the plain overlay append (macho stays null).
+    var macho: ?macho_sign.MachoInfo = null;
+    var base_len: u64 = stub_bytes.len;
+    if (std.mem.startsWith(u8, target, "macos")) {
+        if (macho_sign.parse(stub_bytes)) |info| {
+            macho = info;
+            base_len = info.codesig_dataoff;
+        } else if (std.mem.endsWith(u8, target, "arm64")) {
+            io.writeStderr("error: the macos-arm64 stub is not a code-signed Mach-O and cannot be bundled\n");
+            return 1;
+        }
+    }
+
+    const tail = (w.finish(base_len, &perr) catch return 1) orelse {
         io.printStderr(gpa, "error: bundle assembly failed: {f}\n", .{perr});
         return 1;
     };
     defer gpa.free(tail);
 
     if (opts.dry_run) {
-        printDryRun(gpa, &manifest, &w, stub_bytes.len, tail.len, out_path);
+        printDryRun(gpa, &manifest, &w, @intCast(base_len), tail.len, out_path);
         return 0;
     }
 
+    var total: usize = 0;
     {
+        const core_len: usize = @intCast(base_len);
         var whole: std.ArrayList(u8) = .empty;
         defer whole.deinit(gpa);
-        whole.ensureTotalCapacityPrecise(gpa, stub_bytes.len + tail.len) catch return 1;
-        whole.appendSliceAssumeCapacity(stub_bytes);
+        whole.ensureTotalCapacityPrecise(gpa, core_len + tail.len) catch return 1;
+        whole.appendSliceAssumeCapacity(stub_bytes[0..core_len]);
         whole.appendSliceAssumeCapacity(tail);
-        cwd.writeFile(fio, .{ .sub_path = out_path, .data = whole.items }) catch {
+
+        var signed: ?[]u8 = null;
+        defer if (signed) |s| gpa.free(s);
+        const final_bytes: []const u8 = if (macho) |info| blk: {
+            const s = macho_sign.sign(gpa, whole.items, info, std.fs.path.basename(out_path)) catch return 1;
+            signed = s;
+            break :blk s;
+        } else whole.items;
+        total = final_bytes.len;
+
+        cwd.writeFile(fio, .{ .sub_path = out_path, .data = final_bytes }) catch {
             io.printStderr(gpa, "error: cannot write `{s}`\n", .{out_path});
             return 1;
         };
@@ -406,7 +460,13 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         emitDesktopFiles(gpa, fio, dir, app_name, out_path, icon_bytes);
     }
 
-    const total = stub_bytes.len + tail.len;
+    if (opts.app_dir) |dir| {
+        if (std.mem.startsWith(u8, target, "macos")) {
+            emitAppBundle(gpa, fio, dir, app_name, out_path, icon_bytes);
+        } else {
+            io.writeStderr("note: --app-dir applies to macOS targets; ignored\n");
+        }
+    }
     var packs_summary: std.ArrayList(u8) = .empty;
     defer packs_summary.deinit(gpa);
     packs_summary.appendSlice(gpa, "stdlib") catch {};
@@ -571,6 +631,48 @@ pub fn shimFileName(target: []const u8) []const u8 {
     if (std.mem.startsWith(u8, target, "macos")) return "libklio_skia.dylib";
     if (std.mem.startsWith(u8, target, "windows")) return "klio_skia.dll";
     return "libklio_skia.so";
+}
+
+/// Whether the program opens a window: it references `runApp`, the single
+/// windowing entrypoint in `klio.compose.ui` (offscreen `uiRenderer` bundles
+/// don't). A source scan is enough — runApp is the only window entry.
+fn programOpensWindow(texts: [][]const u8) bool {
+    for (texts) |t| {
+        if (std.mem.indexOf(u8, t, "runApp") != null) return true;
+    }
+    return false;
+}
+
+const ShimWindowSupport = enum { ok, stub, unknown };
+
+/// Read the shim's baked windowing-backend marker (`skia_shim.cpp`
+/// `klio_win_backend_tag`) by a byte scan — works for the host shim and a
+/// cross-target one alike. `stub` means the backend cannot open a window;
+/// `unknown` means the marker is absent (a shim predating the marker).
+fn skiaWindowSupport(shim: []const u8) ShimWindowSupport {
+    const marker = "klio-win-backend:";
+    const idx = std.mem.indexOf(u8, shim, marker) orelse return .unknown;
+    const start = idx + marker.len;
+    var end = start;
+    while (end < shim.len and isTagChar(shim[end])) : (end += 1) {}
+    const kind = shim[start..end];
+    if (std.mem.eql(u8, kind, "stub")) return .stub;
+    return .ok;
+}
+
+fn isTagChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+}
+
+/// The actionable "rebuild the backend" hint for the target's OS.
+fn rebuildHint(target: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, target, "macos")) {
+        return "rebuild the backend with `zig build skia-lib -Dskia -Dcocoa -Dgpu`, or use a UI-enabled klio build.";
+    }
+    if (std.mem.startsWith(u8, target, "windows")) {
+        return "rebuild the backend with a Win32 windowing build of the Skia shim, or use a UI-enabled klio build.";
+    }
+    return "rebuild the backend with `zig build skia-lib -Dskia` after installing libsdl2-dev (or `scripts/fetch-sdl.sh` + `-Dsdl-static`), or use a UI-enabled klio build.";
 }
 
 /// Whether the whole-program image bake is attempted (default yes;
@@ -800,6 +902,105 @@ fn emitDesktopFiles(
     }
 }
 
+/// Emit `<dir>/<name>.app/Contents/` (`Info.plist`, `MacOS/<name>` copied
+/// from the signed bundle, `Resources/icon.icns` from `--icon`) so a macOS
+/// bundle double-clicks and shows a name/icon in the Dock. The inner binary
+/// is the ad-hoc-signed bundle; a user with a signing identity can re-sign
+/// the .app (`codesign --deep -f -s ...`) — the payload survives it.
+fn emitAppBundle(
+    gpa: Allocator,
+    fio: std.Io,
+    dir: []const u8,
+    name: []const u8,
+    out_path: []const u8,
+    icon: ?[]const u8,
+) void {
+    const cwd = std.Io.Dir.cwd();
+    const contents = std.fmt.allocPrint(gpa, "{s}/{s}.app/Contents", .{ dir, name }) catch return;
+    defer gpa.free(contents);
+    const macos_dir = std.fmt.allocPrint(gpa, "{s}/MacOS", .{contents}) catch return;
+    defer gpa.free(macos_dir);
+    cwd.createDirPath(fio, macos_dir) catch return;
+
+    // The inner binary is the finished bundle itself.
+    const exe_bytes = cwd.readFileAlloc(fio, out_path, gpa, .unlimited) catch return;
+    defer gpa.free(exe_bytes);
+    const inner = std.fmt.allocPrint(gpa, "{s}/{s}", .{ macos_dir, name }) catch return;
+    defer gpa.free(inner);
+    cwd.writeFile(fio, .{ .sub_path = inner, .data = exe_bytes }) catch return;
+    markExecutable(inner);
+
+    var icon_key: []const u8 = "";
+    if (icon) |png| {
+        const res_dir = std.fmt.allocPrint(gpa, "{s}/Resources", .{contents}) catch return;
+        defer gpa.free(res_dir);
+        cwd.createDirPath(fio, res_dir) catch {};
+        if (buildIcns(gpa, png)) |icns| {
+            defer gpa.free(icns);
+            const icns_path = std.fmt.allocPrint(gpa, "{s}/icon.icns", .{res_dir}) catch return;
+            defer gpa.free(icns_path);
+            cwd.writeFile(fio, .{ .sub_path = icns_path, .data = icns }) catch {};
+            icon_key = "\n    <key>CFBundleIconFile</key><string>icon</string>";
+        }
+    }
+
+    const plist = std.fmt.allocPrint(gpa,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleExecutable</key><string>{s}</string>
+        \\    <key>CFBundleIdentifier</key><string>klio.app.{s}</string>
+        \\    <key>CFBundleName</key><string>{s}</string>
+        \\    <key>CFBundlePackageType</key><string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key><string>1.0</string>
+        \\    <key>CFBundleVersion</key><string>1</string>
+        \\    <key>NSHighResolutionCapable</key><true/>{s}
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ name, name, name, icon_key }) catch return;
+    defer gpa.free(plist);
+    const plist_path = std.fmt.allocPrint(gpa, "{s}/Info.plist", .{contents}) catch return;
+    defer gpa.free(plist_path);
+    cwd.writeFile(fio, .{ .sub_path = plist_path, .data = plist }) catch return;
+}
+
+/// Wrap a square PNG in a single-entry `.icns`, choosing the icon type from
+/// the PNG's pixel width (falling back to the 256×256 slot). macOS reads
+/// PNG-encoded icon data directly.
+fn buildIcns(gpa: Allocator, png: []const u8) ?[]u8 {
+    const kind = icnsTypeForWidth(pngWidth(png) orelse 256);
+    const entry_len: u32 = 8 + @as(u32, @intCast(png.len));
+    const total_len: u32 = 8 + entry_len;
+    const out = gpa.alloc(u8, total_len) catch return null;
+    @memcpy(out[0..4], "icns");
+    std.mem.writeInt(u32, out[4..8], total_len, .big);
+    @memcpy(out[8..12], kind);
+    std.mem.writeInt(u32, out[12..16], entry_len, .big);
+    @memcpy(out[16..], png);
+    return out;
+}
+
+fn icnsTypeForWidth(w: u32) *const [4]u8 {
+    return switch (w) {
+        16 => "icp4",
+        32 => "icp5",
+        64 => "icp6",
+        128 => "ic07",
+        512 => "ic09",
+        1024 => "ic10",
+        else => "ic08", // 256 and anything non-standard
+    };
+}
+
+fn pngWidth(png: []const u8) ?u32 {
+    if (png.len < 24) return null;
+    if (!std.mem.eql(u8, png[0..8], "\x89PNG\r\n\x1a\n")) return null;
+    if (!std.mem.eql(u8, png[12..16], "IHDR")) return null;
+    return std.mem.readInt(u32, png[16..20], .big);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -816,6 +1017,21 @@ test "parseInclude splits path:mount" {
 test "defaultMount is main-relative, else basename" {
     try std.testing.expectEqualStrings("assets/a.txt", defaultMount("app/assets/a.txt", "app/main.kt"));
     try std.testing.expectEqualStrings("a.txt", defaultMount("elsewhere/a.txt", "app/main.kt"));
+}
+
+test "skiaWindowSupport reads the backend marker" {
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("....klio-win-backend:cocoa\x00..."));
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("klio-win-backend:sdl"));
+    try std.testing.expectEqual(ShimWindowSupport.ok, skiaWindowSupport("x klio-win-backend:win32 y"));
+    try std.testing.expectEqual(ShimWindowSupport.stub, skiaWindowSupport("junk klio-win-backend:stub junk"));
+    try std.testing.expectEqual(ShimWindowSupport.unknown, skiaWindowSupport("a plain dylib with no marker"));
+}
+
+test "programOpensWindow detects runApp, not offscreen uiRenderer" {
+    var windowed = [_][]const u8{"fun main() { runApp(80, 52, 8, \"t\", -1) { } }"};
+    try std.testing.expect(programOpensWindow(&windowed));
+    var offscreen = [_][]const u8{"fun main() { val ui = uiRenderer(16, 10) { }; ui.savePng(\"x\", 8) }"};
+    try std.testing.expect(!programOpensWindow(&offscreen));
 }
 
 test "defaultOutput strips .kt and appends .exe on windows" {
