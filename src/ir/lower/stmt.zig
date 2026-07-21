@@ -339,6 +339,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         else
             null;
         const inherited_lef = try b.localExtFnNames();
+        const inherited_erp = try b.erasedRecvParamNames();
         const encl_recv = b.capturesThisSlot() or
             (!b.this_is_plain_param and b.resolve("this") != null) or
             b.ownerClass() != null or b.isParamThunk() or b.recvTy() != null;
@@ -390,6 +391,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             encl_recv,
             inherited_rlp,
             inherited_lef,
+            inherited_erp,
             &b.local_fn_overloads,
             enclosing_owner,
         );

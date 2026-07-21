@@ -122,6 +122,7 @@ pub fn lowerLambdaBodyCapturing(
     outer_boxed: *const StringSet,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_erp: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKind(
@@ -135,6 +136,7 @@ pub fn lowerLambdaBodyCapturing(
         null,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         enclosing_owner,
     );
 }
@@ -150,6 +152,7 @@ pub fn lowerLambdaBodyCapturingKind(
     tailrec_self: ?[]const u8,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_erp: StringSet,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
     return lowerLambdaBodyCapturingKindWith(
@@ -165,6 +168,7 @@ pub fn lowerLambdaBodyCapturingKind(
         false,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         null,
         enclosing_owner,
     );
@@ -185,6 +189,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_erp: StringSet,
     inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
 ) Allocator.Error!LoweredLambda {
@@ -201,6 +206,7 @@ pub fn lowerLambdaBodyCapturingKindWith(
         named_local_encl_recv,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         inherited_lfo,
         enclosing_owner,
         false,
@@ -227,6 +233,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     named_local_encl_recv: bool,
     inherited_rlp: StringSet,
     inherited_lef: StringSet,
+    inherited_erp: StringSet,
     inherited_lfo: ?*const LocalFnOverloadTable,
     enclosing_owner: ?EnclosingOwner,
     suppress_it: bool,
@@ -311,6 +318,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     var inherited_ext = inherited_lef;
     defer inherited_ext.deinit();
     try b.inheritLocalExtFns(&inherited_ext);
+    // A captured parameter with an unbounded type-parameter type remains
+    // statically erased inside nested lambdas. Preserve that fact so an
+    // explicit receiver call continues to select its callable fallback
+    // instead of consulting members on the runtime value.
+    var inherited_erased = inherited_erp;
+    defer inherited_erased.deinit();
+    try b.inheritErasedRecvParams(&inherited_erased);
     // And for local-fn overload sets: a call in this body to a captured
     // local fn declared more than once must still select the applicable
     // sibling by its mangled binding.
@@ -373,10 +387,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{this_label.?});
         if (b.resolve(label) == null) {
             const this_reg: ?Reg = if (b.resolve("this")) |r| r else blk: {
-                const idx = try b.recordCapture("this");
-                const dst = b.allocReg();
-                try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-                break :blk dst;
+                break :blk try b.loadCaptureHoisted("this");
             };
             if (this_reg) |tr| try b.bind(label, tr);
         }

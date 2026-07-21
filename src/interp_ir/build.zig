@@ -1336,6 +1336,8 @@ fn buildModuleWithOverrides(
     // transplant onto the matching actual after the collection loop.
     var expect_class_ctor_params = std.StringHashMap([]const ast.ClassParam).init(a);
     defer expect_class_ctor_params.deinit();
+    var expect_class_members = std.StringHashMap([]const Decl).init(a);
+    defer expect_class_members.deinit();
 
     for (file.decls) |*d| {
         switch (d.*) {
@@ -1378,6 +1380,16 @@ fn buildModuleWithOverrides(
                     }
                     if (any_ctor_default) {
                         try expect_class_ctor_params.put(c.name.name, c.primary_params);
+                    }
+                    var any_member_default = false;
+                    for (c.members) |*m| {
+                        if (m.* != .Function) continue;
+                        for (m.Function.params) |*p| {
+                            if (p.default != null) any_member_default = true;
+                        }
+                    }
+                    if (any_member_default) {
+                        try expect_class_members.put(c.name.name, c.members);
                     }
                     continue;
                 }
@@ -1506,6 +1518,39 @@ fn buildModuleWithOverrides(
             if (ac.primary_params.len != eparams.len) continue;
             for (ac.primary_params, eparams) |*ap, *ep| {
                 if (ap.default == null) ap.default = ep.default;
+            }
+        }
+    }
+
+    // Member defaults follow the same expect/actual rule as top-level
+    // functions and constructors. The expect class is absent from
+    // `all_decls`, so copy its defaults onto the signature-matching actual
+    // member before class lowering builds default thunks and arity metadata.
+    if (expect_class_members.count() != 0) {
+        for (all_decls.items) |*d| {
+            if (d.* != .Class) continue;
+            const ac = &d.Class;
+            if (!ac.is_actual) continue;
+            const emembers = expect_class_members.get(ac.name.name) orelse continue;
+            for (ac.members) |*am| {
+                if (am.* != .Function) continue;
+                for (emembers) |*em| {
+                    if (em.* != .Function) continue;
+                    const matched = transplantExpectMemberDefaults(&am.Function, &em.Function);
+                    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                        if (std.mem.eql(u8, want, am.Function.name.name)) {
+                            std.debug.print("[expect-default] class={s} actual={s}/{d} expect={s}/{d} matched={}\n", .{
+                                ac.name.name,
+                                am.Function.name.name,
+                                am.Function.params.len,
+                                em.Function.name.name,
+                                em.Function.params.len,
+                                matched,
+                            });
+                        }
+                    }
+                    if (matched) break;
+                }
             }
         }
     }
@@ -4116,6 +4161,36 @@ fn retainDecl(
     }
 }
 
+fn sameExpectActualTypeHead(a: *const ast.TypeRef, b: *const ast.TypeRef) bool {
+    if (!std.mem.eql(u8, a.name.name, b.name.name) or a.nullable != b.nullable) return false;
+    if ((a.function == null) != (b.function == null)) return false;
+    if (a.function) |af| {
+        const bf = b.function.?;
+        if (af.params.len != bf.params.len or af.is_suspend != bf.is_suspend) return false;
+        if ((af.receiver == null) != (bf.receiver == null)) return false;
+    }
+    return true;
+}
+
+/// Copy defaults from an expect-class member to its matching actual member.
+/// Returns true when the declarations have the same callable signature.
+fn transplantExpectMemberDefaults(actual: *ast.Function, expected: *const ast.Function) bool {
+    if (!std.mem.eql(u8, actual.name.name, expected.name.name)) return false;
+    if (actual.params.len != expected.params.len) return false;
+    if ((actual.receiver_type == null) != (expected.receiver_type == null)) return false;
+    if (actual.receiver_type) |*ar| {
+        if (!sameExpectActualTypeHead(ar, &expected.receiver_type.?)) return false;
+    }
+    for (actual.params, expected.params) |*ap, *ep| {
+        if (!std.mem.eql(u8, ap.name.name, ep.name.name)) return false;
+        if (!sameExpectActualTypeHead(&ap.ty, &ep.ty)) return false;
+    }
+    for (actual.params, expected.params) |*ap, *ep| {
+        if (ap.default == null) ap.default = ep.default;
+    }
+    return true;
+}
+
 
 
 // -------------------------------------------------------------------------
@@ -4813,4 +4888,44 @@ test "build_module produces an owned empty module shell" {
     defer built.deinit();
     try testing.expect(built.main == null);
     try testing.expectEqual(@as(usize, 0), built.top_level_props.items.len);
+}
+
+test "expect class member defaults transplant to the matching actual signature" {
+    const s = span.Span.init(span.FileId.from(0), 0, 1);
+    const int_ty: ast.TypeRef = .{
+        .name = .{ .name = "Int", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var default_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = s } };
+    var expected_param: ast.Param = undefined;
+    expected_param.name = .{ .name = "value", .span = s };
+    expected_param.ty = int_ty;
+    expected_param.default = &default_expr;
+    var actual_param: ast.Param = expected_param;
+    actual_param.default = null;
+
+    var expected: ast.Function = undefined;
+    expected.name = .{ .name = "run", .span = s };
+    expected.receiver_type = null;
+    var expected_params = [_]ast.Param{expected_param};
+    expected.params = &expected_params;
+    var actual: ast.Function = undefined;
+    actual.name = expected.name;
+    actual.receiver_type = null;
+    var actual_params = [_]ast.Param{actual_param};
+    actual.params = &actual_params;
+
+    try testing.expect(transplantExpectMemberDefaults(&actual, &expected));
+    try testing.expect(actual.params[0].default == &default_expr);
+
+    actual.params[0].default = null;
+    actual.params[0].ty.name.name = "String";
+    try testing.expect(!transplantExpectMemberDefaults(&actual, &expected));
+    try testing.expect(actual.params[0].default == null);
 }

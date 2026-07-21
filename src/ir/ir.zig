@@ -2358,10 +2358,8 @@ pub const Module = struct {
         /// The winning tier has candidates, but none matches the call's
         /// arity exactly.
         arity_mismatch,
-        /// Every near match declares a default parameter — a
-        /// `required..total` acceptance range the index does not rank.
-        /// Stubs and bodies defer this shape alike, so the verdict never
-        /// depends on whether a candidate's body has been lowered yet.
+        /// Candidates have defaults, but the positional call cannot bind
+        /// them, or a legacy header lacks per-parameter default flags.
         default_param_shape,
         /// Only header stubs / bodyless decls with no declared-arity
         /// record were available.
@@ -2381,7 +2379,7 @@ pub const Module = struct {
 
     /// Result of `resolveBareCallIndexed`: either a unique `FuncId` or a
     /// reason-tagged deferral to the heuristic, plus the winning tier and
-    /// its exact-match count for the resolve audit's readout.
+    /// its best-match count for the resolve audit's readout.
     pub const BareCallResolution = struct {
         pub const Outcome = union(enum) {
             resolved: FuncId,
@@ -2391,9 +2389,9 @@ pub const Module = struct {
         /// Winning preference tier (0..5), or 255 when no candidate
         /// established one.
         tier: u8 = 255,
-        /// Exact-arity matches counted within the winning tier.
+        /// Best-ranked positional matches counted within the winning tier.
         tier_count: usize = 0,
-        /// First two exact matches in the winning tier; both set when
+        /// First two best-ranked matches in the winning tier; both set when
         /// the outcome is `ambiguous_tier`.
         first: ?FuncId = null,
         second: ?FuncId = null,
@@ -2503,11 +2501,25 @@ pub const Module = struct {
         return false;
     }
 
-    /// Whether any user parameter (leading synthesized `this` excluded)
-    /// declares a default value.
-    fn anyUserParamDefault(f: *const Func) bool {
+    /// Number of positional arguments omitted from the end of `f` while still
+    /// producing a valid call. Kotlin permits the omission only when every
+    /// omitted parameter has a default; a required parameter after an earlier
+    /// default therefore remains required for a positional call.
+    fn positionalDefaultsUsed(f: *const Func, want: usize) ?usize {
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
-        for (f.params[off..]) |p| {
+        const params = f.params[off..];
+        if (want > params.len) return null;
+        for (params[want..]) |p| {
+            if (!p.has_default) return null;
+        }
+        return params.len - want;
+    }
+
+    fn omittedPositionHasDefault(f: *const Func, want: usize) bool {
+        const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        const params = f.params[off..];
+        if (want >= params.len) return false;
+        for (params[want..]) |p| {
             if (p.has_default) return true;
         }
         return false;
@@ -2543,9 +2555,10 @@ pub const Module = struct {
     /// Preference order — file-named imports, then the caller's own
     /// package, then wildcard imports, then the default-import packages,
     /// then built-in stdlib (Kotlin's scoping order) — picks the highest
-    /// non-empty tier; within that tier the candidate is returned only
-    /// when exactly one non-extension func matches the requested arity
-    /// exactly with no default parameters. Extension funcs (a leading
+    /// non-empty tier; within that tier the candidate is returned only when
+    /// exactly one non-extension func matches the positional call. Exact
+    /// arity outranks a call that consumes defaults, then fewer consumed
+    /// defaults wins. Extension funcs (a leading
     /// synthesized `this`) are never index-resolved: a bare call to one
     /// needs a receiver the index does not model, so it is left to the
     /// order-based heuristic. A name the index cannot resolve to a
@@ -2606,13 +2619,16 @@ pub const Module = struct {
             return BareCallResolution.deferred(.extension_form);
         }
 
-        // Within the best tier, look for a unique exact-arity,
-        // non-low-priority, non-extension candidate. Track the closest
-        // miss so a zero-match tier defers with the blocking shape.
+        // Within the best tier, look for a unique positional,
+        // non-low-priority, non-extension candidate. Exact arity outranks a
+        // candidate that consumes defaults; among defaulted candidates, the
+        // one consuming fewer defaults outranks one consuming more. Track the
+        // closest miss so a zero-match tier defers with the blocking shape.
         var chosen: ?FuncId = null;
         var second: ?FuncId = null;
         var count: usize = 0;
-        // Whether every exact match is body-bearing with the same user
+        var best_defaults_used: usize = std.math.maxInt(usize);
+        // Whether every best-ranked match has the same user
         // parameter type signature as the first one. Distinguishes a
         // true ambiguity from a type-dispatched overload set.
         var sigs_identical = true;
@@ -2627,12 +2643,10 @@ pub const Module = struct {
             if (funcHasImplicitThis(f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             const is_stub = !f.hasBody();
-            // The stub and body gates must accept the SAME candidate
-            // shapes (exact arity, no defaults, no vararg at any
-            // position) so the resolution — and the ambiguity verdict —
-            // never depends on whether a candidate's body lowered
-            // before the call site.
-            if (is_stub) {
+            // The stub and body gates accept the same positional/default
+            // shapes so resolution never depends on whether the body has
+            // already replaced its phase-1 header.
+            const defaults_used: usize = if (is_stub) blk: {
                 const da = self.stubDeclArity(id) orelse {
                     saw_bodyless = true;
                     continue;
@@ -2645,15 +2659,24 @@ pub const Module = struct {
                     saw_vararg = true;
                     continue;
                 }
-                if (da.total != want_arity) {
+                if (want_arity > da.total) {
                     saw_arity = true;
                     continue;
                 }
-                if (da.required != da.total) {
-                    saw_default = true;
+                // Legacy/test stubs may carry only the aggregate declared
+                // arity. Full arity needs no per-parameter default evidence.
+                if (want_arity == da.total) break :blk 0;
+                const used = positionalDefaultsUsed(f, want_arity) orelse {
+                    if (want_arity < da.total and da.required != da.total) {
+                        saw_default = true;
+                    } else {
+                        saw_arity = true;
+                    }
                     continue;
-                }
-            } else {
+                };
+                if (used != 0) saw_default = true;
+                break :blk used;
+            } else blk: {
                 if (f.low_priority) {
                     saw_low = true;
                     continue;
@@ -2662,18 +2685,26 @@ pub const Module = struct {
                     saw_vararg = true;
                     continue;
                 }
-                if (funcUserArity(f) != want_arity) {
+                const used = positionalDefaultsUsed(f, want_arity) orelse {
                     if (last_arg_lambda and tlShapeMatches(f, want_arity)) {
                         saw_tl = true;
+                    } else if (omittedPositionHasDefault(f, want_arity)) {
+                        saw_default = true;
                     } else {
                         saw_arity = true;
                     }
                     continue;
-                }
-                if (anyUserParamDefault(f)) {
-                    saw_default = true;
-                    continue;
-                }
+                };
+                if (used != 0) saw_default = true;
+                break :blk used;
+            };
+            if (defaults_used > best_defaults_used) continue;
+            if (defaults_used < best_defaults_used) {
+                chosen = null;
+                second = null;
+                count = 0;
+                sigs_identical = true;
+                best_defaults_used = defaults_used;
             }
             if (chosen) |first_id| {
                 if (second == null) second = id;
@@ -3041,7 +3072,7 @@ pub const Module = struct {
             else if (sc.binding.trailing_lambda_param != null)
                 (if (is_ext) 2 else 3)
             else
-                continue; // under-applied default shape — the heuristic defers it
+                (if (is_ext) 5 else 4);
             // Declared-type evidence breaks same-rung ties: an argument whose
             // declared head matches the candidate's parameter head promotes
             // that candidate (`minOf(a, b)` with `a: T` picks the generic
@@ -3329,9 +3360,9 @@ pub const Module = struct {
     ) std.mem.Allocator.Error!?[]const FuncId {
         if (self.funcsBySimpleName(name).len == 0) return null;
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-        const tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
-        if (tier == 255) return null;
-        if (tier >= other_package_tier) {
+        const first_tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
+        if (first_tier == 255) return null;
+        if (first_tier >= other_package_tier) {
             return try alloc.alloc(FuncId, 0);
         }
         var list: std.ArrayList(FuncId) = .empty;
@@ -3339,10 +3370,9 @@ pub const Module = struct {
         for (self.funcsBySimpleName(name)) |id| {
             const f = self.funcById(id) orelse continue;
             if (self.declarationKind(id, f) != .plain) continue;
-            if (self.bareCallTier(f, name, caller_pkg, caller_file) <= tier) {
-                try list.append(alloc, id);
-                if (self.globalArityCanBind(id, f, user_arg_count)) any_arity_match = true;
-            }
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) >= other_package_tier) continue;
+            try list.append(alloc, id);
+            if (self.globalArityCanBind(id, f, user_arg_count)) any_arity_match = true;
         }
         if (!any_arity_match) {
             list.deinit(alloc);
@@ -5186,6 +5216,25 @@ test "bounded call candidates never widen beyond the caller scope" {
     try testing.expect((try m.boundedCallCandidates(a, "missing", "app", FileId.from(0), 0)) == null);
 }
 
+test "bounded call candidates retain lower visible tiers for applicability" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const local = try pushTestFuncOpts(&m, a, "assertContentEquals", "test.text.assertContentEquals", "test.text", 2, .{ .param_ty = "String" });
+    const imported = try pushTestFuncOpts(&m, a, "assertContentEquals", "kotlin.test.assertContentEquals", "kotlin.test", 2, .{ .param_ty = "Sequence" });
+    _ = try pushTestFuncOpts(&m, a, "assertContentEquals", "other.assertContentEquals", "other", 2, .{});
+    var wildcards: std.ArrayList([]const u8) = .empty;
+    try wildcards.append(a, try a.dupe(u8, "kotlin.test"));
+    try m.registry.import_wildcards.put(FileId.from(0), wildcards);
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedCallCandidates(a, "assertContentEquals", "test.text", FileId.from(0), 2)).?;
+    defer a.free(scoped);
+    try testing.expectEqual(@as(usize, 2), scoped.len);
+    try testing.expectEqual(local.int(), scoped[0].int());
+    try testing.expectEqual(imported.int(), scoped[1].int());
+}
+
 test "bounded call candidates preserve the incomplete-header host boundary" {
     const a = testing.allocator;
     var m = Module.default(a);
@@ -5537,38 +5586,69 @@ test "symbol index ranks a forward-referenced stub by declared arity" {
     try testing.expectEqual(@as(u8, 1), got.tier);
 }
 
-test "symbol index defers a stub whose declared arity has defaults or varargs" {
+test "symbol index resolves a default-compatible stub and defers varargs" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // required < total (a default param): only an exact no-default
-    // declared arity is rankable without the lowered body.
-    const dflt = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 0, .{ .stub = true });
+    const dflt = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 2, .{ .stub = true });
+    m.funcByIdMut(dflt).?.params[1].has_default = true;
     try m.decl_user_arity.put(dflt.int(), .{ .required = 1, .total = 2, .has_vararg = false });
-    const va = try pushTestFuncOpts(&m, a, "v", "app.v", "app", 0, .{ .stub = true });
+    const va = try pushTestFuncOpts(&m, a, "v", "app.v", "app", 1, .{ .stub = true, .last_vararg = true });
     try m.decl_user_arity.put(va.int(), .{ .required = 0, .total = 1, .has_vararg = true });
     try m.rebuildFuncNameIndex(a);
 
-    const got_d = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
-    try testing.expectEqual(Module.ResolveDeferReason.default_param_shape, deferReasonOf(got_d).?);
+    const got_d = m.resolveBareCallIndexed("d", "app", FileId.from(0), 1, false);
+    try testing.expect(got_d.outcome == .resolved);
+    try testing.expectEqual(dflt.int(), got_d.outcome.resolved.int());
     const got_v = m.resolveBareCallIndexed("v", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.vararg_only, deferReasonOf(got_v).?);
 }
 
-test "symbol index defers a default-bearing body exactly like its stub" {
+test "symbol index resolves a default-bearing body" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `fun d(x: Int, y: Int = 0)` as a lowered BODY: a full-arity call
-    // must defer the same way the phase-1 stub gate defers
-    // `required != total`, so the verdict cannot flip with declaration
-    // order once the body lowers.
+    // `fun d(x: Int, y: Int = 0)` binds both its full and under-applied
+    // positional forms to the same static target.
     const body = try pushTestFuncOpts(&m, a, "d", "app.d", "app", 2, .{});
     m.funcByIdMut(body).?.params[1].has_default = true;
     try m.rebuildFuncNameIndex(a);
 
-    const got = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
-    try testing.expectEqual(Module.ResolveDeferReason.default_param_shape, deferReasonOf(got).?);
+    const full = m.resolveBareCallIndexed("d", "app", FileId.from(0), 2, false);
+    try testing.expect(full.outcome == .resolved);
+    try testing.expectEqual(body.int(), full.outcome.resolved.int());
+    const omitted = m.resolveBareCallIndexed("d", "app", FileId.from(0), 1, false);
+    try testing.expect(omitted.outcome == .resolved);
+    try testing.expectEqual(body.int(), omitted.outcome.resolved.int());
+}
+
+test "symbol index prefers exact arity over a default-consuming overload" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const exact = try pushTestFuncOpts(&m, a, "d", "app.d1", "app", 1, .{});
+    const wider = try pushTestFuncOpts(&m, a, "d", "app.d2", "app", 2, .{});
+    m.funcByIdMut(wider).?.params[1].has_default = true;
+    try m.rebuildFuncNameIndex(a);
+
+    const got = m.resolveBareCallIndexed("d", "app", FileId.from(0), 1, false);
+    try testing.expect(got.outcome == .resolved);
+    try testing.expectEqual(exact.int(), got.outcome.resolved.int());
+}
+
+test "resolveCall emits a static Call for an omitted default" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const target = try pushTestFuncOpts(&m, a, "Job", "app.Job", "app", 1, .{});
+    m.funcByIdMut(target).?.params[0].has_default = true;
+    try m.rebuildFuncNameIndex(a);
+
+    const res = try m.resolveCall(a, "Job", "app", FileId.from(0), &.{}, false, .{});
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
+    try testing.expectEqual(Module.Confidence.exact, res.confidence);
+    try testing.expectEqual(target.int(), res.target.?.int());
 }
 
 test "packageHeadDeclared distinguishes a package head from a member head" {

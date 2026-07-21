@@ -99,9 +99,7 @@ const lowerStmt = stmt_mod.lowerStmt;
 fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
     if (b.resolve("this")) |r| return r;
     if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        const dst = try b.loadCaptureHoisted("this");
         if (bind_local) try b.bind("this", dst);
         return dst;
     }
@@ -787,9 +785,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{q.name});
                 if (b.resolve(label)) |r| return r;
                 if (b.knowsOuter(label)) {
-                    const idx = try b.recordCapture(label);
-                    const dst2 = b.allocReg();
-                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
+                    const dst2 = try b.loadCaptureHoisted(label);
                     try b.bind(label, dst2);
                     return dst2;
                 }
@@ -808,10 +804,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // Otherwise a class-name label (`this@Outer`): walk at runtime
                 // from the nearest `this` over the class/outer chain.
                 const this_reg = b.resolve("this") orelse blk: {
-                    const idx = try b.recordCapture("this");
-                    const dst = b.allocReg();
-                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-                    break :blk dst;
+                    break :blk try b.loadCaptureHoisted("this");
                 };
                 const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
                 const dst = b.allocReg();
@@ -821,10 +814,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // `this` bare resolves to the implicit first param, or the
             // captured `this` slot inside a lambda body.
             const this_reg = b.resolve("this") orelse blk: {
-                const idx = try b.recordCapture("this");
-                const dst = b.allocReg();
-                try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-                break :blk dst;
+                break :blk try b.loadCaptureHoisted("this");
             };
             return this_reg;
         },
@@ -1372,18 +1362,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // passes a non-cell value unchanged. Without this a captured
         // counter's `++` handed the raw Cell to UnOp.
         if (isLowerAnonCapture(name0)) {
-            const idx = try b.recordCapture(name0);
-            const cell = b.allocReg();
-            try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
+            const cell = try b.loadCaptureHoisted(name0);
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
             return dst;
         }
         // Lambda-body capture.
         if (b.knowsOuter(name0)) {
-            const idx = try b.recordCapture(name0);
-            const cell = b.allocReg();
-            try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
+            const cell = try b.loadCaptureHoisted(name0);
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
@@ -1915,21 +1901,27 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
     // expression: the bound `this`, or the captured slot in a lambda body.
     if (std.mem.eql(u8, ident.name, "this")) {
         if (b.resolve("this")) |r| return r;
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        return dst;
+        return b.loadCaptureHoisted("this");
     }
     // `"… $x …"` where `x` is a `var x by D` local reads THROUGH the delegate,
     // exactly as a bare `x` does.
     if (try lowerDelegateRead(b, ident.name)) |r| return r;
-    if (b.resolve(ident.name)) |r| return r;
+    if (b.resolve(ident.name)) |r| {
+        if (b.isBoxed(ident.name)) {
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
+            return dst;
+        }
+        return r;
+    }
     if (b.knowsOuter(ident.name)) {
-        const idx = try b.recordCapture(ident.name);
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        try b.bind(ident.name, dst);
-        return dst;
+        const cell = try b.loadCaptureHoisted(ident.name);
+        if (b.isBoxed(ident.name)) {
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+            return dst;
+        }
+        return cell;
     }
     if (b.hasOwnMember(ident.name) and b.resolve("this") != null) {
         const this_reg = b.resolve("this").?;
@@ -2460,6 +2452,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    const inherited_erp = try b.erasedRecvParamNames();
     // The implicit label this lambda carries (`runTest { … }` → "runTest").
     // The body binds `this@<label>` to its receiver.
     b.module.pending_lambda_this_label = b.pending_lambda_label;
@@ -2507,6 +2500,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         false,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         &b.local_fn_overloads,
         enclosing_owner,
         suppress_it,
@@ -2585,6 +2579,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    const inherited_erp = try b.erasedRecvParamNames();
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
@@ -2597,6 +2592,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         null,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         enclosing_owner,
     );
     const captured_names = lowered.captures;
@@ -5182,7 +5178,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
             if (selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
-                if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, m, args, ast_arg_names)) |r| return r;
             }
         }
         // SELF-reference: a bare call to the enclosing local fn's own name
@@ -5194,7 +5190,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // this point in the body — the enclosing fn, never the sibling.
         if (b.selfLocalFn()) |slf| {
             if (std.mem.eql(u8, slf.name, bare) and selfLocalFnApplicable(b, slf.mangled, bare, args, ast_arg_names)) {
-                if (try lowerSelectedLocalOverloadCall(b, slf.mangled, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, slf.mangled, args, ast_arg_names)) |r| return r;
             }
         }
         if (b.localFnDecls(bare)) |decls| {
@@ -5214,7 +5210,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.resolve(bare) == null and
                 (b.resolve(decls[0].mangled) != null or b.knowsOuter(decls[0].mangled)))
             {
-                if (try lowerSelectedLocalOverloadCall(b, decls[0].mangled, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, decls[0].mangled, args, ast_arg_names)) |r| return r;
             }
         }
         // A local function shadows an outer one by NAME, but only among
@@ -6410,6 +6406,7 @@ fn selectLocalFnOverload(
 /// caller falls back to the plain-name binding.
 fn lowerSelectedLocalOverloadCall(
     b: *FuncBuilder,
+    bare: []const u8,
     mangled: []const u8,
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
@@ -6453,6 +6450,29 @@ fn lowerSelectedLocalOverloadCall(
     const run = try lowerArgRunFull(b, args, null, lfp);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
+    var member_declared = b.hasEnclosingMember(bare);
+    if (!member_declared) {
+        if (b.ownerClass()) |oc| {
+            if (b.module.registry.hierarchy_methods.get(oc)) |s| {
+                member_declared = s.contains(bare);
+            }
+        }
+    }
+    if (member_declared) {
+        if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+            const name = try b.module.internConst(b.allocator, .{ .String = bare });
+            try b.push(.{ .CallValueOrMember = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .this_recv = this_reg,
+                .name = name,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
     try b.push(.{ .CallValue = .{
         .dst = dst,
         .callee = callee_reg,
@@ -10392,6 +10412,41 @@ test "lowers string template as concat chain" {
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .BinOp);
     try testing.expectEqual(BinOp.StringConcat, insts[insts.len - 1].BinOp.op);
+}
+
+test "boxed capture interpolation reads the entry-hoisted cell value" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var outer = StringSet.init(testing.allocator);
+    try outer.put("count", {});
+    b.setOuterNames(outer);
+    var boxed = StringSet.init(testing.allocator);
+    try boxed.put("count", {});
+    b.setBoxedVars(boxed);
+
+    var parts = [_]ast.StringPart{.{ .ShortInterp = .{ .name = "count", .span = dummySpan() } }};
+    const e = Expr{ .StringTemplate = .{ .parts = &parts, .span = dummySpan() } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "f", build.typeString());
+    defer freeFunc(func);
+
+    var capture_reg: ?Reg = null;
+    var value_reg: ?Reg = null;
+    for (func.blocks[0].insts) |inst| switch (inst) {
+        .LoadCapture => |lc| capture_reg = lc.dst,
+        .CellGet => |cg| {
+            try testing.expectEqual(capture_reg.?, cg.cell);
+            value_reg = cg.dst;
+        },
+        else => {},
+    };
+    try testing.expect(capture_reg != null);
+    try testing.expect(value_reg != null);
+    const concat = func.blocks[0].insts[func.blocks[0].insts.len - 1].BinOp;
+    try testing.expectEqual(value_reg.?, concat.rhs);
 }
 
 test "lowers elvis as branch with null check" {

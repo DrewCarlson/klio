@@ -1642,6 +1642,13 @@ pub const FuncBuilder = struct {
     pub fn isErasedRecvParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.erased_recv_params.contains(name);
     }
+    pub fn erasedRecvParamNames(self: *const FuncBuilder) Allocator.Error!StringSet {
+        return cloneStringSet(self.allocator, &self.erased_recv_params);
+    }
+    pub fn inheritErasedRecvParams(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
+        var it = names.keyIterator();
+        while (it.next()) |k| try self.erased_recv_params.put(k.*, {});
+    }
     pub fn markNonFnParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.non_fn_params.put(name, {});
     }
