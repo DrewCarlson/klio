@@ -7,7 +7,6 @@
 //! interp_ir run, with stdlib + kotlinx + ktor intrinsics registered.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const span = @import("span");
 const SourceMap = span.SourceMap;
@@ -350,8 +349,10 @@ const TestRunCtx = struct {
 fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
-    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch
-        test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };
+    return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch |err| {
+        io.printStderr(ctx.gpa, "error: test runner: {s}\n", .{@errorName(err)});
+        return test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };
+    };
 }
 
 /// `klio test` — discover and run `kotlin.test` `@Test` functions in the
@@ -362,8 +363,9 @@ fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
 /// or crashes is pinpointed (the parent kills the child and records it) rather
 /// than taking down the whole suite. `base_args` is the original `test`
 /// argument vector minus `--isolate`/`--jobs`; the driver re-invokes
-/// `klio test <base_args> --list` to enumerate, then `... --filter=<name>` per
-/// test with the timeout enforced by the parent (`std.process.run`).
+/// `klio test <base_args> --list` to enumerate, then an exact
+/// `... --filter==<name>` per test with the timeout enforced by the parent
+/// (`std.process.run`).
 pub fn runTestsIsolated(
     gpa: std.mem.Allocator,
     self: []const u8,
@@ -411,7 +413,7 @@ pub fn runTestsIsolated(
     for (names.items) |name| {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        const filt = std.fmt.allocPrint(gpa, "--filter={s}", .{name}) catch return 2;
+        const filt = std.fmt.allocPrint(gpa, "--filter=={s}", .{name}) catch return 2;
         defer gpa.free(filt);
         argv.append(gpa, self) catch return 2;
         argv.append(gpa, "test") catch return 2;
@@ -483,9 +485,11 @@ pub fn runTestFiles(
         return 1;
     }
 
-    // Fast path: assemble against the baked stdlib image. The prepared
-    // map holds the user files as its trailing entries, so `--only-file`
-    // FileIds are recovered from the tail positions. Falls back to the
+    // Fast path: assemble against the baked stdlib image. Read each selected
+    // FileId from the reparsed user AST itself; deriving it from map length and
+    // argv position made a multi-`--only-file` batch silently select the wrong
+    // subset whenever preparation inserted additional source-map entries.
+    // Falls back to the
     // legacy whole-module build when the cache misses or the program
     // cannot extend the base (e.g. files declaring expect/actual).
     {
@@ -495,11 +499,15 @@ pub fn runTestFiles(
         if (stdlib_image.tryPrepare(gpa, files.items, features)) |prep| {
             var image_fids: std.ArrayList(u32) = .empty;
             defer image_fids.deinit(gpa);
-            const base_count = prep.map.files.items.len - files.items.len;
             for (files.items, 0..) |path, i| {
                 for (only_files) |of| {
                     if (std.mem.eql(u8, path, of) or std.mem.endsWith(u8, path, of)) {
-                        image_fids.append(gpa, @intCast(base_count + i)) catch return 1;
+                        if (i >= prep.user_asts.len) return 1;
+                        const fid = prep.user_asts[i].span.file.int();
+                        if (runtime.getenvSlice("KLIO_TEST_FILE_TRACE") != null) {
+                            io.printStderr(gpa, "[test-file] {s} -> {d}\n", .{ path, fid });
+                        }
+                        image_fids.append(gpa, fid) catch return 1;
                         break;
                     }
                 }
@@ -670,6 +678,10 @@ fn runTestsOnBuilt(
         if (r.detail) |d| io.printStdout(gpa, "    {s}\n", .{d});
     }
     if (report.results.len == 0) {
+        if (report.failed != 0) {
+            io.printStdout(gpa, "test runner failed before producing a result\n", .{});
+            return 1;
+        }
         io.printStdout(gpa, "no tests found\n", .{});
         return 0;
     }
@@ -954,14 +966,12 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    // macOS: keep the interpreter on the process main thread (with a large stack
-    // via an in-thread stack switch) so a program that opens a Compose UI window
-    // can drive AppKit and the single-threaded Skia Metal context, both of which
-    // must run on the main thread. Elsewhere, a large-stack worker thread is fine.
-    if (builtin.os.tag == .macos) {
-        return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
-    }
-    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+    // Run the interpreter on the process main thread on every platform, with a
+    // large stack via an in-thread stack switch (no worker-thread hop). A program
+    // that opens a Compose UI must drive the platform windowing + single-threaded
+    // GPU context from the main thread (AppKit/Metal on macOS, UIKit/Metal on
+    // iOS); keeping the default uniform means the UI path is the normal path.
+    return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {

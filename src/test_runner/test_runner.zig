@@ -148,12 +148,18 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
 
 /// `filter == null` runs everything; otherwise a test runs when its display
 /// name (a top-level `method`, or a class's `Class`) contains any of the
-/// comma-separated substrings.
+/// comma-separated substrings. A token beginning with `=` matches the entire
+/// display name, which the isolated runner uses to avoid prefix collisions.
 fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
     var it = std.mem.splitScalar(u8, pat, ',');
     while (it.next()) |p| {
-        if (p.len != 0 and std.mem.indexOf(u8, name, p) != null) return true;
+        if (p.len == 0) continue;
+        if (p[0] == '=') {
+            if (std.mem.eql(u8, name, p[1..])) return true;
+        } else if (std.mem.indexOf(u8, name, p) != null) {
+            return true;
+        }
     }
     return false;
 }
@@ -382,14 +388,22 @@ fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const
         .skipped => "SKIPPED",
     };
     const now_ns = runtime.clockMonotonicNanos();
-    const dur_ms: i128 = if (st.last_record_ns == 0) 0 else @divTrunc(now_ns - st.last_record_ns, std.time.ns_per_ms);
+    const dur_ms: i128 = @divTrunc(now_ns - st.last_record_ns, std.time.ns_per_ms);
     st.last_record_ns = now_ns;
     std.debug.print("[test] {s} {s} {d}ms\n", .{ display, tag, dur_ms });
-    try st.results.append(st.gpa, .{
-        .display = try st.gpa.dupe(u8, display),
+    const owned_display = st.gpa.dupe(u8, display) catch |err| {
+        std.debug.print("[test-runner] display allocation failed len={d}\n", .{display.len});
+        return err;
+    };
+    errdefer st.gpa.free(owned_display);
+    st.results.append(st.gpa, .{
+        .display = owned_display,
         .outcome = outcome,
         .detail = detail,
-    });
+    }) catch |err| {
+        std.debug.print("[test-runner] result growth failed len={d} cap={d}\n", .{ st.results.items.len, st.results.capacity });
+        return err;
+    };
 }
 
 /// Run one no-arg call and convert a non-`ok` outcome into a failure detail
@@ -540,7 +554,10 @@ pub fn runTests(
     };
     defer freePlan(gpa, &plan);
 
-    var st = RunState{ .gpa = gpa, .plan = &plan, .results = .empty };
+    // Stamp the clock at run start so the FIRST test's streamed duration is
+    // real; it previously printed 0ms (the delta base was unset), which read
+    // as "did not run" whenever a --filter made the target test the first.
+    var st = RunState{ .gpa = gpa, .plan = &plan, .results = .empty, .last_record_ns = runtime.clockMonotonicNanos() };
     const prep = try vm.runCalls(out, *RunState, &st, runBody);
     if (prep) |_| {
         // Startup failed; surface it as a single failing entry so the caller
@@ -574,4 +591,7 @@ test "filter matches any comma-separated substring" {
     try std.testing.expect(filterMatches("Foo,Baz", "BazTests.qux"));
     try std.testing.expect(!filterMatches("Foo,Baz", "QuuxTests.qux"));
     try std.testing.expect(!filterMatches(",", "QuuxTests.qux"));
+    try std.testing.expect(filterMatches("=FooTests.bar", "FooTests.bar"));
+    try std.testing.expect(!filterMatches("=FooTests.bar", "FooTests.barExtended"));
+    try std.testing.expect(filterMatches("Foo,=BazTests.qux", "BazTests.qux"));
 }

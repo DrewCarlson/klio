@@ -38,6 +38,7 @@ ACTUALS = [
 # The scratch HOME the stdlib_commontest itest installs the kotlin.test
 # pack into; running that suite once populates it. Override with --home.
 CHILD_HOME = "/tmp/klio_itest_stdlibtest_home"
+TEST_FILTER = None
 
 
 def default_jobs():
@@ -133,6 +134,8 @@ def cross_dir_providers(target, provider, texts):
 def run_one(binary, target, support, targets, provider, texts, eager):
     tdir = os.path.dirname(target)
     argv = [binary, "test", f"--only-file={target}"] + support
+    if TEST_FILTER:
+        argv.append(f"--filter={TEST_FILTER}")
     argv += [s for s in targets if s != target and os.path.dirname(s) == tdir]
     argv += cross_dir_providers(target, provider, texts)
     argv.append(target)
@@ -158,7 +161,7 @@ def run_one(binary, target, support, targets, provider, texts, eager):
             reason = lines[i + 1].strip().decode(errors="replace")[:160] if i + 1 < len(lines) else ""
             fails.append((fm.group(1).decode(errors="replace"), reason))
     if passed is None:
-        return target, -1, fails or [("__NO_SUMMARY__", p.stderr[-160:].decode(errors="replace"))]
+        return target, -1, fails or [("__NO_SUMMARY__", no_summary_detail(p))]
     return target, passed, fails
 
 
@@ -169,6 +172,27 @@ def _dedup(seq):
             seen.add(x)
             out.append(x)
     return out
+
+
+def no_summary_detail(p):
+    """Preserve the useful failure seam when a test child aborts."""
+    stderr = p.stderr.decode(errors="replace")
+    tests = re.findall(r"^\[test\] ([^\n]+)$", stderr, re.MULTILINE)
+    last_test = tests[-1] if tests else "none"
+    panic = re.search(r"^(?:thread \d+ panic:|KGC:|error:)[^\n]*", stderr, re.MULTILINE)
+    reason = panic.group(0) if panic else stderr[-300:].strip().splitlines()[0] if stderr.strip() else "no diagnostic"
+    gc_lines = re.findall(r"^\[kgc\][^\n]*", stderr, re.MULTILINE)
+    gc = f"; {gc_lines[-1]}" if gc_lines else ""
+    poison_lines = re.findall(r"^\[GC-POISON\][^\n]*", stderr, re.MULTILINE)
+    poison = f"; {poison_lines[-1]}" if poison_lines else ""
+    cell_lines = re.findall(r"^\[field-probe\][^\n]*", stderr, re.MULTILINE)
+    cell = f"; {cell_lines[-1]}" if cell_lines else ""
+    stdout = p.stdout.decode(errors="replace").strip().splitlines()
+    out = f"; stdout={stdout[-1]}" if stdout else ""
+    if panic and "panic:" in panic.group(0):
+        frames = stderr[panic.end():].strip().splitlines()[:50]
+        reason += "\n" + "\n".join(frames)
+    return f"exit={p.returncode}; last={last_test}; {reason}{gc}{poison}{cell}{out}"[:12000]
 
 
 def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, eager):
@@ -186,6 +210,8 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
         cross += cross_dir_providers(t, provider, texts)
     compile_files = _dedup(list(support) + dir_all + cross)
     argv = [binary, "test"] + [f"--only-file={t}" for t in dir_targets] + compile_files
+    if TEST_FILTER:
+        argv.append(f"--filter={TEST_FILTER}")
     env = dict(os.environ, HOME=CHILD_HOME)
     if eager:
         env["KLIO_EAGER"] = "1"
@@ -208,7 +234,7 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
             reason = lines[i + 1].strip().decode(errors="replace")[:160] if i + 1 < len(lines) else ""
             fails.append((fm.group(1).decode(errors="replace"), reason))
     if passed is None:
-        return tdir, -1, fails or [("__NO_SUMMARY__", p.stderr[-160:].decode(errors="replace"))]
+        return tdir, -1, fails or [("__NO_SUMMARY__", no_summary_detail(p))]
     return tdir, passed, fails
 
 
@@ -261,6 +287,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--filter", default=None, help="substring match on target path")
+    ap.add_argument("--test-filter", default=None, help="comma-separated test-name filter passed to klio test")
     ap.add_argument("--passes", action="store_true", help="also print per-file pass counts")
     ap.add_argument("--eager", choices=["off", "on", "both"], default="off")
     ap.add_argument("--jobs", type=int, default=default_jobs())
@@ -269,6 +296,8 @@ def main():
                     help="one child per file (per-file hang isolation) instead of "
                          "the default per-directory compile-once batching")
     args = ap.parse_args()
+    global TEST_FILTER
+    TEST_FILTER = args.test_filter
     if args.home:
         global CHILD_HOME
         CHILD_HOME = args.home

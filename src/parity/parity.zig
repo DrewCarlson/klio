@@ -1936,6 +1936,37 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
+    // Match the production `safe` profile for execution: compiler/lowering
+    // data remains phase-scoped in the arena, while runtime cells use the
+    // tracing collector's page-returning slab allocator. `off` deliberately
+    // retains the arena path as the diagnostic no-GC profile.
+    const gc_run = runtime.perf.get().reclaim == .gc;
+    const prev_gc_enabled = runtime.gc.gc_enabled;
+    const prev_program_started = runtime.gc.program_started;
+    const prev_alloc_perm = runtime.gc.alloc_perm;
+    const prev_release_to_os = runtime.gc.release_to_os;
+    const prev_gc_stress = runtime.gc.gc_stress;
+    const prev_gc_poison = runtime.gc.gc_poison;
+    const prev_external_accounting = runtime.gc.external_accounting;
+    if (gc_run) {
+        runtime.gc.gc_enabled = true;
+        runtime.gc.program_started = false;
+        runtime.gc.alloc_perm = true;
+        runtime.gc.release_to_os = runtime.slab.reclaimDormant;
+        if (runtime.getenvSlice("KLIO_GC_STRESS")) |v| runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.getenvSlice("KLIO_GC_POISON")) |v| runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.getenvSlice("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
+    }
+    defer {
+        runtime.gc.external_accounting = prev_external_accounting;
+        runtime.gc.gc_poison = prev_gc_poison;
+        runtime.gc.gc_stress = prev_gc_stress;
+        runtime.gc.release_to_os = prev_release_to_os;
+        runtime.gc.alloc_perm = prev_alloc_perm;
+        runtime.gc.program_started = prev_program_started;
+        runtime.gc.gc_enabled = prev_gc_enabled;
+    }
+
     // Arena-backed run: every cell allocates from `arena_inst`, which frees
     // en masse on `deinit` above, so per-cell `ObjRef.deinit` teardown is
     // wasted work. Switch this thread to the reclaim fast path for the run
@@ -2000,10 +2031,25 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         built.deinit();
         return .{ .err = try allocator.dupe(u8, "no main function in module") };
     };
-    const pair = try interp_ir.Vm.fromBuilt(arena, &built);
+    // VM-owned cells are nursery allocations. No GC safe point runs between
+    // construction and `Vm.run`, where the VM is registered as a root.
+    if (gc_run) runtime.gc.alloc_perm = false;
+    const vm_allocator = if (gc_run) runtime.slab.allocator else arena;
+    const pair = try interp_ir.Vm.fromBuilt(vm_allocator, &built);
     built.deinit();
     var vm = pair.vm;
-    defer vm.deinit();
+    defer {
+        if (gc_run) interp_ir.resetRunGlobalCaches();
+        vm.deinit();
+        if (gc_run) {
+            // Nothing from the finished program may remain rooted while its
+            // compiler arena is about to be released.
+            interp_ir.gcResetProgramHooks();
+            runtime.gc.collect();
+            runtime.gc.program_started = false;
+            runtime.gc.alloc_perm = true;
+        }
+    }
     if (prog_bindings) |bindings| try vm.setInstalledBindings(bindings);
 
     var out = CaptureOutput.init(allocator);

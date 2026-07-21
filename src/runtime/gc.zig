@@ -47,6 +47,11 @@ pub const Marker = struct {
     arena: Allocator,
 
     pub fn shade(self: *Marker, h: *GcHeader) void {
+        if (gc_poison and h.gc_trace == poisonTrap) {
+            std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s}\n", .{h.gc_type});
+            std.debug.dumpCurrentStackTrace(.{});
+            @panic("KGC: root shaded a swept cell (incomplete root)");
+        }
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
         h.gc_mark = self.epoch;
         self.grey.append(self.arena, h) catch {
@@ -181,10 +186,10 @@ pub fn noteExternalFreed(bytes: usize) void {
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-/// Gate for the external-bytes Appel accounting (`KLIO_GC_EXT=1`).
-/// Default OFF: the added collection pressure exposed latent keepalive
-/// holes in host paths; enable to reproduce/diagnose them.
-pub var external_accounting: bool = false;
+/// Gate for the external-bytes Appel accounting. Enabled by default so frame
+/// buffers and suspension snapshots advance the same Appel trigger as traced
+/// cells; `KLIO_GC_EXT=0` remains available for diagnosis and comparison.
+pub var external_accounting: bool = true;
 
 /// Cheap poll at opcode-boundary safe points. Every ~64k polls it also
 /// probes for IDLE reclamation: a program that bursts (leaving a large
