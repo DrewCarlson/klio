@@ -315,21 +315,26 @@ unchanged from the 5 pre-existing):
   (`resume()` vs `resume(value)`). Same-arity overloads (type-distinguished) stay on the
   walk. `~770` sites.
 
-**Member methods — measured (+288 sites → ~1058) but NOT landed (open-world hazard).**
-A `recv.name()` member call is monomorphic when exactly one user class declares `name`
-(no override in the closed program) and the receiver's static type (`declared_recv`)
-resolves to a user class (so the runtime receiver is never a builtin with a same-named
-member). This is sound for the WHOLE-PROGRAM re-lower (klio run / itests, which re-lower
-everything). It is NOT sound for a SERIALIZED bake: the stdlib base image is built through
-`bakeStaticMemberCalls`, its member-method bakes freeze at base-build time, and its
-internal callsites are not re-baked on extend — so a consumer that overrides a stdlib
-`open` method would mis-dispatch through the base's stale bake. Extensions are immune
-(statically dispatched, never overridden). To land member methods soundly, bake only
-methods of a provably-final class: add `is_open`/`is_sealed` to `ir.Class` (thread from
-the AST through `lowerClass`, mirroring the runtime `ClassDef` which already carries them)
-and gate the bake on a final, non-abstract, non-interface class — a final class can never
-be subclassed, so its methods are open-world monomorphic. Sketch kept; do this next to
-extend member-call static dispatch.
+- **Member methods on a FINAL receiver class** — LANDED. A `recv.name()` member call is
+  virtual, so it is baked only when the receiver's static type (`declared_recv`) resolves
+  to a FINAL user class: `is_open` was added to `ir.Class` (threaded from the AST through
+  `lowerClass`; image `FORMAT_VERSION` 21 → 22), and `final = !is_open && !is_abstract`
+  (the latter already folds abstract/interface/sealed). A final class can never be
+  subclassed, so its methods cannot be overridden ANYWHERE — the bake stays correct even
+  for a serialized base image consumed by other programs (Kotlin also forbids `open`
+  members on a final class, so every method of one is effectively final). The method is
+  resolved in the class's own-then-supertype order and dispatched through the existing
+  member invoker. `~900` sites. Validated: full stdlib sweep unchanged (5 pre-existing);
+  278/279 examples byte-identical (the 1 is a pre-existing flaky serialization test).
+
+  An EARLIER attempt keyed on name-uniqueness (declared by exactly one class) reached
+  ~1058 sites but was UNSOUND for the serialized base image: it baked methods of `open`
+  classes, which a consumer could override — reverted in favour of the final-class gate.
+
+  Next coverage step (not yet done): per-method final-ness — a non-`open` method inside an
+  `open` class is also un-overridable. `ir.Func` carries `is_override`; add the method's
+  own `open` flag and bake `!method.is_open` members too (the runtime `MethodDef` already
+  serializes per-method `is_open`).
 
 ## Method
 

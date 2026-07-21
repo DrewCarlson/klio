@@ -985,6 +985,12 @@ pub const Class = struct {
     /// (+ inherited) AST members, so a static-receiver walk can trust the
     /// registry's transitive method-name set for visibility decisions.
     is_interface: bool = false,
+    /// `open` modifier — the class can be subclassed. A class that is neither
+    /// `open` nor `is_abstract` (which folds in `abstract`/`interface`/`sealed`)
+    /// is FINAL: it can never be subclassed, so its members cannot be overridden
+    /// anywhere, and a `recv.method()` call on it is monomorphic even open-world
+    /// (used by the static dispatch bake).
+    is_open: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;

@@ -3384,13 +3384,19 @@ fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
                             else => continue,
                         };
                         // A member declared with this name binds ahead of any
-                        // extension (Kotlin's member-over-extension rule). Member
-                        // methods are also VIRTUAL — a subtype can override, and a
-                        // serialized bake (e.g. into the stdlib base image) would
-                        // freeze the wrong target for an overriding consumer — so
-                        // they are left to the walk. Only statically-dispatched
-                        // extensions / member-extensions are baked here.
-                        if (member_names.contains(name)) continue;
+                        // extension (Kotlin's member-over-extension rule). A member
+                        // method is virtual, so it is baked only when the receiver's
+                        // static type is a FINAL class — one that can never be
+                        // subclassed, so the method cannot be overridden anywhere,
+                        // even open-world (a serialized bake stays correct for every
+                        // consumer). Otherwise the name is an extension surface.
+                        if (member_names.contains(name)) {
+                            if (finalReceiverMethod(module, cm.declared_recv, name, cm.n_args)) |mfid| {
+                                cm.resolved = mfid;
+                                baked += 1;
+                            }
+                            continue;
+                        }
                         cm.resolved = uniqueMemberTarget(module, name, cm.n_args) orelse continue;
                         baked += 1;
                     },
@@ -3411,6 +3417,56 @@ fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
 fn hasNamedArg(arg_names: []const ?ir.ConstId) bool {
     for (arg_names) |n| if (n != null) return true;
     return false;
+}
+
+/// The FuncId a `recv.name(<n_args>)` MEMBER call resolves to when the receiver's
+/// static type (`declared_recv`) is a FINAL user class, or null. A final class
+/// can never be subclassed, so the method cannot be overridden anywhere — the
+/// dispatch is monomorphic even open-world, which makes it safe to bake (unlike a
+/// method on an open/abstract class, where a subtype override would diverge from a
+/// serialized target). The receiver being a resolvable user class also guarantees
+/// the runtime value is an instance of that class, never a builtin with a
+/// same-named member.
+fn finalReceiverMethod(module: *ir.Module, declared_recv: ?ir.ConstId, name: []const u8, n_args: u32) ?ir.FuncId {
+    const did = declared_recv orelse return null;
+    var h = switch (module.consts.items[did.int()]) {
+        .String => |s| s,
+        else => return null,
+    };
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| h = h[i + 1 ..];
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    h = std.mem.trimEnd(u8, h, "?");
+    if (h.len == 0) return null;
+    const cid = module.classId(h) orelse return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    const c = &module.classes.items[cid.int()];
+    // Final = not `open` and not abstract/interface/sealed (the latter three fold
+    // into `is_abstract` at lowering).
+    if (c.is_open or c.is_abstract) return null;
+    return resolveMethodInHierarchy(module, cid, name, n_args, 0);
+}
+
+/// First body-bearing, arity-compatible method named `name` in class `cid`'s
+/// resolution order (own methods, then supertypes) — the target `recv.name()`
+/// binds for a receiver of exactly `cid`. `null` when unresolved.
+fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u8, n_args: u32, depth: u8) ?ir.FuncId {
+    if (depth > 32) return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    const c = &module.classes.items[cid.int()];
+    for (c.methods) |mfid| {
+        const mf = module.funcById(mfid) orelse continue;
+        if (!std.mem.eql(u8, mf.name, name)) continue;
+        // A member method carries the receiver as a synthesized leading `this`
+        // param (like an extension), so `extAcceptsArity` scores the value params.
+        if (!(mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this"))) continue;
+        if (!mf.hasBody()) continue;
+        if (!extAcceptsArity(mf, n_args)) continue;
+        return mfid;
+    }
+    for (c.supertypes) |sid| {
+        if (resolveMethodInHierarchy(module, sid, name, n_args, depth + 1)) |m| return m;
+    }
+    return null;
 }
 
 /// Whether an extension / member-extension `f` (whose `params[0]` is the
