@@ -99,9 +99,7 @@ const lowerStmt = stmt_mod.lowerStmt;
 fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
     if (b.resolve("this")) |r| return r;
     if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        const dst = try b.loadCaptureHoisted("this");
         if (bind_local) try b.bind("this", dst);
         return dst;
     }
@@ -115,6 +113,13 @@ fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) A
 /// its receiver at creation time.
 fn resolveThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
     return resolveThisRegKind(b, false, false);
+}
+
+/// Resolve the instance selected by `super`. A lambda nested in a class
+/// member keeps the member's lexical receiver in its closure capture slot,
+/// even though the lambda frame has no locally bound `this` parameter.
+fn resolveSuperThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
+    return resolveThisRegKind(b, true, false);
 }
 
 /// Lower an expression that appears as the *receiver / qualifier head* of a
@@ -787,9 +792,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{q.name});
                 if (b.resolve(label)) |r| return r;
                 if (b.knowsOuter(label)) {
-                    const idx = try b.recordCapture(label);
-                    const dst2 = b.allocReg();
-                    try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
+                    const dst2 = try b.loadCaptureHoisted(label);
                     try b.bind(label, dst2);
                     return dst2;
                 }
@@ -808,10 +811,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // Otherwise a class-name label (`this@Outer`): walk at runtime
                 // from the nearest `this` over the class/outer chain.
                 const this_reg = b.resolve("this") orelse blk: {
-                    const idx = try b.recordCapture("this");
-                    const dst = b.allocReg();
-                    try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-                    break :blk dst;
+                    break :blk try b.loadCaptureHoisted("this");
                 };
                 const nm = try b.module.internConst(b.allocator, .{ .String = q.name });
                 const dst = b.allocReg();
@@ -821,16 +821,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // `this` bare resolves to the implicit first param, or the
             // captured `this` slot inside a lambda body.
             const this_reg = b.resolve("this") orelse blk: {
-                const idx = try b.recordCapture("this");
-                const dst = b.allocReg();
-                try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-                break :blk dst;
+                break :blk try b.loadCaptureHoisted("this");
             };
             return this_reg;
         },
         .Super => {
             // `super` bare reads the same instance value as `this`.
-            if (b.resolve("this")) |this_reg| return this_reg;
+            if (try resolveSuperThisReg(b)) |this_reg| return this_reg;
             try b.push(.{ .Trace = .{ .span = exprSpan(expr) } });
             return b.emitConst(.Unit);
         },
@@ -1372,18 +1369,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // passes a non-cell value unchanged. Without this a captured
         // counter's `++` handed the raw Cell to UnOp.
         if (isLowerAnonCapture(name0)) {
-            const idx = try b.recordCapture(name0);
-            const cell = b.allocReg();
-            try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
+            const cell = try b.loadCaptureHoisted(name0);
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
             return dst;
         }
         // Lambda-body capture.
         if (b.knowsOuter(name0)) {
-            const idx = try b.recordCapture(name0);
-            const cell = b.allocReg();
-            try b.push(.{ .LoadCapture = .{ .dst = cell, .idx = idx } });
+            const cell = try b.loadCaptureHoisted(name0);
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
@@ -1915,21 +1908,27 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
     // expression: the bound `this`, or the captured slot in a lambda body.
     if (std.mem.eql(u8, ident.name, "this")) {
         if (b.resolve("this")) |r| return r;
-        const idx = try b.recordCapture("this");
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        return dst;
+        return b.loadCaptureHoisted("this");
     }
     // `"… $x …"` where `x` is a `var x by D` local reads THROUGH the delegate,
     // exactly as a bare `x` does.
     if (try lowerDelegateRead(b, ident.name)) |r| return r;
-    if (b.resolve(ident.name)) |r| return r;
+    if (b.resolve(ident.name)) |r| {
+        if (b.isBoxed(ident.name)) {
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
+            return dst;
+        }
+        return r;
+    }
     if (b.knowsOuter(ident.name)) {
-        const idx = try b.recordCapture(ident.name);
-        const dst = b.allocReg();
-        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
-        try b.bind(ident.name, dst);
-        return dst;
+        const cell = try b.loadCaptureHoisted(ident.name);
+        if (b.isBoxed(ident.name)) {
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+            return dst;
+        }
+        return cell;
     }
     if (b.hasOwnMember(ident.name) and b.resolve("this") != null) {
         const this_reg = b.resolve("this").?;
@@ -1998,7 +1997,7 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // `super.<prop>` — dispatch its getter via the parent chain.
     if (receiver.* == .Super) {
-        if (b.resolve("this")) |this_reg| {
+        if (try resolveSuperThisReg(b)) |this_reg| {
             if (b.ownerClass()) |owner| {
                 const sup = receiver.Super;
                 const dst = b.allocReg();
@@ -2460,6 +2459,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    const inherited_erp = try b.erasedRecvParamNames();
     // The implicit label this lambda carries (`runTest { … }` → "runTest").
     // The body binds `this@<label>` to its receiver.
     b.module.pending_lambda_this_label = b.pending_lambda_label;
@@ -2494,6 +2494,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Non-callable-local evidence flows into the body (transitively — this
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -2507,6 +2508,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         false,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         &b.local_fn_overloads,
         enclosing_owner,
         suppress_it,
@@ -2585,7 +2587,9 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const enclosing_owner = try enclosingOwnerFor(b);
 
     const inherited_lef = try b.localExtFnNames();
+    const inherited_erp = try b.erasedRecvParamNames();
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,
@@ -2597,6 +2601,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         null,
         inherited_rlp,
         inherited_lef,
+        inherited_erp,
         enclosing_owner,
     );
     const captured_names = lowered.captures;
@@ -2747,19 +2752,102 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
         var i: usize = 0;
         while (i < 1 + supers.len) : (i += 1) {
             const cls = if (i == 0) root else supers[i - 1];
-            const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ cls, name, user_arg_count }) catch return null;
-            defer b.allocator.free(key);
-            const fid = b.module.registry.member_method_fids.get(key) orelse continue;
-            const f = b.module.funcById(fid) orelse continue;
-            if (f.params.len == 0) continue;
-            const last = f.params[f.params.len - 1];
-            if (last.is_vararg) continue;
-            // Only a function-typed last parameter hosts a trailing lambda.
-            if (fnTypeArityAlias(b, last.ty) == null) continue;
-            return fid;
+            const prefix = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00", .{ cls, name }) catch return null;
+            defer b.allocator.free(prefix);
+            var found: ?FuncId = null;
+            var found_arity: ?i16 = null;
+            var found_recv: ?[]const u8 = null;
+            var it = b.module.registry.member_method_fids.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+                const fid = entry.value_ptr.*;
+                const f = b.module.funcById(fid) orelse continue;
+                const hosts = memberHostsTrailingLambdaAtArity(b, cls, f, fid, user_arg_count);
+                if (!hosts) continue;
+                const last = f.params[f.params.len - 1];
+                const arity = fnTypeArityAlias(b, last.ty) orelse continue;
+                const recv = fnTypeReceiverHead(b, last.ty);
+                if (found_arity) |fa| {
+                    if (fa != arity or !optionalStringEql(found_recv, recv)) return null;
+                } else {
+                    found = fid;
+                    found_arity = arity;
+                    found_recv = recv;
+                }
+            }
+            if (found) |fid| return fid;
         }
     }
     return null;
+}
+
+fn predeclaredMemberTrailingLambdaShape(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?ir.ModuleRegistry.MemberTrailingLambdaShape {
+    if (user_arg_count >= 63) return null;
+    const bit = @as(u64, 1) << @intCast(user_arg_count);
+    var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
+    if (b.recvTy()) |rt| roots[1] = rsplitLast(rt, '.');
+    for (roots) |root_opt| {
+        const root = root_opt orelse continue;
+        const supers: []const []const u8 = b.module.registry.class_super_names.get(root) orelse &.{};
+        var i: usize = 0;
+        while (i < 1 + supers.len) : (i += 1) {
+            const cls = if (i == 0) root else supers[i - 1];
+            const shapes = b.module.registry.member_trailing_lambda_shapes.get(.{ .a = cls, .b = name }) orelse continue;
+            var agreed: ?ir.ModuleRegistry.MemberTrailingLambdaShape = null;
+            for (shapes.items) |shape| {
+                if (shape.accepted_arities & bit == 0) continue;
+                if (agreed) |old| {
+                    if (old.value_arity != shape.value_arity or
+                        !optionalStringEql(old.receiver_head, shape.receiver_head)) return null;
+                } else {
+                    agreed = shape;
+                }
+            }
+            if (agreed) |shape| return shape;
+        }
+    }
+    return null;
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn memberParamHasDefault(b: *FuncBuilder, cls: []const u8, fid: FuncId, param_index: usize) bool {
+    const f = b.module.funcById(fid) orelse return false;
+    if (param_index < f.params.len and f.params[param_index].has_default) return true;
+    if (b.module.registry.local_fn_defaults.get(fid)) |slots| {
+        if (param_index < slots.items.len and slots.items[param_index] != null) return true;
+    }
+    if (b.module.registry.abstract_member_defaults.get(.{ .a = cls, .b = f.name })) |slots| {
+        if (param_index < slots.items.len and slots.items[param_index] != null) return true;
+    }
+    const supers: []const []const u8 = b.module.registry.class_super_names.get(cls) orelse &.{};
+    for (supers) |owner| {
+        if (b.module.registry.abstract_member_defaults.get(.{ .a = owner, .b = f.name })) |slots| {
+            if (param_index < slots.items.len and slots.items[param_index] != null) return true;
+        }
+    }
+    return false;
+}
+
+fn memberHostsTrailingLambdaAtArity(b: *FuncBuilder, cls: []const u8, f: *const Func, fid: FuncId, user_arg_count: usize) bool {
+    if (user_arg_count == 0 or f.params.len == 0) return false;
+    const off: usize = if (std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const user_params = f.params.len - off;
+    if (user_arg_count > user_params or user_params == 0) return false;
+    const last = f.params[f.params.len - 1];
+    if (last.is_vararg or fnTypeArityAlias(b, last.ty) == null) return false;
+    // Positional arguments before a trailing lambda fill parameters from the
+    // front. Every gap before the last parameter must therefore have a
+    // declaration-site default, including one inherited from an expect or
+    // abstract member by its concrete implementation.
+    var pi = off + user_arg_count - 1;
+    while (pi < f.params.len - 1) : (pi += 1) {
+        if (!memberParamHasDefault(b, cls, fid, pi)) return false;
+    }
+    return true;
 }
 
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
@@ -3949,7 +4037,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             // Splice bailed: fall back to a plain member dispatch.
             const recv = try lowerReceiver(b, receiver);
-            const bail_arity: ?[]const i16 = try classMemberArgArities(b, receiver, mname, args, ast_arg_names);
+            const bail_arity: ?[]const i16 = try memberCallArgArities(b, receiver, mname, args, ast_arg_names);
             const run = try lowerArgRunWithArity(b, args, bail_arity);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = mname });
@@ -4169,7 +4257,7 @@ fn lowerCallWithWritebackMember(
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
     const recv = try lowerReceiver(b, receiver);
-    const uarg_arity: ?[]const i16 = try classMemberArgArities(b, receiver, name.name, args, ast_arg_names);
+    const uarg_arity: ?[]const i16 = try memberCallArgArities(b, receiver, name.name, args, ast_arg_names);
     const arg_regs = try b.allocator.alloc(Reg, args.len);
     defer b.allocator.free(arg_regs);
     for (args, arg_regs, 0..) |*a, *ar, i| {
@@ -5182,7 +5270,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
             if (selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
-                if (try lowerSelectedLocalOverloadCall(b, m, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, m, args, ast_arg_names)) |r| return r;
             }
         }
         // SELF-reference: a bare call to the enclosing local fn's own name
@@ -5194,7 +5282,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // this point in the body — the enclosing fn, never the sibling.
         if (b.selfLocalFn()) |slf| {
             if (std.mem.eql(u8, slf.name, bare) and selfLocalFnApplicable(b, slf.mangled, bare, args, ast_arg_names)) {
-                if (try lowerSelectedLocalOverloadCall(b, slf.mangled, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, slf.mangled, args, ast_arg_names)) |r| return r;
             }
         }
         if (b.localFnDecls(bare)) |decls| {
@@ -5214,7 +5302,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.resolve(bare) == null and
                 (b.resolve(decls[0].mangled) != null or b.knowsOuter(decls[0].mangled)))
             {
-                if (try lowerSelectedLocalOverloadCall(b, decls[0].mangled, args, ast_arg_names)) |r| return r;
+                if (try lowerSelectedLocalOverloadCall(b, bare, decls[0].mangled, args, ast_arg_names)) |r| return r;
             }
         }
         // A local function shadows an outer one by NAME, but only among
@@ -5676,7 +5764,6 @@ fn inlineTargetForBareCall(
     shape: CallShape,
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
-    if (inline_state.isShadowedInlineName(nm)) return null;
     // The active splice's declared receiver serves as evidence when the
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
@@ -5686,6 +5773,12 @@ fn inlineTargetForBareCall(
         try recvChainOf(b, srt)
     else
         null;
+    // Host-backed default imports suppress the simple-name candidate table,
+    // but not an exact FuncId resolved by the scope-aware index below. The
+    // source declaration remains the semantic target of an inline call and
+    // must be available when reification, non-local return, or suspension
+    // requires a splice; ordinary calls still fall through to the host binding
+    // because `bareInlineNeedsSplice` rejects them.
     const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
     const ires = b.module.resolveBareCallIndexed(
         nm,
@@ -6033,7 +6126,8 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         break :blk companionOwnerInEnclosingHierarchy(b, owner);
     };
     return !recv_mismatch and
-        (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member or
+        (f.is_suspend or argLambdaHasNonlocalReturn(args) or
+            inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
             companion_super_member);
 }
 
@@ -6410,6 +6504,7 @@ fn selectLocalFnOverload(
 /// caller falls back to the plain-name binding.
 fn lowerSelectedLocalOverloadCall(
     b: *FuncBuilder,
+    bare: []const u8,
     mangled: []const u8,
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
@@ -6453,6 +6548,29 @@ fn lowerSelectedLocalOverloadCall(
     const run = try lowerArgRunFull(b, args, null, lfp);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
+    var member_declared = b.hasEnclosingMember(bare);
+    if (!member_declared) {
+        if (b.ownerClass()) |oc| {
+            if (b.module.registry.hierarchy_methods.get(oc)) |s| {
+                member_declared = s.contains(bare);
+            }
+        }
+    }
+    if (member_declared) {
+        if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+            const name = try b.module.internConst(b.allocator, .{ .String = bare });
+            try b.push(.{ .CallValueOrMember = .{
+                .dst = dst,
+                .callee = callee_reg,
+                .this_recv = this_reg,
+                .name = name,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
     try b.push(.{ .CallValue = .{
         .dst = dst,
         .callee = callee_reg,
@@ -9087,23 +9205,21 @@ fn lowerImplicitThisCall(
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     const this_reg = b.resolve("this") orelse return null;
 
+    const member_lambda_shape: ?ir.ModuleRegistry.MemberTrailingLambdaShape = if (allNull(ast_arg_names) and lastArgIsLambda(args))
+        predeclaredMemberTrailingLambdaShape(b, name0, args.len)
+    else
+        null;
+    const member_lambda_fid: ?FuncId = if (allNull(ast_arg_names) and lastArgIsLambda(args))
+        memberHostingTrailingLambda(b, name0, args.len)
+    else
+        null;
+
     // Broad-collection mask: a trailing lambda bound to this member's
     // function-typed parameter whose declared type is `Iterable`/`Collection`
     // marks the lambda's matching params broad, so `it + x` over a runtime
     // `Set` yields a `List` (the declared, not runtime, receiver type).
     const itc_broad: ?[]u32 = blk: {
-        // Only a trailing lambda can be marked broad. Resolve the SIBLING member
-        // method statically and owner-scoped via the `member_method_fids` index
-        // (keyed by class + name + arity): the call target is `this.<name>`, and
-        // `this`'s static class is the enclosing owner, so this is the exact
-        // method — never a same-named member of an unrelated class.
-        if (args.len == 0) break :blk null;
-        const last = args[args.len - 1];
-        if (last != .Lambda and last != .AnonFun) break :blk null;
-        const owner = b.ownerClass() orelse break :blk null;
-        const key = try std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ owner, name0, args.len });
-        defer b.allocator.free(key);
-        const fid = b.module.registry.member_method_fids.get(key) orelse break :blk null;
+        const fid = member_lambda_fid orelse break :blk null;
         const f = b.module.funcById(fid) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         break :blk try argLambdaBroadMasks(b, f, args, ast_arg_names, recv_off);
@@ -9156,7 +9272,27 @@ fn lowerImplicitThisCall(
         return dst;
     };
     b.pending_arg_broad_masks = itc_broad;
-    const run = try lowerArgRun(b, args);
+    var member_arity: ?[]i16 = null;
+    if (member_lambda_fid) |fid| {
+        if (b.module.funcById(fid)) |f| {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
+            member_arity = try argFnArities(b, f, args, ast_arg_names, recv_off);
+        }
+    }
+    if (member_lambda_shape) |shape| {
+        if (member_arity == null) {
+            const out = try b.allocator.alloc(i16, args.len);
+            for (out) |*arity| arity.* = -1;
+            member_arity = out;
+        }
+        member_arity.?[member_arity.?.len - 1] = shape.value_arity;
+        const trailing = &args[args.len - 1];
+        b.recordLambdaArgArity(trailing.span(), shape.value_arity);
+        if (shape.receiver_head) |recv| b.recordLambdaArgRecv(trailing.span(), recv);
+    }
+    defer if (member_arity) |arities| b.allocator.free(arities);
+    const run = try lowerArgRunWithArity(b, args, member_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -9711,6 +9847,58 @@ fn classMemberArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const 
     return null;
 }
 
+/// Expected lambda arities for an explicit-receiver call. Class/object
+/// members are authoritative; otherwise a statically typed receiver can
+/// select visible extension candidates by their declared receiver head. If
+/// every best-scope candidate agrees, that common shape is safe to lower even
+/// though runtime overload dispatch still chooses the callable.
+fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
+    if (try classMemberArgArities(b, receiver, mname, args, ast_arg_names)) |arities| return arities;
+    const recv_ty = argDeclTypeRef(b, receiver) orelse return null;
+    const recv_head = typeHead(recv_ty.name);
+    if (recv_head.len == 0) return null;
+
+    const caller_file = exprSpan(receiver).file;
+    const caller_pkg = b.module.packageOfFile(caller_file) orelse b.self_package;
+    var best_tier: u8 = 255;
+    var agreed: ?[]i16 = null;
+    errdefer if (agreed) |a| b.allocator.free(a);
+
+    for (b.module.funcsBySimpleName(mname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind == .instance_method or f.params.len == 0 or
+            !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (f.kind == .member_extension) {
+            const owner = b.module.registry.member_ext_owner_class.get(fid) orelse continue;
+            const lexical_owner = b.ownerClass() orelse continue;
+            if (!b.module.classIsOrExtends(lexical_owner, owner)) continue;
+        }
+        const candidate_head = typeHead(f.params[0].ty.name);
+        if (!b.module.classIsOrExtends(recv_head, candidate_head)) continue;
+        const tier = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
+        if (tier > 3 or tier > best_tier) continue;
+        const arities = (try argFnArities(b, f, args, ast_arg_names, 1)) orelse continue;
+        if (tier < best_tier) {
+            if (agreed) |old| b.allocator.free(old);
+            agreed = arities;
+            best_tier = tier;
+            continue;
+        }
+        if (agreed) |old| {
+            if (!std.mem.eql(i16, old, arities)) {
+                b.allocator.free(arities);
+                b.allocator.free(old);
+                agreed = null;
+                return null;
+            }
+            b.allocator.free(arities);
+        } else {
+            agreed = arities;
+        }
+    }
+    return agreed;
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -9788,7 +9976,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
 
     // `super.method(...)`.
     if (receiver.* == .Super) {
-        if (b.resolve("this")) |this_reg| {
+        if (try resolveSuperThisReg(b)) |this_reg| {
             if (b.ownerClass()) |owner| {
                 const sup = receiver.Super;
                 const run = try lowerArgRun(b, args);
@@ -9993,7 +10181,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // block then drops its parser-injected `it` and an `it` inside
     // captures the enclosing lambda's, instead of binding a spurious null
     // parameter.
-    const uarg_arity: ?[]const i16 = try classMemberArgArities(b, receiver, name.name, args, ast_arg_names);
+    const uarg_arity: ?[]const i16 = try memberCallArgArities(b, receiver, name.name, args, ast_arg_names);
     const run = try lowerArgRunWithArity(b, args, uarg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
@@ -10334,6 +10522,37 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
 }
 
+test "super property in a lambda uses the enclosing this capture" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Derived");
+    b.setOuterNames(StringSet.init(testing.allocator));
+
+    var receiver = Expr{ .Super = .{
+        .qualifier = null,
+        .label = null,
+        .span = dummySpan(),
+    } };
+    const e = Expr{ .Member = .{
+        .receiver = &receiver,
+        .name = .{ .name = "label", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "Derived.f", build.typeString());
+    defer freeFunc(func);
+
+    try testing.expectEqual(@as(usize, 2), func.blocks[0].insts.len);
+    const capture = func.blocks[0].insts[0].LoadCapture;
+    const call = func.blocks[0].insts[1].CallSuper;
+    try testing.expectEqual(capture.dst, call.receiver);
+    try testing.expectEqualStrings("this", func.capture_order[capture.idx]);
+}
+
 test "lowers int min value as int" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
@@ -10392,6 +10611,41 @@ test "lowers string template as concat chain" {
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .BinOp);
     try testing.expectEqual(BinOp.StringConcat, insts[insts.len - 1].BinOp.op);
+}
+
+test "boxed capture interpolation reads the entry-hoisted cell value" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var outer = StringSet.init(testing.allocator);
+    try outer.put("count", {});
+    b.setOuterNames(outer);
+    var boxed = StringSet.init(testing.allocator);
+    try boxed.put("count", {});
+    b.setBoxedVars(boxed);
+
+    var parts = [_]ast.StringPart{.{ .ShortInterp = .{ .name = "count", .span = dummySpan() } }};
+    const e = Expr{ .StringTemplate = .{ .parts = &parts, .span = dummySpan() } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "f", build.typeString());
+    defer freeFunc(func);
+
+    var capture_reg: ?Reg = null;
+    var value_reg: ?Reg = null;
+    for (func.blocks[0].insts) |inst| switch (inst) {
+        .LoadCapture => |lc| capture_reg = lc.dst,
+        .CellGet => |cg| {
+            try testing.expectEqual(capture_reg.?, cg.cell);
+            value_reg = cg.dst;
+        },
+        else => {},
+    };
+    try testing.expect(capture_reg != null);
+    try testing.expect(value_reg != null);
+    const concat = func.blocks[0].insts[func.blocks[0].insts.len - 1].BinOp;
+    try testing.expectEqual(value_reg.?, concat.rhs);
 }
 
 test "lowers elvis as branch with null check" {
@@ -10523,6 +10777,104 @@ test "trailing-lambda arity host accepts a signature-only candidate" {
     const picked = overloadHostingTrailingLambda(&b, "launch", 2);
     try testing.expect(picked != null);
     try testing.expectEqual(id.int(), picked.?.int());
+}
+
+test "typed explicit extension receiver supplies trailing lambda arity" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    try m.registry.class_super_names.put("TestScope", try a.dupe([]const u8, &.{"CoroutineScope"}));
+
+    const params = try a.alloc(ir.Param, 4);
+    params[0] = .{ .name = "this", .ty = .{ .name = "CoroutineScope", .nullable = false, .args = &.{} }, .default = null };
+    params[1] = .{ .name = "context", .ty = .{ .name = "CoroutineContext", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    params[2] = .{ .name = "start", .ty = .{ .name = "CoroutineStart", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    params[3] = .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null };
+    const id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = "launch",
+        .fqn = "launch",
+        .package = "",
+        .params = params,
+        .return_ty = .{ .name = "Job", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .kind = .top_level_extension,
+    });
+    try m.func_index.append(a, .{ .name = "launch", .id = id });
+    try m.rebuildFuncNameIndex(a);
+    defer {
+        a.free(m.funcs.items[id.int()].params);
+        m.funcs.items[id.int()].params = &.{};
+    }
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const recv_reg = b.allocReg();
+    try b.bind("outerScope", recv_reg);
+    try b.setLocalDeclType("outerScope", "TestScope");
+    var recv_segs = [_]ast.Ident{.{ .name = "outerScope", .span = dummySpan() }};
+    const receiver = Expr{ .Path = .{ .segments = &recv_segs, .span = dummySpan() } };
+    var implicit_it = [_]ast.Ident{.{ .name = "it", .span = dummySpan() }};
+    const args = [_]Expr{.{ .Lambda = .{
+        .params = &implicit_it,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+        .implicit_it = true,
+    } }};
+    const arities = (try memberCallArgArities(&b, &receiver, "launch", &args, &.{})).?;
+    defer a.free(arities);
+    try testing.expectEqualSlices(i16, &.{0}, arities);
+}
+
+test "inherited member receiver lambda uses abstract defaults" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    try m.registry.class_super_names.put("ResumeTest", try a.dupe([]const u8, &.{"TestBase"}));
+
+    var block_args = [_]ir.TypeRef{
+        .{ .name = "CoroutineScope", .nullable = false, .args = &.{} },
+        .{ .name = "Unit", .nullable = false, .args = &.{} },
+    };
+    const params = try a.alloc(ir.Param, 4);
+    params[0] = .{ .name = "this", .ty = .{ .name = "TestBase", .nullable = false, .args = &.{} }, .default = null };
+    params[1] = .{ .name = "expected", .ty = .{ .name = "Function1", .nullable = true, .args = &.{} }, .default = null };
+    params[2] = .{ .name = "unhandled", .ty = .{ .name = "List", .nullable = false, .args = &.{} }, .default = null };
+    params[3] = .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &block_args }, .default = null };
+    const id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = id,
+        .name = "runTest",
+        .fqn = "TestBase.runTest",
+        .package = "",
+        .params = params,
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .kind = .instance_method,
+    });
+    defer {
+        a.free(m.funcs.items[id.int()].params);
+        m.funcs.items[id.int()].params = &.{};
+    }
+    try m.registry.member_method_fids.put(try a.dupe(u8, "TestBase\x00runTest\x003"), id);
+    var defaults: std.ArrayList(?FuncId) = .empty;
+    try defaults.appendSlice(a, &.{ null, id, id, null });
+    try m.registry.abstract_member_defaults.put(.{ .a = "TestBase", .b = "runTest" }, defaults);
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setOwnerClass("ResumeTest");
+    const picked = memberHostingTrailingLambda(&b, "runTest", 1);
+    try testing.expect(picked != null);
+    try testing.expectEqual(id.int(), picked.?.int());
+    try testing.expectEqualStrings("CoroutineScope", fnTypeReceiverHead(&b, params[3].ty).?);
 }
 
 test "headCompatible: literal heads disprove scalar params only" {

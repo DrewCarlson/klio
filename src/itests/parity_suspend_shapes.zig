@@ -187,6 +187,22 @@ test "local_class_suspend_method_resumes_in_its_module" {
     try assertKlio("local_class_suspend_resume", src, "result=got=42\n");
 }
 
+test "local class retains transitive interfaces" {
+    const src =
+        \\
+        \\interface Marker
+        \\open class Base : Marker
+        \\fun main() {
+        \\    class Local : Base()
+        \\    val value: Any = Local()
+        \\    println(value is Base)
+        \\    println(value is Marker)
+        \\}
+        \\
+    ;
+    try assertKlio("local_class_transitive_interfaces", src, "true\ntrue\n");
+}
+
 // A deprecated overload that delegates to the general one via an
 // explicit cast — kotlinx.coroutines' `async(context: Job, …) =
 // async(context as CoroutineContext, …)` — must reach the general
@@ -445,6 +461,54 @@ test "receiver_bound_suspend_value_call_parks" {
         \\
     ;
     try assertKlio("receiver_bound_suspend_value_call", src, "a7|b7\n");
+}
+
+test "suspension survives nested inline lambda forwarding" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\inline fun <reified T> outer(block: () -> Unit) {
+        \\    T::class
+        \\    middle(block)
+        \\}
+        \\inline fun middle(block: () -> Unit) = leaf(block)
+        \\inline fun leaf(block: () -> Unit) = block()
+        \\fun main() = runBlocking {
+        \\    outer<String> {
+        \\        print("before;")
+        \\        delay(1)
+        \\        println("after;")
+        \\    }
+        \\    println("done;")
+        \\}
+        \\
+    ;
+    try assertKlio("nested_inline_suspend_forward", src, "before;after;\ndone;\n");
+}
+
+test "suspension survives host-backed inline lambda forwarding" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\inline fun <reified T> capture(block: () -> Unit): Result<Unit> {
+        \\    T::class
+        \\    return runCatching(block)
+        \\}
+        \\fun main() = runBlocking {
+        \\    val result = capture<String> {
+        \\        print("before;")
+        \\        delay(1)
+        \\        println("after;")
+        \\    }
+        \\    println("success=" + result.isSuccess)
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "host_backed_inline_suspend_forward",
+        src,
+        "before;after;\nsuccess=true\n",
+    );
 }
 
 // The same shape parking multiple times across one body: the continuation

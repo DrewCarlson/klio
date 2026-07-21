@@ -259,6 +259,22 @@ test "captured_var_across_inline_splice" {
     try assertKlio("carrier_inline", src, "acc=6 n=4\n");
 }
 
+test "boxed capture load dominates alternate branch after interpolation" {
+    const src =
+        \\fun main() {
+        \\    var count = 0
+        \\    val read: (Boolean) -> Int = { renderMessage ->
+        \\        count++
+        \\        if (renderMessage) "count=$count".length
+        \\        else listOf(10, 20)[count - 1]
+        \\    }
+        \\    println("value=${read(false)} count=$count")
+        \\}
+        \\
+    ;
+    try assertKlio("boxed_capture_branch", src, "value=10 count=1\n");
+}
+
 // 13. Sibling closures over one captured var: one writes, one reads, while
 //     a stdlib HOF lambda writes the same var. All three observe one cell.
 test "captured_var_sibling_closures_and_hof" {

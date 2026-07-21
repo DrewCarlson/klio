@@ -1009,6 +1009,73 @@ fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, o
     for (c.supertypes) |*st| try collectHierarchyMethodNames(st.name.name, by_name, out, seen);
 }
 
+fn memberTrailingLambdaShape(module: *const ir.Module, f: *const ast.Function) ?ir.ModuleRegistry.MemberTrailingLambdaShape {
+    if (f.params.len == 0) return null;
+    const last_ty = f.params[f.params.len - 1].ty;
+    const value_arity: i16 = if (last_ty.function) |ft|
+        @intCast(@min(ft.params.len + ft.context_params.len, std.math.maxInt(i16)))
+    else blk: {
+        const tag = module.registry.type_aliases.get(last_ty.name.name) orelse return null;
+        if (!std.mem.startsWith(u8, tag, "Function")) return null;
+        break :blk std.fmt.parseInt(i16, tag["Function".len..], 10) catch return null;
+    };
+    const receiver_head: ?[]const u8 = if (last_ty.function) |ft|
+        if (ft.receiver) |rt| rt.name.name else null
+    else
+        null;
+
+    var accepted: u64 = 0;
+    var nargs: usize = 1;
+    while (nargs <= f.params.len and nargs < 63) : (nargs += 1) {
+        const leading = nargs - 1;
+        var fits = true;
+        for (f.params[leading .. f.params.len - 1]) |*p| {
+            if (p.default == null and !p.is_vararg) {
+                fits = false;
+                break;
+            }
+        }
+        if (fits) accepted |= @as(u64, 1) << @intCast(nargs);
+    }
+    if (accepted == 0) return null;
+    return .{
+        .accepted_arities = accepted,
+        .value_arity = value_arity,
+        .receiver_head = receiver_head,
+    };
+}
+
+fn collectMemberTrailingLambdaShapes(module: *ir.Module, by_name: *const FileClasses) Allocator.Error!void {
+    const a = module.registry.allocator;
+    var it = by_name.iterator();
+    while (it.next()) |entry| {
+        const cls = entry.key_ptr.*;
+        const c = entry.value_ptr.get();
+        for (c.members) |*member| {
+            if (member.* != .Function) continue;
+            const f = &member.Function;
+            const shape = memberTrailingLambdaShape(module, f) orelse continue;
+            const key = ir.StrPair{ .a = cls, .b = f.name.name };
+            const gop = try module.registry.member_trailing_lambda_shapes.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            var duplicate = false;
+            for (gop.value_ptr.items) |old| {
+                const same_recv = if (old.receiver_head == null or shape.receiver_head == null)
+                    old.receiver_head == null and shape.receiver_head == null
+                else
+                    std.mem.eql(u8, old.receiver_head.?, shape.receiver_head.?);
+                if (old.accepted_arities == shape.accepted_arities and
+                    old.value_arity == shape.value_arity and same_recv)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try gop.value_ptr.append(a, shape);
+        }
+    }
+}
+
 /// Transitive member-NAME set for the member-shadow gate: every kind a bare
 /// name could bind through the implicit receiver (functions, properties,
 /// primary-ctor `val`/`var` params, nested-object/companion members), walked
@@ -1336,6 +1403,8 @@ fn buildModuleWithOverrides(
     // transplant onto the matching actual after the collection loop.
     var expect_class_ctor_params = std.StringHashMap([]const ast.ClassParam).init(a);
     defer expect_class_ctor_params.deinit();
+    var expect_class_members = std.StringHashMap([]const Decl).init(a);
+    defer expect_class_members.deinit();
 
     for (file.decls) |*d| {
         switch (d.*) {
@@ -1378,6 +1447,16 @@ fn buildModuleWithOverrides(
                     }
                     if (any_ctor_default) {
                         try expect_class_ctor_params.put(c.name.name, c.primary_params);
+                    }
+                    var any_member_default = false;
+                    for (c.members) |*m| {
+                        if (m.* != .Function) continue;
+                        for (m.Function.params) |*p| {
+                            if (p.default != null) any_member_default = true;
+                        }
+                    }
+                    if (any_member_default) {
+                        try expect_class_members.put(c.name.name, c.members);
                     }
                     continue;
                 }
@@ -1506,6 +1585,39 @@ fn buildModuleWithOverrides(
             if (ac.primary_params.len != eparams.len) continue;
             for (ac.primary_params, eparams) |*ap, *ep| {
                 if (ap.default == null) ap.default = ep.default;
+            }
+        }
+    }
+
+    // Member defaults follow the same expect/actual rule as top-level
+    // functions and constructors. The expect class is absent from
+    // `all_decls`, so copy its defaults onto the signature-matching actual
+    // member before class lowering builds default thunks and arity metadata.
+    if (expect_class_members.count() != 0) {
+        for (all_decls.items) |*d| {
+            if (d.* != .Class) continue;
+            const ac = &d.Class;
+            if (!ac.is_actual) continue;
+            const emembers = expect_class_members.get(ac.name.name) orelse continue;
+            for (ac.members) |*am| {
+                if (am.* != .Function) continue;
+                for (emembers) |*em| {
+                    if (em.* != .Function) continue;
+                    const matched = transplantExpectMemberDefaults(&am.Function, &em.Function);
+                    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                        if (std.mem.eql(u8, want, am.Function.name.name)) {
+                            std.debug.print("[expect-default] class={s} actual={s}/{d} expect={s}/{d} matched={}\n", .{
+                                ac.name.name,
+                                am.Function.name.name,
+                                am.Function.params.len,
+                                em.Function.name.name,
+                                em.Function.params.len,
+                                matched,
+                            });
+                        }
+                    }
+                    if (matched) break;
+                }
             }
         }
     }
@@ -2012,6 +2124,11 @@ fn buildModuleWithOverrides(
         }
     }
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
+    // Member signatures need the same source-order independence as top-level
+    // headers. Record the trailing receiver-lambda portion now, before any
+    // class body lowers, so inherited calls in earlier source files still
+    // receive their declaration-site lambda shape.
+    try collectMemberTrailingLambdaShapes(module, &file_classes);
     // Fill every reserved class's primary-constructor parameters BEFORE any
     // class method body is lowered. Class method bodies lower inside the loop
     // below in declaration order, so a constructor call to a class declared
@@ -4116,6 +4233,36 @@ fn retainDecl(
     }
 }
 
+fn sameExpectActualTypeHead(a: *const ast.TypeRef, b: *const ast.TypeRef) bool {
+    if (!std.mem.eql(u8, a.name.name, b.name.name) or a.nullable != b.nullable) return false;
+    if ((a.function == null) != (b.function == null)) return false;
+    if (a.function) |af| {
+        const bf = b.function.?;
+        if (af.params.len != bf.params.len or af.is_suspend != bf.is_suspend) return false;
+        if ((af.receiver == null) != (bf.receiver == null)) return false;
+    }
+    return true;
+}
+
+/// Copy defaults from an expect-class member to its matching actual member.
+/// Returns true when the declarations have the same callable signature.
+fn transplantExpectMemberDefaults(actual: *ast.Function, expected: *const ast.Function) bool {
+    if (!std.mem.eql(u8, actual.name.name, expected.name.name)) return false;
+    if (actual.params.len != expected.params.len) return false;
+    if ((actual.receiver_type == null) != (expected.receiver_type == null)) return false;
+    if (actual.receiver_type) |*ar| {
+        if (!sameExpectActualTypeHead(ar, &expected.receiver_type.?)) return false;
+    }
+    for (actual.params, expected.params) |*ap, *ep| {
+        if (!std.mem.eql(u8, ap.name.name, ep.name.name)) return false;
+        if (!sameExpectActualTypeHead(&ap.ty, &ep.ty)) return false;
+    }
+    for (actual.params, expected.params) |*ap, *ep| {
+        if (ap.default == null) ap.default = ep.default;
+    }
+    return true;
+}
+
 
 
 // -------------------------------------------------------------------------
@@ -4813,4 +4960,84 @@ test "build_module produces an owned empty module shell" {
     defer built.deinit();
     try testing.expect(built.main == null);
     try testing.expectEqual(@as(usize, 0), built.top_level_props.items.len);
+}
+
+test "expect class member defaults transplant to the matching actual signature" {
+    const s = span.Span.init(span.FileId.from(0), 0, 1);
+    const int_ty: ast.TypeRef = .{
+        .name = .{ .name = "Int", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var default_expr = ast.Expr{ .IntLit = .{ .value = 7, .kind = .Int, .span = s } };
+    var expected_param: ast.Param = undefined;
+    expected_param.name = .{ .name = "value", .span = s };
+    expected_param.ty = int_ty;
+    expected_param.default = &default_expr;
+    var actual_param: ast.Param = expected_param;
+    actual_param.default = null;
+
+    var expected: ast.Function = undefined;
+    expected.name = .{ .name = "run", .span = s };
+    expected.receiver_type = null;
+    var expected_params = [_]ast.Param{expected_param};
+    expected.params = &expected_params;
+    var actual: ast.Function = undefined;
+    actual.name = expected.name;
+    actual.receiver_type = null;
+    var actual_params = [_]ast.Param{actual_param};
+    actual.params = &actual_params;
+
+    try testing.expect(transplantExpectMemberDefaults(&actual, &expected));
+    try testing.expect(actual.params[0].default == &default_expr);
+
+    actual.params[0].default = null;
+    actual.params[0].ty.name.name = "String";
+    try testing.expect(!transplantExpectMemberDefaults(&actual, &expected));
+    try testing.expect(actual.params[0].default == null);
+}
+
+test "member receiver-lambda shape records omitted leading defaults" {
+    var module = ir.Module.init(testing.allocator);
+    defer module.deinit(testing.allocator);
+    const s = span.Span.init(span.FileId.from(0), 0, 1);
+    var default_expr = ast.Expr{ .NullLit = .{ .span = s } };
+    var scope_ty: ast.TypeRef = undefined;
+    scope_ty.name = .{ .name = "CoroutineScope", .span = s };
+    var unit_ty: ast.TypeRef = undefined;
+    unit_ty.name = .{ .name = "Unit", .span = s };
+    var fn_ty: ast.FunctionTypeRef = .{
+        .receiver = scope_ty,
+        .params = &.{},
+        .ret = unit_ty,
+        .is_suspend = true,
+        .context_params = &.{},
+        .span = s,
+    };
+    var block_ty: ast.TypeRef = undefined;
+    block_ty.name = .{ .name = "<function>", .span = s };
+    block_ty.function = &fn_ty;
+
+    var params: [3]ast.Param = undefined;
+    params[0].default = &default_expr;
+    params[0].is_vararg = false;
+    params[1].default = &default_expr;
+    params[1].is_vararg = false;
+    params[2].ty = block_ty;
+    params[2].default = null;
+    params[2].is_vararg = false;
+    var f: ast.Function = undefined;
+    f.params = &params;
+
+    const shape = memberTrailingLambdaShape(&module, &f).?;
+    try testing.expectEqual(@as(i16, 0), shape.value_arity);
+    try testing.expectEqualStrings("CoroutineScope", shape.receiver_head.?);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 1) != 0);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 2) != 0);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 3) != 0);
 }

@@ -62,6 +62,16 @@ fun main() = runBlocking {
     val invocations = runAndCount(3) { step -> acc = acc + step }
     println("acc=$acc invocations=$invocations")
 
+    // A captured cell first mentioned by interpolation in a branch that is
+    // not taken must still dominate a read from the other branch.
+    var branchCount = 0
+    val branchRead: (Boolean) -> Int = { renderMessage ->
+        branchCount++
+        if (renderMessage) "count=$branchCount".length
+        else listOf(10, 20)[branchCount - 1]
+    }
+    println("branch=${branchRead(false)} count=$branchCount")
+
     // (c) Captured var mutated inside a coroutine launch across a suspend.
     var suspended = 0
     val jobs = ArrayList<Job>()

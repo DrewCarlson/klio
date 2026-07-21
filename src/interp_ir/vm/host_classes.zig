@@ -30,6 +30,7 @@ const SupertypeDelegate = runtime.SupertypeDelegate;
 const StringSet = std.StringHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
+const ClassTable = root.ClassTable;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const ClassDef = runtime.ClassDef;
@@ -482,7 +483,6 @@ fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) All
 /// Synthesize a runtime `ClassDef` matching `build_module`'s shape for a
 /// local (function-body) class lowered at runtime.
 fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!ObjRef(ClassDef) {
-    _ = self;
     var primary_params = try allocator.alloc(ClassParamDef, class.primary_params.len);
     for (class.primary_params, 0..) |*p, i| {
         primary_params[i] = .{
@@ -515,6 +515,61 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
     for (class.supertypes, 0..) |*t, i| {
         supertype_names[i] = t.name.name;
         supertype_paths[i] = t.qualified_path;
+    }
+
+    // Local classes are registered after the program class graph has been
+    // linked, so connect their direct parent/interface handles here. Keeping
+    // only the written supertype names makes a direct `is Base` check work but
+    // loses Base's transitive interfaces (`Segment` -> `NotCompleted`).
+    var parent: ?ObjRef(ClassDef) = null;
+    errdefer if (parent) |p| p.deinit();
+    var interfaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    errdefer {
+        for (interfaces.items) |iface| iface.deinit();
+        interfaces.deinit(allocator);
+    }
+    {
+        const classes = self.classes.borrow();
+        defer classes.deinit();
+        for (supertype_names, 0..) |name, i| {
+            const qualified = if (i < supertype_paths.len) supertype_paths[i] else null;
+            // Resolve program classes through the same file/package/import
+            // index used during lowering. Only fall back to the runtime table
+            // when the supertype is another local class absent from the IR.
+            const resolved_fqn: ?[]const u8 = static: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const module = mg.get();
+                const file = class.supertypes[i].name.span.file;
+                const cid = if (qualified) |path|
+                    module.classIdByQualifiedSuffix(path)
+                else
+                    module.classIdIndexed(name, module.packageOfFile(file) orelse "", file);
+                const id = cid orelse break :static null;
+                if (id.int() >= module.classes.items.len) break :static null;
+                break :static module.classes.items[id.int()].fqn;
+            };
+            const super_def = if (resolved_fqn) |fqn|
+                classes.get().get(fqn) orelse classes.get().get(name)
+            else if (qualified) |path|
+                classes.get().get(path) orelse classByQualifiedSuffix(classes.get(), path)
+            else
+                classes.get().get(name);
+            const def = super_def orelse continue;
+            const dg = def.borrow();
+            const is_interface = dg.get().is_interface;
+            dg.deinit();
+            if (is_interface) {
+                try interfaces.append(allocator, def.clone());
+            } else if (parent == null) {
+                parent = def.clone();
+            }
+        }
+    }
+    const interface_slice = try interfaces.toOwnedSlice(allocator);
+    errdefer {
+        for (interface_slice) |iface| iface.deinit();
+        allocator.free(interface_slice);
     }
 
     // Init blocks, with each block's member-index position converted to the
@@ -552,8 +607,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .is_sealed = class.is_sealed,
         .supertype_names = supertype_names,
         .supertype_paths = supertype_paths,
-        .parent = null,
-        .interfaces = &.{},
+        .parent = parent,
+        .interfaces = interface_slice,
         .is_interface = class.is_interface,
         .is_fun_interface = class.is_fun_interface,
         .parent_ctor_args = &.{},
@@ -572,6 +627,29 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
         .is_local_runtime = true,
     });
+}
+
+/// Resolve a dotted runtime-only supertype against the class table by an
+/// aligned FQN suffix, preferring the least-nested match. Program declarations
+/// resolve through the module's scope-aware class index before this fallback.
+fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
+    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    var best: ?ObjRef(ClassDef) = null;
+    var best_len: usize = std.math.maxInt(usize);
+    var it = classes.valueIterator();
+    while (it.next()) |def| {
+        const dg = def.borrow();
+        const fqn = dg.get().fqn;
+        const matches = std.mem.endsWith(u8, fqn, qualified) and
+            (fqn.len == qualified.len or fqn[fqn.len - qualified.len - 1] == '.');
+        const fqn_len = fqn.len;
+        dg.deinit();
+        if (matches and fqn_len < best_len) {
+            best = def.*;
+            best_len = fqn_len;
+        }
+    }
+    return best;
 }
 
 /// Lower each member function of `class` into a per-method side module and

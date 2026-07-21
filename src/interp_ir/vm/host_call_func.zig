@@ -2065,6 +2065,12 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
+fn hasConstructibleClass(module: *const Module, name: []const u8) bool {
+    const cid = module.classId(name) orelse return false;
+    if (cid.int() >= module.classes.items.len) return false;
+    return !module.classes.items[cid.int()].is_abstract;
+}
+
 pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, candidate_ids: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
@@ -2141,11 +2147,13 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     var best_ord_score: i32 = 0;
     var best_low: ?FuncId = null;
     var best_low_score: i32 = 0;
+    var best_scope_tier: u8 = 255;
     for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
         // offered a plain Array) is disqualified outright.
         var is_low = false;
+        var candidate_tier: u8 = 0;
         if (funcAt(eff, cand)) |cf| {
             // The bounded set belongs to a CallMemberOrGlobal: its member and
             // extension candidates were already tried against the implicit
@@ -2153,6 +2161,11 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // package-scope functions; never reinterpret a receiver-taking
             // declaration as a receiverless global call.
             if (bounded and cf.kind != .plain) continue;
+            if (bounded) {
+                const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
+                candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
+                if (candidate_tier >= ir.Module.other_package_tier) continue;
+            }
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
             is_low = cf.low_priority;
@@ -2174,6 +2187,14 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         const pts = positionalPoints(self, eff, cand, shapes, scope);
         if (ntrace) std.debug.print("[cno] {s} cand={d} pts={?}\n", .{ name, cand.int(), pts });
         if (pts) |total| {
+            if (candidate_tier > best_scope_tier) continue;
+            if (candidate_tier < best_scope_tier) {
+                best_scope_tier = candidate_tier;
+                best_ord = null;
+                best_ord_score = 0;
+                best_low = null;
+                best_low_score = 0;
+            }
             if (is_low) {
                 if (best_low == null or total > best_low_score) {
                     best_low = cand;
@@ -2199,12 +2220,15 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     if (best_ord != null) {
         if (mg.get().classId(name)) |ccid| {
             if (ccid.int() < mg.get().classes.items.len) {
-                const ctor_sig = applicability.SigView{
-                    .params = mg.get().classes.items[ccid.int()].primary_params,
-                    .has_body = true,
-                };
-                if (applicability.applicable(&ctor_sig, shapes, scope)) |csc| {
-                    if (csc.points > best_ord_score) return .{ .ok = null };
+                const class = &mg.get().classes.items[ccid.int()];
+                if (!class.is_abstract) {
+                    const ctor_sig = applicability.SigView{
+                        .params = class.primary_params,
+                        .has_body = true,
+                    };
+                    if (applicability.applicable(&ctor_sig, shapes, scope)) |csc| {
+                        if (csc.points > best_ord_score) return .{ .ok = null };
+                    }
                 }
             }
         }
@@ -2221,7 +2245,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // Check the MAIN module for a same-name class (the pack's classes
             // live there; `eff` may be a side module whose class index misses
             // them). A class means a constructor the caller will bind.
-            const has_class = ctor_name or mg.get().classId(name) != null;
+            const has_class = ctor_name or hasConstructibleClass(mg.get(), name);
             if (!has_class) break :fallback low;
         }
         return .{ .ok = null };
@@ -2246,6 +2270,41 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
 }
 
 const testing = std.testing;
+
+test "abstract classes do not compete with same-named factory functions" {
+    const a = testing.allocator;
+    var module = Module.default(a);
+    defer module.deinit(a);
+
+    _ = try module.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Factory",
+        .fqn = "app.Factory",
+        .package = "app",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    try testing.expect(!hasConstructibleClass(&module, "Factory"));
+
+    _ = try module.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Concrete",
+        .fqn = "app.Concrete",
+        .package = "app",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try testing.expect(hasConstructibleClass(&module, "Concrete"));
+}
+
 test {
     testing.refAllDecls(@This());
 }

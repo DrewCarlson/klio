@@ -1078,7 +1078,7 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
         // mismatch the shared helper declines to adjudicate (vararg /
         // spread ambiguity); a declared non-vararg scalar param is safe.
         if (args[i] == .Array) {
-            if (overload_match.builtinParamKind(p.ty.name)) |pk| {
+            if (overload_match.builtinParamKind(overload_match.simpleName(p.ty.name))) |pk| {
                 if (pk != .array) return true;
             }
         }
@@ -1110,6 +1110,32 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
         const id = callee.IrClosure.id;
         const captures = callee.IrClosure.captures;
         if (self.closures.get(@intCast(id))) |info| {
+            if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const f = m.funcById(info.body_func);
+                var prior_this: ?Value = null;
+                for (info.capture_names, 0..) |capture_name, i| {
+                    if (!std.mem.eql(u8, capture_name, "this")) continue;
+                    const captures_g = captures.borrow();
+                    defer captures_g.deinit();
+                    if (i < captures_g.get().*.len) prior_this = captures_g.get().*[i];
+                    break;
+                }
+                const prior_name = if (prior_this) |*v| host_call_member.debugClassNameOf(self, v) else "-";
+                std.debug.print(
+                    "[callvalue-this] id={d} fn={s} recv={s} prior={s} args={d} params={d}\n",
+                    .{
+                        id,
+                        if (f) |func| func.fqn else "<unknown>",
+                        host_call_member.debugClassNameOf(self, this_value),
+                        prior_name,
+                        args.len,
+                        info.n_params,
+                    },
+                );
+            }
             // A named LOCAL FUNCTION lowers as a closure but is not a
             // receiver lambda: the caller's `this` reaches its body
             // lexically (captures), never as an argument. The

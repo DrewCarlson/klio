@@ -145,6 +145,10 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
             }
         },
         .CallValue => |c| try w.print("r{d} <- CallValue r{d} (n={d})        [DYN value]", .{ reg(c.dst), reg(c.callee), c.n_args }),
+        .CallValueWithThis => |c| try w.print(
+            "r{d} <- CallValueWithThis r{d} receiver=r{d} (n={d})        [DYN receiver value]",
+            .{ reg(c.dst), reg(c.callee), reg(c.receiver), c.n_args },
+        ),
         .CallSpread => |c| {
             try w.print("r{d} <- CallSpread r{d} (parts={d})", .{ reg(c.dst), reg(c.callee), c.parts.len });
             if (c.member) |mid| {
@@ -178,6 +182,10 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .InstanceOf => |c| try w.print("r{d} <- InstanceOf r{d}", .{ reg(c.dst), reg(c.src) }),
         .NotNullAssert => |c| try w.print("r{d} <- NotNullAssert r{d}", .{ reg(c.dst), reg(c.src) }),
         .Lambda => |c| try w.print("r{d} <- Lambda {s}#{d}", .{ reg(c.dst), funcName(m, c.body_func), c.body_func.int() }),
+        .AstLambda => |c| try w.print(
+            "r{d} <- AstLambda {s}#{d} captures={d}",
+            .{ reg(c.dst), if (c.body_func) |fid| funcName(m, fid) else "<deferred>", if (c.body_func) |fid| fid.int() else 0, c.captured_names.len },
+        ),
         else => try w.print("{s}", .{@tagName(inst.*)}),
     }
     try w.writeAll("\n");

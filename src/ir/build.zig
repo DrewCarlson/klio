@@ -42,6 +42,11 @@ const InlineLambdaFrame = struct {
     caller_scope_depth: usize,
 };
 
+const InlineCallFrame = struct {
+    name: []const u8,
+    decl: *const ast.Function,
+};
+
 /// One `(result reg, join block)` entry on the `inline_return` stack:
 /// a `return` inside an inlined body assigns the result and jumps to
 /// the join (the inline call's value).
@@ -576,9 +581,10 @@ pub const FuncBuilder = struct {
     /// Inline-expansion state. `inline_return` is a stack of
     /// (result reg, join block): a `return` inside an inlined body
     /// assigns the result and jumps to the join. `inline_stack`
-    /// guards recursive inline.
+    /// guards recursive inline by declaration identity. Same-named overloads
+    /// may delegate to one another and must remain spliceable.
     inline_return: std.ArrayList(InlineReturn) = .empty,
-    inline_stack: std.ArrayList([]const u8) = .empty,
+    inline_stack: std.ArrayList(InlineCallFrame) = .empty,
     /// Per inline-fn-splice frame: the lambda-param substitution map
     /// *and* a snapshot of `inline_return` as it was when this frame
     /// was pushed. An unlabeled `return` inside a spliced lambda must
@@ -842,7 +848,7 @@ pub const FuncBuilder = struct {
 
     pub fn currentInlineFn(self: *const FuncBuilder) ?[]const u8 {
         if (self.inline_stack.items.len == 0) return null;
-        return self.inline_stack.items[self.inline_stack.items.len - 1];
+        return self.inline_stack.items[self.inline_stack.items.len - 1].name;
     }
     pub fn pushInlineLambdaRet(self: *FuncBuilder, label: []const u8, r: Reg, end: BlockId) Allocator.Error!void {
         try self.inline_lambda_ret.append(self.allocator, .{ .label = label, .reg = r, .end = end });
@@ -883,15 +889,21 @@ pub const FuncBuilder = struct {
         self.allocator.free(saved);
     }
     pub fn inlineInProgress(self: *const FuncBuilder, name: []const u8) bool {
-        for (self.inline_stack.items) |n| {
-            if (std.mem.eql(u8, n, name)) return true;
+        for (self.inline_stack.items) |frame| {
+            if (std.mem.eql(u8, frame.name, name)) return true;
         }
         return false;
     }
-    pub fn pushInlineName(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
-        try self.inline_stack.append(self.allocator, name);
+    pub fn inlineDeclInProgress(self: *const FuncBuilder, decl: *const ast.Function) bool {
+        for (self.inline_stack.items) |frame| {
+            if (frame.decl == decl) return true;
+        }
+        return false;
     }
-    pub fn popInlineName(self: *FuncBuilder) void {
+    pub fn pushInlineDecl(self: *FuncBuilder, name: []const u8, decl: *const ast.Function) Allocator.Error!void {
+        try self.inline_stack.append(self.allocator, .{ .name = name, .decl = decl });
+    }
+    pub fn popInlineDecl(self: *FuncBuilder) void {
         _ = self.inline_stack.pop();
     }
     /// Push an inline-fn-splice frame. Takes ownership of `m`; a
@@ -1386,6 +1398,23 @@ pub const FuncBuilder = struct {
     pub fn localDeclNullable(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_decl_nullable.contains(name);
     }
+    pub fn localDeclTypesSnapshot(self: *const FuncBuilder) Allocator.Error!ir.PendingLocalDeclTypes {
+        var types = std.StringHashMap([]const u8).init(self.allocator);
+        errdefer types.deinit();
+        var type_it = self.local_decl_types.iterator();
+        while (type_it.next()) |entry| try types.put(entry.key_ptr.*, entry.value_ptr.*);
+        var nullable = std.StringHashMap(void).init(self.allocator);
+        errdefer nullable.deinit();
+        var null_it = self.local_decl_nullable.keyIterator();
+        while (null_it.next()) |name| try nullable.put(name.*, {});
+        return .{ .types = types, .nullable = nullable };
+    }
+    pub fn inheritLocalDeclTypes(self: *FuncBuilder, inherited: *const ir.PendingLocalDeclTypes) Allocator.Error!void {
+        var type_it = inherited.types.iterator();
+        while (type_it.next()) |entry| try self.local_decl_types.put(entry.key_ptr.*, entry.value_ptr.*);
+        var null_it = inherited.nullable.keyIterator();
+        while (null_it.next()) |name| try self.local_decl_nullable.put(name.*, {});
+    }
     /// Record that the local's declared type is a RECEIVER function type
     /// (`suspend Scope.() -> Unit`), so a bare invocation binds the
     /// implicit `this` as the lambda's receiver.
@@ -1641,6 +1670,13 @@ pub const FuncBuilder = struct {
     }
     pub fn isErasedRecvParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.erased_recv_params.contains(name);
+    }
+    pub fn erasedRecvParamNames(self: *const FuncBuilder) Allocator.Error!StringSet {
+        return cloneStringSet(self.allocator, &self.erased_recv_params);
+    }
+    pub fn inheritErasedRecvParams(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
+        var it = names.keyIterator();
+        while (it.next()) |k| try self.erased_recv_params.put(k.*, {});
     }
     pub fn markNonFnParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.non_fn_params.put(name, {});
@@ -2237,6 +2273,26 @@ test "record_capture is idempotent" {
     try testing.expectEqual(@as(u16, 1), idx_b);
     try testing.expectEqual(@as(u16, 0), idx_a_again);
     try testing.expectEqual(@as(usize, 2), b.capturesTaken().len);
+}
+
+test "captured local type metadata transfers to a lambda builder" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var outer = try FuncBuilder.init(testing.allocator, &m);
+    defer outer.deinit();
+    try outer.setLocalDeclType("scope", "CoroutineScope");
+    try outer.setLocalDeclNullable("scope");
+    var snapshot = try outer.localDeclTypesSnapshot();
+    defer {
+        snapshot.types.deinit();
+        snapshot.nullable.deinit();
+    }
+
+    var inner = try FuncBuilder.init(testing.allocator, &m);
+    defer inner.deinit();
+    try inner.inheritLocalDeclTypes(&snapshot);
+    try testing.expectEqualStrings("CoroutineScope", inner.localDeclType("scope").?);
+    try testing.expect(inner.localDeclNullable("scope"));
 }
 
 test "loop frame lookup by label and innermost" {

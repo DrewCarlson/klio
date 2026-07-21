@@ -145,6 +145,62 @@ test "lambda_in_subclass_calls_super" {
     try assertKlio("lambda_super", src, "sub-base-1,sub-base-2\n");
 }
 
+test "lambda captures super property and method receiver" {
+    const src =
+        \\
+        \\open class Base {
+        \\    open val label: String get() = "base-property"
+        \\    open fun ping(): String = "base-method"
+        \\}
+        \\class Derived : Base() {
+        \\    override val label: String
+        \\        get() {
+        \\            val readBase = { super.label }
+        \\            return "derived:${readBase()}"
+        \\        }
+        \\    override fun ping(): String {
+        \\        val callBase = { super.ping() }
+        \\        return "derived:${callBase()}"
+        \\    }
+        \\}
+        \\fun main() {
+        \\    val value = Derived()
+        \\    println(value.label)
+        \\    println(value.ping())
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "lambda_captures_super_receiver",
+        src,
+        "derived:base-property\nderived:base-method\n",
+    );
+}
+
+test "captured receiver alias retains its type through nested lambdas" {
+    const src =
+        \\
+        \\class Test : Base() {
+        \\    fun result(): String = runTest {
+        \\        val outerScope = this
+        \\        with("nested") {
+        \\            listOf("OK").map {
+        \\                outerScope.launch { it }
+        \\            }.single()
+        \\        }
+        \\    }
+        \\}
+        \\open class Base {
+        \\    fun runTest(prefix: String = "", block: Scope.() -> String): String = Scope().block()
+        \\}
+        \\class Scope
+        \\fun Scope.launch(block: Scope.() -> String): String = block()
+        \\fun main() { println(Test().result()) }
+        \\
+    ;
+    try assertKlio("captured_receiver_alias_type", src, "OK\n");
+}
+
 test "higher_order_local_fn_dispatch" {
     const src =
         \\

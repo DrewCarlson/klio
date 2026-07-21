@@ -193,6 +193,22 @@ pub fn argLambdaHasNonlocalReturn(args: []const Expr) bool {
     return false;
 }
 
+/// Recover the original literal when an inline body forwards one of its
+/// lambda parameters to another inline call. The forwarding expression is a
+/// plain path in the callee body, but Kotlin keeps the original lambda inline
+/// through the entire chain.
+pub fn forwardedInlineLambda(b: *const FuncBuilder, arg: *const Expr) ?*const Expr {
+    if (arg.* != .Path or arg.Path.segments.len != 1) return null;
+    return b.inlineLambdaFor(arg.Path.segments[0].name);
+}
+
+pub fn argsForwardInlineLambda(b: *const FuncBuilder, args: []const Expr) bool {
+    for (args) |*arg| {
+        if (forwardedInlineLambda(b, arg) != null) return true;
+    }
+    return false;
+}
+
 fn scanStmts(stmts: []const Stmt) bool {
     for (stmts) |*s| {
         const hit = switch (s.*) {
@@ -869,7 +885,7 @@ pub fn tryInlineCallWithTypeArgs(
             this_arg != null,
         ) orelse return null;
     }
-    if (b.inlineInProgress(fname)) {
+    if (b.inlineDeclInProgress(f)) {
         return null;
     }
     // `kotlin.reflect.typeOf<T>()` is a reified intrinsic: its source body
@@ -956,7 +972,7 @@ pub fn tryInlineCallWithTypeArgs(
     if (!inline_state.inlineExpandEnter()) {
         return null;
     }
-    try b.pushInlineName(fname);
+    try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside
     // `List<*>.countOf()` must stay spliceable) — via the dedicated
@@ -1008,6 +1024,7 @@ pub fn tryInlineCallWithTypeArgs(
     defer b.allocator.free(arg_regs);
     for (f.params, 0..) |*p, i| {
         const a = ordered[i].?; // filled above
+        const forwarded_lambda = forwardedInlineLambda(b, a);
         // A numeric literal argument re-types to its declared primitive
         // parameter (kotlinc literal typing): `f(1)` for `f(x: Long)`
         // binds a `Long`, not an `Int`. The regular call path coerces in
@@ -1064,8 +1081,10 @@ pub fn tryInlineCallWithTypeArgs(
         // non-local return. Klio doesn't currently emit a parser-level
         // diagnostic for the violation; the runtime semantics still
         // match Kotlin.
-        if (!p.is_noinline and a.* == .Lambda) {
-            try lambda_map.put(p.name.name, a);
+        if (!p.is_noinline) {
+            if (forwarded_lambda orelse (if (a.* == .Lambda) a else null)) |lam| {
+                try lambda_map.put(p.name.name, lam);
+            }
         }
     }
     // Mark params whose declared type is one of this inline fn's own
@@ -1356,7 +1375,7 @@ pub fn tryInlineCallWithTypeArgs(
     b.popInlineReturn();
     b.popInlineLambdaFrame();
     try b.popScope();
-    b.popInlineName();
+    b.popInlineDecl();
     inline_state.inlineExpandLeave();
     return result;
 }
@@ -1662,6 +1681,29 @@ test "arg_lambda_has_nonlocal_return false for non-lambda arg" {
     const lit = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } };
     const args = [_]Expr{lit};
     try testing.expect(!argLambdaHasNonlocalReturn(&args));
+}
+
+test "inline lambda forwarding preserves the original literal" {
+    var module = ir.Module.default(testing.allocator);
+    defer module.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &module);
+    defer b.deinit();
+
+    var lambda = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var substitutions = std.StringHashMap(*const ast.Expr).init(testing.allocator);
+    try substitutions.put("block", &lambda);
+    try b.pushInlineLambdaFrame(substitutions, b.scopeDepth());
+    defer b.popInlineLambdaFrame();
+
+    var segments = [_]ast.Ident{ident("block")};
+    const forwarded = Expr{ .Path = .{ .segments = &segments, .span = dummySpan() } };
+    const args = [_]Expr{forwarded};
+    try testing.expectEqual(&lambda, forwardedInlineLambda(&b, &forwarded).?);
+    try testing.expect(argsForwardInlineLambda(&b, &args));
 }
 
 fn typeRef(name: []const u8) TypeRef {
