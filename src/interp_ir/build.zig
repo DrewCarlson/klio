@@ -3298,6 +3298,10 @@ fn buildModuleWithOverrides(
     // Rebuild the name index so funcId lookups see every registered stub.
     try module.rebuildFuncNameIndex(a);
 
+    // Static dispatch bake: resolve provably-monomorphic explicit-receiver
+    // member calls to their target at lower time (see `bakeStaticMemberCalls`).
+    bakeStaticMemberCalls(module, a);
+
     return .{
         .module = module_ref,
         .classes = classes,
@@ -3331,6 +3335,93 @@ fn buildModuleWithOverrides(
         .delegated_body_props = delegated_body_props,
         .allocator = allocator,
     };
+}
+
+// -------------------------------------------------------------------------
+// Static dispatch bake (lowering-time).
+// -------------------------------------------------------------------------
+
+/// Resolve provably-monomorphic explicit-receiver member calls to their target
+/// at lower time. For each `recv.name(args)` in this module's own funcs, when
+/// `name` denotes exactly ONE body-bearing top-level extension / member-extension
+/// and NO class in this module declares a member of that name (Kotlin binds a
+/// member over an extension), the call cannot resolve to anything else at run
+/// time — so its target is settled here, in `Inst.CallMember.resolved`, and the
+/// VM dispatches straight through it, skipping the name-based member-dispatch
+/// ladder + candidate walk. This is the static-dispatch step a bytecode VM
+/// needs: the target is resolved once, at build time, not per call.
+///
+/// Soundness is checked, not assumed: `KLIO_BAKE_ASSERT` runs the full name
+/// walk and flags any callsite whose walk winner differs from the baked target
+/// (a builtin-member or cross-module shadow this static gate did not model). The
+/// runtime fast-path additionally falls back to the walk when a member-extension
+/// owner is unreachable, so a conservative bake degrades rather than miscalls.
+fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
+    var member_names = std.StringHashMap(void).init(a);
+    defer member_names.deinit();
+    for (module.classes.items) |*c| {
+        for (c.methods) |mfid| {
+            const mf = module.funcById(mfid) orelse continue;
+            member_names.put(mf.name, {}) catch {};
+        }
+    }
+
+    var baked: usize = 0;
+    var seen: usize = 0;
+    for (module.funcs.items) |*f| {
+        for (f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                switch (inst.*) {
+                    .CallMember => |*cm| {
+                        seen += 1;
+                        if (cm.resolved != null) continue;
+                        // The `resolved` fast-path dispatches positionally (it
+                        // does not forward `arg_names`), so a named-argument call
+                        // must keep the name-based path that binds by label.
+                        if (hasNamedArg(cm.arg_names)) continue;
+                        const name = switch (module.consts.items[cm.name.int()]) {
+                            .String => |s| s,
+                            else => continue,
+                        };
+                        // A member declared with this name binds ahead of any
+                        // extension (Kotlin's member-over-extension rule), so the
+                        // call is not provably the extension. A `static_recv` /
+                        // `declared_recv` only steers overload selection among
+                        // MULTIPLE candidates; with a single candidate (below) the
+                        // pick is fixed regardless, so those callsites bake too.
+                        if (member_names.contains(name)) continue;
+                        cm.resolved = uniqueMemberTarget(module, name) orelse continue;
+                        baked += 1;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    if (runtime.getenvSlice("KLIO_BAKE_STATS") != null and seen != 0) {
+        std.debug.print("[bake-stats] module funcs={d} callmembers={d} baked={d}\n", .{ module.funcs.items.len, seen, baked });
+    }
+}
+
+/// The single body-bearing top-level extension / member-extension named `name`,
+/// or null when zero or more than one exists. A CallMember's target must take an
+/// explicit receiver (`params[0].name == "this"`); uniqueness among those makes
+/// `recv.name(...)` unambiguous independent of the runtime receiver.
+fn hasNamedArg(arg_names: []const ?ir.ConstId) bool {
+    for (arg_names) |n| if (n != null) return true;
+    return false;
+}
+
+fn uniqueMemberTarget(module: *ir.Module, name: []const u8) ?ir.FuncId {
+    var found: ?ir.FuncId = null;
+    for (module.funcsBySimpleName(name)) |fid| {
+        const f = module.funcById(fid) orelse continue;
+        if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
+        if (!f.hasBody()) continue;
+        if (found != null) return null; // ambiguous
+        found = fid;
+    }
+    return found;
 }
 
 // -------------------------------------------------------------------------

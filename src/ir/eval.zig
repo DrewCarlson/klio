@@ -3884,6 +3884,18 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
+/// Kill-switch for the lowering-time static dispatch bake (`KLIO_BAKE_OFF=1`
+/// routes every `resolved` CallMember back through the name-based walk). Resolved
+/// once; a benign first-use race computes the same value. For A/B measurement and
+/// as a safety escape hatch.
+var bake_disabled: ?bool = null;
+fn bakeDisabled() bool {
+    if (bake_disabled) |v| return v;
+    const v = if (runtime.getenvSlice("KLIO_BAKE_OFF")) |s| std.mem.eql(u8, s, "1") else false;
+    bake_disabled = v;
+    return v;
+}
+
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
         if (fastSubscript(allocator, frame, cm)) |rv| {
@@ -3898,6 +3910,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         // stale bake degrades rather than miscalls.
         if (cm.resolved) |fid| {
             if (comptime @hasDecl(H, "invokeResolvedMember")) {
+                if (!bakeDisabled()) {
                 recv.retain();
                 defer recv.release(allocator);
                 const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
@@ -3910,6 +3923,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                         },
                         .err => |e| return raiseStep(frame, e),
                     }
+                }
                 }
             }
         }

@@ -2336,6 +2336,30 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
     return null;
 }
 
+/// Direct dispatch of a lowering-resolved member-EXTENSION target: seed the
+/// declaring class's `this` as an enclosing receiver (the owner-find), then run
+/// the body. `null` when the owner is not reachable, so the caller falls back to
+/// the name walk. A statically-baked member-ext `resolved` target dispatches
+/// through here.
+fn invokeMemberExtFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    const all = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all);
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    if (funcAt(mod, fid) == null) return null;
+    var pushed = false;
+    if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
+        const inst = (try memberExtOwnerInstance(self, allocator, receiver, owner)) orelse return null;
+        if (funcAt(mod, fid) != null and !funcAt(mod, fid).?.hasBody()) return null; // SAM: use the walk
+        ir.eval.pushEnclosing(&inst);
+        pushed = true;
+    }
+    const r = try callFuncRec(self, allocator, mod, fid, all);
+    if (pushed) ir.eval.popEnclosing();
+    return r;
+}
+
 /// Distance from an instance's runtime class to `target` along the
 /// supertype graph, or `null` when unreachable.
 fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8) ?usize {
@@ -8320,6 +8344,17 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
 /// existing dispatch. Positional args only (the lowerer bakes `resolved`
 /// solely for name-arg-free calls).
 pub fn invokeResolvedMember(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    // A member-extension needs its declaring class's `this` seeded as an
+    // enclosing receiver (the owner-find the walk performs) before the body
+    // runs; a plain member / top-level extension binds `[receiver] ++ args`
+    // directly. Route member-extensions through the owner-replay path, which
+    // returns null (fall back to the name walk) when the owner is unreachable.
+    const is_member_ext = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk isMemberExt(mg.get(), fid);
+    };
+    if (is_member_ext) return invokeMemberExtFuncId(self, allocator, receiver, fid, args);
     return invokeMethodFuncId(self, allocator, receiver, fid, args);
 }
 

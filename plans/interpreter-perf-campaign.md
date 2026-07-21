@@ -251,6 +251,57 @@ EVERY dispatch (member walk, extension walk, owner-find) — not just the baked 
 Care: two classes can share a simple name (the builtin-vs-user clash rule), so the
 identity comparison must resolve to the exact class, not the name.
 
+## Static dispatch bake — built, measured, and the honest conclusion
+
+Two levers were built and measured to settle the dispatch front definitively.
+
+### Identity-based conformance cache — CORRECT, but FLAT (the premise above was wrong)
+
+Implemented a per-class supertype-closure cache (`ProgramImage.conformance_cache`,
+display-normalized name -> min BFS depth, keyed by class-cell identity, built once per
+class), routing `receiverImplementsType` / `instanceSubtypeDistance` through it. Verified
+behavior-identical (`KLIO_CONFORM_ASSERT` differential, 0 mismatches across the dispatch/
+compose/subtype-heavy corpus). Result: **FLAT on the coro bench** (0.6%, noise).
+
+Root cause (corrects the lever premise): `findScalarLast` is NOT in the conformance BFS.
+Profiling `KLIO_PROF_CALLERS=findScalarLast` on the coro bench shows the callers are
+`extensionFnFallback` (the extension candidate WALK) and `callMemberInnerStatic` (the
+member-dispatch probe ladder) — `subtypeDepth`/`applicSubtypeCb` are ~0.2% combined. The
+cost is the walk's OWN per-candidate `simpleName`/`resolveExtReceiverFqn`/scoring, which
+memoizing the conformance BFS does not touch. (This change was subsequently reverted to
+keep the deliverable focused on static dispatch.)
+
+### Lowering-time static dispatch bake — BUILT, CORRECT, bytecode-VM-ready, small wall win
+
+`bakeStaticMemberCalls` (`interp_ir/build.zig`, run at each module's lowering finalize, so
+it serializes into packs) sets `Inst.CallMember.resolved` for every explicit-receiver call
+`recv.name(args)` where `name` denotes exactly ONE body-bearing top-level extension /
+member-extension and no class declares a member of that name (Kotlin's member-over-extension
+rule). The VM dispatches such a call straight through `invokeResolvedMember` (extended to
+replay a member-extension's owner-find, falling back to the walk when the owner is
+unreachable), skipping the whole `callMemberInnerStatic` ladder + `extensionFnFallback`
+walk. `KLIO_BAKE_OFF=1` is the kill-switch; `KLIO_BAKE_STATS=1` reports coverage.
+
+This IS the static-dispatch prerequisite for a bytecode VM: the target is resolved ONCE, at
+build time, not re-resolved per call. Coverage: ~787 callsites of ~14k in a coro program.
+
+Measured (ReleaseFast, coro bench, median of N; `klio run`/itests re-lower from source so the
+bake applies everywhere):
+- Correctness: 279/279 examples byte-identical bake on vs `KLIO_BAKE_OFF`. Behavior-preserving.
+- Wall: **within noise (~0.4-1.6%).**
+
+The empirical ceiling (an unverified per-callsite cache that skipped the ladder for ALL
+ext/member-ext winners) was 8% on the coro bench; the safe static bake realizes ~1% of it.
+The gap is receiver-type-differentiated overloads (`launch`/`resume`, distinguished by the
+receiver's static type, not by name-uniqueness) and member methods — but member-method
+resolution is ALREADY memoized (`instance_method_cache`), so its remaining win is small.
+
+CONCLUSION: member dispatch is a modest slice of interpreter cost (the coro bench is
+dominated by the coroutine pump, the 64-byte `Value` load/store in the eval loop, and
+allocation — see the profile above). The static-dispatch mechanism is worth keeping for
+bytecode-VM-readiness independent of the tree-walker wall win; the larger PERF levers remain
+the deferred list (Value 64->32B, register coalescing, the eval loop), not dispatch.
+
 ## Method
 
 1. Confirm premise: the CI-slow suites (coroutines_commontest baseline 220, compose,
