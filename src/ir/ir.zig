@@ -255,6 +255,13 @@ pub const Inst = union(enum) {
         /// callable. Lets `recv.method(*array)` / a bare own-member
         /// `m(*array)` dispatch through member resolution.
         member: ?ConstId = null,
+        /// The bare top-level name whose overload set lowering bounded by the
+        /// call site's package/import scope. `candidates` is authoritative
+        /// when non-null (including an empty slice); the evaluator selects
+        /// from it after spread parts have been flattened instead of invoking
+        /// the arg-blind function value in `callee`.
+        name: ?ConstId = null,
+        candidates: ?[]const FuncId = null,
     },
     /// `super.method(args)` — dispatch the named method on the
     /// receiver's value, but resolved against the parent of
@@ -492,6 +499,14 @@ pub const Inst = union(enum) {
         /// shadow it; the global leg calls exactly this declaration
         /// instead of re-resolving the simple name.
         func: ?FuncId = null,
+        /// The package/import-scoped callable set computed by the lowering
+        /// resolver. `null` is the legacy/host-symbol boundary: no complete,
+        /// rankable declaration set was available, so the runtime may consult
+        /// the name index. A non-null slice is authoritative, including an
+        /// empty slice (no package-scope callable is visible): runtime
+        /// overload selection must stay within these FuncIds and may not
+        /// widen back to every same-simple-name declaration in the program.
+        candidates: ?[]const FuncId = null,
         /// An inline-splice's bound receiver, held in a local register rather
         /// than the frame's `this` slot or a capture. When set it is the
         /// innermost implicit-receiver candidate, ahead of the frame `this`
@@ -3299,6 +3314,129 @@ pub const Module = struct {
         return list.toOwnedSlice(alloc);
     }
 
+    /// The authoritative package/import-scoped callable set for a deferred
+    /// bare call. `null` means the module has no complete, rankable declaration
+    /// set for `name` (the remaining host-only/incomplete-header boundary); a
+    /// non-null slice is bounded by Kotlin visibility, and may be empty when
+    /// rankable declarations exist but none are visible from this site.
+    pub fn boundedCallCandidates(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg_in: []const u8,
+        caller_file: FileId,
+        user_arg_count: usize,
+    ) std.mem.Allocator.Error!?[]const FuncId {
+        if (self.funcsBySimpleName(name).len == 0) return null;
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
+        const tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
+        if (tier == 255) return null;
+        if (tier >= other_package_tier) {
+            return try alloc.alloc(FuncId, 0);
+        }
+        var list: std.ArrayList(FuncId) = .empty;
+        var any_arity_match = false;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (self.declarationKind(id, f) != .plain) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) <= tier) {
+                try list.append(alloc, id);
+                if (self.globalArityCanBind(id, f, user_arg_count)) any_arity_match = true;
+            }
+        }
+        if (!any_arity_match) {
+            list.deinit(alloc);
+            return null;
+        }
+        return @as(?[]const FuncId, try list.toOwnedSlice(alloc));
+    }
+
+    /// The authoritative package/import-scoped overload set for a bare call
+    /// containing a spread argument. Scope is chosen before applicability and
+    /// only declarations with a `vararg` parameter survive: Kotlin never lets
+    /// a spread bind a fixed parameter. A non-null empty slice means the
+    /// winning scope tier has declarations for the name but no vararg target;
+    /// callers must diagnose that miss rather than widen to another package.
+    pub fn boundedSpreadCandidates(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg_in: []const u8,
+        caller_file: FileId,
+    ) std.mem.Allocator.Error!?[]const FuncId {
+        if (self.funcsBySimpleName(name).len == 0) return null;
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
+        const tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
+        if (tier == 255) return null;
+        if (tier >= other_package_tier) return try alloc.alloc(FuncId, 0);
+
+        var list: std.ArrayList(FuncId) = .empty;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (self.declarationKind(id, f) != .plain) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) > tier) continue;
+            if (!self.declarationHasVararg(id, f)) continue;
+            try list.append(alloc, id);
+        }
+        return @as(?[]const FuncId, try list.toOwnedSlice(alloc));
+    }
+
+    /// Header registration records the declaration kind before a function body
+    /// is placed. During that window the placeholder `Func.kind` may still be
+    /// its default `.plain`; resolution must trust the canonical declaration
+    /// record so extension headers never enter a receiverless global set.
+    fn declarationKind(self: *const Module, id: FuncId, f: *const Func) FuncKind {
+        if (self.decl_sigs.get(id.int())) |ds| return ds.kind;
+        return f.kind;
+    }
+
+    fn declarationHasVararg(self: *const Module, id: FuncId, f: *const Func) bool {
+        if (self.decl_sigs.get(id.int())) |ds| return ds.arity.has_vararg;
+        if (self.stubDeclArity(id)) |arity| return arity.has_vararg;
+        return anyParamVararg(f);
+    }
+
+    /// Whether declaration metadata proves that a receiverless call count can
+    /// bind. If no scoped declaration can bind, the host/incomplete-header
+    /// compatibility boundary remains active until P10 supplies a complete
+    /// declaration for the host shape.
+    fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
+        if (self.decl_sigs.get(id.int())) |ds| {
+            if (want < ds.arity.required) return false;
+            return ds.arity.has_vararg or want <= ds.arity.total;
+        }
+        var required: usize = 0;
+        var total: usize = 0;
+        var has_vararg = false;
+        for (f.params) |p| {
+            total += 1;
+            if (p.is_vararg) {
+                has_vararg = true;
+            } else if (!p.has_default) {
+                required += 1;
+            }
+        }
+        if (want < required) return false;
+        return has_vararg or want <= total;
+    }
+
+    /// The best visible tier among receiverless package-scope functions.
+    /// Members and extensions are handled by the receiver leg of
+    /// `CallMemberOrGlobal`; allowing them to establish this tier would let an
+    /// own-class test method hide an imported top-level function from the
+    /// terminal global leg.
+    fn lowestVisibleGlobalTier(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+        var best: u8 = 255;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            if (self.declarationKind(id, f) != .plain) continue;
+            if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
+            const t = self.bareCallTier(f, name, caller_pkg, caller_file);
+            if (t < best) best = t;
+        }
+        return best;
+    }
+
     /// The lowest scope tier among the rankable (body, or stub with a declared
     /// arity record) candidates named `name`, or 255 when none exists.
     fn lowestVisibleTier(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
@@ -5025,6 +5163,95 @@ test "symbol index classifies a type-distinguishable overload set" {
     const got = m.resolveBareCallIndexed("f", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.type_overload, deferReasonOf(got).?);
     try testing.expectEqual(@as(usize, 2), got.tier_count);
+}
+
+test "bounded call candidates never widen beyond the caller scope" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const app_int = try pushTestFuncOpts(&m, a, "choose", "app.choose", "app", 1, .{ .param_ty = "Int" });
+    const app_string = try pushTestFuncOpts(&m, a, "choose", "app.choose", "app", 1, .{ .param_ty = "String" });
+    _ = try pushTestFuncOpts(&m, a, "choose", "lib.choose", "lib", 1, .{ .param_ty = "Int" });
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedCallCandidates(a, "choose", "app", FileId.from(0), 1)).?;
+    defer a.free(scoped);
+    try testing.expectEqual(@as(usize, 2), scoped.len);
+    try testing.expectEqual(app_int.int(), scoped[0].int());
+    try testing.expectEqual(app_string.int(), scoped[1].int());
+
+    const invisible = (try m.boundedCallCandidates(a, "choose", "other", FileId.from(0), 1)).?;
+    defer a.free(invisible);
+    try testing.expectEqual(@as(usize, 0), invisible.len);
+    try testing.expect((try m.boundedCallCandidates(a, "missing", "app", FileId.from(0), 0)) == null);
+}
+
+test "bounded call candidates preserve the incomplete-header host boundary" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "hostOnly", "platform.hostOnly", "platform", 1, .{ .stub = true });
+    try m.rebuildFuncNameIndex(a);
+
+    try testing.expect((try m.boundedCallCandidates(a, "hostOnly", "app", FileId.from(0), 1)) == null);
+}
+
+test "bounded global candidates ignore a same-name member tier" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const global = try pushTestFuncOpts(&m, a, "minOf", "kotlin.comparisons.minOf", "kotlin.comparisons", 2, .{});
+    const member = try pushTestFuncOpts(&m, a, "minOf", "test.collections.CollectionTest.minOf", "test.collections", 0, .{});
+    try m.decl_sigs.put(member.int(), .{
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedCallCandidates(a, "minOf", "test.collections", FileId.from(0), 2)).?;
+    defer a.free(scoped);
+    try testing.expectEqual(@as(usize, 1), scoped.len);
+    try testing.expectEqual(global.int(), scoped[0].int());
+    try testing.expect((try m.boundedCallCandidates(a, "minOf", "test.collections", FileId.from(0), 4)) == null);
+}
+
+test "bounded spread candidates keep only varargs in the winning scope" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 2, .{});
+    const app_ints = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 2, .{ .last_vararg = true, .param_ty = "Int" });
+    const app_strings = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 2, .{ .last_vararg = true, .param_ty = "String" });
+    _ = try pushTestFuncOpts(&m, a, "pick", "other.pick", "other", 2, .{ .last_vararg = true });
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedSpreadCandidates(a, "pick", "app", FileId.from(0))).?;
+    defer a.free(scoped);
+    try testing.expectEqual(@as(usize, 2), scoped.len);
+    try testing.expectEqual(app_ints.int(), scoped[0].int());
+    try testing.expectEqual(app_strings.int(), scoped[1].int());
+}
+
+test "bounded spread candidates do not widen past a fixed-only tier" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "pick", "imports.pick", "imports", 2, .{});
+    _ = try pushTestFuncOpts(&m, a, "pick", "app.pick", "app", 2, .{ .last_vararg = true });
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "imports";
+    segs[1] = "pick";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "imports.pick"), .segs = segs });
+    var inner = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try inner.put("pick", paths);
+    try m.registry.import_aliases.put(FileId.from(0), inner);
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedSpreadCandidates(a, "pick", "app", FileId.from(0))).?;
+    defer a.free(scoped);
+    try testing.expectEqual(@as(usize, 0), scoped.len);
 }
 
 /// Record a declared-signature entry (all params `ty_name`, non-null,

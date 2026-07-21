@@ -177,8 +177,8 @@ pub const ApplicabilityScope = struct {
 
     /// Select the runtime NAMED-ARGUMENT scoring conventions
     /// (`host_call_func.zig` `scoreNamedCandidate`): each arg's `named` binds to
-    /// its distinct same-named parameter, positional args fill the rest (a final
-    /// vararg absorbing the overflow), and every unfilled non-vararg parameter
+    /// its distinct same-named parameter, positional args fill the rest (a
+    /// vararg absorbing the arguments at its position), and every unfilled non-vararg parameter
     /// must be defaultable. Unlike the positional/member scorers, a per-arg type
     /// mismatch is NEUTRAL (scores 0) rather than disqualifying: named-parameter
     /// presence is the hard discriminator, the type score only ranks survivors.
@@ -858,12 +858,15 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
-    // Under-applied: every unfilled parameter must carry a default.
+    // Under-applied: every unfilled parameter must carry a default or be a
+    // vararg, which Kotlin materializes as an empty array. This matters after
+    // an empty spread is flattened: `listOf(*emptyArray())` reaches the scorer
+    // with zero scalar arguments but still binds `vararg elements`.
     if (params.len > args.len) {
         var all_defaulted = true;
         var i = args.len;
         while (i < params.len) : (i += 1) {
-            if (!paramHasDefault(sig, i)) {
+            if (!paramHasDefault(sig, i) and !params[i].is_vararg) {
                 all_defaulted = false;
                 break;
             }
@@ -1126,7 +1129,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
 // `scoreNamedCandidate`). A named/defaulted/reordered call binds each `named`
 // arg to its distinct same-named parameter, positional args fill the remaining
 // slots (a trailing callable binds out of sequence to the last function-typed
-// param, a final vararg absorbs positional overflow), and every unfilled
+// param, a vararg absorbs positional arguments at its position), and every unfilled
 // non-vararg parameter must be defaultable. A per-arg type mismatch scores 0
 // (neutral) instead of disqualifying the candidate; only a named arg that no
 // parameter accepts, a doubly-filled parameter, or an over-supplied
@@ -1192,22 +1195,54 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         }
     }
 
-    // Vararg-aware positional walk.
-    const has_vararg = params.len > 0 and params[params.len - 1].is_vararg;
+    // Vararg-aware positional walk. Kotlin permits parameters after a vararg;
+    // when those parameters were supplied by name, every remaining positional
+    // argument at the vararg position belongs to the vararg. For generated
+    // slot-exact calls, retain enough trailing positional arguments to fill
+    // the still-unbound, non-defaulted parameters after it.
+    var vararg_pos: ?usize = null;
+    for (params, 0..) |p, pi| {
+        if (p.is_vararg) {
+            vararg_pos = pi;
+            break;
+        }
+    }
+    var positional_left: usize = 0;
+    for (args, 0..) |a, i| {
+        if (a.named != null) continue;
+        if (trailing_lambda != null and i == trailing_lambda.?) continue;
+        positional_left += 1;
+    }
     var pidx: usize = 0;
     for (args, 0..) |*a, i| {
         if (a.named != null) continue;
         if (trailing_lambda != null and i == trailing_lambda.?) continue;
         while (pidx < params.len and filled[pidx]) pidx += 1;
-        if (pidx >= params.len) {
-            if (has_vararg) {
-                if (bind) |bb| {
-                    if (i < bb.len) bb[i] = @intCast(params.len - 1);
+
+        if (vararg_pos) |vp| {
+            if (pidx == vp) {
+                var required_tail: usize = 0;
+                for (params[vp + 1 ..], vp + 1 ..) |p, pi| {
+                    if (filled[pi] or p.is_vararg or paramHasDefault(sig, pi)) continue;
+                    required_tail += 1;
                 }
-                continue;
+                if (positional_left > required_tail) {
+                    const elem = varargElementRef(&params[vp].ty);
+                    const target: *const TypeRef = if (a.is_spread) &params[vp].ty else &elem;
+                    total += scoreArg(sig, target, a, &scope) orelse 0;
+                    if (argIsProven(a)) proven += 1 else unknown += 1;
+                    if (bind) |bb| {
+                        if (i < bb.len) bb[i] = @intCast(vp);
+                    }
+                    positional_left -= 1;
+                    continue;
+                }
+                pidx = vp + 1;
+                while (pidx < params.len and filled[pidx]) pidx += 1;
             }
-            return null; // too many positional args
         }
+
+        if (pidx >= params.len) return null;
         total += scoreArg(sig, &params[pidx].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         if (bind) |bb| {
@@ -1215,6 +1250,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         }
         filled[pidx] = true;
         pidx += 1;
+        positional_left -= 1;
     }
 
     // Every unfilled non-vararg parameter must be defaultable.
@@ -1331,6 +1367,16 @@ test "applicable: under-application with a default scores with the -1 penalty" {
     const sc = applicable(&sig, &args, .{}).?;
     // 100 (exact head) - 1 (under-application) == 99.
     try testing.expectEqual(@as(i32, 99), sc.points);
+    try testing.expect(!sc.exact_arity);
+}
+
+test "applicable: an empty trailing vararg is applicable" {
+    var p = oneParam("Array");
+    p[0].is_vararg = true;
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{};
+    const sc = applicable(&sig, &args, .{}).?;
+    try testing.expectEqual(@as(i32, -1), sc.points);
     try testing.expect(!sc.exact_arity);
 }
 
@@ -1595,6 +1641,43 @@ test "applicable named: reordered named args bind by name and record the binding
     try testing.expectEqual(@as(i32, 200), sc.points);
     try testing.expectEqual(@as(u16, 1), sc.binding.arg_to_param[0]); // b -> param 1
     try testing.expectEqual(@as(u16, 0), sc.binding.arg_to_param[1]); // a -> param 0
+}
+
+test "applicable named: non-final vararg absorbs values before a named tail" {
+    const p = [_]Param{
+        .{ .name = "a", .ty = tref("T"), .default = null },
+        .{ .name = "other", .ty = tref("T"), .default = null, .is_vararg = true },
+        .{ .name = "comparator", .ty = tref("Comparator"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Card" },
+        .{ .runtime_class = "Card" },
+        .{ .runtime_class = "Card" },
+        .{ .runtime_class = "Comparator", .named = "comparator" },
+    };
+    var bind_buf: [4]u16 = undefined;
+    const scope = ApplicabilityScope{ .named = true, .arg_to_param_buf = &bind_buf };
+    const sc = applicable(&sig, &args, scope).?;
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 1, 2 }, sc.binding.arg_to_param);
+}
+
+test "applicable named: non-final vararg leaves a required positional tail" {
+    const p = [_]Param{
+        .{ .name = "head", .ty = tref("Int"), .default = null },
+        .{ .name = "middle", .ty = tref("Int"), .default = null, .is_vararg = true },
+        .{ .name = "tail", .ty = tref("String"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int" },
+        .{ .runtime_class = "Int" },
+        .{ .runtime_class = "String" },
+    };
+    var bind_buf: [3]u16 = undefined;
+    const scope = ApplicabilityScope{ .named = true, .arg_to_param_buf = &bind_buf };
+    const sc = applicable(&sig, &args, scope).?;
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, sc.binding.arg_to_param);
 }
 
 test "applicable named: a name matching no parameter is a hard reject" {

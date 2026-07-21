@@ -95,6 +95,26 @@ test "override_open_property_with_getter" {
     try assertKlio("open_prop_getter", src, "woof,meow,?\n");
 }
 
+test "stored_override_dispatches_from_base_computed_getter" {
+    const src =
+        \\
+        \\open class Base {
+        \\    open val handled: Boolean get() = true
+        \\    fun read(): Boolean = handled
+        \\}
+        \\class Derived : Base() {
+        \\    override val handled: Boolean = false
+        \\}
+        \\fun main() {
+        \\    val value: Base = Derived()
+        \\    println(value.handled)
+        \\    println(value.read())
+        \\}
+        \\
+    ;
+    try assertKlio("stored_override_base_getter", src, "false\nfalse\n");
+}
+
 test "backing_field_field_keyword" {
     const src =
         \\

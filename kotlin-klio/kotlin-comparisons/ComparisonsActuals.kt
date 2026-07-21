@@ -58,6 +58,42 @@ public actual fun minOf(a: Double, b: Double, c: Double): Double {
     return kotlin.math.min(a, kotlin.math.min(b, c))
 }
 
+public actual fun minOf(a: Byte, vararg other: Byte): Byte {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
+public actual fun minOf(a: Short, vararg other: Short): Short {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
+public actual fun minOf(a: Int, vararg other: Int): Int {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
+public actual fun minOf(a: Long, vararg other: Long): Long {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
+public actual fun minOf(a: Float, vararg other: Float): Float {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
+public actual fun minOf(a: Double, vararg other: Double): Double {
+    var min = a
+    for (value in other) min = minOf(min, value)
+    return min
+}
+
 public actual fun maxOf(a: Byte, b: Byte): Byte {
     return if (a >= b) a else b
 }
@@ -106,6 +142,42 @@ public actual fun maxOf(a: Double, b: Double, c: Double): Double {
     return kotlin.math.max(a, kotlin.math.max(b, c))
 }
 
+public actual fun maxOf(a: Byte, vararg other: Byte): Byte {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
+public actual fun maxOf(a: Short, vararg other: Short): Short {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
+public actual fun maxOf(a: Int, vararg other: Int): Int {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
+public actual fun maxOf(a: Long, vararg other: Long): Long {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
+public actual fun maxOf(a: Float, vararg other: Float): Float {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
+public actual fun maxOf(a: Double, vararg other: Double): Double {
+    var max = a
+    for (value in other) max = maxOf(max, value)
+    return max
+}
+
 public actual fun <T : Comparable<T>> minOf(a: T, b: T): T {
     return if (a <= b) a else b
 }
@@ -122,4 +194,16 @@ public actual fun <T : Comparable<T>> maxOf(a: T, b: T): T {
 public actual fun <T : Comparable<T>> maxOf(a: T, b: T, c: T): T {
     val ab = if (a >= b) a else b
     return if (ab >= c) ab else c
+}
+
+public actual fun <T : Comparable<T>> minOf(a: T, vararg other: T): T {
+    var min = a
+    for (value in other) if (min > value) min = value
+    return min
+}
+
+public actual fun <T : Comparable<T>> maxOf(a: T, vararg other: T): T {
+    var max = a
+    for (value in other) if (max < value) max = value
+    return max
 }

@@ -190,6 +190,21 @@ pub fn math_max(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allocator.Error!EvalResult {
+    // A statically selected final-vararg overload reaches its native form with
+    // the vararg materialized in the second ABI slot. Normalize that packed
+    // array to the flat value sequence consumed by the intrinsic.
+    if (ctx.args.len == 2 and ctx.args[1] == .Array) {
+        const tail = try ctx.args[1].Array.snapshot(ctx.allocator);
+        defer ctx.allocator.free(tail);
+        const flat = try ctx.allocator.alloc(Value, tail.len + 1);
+        defer ctx.allocator.free(flat);
+        flat[0] = ctx.args[0];
+        @memcpy(flat[1..], tail);
+        var flattened = ctx.*;
+        flattened.args = flat;
+        return cmp_extreme(&flattened, want_min, what);
+    }
+
     // `maxOf(a, b, comparator)` / `maxOf(a, b, c, comparator)` /
     // `maxOf(a, vararg other, comparator)`: a trailing `Comparator` picks the
     // extreme of the preceding values by `comparator.compare`, not numerically.
@@ -1137,6 +1152,17 @@ test "min and max widen and propagate NaN" {
     var c5 = makeCtx(&.{ .{ .Char = 'b' }, .{ .Char = 'a' } }, &h, &cap);
     const r5 = try math_min(&c5);
     try testing.expectEqual(@as(u16, 'a'), r5.ok.Char);
+
+    // Static vararg dispatch materializes the spread as a primitive array.
+    const packed_values = try runtime.ArrayData.initPacked(testing.allocator, .Double, &.{
+        .{ .Double = 2.0 },
+        .{ .Double = std.math.nan(f64) },
+    });
+    defer packed_values.Array.deinitStorage();
+    var c6 = makeCtx(&.{ .{ .Double = 5.0 }, packed_values }, &h, &cap);
+    const r6 = try math_min(&c6);
+    try testing.expect(r6.ok == .Double);
+    try testing.expect(std.math.isNan(r6.ok.Double));
 }
 
 test "min and max compare unsigned operands by magnitude" {

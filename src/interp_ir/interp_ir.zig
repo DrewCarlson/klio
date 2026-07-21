@@ -185,9 +185,16 @@ pub const ProgramImage = struct {
     /// `lookupIntrinsic`s (each a double `prog`/bindings borrow) on EVERY member
     /// call — the dominant constant-factor cost for member-heavy code. Only
     /// non-`Instance`, non-array-builder receivers are cached (their resolution
-    /// is a pure function of the key); the keys are stable string pointers
-    /// (static type FQNs, interned method names), so this is keyed by identity.
+    /// is a pure function of the key). Method names are canonicalized through
+    /// `member_names` before their pointer identity enters any dispatch cache.
     member_resolve_cache: std.AutoHashMap(MemberResolveKey, MemberResolveEntry),
+    /// Program-lifetime canonical storage for method names used by the dispatch
+    /// caches below. Most calls carry an IR-interned name, but a callable
+    /// reference reads its name from a collected runtime String. Allocator reuse
+    /// can give two different such names the same temporary address; converting
+    /// every name to this content-interned address keeps pointer-keyed caches
+    /// both fast and exact.
+    member_names: std.StringHashMap(void),
     /// Monomorphic inline cache for user-class instance-method dispatch. Without
     /// it, every `inst.method()` re-walks the class hierarchy (linear class +
     /// method scans, string compares) and heap-allocates a work queue + seen-set
@@ -332,6 +339,7 @@ pub const ProgramImage = struct {
             .any_member_globals = std.StringHashMap([]const u8).init(allocator),
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
+            .member_names = std.StringHashMap(void).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
@@ -374,6 +382,11 @@ pub const ProgramImage = struct {
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
         }
         self.member_resolve_cache.deinit();
+        {
+            var it = self.member_names.keyIterator();
+            while (it.next()) |name| self.allocator.free(name.*);
+        }
+        self.member_names.deinit();
         self.instance_method_cache.deinit();
         self.ext_method_cache.deinit();
         {
@@ -386,6 +399,19 @@ pub const ProgramImage = struct {
         self.overload_cache.deinit();
         self.field_read_cache.deinit();
         self.func_owner_class_cache.deinit();
+    }
+
+    /// Return the program-lifetime pointer identity for `name`. Cache callers
+    /// must decline to cache when allocation fails rather than keying a
+    /// temporary runtime string directly.
+    pub fn memberNameIdentity(self: *ProgramImage, name: []const u8) ?usize {
+        if (self.member_names.getKey(name)) |stored| return @intFromPtr(stored.ptr);
+        const owned = self.allocator.dupe(u8, name) catch return null;
+        self.member_names.put(owned, {}) catch {
+            self.allocator.free(owned);
+            return null;
+        };
+        return @intFromPtr(owned.ptr);
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {
@@ -519,24 +545,30 @@ pub const ProgramImage = struct {
         return f.params.len;
     }
 
-    /// Whether every value parameter of `f` is typed by one of the func's
-    /// own declared type parameters (`fun <T : Comparable<T>> minOf(a: T,
-    /// b: T)`). The registry's `func_type_params` carries the declared
-    /// type-parameter names.
+    fn typeUsesTypeParam(ty: *const ir.TypeRef, type_params: []const []const u8) bool {
+        var head = ty.name;
+        if (std.mem.startsWith(u8, head, "in#")) head = head["in#".len..];
+        if (std.mem.startsWith(u8, head, "out#")) head = head["out#".len..];
+        for (type_params) |tp| {
+            if (std.mem.eql(u8, head, tp)) return true;
+        }
+        for (ty.args) |*arg| {
+            if (typeUsesTypeParam(arg, type_params)) return true;
+        }
+        return false;
+    }
+
+    /// Whether every value parameter of `f` depends on one of the function's
+    /// own declared type parameters. This includes structural uses such as
+    /// `Comparator<in T>`, not only a bare `T` head. The registry's
+    /// `func_type_params` carries the declared type-parameter names.
     fn funcHasGenericSig(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
         const tps = module.registry.func_type_params.get(fid) orelse return false;
         if (tps.items.len == 0) return false;
         const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (f.params.len == off) return false;
         for (f.params[off..]) |*p| {
-            var is_tp = false;
-            for (tps.items) |tp| {
-                if (std.mem.eql(u8, p.ty.name, tp)) {
-                    is_tp = true;
-                    break;
-                }
-            }
-            if (!is_tp) return false;
+            if (!typeUsesTypeParam(&p.ty, tps.items)) return false;
         }
         return true;
     }
@@ -830,7 +862,7 @@ fn closureSingletonThunk(id: u64) u64 {
     const info = sc.get(id) orelse return 0;
     // A reclaimed slot's metadata is gone; a captured closure keeps per-instance
     // identity (Kotlin makes only non-capturing lambdas singletons).
-    if (info.reclaimed or info.capture_names.len != 0) return 0;
+    if (info.reclaimed or info.capture_names.len != 0 or info.chain.len != 0) return 0;
     const mod_bits: u64 = if (info.module) |m| @intFromPtr(m) else 0;
     var h: u64 = 1469598103934665603;
     h = (h ^ mod_bits) *% 1099511628211;
@@ -850,6 +882,15 @@ pub fn gcInstallClosureHook(closures: SharedClosures) void {
     // mark/free hooks so the GC roots and reclaims those frames.
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
     runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
+}
+
+/// Clear program-owned closure hooks before a repeated in-process runner
+/// collects the completed program graph and releases its phase arena.
+pub fn gcResetProgramHooks() void {
+    active_closures = null;
+    runtime.gc.markClosureHook = null;
+    runtime.gc.sweepClosureHook = null;
+    runtime.gc.closureSingletonHook = null;
 }
 
 /// Lambda/closure side-table shared across every OS thread of one
@@ -1505,6 +1546,44 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
 }
 
+test "linkResolvedForms keeps a structurally generic overload body" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| {
+            a.free(f.blocks);
+            if (f.params.len != 0) a.free(f.params);
+        }
+        m.deinit(a);
+    }
+
+    const fqn = "kotlin.comparisons.choose";
+    const generic = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
+    const concrete = try pushLinkTestFuncParams(&m, a, "choose", fqn, 3, false);
+    var comparator_args = [_]ir.TypeRef{.{ .name = "in#T", .nullable = false, .args = &.{} }};
+    const gp = @constCast(m.funcById(generic).?.params);
+    gp[0].ty = .{ .name = "T", .nullable = false, .args = &.{} };
+    gp[1].ty = .{ .name = "T", .nullable = false, .args = &.{} };
+    gp[1].is_vararg = true;
+    gp[2].ty = .{ .name = "Comparator", .nullable = false, .args = &comparator_args };
+    var type_params: std.ArrayList([]const u8) = .empty;
+    try type_params.append(a, "T");
+    try m.registry.func_type_params.put(generic, type_params);
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        try bg.get().register(fqn, linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+
+    try testing.expect(prog.resolvedNativeForm(generic) == null);
+    try testing.expect(prog.resolvedNativeForm(concrete) != null);
+}
+
 test "a bodyless expect never links to a same-named function in another package" {
     const a = testing.allocator;
     var m = Module.default(a);
@@ -1679,6 +1758,38 @@ test "shared closures push is append-stable" {
     try testing.expectEqual(@as(u64, 1), id1);
     try testing.expect(sc.get(0) != null);
     try testing.expect(sc.get(2) == null);
+}
+
+test "dispatch cache method identities survive runtime string address reuse" {
+    var prog = try ProgramImage.init(testing.allocator);
+    defer prog.deinit();
+
+    var runtime_name = [_]u8{ 't', 'o', 'D', 'o', 'u', 'b', 'l', 'e' };
+    const double_id = prog.memberNameIdentity(&runtime_name).?;
+    @memcpy(&runtime_name, "toUShort");
+    const ushort_id = prog.memberNameIdentity(&runtime_name).?;
+    try testing.expect(double_id != ushort_id);
+
+    @memcpy(&runtime_name, "toDouble");
+    try testing.expectEqual(double_id, prog.memberNameIdentity(&runtime_name).?);
+}
+
+test "closure singleton identity excludes lexical receiver chains" {
+    const sc = try SharedClosures.new(testing.allocator);
+    defer sc.deinit();
+    active_closures = sc;
+    defer active_closures = null;
+    const caps = try ObjRef(std.ArrayList(Value)).init(testing.allocator, .empty);
+    defer caps.deinit();
+
+    const plain0 = try sc.push(.{ .body_func = .from(7), .n_params = 0, .capture_names = &.{}, .captures = caps });
+    const plain1 = try sc.push(.{ .body_func = .from(7), .n_params = 0, .capture_names = &.{}, .captures = caps });
+    try testing.expect(closureSingletonThunk(plain0) != 0);
+    try testing.expectEqual(closureSingletonThunk(plain0), closureSingletonThunk(plain1));
+
+    const chain = &[_]ir.eval.EnclosingEntry{.{ .v = .Unit }};
+    const lexical = try sc.push(.{ .body_func = .from(7), .n_params = 0, .capture_names = &.{}, .captures = caps, .chain = chain });
+    try testing.expectEqual(@as(u64, 0), closureSingletonThunk(lexical));
 }
 
 test "shared output records and replays into the real sink" {

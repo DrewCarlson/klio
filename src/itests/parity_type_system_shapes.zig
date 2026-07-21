@@ -134,6 +134,18 @@ test "kclass_simple_name" {
     try assertKlio("kclass_name", src, "Box,Box\n");
 }
 
+test "callable_class_literal_is_a_kclass" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val block = { 1 }
+        \\    println(block::class.simpleName)
+        \\}
+        \\
+    ;
+    try assertKlio("callable_kclass_name", src, "Function\n");
+}
+
 test "type_parameter_method_resolution" {
     const src =
         \\

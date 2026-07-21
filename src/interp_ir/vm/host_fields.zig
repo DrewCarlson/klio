@@ -761,7 +761,12 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     }
                 }
             }
-            if (receiver.* == .Instance) {
+            const lexical_private_getter = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
+            };
+            if (receiver.* == .Instance and !lexical_private_getter) {
                 var cur: ?[]const u8 = className(receiver.Instance);
                 var seen: std.ArrayList([]const u8) = .empty;
                 defer seen.deinit(allocator);
@@ -769,6 +774,21 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     cur = null;
                     if (containsStr(seen.items, cn)) break;
                     try seen.append(allocator, cn);
+                    const stored_here = blk: {
+                        const cg = self.classes.borrow();
+                        defer cg.deinit();
+                        const def = cg.get().get(cn) orelse break :blk false;
+                        const dg = def.borrow();
+                        defer dg.deinit();
+                        break :blk declaresStored(dg.get(), prop);
+                    };
+                    // A concrete stored override is itself the virtual
+                    // implementation of the property. Stop before an inherited
+                    // computed getter and let the ordinary field path select
+                    // the override's backing cell.
+                    if (stored_here) {
+                        return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                    }
                     const vfid = blk: {
                         const pg = self.prog.borrow();
                         defer pg.deinit();

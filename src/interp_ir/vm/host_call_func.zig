@@ -2065,12 +2065,18 @@ fn attachDeclaredElemTypes(module: *const Module, func: FuncId, type_args: []con
     runtime.attachDeclaredElemTypes(f.fqn, type_args, &result.ok);
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, candidate_ids: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
     defer mg.deinit();
-    const eff: *const Module = if (module.func_index.items.len == 0) mg.get() else module;
+    const bounded = candidate_ids != null;
+    // Candidate ids are assigned against the assembled program image even
+    // when the executing frame belongs to a copied stdlib func or a synthetic
+    // side module. The set narrows which ids may run; it must be dereferenced
+    // by the image that owns those ids. Legacy unbounded lookup retains the
+    // frame-module rule because it searches that module's name index.
+    const eff: *const Module = if (bounded or module.func_index.items.len == 0) mg.get() else module;
     // The package the visibility filter scopes against. For an ordinary
     // packaged caller this is `caller_pkg`, so the filter and the dispatch
     // below behave exactly as before. Only when the caller frame is a
@@ -2086,9 +2092,16 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // authority as `func_index` (every append pairs with a name-index
     // push); the old per-call linear scan of the whole index was the
     // hottest frame in the interpreter profile.
-    const candidates = eff.funcsBySimpleName(name);
+    const candidates = candidate_ids orelse eff.funcsBySimpleName(name);
     const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
-    if (candidates.len < 2) {
+    if (ntrace) std.debug.print("[cno] {s} bounded={} cands={d} eff_funcs={d} frame_funcs={d}\n", .{
+        name,
+        bounded,
+        candidates.len,
+        eff.func_index.items.len,
+        module.func_index.items.len,
+    });
+    if (!bounded and candidates.len < 2) {
         if (ntrace) std.debug.print("[cno] {s} cands={d} -> decline\n", .{ name, candidates.len });
         return .{ .ok = null };
     }
@@ -2134,6 +2147,12 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         // offered a plain Array) is disqualified outright.
         var is_low = false;
         if (funcAt(eff, cand)) |cf| {
+            // The bounded set belongs to a CallMemberOrGlobal: its member and
+            // extension candidates were already tried against the implicit
+            // receiver chain. The terminal global leg may execute only plain
+            // package-scope functions; never reinterpret a receiver-taking
+            // declaration as a receiverless global call.
+            if (bounded and cf.kind != .plain) continue;
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
             is_low = cf.low_priority;
@@ -2142,7 +2161,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // pack's `max(Dp, Dp)` must not swallow `kotlin.math.max(Int,
             // Int)` just because the intrinsic carries no rankable body.
             // Extensions stay: receiver narrowing is their discriminator.
-            if (scope_pkg.len != 0 and
+            if (!bounded and scope_pkg.len != 0 and
                 !(cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")))
             {
                 const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
@@ -2218,7 +2237,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // (a synthesized empty-package frame), that re-pick runs without scope and
     // would re-cross to the twin; dispatch `func` exactly to hold the pick.
     // The narrow condition keeps every ordinary call on the re-pick path.
-    const exact_dispatch = anchored and excluded_xpkg;
+    const exact_dispatch = bounded or (anchored and excluded_xpkg);
     const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, exact_dispatch);
     return switch (r) {
         .ok => |v| .{ .ok = v },

@@ -3938,6 +3938,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .arg_names = arg_names_c,
                         .recv = recv,
                         .func = fid,
+                        .candidates = try cmgCandidates(b, mname, callee.Member.name.span.file, run[1]),
                         .type_args = ta_ids,
                     } });
                     return dst;
@@ -4309,6 +4310,7 @@ fn lowerCallWithWritebackPath(
                     .n_args = @intCast(arg_regs.len),
                     .arg_names = an,
                     .func = bound_id,
+                    .candidates = try cmgCandidates(b, segments[0].name, segments[0].span.file, arg_regs.len),
                     .static_recv = try cmgStaticRecv(b),
                 } });
                 return dst;
@@ -4325,6 +4327,7 @@ fn lowerCallWithWritebackPath(
                     .arg_names = an,
                     .func = bound_id,
                     .recv = tr,
+                    .candidates = try cmgCandidates(b, segments[0].name, segments[0].span.file, arg_regs.len),
                     .static_recv = try cmgStaticRecv(b),
                 } });
                 return dst;
@@ -4385,6 +4388,7 @@ fn lowerCallWithWritebackPath(
                     .n_args = n_args,
                     .arg_names = arg_names,
                     .recv = this_reg,
+                    .candidates = try cmgCandidates(b, segments[0].name, segments[0].span.file, n_args),
                     .static_recv = try cmgStaticRecv(b),
                 } });
             } else {
@@ -4398,6 +4402,7 @@ fn lowerCallWithWritebackPath(
                     .args = args_start,
                     .n_args = n_args,
                     .arg_names = arg_names,
+                    .candidates = try cmgCandidates(b, segments[0].name, segments[0].span.file, n_args),
                     .static_recv = try cmgStaticRecv(b),
                 } });
             }
@@ -4562,6 +4567,8 @@ fn lowerCallSpread(
     // receiver and carry the method name so the evaluator routes through
     // `callMemberNamed`.
     var member_id: ?ConstId = null;
+    var spread_name: ?ConstId = null;
+    var spread_candidates: ?[]const FuncId = null;
     const callee_reg = blk: {
         if (callee.* == .Member) {
             const m = callee.Member;
@@ -4594,8 +4601,22 @@ fn lowerCallSpread(
             if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
                 !b.hasOwnMember(name) and b.module.funcsBySimpleName(name).len > 1)
             {
+                const nm = try b.module.internConst(b.allocator, .{ .String = name });
+                if (try b.module.boundedSpreadCandidates(
+                    b.allocator,
+                    name,
+                    b.self_package,
+                    callee.Path.segments[0].span.file,
+                )) |ids| {
+                    spread_name = nm;
+                    spread_candidates = ids;
+                    if (ids.len != 0) {
+                        const dst = b.allocReg();
+                        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = ids[0] } });
+                        break :blk dst;
+                    }
+                }
                 if (b.module.funcIdForSpreadCall(name, b.ownerClass())) |fid| {
-                    const nm = try b.module.internConst(b.allocator, .{ .String = name });
                     const dst = b.allocReg();
                     try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = fid } });
                     break :blk dst;
@@ -4622,6 +4643,8 @@ fn lowerCallSpread(
         .parts = parts,
         .arg_names = arg_names,
         .member = member_id,
+        .name = spread_name,
+        .candidates = spread_candidates,
     } });
     return dst;
 }
@@ -4942,6 +4965,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .n_args = run[1],
                         .arg_names = arg_names,
                         .recv = bound_this,
+                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
                         .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
@@ -4975,6 +4999,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .n_args = run[1],
                         .arg_names = arg_names,
                         .recv = bound_this,
+                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
                         .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
@@ -4993,6 +5018,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
+                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
                         .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
@@ -5344,6 +5370,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .n_args = run[1],
                     .arg_names = arg_names,
                     .class = class_id,
+                    .candidates = try cmgCandidates(b, callee.Path.segments[0].name, callee.Path.segments[0].span.file, run[1]),
                     .static_recv = try cmgStaticRecv(b),
                 } });
             }
@@ -8727,6 +8754,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .n_args = run[1],
         .arg_names = arg_names,
         .func = func_id,
+        .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = cmg_static_recv,
         .type_args = type_args,
     } });
@@ -8789,6 +8817,15 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
     const rt = b.recvTy() orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
+}
+
+/// Package/import-scoped declarations carried by a deferred bare call. The
+/// optional distinction is intentional: null means the remaining host-only or
+/// incomplete-header boundary has no rankable declaration metadata; a non-null
+/// (possibly empty) slice is authoritative and prevents the runtime from
+/// widening back to the program-wide simple-name index.
+fn cmgCandidates(b: *FuncBuilder, name: []const u8, file: ir.FileId, user_arg_count: usize) Allocator.Error!?[]const FuncId {
+    return b.module.boundedCallCandidates(b.allocator, name, b.self_package, file, user_arg_count);
 }
 
 /// The `CallValue` emit form for a bare name with no committed target: load the
@@ -9143,6 +9180,7 @@ fn lowerImplicitThisCall(
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
+            .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
         } });
         return dst;
@@ -9315,6 +9353,7 @@ fn lowerUnresolvedBareCall(
             .arg_names = arg_names,
             .recv = this_reg,
             .func = static_ext,
+            .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
         } });
@@ -9331,6 +9370,7 @@ fn lowerUnresolvedBareCall(
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
     } });
