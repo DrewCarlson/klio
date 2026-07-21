@@ -205,7 +205,7 @@ backend (the default for `fast`/`safe`).
 | `KLIO_GC_NOFREE` | set; `0`/empty off | Marks fully but never frees; if a crash disappears, it was a premature free, not a marking bug | none |
 | `KLIO_GC_POISON` | set; `0`/empty off | Quarantines swept cells and traps the next trace through one, naming the swept-while-live type | `[GC-POISON]` (panics) |
 | `KLIO_GC_GUARD` | set, or `dbg` | Panics on absurd (>1 MB) allocations after program start, the signature of reading a corrupted length from a swept buffer; `dbg` uses the checking allocator instead | panic |
-| `KLIO_GC_EXT` | set; `0`/empty off | Counts external (non-cell) heap growth toward the GC trigger | none |
+| `KLIO_GC_EXT` | `1` on, `0`/empty off (default on) | Counts external frame/snapshot heap growth toward the GC trigger | none |
 | `KLIO_GC_ALLOC` | `slab` (default), `smp`, `gpa`, `calloc`, `leaktrack` | The freeing backend the collector frees into; `leaktrack` wraps the slab in the leak locator and reports at exit | `[leaktrack]` |
 | `KLIO_LEAK_BY_FQN` | set (needs `KLIO_GC_ALLOC=leaktrack`) | Attributes outstanding allocations by intrinsic FQN instead of by stack (much cheaper) | `[leaktrack-by-fqn]` |
 | `KLIO_RC_DETECT` | set; `0`/empty off | Refcount double-free detector: leaks control blocks so a second decrement is observable, then dumps a stack trace | `[RC DOUBLE-FREE]` |

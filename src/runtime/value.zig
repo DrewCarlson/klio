@@ -1661,6 +1661,16 @@ pub const Value = union(enum) {
     pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
         self.forEachChildCell(MarkVisitor{ .m = m });
         switch (self) {
+            // Most declared classes are minted in the permanent generation,
+            // but synthetic class literals and local class declarations can
+            // be created after program start. A live KClass value must keep
+            // either kind reachable. A bound inner-class constructor also
+            // owns the outer instance it will pass to construction.
+            .Class => |c| m.shade(&c.cell.hdr),
+            .BoundInnerClass => |b| {
+                m.shade(&b.class.cell.hdr);
+                m.shade(&b.outer.cell.hdr);
+            },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
             .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
@@ -3182,4 +3192,3 @@ test "display produces an owned string" {
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("42", s);
 }
-

@@ -64,6 +64,12 @@ checked-in expected output under `tests/corpus/expected/`, so the
 example corpus is part of `zig build itest` (it interprets programs,
 so it rides the integration suite, not the fast unit step).
 
+In-process parity/e2e execution uses the same runtime profile as the CLI:
+`safe` by default (interpreter plus tracing GC), `fast` when requested, and
+the no-GC phase arena only under the explicit `off` profile. Parsing and IR
+lowering remain arena-scoped compiler phases; VM cells use the production
+page-returning slab allocator and are collected at each program boundary.
+
 The corpus only grows. Removing a `.kt` from it is a deliberate act
 that requires reviewer sign-off.
 

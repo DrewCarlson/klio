@@ -322,8 +322,19 @@ pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.
 // ---- GC: the Vm program-graph root provider -----------------------------
 var gc_vms: std.ArrayListUnmanaged(*const Vm) = .empty;
 var gc_vm_root_registered = std.atomic.Value(bool).init(false);
+var gc_vms_lock = std.atomic.Value(bool).init(false);
+
+fn gcVmsLock() void {
+    while (gc_vms_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+
+fn gcVmsUnlock() void {
+    gc_vms_lock.store(false, .release);
+}
 
 fn gcMarkAllVms(m: *runtime.gc.Marker) void {
+    gcVmsLock();
+    defer gcVmsUnlock();
     for (gc_vms.items) |vm| {
         m.shade(&vm.globals.cell.hdr);
         m.shade(&vm.classes.cell.hdr);
@@ -356,7 +367,27 @@ pub fn gcRegisterVm(vm: *const Vm) void {
     root.gcInstallClosureHook(vm.closures);
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
+    gcVmsLock();
+    defer gcVmsUnlock();
+    for (gc_vms.items) |registered| {
+        if (registered == vm) return;
+    }
     gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");
+}
+
+/// Remove a finished Vm from the process root set. The root callback itself is
+/// process-lifetime, but it must never retain a pointer into a completed
+/// in-process test run's phase arena.
+pub fn gcUnregisterVm(vm: *const Vm) void {
+    if (!runtime.gc.gc_enabled) return;
+    gcVmsLock();
+    defer gcVmsUnlock();
+    for (gc_vms.items, 0..) |registered, i| {
+        if (registered == vm) {
+            _ = gc_vms.swapRemove(i);
+            return;
+        }
+    }
 }
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
@@ -375,6 +406,7 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     // The main run thread joins the mutator set so a collection started by any
     // spawned worker stops it at a safe point before touching the shared heap.
     vmhost.coroutines.gcThreadEnter();
+    defer vmhost.coroutines.gcThreadExit();
     const result = try vmRunInner(self, main);
     self.out_sink.replayInto(out);
     return result;
@@ -662,6 +694,11 @@ pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome 
 pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocator.Error!CallOutcome {
     // Route through `callMember` directly (not `invokeMethod`, which flattens
     // every non-throw error to null) so a test method's real failure surfaces.
+    // The test runner owns `receiver` in a Zig local rather than an evaluator
+    // frame; pin it across dispatch until the called frame has rooted its params.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePush(receiver.*);
     var host = vmMakeHost(self, self.out_sink.output());
     const r = try host.callMember(self.allocator, receiver, name, &.{});
     return outcomeFromEval(self, r);
@@ -684,8 +721,9 @@ pub fn vmRunCalls(
     runtime.gc.alloc_perm = false;
     runtime.gc.program_started = true;
     vmhost.coroutines.gcThreadEnter();
+    defer vmhost.coroutines.gcThreadExit();
     const prep = try vmPrepare(self);
-    if (prep == null) body(ctx, self) catch {};
+    if (prep == null) try body(ctx, self);
     _ = joinAllThreads(self, .{ .ok = .{ .Unit = {} } });
     self.out_sink.replayInto(out);
     return prep;
@@ -819,18 +857,14 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
 
 /// Release every owned handle of the Vm.
 ///
-/// Under the arena fast path (`runtime.reclaimEnabled() == false`) the
-/// value-graph teardown is a no-op: every handle here is an `ObjRef`/
-/// ArrayList backed by the run arena, and `ObjRef.deinit` already
-/// short-circuits, so the arena reclaims them en masse on reset. Only the
-/// NON-memory side effect survives the fast path: the receiver/coroutine
-/// thread-locals must still be cleared so leaked-across-runs state stays a
-/// loud failure for the next program on this thread. Real OS thread join
-/// handles are not freed here — they are joined in `joinAllThreads` at the
-/// end of `vmRunInner`, before this is reached, on both the full and fast
-/// paths.
+/// The pure arena profile drops everything en masse. Freeing profiles still
+/// release raw host containers here; under tracing GC the `ObjRef` releases are
+/// inert and reachability owns their cells. Receiver/coroutine thread-locals are
+/// cleared in every mode. Real OS thread handles were already joined by
+/// `joinAllThreads`.
 pub fn vmDeinit(self: *Vm) void {
-    if (runtime.reclaimEnabled()) {
+    gcUnregisterVm(self);
+    if (runtime.freeScratch()) {
         self.module.deinit();
         self.globals.deinit();
         self.instance_id_counter.deinit();
