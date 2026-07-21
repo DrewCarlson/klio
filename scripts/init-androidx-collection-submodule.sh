@@ -7,29 +7,21 @@
 # submodule is `update = none` and populated here with only the collection
 # library's commonMain + nonJvmMain + jbMain source sets.
 #
-# Idempotent: a no-op once the commonMain sources are present.
+# Idempotent and self-reconciling: on re-run it widens a checkout left narrow
+# by an older version of this script to the sparse set below.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+. scripts/lib_sparse_checkout.sh
 
 path="kotlin-klio/klio-androidx-collection/upstream"
-sparse_common="collection/collection/src/commonMain"
-sparse_nonjvm="collection/collection/src/nonJvmMain"
-sparse_jb="collection/collection/src/jbMain"
+sparse=(
+  "collection/collection/src/commonMain"
+  "collection/collection/src/nonJvmMain"
+  "collection/collection/src/jbMain"
+)
 
 url=$(git config -f .gitmodules submodule."$path".url)
 ref=$(git config -f .gitmodules submodule."$path".branch)
 
-if [ -e "$path/$sparse_common" ]; then
-  echo "androidx.collection upstream already present at ${ref}; nothing to do."
-  exit 0
-fi
-
-rm -rf "$path"
-git clone --filter=tree:0 --no-checkout --depth 1 --branch "$ref" "$url" "$path"
-git -C "$path" sparse-checkout init --cone
-git -C "$path" sparse-checkout set "$sparse_common" "$sparse_nonjvm" "$sparse_jb"
-git -C "$path" checkout "$ref"
-git submodule absorbgitdirs "$path"
-
-echo "androidx.collection upstream populated at ${ref}."
+reconcile_sparse_submodule "$path" "$url" "$ref" --filter=tree:0 "${sparse[@]}"

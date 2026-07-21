@@ -378,6 +378,8 @@ pub fn build(b: *std.Build) void {
     // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
     // see plans/UI-RENDERING-PACKS.md. Defaults ON when the vendored libs are
     // present (`scripts/fetch-skia.sh`); a checkout without them stays green.
+    // On macOS the shim defaults to the Cocoa window + Metal backend (see
+    // buildSkiaShim), so a plain `zig build` produces a UI-capable zig-out.
     const skia_libs_present = skiaLibsPresent(b, target);
     const want_skia = b.option(bool, "skia", "Build the Compose-UI Skia rendering backend (default: on when third_party/skia is present for the target)") orelse skia_libs_present;
 
@@ -1159,8 +1161,15 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.
     const default_cxx: []const u8 = if (os == .linux) "g++" else "clang++";
     const cxx = b.option([]const u8, "skia-cxx", "C++ compiler for the Skia shim (default: g++ on linux, clang++ elsewhere)") orelse default_cxx;
-    const want_gpu = b.option(bool, "gpu", "Build the optional GPU surface for the Skia shim (linux Ganesh+EGL, or macOS Metal with -Dcocoa; opt-in, falls back to raster)") orelse false;
-    const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; opt-in)") orelse false;
+    // macOS builds the Cocoa window + Metal surface by default, so a plain
+    // `zig build` yields a UI-capable shim (no window backend => runApp opens
+    // nothing). Pass -Dcocoa=false / -Dgpu=false for a headless offscreen-only
+    // shim. Linux windowing is SDL (auto-linked when present); its GL surface
+    // stays opt-in via -Dgpu. Metal falls back to raster at runtime if bring-up
+    // fails, so defaulting it on is safe.
+    const macos_backend_default = os == .macos;
+    const want_gpu = b.option(bool, "gpu", "Build the GPU surface for the Skia shim (macOS Metal with -Dcocoa, or linux Ganesh+EGL; default: on for macOS, opt-in elsewhere; falls back to raster)") orelse macos_backend_default;
+    const want_cocoa = b.option(bool, "cocoa", "Build the macOS Cocoa window backend (compiles the shim as Objective-C++; default: on for macOS)") orelse macos_backend_default;
 
     const run = b.addSystemCommand(&.{cxx});
     // -DNDEBUG matches the Release prebuilt: Skia headers define SK_DEBUG when

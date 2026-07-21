@@ -52,3 +52,4 @@
 	path = kotlin-klio/klio-mosaic/upstream
 	url = https://github.com/JakeWharton/mosaic
 	update = none
+	branch = 0.3.0

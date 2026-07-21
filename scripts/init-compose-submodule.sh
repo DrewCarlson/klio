@@ -6,22 +6,24 @@
 # sources verbatim from this submodule. The full compose-multiplatform-core
 # repo is a large androidx-derived monorepo, so the submodule is registered
 # with `update = none` (a blanket `git submodule update` skips it) and
-# populated here with only compose/runtime/runtime/src/commonMain of the
-# pinned tag.
+# populated here with only the source sets the klio compose packs consume.
 #
-# Idempotent: a no-op once the commonMain sources are present. Run it after
-# cloning klio, or any time the upstream checkout is missing.
+# Idempotent and self-reconciling: on re-run it widens a checkout left narrow
+# by an older version of this script to the sparse set below, so packs that
+# reference newly-added sources build complete. Run it after cloning klio, or
+# any time the compose upstream checkout is missing or stale.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+. scripts/lib_sparse_checkout.sh
 
 path="kotlin-klio/klio-compose-runtime/upstream"
 # The compose runtime commonMain, plus every upstream module the klio compose
 # packs consume verbatim: the pure-Kotlin ui foundation (geometry / unit / util
 # / graphics), the runtime saveable Saver surface, the ui engine (ui/ui), the
 # text and animation modules, and foundation.
-sparse="compose/runtime/runtime/src/commonMain"
-sparse_ui=(
+sparse=(
+  "compose/runtime/runtime/src/commonMain"
   "compose/ui/ui-util/src/commonMain"
   "compose/ui/ui-geometry/src/commonMain"
   "compose/ui/ui-unit/src/commonMain"
@@ -50,33 +52,13 @@ sparse_ui=(
   "compose/runtime/runtime/src/commonTest"
   "compose/runtime/runtime/src/nonEmulatorCommonTest"
   # nonAndroidMain: the platform actuals for the snapshot state objects
-  # (SnapshotStateList/Set, the primitive Snapshot*State factories) that klio
-  # ships to run the real MVCC snapshot core.
+  # (SnapshotStateList/Set, the primitive Snapshot*State factories) and the
+  # internal Trace/precondition helpers klio ships to run the real MVCC
+  # snapshot core.
   "compose/runtime/runtime/src/nonAndroidMain"
 )
 
 url=$(git config -f .gitmodules submodule."$path".url)
 ref=$(git config -f .gitmodules submodule."$path".branch)
 
-if [ -e "$path/$sparse" ]; then
-  echo "compose upstream already present at ${ref} (sparse: ${sparse}); nothing to do."
-  exit 0
-fi
-
-# A fresh klio clone leaves the path an empty submodule placeholder, which
-# would block the clone below; clear it (the gitlink in the index and the
-# .gitmodules entry remain, so absorbgitdirs still re-links it afterward).
-rm -rf "$path"
-
-# Clone the pinned tag without trees or a working tree, narrow it to the
-# runtime commonMain source set, then check out -- only that subtree's
-# trees + blobs are fetched.
-git clone --filter=tree:0 --no-checkout --depth 1 --branch "$ref" "$url" "$path"
-git -C "$path" sparse-checkout init --cone
-git -C "$path" sparse-checkout set "$sparse" "${sparse_ui[@]}"
-git -C "$path" checkout "$ref"
-
-# Move the submodule's .git under .git/modules so it is a proper submodule.
-git submodule absorbgitdirs "$path"
-
-echo "compose upstream populated at ${ref} (sparse: ${sparse})."
+reconcile_sparse_submodule "$path" "$url" "$ref" --filter=tree:0 "${sparse[@]}"
