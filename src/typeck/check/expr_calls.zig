@@ -163,7 +163,16 @@ pub fn checkCall(
             if (is_builder) {
                 self.builder_inference_active = true;
             }
-            const result = try checkOverloadedCallRecorded(self, sigs_list.items, args, arg_names, type_args, callee.span(), name);
+            // A receiver lambda contributes an implicit-receiver candidate
+            // tower that the flat top-level function map does not contain.
+            // If any same-named extension can take this call, the top-level
+            // set is incomplete and its pick cannot enter the eager channel.
+            const extension_may_shadow = self.lambda_depth > 0 and
+                anyExtensionFitsArity(self, name, args.len);
+            const result = if (extension_may_shadow)
+                try checkOverloadedCall(self, sigs_list.items, args, arg_names, type_args, callee.span())
+            else
+                try checkOverloadedCallRecorded(self, sigs_list.items, args, arg_names, type_args, callee.span(), name);
             self.builder_inference_active = prev_bi;
             return result;
         }
@@ -373,6 +382,24 @@ pub fn checkCall(
         t.deinit(self.allocator);
     }
     return .Unresolved;
+}
+
+fn anyExtensionFitsArity(self: *const Checker, name: []const u8, n_args: usize) bool {
+    var lists = self.extensions.valueIterator();
+    while (lists.next()) |list| {
+        for (list.items) |*ext| {
+            if (!std.mem.eql(u8, ext.name, name)) continue;
+            const min = sigMinArity(&ext.sig);
+            const fits = if (sigVarargIdx(&ext.sig) != null)
+                n_args >= min
+            else
+                n_args >= min and n_args <= ext.sig.params.len;
+            if (fits) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 fn isScopeFn(name: []const u8) bool {

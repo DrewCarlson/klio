@@ -779,6 +779,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .captured_names = captured_names,
                 .captures = captures,
                 .scope_renames = try collectScopeRenames(b, expr.ObjectExpr.span.file.int()),
+                .scope_classes = try collectScopeClasses(b, expr),
             } });
             return dst;
         },
@@ -1198,6 +1199,33 @@ fn collectScopeRenames(b: *FuncBuilder, file: u32) Allocator.Error![]const ir.Sc
     return out.toOwnedSlice(b.allocator);
 }
 
+/// Resolve every bare classifier referenced by an anonymous-object subtree at
+/// its lexical site. The object's bodies lower later in a side module, so these
+/// exact identities must travel with the object instruction.
+fn collectScopeClasses(b: *FuncBuilder, expr: *const Expr) Allocator.Error![]const ir.ScopeClassRef {
+    var names = StringSet.init(b.allocator);
+    defer names.deinit();
+    try collectPathIdents(expr, &names);
+
+    var out: std.ArrayList(ir.ScopeClassRef) = .empty;
+    var it = names.keyIterator();
+    while (it.next()) |name_ptr| {
+        const name = name_ptr.*;
+        const cid = classIdAtLexicalSite(b, name, expr.span().file) orelse continue;
+        if (cid.int() >= b.module.classes.items.len) continue;
+        const cls = b.module.classes.items[cid.int()];
+        const has_companion = b.module.registry.companion_singletons.contains(name) or
+            b.module.registry.companion_singletons.contains(cls.name) or
+            b.module.registry.companion_singletons.contains(cls.fqn);
+        try out.append(b.allocator, .{
+            .name = name,
+            .fqn = cls.fqn,
+            .has_companion = has_companion,
+        });
+    }
+    return out.toOwnedSlice(b.allocator);
+}
+
 /// Reduce a dotted path to its last two segments (`a.b.C` -> `b.C`);
 /// null when the path has fewer than two.
 fn lastTwoSegments(path: []const u8) ?[]const u8 {
@@ -1457,6 +1485,20 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return lowerExpr(b, &qualified);
                 }
             }
+        }
+        // Runtime-lowered anonymous-object bodies carry the exact classifier
+        // identities visible at their lexical site. Their side modules do not
+        // contain the program class index, so bind the classifier directly by
+        // FQN after locals, captures, and receiver members have had priority.
+        if (build.anonScopeClass(name0)) |class_ref| {
+            const cls = b.allocReg();
+            const fqn = try b.module.internConst(b.allocator, .{ .String = class_ref.fqn });
+            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = fqn } });
+            if (!class_ref.has_companion) return cls;
+            const dst = b.allocReg();
+            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
+            return dst;
         }
         // A visible top-level `const val` outranks a class binding from a
         // less-visible scope: inside ScatterMap.kt the bare `Empty` is the
@@ -5364,8 +5406,18 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    const callee_class_id: ?ir.ClassId = if (callee.* == .Path and callee.Path.segments.len == 1)
+        b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
+            b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file)
+    else
+        null;
+    const callee_is_object = if (callee_class_id) |cid|
+        cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_object
+    else
+        false;
+
     // Whether a single-segment class-name call resolves to the constructor.
-    const shadowed_by_class = try shadowedByClass(b, callee, args);
+    const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args);
     // A constructible same-named class competing with the function
     // candidates: a static commit to the function is only sound when the
     // pick is type-proven; otherwise the deferred class-carrying form
@@ -5373,8 +5425,8 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // argument types (`Box(s.length)` constructs `Box(Int)`, not the
     // `fun Box(s: String)` factory the arity-only view would pick).
     const class_competes = callee.* == .Path and callee.Path.segments.len == 1 and
-        !shadowed_by_class and blk: {
-            const cid = b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse break :blk false;
+        !shadowed_by_class and !callee_is_object and blk: {
+            const cid = callee_class_id orelse break :blk false;
             if (cid.int() >= b.module.classes.items.len) break :blk false;
             const cls = &b.module.classes.items[cid.int()];
             // An abstract/interface/sealed class never constructs, so it
@@ -5403,6 +5455,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Path-callee with a registered top-level fn → Call{func}.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (try lowerPathCall(b, expr, shadowed_by_class, class_competes)) |r| return r;
+    }
+
+    // A named object is a singleton value, not a constructible class.
+    // Once same-named function overloads have had their ordinary call tier,
+    // invoke the exact object identity through its operator surface.
+    if (callee_is_object) {
+        return try emitObjectValueCall(b, args, ast_arg_names, ast_type_args, callee.Path.segments[0].name, callee_class_id.?);
     }
 
     // A LOCAL class declared in this function (or an enclosing one) shadows
@@ -7343,6 +7402,78 @@ fn simpleTypeHead(name: []const u8) []const u8 {
     return n;
 }
 
+/// Resolve a renamed import against the exact FQN the import denotes while
+/// retaining the implicit receiver of a bare extension call.  Qualifying the
+/// callee path is not equivalent: `import p.f as g; recv.g(x)` can be written
+/// as bare `g(x)` inside an extension body, and `p.f(x)` would drop `recv`.
+/// Null means the imported overload set is not statically unique from the
+/// evidence available at lowering time.
+fn renamedImportDirectTarget(
+    b: *FuncBuilder,
+    ident: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?FuncId {
+    const paths = b.module.importAliasPathsIn(ident.span.file, ident.name);
+    if (paths.len != 1 or paths[0].segs.len < 2) return null;
+    const target_leaf = paths[0].segs[paths[0].segs.len - 1];
+    if (std.mem.eql(u8, target_leaf, ident.name)) return null;
+
+    // A real member named by the alias remains in the implicit-receiver
+    // candidate group ahead of the imported extension.
+    if (inReceiverContext(b) and anyReceiverClassDeclares(b, ident.name)) return null;
+
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const recv = b.enclosingRecvTy() orelse b.recvTy() orelse b.ownerClass();
+    const can_supply_this = b.resolve("this") != null or b.knowsOuter("this") or
+        b.capturesThisSlot();
+
+    var best: ?FuncId = null;
+    var best_rank: i16 = -1;
+    var tied = false;
+    for (b.module.funcsBySimpleName(target_leaf)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) continue;
+        if (f.low_priority) continue;
+        if (!fqnCallArityFits(b, fid, args.len)) continue;
+        if (!b.module.declSigCompatible(fid, shapes)) continue;
+
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        var recv_match = false;
+        if (is_ext) {
+            if (!can_supply_this) continue;
+            if (recv) |r| {
+                const actual = simpleTypeHead(r);
+                const declared = simpleTypeHead(f.params[0].ty.name);
+                recv_match = std.mem.eql(u8, actual, declared) or
+                    b.module.classIsOrExtends(actual, declared);
+                if (!recv_match) continue;
+            }
+        }
+
+        const arity = b.module.decl_user_arity.get(fid.int()) orelse continue;
+        var rank: i16 = if (arity.has_vararg)
+            1
+        else if (arity.total == args.len)
+            4
+        else
+            2;
+        // Kotlin resolves the applicable implicit-receiver group before a
+        // receiverless sibling from the same imported overload family.
+        if (recv_match) rank += 8;
+
+        if (rank > best_rank) {
+            best = fid;
+            best_rank = rank;
+            tied = false;
+        } else if (rank == best_rank) {
+            tied = true;
+        }
+    }
+    return if (tied) null else best;
+}
+
 fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -7440,6 +7571,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             } });
         }
         return dst;
+    }
+
+    // A renamed import whose exact overload is an ordinary function binds
+    // directly.  This preserves an implicit extension receiver and is also
+    // immune to unrelated same-simple-name globals. Inline targets stay with
+    // the splice path because reification, suspension, and non-local returns
+    // may require the source body at this call site.
+    if (!shadowed_by_class and segments.len == 1 and
+        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+    {
+        if (try renamedImportDirectTarget(b, segments[0], args, ast_arg_names)) |target| {
+            const f = b.module.funcById(target) orelse return null;
+            if (!f.is_inline) return try emitCall(b, expr, target, true);
+        }
     }
 
     // FQN-precedence: a UNIQUE explicit import routes a collision call.
@@ -8912,6 +9057,28 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 /// pick — `object E : Base(Key)` inside a class declaring `object Key`
 /// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
 fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
+    // A receiver context whose owner chain is unknown here (a super-arg /
+    // default-value thunk, a lambda) may still see a NESTED classifier the
+    // flat index cannot rank; committing the package-scope pick would
+    // override the runtime's scope walk with the wrong declaration
+    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
+    // the name-keyed runtime path owns the scoped resolution.
+    if (inReceiverContext(b)) return null;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
+/// The class visible at a lexical source site without the receiver-context
+/// decline used by an immediately-lowered read. Anonymous-object bodies use
+/// this before moving into their registry-free side modules.
+fn classIdAtLexicalSite(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
+fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
     if (b.ownerClass()) |oc| {
         // Resolve the OWNER to an id once (its lifted simple name is in the
         // class index), then answer through the nesting tree — the one
@@ -8938,21 +9105,7 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
             }
         }
     }
-    // An explicit `import pkg.Outer.Name` in THIS file is unambiguous and
-    // outranks both the scope-tier index and the receiver-scope decline:
-    // when two files each import a different same-simple-name class (the
-    // gapbuffer vs linkbuffer `InsertSlotsWithFixups`), the flat index would
-    // hand every reference the first-registered one. Bind the file's own
-    // import instead.
-    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
-    // A receiver context whose owner chain is unknown here (a super-arg /
-    // default-value thunk, a lambda) may still see a NESTED classifier the
-    // flat index cannot rank; committing the package-scope pick would
-    // override the runtime's scope walk with the wrong declaration
-    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
-    // the name-keyed runtime path owns the scoped resolution.
-    if (inReceiverContext(b)) return null;
-    return b.module.classIdIndexed(name0, b.self_package, file);
+    return null;
 }
 
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
@@ -8983,6 +9136,34 @@ fn emitValueCall(
     const callee_r = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm } });
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_r,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .type_args = type_args,
+    } });
+    return dst;
+}
+
+fn emitObjectValueCall(
+    b: *FuncBuilder,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    name0: []const u8,
+    class_id: ir.ClassId,
+) Allocator.Error!Reg {
+    orEmitAudit(b, "object_operator_call", "LoadGlobal", name0);
+    const callee_r = b.allocReg();
+    const identity = b.module.classFqnById(class_id) orelse name0;
+    const nm = try b.module.internConst(b.allocator, .{ .String = identity });
+    try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm, .class = class_id } });
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
@@ -10559,6 +10740,170 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
 }
 
+test "calling an object loads its exact singleton for operator invoke" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const cid = try m.reserveClassFqn(a, "Callable", "sample.Callable", "sample", false);
+    m.classes.items[cid.int()].is_object = true;
+    try m.registry.file_packages.put(dummySpan().file, "sample");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var segments = [_]ast.Ident{.{ .name = "Callable", .span = dummySpan() }};
+    var callee = Expr{ .Path = .{ .segments = &segments, .span = dummySpan() } };
+    var args = [_]Expr{.{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } }};
+    const call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &call);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "sample.f", build.typeInt());
+    defer freeFunc(func);
+
+    try testing.expect(func.blocks[0].insts[0] == .LoadGlobal);
+    try testing.expectEqual(cid, func.blocks[0].insts[0].LoadGlobal.class.?);
+    try testing.expect(func.blocks[0].insts[func.blocks[0].insts.len - 1] == .CallValue);
+    for (func.blocks[0].insts) |inst| try testing.expect(inst != .NewInstance);
+}
+
+test "renamed overloaded import binds exact extension and plain identities" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+
+    const Add = struct {
+        fn func(
+            module: *Module,
+            alloc: Allocator,
+            params: []ir.Param,
+            kind: ir.FuncKind,
+            is_inline: bool,
+            arity: Module.DeclArity,
+        ) !FuncId {
+            const id = module.nextFuncId();
+            try module.funcs.append(alloc, .{
+                .id = id,
+                .name = "combine",
+                .fqn = "sample.combine",
+                .package = "sample",
+                .params = params,
+                .return_ty = .{ .name = "Flow", .nullable = false, .args = &.{} },
+                .n_locals = 0,
+                .blocks = &.{},
+                .entry = ir.BlockId.from(0),
+                .is_suspend = false,
+                .kind = kind,
+                .has_receiver_param = kind == .top_level_extension,
+                .is_inline = is_inline,
+            });
+            try module.func_index.append(alloc, .{ .name = "combine", .id = id });
+            try module.decl_user_arity.put(id.int(), arity);
+            return id;
+        }
+    };
+
+    const ext_params = try a.alloc(ir.Param, 3);
+    ext_params[0] = .{ .name = "this", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    const ext_id = try Add.func(&m, a, ext_params, .top_level_extension, false, .{
+        .required = 2,
+        .total = 2,
+        .has_vararg = false,
+    });
+
+    const plain_params = try a.alloc(ir.Param, 3);
+    plain_params[0] = .{ .name = "flow", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    const plain_id = try Add.func(&m, a, plain_params, .plain, false, .{
+        .required = 3,
+        .total = 3,
+        .has_vararg = false,
+    });
+
+    const inline_params = try a.alloc(ir.Param, 2);
+    inline_params[0] = .{ .name = "flows", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null, .is_vararg = true };
+    inline_params[1] = .{ .name = "transform", .ty = .{ .name = "Function1", .nullable = false, .args = &.{} }, .default = null };
+    _ = try Add.func(&m, a, inline_params, .plain, true, .{
+        .required = 1,
+        .total = 2,
+        .has_vararg = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    var paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+    const import_segs = try a.dupe([]const u8, &.{ "sample", "combine" });
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "sample.combine"), .segs = import_segs });
+    var imports = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+    try imports.put("combineOriginal", paths);
+    try m.registry.import_aliases.put(sp.file, imports);
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setRecvTy("Flow");
+    try b.bind("this", b.allocReg());
+    try b.bind("first", b.allocReg());
+    try b.bind("other", b.allocReg());
+    try b.bind("transform", b.allocReg());
+    try b.setLocalDeclType("first", "Flow");
+    try b.setLocalDeclType("other", "Flow");
+    try b.setLocalDeclType("transform", "Function2");
+
+    var callee_segs = [_]ast.Ident{.{ .name = "combineOriginal", .span = sp }};
+    var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = sp } };
+    var other_segs = [_]ast.Ident{.{ .name = "other", .span = sp }};
+    var transform_segs = [_]ast.Ident{.{ .name = "transform", .span = sp }};
+    var ext_args = [_]Expr{
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &transform_segs, .span = sp } },
+    };
+    const ext_call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &ext_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &ext_call);
+    const ext_insts = b.blocks.items[b.cur.int()].insts;
+    const ext_inst = ext_insts[ext_insts.len - 1];
+    try testing.expect(ext_inst == .Call);
+    try testing.expectEqual(ext_id, ext_inst.Call.func);
+    try testing.expect(ext_inst.Call.exact);
+
+    var first_segs = [_]ast.Ident{.{ .name = "first", .span = sp }};
+    var plain_args = [_]Expr{
+        .{ .Path = .{ .segments = &first_segs, .span = sp } },
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &transform_segs, .span = sp } },
+    };
+    const plain_call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &plain_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &plain_call);
+    const plain_insts = b.blocks.items[b.cur.int()].insts;
+    const plain_inst = plain_insts[plain_insts.len - 1];
+    try testing.expect(plain_inst == .Call);
+    try testing.expectEqual(plain_id, plain_inst.Call.func);
+    try testing.expect(plain_inst.Call.exact);
+}
+
 test "scope getter owner follows the class contributing an enclosing property" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
@@ -10841,6 +11186,28 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         .qualified_path = null,
     };
     try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
+}
+
+test "anonymous object carries a lexical classifier identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.reserveClassFqn(a, "Marker", "sample.Marker", "sample", false);
+    try m.registry.companion_singletons.put("Marker", "Marker$Companion");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var segs = [_]ast.Ident{.{ .name = "Marker", .span = sp }};
+    const expr = Expr{ .Path = .{ .segments = &segs, .span = sp } };
+    const refs = try collectScopeClasses(&b, &expr);
+    try testing.expectEqual(@as(usize, 1), refs.len);
+    try testing.expectEqualStrings("Marker", refs[0].name);
+    try testing.expectEqualStrings("sample.Marker", refs[0].fqn);
+    try testing.expect(refs[0].has_companion);
 }
 
 test "trailing-lambda arity host accepts a signature-only candidate" {

@@ -119,6 +119,20 @@ test "a parenthesized factory result accepts a trailing lambda" {
     try assertKlio("parenthesized_callable_result", src, "42\n");
 }
 
+test "anonymous object initializer retains lexical classifier identity" {
+    const src =
+        \\
+        \\import kotlin.coroutines.ContinuationInterceptor
+        \\
+        \\fun main() {
+        \\    val holder = object { val key = ContinuationInterceptor }
+        \\    println(holder.key === ContinuationInterceptor)
+        \\}
+        \\
+    ;
+    try assertKlio("anonymous_object_classifier_identity", src, "true\n");
+}
+
 test "lateinit_var_with_is_initialized" {
     const alt =
         \\

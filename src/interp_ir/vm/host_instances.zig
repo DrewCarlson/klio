@@ -3618,7 +3618,7 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
     return entry;
 }
 
-pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename) Allocator.Error!EvalResult {
+pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename, scope_classes: []const ir.ScopeClassRef) Allocator.Error!EvalResult {
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
     }
@@ -3631,6 +3631,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // renamed file-private type) still resolves scope-true.
     const prev_renames = ir.build.setLowerAnonScopeRenames(scope_renames);
     defer _ = ir.build.setLowerAnonScopeRenames(prev_renames);
+    const prev_classes = ir.build.setLowerAnonScopeClasses(scope_classes);
+    defer _ = ir.build.setLowerAnonScopeClasses(prev_classes);
     const obj = expr.ObjectExpr;
     const members = obj.members;
     const supertypes = obj.supertypes;

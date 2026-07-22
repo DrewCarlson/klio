@@ -159,6 +159,27 @@ const Builder = struct {
         };
     }
 
+    /// `Receiver.(params) -> ret`
+    fn tyReceiverFun(self: *Builder, receiver: TypeRef, params: []const TypeRef, ret: TypeRef) TypeRef {
+        const ftr = self.dup(FunctionTypeRef, .{
+            .receiver = receiver,
+            .params = self.slice(TypeRef, params),
+            .ret = ret,
+            .is_suspend = false,
+            .span = self.ts(),
+        });
+        return .{
+            .name = self.ident("<function>"),
+            .nullable = false,
+            .span = self.ts(),
+            .type_args = &.{},
+            .function = ftr,
+            .definitely_non_null = false,
+            .annotations = &.{},
+            .qualified_path = null,
+        };
+    }
+
     // --- expressions ---
 
     fn intLit(self: *Builder, value: i64) Expr {
@@ -1634,6 +1655,40 @@ test "extension_function_resolves_through_receiver_chain" {
     var c = checkFile(testing.allocator, &f);
     defer c.deinit();
     try testing.expect(!c.hasErrors());
+}
+
+test "receiver extension keeps shadowable global out of eager calls" {
+    // class Scope
+    // fun launch(block: () -> Unit) {}
+    // fun Scope.launch(block: () -> Unit) {}
+    // fun withScope(block: Scope.() -> Unit) {}
+    // fun main() { withScope { launch {} } }
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    const block_ty = b.tyFun(&.{}, b.ty("Unit"));
+    const global_launch = b.funBlock("launch", &.{b.param("block", block_ty)}, null, &.{});
+    var extension_launch = b.funBlock("launch", &.{b.param("block", block_ty)}, null, &.{});
+    extension_launch.receiver_type = b.ty("Scope");
+    const receiver_block_ty = b.tyReceiverFun(b.ty("Scope"), &.{}, b.ty("Unit"));
+    const with_scope = b.funBlock("withScope", &.{b.param("block", receiver_block_ty)}, null, &.{});
+
+    const launch_path = b.path("launch");
+    const launch_span = launch_path.span();
+    const launch_call = b.call(launch_path, &.{b.lambda(&.{}, &.{})});
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.exprStmt(b.call(b.path("withScope"), &.{b.lambda(&.{}, &.{b.exprStmt(launch_call)})})),
+    });
+    const f = b.file(&.{
+        .{ .Class = b.class("Scope") },
+        .{ .Function = global_launch },
+        .{ .Function = extension_launch },
+        .{ .Function = with_scope },
+        .{ .Function = main },
+    });
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.tc.resolved_calls.contains(launch_span));
 }
 
 test "stdlib_chain_infers_lambda_params_and_fold_result" {

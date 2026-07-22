@@ -121,6 +121,15 @@ pub const ConstId = enum(u32) {
 /// object expression's lexical scope.
 pub const ScopeRename = struct { name: []const u8, renamed: []const u8 };
 
+/// One classifier resolved at an anonymous-object expression's lexical site.
+/// Runtime-lowered object members use its exact FQN instead of re-resolving a
+/// bare name in their intentionally small side module.
+pub const ScopeClassRef = struct {
+    name: []const u8,
+    fqn: []const u8,
+    has_companion: bool,
+};
+
 /// One IR instruction. Drives the per-frame evaluator switch.
 pub const Inst = union(enum) {
     /// Materialise a constant into a register.
@@ -562,6 +571,8 @@ pub const Inst = union(enum) {
         /// with none of the build's scope registries, so the lexical
         /// renames ride on the instruction.
         scope_renames: []const ScopeRename = &.{},
+        /// Exact classifier identities referenced by the object subtree.
+        scope_classes: []const ScopeClassRef = &.{},
     },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `[]Reg`; the
@@ -1018,6 +1029,10 @@ pub const Class = struct {
     /// anywhere, and a `recv.method()` call on it is monomorphic even open-world
     /// (used by the static dispatch bake).
     is_open: bool = false,
+    /// A named Kotlin `object`. Calling its classifier name resolves the
+    /// singleton value and dispatches `operator fun invoke`; it is never a
+    /// constructor call despite sharing the class table representation.
+    is_object: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;
@@ -3930,6 +3945,7 @@ pub const Module = struct {
                 for (ids) |cid| {
                     const existing = &self.classes.items[cid.int()];
                     if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                        class.is_object = class.is_object or existing.is_object;
                         class.id = cid;
                         self.classes.items[cid.int()] = class;
                         return cid;
@@ -3942,6 +3958,7 @@ pub const Module = struct {
                 if (!std.mem.eql(u8, entry.name, class.name)) continue;
                 const existing = &self.classes.items[entry.id.int()];
                 if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                    class.is_object = class.is_object or existing.is_object;
                     class.id = entry.id;
                     self.classes.items[entry.id.int()] = class;
                     return entry.id;
@@ -3951,6 +3968,7 @@ pub const Module = struct {
                 }
             }
             if (legacy_stub) |id| {
+                class.is_object = class.is_object or self.classes.items[id.int()].is_object;
                 class.id = id;
                 self.classes.items[id.int()] = class;
                 self.fixupStubClaimCaches(id, class.name, class.fqn);

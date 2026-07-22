@@ -201,6 +201,19 @@ test "captured receiver alias retains its type through nested lambdas" {
     try assertKlio("captured_receiver_alias_type", src, "OK\n");
 }
 
+test "receiver extension shadows a same-named global in eager lowering" {
+    const src =
+        \\
+        \\class Scope
+        \\fun launch(block: () -> Unit) { block(); println("global") }
+        \\fun Scope.launch(block: () -> Unit) { block(); println("extension") }
+        \\fun withScope(block: Scope.() -> Unit) { Scope().block() }
+        \\fun main() { withScope { launch {} } }
+        \\
+    ;
+    try assertKlio("receiver_extension_shadow", src, "extension\n");
+}
+
 test "higher_order_local_fn_dispatch" {
     const src =
         \\
@@ -357,6 +370,25 @@ test "invoke_operator_instance_used_as_lambda_value" {
         \\
     ;
     try assertKlio("operator_invoke_value", src, "note:hello\nnote:a,note:b\nnote:c,note:d\n");
+}
+
+test "named object operator invoke uses the singleton" {
+    const src =
+        \\
+        \\object Formatter {
+        \\    var calls = 0
+        \\    operator fun invoke(value: String): String {
+        \\        calls++
+        \\        return "$calls:$value"
+        \\    }
+        \\}
+        \\fun main() {
+        \\    println(Formatter("first"))
+        \\    println(Formatter("second"))
+        \\}
+        \\
+    ;
+    try assertKlio("object_operator_invoke", src, "1:first\n2:second\n");
 }
 
 test "unbound_class_method_reference_invoked_as_value" {

@@ -306,6 +306,22 @@ pub fn anonScopeRename(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Classifier identities carried into runtime anonymous-object lowering.
+threadlocal var lower_anon_scope_classes: []const ir.ScopeClassRef = &.{};
+
+pub fn setLowerAnonScopeClasses(classes: []const ir.ScopeClassRef) []const ir.ScopeClassRef {
+    const prev = lower_anon_scope_classes;
+    lower_anon_scope_classes = classes;
+    return prev;
+}
+
+pub fn anonScopeClass(name: []const u8) ?ir.ScopeClassRef {
+    for (lower_anon_scope_classes) |class_ref| {
+        if (std.mem.eql(u8, class_ref.name, name)) return class_ref;
+    }
+    return null;
+}
+
 /// One same-named local-function declaration: the mangled binding its
 /// closure is ALSO bound under, plus the static signature facts a call
 /// site selects on. Slices are owned by the declaring builder's allocator.
