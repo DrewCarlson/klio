@@ -299,6 +299,7 @@ pub const VmHost = struct {
     pub const callMemberNamed = host_call_member.callMemberNamed;
     pub const callMemberNamedStatic = host_call_member.callMemberNamedStatic;
     pub const callMemberNamedDeclared = host_call_member.callMemberNamedDeclared;
+    pub const invokeVirtualMember = host_call_member.invokeVirtualMember;
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
     pub const callMemberMembersOnly = host_call_member.callMemberMembersOnly;
     pub const callMemberMembersOnlyLenient = host_call_member.callMemberMembersOnlyLenient;

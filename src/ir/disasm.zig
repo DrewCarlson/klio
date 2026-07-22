@@ -1,6 +1,7 @@
 //! Human-readable IR dump (`klio dump-ir`). Prints a built `Module`'s functions
 //! as registers + instructions, classifying every call site as DIRECT (a baked
-//! `FuncId`/`ClassId` target) vs DYNAMIC (resolved by name at runtime), and
+//! `FuncId`/`ClassId` target), VIRTUAL (a numeric method slot), or DYNAMIC
+//! (resolved by name at runtime), and
 //! distinguishing a dynamic call the lowerer *did* resolve to a unique target
 //! but still left dynamic (BOUND) from one with no carried target (UNBOUND).
 //!
@@ -24,22 +25,24 @@ pub const Options = struct {
 };
 
 /// A call site's binding class, for the Direct/Dynamic tally.
-const Kind = enum { direct, dyn_bound, dyn_unbound };
+const Kind = enum { direct, virtual, dyn_bound, dyn_unbound };
 
 const Tally = struct {
     direct: usize = 0,
+    virtual: usize = 0,
     dyn_bound: usize = 0,
     dyn_unbound: usize = 0,
 
     fn add(self: *Tally, k: Kind) void {
         switch (k) {
             .direct => self.direct += 1,
+            .virtual => self.virtual += 1,
             .dyn_bound => self.dyn_bound += 1,
             .dyn_unbound => self.dyn_unbound += 1,
         }
     }
     fn total(self: Tally) usize {
-        return self.direct + self.dyn_bound + self.dyn_unbound;
+        return self.direct + self.virtual + self.dyn_bound + self.dyn_unbound;
     }
 };
 
@@ -50,6 +53,7 @@ fn classify(inst: *const Inst) ?Kind {
         .NewInstance => .direct,
         .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallSpread => |c| if (c.candidates != null) .dyn_bound else .dyn_unbound,
+        .CallVirtual => .virtual,
         .CallMember,
         .CallValue,
         .CallValueWithThis,
@@ -130,6 +134,11 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
             try w.print("r{d} <- CallMember r{d}.'{s}' ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) });
             try argRun(w, c.args, c.n_args);
             try w.print("        [DYN member '{s}']", .{constStr(m, c.name)});
+        },
+        .CallVirtual => |c| {
+            try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
+            try argRun(w, c.args, c.n_args);
+            try w.writeAll("        [VIRTUAL]");
         },
         .CallMemberOrGlobal => |c| {
             try w.print("r{d} <- CallMemberOrGlobal this.'{s}' ", .{ reg(c.dst), constStr(m, c.name) });
@@ -238,10 +247,11 @@ fn dumpFunc(w: *std.Io.Writer, m: *const Module, f: *const Func, mod_tally: *Tal
         }
         try dumpTerminator(w, &b.terminator);
     }
-    try w.print("  calls: {d} direct, {d} dynamic ({d} bound, {d} unbound)\n\n", .{
-        tally.direct, tally.dyn_bound + tally.dyn_unbound, tally.dyn_bound, tally.dyn_unbound,
+    try w.print("  calls: {d} direct, {d} virtual, {d} dynamic ({d} bound, {d} unbound)\n\n", .{
+        tally.direct, tally.virtual, tally.dyn_bound + tally.dyn_unbound, tally.dyn_bound, tally.dyn_unbound,
     });
     mod_tally.direct += tally.direct;
+    mod_tally.virtual += tally.virtual;
     mod_tally.dyn_bound += tally.dyn_bound;
     mod_tally.dyn_unbound += tally.dyn_unbound;
 }
@@ -286,7 +296,7 @@ pub fn dumpModule(w: *std.Io.Writer, m: *const Module, opts: Options) !void {
         }
     }
 
-    try w.print("module rollup: {d} functions, {d} direct, {d} dynamic ({d} bound, {d} unbound)\n", .{
-        dumped, mod_tally.direct, mod_tally.dyn_bound + mod_tally.dyn_unbound, mod_tally.dyn_bound, mod_tally.dyn_unbound,
+    try w.print("module rollup: {d} functions, {d} direct, {d} virtual, {d} dynamic ({d} bound, {d} unbound)\n", .{
+        dumped, mod_tally.direct, mod_tally.virtual, mod_tally.dyn_bound + mod_tally.dyn_unbound, mod_tally.dyn_bound, mod_tally.dyn_unbound,
     });
 }

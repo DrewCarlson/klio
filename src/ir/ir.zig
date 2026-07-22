@@ -377,6 +377,18 @@ pub const Inst = union(enum) {
         /// name-based path.
         resolved: ?FuncId = null,
     },
+    /// Virtual member call whose overload was resolved statically. `slot`
+    /// names the selected declaration's override family; runtime work is one
+    /// `(receiver ClassId, slot) -> FuncId` lookup, never a method-name search.
+    CallVirtual: struct {
+        dst: Reg,
+        receiver: Reg,
+        slot: MethodSlotId,
+        args: Reg,
+        n_args: u32,
+        arg_names: []?ConstId = &.{},
+        trailing_lambda: bool = false,
+    },
     /// Instantiate a class.
     NewInstance: struct {
         dst: Reg,

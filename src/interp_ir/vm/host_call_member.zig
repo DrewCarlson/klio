@@ -44,6 +44,7 @@ const CallCtx = runtime.CallCtx;
 const Module = ir.Module;
 const Func = ir.Func;
 const FuncId = ir.FuncId;
+const MethodSlotId = ir.MethodSlotId;
 const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
@@ -8408,6 +8409,50 @@ pub fn invokeResolvedMember(self: *VmHost, allocator: Allocator, receiver: *cons
     };
     if (is_member_ext) return invokeMemberExtFuncId(self, allocator, receiver, fid, args);
     return invokeMethodFuncId(self, allocator, receiver, fid, args);
+}
+
+/// Invoke a statically resolved virtual family by numeric slot. The runtime
+/// receiver contributes only its exact `ClassId`; overload selection and
+/// method names are absent from this path.
+pub fn invokeVirtualMember(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    slot: MethodSlotId,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+) Allocator.Error!EvalResult {
+    if (receiver.* != .Instance) return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
+    const recv_fqn = blk: {
+        const instance = receiver.Instance.borrow();
+        defer instance.deinit();
+        const class = instance.get().class.borrow();
+        defer class.deinit();
+        break :blk class.get().fqn;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const runtime_class = module.classIdByFqn(recv_fqn) orelse
+        return .{ .err = .{ .Type = "virtual call receiver class is not linked" } };
+    const target = module.methodSlotTarget(runtime_class, slot) orelse
+        return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
+
+    var any_named = false;
+    for (arg_names) |name| if (name != null) {
+        any_named = true;
+        break;
+    };
+    if (!any_named) return (try invokeMethodFuncId(self, allocator, receiver, target, args)) orelse
+        .{ .err = .{ .Type = "virtual method target is not executable" } };
+
+    const all = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all);
+    const names = try allocator.alloc(?[]const u8, arg_names.len + 1);
+    defer if (runtime.freeScratch()) allocator.free(names);
+    names[0] = null;
+    @memcpy(names[1..], arg_names);
+    return callFuncNamedRec(self, allocator, module, target, all, names);
 }
 
 fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {

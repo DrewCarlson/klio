@@ -183,6 +183,17 @@ The next implementation order is:
    `CallMemberOrGlobal.candidates == null` and runtime global lookup by simple name
    are invalid states for Kotlin calls.
 
+The virtual-call representation is now live for ordinary object-ABI classes:
+`MethodSlotId` is rooted at the statically selected declaration, a link step
+composes generic supertype substitutions and maps every `(ClassId, slot)` to its
+concrete `FuncId`, and lowering emits `CallVirtual(slot)` for resolved open-class
+calls. One implementation can populate several interface-root slots. Kotlin
+runtime classes with specialized scalar/collection representations remain on the
+compatibility path until the host symbol manifest records their ABI explicitly;
+interface calls also remain there while callable-backed SAM values are admitted
+to numeric slots. `dump-ir` reports virtual calls separately from name-dynamic
+calls so migration coverage is measurable.
+
 The concrete correctness canary for item 1 is a class containing two private
 same-name, same-arity overloads (`pick(Int)` and `pick(String)`). Today the
 declaration-order map keeps one `FuncId`, so both calls can reach that sibling. The

@@ -35,7 +35,7 @@ Run any program with:
 |----------------------------|----------------------------------------------------------------|
 | `classes.kt`               | Primary-ctor properties, methods, `data class`, `companion object`, `object`, `operator fun compareTo`. |
 | `inheritance.kt`           | `open`/`override`, super-constructor calls, `super.method()`, polymorphic dispatch. |
-| `final_override_dispatch.kt` | `final override` seals a method against further overriding, so a call through the declaring type is monomorphic even on an `open` class and resolves statically; a plain `override` beside it stays virtual, while same-arity overloads on a final class bind directly by argument type. |
+| `final_override_dispatch.kt` | Static member resolution: same-arity overloads on a final class bind directly by argument type, while calls through an open `Shape` receiver carry numeric virtual slots and reach the `Circle`/`Dot` overrides. |
 | `interface_default_dispatch.kt` | An interface member is implicitly open — a default body is always overridable by an implementer — so a call through the interface type dispatches virtually and is never resolved to the default at lowering time. |
 | `inheritance_delegation.kt`, `delegated_inheritance.kt` | Interface and inherited-delegate resolution (`by`). |
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |

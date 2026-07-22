@@ -25,8 +25,10 @@ class FinalOverloads {
 fun pickBoth(target: FinalOverloads): String =
     target.pick(1) + "/" + target.pick("x")
 
+fun describe(shape: Shape): String = "${shape.name()} ${shape.sides()}"
+
 fun main() {
     val shapes: List<Shape> = listOf(Shape(), Circle(), Dot())
-    for (s in shapes) println("${s.name()} ${s.sides()}")
+    for (s in shapes) println(describe(s))
     println(pickBoth(FinalOverloads()))
 }
