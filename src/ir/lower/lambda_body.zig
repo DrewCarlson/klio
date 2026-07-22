@@ -467,6 +467,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const id = module.nextFuncId();
     func.id = id;
     func.is_lambda = is_lambda;
+    func.lambda_receiver_ty = b.recvTy();
     // Declared parameter annotations (`{ s: String -> … }`, an anonymous
     // function's typed params) land on the body func so runtime overload
     // dispatch can match the value against a declared function-type

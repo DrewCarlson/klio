@@ -913,6 +913,11 @@ pub const Func = struct {
     /// propagates as a non-local return through this frame instead
     /// of being caught locally.
     is_lambda: bool = false,
+    /// Declared receiver head of a receiver-lambda body. Unlike a local
+    /// extension function this receiver is supplied at invocation rather
+    /// than occupying a parameter slot; the VM uses the head to select the
+    /// compatible receiver from the implicit-receiver tower.
+    lambda_receiver_ty: ?[]const u8 = null,
     /// True for `inline fun`. A non-local `return` from a lambda
     /// passed to an inline function unwinds *through* this frame
     /// (back to the function that wrote the lambda) rather than

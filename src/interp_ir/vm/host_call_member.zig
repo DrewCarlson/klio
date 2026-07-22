@@ -3478,6 +3478,12 @@ fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value
     return null;
 }
 
+/// Select the innermost implicit receiver satisfying `head`, starting with
+/// `receiver` and then walking the frame's enclosing-receiver tower.
+pub fn implicitReceiverForHead(self: *VmHost, allocator: Allocator, receiver: *const Value, head: []const u8) Allocator.Error!?Value {
+    return recvFnReceiverFor(self, allocator, receiver, head);
+}
+
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance) return null;
     const head = recvFnPropHeadOf(self, receiver, name) orelse return null;

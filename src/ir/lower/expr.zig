@@ -8634,6 +8634,14 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
 
+    // The committed target is overload-precise, so its receiver-function
+    // parameter types are authoritative even when the source callee is an
+    // alias with no same-named entry in the function index.
+    if (b.module.funcById(func_id)) |f| {
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        recordLambdaArgReceivers(b, f, args, ast_arg_names, recv_off);
+    }
+
     const needs_this = blk: {
         if (b.module.funcById(func_id)) |f| {
             break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");

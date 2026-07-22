@@ -1086,8 +1086,25 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
     return false;
 }
 
-pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     _ = arg_names;
+    var selected_this = this_value_in.*;
+    if (callee.* == .IrClosure) {
+        const id = callee.IrClosure.id;
+        if (self.closures.get(@intCast(id))) |info| {
+            const module_g = self.module.borrow();
+            defer module_g.deinit();
+            const m = info.module orelse module_g.get();
+            if (m.funcById(info.body_func)) |f| {
+                if (f.lambda_receiver_ty) |head| {
+                    if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
+                        selected_this = matched;
+                    }
+                }
+            }
+        }
+    }
+    const this_value = &selected_this;
     // A receiver-lambda's receiver (`with(r) { … }`, `r.apply { … }`) is an
     // implicit receiver, hence a context-argument source for a contextual
     // callee inside the block. Feed it into the context stack for the

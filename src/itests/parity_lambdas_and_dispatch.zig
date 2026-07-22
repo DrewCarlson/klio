@@ -471,6 +471,28 @@ test "receiver_typed_lambda_bare_invocation_field_read" {
     try assertKlio("receiver_lambda_field", src, "p\n");
 }
 
+test "receiver lambda parameter selects compatible outer receiver" {
+    const src =
+        \\
+        \\class Sink {
+        \\    private val values = mutableListOf<String>()
+        \\    fun emit(value: String) { values.add(value) }
+        \\    fun result(): String = values.joinToString(",")
+        \\}
+        \\class Scope
+        \\fun Sink.forward(block: Sink.(String) -> Unit) {
+        \\    with(Scope()) { block("outer") }
+        \\}
+        \\fun main() {
+        \\    val sink = Sink()
+        \\    sink.forward { emit(it) }
+        \\    println(sink.result())
+        \\}
+        \\
+    ;
+    try assertKlio("receiver_lambda_compatible_outer", src, "outer\n");
+}
+
 test "bare_write_reaches_outer_receiver_member" {
     // kotlinc-pinned (tests/fixtures/parity_corpus/bare_write_outer_receiver_member.kt):
     // a bare-name write inside a nested receiver lambda resolves against
