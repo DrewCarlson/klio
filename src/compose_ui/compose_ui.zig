@@ -59,6 +59,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSurface", winSurfaceOf);
     try b.register("androidx.compose.ui.window.__composeui_winPresent", winPresent);
     try b.register("androidx.compose.ui.window.__composeui_winClear", winClear);
+    try b.register("androidx.compose.ui.window.__composeui_isHosted", isHosted);
+    try b.register("androidx.compose.ui.window.__composeui_setFrameCallback", setFrameCallback);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -193,6 +195,10 @@ const Skia = struct {
     paraPhCount: ?ParaPhCountFn,
     paraPhRect: ?ParaPhRectFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
+    /// Optional: mobile backends (iOS) attach to an OS-provided surface layer
+    /// instead of creating a window. Null on desktop backends (Cocoa/SDL), where
+    /// `winOpen` creates the window.
+    winAttach: ?WinAttachFn,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
     winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
@@ -206,6 +212,7 @@ const Skia = struct {
     winSetIconPng: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
 };
 
+const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*SkWindow;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
 const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
@@ -343,6 +350,7 @@ fn loadSkia() ?*Skia {
         .paraPhCount = lib.lookup(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = lib.lookup(ParaPhRectFn, "klio_skia_para_ph_rect"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
+        .winAttach = lib.lookup(WinAttachFn, "klio_win_attach"),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
@@ -432,6 +440,7 @@ fn loadSkiaStatic() ?*Skia {
         .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
         .winOpen = externSym(@FieldType(Skia, "winOpen"), "klio_win_open"),
+        .winAttach = externSym(WinAttachFn, "klio_win_attach"),
         .winSurface = externSym(@FieldType(Skia, "winSurface"), "klio_win_surface"),
         .winPresent = externSym(@FieldType(Skia, "winPresent"), "klio_win_present"),
         .winPoll = externSym(@FieldType(Skia, "winPoll"), "klio_win_poll"),
@@ -684,7 +693,14 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
         kotlin_title;
     const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{title_bytes}, 0) catch return ok(Value.newLong(0));
     defer ctx.allocator.free(title_z);
-    const win = skia.winOpen(w, h, title_z.ptr) orelse return ok(Value.newLong(0));
+    // Mobile: attach to the app-provided surface layer instead of creating a
+    // window (the OS owns the view). Desktop backends have no winAttach and
+    // create the window via winOpen.
+    var win_opt: ?*SkWindow = null;
+    if (surface_layer) |layer| {
+        if (skia.winAttach) |attach| win_opt = attach(layer, w, h, surface_scale);
+    }
+    const win = (win_opt orelse skia.winOpen(w, h, title_z.ptr)) orelse return ok(Value.newLong(0));
     if (window_icon_png) |png| {
         if (skia.winSetIconPng) |set_icon| set_icon(win, png.ptr, png.len);
     }
@@ -756,6 +772,69 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
         (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
         @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
     return ok(Value.newLong(packed_ev));
+}
+
+// ---------------------------------------------------------------------------
+// OS-driven frame loop (mobile): the platform owns the run loop and calls
+// klio_render_frame each vsync on the resident VM. `application` (KlioWindow)
+// registers a per-frame render callback and returns instead of looping; the app
+// shell drives it (iOS CADisplayLink). See plans/MOBILE-TARGETS.md.
+// ---------------------------------------------------------------------------
+
+// The OS-provided surface layer + geometry the app installs before running the
+// program. When set, winOpen attaches to it (klio_win_attach) instead of
+// creating a window, and __composeui_isHosted reports true.
+var surface_layer: ?*anyopaque = null;
+var surface_w: c_int = 0;
+var surface_h: c_int = 0;
+var surface_scale: f64 = 1.0;
+
+/// Install the app-provided surface layer (an iOS CAMetalLayer) + geometry. The
+/// app shell calls this before running the program.
+pub export fn klio_set_surface(layer: ?*anyopaque, w: c_int, h: c_int, scale: f64) void {
+    surface_layer = layer;
+    surface_w = w;
+    surface_h = h;
+    surface_scale = scale;
+}
+
+/// The resident per-frame render callback: the Kotlin render lambda plus the host
+/// and output to invoke it through. Unlike ResizeCb this outlives the call that
+/// registered it — the program's main returns while the VM stays resident, and
+/// the mobile run keeps everything on a process-lifetime arena, so the captured
+/// composition survives across frames.
+const FrameCb = struct {
+    host: IntrinsicHost,
+    callback: Value,
+    out: Output,
+    set: bool = false,
+};
+var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+
+/// `__composeui_isHosted(): Boolean` — true when the platform owns the frame loop
+/// (an app surface has been installed). `application` then registers a frame
+/// callback and returns instead of running its own loop.
+fn isHosted(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value{ .Bool = surface_layer != null });
+}
+
+/// `__composeui_setFrameCallback(cb: () -> Boolean): Long` — store the render
+/// callback the platform frame source invokes each frame.
+fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    frame_cb = .{ .host = ctx.host, .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
+/// Render one frame: invoke the resident Kotlin render callback. Called by the
+/// app shell's frame source (iOS CADisplayLink) on the main thread — the same
+/// thread the resident VM ran main on, so it is a plain same-thread re-entry
+/// (the resizeTrampoline mechanism).
+pub export fn klio_render_frame() void {
+    if (!frame_cb.set) return;
+    var args = [_]Value{};
+    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
