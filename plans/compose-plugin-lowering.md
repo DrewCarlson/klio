@@ -33,8 +33,9 @@ reimplementation.
   now also passes its snapshot `AtomicInt.add` path: property-initializer
   lowering reads constructor parameter types from the declaring class's exact
   FQN, so Compose's `atomic(value: Int)` selects `AtomicInt` rather than the
-  generic `AtomicRef<T>`. Its next stop is the separate missing test-platform
-  actual `androidx.compose.runtime.mock.synchronizedImpl`.
+  generic `AtomicRef<T>`. The common-test platform supplies the upstream mock
+  synchronization actual through klio's monitor implementation, and
+  `CompositionTests.simpleChanges` now passes completely.
 
 ## Current state (being replaced)
 
