@@ -187,6 +187,22 @@ test "local_class_suspend_method_resumes_in_its_module" {
     try assertKlio("local_class_suspend_resume", src, "result=got=42\n");
 }
 
+test "local class retains transitive interfaces" {
+    const src =
+        \\
+        \\interface Marker
+        \\open class Base : Marker
+        \\fun main() {
+        \\    class Local : Base()
+        \\    val value: Any = Local()
+        \\    println(value is Base)
+        \\    println(value is Marker)
+        \\}
+        \\
+    ;
+    try assertKlio("local_class_transitive_interfaces", src, "true\ntrue\n");
+}
+
 // A deprecated overload that delegates to the general one via an
 // explicit cast — kotlinx.coroutines' `async(context: Job, …) =
 // async(context as CoroutineContext, …)` — must reach the general
