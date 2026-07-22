@@ -1,4 +1,5 @@
 shape 0
 circle 1
 circle 0
+inherited
 int:1/string:x

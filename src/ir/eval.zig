@@ -3407,6 +3407,7 @@ fn instDst(inst: *const Inst) ?Reg {
         .CallSpread => |x| x.dst,
         .CallSuper => |x| x.dst,
         .CallMember => |x| x.dst,
+        .CallVirtual => |x| x.dst,
         .CallMemberOrGlobal => |x| x.dst,
         .CallValueOrMember => |x| x.dst,
         .CallMemberOrValue => |x| x.dst,
@@ -3546,6 +3547,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |cm| return execArmCallMember(H, allocator, frame, cm, host),
+        .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
         .CallValueOrMember => |cvm| return execArmCallValueOrMember(H, allocator, frame, cvm, host),
         .NewInstance => |ni| return execArmNewInstance(H, allocator, frame, ni, host),
@@ -4478,6 +4480,35 @@ fn bakeDisabled() bool {
     const v = if (runtime.getenvSlice("KLIO_BAKE_OFF")) |s| std.mem.eql(u8, s, "1") else false;
     bake_disabled = v;
     return v;
+}
+
+/// Execute a statically selected virtual slot. Unlike `CallMember`, this arm
+/// has no name-based fallback: a missing slot is a link error in the program
+/// image and is reported by the host.
+noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
+    if (comptime !@hasDecl(H, "invokeVirtualMember")) {
+        return raiseStep(frame, .{ .Type = "CallVirtual is unsupported by this host" });
+    }
+    const recv = frame.read(cv.receiver);
+    recv.retain();
+    defer recv.release(allocator);
+    const args = try readArgRun(allocator, frame, cv.args, cv.n_args);
+    defer allocator.free(args);
+    const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
+    defer allocator.free(names);
+    const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+        H.setTrailingMemberCall(true)
+    else
+        false;
+    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names);
+    if (cv.trailing_lambda) {
+        if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
+    }
+    switch (try result) {
+        .ok => |value| try frame.write(cv.dst, value),
+        .err => |err| return raiseStep(frame, err),
+    }
+    return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.

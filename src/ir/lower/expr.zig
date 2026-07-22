@@ -10158,9 +10158,10 @@ fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u
     return agreed;
 }
 
-/// Lower a member call directly when the shared resolver proves one
-/// non-overridable declaration from the receiver and argument static shapes.
-fn lowerDirectMemberCall(
+/// Lower a member call once the shared resolver identifies its declaration.
+/// Final/private declarations become `Call(FuncId)`; overridable class members
+/// become `CallVirtual(MethodSlotId)`. Both forms leave no runtime name lookup.
+fn lowerResolvedMemberCall(
     b: *FuncBuilder,
     receiver: *const Expr,
     name: ast.Ident,
@@ -10190,8 +10191,19 @@ fn lowerDirectMemberCall(
     const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
         .lexical_owner = lexical_owner,
     });
-    if (resolved.dispatch != .direct) return null;
     const func_id = resolved.target orelse return null;
+    if (resolved.dispatch == .deferred) return null;
+    if (resolved.dispatch == .virtual) {
+        const owner = &b.module.classes.items[static_owner.int()];
+        // Interface receivers may be represented by a SAM callable rather than
+        // an Instance. Value classes, unresolved shells, and declarations in
+        // the host-backed Kotlin runtime use specialized value ABIs. Those
+        // declarations gain numeric slots after the symbol manifest records
+        // their representation explicitly; ordinary user/library classes are
+        // already guaranteed to use `Value.Instance`.
+        if (owner.is_interface or owner.is_value or owner.is_stub or ast_type_args.len != 0 or
+            std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
+    }
     const target = b.module.funcById(func_id) orelse return null;
 
     recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
@@ -10205,6 +10217,22 @@ fn lowerDirectMemberCall(
     b.pending_arg_fn_generic = arg_generic;
 
     const recv_reg = try lowerReceiver(b, receiver);
+    if (resolved.dispatch == .virtual) {
+        const run = try lowerArgRunWithArity(b, args, arg_arity);
+        const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+        const dst = b.allocReg();
+        try b.push(.{ .CallVirtual = .{
+            .dst = dst,
+            .receiver = recv_reg,
+            .slot = ir.MethodSlotId.fromFunc(func_id),
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .trailing_lambda = b.callTrailingLambda(),
+        } });
+        return dst;
+    }
+
     const args_start = b.allocReg();
     const run = try lowerArgRunWithArity(b, args, arg_arity);
     try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
@@ -10243,10 +10271,10 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const name = callee.Member.name;
     const declared_ty = argDeclTypeRef(b, receiver);
 
-    // Member declarations take precedence over local callables and
-    // extensions. Commit only when the static receiver and arguments identify
-    // a private/final target; virtual and ambiguous calls continue below.
-    if (try lowerDirectMemberCall(
+    // Member declarations take precedence over local callables and extensions.
+    // A unique static declaration commits here as either an exact function or
+    // a virtual slot; only ambiguous/incomplete receiver shapes continue below.
+    if (try lowerResolvedMemberCall(
         b,
         receiver,
         name,
@@ -11640,6 +11668,24 @@ test "shared member resolution selects overloads and dispatch forms" {
     const virtual_result = m.resolveMemberCall(owner, "virtualPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, virtual_result.dispatch);
     try testing.expectEqual(virtual_pick, virtual_result.target.?);
+    const recv_reg = b.allocReg();
+    try b.bind("target", recv_reg);
+    try b.setLocalDeclType("target", "Owner");
+    var recv_path = [_]ast.Ident{.{ .name = "target", .span = dummySpan() }};
+    const recv_expr = Expr{ .Path = .{ .segments = &recv_path, .span = dummySpan() } };
+    const lowered_virtual = try lowerResolvedMemberCall(
+        &b,
+        &recv_expr,
+        .{ .name = "virtualPick", .span = dummySpan() },
+        &int_args,
+        &.{},
+        &.{},
+        .{ .name = "Owner", .nullable = false, .args = &.{} },
+    );
+    try testing.expect(lowered_virtual != null);
+    const virtual_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
+    try testing.expect(virtual_inst == .CallVirtual);
+    try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), virtual_inst.CallVirtual.slot);
     m.classes.items[owner.int()].is_open = false;
     m.classes.items[owner.int()].is_stub = true;
     const stub_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
