@@ -41,8 +41,16 @@ class Holder<K, V> : StateObj {
     fun clear(): Int = update { it * 2 }
 }
 
+class ForwardPrivateOverloads {
+    fun chooseBoth(): String = choose(1) + "/" + choose("x")
+
+    private fun choose(value: Int): String = "int:$value"
+    private fun choose(value: String): String = "string:$value"
+}
+
 fun main() {
     println(Holder<Int, Float>().clear())
     println(RecImpl(7).withCurrent { it.id })
     println(OtherList<Int>().withCurrent { it + 10 })
+    println(ForwardPrivateOverloads().chooseBoth())
 }

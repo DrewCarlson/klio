@@ -1382,6 +1382,9 @@ pub const Module = struct {
         /// excluding any implicit receiver slot.
         sig: []const TypeRef = &.{},
         kind: FuncKind = .plain,
+        /// Private member declarations are lexically bound and cannot be
+        /// overridden, so a resolved call may target their FuncId directly.
+        is_private: bool = false,
         is_inline: bool = false,
         is_suspend: bool = false,
         /// The declaration carries a source body.

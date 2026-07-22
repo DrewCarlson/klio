@@ -9418,33 +9418,63 @@ fn allNull(names: []const ?[]const u8) bool {
     return true;
 }
 
-/// Whether the statically-bound private method `fid` can accept a call
-/// supplying `n_args` positional arguments. The fid map keeps one entry
-/// per name, so an overloaded private method may bind a sibling of the
-/// wrong arity; declining here routes the call through dynamic member
-/// dispatch, which picks the right overload. A named-argument call binds
-/// by parameter name, which only the dynamic path models, so accept it
-/// only when the positional arity already fits the bound fid.
-fn privateFidAcceptsArity(b: *FuncBuilder, fid: FuncId, n_args: usize, arg_names: []const ?[]const u8) bool {
-    const f = b.module.funcById(fid) orelse return true;
-    const params = f.params;
-    const skip: usize = if (params.len > 0 and std.mem.eql(u8, params[0].name, "this")) 1 else 0;
-    const user = params[skip..];
-    // A vararg tail absorbs any number of trailing positional args.
-    if (user.len > 0 and user[user.len - 1].is_vararg) return n_args + 1 >= user.len;
-    if (n_args > user.len) return false;
-    if (n_args == user.len) return true;
-    // Fewer args than params: every unsupplied trailing parameter must be
-    // defaulted. Named args may fill a gap, so only decline when a clearly
-    // unfilled positional tail has no default.
-    _ = arg_names;
-    const defaults = b.module.registry.local_fn_defaults.get(fid);
-    var i = skip + n_args;
-    while (i < params.len) : (i += 1) {
-        const has = defaults != null and i < defaults.?.items.len and defaults.?.items[i] != null;
-        if (!has) return false;
+/// Resolve an own private method against the complete predeclared overload
+/// set. Private members cannot be overridden, so a unique applicability winner
+/// is a direct target even when its declaration appears after the caller.
+fn resolvePrivateMemberCall(
+    b: *FuncBuilder,
+    name: []const u8,
+    file: ir.FileId,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+) Allocator.Error!?FuncId {
+    const owner_name = b.ownerClass() orelse return null;
+    const owner_id = b.module.classIdIndexed(owner_name, b.self_package, file) orelse
+        b.module.classId(owner_name) orelse return null;
+    if (owner_id.int() >= b.module.classes.items.len) return null;
+    const owner = &b.module.classes.items[owner_id.int()];
+    const candidates = b.module.memberDecls(owner.fqn, name);
+    if (candidates.len == 0) return null;
+
+    const shapes = try buildArgShapes(b, args, arg_names);
+    defer b.allocator.free(shapes);
+    const named = !allNull(arg_names);
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .named = named,
+        .recv_external = named,
+    };
+    var best: ?FuncId = null;
+    var best_score: i32 = std.math.minInt(i32);
+    var tied = false;
+    for (candidates) |fid| {
+        const ds = b.module.decl_sigs.get(fid.int()) orelse continue;
+        if (!ds.is_private or !ds.has_body or ds.kind != .instance_method) continue;
+        const f = b.module.funcById(fid) orelse continue;
+        const sig = applicability.SigView{
+            .params = f.params,
+            .has_body = ds.has_body,
+            .low_priority = f.low_priority,
+            .is_member = true,
+            .fid = fid,
+            .package = f.package,
+        };
+        const score = applicability.applicable(&sig, shapes, scope) orelse continue;
+        var applied = score.points + if (!named and f.params.len != 0)
+            applicability.tyEvidenceBonus(f.params[1..], shapes)
+        else
+            0;
+        if (score.exact_arity) applied += 5;
+        if (score.low_priority) applied -= 1000;
+        if (applied > best_score) {
+            best = fid;
+            best_score = applied;
+            tied = false;
+        } else if (applied == best_score) {
+            tied = true;
+        }
     }
-    return true;
+    return if (tied) null else best;
 }
 
 /// Inside a method body: unqualified `name(...)` is a method call on `this`.
@@ -9497,14 +9527,8 @@ fn lowerImplicitThisCall(
     };
     defer if (itc_broad) |m| b.allocator.free(m);
 
-    // Private own-class methods bind statically. The fid map records one
-    // entry per name, so an overloaded private method (two `helper`s of
-    // different arity) keeps only one of them. Take the static bind only
-    // when that fid can actually accept this call's arity; otherwise fall
-    // through to the dynamic member dispatch below, whose
-    // `pickMethodOverload` selects the right private sibling from the
-    // class method table.
-    if (b.privateMethodFid(name0)) |fid| if (privateFidAcceptsArity(b, fid, args.len, ast_arg_names)) {
+    // Private own-class methods bind to their stable declaration identity.
+    if (try resolvePrivateMemberCall(b, name0, segments[0].span.file, args, ast_arg_names)) |fid| {
         // Reserve the receiver slot first, then lower the arguments into a
         // contiguous run immediately after it. `lowerArgRun` reserves every
         // argument slot before lowering any argument, so an argument's own
@@ -9538,10 +9562,10 @@ fn lowerImplicitThisCall(
             .n_args = run[1] + 1,
             .arg_names = arg_names,
             .type_args = &.{},
-            .exact = false,
+            .exact = true,
         } });
         return dst;
-    };
+    }
     b.pending_arg_broad_masks = itc_broad;
     var member_arity: ?[]i16 = null;
     if (member_lambda_fid) |fid| {
@@ -11475,6 +11499,73 @@ test "headCompatible: literal heads disprove scalar params only" {
     // Nullable params adjudicate under the underlying head.
     try std.testing.expect(headCompatible("Boolean", "Boolean?", true));
     try std.testing.expect(!headCompatible("Boolean", "String?", true));
+}
+
+test "private member resolution selects forward same-arity overloads statically" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const owner = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Owner",
+        .fqn = "sample.Owner",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+
+    const Add = struct {
+        fn member(module: *Module, allocator: Allocator, owner_id: ir.ClassId, ty: []const u8) !FuncId {
+            const id = module.nextFuncId();
+            const params = try allocator.alloc(ir.Param, 2);
+            params[0] = .{ .name = "this", .ty = .{ .name = "Owner", .nullable = false, .args = &.{} }, .default = null };
+            params[1] = .{ .name = "value", .ty = .{ .name = ty, .nullable = false, .args = &.{} }, .default = null };
+            try module.funcs.append(allocator, .{
+                .id = id,
+                .name = "pick",
+                .fqn = "sample.Owner.pick",
+                .package = "sample",
+                .params = params,
+                .return_ty = build.typeUnit(),
+                .n_locals = 0,
+                .blocks = &.{},
+                .entry = ir.BlockId.from(0),
+                .is_suspend = false,
+                .kind = .instance_method,
+                .has_receiver_param = true,
+            });
+            const declared = try allocator.alloc(ir.TypeRef, 1);
+            declared[0] = params[1].ty;
+            try module.decl_sigs.put(id.int(), .{
+                .enclosing_class = owner_id,
+                .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+                .sig = declared,
+                .kind = .instance_method,
+                .is_private = true,
+                .has_body = true,
+            });
+            try module.registerMemberDecl(allocator, "sample.Owner", "pick", id);
+            return id;
+        }
+    };
+    const int_pick = try Add.member(&m, a, owner, "Int");
+    const bool_pick = try Add.member(&m, a, owner, "Boolean");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setOwnerClass("Owner");
+    var int_args = [_]Expr{.{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } }};
+    var bool_args = [_]Expr{.{ .BoolLit = .{ .value = true, .span = dummySpan() } }};
+    var unknown_name = [_]ast.Ident{.{ .name = "unknown", .span = dummySpan() }};
+    var unknown_args = [_]Expr{.{ .Path = .{ .segments = &unknown_name, .span = dummySpan() } }};
+    try testing.expectEqual(int_pick, (try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &int_args, &.{})).?);
+    try testing.expectEqual(bool_pick, (try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &bool_args, &.{})).?);
+    try testing.expect((try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &unknown_args, &.{})) == null);
 }
 
 test "lowers postfix not-null assert" {
