@@ -1955,12 +1955,29 @@ pub const Module = struct {
             while (inherited.next()) |entry| try maps[cid.int()].put(entry.key_ptr.*, entry.value_ptr.*);
         }
 
-        for (class.methods) |fid| {
+        // `Class.methods` contains executable bodies only; abstract/interface
+        // headers are deliberately absent. Slots are declaration metadata, so
+        // enumerate the canonical declaration table instead.
+        var own_methods: std.ArrayList(FuncId) = .empty;
+        defer own_methods.deinit(allocator);
+        var decl_it = self.decl_sigs.iterator();
+        while (decl_it.next()) |entry| {
+            const decl_owner = entry.value_ptr.enclosing_class orelse continue;
+            if (decl_owner.int() != cid.int() or entry.value_ptr.kind != .instance_method) continue;
+            try own_methods.append(allocator, FuncId.from(entry.key_ptr.*));
+        }
+        std.mem.sort(FuncId, own_methods.items, {}, struct {
+            fn lessThan(_: void, lhs: FuncId, rhs: FuncId) bool {
+                return lhs.int() < rhs.int();
+            }
+        }.lessThan);
+        for (own_methods.items) |fid| {
             const sig = self.decl_sigs.get(fid.int()) orelse continue;
             if (sig.kind != .instance_method or sig.is_private) continue;
             const inherited_count = maps[cid.int()].count();
             if (inherited_count != 0) {
                 const slots = try allocator.alloc(u32, inherited_count);
+                defer allocator.free(slots);
                 var slot_it = maps[cid.int()].keyIterator();
                 var i: usize = 0;
                 while (slot_it.next()) |slot| : (i += 1) slots[i] = slot.*;
@@ -5518,8 +5535,6 @@ test "method slots link generic overrides and multiple interface roots" {
     m.funcs.items[both_run.int()].is_override = true;
     m.classes.items[base.int()].methods = try a.dupe(FuncId, &.{base_put});
     m.classes.items[child.int()].methods = try a.dupe(FuncId, &.{child_put});
-    m.classes.items[left.int()].methods = try a.dupe(FuncId, &.{left_run});
-    m.classes.items[right.int()].methods = try a.dupe(FuncId, &.{right_run});
     m.classes.items[both.int()].methods = try a.dupe(FuncId, &.{both_run});
 
     const owners = [_]ClassId{ base, child, left, right, both };

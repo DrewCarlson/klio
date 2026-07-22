@@ -23,6 +23,18 @@ class NamedInheritedShape : InheritedShape() {
     override fun name(): String = "inherited"
 }
 
+interface Labelled {
+    fun label(): String
+}
+
+open class BaseLabel : Labelled {
+    override fun label(): String = "base-label"
+}
+
+class DerivedLabel : BaseLabel() {
+    override fun label(): String = "derived-label"
+}
+
 class FinalOverloads {
     fun pick(value: Int): String = "int:$value"
     fun pick(value: String): String = "string:$value"
@@ -35,9 +47,12 @@ fun describe(shape: Shape): String = "${shape.name()} ${shape.sides()}"
 
 fun inheritedName(shape: InheritedShape): String = shape.name()
 
+fun interfaceLabel(value: Labelled): String = value.label()
+
 fun main() {
     val shapes: List<Shape> = listOf(Shape(), Circle(), Dot())
     for (s in shapes) println(describe(s))
     println(inheritedName(NamedInheritedShape()))
+    println(interfaceLabel(DerivedLabel()))
     println(pickBoth(FinalOverloads()))
 }

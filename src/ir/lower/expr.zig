@@ -10195,13 +10195,18 @@ fn lowerResolvedMemberCall(
     if (resolved.dispatch == .deferred) return null;
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
-        // Interface receivers may be represented by a SAM callable rather than
-        // an Instance. Value classes, unresolved shells, and declarations in
-        // the host-backed Kotlin runtime use specialized value ABIs. Those
+        // Value classes, unresolved shells, and declarations in the
+        // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`.
-        if (owner.is_interface or owner.is_value or owner.is_stub or ast_type_args.len != 0 or
+        // already guaranteed to use `Value.Instance`. Interface SAM values use
+        // the same slot but need a declaration-order named-argument binder.
+        var has_named = false;
+        for (ast_arg_names) |arg_name| if (arg_name != null) {
+            has_named = true;
+            break;
+        };
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and has_named) or
             std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
     }
     const target = b.module.funcById(func_id) orelse return null;

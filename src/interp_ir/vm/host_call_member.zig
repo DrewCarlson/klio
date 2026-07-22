@@ -8422,7 +8422,23 @@ pub fn invokeVirtualMember(
     args: []const Value,
     arg_names: []const ?[]const u8,
 ) Allocator.Error!EvalResult {
-    if (receiver.* != .Instance) return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
+    if (receiver.* != .Instance) {
+        if (isCallable(receiver)) {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const root = FuncId.from(slot.int());
+            const sig = module.decl_sigs.get(root.int()) orelse
+                return .{ .err = .{ .Type = "virtual callable slot has no declaration" } };
+            const owner = sig.enclosing_class orelse
+                return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
+            if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
+                return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
+            }
+            return host_call_value.callValue(self, allocator, receiver, args);
+        }
+        return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
+    }
     const recv_fqn = blk: {
         const instance = receiver.Instance.borrow();
         defer instance.deinit();
@@ -8443,6 +8459,21 @@ pub fn invokeVirtualMember(
         any_named = true;
         break;
     };
+
+    // A synthetic fun-interface instance implements its abstract slot with
+    // the callable stored by SAM conversion, rather than an IR method body.
+    if (!any_named) {
+        const sig = module.decl_sigs.get(target.int());
+        if (sig != null and !sig.?.has_body) {
+            const instance = receiver.Instance.borrow();
+            const sam_target = instance.get().get("__sam_target__");
+            instance.deinit();
+            if (sam_target) |callable| {
+                return host_call_value.callValue(self, allocator, &callable, args);
+            }
+        }
+    }
+
     if (!any_named) return (try invokeMethodFuncId(self, allocator, receiver, target, args)) orelse
         .{ .err = .{ .Type = "virtual method target is not executable" } };
 

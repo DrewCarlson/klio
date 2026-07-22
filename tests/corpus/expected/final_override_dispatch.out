@@ -2,4 +2,5 @@ shape 0
 circle 1
 circle 0
 inherited
+derived-label
 int:1/string:x
