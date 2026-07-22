@@ -205,6 +205,21 @@ default thunks are keyed by their reserved `FuncId`, avoiding the prior
 class/name collision between overloads. `dump-ir` reports virtual calls
 separately from name-dynamic calls so migration coverage is measurable.
 
+Explicit-receiver top-level extensions now resolve through
+`Module.resolveExtensionCall`, using the same declaration index and shared
+applicability engine as the other call forms. A direct target requires an
+in-scope declaration, a statically assignable receiver, positive type evidence
+for every value argument, and a unique overload before the stable `FuncId`
+tiebreak. Non-inline user and library extensions then emit exact
+`Call(FuncId)` instructions; the extension canary's `shout`, inherited-receiver
+`greet`, and generic-receiver `doubled` calls are all direct in eager-on and
+eager-off lowering. Named/spread calls, inline extensions, and `kotlin`
+runtime declarations remain deferred. Inline targets need a resolved inline
+lowering strategy that preserves the declaration's lexical helper identities,
+while `kotlin` declarations need P10's host ABI manifest; neither category may
+be emitted as an ordinary direct call. The 117-file stdlib sweep is unchanged
+in both eager modes, including the single existing ULong range-sort failure.
+
 The concrete correctness canary for item 1 is a class containing two private
 same-name, same-arity overloads (`pick(Int)` and `pick(String)`). Today the
 declaration-order map keeps one `FuncId`, so both calls can reach that sibling. The

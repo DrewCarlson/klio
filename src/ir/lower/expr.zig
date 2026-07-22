@@ -7091,6 +7091,9 @@ fn typeheadAuditOn() bool {
 }
 
 fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (arg.* == .StringTemplate) {
+        return .{ .name = "String", .nullable = false, .args = &.{} };
+    }
     // An unsafe cast fixes the argument's static type for overload
     // resolution — kotlinc sees exactly the cast target. That is the
     // documented way to force a sibling overload (ktor's deprecated
@@ -7101,8 +7104,36 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
-        if (b.localCallReturn(arg.Call.callee.Path.segments[0].name)) |ret| {
+        const seg = arg.Call.callee.Path.segments[0];
+        if (b.localCallReturn(seg.name)) |ret| {
             return .{ .name = ret.name, .nullable = ret.nullable, .args = &.{} };
+        }
+        // A unique concrete classifier with no same-named plain function is
+        // a constructor call, so its result head is statically authoritative.
+        // The conservative function gate leaves factory/class collisions for
+        // the ordinary call resolver instead of inventing a receiver type.
+        if (b.resolve(seg.name) == null and !b.isLocalFn(seg.name)) {
+            var same_named_function = false;
+            for (b.module.funcsBySimpleName(seg.name)) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                if (f.kind == .plain and
+                    (f.hasBody() or b.module.decl_ast_body.contains(fid.int())))
+                {
+                    same_named_function = true;
+                    break;
+                }
+            }
+            if (!same_named_function) {
+                const pkg = b.module.packageOfFile(seg.span.file) orelse b.self_package;
+                if (b.module.classIdIndexed(seg.name, pkg, seg.span.file)) |cid| {
+                    if (cid.int() < b.module.classes.items.len) {
+                        const class = &b.module.classes.items[cid.int()];
+                        if (!class.is_object and !class.is_interface and !class.is_abstract) {
+                            return .{ .name = class.fqn, .nullable = false, .args = &.{} };
+                        }
+                    }
+                }
+            }
         }
     }
     // A qualified object/class property read (`Nodes.Traversable`, parsed
@@ -10308,6 +10339,74 @@ fn lowerResolvedMemberCall(
     return dst;
 }
 
+/// Bind an explicit-receiver top-level extension to its declaration identity.
+/// Extensions are statically dispatched in Kotlin; the module resolver only
+/// returns a target when receiver compatibility, visibility, and overload
+/// ranking are all provable without a runtime value.
+fn lowerResolvedExtensionCall(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    declared_ty: ?TypeRef,
+) Allocator.Error!?Reg {
+    const recv_ty = declared_ty orelse return null;
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const caller_file = name.span.file;
+    const resolution = b.module.resolveExtensionCall(name.name, recv_ty, shapes, .{
+        .caller_file = caller_file,
+        .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
+    });
+    const func_id = resolution.target orelse return null;
+    const target = b.module.funcById(func_id) orelse return null;
+    // Inline declarations require their own resolved-target lowering strategy:
+    // an ordinary exact call executes InlineOnly wrapper bodies, while a splice
+    // can change lexical lookup for body-local helpers. Keep the declaration
+    // identity on the compatibility path until that strategy consumes FuncId.
+    if (target.is_inline) return null;
+
+    recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
+    const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
+    defer if (broad_masks) |masks| b.allocator.free(masks);
+    b.pending_arg_broad_masks = broad_masks;
+    const arg_arity = try argFnArities(b, target, args, ast_arg_names, 1);
+    defer if (arg_arity) |arities| b.allocator.free(arities);
+    const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
+    defer if (arg_generic) |flags| b.allocator.free(flags);
+    b.pending_arg_fn_generic = arg_generic;
+
+    const recv_reg = try lowerReceiver(b, receiver);
+    const args_start = b.allocReg();
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
+
+    const user_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+    const arg_names: []?ConstId = if (user_names.len == 0)
+        &.{}
+    else blk: {
+        const names = try b.allocator.alloc(?ConstId, user_names.len + 1);
+        names[0] = null;
+        @memcpy(names[1..], user_names);
+        break :blk names;
+    };
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .Call = .{
+        .dst = dst,
+        .func = func_id,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = args_start,
+        .n_args = run[1] + 1,
+        .arg_names = arg_names,
+        .type_args = type_args,
+        .exact = true,
+    } });
+    return dst;
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -10595,6 +10694,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             }
         }
     }
+
+    if (try lowerResolvedExtensionCall(
+        b,
+        receiver,
+        name,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        declared_ty,
+    )) |reg| return reg;
 
     const recv = try lowerReceiver(b, receiver);
     // A class-named receiver (`Snapshot.withMutableSnapshot { … }`, or an
