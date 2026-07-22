@@ -18,6 +18,7 @@ package androidx.compose.ui.klio
 import androidx.collection.MutableIntObjectMap
 import androidx.collection.mutableIntObjectMapOf
 import androidx.compose.runtime.AbstractApplier
+import androidx.compose.runtime.BroadcastFrameClock
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Composition
 import androidx.compose.runtime.CompositionLocalProvider
@@ -96,6 +97,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 
 // ---------------------------------------------------------------------------
 // The applier that builds the LayoutNode tree from emitted ComposeNodes.
@@ -516,6 +519,27 @@ internal fun ProvideKlioCompositionLocals(owner: KlioComposeOwner, content: @Com
 // Headless render entry point.
 // ---------------------------------------------------------------------------
 
+internal class KlioRecomposerDriver {
+    private val frameClock = BroadcastFrameClock()
+    private val effectScope = CoroutineScope(frameClock + Dispatchers.Unconfined)
+    val recomposer = Recomposer(effectScope.coroutineContext)
+    private val runner = effectScope.launch { recomposer.runRecomposeAndApplyChanges() }
+    private var frameNanos = 0L
+
+    fun frame(): Boolean {
+        val before = recomposer.changeCount
+        frameClock.sendFrame(frameNanos)
+        frameNanos += 16_666_666L
+        return recomposer.changeCount != before
+    }
+
+    fun close() {
+        recomposer.close()
+        runner.cancel()
+        frameClock.cancel()
+    }
+}
+
 /**
  * Render [content] through the real androidx.compose.ui engine into a [width] x
  * [height] px PNG at [path] (at [density] px/dp). Returns false if no Skia backend
@@ -533,7 +557,8 @@ class KlioComposeScene(
     private var height: Int,
     density: Float = 1f,
 ) {
-    private val recomposer = Recomposer()
+    private val recomposerDriver = KlioRecomposerDriver()
+    private val recomposer = recomposerDriver.recomposer
     internal val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
     private val composition = Composition(KlioUiApplier(owner.root), recomposer)
     private val pointerProcessor = PointerInputEventProcessor(owner.root)
@@ -554,7 +579,7 @@ class KlioComposeScene(
 
     /** Recompose pending invalidations and run measure + layout. */
     fun frame() {
-        recomposer.recompose()
+        recomposerDriver.frame()
         owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
         owner.measureAndLayoutForFrame()
     }
@@ -617,7 +642,7 @@ class KlioComposeScene(
 
     fun dispose() {
         composition.dispose()
-        recomposer.close()
+        recomposerDriver.close()
     }
 }
 
@@ -628,17 +653,18 @@ fun renderComposeToPng(
     path: String,
     content: @Composable () -> Unit,
 ): Boolean {
-    val recomposer = Recomposer()
+    val recomposerDriver = KlioRecomposerDriver()
+    val recomposer = recomposerDriver.recomposer
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {
         ProvideKlioCompositionLocals(owner) { content() }
     }
-    recomposer.recompose()
+    recomposerDriver.frame()
     owner.setRootConstraints(Constraints(maxWidth = width, maxHeight = height))
     owner.measureAndLayoutForFrame()
     val ok = klioDrawToPng(width, height, path) { owner.drawTo(this) }
     composition.dispose()
-    recomposer.close()
+    recomposerDriver.close()
     return ok
 }
