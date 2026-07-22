@@ -44,6 +44,49 @@ fun returnInFinally(): Int {
     }
 }
 
+fun caughtCleanupPreservesPrimary(): String {
+    var primary: Throwable? = null
+    try {
+        try {
+            throw IllegalStateException("primary")
+        } catch (e: Throwable) {
+            primary = e
+            throw e
+        } finally {
+            try {
+                throw IllegalArgumentException("cleanup")
+            } catch (cleanup: Throwable) {
+                primary?.addSuppressed(cleanup)
+            }
+        }
+    } catch (e: Throwable) {
+        return "caught ${e.message} suppressed=${e.suppressedExceptions.map { it.message }}"
+    }
+}
+
+fun uncaughtCleanupReplacesPrimary(): String {
+    return try {
+        try {
+            throw IllegalStateException("primary")
+        } finally {
+            throw IllegalArgumentException("cleanup")
+        }
+    } catch (e: Throwable) {
+        "caught ${e.message}"
+    }
+}
+
+fun caughtCleanupPreservesReturn(): Int {
+    try {
+        return 7
+    } finally {
+        try {
+            throw IllegalStateException("caught cleanup")
+        } catch (_: Throwable) {
+        }
+    }
+}
+
 
 fun breakContinueThroughFinally() {
     var log = ""
@@ -77,5 +120,8 @@ fun main() {
     println(plainFinallyThrow())
     println(branchyFinallyThrow())
     println(returnInFinally())
+    println(caughtCleanupPreservesPrimary())
+    println(uncaughtCleanupReplacesPrimary())
+    println(caughtCleanupPreservesReturn())
     breakContinueThroughFinally()
 }

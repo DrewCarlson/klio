@@ -1077,7 +1077,7 @@ pub const TryFrame = struct {
 };
 
 const PendingRethrow = struct { key: BlockId, exc: Value, depth: usize };
-const PendingReturn = struct { key: BlockId, val: Value };
+const PendingReturn = struct { key: BlockId, val: Value, depth: usize };
 const PendingUnwind = struct { key: BlockId, err: EvalError, depth: usize };
 
 /// Control flow paused while a `finally` body runs. It belongs to the active
@@ -1087,6 +1087,13 @@ const PendingFinallyState = struct {
     rethrow: ?PendingRethrow = null,
     return_value: ?PendingReturn = null,
     unwind: ?PendingUnwind = null,
+
+    fn tryDepth(self: PendingFinallyState) ?usize {
+        if (self.rethrow) |p| return p.depth;
+        if (self.return_value) |p| return p.depth;
+        if (self.unwind) |p| return p.depth;
+        return null;
+    }
 
     fn payloadOfError(err: EvalError) ?Value {
         return switch (err) {
@@ -2970,7 +2977,7 @@ fn runFrameInner(
         }
         if (thrown) |exc| {
             // Mid-block throw — same try-stack walk as Terminator.Throw.
-            frame.pending_finally.release(allocator);
+            const pending_depth = frame.pending_finally.tryDepth();
             var routed = false;
             while (try_stack.pop()) |tf| {
                 // A throw raised inside this frame's own finally body must not
@@ -2982,11 +2989,24 @@ fn runFrameInner(
                     if (std.meta.eql(fin0, cur)) continue;
                 }
                 if (findCatch(H, host, &exc, tf.catches)) |h| {
+                    // A catch belonging to a try nested inside the active
+                    // finally handles the new throw without replacing the
+                    // exception / return that caused the finally to run.
+                    // Once the scan crosses the saved stack depth, the throw
+                    // is escaping that finally and Kotlin replaces the prior
+                    // control flow with it.
+                    if (pending_depth) |depth| {
+                        if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
+                    }
                     try frame.write(h.exception_reg, exc);
                     cur = h.handler;
                     routed = true;
                     break;
                 } else if (tf.finally_entry) |fin| {
+                    // An uncaught throw entering a nested finally will escape
+                    // its surrounding finally (or itself be replaced there),
+                    // so it supersedes the already-pending control flow.
+                    frame.pending_finally.release(allocator);
                     const key = tf.finally_done orelse fin;
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
@@ -2995,6 +3015,7 @@ fn runFrameInner(
                 }
             }
             if (!routed) {
+                frame.pending_finally.release(allocator);
                 return errResult(.{ .Throw = exc });
             }
             continue;
@@ -3042,7 +3063,7 @@ fn runFrameInner(
                 }
                 if (chosen) |c| {
                     try_stack.shrinkRetainingCapacity(c.i);
-                    frame.pending_finally.return_value = .{ .key = c.key, .val = v };
+                    frame.pending_finally.return_value = .{ .key = c.key, .val = v, .depth = try_stack.items.len };
                     cur = c.jump;
                     continue;
                 }
@@ -3122,7 +3143,7 @@ fn runFrameInner(
         // A return/throw written inside a finally replaces the control flow
         // that entered it, even when the finally spans several IR blocks and
         // the exit is not its synthesized done sentinel.
-        if (isReturnLike(term)) frame.pending_finally.release(allocator);
+        if (replacesPendingBeforeRouting(term)) frame.pending_finally.release(allocator);
         switch (term) {
             .Goto => |next| cur = next,
             .Branch => |br| {
@@ -3155,7 +3176,7 @@ fn runFrameInner(
                 }
                 if (chosen) |c| {
                     try_stack.shrinkRetainingCapacity(c.i);
-                    frame.pending_finally.return_value = .{ .key = c.key, .val = v };
+                    frame.pending_finally.return_value = .{ .key = c.key, .val = v, .depth = try_stack.items.len };
                     cur = c.jump;
                     continue;
                 }
@@ -3202,6 +3223,7 @@ fn runFrameInner(
                     if (envVarSet("KLIO_THROW_STACK")) dumpFrameChainForDiagAlways();
                 }
                 // Walk the try stack for a matching handler.
+                const pending_depth = frame.pending_finally.tryDepth();
                 var routed = false;
                 while (try_stack.pop()) |tf| {
                     // Same own-finally guard as the mid-block walk: a throw
@@ -3210,11 +3232,15 @@ fn runFrameInner(
                         if (std.meta.eql(fin0, cur)) continue;
                     }
                     if (findCatch(H, host, &exc, tf.catches)) |h| {
+                        if (pending_depth) |depth| {
+                            if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
+                        }
                         try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin| {
+                        frame.pending_finally.release(allocator);
                         const key = tf.finally_done orelse fin;
                         frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
@@ -3223,6 +3249,7 @@ fn runFrameInner(
                     }
                 }
                 if (!routed) {
+                    frame.pending_finally.release(allocator);
                     return errResult(.{ .Throw = exc });
                 }
             },
@@ -3285,6 +3312,13 @@ fn envVarSet(name: []const u8) bool {
 fn isReturnLike(term: Terminator) bool {
     return switch (term) {
         .Return, .NonLocalReturn, .LabeledReturn, .Throw => true,
+        else => false,
+    };
+}
+
+fn replacesPendingBeforeRouting(term: Terminator) bool {
+    return switch (term) {
+        .Return, .NonLocalReturn, .LabeledReturn => true,
         else => false,
     };
 }
