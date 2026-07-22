@@ -8751,6 +8751,9 @@ fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Val
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
+        if (instanceIsThrowable(self, allocator, inst)) {
+            return .{ .ok = try inheritedInstanceToString(allocator, inst, true) };
+        }
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         defer {
@@ -9258,6 +9261,31 @@ pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(Ins
         cg.deinit();
     }
     return false;
+}
+
+fn inheritedInstanceToString(allocator: Allocator, inst: ObjRef(InstanceData), is_throwable: bool) Allocator.Error!Value {
+    const ig = inst.borrow();
+    defer ig.deinit();
+    const cg = ig.get().class.borrow();
+    const fqn = cg.get().fqn;
+    cg.deinit();
+    if (is_throwable) {
+        const msg: ?[]const u8 = if (ig.get().get("message")) |mv| switch (mv) {
+            .String => |s| blk: {
+                const sg = s.borrow();
+                defer sg.deinit();
+                break :blk try allocator.dupe(u8, sg.get().bytes);
+            },
+            else => null,
+        } else null;
+        const rendered = if (msg) |m|
+            try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
+        else
+            try allocator.dupe(u8, fqn);
+        return .{ .String = try runtime.strInitOwned(allocator, rendered) };
+    }
+    const rendered = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
+    return .{ .String = try runtime.strInitOwned(allocator, rendered) };
 }
 
 /// Whether `fid` is a member extension. Authoritative via the func's
@@ -12030,31 +12058,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     if (receiver.* == .Instance) {
         const inst = receiver.Instance;
         if (std.mem.eql(u8, name, "toString") and args.len == 0) {
-            const is_throwable = instanceIsThrowable(self, allocator, inst);
-            const ig = inst.borrow();
-            defer ig.deinit();
-            const fqn = blk: {
-                const cg = ig.get().class.borrow();
-                defer cg.deinit();
-                break :blk cg.get().fqn;
-            };
-            if (is_throwable) {
-                const msg: ?[]const u8 = if (ig.get().get("message")) |mv| switch (mv) {
-                    .String => |s| blk2: {
-                        const sg = s.borrow();
-                        defer sg.deinit();
-                        break :blk2 try allocator.dupe(u8, sg.get().bytes);
-                    },
-                    else => null,
-                } else null;
-                const s = if (msg) |m|
-                    try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
-                else
-                    try allocator.dupe(u8, fqn);
-                return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
-            }
-            const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
-            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+            return .{ .ok = try inheritedInstanceToString(allocator, inst, instanceIsThrowable(self, allocator, inst)) };
         }
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
             const ig = inst.borrow();

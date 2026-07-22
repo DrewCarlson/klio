@@ -204,6 +204,14 @@ test "exception_hierarchy_multilevel" {
     );
 }
 
+test "exception_inherited_tostring" {
+    try check("exception_inherited_tostring",
+        \\SpecificFailure: bad
+        \\decorated DecoratedFailure: worse
+        \\
+    );
+}
+
 test "compound_assign_val_plus_assign" {
     try check("compound_assign_val_plus_assign",
         \\[base, user, tail]
