@@ -1099,6 +1099,11 @@ pub const SelfLocalFn = struct {
     mangled: []const u8,
 };
 
+pub const PendingLocalDeclTypes = struct {
+    types: std.StringHashMap([]const u8),
+    nullable: std.StringHashMap(void),
+};
+
 pub const Module = struct {
     funcs: std.ArrayList(Func) = .empty,
     /// True when any declaration in this module has a `context(...)`
@@ -1157,6 +1162,11 @@ pub const Module = struct {
     /// value (`var key = 0` beside the `key(...) {}` composable). Owned by the
     /// receiving builder once consumed. Not serialized.
     pending_lambda_nonfn_locals: ?std.StringHashMap(void) = null,
+    /// Declared type heads of enclosing locals captured by the lambda body
+    /// about to lower. The runtime capture carries the value; this parallel
+    /// lowering-only carrier preserves the compile-time type Kotlin inferred
+    /// for explicit-receiver resolution inside the closure.
+    pending_lambda_local_decl_types: ?PendingLocalDeclTypes = null,
     /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
     /// self-contained, decoded on first execution. Borrows the image buffer;
     /// empty unless this module was loaded from an image.
@@ -1595,6 +1605,11 @@ pub const Module = struct {
         self.decl_ast_body.deinit();
         self.decl_sigs.deinit();
         self.resolve_diags.deinit(allocator);
+        if (self.pending_lambda_nonfn_locals) |*names| names.deinit();
+        if (self.pending_lambda_local_decl_types) |*locals| {
+            locals.types.deinit();
+            locals.nullable.deinit();
+        }
     }
 
     /// Clone this module so the copy can be EXTENDED (funcs/classes/consts

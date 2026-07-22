@@ -1398,6 +1398,23 @@ pub const FuncBuilder = struct {
     pub fn localDeclNullable(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_decl_nullable.contains(name);
     }
+    pub fn localDeclTypesSnapshot(self: *const FuncBuilder) Allocator.Error!ir.PendingLocalDeclTypes {
+        var types = std.StringHashMap([]const u8).init(self.allocator);
+        errdefer types.deinit();
+        var type_it = self.local_decl_types.iterator();
+        while (type_it.next()) |entry| try types.put(entry.key_ptr.*, entry.value_ptr.*);
+        var nullable = std.StringHashMap(void).init(self.allocator);
+        errdefer nullable.deinit();
+        var null_it = self.local_decl_nullable.keyIterator();
+        while (null_it.next()) |name| try nullable.put(name.*, {});
+        return .{ .types = types, .nullable = nullable };
+    }
+    pub fn inheritLocalDeclTypes(self: *FuncBuilder, inherited: *const ir.PendingLocalDeclTypes) Allocator.Error!void {
+        var type_it = inherited.types.iterator();
+        while (type_it.next()) |entry| try self.local_decl_types.put(entry.key_ptr.*, entry.value_ptr.*);
+        var null_it = inherited.nullable.keyIterator();
+        while (null_it.next()) |name| try self.local_decl_nullable.put(name.*, {});
+    }
     /// Record that the local's declared type is a RECEIVER function type
     /// (`suspend Scope.() -> Unit`), so a bare invocation binds the
     /// implicit `this` as the lambda's receiver.
@@ -2256,6 +2273,26 @@ test "record_capture is idempotent" {
     try testing.expectEqual(@as(u16, 1), idx_b);
     try testing.expectEqual(@as(u16, 0), idx_a_again);
     try testing.expectEqual(@as(usize, 2), b.capturesTaken().len);
+}
+
+test "captured local type metadata transfers to a lambda builder" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var outer = try FuncBuilder.init(testing.allocator, &m);
+    defer outer.deinit();
+    try outer.setLocalDeclType("scope", "CoroutineScope");
+    try outer.setLocalDeclNullable("scope");
+    var snapshot = try outer.localDeclTypesSnapshot();
+    defer {
+        snapshot.types.deinit();
+        snapshot.nullable.deinit();
+    }
+
+    var inner = try FuncBuilder.init(testing.allocator, &m);
+    defer inner.deinit();
+    try inner.inheritLocalDeclTypes(&snapshot);
+    try testing.expectEqualStrings("CoroutineScope", inner.localDeclType("scope").?);
+    try testing.expect(inner.localDeclNullable("scope"));
 }
 
 test "loop frame lookup by label and innermost" {

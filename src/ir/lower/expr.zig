@@ -2487,6 +2487,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Non-callable-local evidence flows into the body (transitively — this
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -2581,6 +2582,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const inherited_lef = try b.localExtFnNames();
     const inherited_erp = try b.erasedRecvParamNames();
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+    b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,

@@ -191,6 +191,22 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markNonFnLocal(p.name.name);
         }
     } else if (p.init) |*e| {
+        // Preserve the inferred static type of a simple receiver alias. This
+        // is the type kotlinc assigns to `val outerScope = this`, and later
+        // explicit-receiver extension calls need it before runtime dispatch
+        // (notably to type a trailing receiver lambda correctly).
+        switch (e.*) {
+            .This => |t| if (t.qualifier == null) {
+                if (b.enclosingRecvTy()) |ty| try b.setLocalDeclType(p.name.name, ty);
+            },
+            .Path => |path| if (path.segments.len == 1) {
+                if (b.localDeclType(path.segments[0].name)) |ty| {
+                    try b.setLocalDeclType(p.name.name, ty);
+                    if (b.localDeclNullable(path.segments[0].name)) try b.setLocalDeclNullable(p.name.name);
+                }
+            },
+            else => {},
+        }
         // Literal initializers are recorded too: a call site uses them as
         // definite NON-callable evidence (`var nodeIndex = 0` beside
         // `fun nodeIndex(...)` — the call resolves to the function).
@@ -1171,6 +1187,39 @@ test "val without annotation binds directly" {
     // `val x = 3` binds `x` to the init register without a home slot.
     try testing.expect(b.resolve("x") != null);
     try testing.expect(b.mutableHome("x") == null);
+}
+
+test "val initialized from this retains the receiver type" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setEnclosingRecvTy("TestScope");
+    var p = ast.Property{
+        .mutable = false,
+        .name = .{ .name = "outerScope", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = .{ .This = .{ .qualifier = null, .span = dummySpan() } },
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const s = Stmt{ .Decl = .{ .Property = &p } };
+    _ = try lowerStmt(&b, &s);
+    try testing.expectEqualStrings("TestScope", b.localDeclType("outerScope").?);
 }
 
 test "var declaration gets a mutable home slot" {

@@ -278,6 +278,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         nf_own.deinit();
         module.pending_lambda_nonfn_locals = null;
     }
+    if (module.pending_lambda_local_decl_types) |*locals| {
+        try b.inheritLocalDeclTypes(locals);
+        var owned = locals.*;
+        owned.types.deinit();
+        owned.nullable.deinit();
+        module.pending_lambda_local_decl_types = null;
+    }
     // A local `fun`'s BLOCK body returns Unit on fall-through, never the
     // tail statement's value (stashed by `lowerLocalFnDecl`; a lambda
     // literal keeps last-expression semantics). Consumed here, before any
