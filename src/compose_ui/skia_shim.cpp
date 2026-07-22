@@ -2405,10 +2405,11 @@ void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
 
 }  // extern "C"
 
-#else  // no windowing backend
+#else  // no windowing backend (offscreen/raster only)
 
 extern "C" {
 void* klio_win_open(int, int, const char*) { return nullptr; }
+void* klio_win_attach(void*, int, int, double) { return nullptr; }
 void* klio_win_surface(void*) { return nullptr; }
 void klio_win_present(void*) {}
 int klio_win_poll(void*, int, int*, int*) { return 2; }

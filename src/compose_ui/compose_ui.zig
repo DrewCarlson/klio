@@ -292,14 +292,16 @@ fn loadSkia() ?*Skia {
     if (skia_tried) return null;
     skia_tried = true;
 
-    // iOS bans dlopen of a runtime-written dylib, so the shim is linked
-    // statically and resolved from symbols rather than a DynLib — but only when
-    // the app host opts in (it links libklio_skia.a). The plain interpreter exe
-    // does not, so it emits no shim references and renders headless there.
-    if (comptime @import("builtin").os.tag == .ios) {
-        if (comptime use_static_skia) return loadSkiaStatic();
-        return null;
-    }
+    // Mobile app hosts (iOS, Android) link the shim statically and opt in via
+    // `klio_skia_static` — resolve from symbols, not dlopen (iOS bans dlopen of a
+    // runtime-written dylib; the Android host ships no separate .so).
+    if (comptime use_static_skia) return loadSkiaStatic();
+    // A mobile target WITHOUT the static opt-in (the plain interpreter) has no
+    // shim to dlopen, so it renders headless rather than searching for one.
+    const mobile_os = @import("builtin").os.tag == .ios or
+        (@import("builtin").os.tag == .linux and
+            (@import("builtin").abi == .android or @import("builtin").abi == .androideabi));
+    if (comptime mobile_os) return null;
 
     var lib = openSkiaLib() orelse return null;
     const F = struct {
