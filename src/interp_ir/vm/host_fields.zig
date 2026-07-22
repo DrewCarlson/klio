@@ -716,6 +716,30 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
             const mptr: *const Module = self.module.asPtr();
+            // Reject a foreign implicit receiver before virtual getter or
+            // stored-field lookup. Otherwise its unrelated same-named member
+            // can win before the enclosing lexical receiver is considered.
+            // If the lexical owner does not declare the property, the scoped
+            // marker is only a fallback and the candidate may legitimately
+            // provide it (for example, a `with` subject).
+            if (member_probe and receiver.* == .Instance) {
+                const rcn = className(receiver.Instance);
+                const owns = std.mem.eql(u8, rcn, owner) or blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk mg.get().classIsOrExtends(rcn, owner);
+                };
+                const owner_declares = classDeclaresStoredProp(self, owner, prop) or blk: {
+                    const pg = self.prog.borrow();
+                    defer pg.deinit();
+                    break :blk lookupPairFunc(pg.get().body_prop_inits, owner, prop) != null or
+                        lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
+                        lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
+                };
+                if (!owns and owner_declares) {
+                    return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ prop, rcn }) });
+                }
+            }
             // A private SHADOW of a supertype's same-name declaration has
             // its own storage cell under the owner-mangled key; the
             // declaring class's own reads address exactly that cell (the
@@ -837,41 +861,6 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (fid.int() < mptr.funcCount()) {
                         return evalGetter(self, allocator, fid, receiver.*);
                     }
-                }
-            }
-            // During an implicit-receiver probe an owner-qualified sgetter
-            // names the lexically enclosing `owner`'s member. A candidate that
-            // neither IS `owner` nor extends it — a `with`/`coroutineScope { … }`
-            // scope receiver whose runtime class merely declares a same-named
-            // field (e.g. `JobSupport._state` under a `CoroutineScope` receiver
-            // in a lambda enclosed by another class) — does not own that member.
-            // Reading its plain field would let a foreign, often private, field
-            // shadow the enclosing owner's property, so report a probe miss and
-            // let the walk continue to the enclosing `owner`. The transitive
-            // `classIsOrExtends` is used because `isRuntimeType` misses deep
-            // supertype chains for the coroutines classes.
-            if (member_probe and receiver.* == .Instance) {
-                const rcn = className(receiver.Instance);
-                const owns = std.mem.eql(u8, rcn, owner) or blk: {
-                    const mg = self.module.borrow();
-                    defer mg.deinit();
-                    break :blk mg.get().classIsOrExtends(rcn, owner);
-                };
-                // Skip only for a genuine shadow conflict: `owner` (the lexical
-                // class the bare name was written in) must itself declare `prop`.
-                // When it does not — `prop` comes from an OUTER class read via a
-                // `with` subject, e.g. `objectArgs` on the `Operations` subject
-                // inside a `WriteScope` method — the subject legitimately
-                // provides it and the read must proceed.
-                const owner_declares = blk: {
-                    const pg = self.prog.borrow();
-                    defer pg.deinit();
-                    break :blk lookupPairFunc(pg.get().body_prop_inits, owner, prop) != null or
-                        lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
-                        lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
-                };
-                if (!owns and owner_declares) {
-                    return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ prop, rcn }) });
                 }
             }
             return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
