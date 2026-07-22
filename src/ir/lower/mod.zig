@@ -133,7 +133,7 @@ pub const lowerFunction = decl.lowerFunction;
 pub const lowerFunctionWithFile = decl.lowerFunctionWithFile;
 pub const lowerFunctionBodyInto = decl.lowerFunctionBodyInto;
 pub const lowerMethod = decl.lowerMethod;
-pub const lowerMethodWithPrivate = decl.lowerMethodWithPrivate;
+pub const lowerMethodWithMemberContext = decl.lowerMethodWithMemberContext;
 pub const setLowerAnonCaptures = decl.setLowerAnonCaptures;
 pub const resolveAnnotationNames = decl.resolveAnnotationNames;
 

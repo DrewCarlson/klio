@@ -35,7 +35,7 @@ Run any program with:
 |----------------------------|----------------------------------------------------------------|
 | `classes.kt`               | Primary-ctor properties, methods, `data class`, `companion object`, `object`, `operator fun compareTo`. |
 | `inheritance.kt`           | `open`/`override`, super-constructor calls, `super.method()`, polymorphic dispatch. |
-| `final_override_dispatch.kt` | `final override` seals a method against further overriding, so a call through the declaring type is monomorphic even on an `open` class and resolves statically; a plain `override` beside it stays virtual. |
+| `final_override_dispatch.kt` | `final override` seals a method against further overriding, so a call through the declaring type is monomorphic even on an `open` class and resolves statically; a plain `override` beside it stays virtual, while same-arity overloads on a final class bind directly by argument type. |
 | `interface_default_dispatch.kt` | An interface member is implicitly open — a default body is always overridable by an implementer — so a call through the interface type dispatches virtually and is never resolved to the default at lowering time. |
 | `inheritance_delegation.kt`, `delegated_inheritance.kt` | Interface and inherited-delegate resolution (`by`). |
 | `interfaces.kt`            | Abstract members, default methods, multiple interfaces, marker interfaces. |
@@ -83,7 +83,7 @@ Run any program with:
 | `infix_calls.kt`              | `infix` functions.                                          |
 | `scoping_fns_top_level.kt`    | `let` / `also` / `apply` / `run` / `with` / `takeIf`.       |
 | `receiver_member_precedence.kt` | Implicit-receiver precedence for bare reads, writes, and calls: innermost receiver first, member over extension within one receiver, receiver member over top-level binding, inner-class nesting tower. |
-| `private_member_beats_extension.kt` | A bare call inside a class binds the class's OWN member — private inline included — over same-named top-level inline extensions, and never re-picks a top-level namesake at runtime; explicit-receiver calls still reach the extensions. |
+| `private_member_beats_extension.kt` | A bare call inside a class binds the class's OWN member — private inline included — over same-named top-level inline extensions, and never re-picks a top-level namesake at runtime; forward same-arity private overloads resolve by argument type to direct targets; explicit-receiver calls still reach the extensions. |
 | `ext_needs_receiver_in_scope.kt` | A bare call in a plain method never binds an extension whose declared receiver no statically-known receiver supplies — the top-level namesake wins, named and positional forms alike; an explicit receiver still reaches the extension. |
 | `cross_package_extension_twin.kt` | Two same-simple-name classes in different namespaces, each with its own same-named extension: with the call-site static type erased, the runtime receiver's actual class FQN — not the shared simple name — selects which twin binds. |
 | `nested_it_through_member_hof.kt` | An `it` inside a `() -> R` block passed to a class/companion member captures the enclosing lambda's `it` — the member's declared signature supplies the block's zero arity, dropping the parser-injected `it`. |

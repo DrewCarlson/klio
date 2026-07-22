@@ -24,7 +24,6 @@ const FuncId = ir.FuncId;
 const Inst = ir.Inst;
 const Terminator = ir.Terminator;
 const StringSet = std.StringHashMap(void);
-const StringFuncIdMap = std.StringHashMap(FuncId);
 
 /// File-scoped class registry: simple name → AST class. Threaded through
 /// the public lowering entry points so cross-class member lookups resolve.
@@ -354,6 +353,7 @@ pub fn reserveMemberHeaders(
             .arity = arity,
             .sig = sig,
             .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+            .is_private = f.visibility == .Private,
             .is_inline = f.is_inline,
             .is_suspend = f.is_suspend,
             .has_body = f.body != null,
@@ -635,6 +635,9 @@ pub fn lowerClassWithExtras(
 ) Allocator.Error!ClassId {
     const a = module.registry.allocator;
 
+    const class_type_params = try a.alloc([]const u8, c.type_params.len);
+    for (c.type_params, class_type_params) |*param, *out| out.* = param.name.name;
+
     // Register the class shell first so the class name resolves inside
     // its own method bodies (`class Foo { fun copy() = Foo(...) }`).
     const class_fqn = lower_class_fqn orelse c.name.name;
@@ -648,10 +651,13 @@ pub fn lowerClassWithExtras(
         .init_block = null,
         .companion = null,
         .supertypes = &.{},
+        .type_params = class_type_params,
+        .supertype_refs = &.{},
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
         .is_interface = c.is_interface,
         .is_open = c.is_open,
+        .is_value = c.is_value,
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
@@ -686,15 +692,6 @@ pub fn lowerClassWithExtras(
 
     var methods: std.ArrayList(FuncId) = .empty;
     errdefer methods.deinit(a);
-    // Track private methods lowered so far in declaration order so a
-    // later method's body can statically bind to an earlier private
-    // sibling's FuncId rather than virtual-dispatching it (Kotlin:
-    // private members are invisible to subclasses, so the dispatch is
-    // fixed to the declaring class). Forward-references would need a
-    // reservation pass; the common case (helper declared before its
-    // caller) is covered.
-    var private_method_fids = StringFuncIdMap.init(a);
-    defer private_method_fids.deinit();
     for (c.members) |*m| {
         if (m.* == .Function) {
             const f = &m.Function;
@@ -722,13 +719,12 @@ pub fn lowerClassWithExtras(
             // Use the method's own FuncId, not `funcs.len() - 1`:
             // lowering a method also pushes its default-arg thunk funcs,
             // so the last slot is no longer the method body.
-            const placed = try lowerMethodWithPrivate(
+            const placed = try lowerMethodWithMemberContext(
                 module,
                 f,
                 c.name.name,
                 &own_member_names,
                 extra_members,
-                &private_method_fids,
                 &own_member_arity,
             );
             try methods.append(a, placed.id);
@@ -766,18 +762,18 @@ pub fn lowerClassWithExtras(
                     .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
                     .sig = msig,
                     .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+                    .is_private = f.visibility == .Private,
                     .is_inline = f.is_inline,
                     .is_suspend = f.is_suspend,
                     .has_body = true,
                 });
             }
-            if (f.visibility == .Private) {
-                try private_method_fids.put(f.name.name, placed.id);
-            }
         }
     }
     var supertypes: std.ArrayList(ClassId) = .empty;
     errdefer supertypes.deinit(a);
+    var supertype_refs: std.ArrayList(TypeRef) = .empty;
+    errdefer supertype_refs.deinit(a);
     // A supertype reference resolves from the declaring class's own
     // scope (its package + its file's imports), so a cross-package
     // simple-name collision binds the supertype this class can see.
@@ -791,11 +787,13 @@ pub fn lowerClassWithExtras(
         if (t.qualified_path) |qp| {
             if (module.classIdByQualifiedSuffix(qp)) |cid| {
                 try supertypes.append(a, cid);
+                try supertype_refs.append(a, try loweredTypeRef(a, t, false));
                 continue;
             }
         }
         if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
             try supertypes.append(a, cid);
+            try supertype_refs.append(a, try loweredTypeRef(a, t, false));
         }
     }
     // Patch the registered class with its now-known method list and
@@ -804,6 +802,7 @@ pub fn lowerClassWithExtras(
         const slot = &module.classes.items[class_id.int()];
         slot.methods = try methods.toOwnedSlice(a);
         slot.supertypes = try supertypes.toOwnedSlice(a);
+        slot.supertype_refs = try supertype_refs.toOwnedSlice(a);
     }
     return class_id;
 }
@@ -1076,20 +1075,17 @@ pub fn lowerMethod(
     owner_class: []const u8,
     own_members: *const StringSet,
 ) Allocator.Error!Func {
-    var empty = StringFuncIdMap.init(module.registry.allocator);
-    defer empty.deinit();
     var no_enclosing = StringSet.init(module.registry.allocator);
     defer no_enclosing.deinit();
-    return lowerMethodWithPrivate(module, f, owner_class, own_members, &no_enclosing, &empty, null);
+    return lowerMethodWithMemberContext(module, f, owner_class, own_members, &no_enclosing, null);
 }
 
-pub fn lowerMethodWithPrivate(
+pub fn lowerMethodWithMemberContext(
     module: *Module,
     f: *const ast.Function,
     owner_class: []const u8,
     own_members: *const StringSet,
     enclosing_members: *const StringSet,
-    private_method_fids: *const StringFuncIdMap,
     own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
@@ -1112,7 +1108,7 @@ pub fn lowerMethodWithPrivate(
         // a `::name` referencing an owner member must bind the DISPATCH
         // receiver via the qualified-this walk, and the ref lowering
         // keys that on the owner-class name.
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null, null);
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null);
         const reserved_id = module.funcByDeclSpan(f.name.span);
         const id = reserved_id orelse module.nextFuncId();
         var placed = func;
@@ -1149,7 +1145,6 @@ pub fn lowerMethodWithPrivate(
         owner_class,
         own_members,
         enclosing_members,
-        private_method_fids,
         own_member_arity,
     );
     const reserved_id = module.funcByDeclSpan(f.name.span);
@@ -1198,27 +1193,6 @@ pub fn lowerFunctionBodyWithImplicitOwner(
         own_members,
         null,
         null,
-        null,
-    );
-}
-
-pub fn lowerFunctionBodyWithImplicitOwnerPriv(
-    module: *Module,
-    f: *const ast.Function,
-    implicit_params: []const []const u8,
-    owner_class: ?[]const u8,
-    own_members: ?*const StringSet,
-    private_method_fids: ?*const StringFuncIdMap,
-) Allocator.Error!Func {
-    return lowerFunctionBodyWithImplicitOwnerEnclosing(
-        module,
-        f,
-        implicit_params,
-        owner_class,
-        own_members,
-        null,
-        private_method_fids,
-        null,
     );
 }
 
@@ -1235,7 +1209,6 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     owner_class: ?[]const u8,
     own_members: ?*const StringSet,
     enclosing_members: ?*const StringSet,
-    private_method_fids: ?*const StringFuncIdMap,
     own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
@@ -1455,9 +1428,6 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     if (enclosing_members) |set| {
         if (set.count() != 0) b.setEnclosingMembers(try cloneStringSet(a, set));
     }
-    if (private_method_fids) |map| {
-        b.setPrivateMethodFids(try cloneStringFuncIdMap(a, map));
-    }
     if (own_member_arity) |map| {
         var copy = std.StringHashMap(u64).init(a);
         var it = map.iterator();
@@ -1660,15 +1630,6 @@ fn cloneStringSet(allocator: Allocator, src: *const StringSet) Allocator.Error!S
     var out = StringSet.init(allocator);
     var it = src.keyIterator();
     while (it.next()) |k| try out.put(k.*, {});
-    return out;
-}
-
-/// Duplicate a `StringHashMap(FuncId)` into a fresh owned map sharing the
-/// borrowed key slices.
-fn cloneStringFuncIdMap(allocator: Allocator, src: *const StringFuncIdMap) Allocator.Error!StringFuncIdMap {
-    var out = StringFuncIdMap.init(allocator);
-    var it = src.iterator();
-    while (it.next()) |e| try out.put(e.key_ptr.*, e.value_ptr.*);
     return out;
 }
 

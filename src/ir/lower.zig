@@ -111,7 +111,7 @@ pub const lowerFunction = mod.lowerFunction;
 pub const lowerFunctionWithFile = mod.lowerFunctionWithFile;
 pub const lowerFunctionBodyInto = mod.lowerFunctionBodyInto;
 pub const lowerMethod = mod.lowerMethod;
-pub const lowerMethodWithPrivate = mod.lowerMethodWithPrivate;
+pub const lowerMethodWithMemberContext = mod.lowerMethodWithMemberContext;
 pub const setLowerAnonCaptures = mod.setLowerAnonCaptures;
 pub const resolveAnnotationNames = mod.resolveAnnotationNames;
 

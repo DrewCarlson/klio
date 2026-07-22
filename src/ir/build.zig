@@ -25,7 +25,6 @@ const CatchHandler = ir.CatchHandler;
 
 pub const StringSet = std.StringHashMap(void);
 const StringRegMap = std.StringHashMap(Reg);
-const StringFuncIdMap = std.StringHashMap(FuncId);
 
 /// Per inline-fn-splice frame: a lambda-param substitution map paired
 /// with the `inline_return` snapshot taken when the frame was pushed.
@@ -462,11 +461,6 @@ pub const FuncBuilder = struct {
     /// reference through `this.<member>`; it only lets an enclosing
     /// member out-prioritise a same-named imported extension.
     enclosing_members: StringSet,
-    /// Private methods of `owner_class` that have already been
-    /// lowered (so their `FuncIds` are known). A bare call resolving
-    /// to a name in this map binds statically to the listed `FuncId`
-    /// rather than virtual-dispatching.
-    private_method_fids: StringFuncIdMap,
     /// When the function is `tailrec`, the simple name of the
     /// function itself. Self-calls are lowered as `Terminator.TailJump`
     /// to keep the stack flat across recursion.
@@ -727,7 +721,6 @@ pub const FuncBuilder = struct {
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .lambda_arg_recv = std.AutoHashMap(span_mod.Span, []const u8).init(allocator),
             .enclosing_members = StringSet.init(allocator),
-            .private_method_fids = StringFuncIdMap.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
@@ -794,7 +787,6 @@ pub const FuncBuilder = struct {
         self.type_param_names.deinit();
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
-        self.private_method_fids.deinit();
         self.param_names.deinit();
         {
             var it = self.local_fn_param_tys.valueIterator();
@@ -1281,35 +1273,6 @@ pub const FuncBuilder = struct {
         var it = self.enclosing_members.keyIterator();
         while (it.next()) |k| try out.put(k.*, {});
         return out;
-    }
-    /// Replace the private-method-fid map. Takes ownership of `map`.
-    pub fn setPrivateMethodFids(self: *FuncBuilder, map: StringFuncIdMap) void {
-        self.private_method_fids.deinit();
-        self.private_method_fids = map;
-    }
-    pub fn privateMethodFid(self: *const FuncBuilder, name: []const u8) ?FuncId {
-        return self.private_method_fids.get(name);
-    }
-    /// The statically-bound private own-class method for `name`, but only
-    /// when its parameter list can accept a positional call of `n_args`
-    /// user arguments. The map holds one FuncId per name, so when a private
-    /// method is overloaded the stored entry may be a different-arity
-    /// sibling; binding it regardless would route the call to the wrong
-    /// overload. A mismatch returns null so the caller defers to the
-    /// arity-aware dynamic dispatch.
-    pub fn privateMethodFidForArity(self: *const FuncBuilder, name: []const u8, n_args: usize) ?FuncId {
-        const fid = self.private_method_fids.get(name) orelse return null;
-        const f = self.module.funcById(fid) orelse return fid;
-        const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-        const user = if (has_this) f.params.len - 1 else f.params.len;
-        var min_required: usize = 0;
-        var has_vararg = false;
-        for (f.params[(if (has_this) @as(usize, 1) else 0)..]) |p| {
-            if (p.is_vararg) has_vararg = true;
-            if (!p.has_default and !p.is_vararg) min_required += 1;
-        }
-        if (has_vararg) return if (n_args >= min_required) fid else null;
-        return if (n_args >= min_required and n_args <= user) fid else null;
     }
     pub fn hasOwnMember(self: *const FuncBuilder, name: []const u8) bool {
         return self.own_members.contains(name);
