@@ -283,6 +283,14 @@ const CAP_CONFLATED: i64 = -1;
 const CAP_BUFFERED: i64 = -2;
 const DEFAULT_BUFFER_CAPACITY: usize = 64;
 
+fn channelIllegalArgument(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
+        .message = try runtime.strInit(ctx.allocator, message),
+        .cause = null,
+    } } } };
+}
+
 fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // arg0 is the capacity (Int / Long); arg1, when present, is the
     // `BufferOverflow` policy enum entry. `Channel(...)` is shadowed by
@@ -301,6 +309,9 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var effective_cap: usize = undefined;
     var eff_overflow = overflow;
     if (capacity == CAP_CONFLATED) {
+        if (overflow != .suspend_) {
+            return channelIllegalArgument(ctx, "CONFLATED capacity cannot be used with non-default onBufferOverflow");
+        }
         // A conflated channel keeps only the latest value: capacity-1
         // drop-oldest, regardless of the requested overflow policy.
         effective_cap = 1;
@@ -320,6 +331,11 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             effective_cap = 1;
         }
     } else {
+        if (capacity < 0) {
+            const message = try std.fmt.allocPrint(ctx.allocator, "Invalid channel capacity: {d}, should be >=0", .{capacity});
+            defer if (runtime.freeScratch()) ctx.allocator.free(message);
+            return channelIllegalArgument(ctx, message);
+        }
         effective_cap = @intCast(capacity);
     }
 
@@ -421,8 +437,7 @@ fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
             std.debug.print("[chan] arm slot={d}: NO ACTIVE SCOPE\n", .{slot});
         return;
     };
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
-        {
+    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null) {
         const cls: []const u8 = if (scope == .Instance) blk: {
             const g = scope.Instance.borrow();
             defer g.deinit();
@@ -2245,6 +2260,43 @@ test "overflowOf reads the BufferOverflow ordinal" {
     // A non-instance argument defaults to suspend.
     const nil: Value = .Null;
     try testing.expectEqual(ChannelState.Overflow.suspend_, overflowOf(&nil));
+}
+
+test "channel factory rejects invalid capacity combinations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    {
+        const args = [_]Value{Value.newInt(-3)};
+        var ctx = makeCtx(&host, &cap, &args);
+        const result = try channelCreate(&ctx);
+        defer result.err.Thrown.release(testing.allocator);
+        try testing.expect(result == .err and result.err == .Thrown);
+        const fqn = result.err.Thrown.Exception.fqn.borrow();
+        defer fqn.deinit();
+        try testing.expectEqualStrings("kotlin.IllegalArgumentException", fqn.get().bytes);
+    }
+
+    const cls = try makeClassDef(a, "kotlinx.coroutines.channels.BufferOverflow");
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.append(a, .{ .name = "ordinal", .value = Value.newInt(1) });
+    const drop_oldest = Value{ .Instance = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = fields,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    }) };
+    const args = [_]Value{ Value.newInt(CAP_CONFLATED), drop_oldest };
+    var ctx = makeCtx(&host, &cap, &args);
+    const result = try channelCreate(&ctx);
+    defer result.err.Thrown.release(testing.allocator);
+    try testing.expect(result == .err and result.err == .Thrown);
 }
 
 test "conflated channel keeps only the latest value" {
