@@ -7,7 +7,6 @@
 //! interp_ir run, with stdlib + kotlinx + ktor intrinsics registered.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const span = @import("span");
 const SourceMap = span.SourceMap;
@@ -967,14 +966,12 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    // macOS: keep the interpreter on the process main thread (with a large stack
-    // via an in-thread stack switch) so a program that opens a Compose UI window
-    // can drive AppKit and the single-threaded Skia Metal context, both of which
-    // must run on the main thread. Elsewhere, a large-stack worker thread is fine.
-    if (builtin.os.tag == .macos) {
-        return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
-    }
-    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+    // Run the interpreter on the process main thread on every platform, with a
+    // large stack via an in-thread stack switch (no worker-thread hop). A program
+    // that opens a Compose UI must drive the platform windowing + single-threaded
+    // GPU context from the main thread (AppKit/Metal on macOS, UIKit/Metal on
+    // iOS); keeping the default uniform means the UI path is the normal path.
+    return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
