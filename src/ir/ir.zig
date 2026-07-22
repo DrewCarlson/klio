@@ -121,6 +121,15 @@ pub const ConstId = enum(u32) {
 /// object expression's lexical scope.
 pub const ScopeRename = struct { name: []const u8, renamed: []const u8 };
 
+/// One classifier resolved at an anonymous-object expression's lexical site.
+/// Runtime-lowered object members use its exact FQN instead of re-resolving a
+/// bare name in their intentionally small side module.
+pub const ScopeClassRef = struct {
+    name: []const u8,
+    fqn: []const u8,
+    has_companion: bool,
+};
+
 /// One IR instruction. Drives the per-frame evaluator switch.
 pub const Inst = union(enum) {
     /// Materialise a constant into a register.
@@ -562,6 +571,8 @@ pub const Inst = union(enum) {
         /// with none of the build's scope registries, so the lexical
         /// renames ride on the instruction.
         scope_renames: []const ScopeRename = &.{},
+        /// Exact classifier identities referenced by the object subtree.
+        scope_classes: []const ScopeClassRef = &.{},
     },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `[]Reg`; the

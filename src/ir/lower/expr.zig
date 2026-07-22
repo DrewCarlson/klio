@@ -779,6 +779,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .captured_names = captured_names,
                 .captures = captures,
                 .scope_renames = try collectScopeRenames(b, expr.ObjectExpr.span.file.int()),
+                .scope_classes = try collectScopeClasses(b, expr),
             } });
             return dst;
         },
@@ -1198,6 +1199,33 @@ fn collectScopeRenames(b: *FuncBuilder, file: u32) Allocator.Error![]const ir.Sc
     return out.toOwnedSlice(b.allocator);
 }
 
+/// Resolve every bare classifier referenced by an anonymous-object subtree at
+/// its lexical site. The object's bodies lower later in a side module, so these
+/// exact identities must travel with the object instruction.
+fn collectScopeClasses(b: *FuncBuilder, expr: *const Expr) Allocator.Error![]const ir.ScopeClassRef {
+    var names = StringSet.init(b.allocator);
+    defer names.deinit();
+    try collectPathIdents(expr, &names);
+
+    var out: std.ArrayList(ir.ScopeClassRef) = .empty;
+    var it = names.keyIterator();
+    while (it.next()) |name_ptr| {
+        const name = name_ptr.*;
+        const cid = classIdAtLexicalSite(b, name, expr.span().file) orelse continue;
+        if (cid.int() >= b.module.classes.items.len) continue;
+        const cls = b.module.classes.items[cid.int()];
+        const has_companion = b.module.registry.companion_singletons.contains(name) or
+            b.module.registry.companion_singletons.contains(cls.name) or
+            b.module.registry.companion_singletons.contains(cls.fqn);
+        try out.append(b.allocator, .{
+            .name = name,
+            .fqn = cls.fqn,
+            .has_companion = has_companion,
+        });
+    }
+    return out.toOwnedSlice(b.allocator);
+}
+
 /// Reduce a dotted path to its last two segments (`a.b.C` -> `b.C`);
 /// null when the path has fewer than two.
 fn lastTwoSegments(path: []const u8) ?[]const u8 {
@@ -1457,6 +1485,20 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return lowerExpr(b, &qualified);
                 }
             }
+        }
+        // Runtime-lowered anonymous-object bodies carry the exact classifier
+        // identities visible at their lexical site. Their side modules do not
+        // contain the program class index, so bind the classifier directly by
+        // FQN after locals, captures, and receiver members have had priority.
+        if (build.anonScopeClass(name0)) |class_ref| {
+            const cls = b.allocReg();
+            const fqn = try b.module.internConst(b.allocator, .{ .String = class_ref.fqn });
+            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = fqn } });
+            if (!class_ref.has_companion) return cls;
+            const dst = b.allocReg();
+            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
+            return dst;
         }
         // A visible top-level `const val` outranks a class binding from a
         // less-visible scope: inside ScatterMap.kt the bare `Empty` is the
@@ -8912,6 +8954,28 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 /// pick — `object E : Base(Key)` inside a class declaring `object Key`
 /// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
 fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
+    // A receiver context whose owner chain is unknown here (a super-arg /
+    // default-value thunk, a lambda) may still see a NESTED classifier the
+    // flat index cannot rank; committing the package-scope pick would
+    // override the runtime's scope walk with the wrong declaration
+    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
+    // the name-keyed runtime path owns the scoped resolution.
+    if (inReceiverContext(b)) return null;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
+/// The class visible at a lexical source site without the receiver-context
+/// decline used by an immediately-lowered read. Anonymous-object bodies use
+/// this before moving into their registry-free side modules.
+fn classIdAtLexicalSite(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
+    if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
+    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
+    return b.module.classIdIndexed(name0, b.self_package, file);
+}
+
+fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
     if (b.ownerClass()) |oc| {
         // Resolve the OWNER to an id once (its lifted simple name is in the
         // class index), then answer through the nesting tree — the one
@@ -8938,21 +9002,7 @@ fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.C
             }
         }
     }
-    // An explicit `import pkg.Outer.Name` in THIS file is unambiguous and
-    // outranks both the scope-tier index and the receiver-scope decline:
-    // when two files each import a different same-simple-name class (the
-    // gapbuffer vs linkbuffer `InsertSlotsWithFixups`), the flat index would
-    // hand every reference the first-registered one. Bind the file's own
-    // import instead.
-    if (b.module.classIdExactImport(name0, file)) |cid| return cid;
-    // A receiver context whose owner chain is unknown here (a super-arg /
-    // default-value thunk, a lambda) may still see a NESTED classifier the
-    // flat index cannot rank; committing the package-scope pick would
-    // override the runtime's scope walk with the wrong declaration
-    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
-    // the name-keyed runtime path owns the scoped resolution.
-    if (inReceiverContext(b)) return null;
-    return b.module.classIdIndexed(name0, b.self_package, file);
+    return null;
 }
 
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
@@ -10841,6 +10891,28 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
         .qualified_path = null,
     };
     try testing.expectEqualStrings("Marker", loweredCheckTypeName(&b, &ty2));
+}
+
+test "anonymous object carries a lexical classifier identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.reserveClassFqn(a, "Marker", "sample.Marker", "sample", false);
+    try m.registry.companion_singletons.put("Marker", "Marker$Companion");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var segs = [_]ast.Ident{.{ .name = "Marker", .span = sp }};
+    const expr = Expr{ .Path = .{ .segments = &segs, .span = sp } };
+    const refs = try collectScopeClasses(&b, &expr);
+    try testing.expectEqual(@as(usize, 1), refs.len);
+    try testing.expectEqualStrings("Marker", refs[0].name);
+    try testing.expectEqualStrings("sample.Marker", refs[0].fqn);
+    try testing.expect(refs[0].has_companion);
 }
 
 test "trailing-lambda arity host accepts a signature-only candidate" {
