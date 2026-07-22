@@ -1647,6 +1647,62 @@ pub fn pickNamedOverloadIdRecv(
     return best_ord orelse best_low;
 }
 
+/// Invoke a member target using declaration parameter indices already resolved
+/// by lowering. `arg_params` is parallel to the source-order user arguments;
+/// the receiver occupies parameter zero in the executable member ABI.
+pub fn callFuncIndexed(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    func: FuncId,
+    defaults_from: FuncId,
+    receiver: *const Value,
+    args: []const Value,
+    arg_params: []const u32,
+) Allocator.Error!EvalResult {
+    const f = funcAt(module, func) orelse
+        return .{ .err = typeErr(allocator, "indexed-call FuncId {d} out of range", .{func.int()}) };
+    if (f.params.len == 0 or arg_params.len != args.len) {
+        return .{ .err = typeErr(allocator, "indexed-call argument map does not match target", .{}) };
+    }
+
+    const slots = try allocator.alloc(?Value, f.params.len);
+    defer allocator.free(slots);
+    for (slots) |*slot| slot.* = null;
+    slots[0] = receiver.*;
+    for (args, arg_params) |arg, user_index| {
+        const param_index: usize = @as(usize, user_index) + 1;
+        if (param_index >= slots.len or slots[param_index] != null) {
+            return .{ .err = typeErr(allocator, "indexed-call parameter map is invalid", .{}) };
+        }
+        slots[param_index] = arg;
+    }
+
+    const defaults = funcDefaults(self, defaults_from);
+    var ordered: std.ArrayList(Value) = .empty;
+    defer ordered.deinit(allocator);
+    for (slots, 0..) |slot, i| {
+        if (slot) |value| {
+            try ordered.append(allocator, value);
+            continue;
+        }
+        const default_id: ?FuncId = if (defaults != null and i < defaults.?.len) defaults.?[i] else null;
+        const id = default_id orelse
+            return .{ .err = typeErr(allocator, "indexed-call omitted required parameter {d}", .{i}) };
+        const default_func = funcAt(module, id) orelse
+            return .{ .err = typeErr(allocator, "default-arg FuncId {d} out of range", .{id.int()}) };
+        var thunk_args = try argsFromSlice(allocator, ordered.items);
+        vmhost.emitPath(allocator, "call_func_indexed_thunk", default_func.fqn, id, null, ordered.items);
+        const result = try ir.eval.evalWith(VmHost, allocator, module, default_func, thunk_args, self);
+        _ = &thunk_args;
+        switch (result) {
+            .ok => |value| try ordered.append(allocator, value),
+            .err => |err| return .{ .err = err },
+        }
+    }
+    return callFunc(self, allocator, module, func, ordered.items);
+}
+
 pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func_in: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {

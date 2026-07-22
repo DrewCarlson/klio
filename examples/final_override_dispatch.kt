@@ -35,6 +35,14 @@ class DerivedLabel : BaseLabel() {
     override fun label(): String = "derived-label"
 }
 
+open class NamedVirtual {
+    open fun combine(left: String, middle: String = "middle", right: String): String = "$left:$middle:$right"
+}
+
+class RenamedVirtual : NamedVirtual() {
+    override fun combine(first: String, center: String, second: String): String = "$first:$center:$second"
+}
+
 class FinalOverloads {
     fun pick(value: Int): String = "int:$value"
     fun pick(value: String): String = "string:$value"
@@ -49,10 +57,13 @@ fun inheritedName(shape: InheritedShape): String = shape.name()
 
 fun interfaceLabel(value: Labelled): String = value.label()
 
+fun namedDispatch(value: NamedVirtual): String = value.combine(right = "R", left = "L")
+
 fun main() {
     val shapes: List<Shape> = listOf(Shape(), Circle(), Dot())
     for (s in shapes) println(describe(s))
     println(inheritedName(NamedInheritedShape()))
     println(interfaceLabel(DerivedLabel()))
+    println(namedDispatch(RenamedVirtual()))
     println(pickBoth(FinalOverloads()))
 }

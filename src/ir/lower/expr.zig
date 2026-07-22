@@ -10227,6 +10227,15 @@ fn lowerResolvedMemberCall(
     if (resolved.dispatch == .virtual) {
         const run = try lowerArgRunWithArity(b, args, arg_arity);
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+        const arg_params: []u32 = if (anyNamedArg(ast_arg_names)) blk: {
+            if (target.params.len == 0) return null;
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return null;
+            defer b.allocator.free(mapped);
+            for (mapped) |param| if (param == null) return null;
+            const indices = try b.allocator.alloc(u32, mapped.len);
+            for (mapped, indices) |param, *out| out.* = @intCast(param.?);
+            break :blk indices;
+        } else &.{};
         const dst = b.allocReg();
         try b.push(.{ .CallVirtual = .{
             .dst = dst,
@@ -10234,7 +10243,8 @@ fn lowerResolvedMemberCall(
             .slot = ir.MethodSlotId.fromFunc(func_id),
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
+            .arg_params = arg_params,
+            .arg_names = if (arg_params.len == 0) arg_names else &.{},
             .trailing_lambda = b.callTrailingLambda(),
         } });
         return dst;

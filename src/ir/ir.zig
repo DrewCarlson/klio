@@ -386,6 +386,11 @@ pub const Inst = union(enum) {
         slot: MethodSlotId,
         args: Reg,
         n_args: u32,
+        /// For a named call, the declaration parameter index filled by each
+        /// source-order argument (receiver excluded). Empty for positional
+        /// calls. This is resolved against the slot root during lowering, so
+        /// an override's parameter names are irrelevant at runtime.
+        arg_params: []u32 = &.{},
         arg_names: []?ConstId = &.{},
         trailing_lambda: bool = false,
     },

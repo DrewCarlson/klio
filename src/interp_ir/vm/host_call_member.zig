@@ -523,6 +523,22 @@ fn callFuncNamedRec(self: *VmHost, allocator: Allocator, module: *const Module, 
     return r;
 }
 
+fn callFuncIndexedRec(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    func: FuncId,
+    defaults_from: FuncId,
+    receiver: *const Value,
+    args: []const Value,
+    arg_params: []const u32,
+) Allocator.Error!EvalResult {
+    if (trailing_member_call) host_call_func.setTrailingLambdaCall(true);
+    const r = host_call_func.callFuncIndexed(self, allocator, module, func, defaults_from, receiver, args, arg_params);
+    host_call_func.setTrailingLambdaCall(false);
+    return r;
+}
+
 // -------------------------------------------------------------------------
 // Intrinsic resolution / dispatch.
 // -------------------------------------------------------------------------
@@ -8421,6 +8437,7 @@ pub fn invokeVirtualMember(
     slot: MethodSlotId,
     args: []const Value,
     arg_names: []const ?[]const u8,
+    arg_params: []const u32,
 ) Allocator.Error!EvalResult {
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
@@ -8453,6 +8470,10 @@ pub fn invokeVirtualMember(
         return .{ .err = .{ .Type = "virtual call receiver class is not linked" } };
     const target = module.methodSlotTarget(runtime_class, slot) orelse
         return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
+
+    if (arg_params.len != 0) {
+        return callFuncIndexedRec(self, allocator, module, target, FuncId.from(slot.int()), receiver, args, arg_params);
+    }
 
     var any_named = false;
     for (arg_names) |name| if (name != null) {
