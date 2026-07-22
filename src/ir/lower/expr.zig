@@ -5406,8 +5406,18 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    const callee_class_id: ?ir.ClassId = if (callee.* == .Path and callee.Path.segments.len == 1)
+        b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
+            b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file)
+    else
+        null;
+    const callee_is_object = if (callee_class_id) |cid|
+        cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_object
+    else
+        false;
+
     // Whether a single-segment class-name call resolves to the constructor.
-    const shadowed_by_class = try shadowedByClass(b, callee, args);
+    const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args);
     // A constructible same-named class competing with the function
     // candidates: a static commit to the function is only sound when the
     // pick is type-proven; otherwise the deferred class-carrying form
@@ -5415,8 +5425,8 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // argument types (`Box(s.length)` constructs `Box(Int)`, not the
     // `fun Box(s: String)` factory the arity-only view would pick).
     const class_competes = callee.* == .Path and callee.Path.segments.len == 1 and
-        !shadowed_by_class and blk: {
-            const cid = b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse break :blk false;
+        !shadowed_by_class and !callee_is_object and blk: {
+            const cid = callee_class_id orelse break :blk false;
             if (cid.int() >= b.module.classes.items.len) break :blk false;
             const cls = &b.module.classes.items[cid.int()];
             // An abstract/interface/sealed class never constructs, so it
@@ -5445,6 +5455,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Path-callee with a registered top-level fn → Call{func}.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (try lowerPathCall(b, expr, shadowed_by_class, class_competes)) |r| return r;
+    }
+
+    // A named object is a singleton value, not a constructible class.
+    // Once same-named function overloads have had their ordinary call tier,
+    // invoke the exact object identity through its operator surface.
+    if (callee_is_object) {
+        return try emitObjectValueCall(b, args, ast_arg_names, ast_type_args, callee.Path.segments[0].name, callee_class_id.?);
     }
 
     // A LOCAL class declared in this function (or an enclosing one) shadows
@@ -9048,6 +9065,34 @@ fn emitValueCall(
     return dst;
 }
 
+fn emitObjectValueCall(
+    b: *FuncBuilder,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    name0: []const u8,
+    class_id: ir.ClassId,
+) Allocator.Error!Reg {
+    orEmitAudit(b, "object_operator_call", "LoadGlobal", name0);
+    const callee_r = b.allocReg();
+    const identity = b.module.classFqnById(class_id) orelse name0;
+    const nm = try b.module.internConst(b.allocator, .{ .String = identity });
+    try b.push(.{ .LoadGlobal = .{ .dst = callee_r, .name = nm, .class = class_id } });
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_r,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .type_args = type_args,
+    } });
+    return dst;
+}
+
 /// Arg names for a bare `Call`, synthesizing a name for a trailing lambda
 /// that follows a vararg parameter so it binds the target's last
 /// (function-typed) parameter rather than being packed into the vararg.
@@ -10607,6 +10652,38 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     // The lambda's bound receiver is unknowable statically; the Or form
     // keeps the runtime member arm.
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
+}
+
+test "calling an object loads its exact singleton for operator invoke" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const cid = try m.reserveClassFqn(a, "Callable", "sample.Callable", "sample", false);
+    m.classes.items[cid.int()].is_object = true;
+    try m.registry.file_packages.put(dummySpan().file, "sample");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var segments = [_]ast.Ident{.{ .name = "Callable", .span = dummySpan() }};
+    var callee = Expr{ .Path = .{ .segments = &segments, .span = dummySpan() } };
+    var args = [_]Expr{.{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } }};
+    const call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &call);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "sample.f", build.typeInt());
+    defer freeFunc(func);
+
+    try testing.expect(func.blocks[0].insts[0] == .LoadGlobal);
+    try testing.expectEqual(cid, func.blocks[0].insts[0].LoadGlobal.class.?);
+    try testing.expect(func.blocks[0].insts[func.blocks[0].insts.len - 1] == .CallValue);
+    for (func.blocks[0].insts) |inst| try testing.expect(inst != .NewInstance);
 }
 
 test "scope getter owner follows the class contributing an enclosing property" {

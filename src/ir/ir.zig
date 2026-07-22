@@ -1029,6 +1029,10 @@ pub const Class = struct {
     /// anywhere, and a `recv.method()` call on it is monomorphic even open-world
     /// (used by the static dispatch bake).
     is_open: bool = false,
+    /// A named Kotlin `object`. Calling its classifier name resolves the
+    /// singleton value and dispatches `operator fun invoke`; it is never a
+    /// constructor call despite sharing the class table representation.
+    is_object: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;
@@ -3941,6 +3945,7 @@ pub const Module = struct {
                 for (ids) |cid| {
                     const existing = &self.classes.items[cid.int()];
                     if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                        class.is_object = class.is_object or existing.is_object;
                         class.id = cid;
                         self.classes.items[cid.int()] = class;
                         return cid;
@@ -3953,6 +3958,7 @@ pub const Module = struct {
                 if (!std.mem.eql(u8, entry.name, class.name)) continue;
                 const existing = &self.classes.items[entry.id.int()];
                 if (std.mem.eql(u8, existing.fqn, class.fqn)) {
+                    class.is_object = class.is_object or existing.is_object;
                     class.id = entry.id;
                     self.classes.items[entry.id.int()] = class;
                     return entry.id;
@@ -3962,6 +3968,7 @@ pub const Module = struct {
                 }
             }
             if (legacy_stub) |id| {
+                class.is_object = class.is_object or self.classes.items[id.int()].is_object;
                 class.id = id;
                 self.classes.items[id.int()] = class;
                 self.fixupStubClaimCaches(id, class.name, class.fqn);

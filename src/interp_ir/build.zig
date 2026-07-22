@@ -2104,7 +2104,9 @@ fn buildModuleWithOverrides(
         const c = &d.Class;
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
-        _ = try module.reserveClassFqn(a, c.name.name, cfqn, cls_pkg, c.is_inner);
+        const cid = try module.reserveClassFqn(a, c.name.name, cfqn, cls_pkg, c.is_inner);
+        module.classes.items[cid.int()].is_object = module.classes.items[cid.int()].is_object or
+            spanNamesObject(object_spans.items, c.span);
     }
     // Member extensions participate in bare-call resolution from class and
     // receiver-lambda bodies. Reserve their complete headers globally, after
@@ -3950,6 +3952,13 @@ fn memberHasBackingField(p: *const ast.Property) bool {
     return false;
 }
 
+fn spanNamesObject(object_spans: []const Span, target: Span) bool {
+    for (object_spans) |s| {
+        if (std.meta.eql(s, target)) return true;
+    }
+    return false;
+}
+
 fn buildClassDef(
     module: *Module,
     a: Allocator,
@@ -4010,13 +4019,7 @@ fn buildClassDef(
 
     // Matched by declaration span, never by simple name: a same-named
     // `object` from another package must not mark this class an object.
-    var is_object = false;
-    for (object_spans.items) |s| {
-        if (std.meta.eql(s, c.span)) {
-            is_object = true;
-            break;
-        }
-    }
+    const is_object = spanNamesObject(object_spans.items, c.span);
 
     // init-block property positions: count `Property` decls in members[0..pos].
     var init_block_positions = try a.alloc(usize, c.init_block_positions.len);
