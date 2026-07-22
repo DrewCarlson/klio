@@ -115,6 +115,13 @@ fn resolveThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
     return resolveThisRegKind(b, false, false);
 }
 
+/// Resolve the instance selected by `super`. A lambda nested in a class
+/// member keeps the member's lexical receiver in its closure capture slot,
+/// even though the lambda frame has no locally bound `this` parameter.
+fn resolveSuperThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
+    return resolveThisRegKind(b, true, false);
+}
+
 /// Lower an expression that appears as the *receiver / qualifier head* of a
 /// member access or call. A bare single-segment class/interface name here
 /// is a *qualifier* — it stays the class value so nested-class
@@ -820,7 +827,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Super => {
             // `super` bare reads the same instance value as `this`.
-            if (b.resolve("this")) |this_reg| return this_reg;
+            if (try resolveSuperThisReg(b)) |this_reg| return this_reg;
             try b.push(.{ .Trace = .{ .span = exprSpan(expr) } });
             return b.emitConst(.Unit);
         },
@@ -1990,7 +1997,7 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // `super.<prop>` — dispatch its getter via the parent chain.
     if (receiver.* == .Super) {
-        if (b.resolve("this")) |this_reg| {
+        if (try resolveSuperThisReg(b)) |this_reg| {
             if (b.ownerClass()) |owner| {
                 const sup = receiver.Super;
                 const dst = b.allocReg();
@@ -9969,7 +9976,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
 
     // `super.method(...)`.
     if (receiver.* == .Super) {
-        if (b.resolve("this")) |this_reg| {
+        if (try resolveSuperThisReg(b)) |this_reg| {
             if (b.ownerClass()) |owner| {
                 const sup = receiver.Super;
                 const run = try lowerArgRun(b, args);
@@ -10513,6 +10520,37 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     // The lambda's bound receiver is unknowable statically; the Or form
     // keeps the runtime member arm.
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
+}
+
+test "super property in a lambda uses the enclosing this capture" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Derived");
+    b.setOuterNames(StringSet.init(testing.allocator));
+
+    var receiver = Expr{ .Super = .{
+        .qualifier = null,
+        .label = null,
+        .span = dummySpan(),
+    } };
+    const e = Expr{ .Member = .{
+        .receiver = &receiver,
+        .name = .{ .name = "label", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "Derived.f", build.typeString());
+    defer freeFunc(func);
+
+    try testing.expectEqual(@as(usize, 2), func.blocks[0].insts.len);
+    const capture = func.blocks[0].insts[0].LoadCapture;
+    const call = func.blocks[0].insts[1].CallSuper;
+    try testing.expectEqual(capture.dst, call.receiver);
+    try testing.expectEqualStrings("this", func.capture_order[capture.idx]);
 }
 
 test "lowers int min value as int" {
