@@ -763,12 +763,16 @@ pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity:
             }
         }
     }
-    // The native channel synth carries the `Channel` interface hierarchy so
-    // extension resolution finds the `ReceiveChannel`/`SendChannel`
-    // extension properties that supply the `select` clauses (`onReceive`,
-    // `onSend`, `onReceiveCatching`). Other synth classes have no supertypes.
+    // Native channel synths carry the source implementation type plus the
+    // `Channel` interface hierarchy. This keeps runtime type checks accurate
+    // while extension resolution still finds `ReceiveChannel`/`SendChannel`
+    // properties such as `onReceive`, `onSend`, and `onReceiveCatching`.
     const supertypes: []const []const u8 = if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioChannel"))
         &.{ "Channel", "ReceiveChannel", "SendChannel" }
+    else if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioBufferedChannel"))
+        &.{ "BufferedChannel", "Channel", "ReceiveChannel", "SendChannel" }
+    else if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioConflatedBufferedChannel"))
+        &.{ "ConflatedBufferedChannel", "BufferedChannel", "Channel", "ReceiveChannel", "SendChannel" }
     else
         &.{};
     const class_def = try ObjRef(ClassDef).init(self.allocator, .{

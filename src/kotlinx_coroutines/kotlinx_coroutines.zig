@@ -282,6 +282,8 @@ const CAP_RENDEZVOUS: i64 = 0;
 const CAP_CONFLATED: i64 = -1;
 const CAP_BUFFERED: i64 = -2;
 const DEFAULT_BUFFER_CAPACITY: usize = 64;
+const BUFFERED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioBufferedChannel";
+const CONFLATED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioConflatedBufferedChannel";
 
 fn channelIllegalArgument(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Thrown = .{ .Exception = .{
@@ -308,6 +310,7 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var rendezvous = false;
     var effective_cap: usize = undefined;
     var eff_overflow = overflow;
+    var class_fqn: []const u8 = BUFFERED_CHANNEL_FQN;
     if (capacity == CAP_CONFLATED) {
         if (overflow != .suspend_) {
             return channelIllegalArgument(ctx, "CONFLATED capacity cannot be used with non-default onBufferOverflow");
@@ -316,10 +319,16 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // drop-oldest, regardless of the requested overflow policy.
         effective_cap = 1;
         eff_overflow = .drop_oldest;
+        class_fqn = CONFLATED_CHANNEL_FQN;
     } else if (capacity == CAP_UNLIMITED) {
         effective_cap = std.math.maxInt(usize);
     } else if (capacity == CAP_BUFFERED) {
-        effective_cap = DEFAULT_BUFFER_CAPACITY;
+        if (overflow == .suspend_) {
+            effective_cap = DEFAULT_BUFFER_CAPACITY;
+        } else {
+            effective_cap = 1;
+            class_fqn = CONFLATED_CHANNEL_FQN;
+        }
     } else if (capacity == CAP_RENDEZVOUS) {
         if (overflow == .suspend_) {
             // A true rendezvous: no buffer, `send` parks until received.
@@ -329,6 +338,7 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             // RENDEZVOUS with a non-default overflow degrades to a
             // capacity-1 buffered channel (upstream `ConflatedBufferedChannel`).
             effective_cap = 1;
+            class_fqn = CONFLATED_CHANNEL_FQN;
         }
     } else {
         if (capacity < 0) {
@@ -337,6 +347,7 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return channelIllegalArgument(ctx, message);
         }
         effective_cap = @intCast(capacity);
+        if (overflow != .suspend_) class_fqn = CONFLATED_CHANNEL_FQN;
     }
 
     const id = ctx.host.allocInstanceId();
@@ -346,7 +357,7 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         defer coro_reg_mutex.unlock();
         try coro_reg.channels.put(regAllocator(), id, ChannelState.init(effective_cap, eff_overflow, rendezvous));
     }
-    const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannel", id, &.{});
+    const inst = try ctx.host.newSynthInstance(class_fqn, id, &.{});
     return .{ .ok = inst };
 }
 
@@ -1964,6 +1975,27 @@ fn schedulerDrainCount(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.newInt(@as(i64, n)) };
 }
 
+const CHANNEL_CLASS_FQNS = [_][]const u8{
+    "kotlinx.coroutines.channels.KlioChannel",
+    BUFFERED_CHANNEL_FQN,
+    CONFLATED_CHANNEL_FQN,
+};
+
+const CHANNEL_MEMBER_BINDINGS = [_]struct { name: []const u8, f: runtime.StdlibFn }{
+    .{ .name = "cancel", .f = channelClose },
+    .{ .name = "send", .f = channelSend },
+    .{ .name = "trySend", .f = channelTrySend },
+    .{ .name = "receive", .f = channelReceive },
+    .{ .name = "receiveCatching", .f = channelReceiveCatching },
+    .{ .name = "tryReceive", .f = channelTryReceive },
+    .{ .name = "close", .f = channelClose },
+    .{ .name = "isClosedForSend", .f = channelIsClosedForSend },
+    .{ .name = "isClosedForReceive", .f = channelIsClosedForReceive },
+    .{ .name = "isEmpty", .f = channelIsEmpty },
+    .{ .name = "invokeOnClose", .f = channelInvokeOnClose },
+    .{ .name = "iterator", .f = channelIterator },
+};
+
 /// The `(fqn, fn)` binding table for the coroutines pack's host bindings.
 const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.__kxco_delayMillis", .f = delayMillis },
@@ -2001,19 +2033,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollSend", .f = channelSelectPollSend },
     .{ .fqn = "kotlinx.coroutines.__kxco_rbPump", .f = rbPump },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_reportUncaught", .f = reportUncaught },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.cancel", .f = channelClose },
     .{ .fqn = "kotlinx.coroutines.channels.Channel", .f = channelCreate },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.send", .f = channelSend },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.trySend", .f = channelTrySend },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.receive", .f = channelReceive },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.receiveCatching", .f = channelReceiveCatching },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.tryReceive", .f = channelTryReceive },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.close", .f = channelClose },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForSend", .f = channelIsClosedForSend },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForReceive", .f = channelIsClosedForReceive },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isEmpty", .f = channelIsEmpty },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.invokeOnClose", .f = channelInvokeOnClose },
-    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.iterator", .f = channelIterator },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.hasNext", .f = channelIterHasNext },
     .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.next", .f = channelIterNext },
 };
@@ -2029,6 +2049,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
     errdefer b.deinit();
     for (BINDINGS) |entry| {
         try b.register(entry.fqn, entry.f);
+    }
+    inline for (CHANNEL_CLASS_FQNS) |class_fqn| {
+        inline for (CHANNEL_MEMBER_BINDINGS) |entry| {
+            try b.register(class_fqn ++ "." ++ entry.name, entry.f);
+        }
     }
     return b;
 }
@@ -2057,9 +2082,11 @@ fn makeCtx(host: *NoopHost, cap: *CaptureOutput, args: []const Value) CallCtx {
 test "host bindings registry populated" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
-    try testing.expectEqual(@as(usize, BINDINGS.len), b.len());
+    try testing.expectEqual(@as(usize, BINDINGS.len + CHANNEL_CLASS_FQNS.len * CHANNEL_MEMBER_BINDINGS.len), b.len());
     try testing.expect(b.resolve("kotlinx.coroutines.__kxco_delayMillis") != null);
     try testing.expect(b.resolve("kotlinx.coroutines.channels.Channel") != null);
+    try testing.expect(b.resolve("kotlinx.coroutines.channels.KlioBufferedChannel.send") != null);
+    try testing.expect(b.resolve("kotlinx.coroutines.channels.KlioConflatedBufferedChannel.receive") != null);
     try testing.expect(b.resolve("kotlinx.coroutines.__kxco_rbPump") != null);
     try testing.expect(b.resolve("not.a.symbol") == null);
 }
