@@ -238,3 +238,5 @@ id = "kotlinx.coroutines"
 # system, collections) is built on androidx.collection.
 [[deps]]
 id = "androidx.collection"
+[[deps]]
+id = "kotlinx.atomicfu"

@@ -39,6 +39,7 @@ include = [
     "androidx/compose/runtime/InternalComposeTracingApi.kt",
     "androidx/compose/runtime/ComposeRuntimeFlags.kt",
     "androidx/compose/runtime/ComposeVersion.kt",
+    "androidx/compose/runtime/Preconditions.kt",
     "androidx/compose/runtime/internal/FunctionKeyMeta.kt",
     "androidx/compose/runtime/internal/StabilityInferred.kt",
     # Pure public interface: a remembered value implementing it gets
@@ -135,3 +136,5 @@ id = "kotlinx.coroutines"
 # system, collections) is built on androidx.collection.
 [[deps]]
 id = "androidx.collection"
+[[deps]]
+id = "kotlinx.atomicfu"
