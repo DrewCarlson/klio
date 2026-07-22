@@ -2405,6 +2405,145 @@ void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
 
 }  // extern "C"
 
+#elif defined(KLIO_ANDROID)
+
+// Android backend: attach to an app-provided ANativeWindow (from a
+// NativeActivity's SurfaceView), bring up an EGL context + a GLES-backed Ganesh
+// surface, and let the app's Choreographer drive frames — the GLES analogue of
+// the iOS Cocoa/Metal path. The OS owns the view + run loop, so there is no
+// shim-side window creation or event poll.
+#include <android/native_window.h>
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include "include/gpu/ganesh/GrBackendSurface.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
+#include "include/gpu/ganesh/gl/GrGLDirectContext.h"
+#include "include/gpu/ganesh/gl/GrGLInterface.h"
+#include "include/gpu/ganesh/gl/GrGLTypes.h"
+#include "include/gpu/ganesh/gl/egl/GrGLMakeEGLInterface.h"
+
+struct KlioWindow {
+    ANativeWindow* nwin;
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface eglSurface;
+    sk_sp<GrDirectContext> grContext;
+    KlioSurface* surface;   // this frame's wrapped GL framebuffer, freed at present
+    double scale;           // points -> pixels
+    int w;                  // points
+    int h;
+};
+
+extern "C" {
+
+// Attach to an ANativeWindow. `w`/`h` are in points, `scale` the display density.
+KlioWindow* klio_win_attach(void* nativeWindow, int w, int h, double scale) {
+    ANativeWindow* nwin = static_cast<ANativeWindow*>(nativeWindow);
+    if (!nwin) return nullptr;
+    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (dpy == EGL_NO_DISPLAY) return nullptr;
+    if (!eglInitialize(dpy, nullptr, nullptr)) return nullptr;
+    const EGLint cfgAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_STENCIL_SIZE, 8,
+        EGL_NONE,
+    };
+    EGLConfig cfg;
+    EGLint num = 0;
+    if (!eglChooseConfig(dpy, cfgAttribs, &cfg, 1, &num) || num < 1) return nullptr;
+    const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctxAttribs);
+    if (ctx == EGL_NO_CONTEXT) return nullptr;
+    EGLSurface surf = eglCreateWindowSurface(dpy, cfg, nwin, nullptr);
+    if (surf == EGL_NO_SURFACE) { eglDestroyContext(dpy, ctx); return nullptr; }
+    if (!eglMakeCurrent(dpy, surf, surf, ctx)) {
+        eglDestroySurface(dpy, surf);
+        eglDestroyContext(dpy, ctx);
+        return nullptr;
+    }
+    sk_sp<const GrGLInterface> iface = GrGLInterfaces::MakeEGL();
+    sk_sp<GrDirectContext> grCtx = GrDirectContexts::MakeGL(iface);
+    if (!grCtx) {
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(dpy, surf);
+        eglDestroyContext(dpy, ctx);
+        return nullptr;
+    }
+    KlioWindow* kw = new KlioWindow();
+    kw->nwin = nwin;
+    kw->display = dpy;
+    kw->context = ctx;
+    kw->eglSurface = surf;
+    kw->grContext = grCtx;
+    kw->surface = nullptr;
+    kw->scale = scale < 1.0 ? 1.0 : scale;
+    kw->w = w;
+    kw->h = h;
+    ensureFonts();
+    if (std::getenv("KLIO_SKIA_VERBOSE"))
+        fprintf(stderr, "[klio-skia] android backend: GLES (Ganesh)\n");
+    return kw;
+}
+
+KlioSurface* klio_win_surface(KlioWindow* kw) {
+    if (!kw || !kw->grContext) return nullptr;
+    // Idempotent within a frame: acquire once, clear + draw into it, then present
+    // (which frees it). Wrap the window's default framebuffer (FBO 0).
+    if (kw->surface) return kw->surface;
+    EGLint pw = 0, ph = 0;
+    eglQuerySurface(kw->display, kw->eglSurface, EGL_WIDTH, &pw);
+    eglQuerySurface(kw->display, kw->eglSurface, EGL_HEIGHT, &ph);
+    GrGLFramebufferInfo fbInfo;
+    fbInfo.fFBOID = 0;
+    fbInfo.fFormat = GL_RGBA8;
+    GrBackendRenderTarget backendRT = GrBackendRenderTargets::MakeGL(pw, ph, 0, 8, fbInfo);
+    sk_sp<SkSurface> surf = SkSurfaces::WrapBackendRenderTarget(
+        kw->grContext.get(), backendRT, kBottomLeft_GrSurfaceOrigin,
+        kRGBA_8888_SkColorType, nullptr, nullptr);
+    if (!surf) return nullptr;
+    // The framebuffer is sized in physical pixels; scale so the display list (in
+    // points) rasterizes at full resolution.
+    if (kw->scale != 1.0) surf->getCanvas()->scale(kw->scale, kw->scale);
+    kw->surface = new KlioSurface();
+    kw->surface->surface = surf;
+    return kw->surface;
+}
+
+void klio_win_present(KlioWindow* kw) {
+    if (!kw || !kw->grContext || !kw->surface) return;
+    kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+    eglSwapBuffers(kw->display, kw->eglSurface);
+    klio_skia_free(kw->surface);
+    kw->surface = nullptr;
+}
+
+void klio_win_close(KlioWindow* kw) {
+    if (!kw) return;
+    if (kw->surface) klio_skia_free(kw->surface);
+    kw->grContext.reset();
+    if (kw->display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(kw->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (kw->eglSurface != EGL_NO_SURFACE) eglDestroySurface(kw->display, kw->eglSurface);
+        if (kw->context != EGL_NO_CONTEXT) eglDestroyContext(kw->display, kw->context);
+    }
+    delete kw;
+}
+
+// The OS owns the run loop on Android: no shim-side window creation or poll.
+KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
+int klio_win_poll(void*, int, int*, int*) { return 0; }
+void klio_win_set_title(KlioWindow*, const char*) {}
+void klio_win_set_size(KlioWindow* kw, int w, int h) { if (kw) { kw->w = w; kw->h = h; } }
+void klio_win_set_icon_png(KlioWindow*, const unsigned char*, size_t) {}
+void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
+
+}  // extern "C"
+
 #else  // no windowing backend (offscreen/raster only)
 
 extern "C" {
