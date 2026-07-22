@@ -17,7 +17,16 @@ class Dot : Circle() {
     override fun sides(): Int = 0
 }
 
+class FinalOverloads {
+    fun pick(value: Int): String = "int:$value"
+    fun pick(value: String): String = "string:$value"
+}
+
+fun pickBoth(target: FinalOverloads): String =
+    target.pick(1) + "/" + target.pick("x")
+
 fun main() {
     val shapes: List<Shape> = listOf(Shape(), Circle(), Dot())
     for (s in shapes) println("${s.name()} ${s.sides()}")
+    println(pickBoth(FinalOverloads()))
 }

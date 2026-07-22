@@ -9432,49 +9432,13 @@ fn resolvePrivateMemberCall(
     const owner_id = b.module.classIdIndexed(owner_name, b.self_package, file) orelse
         b.module.classId(owner_name) orelse return null;
     if (owner_id.int() >= b.module.classes.items.len) return null;
-    const owner = &b.module.classes.items[owner_id.int()];
-    const candidates = b.module.memberDecls(owner.fqn, name);
-    if (candidates.len == 0) return null;
-
     const shapes = try buildArgShapes(b, args, arg_names);
     defer b.allocator.free(shapes);
-    const named = !allNull(arg_names);
-    const scope = applicability.ApplicabilityScope{
-        .member = true,
-        .named = named,
-        .recv_external = named,
-    };
-    var best: ?FuncId = null;
-    var best_score: i32 = std.math.minInt(i32);
-    var tied = false;
-    for (candidates) |fid| {
-        const ds = b.module.decl_sigs.get(fid.int()) orelse continue;
-        if (!ds.is_private or !ds.has_body or ds.kind != .instance_method) continue;
-        const f = b.module.funcById(fid) orelse continue;
-        const sig = applicability.SigView{
-            .params = f.params,
-            .has_body = ds.has_body,
-            .low_priority = f.low_priority,
-            .is_member = true,
-            .fid = fid,
-            .package = f.package,
-        };
-        const score = applicability.applicable(&sig, shapes, scope) orelse continue;
-        var applied = score.points + if (!named and f.params.len != 0)
-            applicability.tyEvidenceBonus(f.params[1..], shapes)
-        else
-            0;
-        if (score.exact_arity) applied += 5;
-        if (score.low_priority) applied -= 1000;
-        if (applied > best_score) {
-            best = fid;
-            best_score = applied;
-            tied = false;
-        } else if (applied == best_score) {
-            tied = true;
-        }
-    }
-    return if (tied) null else best;
+    const resolved = b.module.resolveMemberCall(owner_id, name, shapes, .{
+        .lexical_owner = owner_id,
+        .private_only = true,
+    });
+    return if (resolved.dispatch == .direct) resolved.target else null;
 }
 
 /// Inside a method body: unqualified `name(...)` is a method call on `this`.
@@ -10194,6 +10158,81 @@ fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u
     return agreed;
 }
 
+/// Lower a member call directly when the shared resolver proves one
+/// non-overridable declaration from the receiver and argument static shapes.
+fn lowerDirectMemberCall(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    declared_ty: ?TypeRef,
+) Allocator.Error!?Reg {
+    const ty = declared_ty orelse return null;
+    var head = typeHead(ty.name);
+    head = std.mem.trimEnd(u8, head, "?");
+    const owner_id = if (std.mem.indexOfScalar(u8, head, '.') != null)
+        b.module.classIdByFqn(head)
+    else
+        b.module.classIdIndexed(head, b.self_package, name.span.file);
+    const static_owner = owner_id orelse return null;
+
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const lexical_owner: ?ir.ClassId = if (b.ownerClass()) |owner_name|
+        (if (std.mem.indexOfScalar(u8, owner_name, '.') != null)
+            b.module.classIdByFqn(owner_name)
+        else
+            (b.module.classIdIndexed(owner_name, b.self_package, name.span.file) orelse b.module.classId(owner_name)))
+    else
+        null;
+    const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
+        .lexical_owner = lexical_owner,
+    });
+    if (resolved.dispatch != .direct) return null;
+    const func_id = resolved.target orelse return null;
+    const target = b.module.funcById(func_id) orelse return null;
+
+    recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
+    const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
+    defer if (broad_masks) |masks| b.allocator.free(masks);
+    b.pending_arg_broad_masks = broad_masks;
+    const arg_arity = try argFnArities(b, target, args, ast_arg_names, 1);
+    defer if (arg_arity) |arities| b.allocator.free(arities);
+    const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
+    defer if (arg_generic) |flags| b.allocator.free(flags);
+    b.pending_arg_fn_generic = arg_generic;
+
+    const recv_reg = try lowerReceiver(b, receiver);
+    const args_start = b.allocReg();
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
+
+    const user_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+    const arg_names: []?ConstId = if (user_names.len == 0)
+        &.{}
+    else blk: {
+        const names = try b.allocator.alloc(?ConstId, user_names.len + 1);
+        names[0] = null;
+        @memcpy(names[1..], user_names);
+        break :blk names;
+    };
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .Call = .{
+        .dst = dst,
+        .func = func_id,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = args_start,
+        .n_args = run[1] + 1,
+        .arg_names = arg_names,
+        .type_args = type_args,
+        .exact = true,
+    } });
+    return dst;
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -10202,6 +10241,20 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
+    const declared_ty = argDeclTypeRef(b, receiver);
+
+    // Member declarations take precedence over local callables and
+    // extensions. Commit only when the static receiver and arguments identify
+    // a private/final target; virtual and ambiguous calls continue below.
+    if (try lowerDirectMemberCall(
+        b,
+        receiver,
+        name,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        declared_ty,
+    )) |reg| return reg;
 
     // A bound local/param/captured-outer of this name shadows the member.
     // A plain bound local (`for (module in modules) { application.module() }`,
@@ -10489,7 +10542,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // type (`String?.orEmpty()` vs `List?.orEmpty()`), and a Null
     // runtime receiver offers the filter nothing else to go on.
     const declared_recv: ?ConstId = blk: {
-        const t = argDeclTypeRef(b, receiver) orelse break :blk null;
+        const t = declared_ty orelse break :blk null;
         const head = std.mem.trimEnd(u8, t.name, "?");
         if (head.len == 0) break :blk null;
         break :blk try b.module.internConst(b.allocator, .{ .String = head });
@@ -11501,7 +11554,7 @@ test "headCompatible: literal heads disprove scalar params only" {
     try std.testing.expect(!headCompatible("Boolean", "String?", true));
 }
 
-test "private member resolution selects forward same-arity overloads statically" {
+test "shared member resolution selects overloads and dispatch forms" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -11520,15 +11573,23 @@ test "private member resolution selects forward same-arity overloads statically"
     });
 
     const Add = struct {
-        fn member(module: *Module, allocator: Allocator, owner_id: ir.ClassId, ty: []const u8) !FuncId {
+        fn member(
+            module: *Module,
+            allocator: Allocator,
+            owner_id: ir.ClassId,
+            name: []const u8,
+            ty: []const u8,
+            is_private: bool,
+            is_open: bool,
+        ) !FuncId {
             const id = module.nextFuncId();
             const params = try allocator.alloc(ir.Param, 2);
             params[0] = .{ .name = "this", .ty = .{ .name = "Owner", .nullable = false, .args = &.{} }, .default = null };
             params[1] = .{ .name = "value", .ty = .{ .name = ty, .nullable = false, .args = &.{} }, .default = null };
             try module.funcs.append(allocator, .{
                 .id = id,
-                .name = "pick",
-                .fqn = "sample.Owner.pick",
+                .name = name,
+                .fqn = "sample.Owner.member",
                 .package = "sample",
                 .params = params,
                 .return_ty = build.typeUnit(),
@@ -11538,6 +11599,7 @@ test "private member resolution selects forward same-arity overloads statically"
                 .is_suspend = false,
                 .kind = .instance_method,
                 .has_receiver_param = true,
+                .is_open = is_open,
             });
             const declared = try allocator.alloc(ir.TypeRef, 1);
             declared[0] = params[1].ty;
@@ -11546,15 +11608,18 @@ test "private member resolution selects forward same-arity overloads statically"
                 .arity = .{ .required = 1, .total = 1, .has_vararg = false },
                 .sig = declared,
                 .kind = .instance_method,
-                .is_private = true,
+                .is_private = is_private,
                 .has_body = true,
             });
-            try module.registerMemberDecl(allocator, "sample.Owner", "pick", id);
+            try module.registerMemberDecl(allocator, "sample.Owner", name, id);
             return id;
         }
     };
-    const int_pick = try Add.member(&m, a, owner, "Int");
-    const bool_pick = try Add.member(&m, a, owner, "Boolean");
+    const int_pick = try Add.member(&m, a, owner, "pick", "Int", true, false);
+    const bool_pick = try Add.member(&m, a, owner, "pick", "Boolean", true, false);
+    m.classes.items[owner.int()].is_open = true;
+    const final_pick = try Add.member(&m, a, owner, "finalPick", "Int", false, false);
+    const virtual_pick = try Add.member(&m, a, owner, "virtualPick", "Int", false, true);
 
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
@@ -11566,6 +11631,30 @@ test "private member resolution selects forward same-arity overloads statically"
     try testing.expectEqual(int_pick, (try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &int_args, &.{})).?);
     try testing.expectEqual(bool_pick, (try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &bool_args, &.{})).?);
     try testing.expect((try resolvePrivateMemberCall(&b, "pick", dummySpan().file, &unknown_args, &.{})) == null);
+
+    const int_shapes = try buildArgShapes(&b, &int_args, &.{});
+    defer a.free(int_shapes);
+    const final_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.direct, final_result.dispatch);
+    try testing.expectEqual(final_pick, final_result.target.?);
+    const virtual_result = m.resolveMemberCall(owner, "virtualPick", int_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.virtual, virtual_result.dispatch);
+    try testing.expectEqual(virtual_pick, virtual_result.target.?);
+    m.classes.items[owner.int()].is_open = false;
+    m.classes.items[owner.int()].is_stub = true;
+    const stub_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.virtual, stub_result.dispatch);
+    try testing.expectEqual(final_pick, stub_result.target.?);
+    m.classes.items[owner.int()].is_stub = false;
+    m.classes.items[owner.int()].is_value = true;
+    const value_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.virtual, value_result.dispatch);
+    try testing.expectEqual(final_pick, value_result.target.?);
+    m.classes.items[owner.int()].is_value = false;
+    m.decl_sigs.getPtr(final_pick.int()).?.has_body = false;
+    const bodyless_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.virtual, bodyless_result.dispatch);
+    try testing.expectEqual(final_pick, bodyless_result.target.?);
 }
 
 test "lowers postfix not-null assert" {

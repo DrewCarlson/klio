@@ -1038,6 +1038,9 @@ pub const Class = struct {
     /// singleton value and dispatches `operator fun invoke`; it is never a
     /// constructor call despite sharing the class table representation.
     is_object: bool = false,
+    /// A Kotlin value class. Its receiver uses a specialized runtime
+    /// representation, so ordinary instance-call ABI assumptions do not apply.
+    is_value: bool = false,
     /// True only for an as-yet-unfilled `reserveClass` placeholder. A real
     /// class is registered with `methods`/`supertypes`/`init_block` not yet
     /// backpatched, so it is structurally indistinguishable from a stub;
@@ -1391,6 +1394,30 @@ pub const Module = struct {
         has_body: bool = false,
     };
 
+    pub const MemberDispatch = enum {
+        /// The declaration cannot be overridden at this call site.
+        direct,
+        /// The declaration is resolved, but the runtime receiver selects an
+        /// override. This becomes a numeric method slot in the VM contract.
+        virtual,
+        /// Static evidence did not identify one declaration.
+        deferred,
+    };
+
+    pub const MemberResolution = struct {
+        target: ?FuncId = null,
+        dispatch: MemberDispatch = .deferred,
+    };
+
+    pub const MemberResolveCtx = struct {
+        /// Lexical class whose body contains the call. Private declarations
+        /// are visible only when this is their declaring class.
+        lexical_owner: ?ClassId = null,
+        /// Restrict the query to private declarations. Used by bare own-member
+        /// calls, which can commit directly without considering virtual peers.
+        private_only: bool = false,
+    };
+
     /// One ambiguous bare-call diagnostic: the call-site name and span
     /// plus the first two identical-signature candidates' FQNs and
     /// declaration spans (a span is null when the candidate carries no
@@ -1599,6 +1626,95 @@ pub const Module = struct {
     pub fn memberDecls(self: *const Module, owner_fqn: []const u8, name: []const u8) []const FuncId {
         const list = self.member_name_index.get(.{ .a = owner_fqn, .b = name }) orelse return &.{};
         return list.items;
+    }
+
+    /// Resolve one member name against the declarations owned by the static
+    /// receiver class. Candidate applicability and overload ranking are shared
+    /// with runtime dispatch; this function additionally classifies whether
+    /// the resulting declaration can be called directly or needs a virtual
+    /// method slot.
+    pub fn resolveMemberCall(
+        self: *const Module,
+        owner: ClassId,
+        name: []const u8,
+        args: []const applicability.ArgShape,
+        ctx: MemberResolveCtx,
+    ) MemberResolution {
+        if (owner.int() >= self.classes.items.len) return .{};
+        const class = &self.classes.items[owner.int()];
+        const candidates = self.memberDecls(class.fqn, name);
+        if (candidates.len == 0) return .{};
+
+        var named = false;
+        for (args) |arg| {
+            if (arg.named != null) {
+                named = true;
+                break;
+            }
+        }
+        const scope = applicability.ApplicabilityScope{
+            .member = true,
+            .named = named,
+            .recv_external = named,
+        };
+        var best: ?FuncId = null;
+        var best_score: i32 = std.math.minInt(i32);
+        var tied = false;
+        for (candidates) |fid| {
+            const ds = self.decl_sigs.get(fid.int()) orelse continue;
+            if (ds.kind != .instance_method) continue;
+            if (ds.is_private and (ctx.lexical_owner == null or ctx.lexical_owner.?.int() != owner.int())) continue;
+            if (ctx.private_only and !ds.is_private) continue;
+            const f = self.funcById(fid) orelse continue;
+            const sig = applicability.SigView{
+                .params = f.params,
+                // Member resolution may bind an abstract declaration to a
+                // virtual slot; executability belongs to dispatch, not
+                // overload applicability.
+                .has_body = true,
+                .low_priority = f.low_priority,
+                .is_member = true,
+                .fid = fid,
+                .package = f.package,
+            };
+            const score = applicability.applicable(&sig, args, scope) orelse continue;
+            var applied = score.points + if (!named and f.params.len != 0)
+                applicability.tyEvidenceBonus(f.params[1..], args)
+            else
+                0;
+            if (score.exact_arity) applied += 5;
+            if (score.low_priority) applied -= 1000;
+            if (applied > best_score) {
+                best = fid;
+                best_score = applied;
+                tied = false;
+            } else if (applied == best_score) {
+                tied = true;
+            }
+        }
+        if (best == null or tied) return .{};
+        const target = best.?;
+        const ds = self.decl_sigs.get(target.int()).?;
+        // Native/expect/abstract headers identify an overload but do not carry
+        // the ordinary IR-function ABI required by a direct FuncId call.
+        if (!ds.has_body) return .{ .target = target, .dispatch = .virtual };
+        if (ds.is_private) return .{ .target = target, .dispatch = .direct };
+        const f = self.funcById(target) orelse return .{};
+        // An unclaimed classifier header carries no trustworthy final/open/
+        // interface modifiers. Its declaration identity can still resolve the
+        // overload, but dispatch must remain virtual until the class is filled.
+        if (class.is_stub) return .{ .target = target, .dispatch = .virtual };
+        if (class.is_value) return .{ .target = target, .dispatch = .virtual };
+        if (!class.is_interface and (!class.is_open and !class.is_abstract or methodIsFinal(f))) {
+            return .{ .target = target, .dispatch = .direct };
+        }
+        return .{ .target = target, .dispatch = .virtual };
+    }
+
+    fn methodIsFinal(f: *const Func) bool {
+        if (f.is_open) return false;
+        if (f.is_override and !f.is_final) return false;
+        return true;
     }
 
     /// Reconstruct the owner-scoped index from serialized declaration records.
