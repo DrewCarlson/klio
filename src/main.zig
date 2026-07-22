@@ -3,6 +3,26 @@ const builtin = @import("builtin");
 const cli = @import("cli");
 const runtime = @import("runtime");
 
+/// Mobile app targets (iOS, Android). An app process cannot symbolize its own
+/// image at runtime — the iOS simulator SDK does not export the dyld
+/// image-header lookup std's stack-trace unwinder (`SelfInfo`) links against,
+/// and a packaged app has nowhere to print a trace regardless (crashes go to the
+/// OS crash reporter). Route panics to a minimal handler so `SelfInfo` is never
+/// linked; desktop keeps the full stack-trace panic.
+const is_mobile_target = builtin.os.tag == .ios or
+    (builtin.os.tag == .linux and (builtin.abi == .android or builtin.abi == .androideabi));
+
+pub const panic = if (is_mobile_target)
+    std.debug.FullPanic(mobilePanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+fn mobilePanic(msg: []const u8, _: ?usize) noreturn {
+    _ = std.c.write(2, msg.ptr, msg.len);
+    _ = std.c.write(2, "\n".ptr, 1);
+    std.c.abort();
+}
+
 /// macOS: ask every malloc zone to return its cached free pages to the OS.
 /// Called by the collector after a sweep so process RSS tracks the live set,
 /// not the cumulative allocation churn the libc free-lists would otherwise hold.
@@ -92,7 +112,11 @@ fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
-    if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
+    // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
+    // mobile — see the panic override above); gate it out there at comptime.
+    if (comptime !is_mobile_target) {
+        if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
+    }
     if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeStart();
     defer if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeReport();
     // In bundle mode argv belongs entirely to the embedded program, so the
@@ -101,6 +125,20 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         runtime.perf.resolveBinaryProfile(&.{})
     else
         resolveProfile(init.args));
+
+    // Mobile app process: no diagnostic allocator modes. The debug/guard/gpa
+    // branches below instantiate `std.heap.DebugAllocator`, whose leak reporting
+    // pulls the `SelfInfo` stack-trace symbolizer (unavailable on mobile — see
+    // the panic override above). Take the default process-lifetime arena
+    // directly and comptime-drop the whole diagnostic switch.
+    if (comptime is_mobile_target) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = runtime.allocTrackWrap(arena.allocator());
+        defer runtime.allocTrackReportStderr();
+        return cli.run(a, init.args);
+    }
+
     const mode = runtime.allocChoice();
     switch (mode) {
         .arena => {

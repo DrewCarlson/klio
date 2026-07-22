@@ -8667,7 +8667,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
         const c0 = call.callee;
         if (c0.* == .Path and c0.Path.segments.len == 1 and std.mem.eql(u8, c0.Path.segments[0].name, "remember") and @intFromEnum(c0.Path.segments[0].span.file) == 0) {
             std.debug.print("[emitCall] remember -> #{d} nargs={d}\n", .{ func_id.int(), call.args.len });
-            std.debug.dumpCurrentStackTrace(.{});
+            runtime.trace.dumpCurrent(.{});
         }
     }
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);

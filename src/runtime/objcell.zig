@@ -35,6 +35,7 @@
 //! one) when the count reaches zero.
 
 const std = @import("std");
+const trace = @import("trace.zig");
 pub const gc = @import("gc.zig");
 
 /// Per-thread teardown mode for `ObjRef.deinit`.
@@ -536,7 +537,7 @@ pub fn ObjRef(comptime T: type) type {
                 // offending stack.
                 if (prev == 0 or prev > (1 << 40)) {
                     std.debug.print("\n[RC DOUBLE-FREE] cell={*} payload={s}\n", .{ self.cell, @typeName(T) });
-                    std.debug.dumpCurrentStackTrace(.{});
+                    trace.dumpCurrent(.{});
                 }
                 if (prev == 1) {
                     const allocator = self.cell.allocator;

@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const trace = @import("trace.zig");
 const gc = @import("gc.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -212,7 +213,7 @@ pub fn traceReport() void {
         shown += 1;
         std.debug.print("\n[slabtrace] live {d} bytes in {d} mmaps:\n", .{ s.bytes, s.count });
         const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
-        std.debug.dumpStackTrace(&st);
+        trace.dump(&st);
     }
     std.debug.print("\n[slabtrace] total live sites: {d}\n", .{sites.items.len});
 }

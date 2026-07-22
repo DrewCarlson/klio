@@ -6,6 +6,7 @@
 //! those sites directly, ranked by bytes. Scaffolding, not a production path.
 
 const std = @import("std");
+const trace = @import("trace.zig");
 const gc = @import("gc.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -209,6 +210,6 @@ pub fn report() void {
         shown += 1;
         std.debug.print("\n[leaktrack] outstanding {d} bytes in {d} allocs:\n", .{ s.bytes, s.count });
         const st: std.debug.StackTrace = .{ .return_addresses = s.addrs[0..s.n], .skipped = .none };
-        std.debug.dumpStackTrace(&st);
+        trace.dump(&st);
     }
 }

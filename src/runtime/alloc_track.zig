@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const trace = @import("trace.zig");
 const SpinMutex = @import("objcell.zig").SpinMutex;
 
 const BUCKETS = 40;
@@ -203,7 +204,7 @@ fn pageAllocFn(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr
         page_mutex.unlock();
         if (n < 4) {
             std.debug.print("[page-trace] direct page alloc of {d} bytes:\n", .{len});
-            std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+            trace.dumpCurrent(.{ .first_address = @returnAddress() });
         }
     }
     return p;

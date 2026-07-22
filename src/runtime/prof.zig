@@ -124,6 +124,7 @@ const NameCount = struct { name: []const u8, count: u32 };
 
 /// Stop sampling and print the by-function histogram to stderr.
 pub fn maybeReport() void {
+    if (builtin.os.tag != .linux) return;
     if (!active) return;
     active = false;
     const zero = linux.itimerspec{

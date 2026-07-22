@@ -373,6 +373,11 @@ pub fn build(b: *std.Build) void {
         "Optimize mode for the program-running test harnesses (default ReleaseSafe)",
     ) orelse .ReleaseSafe;
 
+    // iOS/simulator SDK for the target artifacts (see resolveAppleSdk). Null for
+    // every other target; wired onto the target module universe + target zstd +
+    // the klio executables below, never onto the host-run build tools.
+    const apple_sdk: ?[]const u8 = resolveAppleSdk(b, target);
+
     // The Compose-UI Skia backend: libklio_skia.so (the compose_ui module
     // dlopens it) is built by the system C++ toolchain because the prebuilt
     // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
@@ -401,6 +406,10 @@ pub fn build(b: *std.Build) void {
         const mod = mods.get(m.name).?;
         for (m.deps) |d| mod.addImport(d, mods.get(d).?);
     }
+    if (apple_sdk) |sdk| {
+        var it = mods.valueIterator();
+        while (it.next()) |m| wireAppleSdk(b, m.*, sdk);
+    }
 
     // The pack format compresses sections with zstd. Zig std ships only a
     // zstd decoder, so the encoder is linked from the vendored zstd C
@@ -408,6 +417,7 @@ pub fn build(b: *std.Build) void {
     // declared extern in src/pack/zstd.zig (no header needed). Link inputs
     // attached to the pack module flow into every artifact that imports it.
     const zstd = buildZstd(b, target, optimize);
+    if (apple_sdk) |sdk| wireAppleSdk(b, zstd.root_module, sdk);
     const pack_mod = mods.get("pack").?;
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
@@ -455,6 +465,11 @@ pub fn build(b: *std.Build) void {
         harness_mods.get("compose_ui").?.link_libc = true;
         harness_mods.get("ir").?.link_libc = true;
         if (target.result.os.tag.isDarwin()) harness_mods.get("jit").?.link_libc = true;
+        if (apple_sdk) |sdk| {
+            var it = harness_mods.valueIterator();
+            while (it.next()) |m| wireAppleSdk(b, m.*, sdk);
+            wireAppleSdk(b, zstd_harness.root_module, sdk);
+        }
     }
 
     // The stdlib pack is baked into the binary: embed_gen builds it from
@@ -557,7 +572,7 @@ pub fn build(b: *std.Build) void {
     zstd_lib_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
 
     const exe = b.addExecutable(.{
-        .name = "klio",
+        .name = b.fmt("klio{s}", .{targetBinSuffix(target)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -572,6 +587,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (apple_sdk) |sdk| wireAppleSdk(b, exe.root_module, sdk);
     b.installArtifact(exe);
 
     // Build + install the Compose-UI Skia backend as a shared library the
@@ -611,6 +627,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (apple_sdk) |sdk| wireAppleSdk(b, harness_exe.root_module, sdk);
     const harness_exe_step = b.step("klio-harness", "Build+install the harness-optimized klio binary");
     harness_exe_step.dependOn(&b.addInstallArtifact(harness_exe, .{}).step);
 
@@ -994,6 +1011,43 @@ const zstd_sources = [_][]const u8{
     "dictBuilder/fastcover.c",
     "dictBuilder/zdict.c",
 };
+
+/// Resolve the Apple SDK for an iOS target. Zig cannot auto-detect the iOS SDK
+/// the way it does the native macOS one, so it must be supplied. A global
+/// `--sysroot` is the wrong tool: it would also apply to the native host tools
+/// (`stdlib-embed-gen` runs on the build host), linking them against the iOS
+/// libc. Instead we resolve the SDK path here (xcrun, or `-Dapple-sdk`) and
+/// attach its include/lib/framework paths onto the target artifacts only. Null
+/// for non-iOS targets (native macOS auto-detects; other targets use zig's libc).
+fn resolveAppleSdk(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
+    const override = b.option([]const u8, "apple-sdk", "Apple SDK path for iOS targets (default: xcrun lookup)");
+    if (target.result.os.tag != .ios) return null;
+    if (override) |p| return p;
+    const sdk_name = if (target.result.abi == .simulator) "iphonesimulator" else "iphoneos";
+    const out = b.run(&.{ "xcrun", "--sdk", sdk_name, "--show-sdk-path" });
+    return b.dupe(std.mem.trim(u8, out, " \n\r\t"));
+}
+
+/// Per-target suffix for the installed `klio` binary, so a mobile cross build
+/// installs as a distinct file (`klio-ios`, `klio-ios-sim`, `klio-android`) and
+/// never overwrites the desktop `zig-out/bin/klio`. Desktop targets keep the
+/// bare `klio` name.
+fn targetBinSuffix(target: std.Build.ResolvedTarget) []const u8 {
+    return switch (target.result.os.tag) {
+        .ios => if (target.result.abi == .simulator) "-ios-sim" else "-ios",
+        .linux => if (target.result.abi == .android or target.result.abi == .androideabi) "-android" else "",
+        else => "",
+    };
+}
+
+/// Attach an Apple SDK's header/library/framework search paths to a module, so a
+/// libc-linking (and C-compiling) target artifact resolves `<string.h>` and
+/// `libSystem` without a global `--sysroot`.
+fn wireAppleSdk(b: *std.Build, mod: *std.Build.Module, sdk: []const u8) void {
+    mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+}
 
 /// Build the vendored zstd C library as a static library statically linked
 /// into the binary and test artifacts. No system zstd is referenced.
