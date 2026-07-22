@@ -1177,7 +1177,13 @@ fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!Eva
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var best: ?Value = null;
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     for (items) |v| {
+        runtime.keepaliveRestore(loop_keepalive);
+        if (best) |b| runtime.keepalivePush(b);
         const r = switch (try invoke(ctx, &block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
@@ -1591,7 +1597,13 @@ fn sortByKeyInsertion(ctx: *CallCtx, items: []Value, block: Value, descending: b
     const a = ctx.allocator;
     // Precompute keys.
     const keys = try a.alloc(Value, items.len);
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     for (items, 0..) |v, i| {
+        runtime.keepaliveRestore(loop_keepalive);
+        runtime.keepalivePushSlice(keys[0..i]);
         keys[i] = switch (try invoke(ctx, &block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
@@ -1652,7 +1664,14 @@ fn iterMaxMinByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!Eva
         .err => |e| return e,
     };
     var best = items[0];
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     for (items[1..]) |v| {
+        runtime.keepaliveRestore(loop_keepalive);
+        runtime.keepalivePush(best_key);
+        runtime.keepalivePush(best);
         const key = switch (try invoke(ctx, &block, &.{v})) {
             .value => |x| x,
             .err => |e| return e,
@@ -1846,7 +1865,13 @@ fn iterExtreme(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var best: ?Value = null;
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     for (items) |v| {
+        runtime.keepaliveRestore(loop_keepalive);
+        if (best) |b| runtime.keepalivePush(b);
         const r = switch (try invoke(ctx, &block, &.{v})) {
             .value => |x| x,
             .err => |e| return e,
