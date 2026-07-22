@@ -128,6 +128,15 @@ fn simpleName(name: []const u8) []const u8 {
     return name;
 }
 
+/// Remove nullability and type arguments from a declared receiver name so it
+/// can address the host binding registered for the receiver's class.
+fn staticReceiverBindingHead(name: []const u8) []const u8 {
+    var head = std.mem.trim(u8, name, " ");
+    head = std.mem.trimEnd(u8, head, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |i| head = head[0..i];
+    return std.mem.trim(u8, head, " ");
+}
+
 /// The Kotlin simple name shown by `toString`/`KClass.simpleName` for a
 /// class whose internal `name` may be a lifted-nested mangle. A nested
 /// class lifts to a flat top-level name like `Outer$Data`; Kotlin reports
@@ -3893,6 +3902,29 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Companion forwarding + enum values/valueOf for a class receiver.
     if (receiver.* == .Class) {
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
+    }
+
+    // A null value has no useful runtime type, but a statically-directed call
+    // still has an exact declared receiver. Use that receiver to address its
+    // host binding before the runtime-type member ladder. This is how a
+    // `String?::plus` reference invokes `kotlin.String.plus` when its eventual
+    // receiver is null, without widening to unrelated `plus` extensions.
+    if (receiver.* == .Null) {
+        if (static_recv) |declared| {
+            const head = staticReceiverBindingHead(declared);
+            if (head.len != 0) {
+                var fqn_buf: [256]u8 = undefined;
+                const fqn = if (std.mem.indexOfScalar(u8, head, '.') != null)
+                    std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ head, name }) catch null
+                else
+                    std.fmt.bufPrint(&fqn_buf, "kotlin.{s}.{s}", .{ head, name }) catch null;
+                if (fqn) |binding_fqn| {
+                    if (lookupIntrinsic(self, binding_fqn)) |func| {
+                        return dispatchWithReceiver(self, allocator, binding_fqn, func, receiver, args);
+                    }
+                }
+            }
+        }
     }
 
     // Null-receiver `equals` — 1-arg `Any?.equals` and 2-arg
@@ -12241,6 +12273,11 @@ test "simpleName returns the trailing dotted segment" {
     try testing.expectEqualStrings("C", simpleName("a.b.C"));
     try testing.expectEqualStrings("C", simpleName("C"));
     try testing.expectEqualStrings("", simpleName("a."));
+}
+
+test "static receiver binding head removes Kotlin type suffixes" {
+    try testing.expectEqualStrings("kotlin.String", staticReceiverBindingHead("kotlin.String?"));
+    try testing.expectEqualStrings("List", staticReceiverBindingHead(" List<String>? "));
 }
 
 test "allUppercase recognizes type-parameter-style names" {

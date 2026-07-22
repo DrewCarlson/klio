@@ -107,6 +107,32 @@ fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
     return false;
 }
 
+/// The declared receiver head captured by an unbound type reference. A
+/// `String?::plus` reference carries the String class value even when its
+/// eventual receiver is null; invocation must continue resolving against
+/// that static type instead of widening to every extension named `plus`.
+fn typeReferenceStaticReceiver(v: *const Value) ?[]const u8 {
+    if (v.* == .Class) {
+        const g = v.Class.borrow();
+        defer g.deinit();
+        return g.get().fqn;
+    }
+    if (v.* == .Function and v.Function.decl.name.name.len > 0 and
+        std.ascii.isUpper(v.Function.decl.name.name[0]))
+    {
+        return v.Function.decl.name.name;
+    }
+    return null;
+}
+
+fn boundReferenceStaticReceiver(callee: *const Value) ?[]const u8 {
+    if (callee.* != .Instance) return null;
+    const g = callee.Instance.borrow();
+    defer g.deinit();
+    const recv = g.get().get("__bound_receiver__") orelse return null;
+    return typeReferenceStaticReceiver(&recv);
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
@@ -176,7 +202,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 if (rest.len == 0 and root.memberIsProperty(allocator, &self.classes, &first, name)) {
                     return host_fields.getField(self, allocator, &first, name);
                 }
-                return host_call_member.callMember(self, allocator, &first, name, rest);
+                return host_call_member.callMemberNamedStatic(
+                    self,
+                    allocator,
+                    &first,
+                    name,
+                    rest,
+                    &.{},
+                    typeReferenceStaticReceiver(&rv),
+                );
             }
             if (args.len == 0 and root.memberIsProperty(allocator, &self.classes, &rv, name)) {
                 return host_fields.getField(self, allocator, &rv, name);
@@ -1345,7 +1379,15 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
-            return host_call_member.callMember(self, allocator, this_value, name, args);
+            return host_call_member.callMemberNamedStatic(
+                self,
+                allocator,
+                this_value,
+                name,
+                args,
+                &.{},
+                boundReferenceStaticReceiver(callee),
+            );
         }
     }
     var sink = self.out_sink.clone();

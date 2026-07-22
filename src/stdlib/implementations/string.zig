@@ -437,12 +437,16 @@ pub fn string_lowercase(ctx: *CallCtx) Allocator.Error!EvalResult {
 }
 
 pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const r = try recvString(ctx.allocator, ctx.args, "String.plus");
-    const s = switch (r) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = e },
-    };
     if (ctx.args.len < 2) return errArity("String.plus requires one argument");
+    const s: []const u8 = if (ctx.args[0] == .Null)
+        "null"
+    else blk: {
+        const r = try recvString(ctx.allocator, ctx.args, "String.plus");
+        break :blk switch (r) {
+            .ok => |v| v,
+            .err => |e| return .{ .err = e },
+        };
+    };
     const other = ctx.args[1];
     var joined: std.ArrayList(u8) = .empty;
     errdefer joined.deinit(ctx.allocator);
@@ -3223,6 +3227,20 @@ fn expectStr(allocator: Allocator, res: EvalResult, want: []const u8) !void {
         .err => return error.UnexpectedError,
     }
     _ = allocator;
+}
+
+test "plus accepts its nullable String receiver" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        var ctx = ctxFor(a, &.{ .Null, try strVal(a, "tail") });
+        try expectStr(a, try string_plus(&ctx), "nulltail");
+    }
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "head"), .Null });
+        try expectStr(a, try string_plus(&ctx), "headnull");
+    }
 }
 
 test "length counts utf16 code units" {
