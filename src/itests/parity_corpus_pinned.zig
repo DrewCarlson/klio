@@ -764,3 +764,15 @@ test "incdec_index_array" {
         \\
     );
 }
+
+test "expect_actual_superclass_delegate" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/expect_actual_superclass_delegate/common.kt",
+        CORPUS_DIR ++ "/expect_actual_superclass_delegate/actual.kt",
+    },
+        \\reported 7
+        \\reported 42
+        \\boom
+        \\
+    );
+}
