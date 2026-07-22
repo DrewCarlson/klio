@@ -19,7 +19,9 @@ import androidx.compose.ui.window.application
 
 fun main() {
     application {
-        Window(onCloseRequest = ::exitApplication, title = "klio") {
+        // width/height are placeholders: a hosted (mobile) Window fills the
+        // device surface, so these matter only on desktop.
+        Window(onCloseRequest = ::exitApplication, title = "klio", width = 390, height = 844) {
             MaterialTheme {
                 Box(Modifier.fillMaxSize().background(Color(0xFF102A44))) {
                     Column(Modifier.padding(24.dp)) {
