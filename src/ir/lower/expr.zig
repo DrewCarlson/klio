@@ -10195,23 +10195,31 @@ fn lowerResolvedMemberCall(
     });
     const func_id = resolved.target orelse return null;
     if (resolved.dispatch == .deferred) return null;
+    const target = b.module.funcById(func_id) orelse return null;
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Value classes, unresolved shells, and declarations in the
         // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`. Interface SAM values use
-        // the same slot but need a declaration-order named-argument binder.
+        // already guaranteed to use `Value.Instance`. Named interface calls
+        // carry a numeric parameter map and fill declaration defaults by slot;
+        // vararg interface forms remain on the compatibility path for now.
         var has_named = false;
         for (ast_arg_names) |arg_name| if (arg_name != null) {
             has_named = true;
             break;
         };
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and has_named) or
+        var interface_named_supported = true;
+        if (has_named) {
+            for (target.params[1..]) |param| if (param.is_vararg) {
+                interface_named_supported = false;
+                break;
+            };
+        }
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and !interface_named_supported) or
             std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
     }
-    const target = b.module.funcById(func_id) orelse return null;
 
     recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
     const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
@@ -10227,6 +10235,15 @@ fn lowerResolvedMemberCall(
     if (resolved.dispatch == .virtual) {
         const run = try lowerArgRunWithArity(b, args, arg_arity);
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+        const arg_params: []u32 = if (anyNamedArg(ast_arg_names)) blk: {
+            if (target.params.len == 0) return null;
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return null;
+            defer b.allocator.free(mapped);
+            for (mapped) |param| if (param == null) return null;
+            const indices = try b.allocator.alloc(u32, mapped.len);
+            for (mapped, indices) |param, *out| out.* = @intCast(param.?);
+            break :blk indices;
+        } else &.{};
         const dst = b.allocReg();
         try b.push(.{ .CallVirtual = .{
             .dst = dst,
@@ -10234,7 +10251,8 @@ fn lowerResolvedMemberCall(
             .slot = ir.MethodSlotId.fromFunc(func_id),
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
+            .arg_params = arg_params,
+            .arg_names = if (arg_params.len == 0) arg_names else &.{},
             .trailing_lambda = b.callTrailingLambda(),
         } });
         return dst;

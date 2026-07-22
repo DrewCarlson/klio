@@ -593,6 +593,18 @@ fn recordAbstractMemberDefaults(
             try slots.append(a, null);
         }
     }
+    // Reserved member headers have stable declaration identities before body
+    // lowering. Attach defaults to that exact identity so overloaded abstract
+    // methods never share a class/name bucket and virtual slot roots can bind
+    // defaults without reconstructing a source-level lookup.
+    if (module.funcByDeclSpan(f.name.span)) |fid| {
+        var exact: std.ArrayList(?FuncId) = .empty;
+        try exact.appendSlice(a, slots.items);
+        const gop = try module.registry.local_fn_defaults.getOrPut(fid);
+        if (gop.found_existing) gop.value_ptr.deinit(a);
+        gop.value_ptr.* = exact;
+    }
+
     const key = ir.StrPair{ .a = c.name.name, .b = f.name.name };
     try module.registry.abstract_member_defaults.put(key, slots);
 }
@@ -1737,10 +1749,11 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     var string_ty = scope_ty;
     string_ty.name = .{ .name = "String", .span = sp_string };
     string_ty.span = sp_string;
+    var int_default: ast.Expr = .{ .IntLit = .{ .value = 7, .kind = .Int, .span = sp_int } };
     var int_params = [_]ast.Param{.{
         .name = .{ .name = "value", .span = sp_int },
         .ty = int_ty,
-        .default = null,
+        .default = &int_default,
         .is_vararg = false,
         .is_crossinline = false,
         .is_noinline = false,
@@ -1761,6 +1774,8 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     int_overload.name.span = sp_int;
     int_overload.receiver_type = null;
     int_overload.params = &int_params;
+    int_overload.body = null;
+    int_overload.is_abstract = true;
     int_overload.span = sp_int;
     var string_overload = helper;
     string_overload.name.span = sp_string;
@@ -1805,6 +1820,7 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     };
     const owner = try m.reserveClassFqn(a, "Host", "sample.Host", "sample", false);
     try reserveMemberHeaders(&m, &cls, "sample.Host", "sample");
+    try recordAbstractMemberDefaults(&m, &cls, &int_overload);
 
     const id = m.funcByDeclSpan(sp).?;
     const f = m.funcById(id).?;
@@ -1820,6 +1836,10 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     try std.testing.expectEqual(ir.FuncKind.instance_method, m.funcById(overloads[2]).?.kind);
     try std.testing.expectEqualStrings("Int", m.funcById(overloads[1]).?.params[1].ty.name);
     try std.testing.expectEqualStrings("String", m.funcById(overloads[2]).?.params[1].ty.name);
+    const exact_defaults = m.registry.local_fn_defaults.get(overloads[1]).?;
+    try std.testing.expectEqual(@as(usize, 2), exact_defaults.items.len);
+    try std.testing.expect(exact_defaults.items[1] != null);
+    try std.testing.expect(m.registry.local_fn_defaults.get(overloads[2]) == null);
 }
 
 fn expectContains(haystack: []const []const u8, needle: []const u8) !void {

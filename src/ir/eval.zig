@@ -4500,7 +4500,7 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
         H.setTrailingMemberCall(true)
     else
         false;
-    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names);
+    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names, cv.arg_params);
     if (cv.trailing_lambda) {
         if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
     }

@@ -3,4 +3,5 @@ circle 1
 circle 0
 inherited
 derived-label
+L:middle:R
 int:1/string:x

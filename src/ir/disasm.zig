@@ -138,6 +138,14 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CallVirtual => |c| {
             try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
             try argRun(w, c.args, c.n_args);
+            if (c.arg_params.len != 0) {
+                try w.writeAll(" params=[");
+                for (c.arg_params, 0..) |param, i| {
+                    if (i != 0) try w.writeByte(',');
+                    try w.print("{d}", .{param});
+                }
+                try w.writeByte(']');
+            }
             try w.writeAll("        [VIRTUAL]");
         },
         .CallMemberOrGlobal => |c| {

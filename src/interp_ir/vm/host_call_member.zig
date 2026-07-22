@@ -523,6 +523,22 @@ fn callFuncNamedRec(self: *VmHost, allocator: Allocator, module: *const Module, 
     return r;
 }
 
+fn callFuncIndexedRec(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    func: FuncId,
+    defaults_from: FuncId,
+    receiver: *const Value,
+    args: []const Value,
+    arg_params: []const u32,
+) Allocator.Error!EvalResult {
+    if (trailing_member_call) host_call_func.setTrailingLambdaCall(true);
+    const r = host_call_func.callFuncIndexed(self, allocator, module, func, defaults_from, receiver, args, arg_params);
+    host_call_func.setTrailingLambdaCall(false);
+    return r;
+}
+
 // -------------------------------------------------------------------------
 // Intrinsic resolution / dispatch.
 // -------------------------------------------------------------------------
@@ -3287,6 +3303,27 @@ fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const V
     all[0] = receiver.*;
     @memcpy(all[1..], args);
     return all;
+}
+
+fn callCallableIndexed(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    root: FuncId,
+    receiver: *const Value,
+    callable: *const Value,
+    args: []const Value,
+    arg_params: []const u32,
+) Allocator.Error!EvalResult {
+    const bound = try host_call_func.bindFuncIndexedArgs(self, allocator, module, root, root, receiver, args, arg_params);
+    switch (bound) {
+        .ok => |ordered| {
+            defer allocator.free(ordered);
+            if (ordered.len == 0) return .{ .err = .{ .Type = "virtual callable slot has no receiver" } };
+            return host_call_value.callValue(self, allocator, callable, ordered[1..]);
+        },
+        .err => |err| return .{ .err = err },
+    }
 }
 
 /// Dispatch an intrinsic with the receiver prepended to `args`, using a stack
@@ -8421,6 +8458,7 @@ pub fn invokeVirtualMember(
     slot: MethodSlotId,
     args: []const Value,
     arg_names: []const ?[]const u8,
+    arg_params: []const u32,
 ) Allocator.Error!EvalResult {
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
@@ -8434,6 +8472,9 @@ pub fn invokeVirtualMember(
                 return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
             if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
                 return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
+            }
+            if (arg_params.len != 0) {
+                return callCallableIndexed(self, allocator, module, root, receiver, receiver, args, arg_params);
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
@@ -8453,6 +8494,20 @@ pub fn invokeVirtualMember(
         return .{ .err = .{ .Type = "virtual call receiver class is not linked" } };
     const target = module.methodSlotTarget(runtime_class, slot) orelse
         return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
+
+    if (arg_params.len != 0) {
+        const sig = module.decl_sigs.get(target.int());
+        if (sig != null and !sig.?.has_body) {
+            const instance = receiver.Instance.borrow();
+            const sam_target = instance.get().get("__sam_target__");
+            instance.deinit();
+            if (sam_target) |callable| {
+                const root = FuncId.from(slot.int());
+                return callCallableIndexed(self, allocator, module, root, receiver, &callable, args, arg_params);
+            }
+        }
+        return callFuncIndexedRec(self, allocator, module, target, FuncId.from(slot.int()), receiver, args, arg_params);
+    }
 
     var any_named = false;
     for (arg_names) |name| if (name != null) {
