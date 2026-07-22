@@ -49,6 +49,7 @@ const loadInstalledPacks = pack_cache.loadInstalledPacks;
 const stdlib_image = @import("stdlib_image.zig");
 
 const test_runner = @import("test_runner");
+const compose_ui = @import("compose_ui");
 
 /// Output format for `klio check`. Mirrors `commands::DiagFormat`.
 pub const DiagFormat = enum {
@@ -895,7 +896,11 @@ pub fn runBuiltModuleArgs(
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
-    defer runtime.setReclaim(prev_reclaim);
+    // A hosted UI run stays resident after `main` returns: the platform frame
+    // source re-enters the VM each vsync, so its reclaim mode, source map, and
+    // VM state must survive this scope instead of being torn down. Every
+    // non-hosted run (all of desktop/headless) restores/deinits as before.
+    defer if (!compose_ui.hostedActive()) runtime.setReclaim(prev_reclaim);
 
     var built = built_in;
     // Lowering-time resolution diagnostics (ambiguous bare calls) fail
@@ -916,7 +921,7 @@ pub fn runBuiltModuleArgs(
     const main_id = built.main;
     const fb = Vm.fromBuilt(gpa, &built) catch return 1;
     var vm = fb.vm;
-    defer vm.deinit();
+    defer if (!compose_ui.hostedActive()) vm.deinit();
     vm.program_args = program_args;
     vm.setInstalledBindings(bindings) catch return 1;
 
@@ -930,7 +935,9 @@ pub fn runBuiltModuleArgs(
     // captured frames resolve to file paths + lines (uncaught render and
     // `printStackTrace`). Cleared after the run.
     span.active_map = map;
-    defer span.active_map = null;
+    defer if (!compose_ui.hostedActive()) {
+        span.active_map = null;
+    };
     runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();

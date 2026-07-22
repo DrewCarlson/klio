@@ -61,6 +61,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.window.__composeui_isHosted", isHosted);
     try b.register("androidx.compose.ui.window.__composeui_setFrameCallback", setFrameCallback);
+    try b.register("androidx.compose.ui.window.__composeui_surfaceWidth", surfaceWidth);
+    try b.register("androidx.compose.ui.window.__composeui_surfaceHeight", surfaceHeight);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -819,22 +821,59 @@ fn isHosted(ctx: *CallCtx) Error!EvalResult {
     return ok(Value{ .Bool = surface_layer != null });
 }
 
+/// `__composeui_surfaceWidth(): Int` / `__composeui_surfaceHeight(): Int` — the
+/// hosted surface's size in points (the OS owns the geometry on mobile). A
+/// hosted `Window` sizes itself to these so its Metal drawable matches the view;
+/// `0` when no surface is installed.
+fn surfaceWidth(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(surface_w));
+}
+fn surfaceHeight(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(surface_h));
+}
+
 /// `__composeui_setFrameCallback(cb: () -> Boolean): Long` — store the render
-/// callback the platform frame source invokes each frame.
+/// callback the platform frame source invokes each frame. The host handed to a
+/// native intrinsic is transient (it dies when `main`'s activation returns), so
+/// `persist()` it into a resident copy the frame loop can re-enter later. The
+/// callback lambda and its captured composition live on the run's process-
+/// lifetime arena, so storing the `Value` by itself is safe across frames.
 fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
-    frame_cb = .{ .host = ctx.host, .callback = ctx.args[0], .out = ctx.out, .set = true };
+    frame_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
     return ok(Value.newLong(1));
+}
+
+/// True once `application` has registered a hosted frame callback: the run must
+/// stay resident (its VM, arena, and reclaim mode are kept alive) so the
+/// platform frame source can re-enter each vsync.
+pub fn hostedActive() bool {
+    return frame_cb.set;
+}
+
+fn renderFrameBody(_: void) void {
+    var args = [_]Value{};
+    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
 }
 
 /// Render one frame: invoke the resident Kotlin render callback. Called by the
 /// app shell's frame source (iOS CADisplayLink) on the main thread — the same
-/// thread the resident VM ran main on, so it is a plain same-thread re-entry
-/// (the resizeTrampoline mechanism).
+/// thread the resident VM ran main on, so it is a plain same-thread re-entry.
+/// The platform callback arrives on the UI thread's small stack, so the frame
+/// body runs on the persistent interpreter stack (a deep composition would
+/// otherwise overflow).
 pub export fn klio_render_frame() void {
     if (!frame_cb.set) return;
-    var args = [_]Value{};
-    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
+    runtime.runOnPersistentBigStack(void, void, renderFrameBody, {});
+}
+
+/// C query for the app shell: nonzero once the program registered a hosted frame
+/// callback (a Compose UI opened). The shell starts its frame source (iOS
+/// CADisplayLink) only then; a non-UI program leaves it zero and the shell exits.
+pub export fn klio_frame_active() c_int {
+    return if (frame_cb.set) 1 else 0;
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
@@ -1383,7 +1422,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 61), b.len());
+    try testing.expectEqual(@as(usize, 65), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

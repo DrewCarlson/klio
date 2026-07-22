@@ -251,17 +251,24 @@ fun ApplicationScope.Window(
 ) {
     val scope = this
     if (scope !is KlioApplicationScope) return
-    val holder = remember { scope.open(title, width, height, content) }
+    // On a hosted (mobile) surface the OS owns the geometry: fill it and ignore
+    // the requested size, so the composition lays out at — and its Metal
+    // drawable matches — the actual view. Desktop keeps the requested size.
+    val sw = __composeui_surfaceWidth()
+    val sh = __composeui_surfaceHeight()
+    val w = if (sw > 0) sw else width
+    val h = if (sh > 0) sh else height
+    val holder = remember { scope.open(title, w, h, content) }
     if (holder != null) {
         holder.onCloseRequest = onCloseRequest
         if (holder.title != title) {
             holder.title = title
             __composeui_winSetTitle(holder.handle, title)
         }
-        if (holder.w != width || holder.h != height) {
-            holder.w = width
-            holder.h = height
-            __composeui_winSetSize(holder.handle, width, height)
+        if (holder.w != w || holder.h != h) {
+            holder.w = w
+            holder.h = h
+            __composeui_winSetSize(holder.handle, w, h)
             holder.dirty = true
         }
         DisposableEffect(Unit) {
@@ -465,3 +472,11 @@ internal fun __composeui_isHosted(): Boolean =
 // source invokes it once per vsync on the resident VM.
 internal fun __composeui_setFrameCallback(callback: () -> Boolean): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_setFrameCallback not installed")
+
+// The hosted surface's size in points (mobile), or 0 when none is installed. A
+// hosted Window fills these instead of its requested size.
+internal fun __composeui_surfaceWidth(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_surfaceWidth not installed")
+
+internal fun __composeui_surfaceHeight(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_surfaceHeight not installed")
