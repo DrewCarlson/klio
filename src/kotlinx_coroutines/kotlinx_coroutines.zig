@@ -1176,6 +1176,10 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return channelCloseImpl(ctx, false);
+}
+
+fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.close expects a receiver" } };
     const recv = ctx.args[0];
     const close_cause: Value = if (ctx.args.len > 1) ctx.args[1] else .Null;
@@ -1197,7 +1201,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             did_close = true;
             recvs = try state.receive_waiters.drain(regAllocator());
             iters = try state.receive_iter_waiters.drain(regAllocator());
-            sends = try state.send_waiters.drain(regAllocator());
+            if (cancel_pending_sends) sends = try state.send_waiters.drain(regAllocator());
         }
     }
     if (!did_close) return .{ .ok = .{ .Bool = false } };
@@ -1269,7 +1273,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// exception, unlike `SendChannel.close(null)`, whose close cause is null.
 fn channelCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.cancel expects a receiver" } };
-    if (ctx.args.len > 1 and ctx.args[1] != .Null) return channelClose(ctx);
+    if (ctx.args.len > 1 and ctx.args[1] != .Null) return channelCloseImpl(ctx, true);
 
     const cause = Value{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlinx.coroutines.CancellationException"),
@@ -1280,7 +1284,7 @@ fn channelCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = [_]Value{ ctx.args[0], cause };
     var forwarded = ctx.*;
     forwarded.args = &args;
-    return channelClose(&forwarded);
+    return channelCloseImpl(&forwarded, true);
 }
 
 /// `SendChannel.invokeOnClose(handler)` — register a `(cause: Throwable?) ->
@@ -1547,7 +1551,10 @@ fn channelIsClosedForReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "isClosedForReceive: bad receiver" } };
     coro_reg_mutex.lock();
     defer coro_reg_mutex.unlock();
-    const drained_closed = if (coro_reg.channels.getPtr(id)) |s| (s.closed and s.buffer.isEmpty()) else true;
+    const drained_closed = if (coro_reg.channels.getPtr(id)) |s|
+        (s.closed and s.buffer.isEmpty() and s.send_waiters.isEmpty())
+    else
+        true;
     return .{ .ok = .{ .Bool = drained_closed } };
 }
 
@@ -1713,7 +1720,10 @@ fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "isEmpty: bad receiver" } };
     coro_reg_mutex.lock();
     defer coro_reg_mutex.unlock();
-    const empty = if (coro_reg.channels.getPtr(id)) |s| s.buffer.isEmpty() else true;
+    const empty = if (coro_reg.channels.getPtr(id)) |s|
+        (s.buffer.isEmpty() and s.send_waiters.isEmpty())
+    else
+        true;
     return .{ .ok = .{ .Bool = empty } };
 }
 
@@ -2515,6 +2525,38 @@ test "buffered channel trySend fails when full; rendezvous trySend fails without
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         try testing.expectEqual(@as(usize, 0), coro_reg.channels.getPtr(6262).?.buffer.len());
+    }
+}
+
+test "native channel close preserves a queued send until receive" {
+    defer resetRegistry();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    const recv = try makeChannel(a, 6363, ChannelState.init(0, .suspend_, true));
+    {
+        const args = [_]Value{ recv, Value.newInt(42) };
+        var ctx = makeCtx(&host, &cap, &args);
+        const sent = try channelSend(&ctx);
+        try testing.expect(sent == .err and sent.err == .Suspend);
+    }
+    {
+        const args = [_]Value{recv};
+        var ctx = makeCtx(&host, &cap, &args);
+        const closed = try channelClose(&ctx);
+        try testing.expect(closed == .ok and closed.ok.Bool);
+        try testing.expect(!(try channelIsClosedForReceive(&ctx)).ok.Bool);
+        try testing.expect(!(try channelIsEmpty(&ctx)).ok.Bool);
+
+        const received = try channelReceive(&ctx);
+        try testing.expect(received == .ok and received.ok.Int == 42);
+        try testing.expect((try channelIsClosedForReceive(&ctx)).ok.Bool);
+        try testing.expect((try channelIsEmpty(&ctx)).ok.Bool);
     }
 }
 
