@@ -1331,6 +1331,19 @@ pub const FuncBuilder = struct {
         if (want >= 63) return false;
         return mask & (@as(u64, 1) << @intCast(want)) != 0;
     }
+    /// Whether the lexical class hierarchy declares a callable member that
+    /// could accept `want` arguments. Unlike `ownMemberApplicable`, a stored
+    /// or computed property with no same-named function is not callable.
+    pub fn callableMemberApplicable(self: *const FuncBuilder, name: []const u8, want: usize) bool {
+        if (self.own_member_arity.get(name)) |mask| {
+            if (mask & (@as(u64, 1) << 63) != 0) return true;
+            if (want >= 63) return false;
+            return mask & (@as(u64, 1) << @intCast(want)) != 0;
+        }
+        const owner = self.owner_class orelse return false;
+        const methods = self.module.registry.hierarchy_methods.get(owner) orelse return false;
+        return methods.contains(name);
+    }
     /// Swap-in a new `owner_class` + `own_members` pair and return the
     /// previous values, so an inline splice can run the spliced body in
     /// the inline fn's enclosing-class context and then restore the

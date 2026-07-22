@@ -549,6 +549,14 @@ test "member_extension_foreign_field_shadow" {
     );
 }
 
+test "imported_function_over_noncallable_member" {
+    try check("imported_function_over_noncallable_member",
+        \\1.0
+        \\2.0
+        \\
+    );
+}
+
 // A user parameter named `this` (backticked, since `this` is a hard
 // keyword) is an ordinary parameter, not a dispatch receiver, so a bare
 // call in the function body is unresolved (kotlinc: `unresolved reference

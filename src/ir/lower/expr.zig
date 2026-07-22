@@ -7621,7 +7621,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the splice path because reification, suspension, and non-local returns
     // may require the source body at this call site.
     if (!shadowed_by_class and segments.len == 1 and
-        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+        !b.callableMemberApplicable(name0, args.len))
     {
         if (try renamedImportDirectTarget(b, segments[0], args, ast_arg_names)) |target| {
             const f = b.module.funcById(target) orelse return null;
@@ -7726,13 +7726,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the invisible candidate. Order-independent (decided from this file's imports)
     // and gated on the import actually naming in-scope funcs, so it never invents
     // a target.
-    // A member of the enclosing class (or an own member) shadows a top-level
-    // import for a bare call — Kotlin resolves `circle()` inside a class whose
-    // companion declares `fun circle()` to that member, never to an
-    // `import ....circle`. Leave the shadowed name for the member-dispatch
-    // paths below instead of qualifying it to the import's FQN.
+    // An applicable function in the enclosing class hierarchy shadows a
+    // top-level import. A same-named non-callable property does not participate
+    // in call resolution, so it must not block the imported function.
     if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
-        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+        !b.callableMemberApplicable(name0, args.len))
     {
         const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
         if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
