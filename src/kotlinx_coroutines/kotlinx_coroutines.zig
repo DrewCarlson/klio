@@ -838,6 +838,7 @@ const ChannelSendOutcome = union(enum) {
     HandToIter: struct { slot: i64, scope: Value },
     Buffered,
     ParkOnSlot: i64,
+    Closed: Value,
 };
 
 fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -859,11 +860,11 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
-        if (state.closed) return .{ .err = .{ .Thrown = try closedSendExc(ctx.allocator) } };
-
-        // Iterator waiters take priority — write the value into the iter's
-        // `__pending__` field and resume with Bool(true).
-        if (state.receive_iter_waiters.popFront()) |w| {
+        if (state.closed) {
+            outcome = .{ .Closed = state.close_cause };
+        } else if (state.receive_iter_waiters.popFront()) |w| {
+            // Iterator waiters take priority — write the value into the iter's
+            // `__pending__` field and resume with Bool(true).
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
             try setIteratorNextState(w.iter, .value_ready);
             outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
@@ -907,8 +908,9 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             coro_reg_mutex.lock();
             defer coro_reg_mutex.unlock();
             const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
-            if (state.closed) return .{ .err = .{ .Thrown = try closedSendExc(ctx.allocator) } };
-            if (state.receive_waiters.popFront()) |w| {
+            if (state.closed) {
+                fallback = .{ .Closed = state.close_cause };
+            } else if (state.receive_waiters.popFront()) |w| {
                 fallback = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
             } else if (state.rendezvous) {
                 const slot = allocKxcoSlot();
@@ -950,6 +952,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             armChannelCancel(ctx, recv, slot);
             return .{ .err = .{ .Suspend = -1 } };
         },
+        .Closed => |cause| return .{ .err = .{ .Thrown = try channelCloseException(ctx.allocator, cause, false) } },
     }
 }
 
@@ -957,7 +960,7 @@ const ChannelTrySendOutcome = union(enum) {
     HandToReceiver: struct { slot: i64, value: Value, catching: bool, scope: Value },
     Success,
     Full,
-    Closed,
+    Closed: Value,
 };
 
 fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -973,7 +976,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         defer coro_reg_mutex.unlock();
         const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.trySend: missing state" } };
         if (state.closed) {
-            outcome = .Closed;
+            outcome = .{ .Closed = state.close_cause };
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
             try setIteratorNextState(w.iter, .value_ready);
@@ -1013,7 +1016,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             defer coro_reg_mutex.unlock();
             const state = coro_reg.channels.getPtr(id) orelse return .{ .ok = try channelResult(ctx, .failure, .Unit) };
             if (state.closed) {
-                fb = .Closed;
+                fb = .{ .Closed = state.close_cause };
             } else if (state.receive_waiters.popFront()) |w| {
                 fb = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
             } else if (state.rendezvous) {
@@ -1039,7 +1042,11 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             },
             .Success => return .{ .ok = try channelResult(ctx, .success, .Unit) },
             .Full => return .{ .ok = try channelResult(ctx, .failure, .Unit) },
-            .Closed => return .{ .ok = try channelResult(ctx, .closed, try closedSendExc(ctx.allocator)) },
+            .Closed => |cause| {
+                const exc = try channelCloseException(ctx.allocator, cause, false);
+                defer if (runtime.reclaimEnabled()) exc.release(ctx.allocator);
+                return .{ .ok = try channelResult(ctx, .closed, exc) };
+            },
         }
     }
 
@@ -1051,14 +1058,18 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         },
         .Success => try channelResult(ctx, .success, .Unit),
         .Full => try channelResult(ctx, .failure, .Unit),
-        .Closed => try channelResult(ctx, .closed, try closedSendExc(ctx.allocator)),
+        .Closed => |cause| blk: {
+            const exc = try channelCloseException(ctx.allocator, cause, false);
+            defer if (runtime.reclaimEnabled()) exc.release(ctx.allocator);
+            break :blk try channelResult(ctx, .closed, exc);
+        },
     };
     return .{ .ok = result };
 }
 
 const ChannelReceiveOutcome = union(enum) {
     Got: struct { value: Value, resumed: ?i64, resumed_scope: Value = .Unit },
-    Closed,
+    Closed: Value,
     ParkOnSlot: i64,
 };
 
@@ -1099,7 +1110,7 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
             // is handed directly to this receiver and the sender resumes.
             outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot, .resumed_scope = sw.scope } };
         } else if (state.closed) {
-            outcome = .Closed;
+            outcome = .{ .Closed = state.close_cause };
         } else {
             const slot = allocKxcoSlot();
             try state.receive_waiters.pushBack(regAllocator(), .{ .slot = slot, .catching = catching, .scope = park_scope });
@@ -1115,9 +1126,9 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
             if (catching) return .{ .ok = try channelResult(ctx, .success, g.value) };
             return .{ .ok = g.value };
         },
-        .Closed => {
-            if (catching) return .{ .ok = try channelResult(ctx, .closed, .Null) };
-            return .{ .err = .{ .Thrown = try closedReceiveExc(ctx.allocator) } };
+        .Closed => |cause| {
+            if (catching) return .{ .ok = try channelResult(ctx, .closed, cause) };
+            return .{ .err = .{ .Thrown = try channelCloseException(ctx.allocator, cause, true) } };
         },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
@@ -1136,7 +1147,7 @@ fn channelReceiveImpl(ctx: *CallCtx, catching: bool) std.mem.Allocator.Error!Eva
 const ChannelTryReceiveOutcome = union(enum) {
     Got: Value,
     Empty,
-    Closed,
+    Closed: Value,
 };
 
 fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1144,7 +1155,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = ctx.args[0];
     const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.tryReceive: bad receiver" } };
 
-    var outcome: ChannelTryReceiveOutcome = .Closed;
+    var outcome: ChannelTryReceiveOutcome = .{ .Closed = .Null };
     var resumed_slot: ?i64 = null;
     var resumed_scope: Value = .Unit;
     {
@@ -1166,7 +1177,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 resumed_scope = sw.scope;
                 outcome = .{ .Got = sw.value };
             } else if (state.closed) {
-                outcome = .Closed;
+                outcome = .{ .Closed = state.close_cause };
             } else {
                 outcome = .Empty;
             }
@@ -1179,7 +1190,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const result: Value = switch (outcome) {
         .Got => |v| try channelResult(ctx, .success, v),
         .Empty => try channelResult(ctx, .failure, .Unit),
-        .Closed => try channelResult(ctx, .closed, .Null),
+        .Closed => |cause| try channelResult(ctx, .closed, cause),
     };
     return .{ .ok = result };
 }
@@ -1197,6 +1208,7 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
     var recvs: []ChannelState.RecvWaiter = &.{};
     var iters: []ChannelState.IterWaiter = &.{};
     var sends: []ChannelState.SendWaiter = &.{};
+    var discarded: []Value = &.{};
     var did_close = false;
     {
         coro_reg_mutex.lock();
@@ -1210,13 +1222,18 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
             did_close = true;
             recvs = try state.receive_waiters.drain(regAllocator());
             iters = try state.receive_iter_waiters.drain(regAllocator());
-            if (cancel_pending_sends) sends = try state.send_waiters.drain(regAllocator());
+            if (cancel_pending_sends) {
+                sends = try state.send_waiters.drain(regAllocator());
+                discarded = try state.buffer.drain(regAllocator());
+            }
         }
     }
     if (!did_close) return .{ .ok = .{ .Bool = false } };
     defer regAllocator().free(recvs);
     defer regAllocator().free(iters);
     defer regAllocator().free(sends);
+    defer regAllocator().free(discarded);
+    if (runtime.reclaimEnabled()) for (discarded) |v| v.release(regAllocator());
 
     const exc = try closedReceiveExc(ctx.allocator);
     defer exc.release(ctx.allocator);
@@ -1233,16 +1250,20 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
             resumeWaiterNormal(ctx, w.slot, failure, w.scope);
         }
     }
-    // Iterator-style waiters resume with `Bool(false)` so the
-    // for-loop hasNext() returns false and the loop exits.
+    // A normal close makes iterator `hasNext()` return false. A failed close
+    // throws its exact cause at the suspended `hasNext()` call.
     for (iters) |w| {
-        try setIteratorNextState(w.iter, .closed_ready);
-        resumeWaiterNormal(ctx, w.slot, .{ .Bool = false }, w.scope);
+        if (close_cause == .Null) {
+            try setIteratorNextState(w.iter, .closed_ready);
+            resumeWaiterNormal(ctx, w.slot, .{ .Bool = false }, w.scope);
+        } else {
+            close_cause.retain();
+            const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, close_cause) } };
+            resumeWaiterNormal(ctx, w.slot, failure, w.scope);
+        }
     }
-    const send_exc = try closedSendExc(ctx.allocator);
-    defer send_exc.release(ctx.allocator);
     for (sends) |sw| {
-        send_exc.retain();
+        const send_exc = try channelCloseException(ctx.allocator, close_cause, false);
         const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
         resumeWaiterNormal(ctx, sw.slot, failure, sw.scope);
     }
@@ -1294,6 +1315,19 @@ fn channelCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var forwarded = ctx.*;
     forwarded.args = &args;
     return channelCloseImpl(&forwarded, true);
+}
+
+/// Exact cause retained by a closed native channel, or null after a normal
+/// close. The select shim uses it to build the same closed result or thrown
+/// exception as direct receive/send operations.
+fn channelCloseCause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .ok = .Null };
+    const id = channelId(&ctx.args[0]) orelse return .{ .ok = .Null };
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    const cause = if (coro_reg.channels.getPtr(id)) |state| state.close_cause else Value.Null;
+    cause.retain();
+    return .{ .ok = cause };
 }
 
 /// `SendChannel.invokeOnClose(handler)` — register a `(cause: Throwable?) ->
@@ -1636,7 +1670,7 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // it never sees, parking this iterator forever.
     const Outcome = union(enum) {
         Got: struct { value: Value, resumed: ?i64, resumed_scope: Value = .Unit },
-        Closed,
+        Closed: Value,
         NoState,
         ParkOnSlot: i64,
     };
@@ -1660,7 +1694,7 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 // Rendezvous: hand the parked sender's value to the iterator.
                 outcome = .{ .Got = .{ .value = sw.value, .resumed = sw.slot, .resumed_scope = sw.scope } };
             } else if (state.closed) {
-                outcome = .Closed;
+                outcome = .{ .Closed = state.close_cause };
             } else {
                 const slot = allocKxcoSlot();
                 try state.receive_iter_waiters.pushBack(regAllocator(), .{ .slot = slot, .iter = iter_inst, .scope = park_scope });
@@ -1677,7 +1711,14 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             try setIteratorNextState(iter_inst, .value_ready);
             return .{ .ok = .{ .Bool = true } };
         },
-        .Closed, .NoState => {
+        .Closed => |cause| {
+            if (cause != .Null) {
+                return .{ .err = .{ .Thrown = try channelCloseException(ctx.allocator, cause, true) } };
+            }
+            try setIteratorNextState(iter_inst, .closed_ready);
+            return .{ .ok = .{ .Bool = false } };
+        },
+        .NoState => {
             try setIteratorNextState(iter_inst, .closed_ready);
             return .{ .ok = .{ .Bool = false } };
         },
@@ -1730,9 +1771,9 @@ fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     coro_reg_mutex.lock();
     defer coro_reg_mutex.unlock();
     const empty = if (coro_reg.channels.getPtr(id)) |s|
-        (s.buffer.isEmpty() and s.send_waiters.isEmpty())
+        (!s.closed and s.buffer.isEmpty() and s.send_waiters.isEmpty())
     else
-        true;
+        false;
     return .{ .ok = .{ .Bool = empty } };
 }
 
@@ -1750,6 +1791,14 @@ fn closedSendExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
         .message = try runtime.strInit(allocator, "Channel was closed"),
         .cause = null,
     } };
+}
+
+fn channelCloseException(allocator: std.mem.Allocator, cause: Value, receive: bool) std.mem.Allocator.Error!Value {
+    if (cause != .Null) {
+        cause.retain();
+        return cause;
+    }
+    return if (receive) closedReceiveExc(allocator) else closedSendExc(allocator);
 }
 
 /// `yield()` — cooperative reschedule: park with a zero-ms wakeup so
@@ -2153,6 +2202,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveSender", .f = channelSelectRemoveSender },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollReceive", .f = channelSelectPollReceive },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollSend", .f = channelSelectPollSend },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanCloseCause", .f = channelCloseCause },
     .{ .fqn = "kotlinx.coroutines.__kxco_rbPump", .f = rbPump },
     .{ .fqn = "kotlinx.coroutines.internal.__kxco_reportUncaught", .f = reportUncaught },
     .{ .fqn = "kotlinx.coroutines.channels.Channel", .f = channelCreate },
@@ -2565,7 +2615,44 @@ test "native channel close preserves a queued send until receive" {
         const received = try channelReceive(&ctx);
         try testing.expect(received == .ok and received.ok.Int == 42);
         try testing.expect((try channelIsClosedForReceive(&ctx)).ok.Bool);
-        try testing.expect((try channelIsEmpty(&ctx)).ok.Bool);
+        try testing.expect(!(try channelIsEmpty(&ctx)).ok.Bool);
+    }
+}
+
+test "native channel cancellation discards buffered values and preserves its cause" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    defer resetRegistry();
+    const a = arena.allocator();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    const recv = try makeChannel(a, 6464, ChannelState.init(1, .suspend_, false));
+    {
+        const args = [_]Value{ recv, Value.newInt(42) };
+        var ctx = makeCtx(&host, &cap, &args);
+        try testing.expect((try channelSend(&ctx)) == .ok);
+    }
+    const cause = Value{ .Exception = .{
+        .fqn = try runtime.strInit(a, "test.Cancellation"),
+        .message = null,
+        .cause = null,
+    } };
+    {
+        const args = [_]Value{ recv, cause };
+        var ctx = makeCtx(&host, &cap, &args);
+        try testing.expect((try channelCancel(&ctx)) == .ok);
+    }
+    {
+        const args = [_]Value{recv};
+        var ctx = makeCtx(&host, &cap, &args);
+        const received = try channelReceive(&ctx);
+        try testing.expect(received == .err and received.err == .Thrown);
+        defer if (runtime.reclaimEnabled()) received.err.Thrown.release(a);
+        try testing.expectEqualStrings("test.Cancellation", received.err.Thrown.Exception.fqn.asPtr().bytes);
+        try testing.expect(!(try channelIsEmpty(&ctx)).ok.Bool);
     }
 }
 
