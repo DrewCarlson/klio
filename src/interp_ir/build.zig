@@ -2150,7 +2150,8 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        if (module.classIndexEntryByName(c.name.name)) |cid| {
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        if (module.classIdByFqn(cfqn)) |cid| {
             if (cid.int() < module.classes.items.len and module.classes.items[cid.int()].primary_params.len == 0) {
                 module.classes.items[cid.int()].primary_params = try ir.lower.decl.classPrimaryParams(a, c);
             }
@@ -2515,7 +2516,7 @@ fn buildModuleWithOverrides(
 
         const body_prop_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
-        const body_prop_class_id = module.classId(body_prop_cfqn) orelse module.classId(c.name.name);
+        const body_prop_class_id = module.classIdByFqn(body_prop_cfqn);
         const body_prop_param_types: []const ir.Param = if (body_prop_class_id) |cid|
             module.classes.items[cid.int()].primary_params
         else

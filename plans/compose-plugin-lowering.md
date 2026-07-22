@@ -30,7 +30,11 @@ reimplementation.
   implementation and caching the result. This removes the empty-header panic
   on Compose's anonymous `FlowCollector.emit`; upstream
   `CompositionTests.simple` now passes. `CompositionTests.simpleChanges`
-  proceeds to the older `AtomicRef.addAndGet` host-surface gap.
+  now also passes its snapshot `AtomicInt.add` path: property-initializer
+  lowering reads constructor parameter types from the declaring class's exact
+  FQN, so Compose's `atomic(value: Int)` selects `AtomicInt` rather than the
+  generic `AtomicRef<T>`. Its next stop is the separate missing test-platform
+  actual `androidx.compose.runtime.mock.synchronizedImpl`.
 
 ## Current state (being replaced)
 

@@ -97,6 +97,11 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
 - **P8 — hatch deletions**: the tailrec name-list arm, `concreteSibling`,
   `isPrimitiveConv`, the duplicate builtin-supertype table, the `is_ctor_name`
   classId arm, and the `instance_prop_private`-era stopgaps are gone.
+- **Class-owned lowering metadata is FQN-keyed**: constructor signature
+  pre-registration and body-property initializer lowering resolve the exact
+  declaring `ClassId`. A dependency's same-simple-name class can no longer
+  donate unrelated constructor parameter types and change overload selection.
+  `atomic_ctor_param_overload.kt` pins this through the atomicfu pack.
 
 ### Verification infrastructure (use these; the canonical alone is NOT enough)
 
