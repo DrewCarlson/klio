@@ -190,7 +190,9 @@ declaration, a link step composes generic supertype substitutions and maps every
 `CallVirtual(slot)`. Abstract interface headers come from the canonical
 declaration table, so one implementation can populate several interface-root
 slots. Synthetic SAM instances and callable-backed SAM parameters execute the
-selected abstract slot through their stored callable without name resolution.
+selected abstract slot through their stored callable without name resolution;
+the fun-interface classifier call itself lowers directly to `NewInstance` with
+its resolved `ClassId`.
 Kotlin runtime classes with specialized scalar/collection representations and
 named interface calls remain on the compatibility path until their ABI and
 declaration-order argument binder are explicit. `dump-ir` reports virtual calls

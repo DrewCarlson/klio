@@ -656,6 +656,7 @@ pub fn lowerClassWithExtras(
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
         .is_interface = c.is_interface,
+        .is_fun_interface = c.is_fun_interface,
         .is_open = c.is_open,
         .is_value = c.is_value,
     });

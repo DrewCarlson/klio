@@ -5523,7 +5523,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             defer if (realigned) |r| b.allocator.free(r);
             const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
             const dst = b.allocReg();
-            if (shadowed_by_class) {
+            const cls = &b.module.classes.items[class_id.int()];
+            const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
+            if (shadowed_by_class or static_sam) {
                 // A bare `Inner()` uses the enclosing `this` as the new
                 // instance's outer. Inside a lambda body that `this` is
                 // only reachable through the closure's capture set, so
@@ -5535,7 +5537,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 {
                     _ = try b.recordCapture("this");
                 }
-                orEmitAudit(b, "bare_ctor_shadowed_by_class", "NewInstance", callee.Path.segments[0].name);
+                orEmitAudit(b, if (static_sam) "fun_interface_sam" else "bare_ctor_shadowed_by_class", "NewInstance", callee.Path.segments[0].name);
                 try b.push(.{ .NewInstance = .{
                     .dst = dst,
                     .class = class_id,
@@ -10947,6 +10949,61 @@ test "calling an object loads its exact singleton for operator invoke" {
     try testing.expectEqual(cid, func.blocks[0].insts[0].LoadGlobal.class.?);
     try testing.expect(func.blocks[0].insts[func.blocks[0].insts.len - 1] == .CallValue);
     for (func.blocks[0].insts) |inst| try testing.expect(inst != .NewInstance);
+}
+
+test "fun interface classifier lowers to a static SAM instance" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const cid = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Action",
+        .fqn = "sample.Action",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_abstract = true,
+        .is_interface = true,
+        .is_fun_interface = true,
+    });
+    try m.registry.file_packages.put(dummySpan().file, "sample");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    var segments = [_]ast.Ident{.{ .name = "Action", .span = dummySpan() }};
+    var callee = Expr{ .Path = .{ .segments = &segments, .span = dummySpan() } };
+    var args = [_]Expr{.{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } }};
+    const call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &call);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "sample.f", build.typeUnit());
+
+    var saw_sam = false;
+    for (func.blocks[0].insts) |inst| switch (inst) {
+        .NewInstance => |ni| {
+            try testing.expectEqual(cid, ni.class);
+            saw_sam = true;
+        },
+        .CallMemberOrGlobal => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try testing.expect(saw_sam);
 }
 
 test "renamed overloaded import binds exact extension and plain identities" {

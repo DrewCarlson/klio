@@ -1066,6 +1066,10 @@ pub const Class = struct {
     /// (+ inherited) AST members, so a static-receiver walk can trust the
     /// registry's transitive method-name set for visibility decisions.
     is_interface: bool = false,
+    /// A Kotlin `fun interface`. Its classifier call with one callable
+    /// argument is a statically known SAM conversion, not a constructor or
+    /// same-simple-name global lookup.
+    is_fun_interface: bool = false,
     /// `open` modifier — the class can be subclassed. A class that is neither
     /// `open` nor `is_abstract` (which folds in `abstract`/`interface`/`sealed`)
     /// is FINAL: it can never be subclassed, so its members cannot be overridden
