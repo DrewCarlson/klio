@@ -365,6 +365,20 @@ fn bodyPropInit(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8, p
     return g.get().body_prop_inits.get(.{ .a = sideTableKey(class_fqn, class_name), .b = prop_name });
 }
 
+fn appendPrimaryCtorPropertyFields(
+    allocator: Allocator,
+    fields: *std.ArrayList(InstanceData.Field),
+    class_def: ObjRef(ClassDef),
+    args: []const Value,
+) Allocator.Error!void {
+    const dg = class_def.borrow();
+    defer dg.deinit();
+    for (dg.get().primary_params, 0..) |param, i| {
+        if (param.property == null or i >= args.len) continue;
+        try fields.append(allocator, .{ .name = param.name, .value = args[i] });
+    }
+}
+
 fn nextInstanceId(self: *VmHost) u64 {
     const g = self.instance_id_counter.borrowMut();
     defer g.deinit();
@@ -953,6 +967,97 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
 }
 
 const ChainEntry = struct { name: []const u8, fqn: ?[]const u8 = null, args: []Value };
+
+/// Evaluate every named class-to-class delegation below the direct
+/// superclass of an object expression. The direct call has already been
+/// evaluated in the enclosing lexical scope; subsequent calls use each
+/// class's primary-constructor parameters, just like named construction.
+fn extendAnonymousParentCtorArgs(
+    self: *VmHost,
+    allocator: Allocator,
+    direct_def: ObjRef(ClassDef),
+    direct_args: []Value,
+    outer_hint: ?*const Value,
+    fields: *std.ArrayList(InstanceData.Field),
+    args_by_class: *std.StringHashMap([]Value),
+) Allocator.Error!UnitOrErr {
+    var cur_def: ?ObjRef(ClassDef) = direct_def.clone();
+    defer if (cur_def) |d| d.deinit();
+    var cur_args: []const Value = direct_args;
+    var depth: usize = 0;
+
+    while (cur_def) |cdef| {
+        if (depth >= 128) break;
+        depth += 1;
+
+        const cur_name = classDefName(cdef);
+        const cur_fqn = classDefFqn(cdef);
+        const thunks = parentCtorArgThunks(self, cur_fqn, cur_name) orelse break;
+        const pref = firstNonInterfaceSuper(self, cdef) orelse break;
+        if (std.mem.eql(u8, pref.name, cur_name)) break;
+
+        var parent_args: std.ArrayList(Value) = .empty;
+        for (thunks) |fid| {
+            const fr = try funcAt(self, fid, "anonymous parent ctor arg");
+            switch (fr) {
+                .err => |e| {
+                    parent_args.deinit(allocator);
+                    return .{ .err = e };
+                },
+                .ok => |func| switch (try evalThunk(self, func, cur_args)) {
+                    .ok => |v| try parent_args.append(allocator, v),
+                    .err => |e| {
+                        parent_args.deinit(allocator);
+                        return .{ .err = e };
+                    },
+                },
+            }
+        }
+
+        const parent_def = classDefByName(self, sideTableKey(pref.fqn, pref.name)) orelse {
+            parent_args.deinit(allocator);
+            break;
+        };
+        if (classDefIsInterface(parent_def)) {
+            parent_def.deinit();
+            parent_args.deinit(allocator);
+            break;
+        }
+        switch (try reorderNamedSuperArgs(
+            self,
+            allocator,
+            parent_def,
+            pref.fqn,
+            pref.name,
+            parentCtorArgNames(self, cur_fqn, cur_name),
+            &parent_args,
+            outer_hint,
+        )) {
+            .ok => {},
+            .err => |e| {
+                parent_def.deinit();
+                parent_args.deinit(allocator);
+                return .{ .err = e };
+            },
+        }
+        switch (try padParentCtorDefaults(self, allocator, parent_def, pref.fqn, pref.name, &parent_args, outer_hint)) {
+            .ok => {},
+            .err => |e| {
+                parent_def.deinit();
+                parent_args.deinit(allocator);
+                return .{ .err = e };
+            },
+        }
+        const packed_args = try packPrimaryCtorVarargs(self, pref.fqn, pref.name, try parent_args.toOwnedSlice(allocator));
+        try appendPrimaryCtorPropertyFields(allocator, fields, parent_def, packed_args);
+        try args_by_class.put(pref.name, packed_args);
+
+        cur_def.?.deinit();
+        cur_def = parent_def;
+        cur_args = packed_args;
+    }
+    return .{ .ok = {} };
+}
 
 /// Whether a chain entry denotes the same class as (`fqn`, `name`):
 /// resolved-FQN identity when both sides carry one, written-name
@@ -4002,6 +4107,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // enclosing receiver, or Null at top level); the direct path covers
     // literals and captured names.
     var super_args_by_class = std.StringHashMap([]Value).init(allocator);
+    defer super_args_by_class.deinit();
+    var direct_parent: ?ObjRef(ClassDef) = null;
+    defer if (direct_parent) |p| p.deinit();
     for (supertypes, 0..) |*sup, idx| {
         const arg_exprs = if (idx < supertype_args.len) (supertype_args[idx] orelse continue) else continue;
         var vals = try allocator.alloc(Value, arg_exprs.len);
@@ -4017,17 +4125,48 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 vals[ai] = try evalSuperArg(self, allocator, ae, capture_pairs);
             }
         }
-        const parent_def = classDefByName(self, sup.name.name);
+        const resolved_name = blk: {
+            const cg = class_def.borrow();
+            defer cg.deinit();
+            break :blk if (idx < cg.get().supertype_names.len) cg.get().supertype_names[idx] else sup.name.name;
+        };
+        const parent_def = classDefByName(self, resolved_name);
         if (parent_def) |pdef| {
             defer pdef.deinit();
-            const dg = pdef.borrow();
-            defer dg.deinit();
-            for (dg.get().primary_params, 0..) |param, pi| {
-                if (param.property == null) continue;
-                if (pi < vals.len) try fields.append(allocator, .{ .name = param.name, .value = vals[pi] });
+            var ordered = std.ArrayList(Value).fromOwnedSlice(vals);
+            const arg_names = if (idx < obj.supertype_arg_names.len) obj.supertype_arg_names[idx] else null;
+            switch (try reorderNamedSuperArgs(self, allocator, pdef, classDefFqn(pdef), classDefName(pdef), arg_names, &ordered, null)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
+            }
+            switch (try padParentCtorDefaults(self, allocator, pdef, classDefFqn(pdef), classDefName(pdef), &ordered, null)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
+            }
+            vals = try packPrimaryCtorVarargs(self, classDefFqn(pdef), classDefName(pdef), try ordered.toOwnedSlice(allocator));
+            try appendPrimaryCtorPropertyFields(allocator, &fields, pdef, vals);
+            if (!classDefIsInterface(pdef) and direct_parent == null) direct_parent = pdef.clone();
+        }
+        try super_args_by_class.put(resolved_name, vals);
+    }
+
+    if (direct_parent) |pdef| {
+        const direct_name = classDefName(pdef);
+        if (super_args_by_class.get(direct_name)) |direct_args| {
+            const outer_hint: ?Value = findCapture(capture_pairs, "this");
+            switch (try extendAnonymousParentCtorArgs(
+                self,
+                allocator,
+                pdef,
+                direct_args,
+                if (outer_hint) |*v| v else null,
+                &fields,
+                &super_args_by_class,
+            )) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
             }
         }
-        try super_args_by_class.put(sup.name.name, vals);
     }
 
     const outer: ?Value = findCapture(capture_pairs, "this");
