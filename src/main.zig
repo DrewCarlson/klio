@@ -9,19 +9,12 @@ const runtime = @import("runtime");
 /// and a packaged app has nowhere to print a trace regardless (crashes go to the
 /// OS crash reporter). Route panics to a minimal handler so `SelfInfo` is never
 /// linked; desktop keeps the full stack-trace panic.
-const is_mobile_target = builtin.os.tag == .ios or
-    (builtin.os.tag == .linux and (builtin.abi == .android or builtin.abi == .androideabi));
+const is_mobile_target = runtime.trace.mobile;
 
 pub const panic = if (is_mobile_target)
-    std.debug.FullPanic(mobilePanic)
+    std.debug.FullPanic(runtime.trace.panicFn)
 else
     std.debug.FullPanic(std.debug.defaultPanic);
-
-fn mobilePanic(msg: []const u8, _: ?usize) noreturn {
-    _ = std.c.write(2, msg.ptr, msg.len);
-    _ = std.c.write(2, "\n".ptr, 1);
-    std.c.abort();
-}
 
 /// macOS: ask every malloc zone to return its cached free pages to the OS.
 /// Called by the collector after a sweep so process RSS tracks the live set,

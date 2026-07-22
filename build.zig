@@ -631,6 +631,39 @@ pub fn build(b: *std.Build) void {
     const harness_exe_step = b.step("klio-harness", "Build+install the harness-optimized klio binary");
     harness_exe_step.dependOn(&b.addInstallArtifact(harness_exe, .{}).step);
 
+    // Static interpreter library for a mobile app host (iOS/Android). The app's
+    // native launch code links this archive and calls the exported C `klio_run`
+    // (src/mobile_lib.zig); there is no spawned klio executable on device. Only
+    // meaningful for a mobile -Dtarget; built via the `mobile-lib` step. Shares
+    // the target module universe, so it inherits the embedded stdlib pack, the
+    // zstd link, and the Apple SDK wiring.
+    const mobile_lib = b.addLibrary(.{
+        .name = b.fmt("klio{s}", .{targetBinSuffix(target)}),
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mobile_lib.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "cli", .module = mods.get("cli").? },
+                .{ .name = "runtime", .module = mods.get("runtime").? },
+            },
+        }),
+    });
+    if (apple_sdk) |sdk| wireAppleSdk(b, mobile_lib.root_module, sdk);
+    // The app host links this archive with the platform toolchain (clang/NDK),
+    // not zig, so the Zig compiler-rt/ubsan builtins must travel inside the
+    // archive (zig bundles them into an executable, but not a static lib).
+    mobile_lib.bundle_compiler_rt = true;
+    mobile_lib.bundle_ubsan_rt = true;
+    const mobile_lib_step = b.step("mobile-lib", "Build the static interpreter library for a mobile app host");
+    mobile_lib_step.dependOn(&b.addInstallArtifact(mobile_lib, .{}).step);
+    // The interpreter references the vendored zstd, which zig keeps in a separate
+    // archive (linked at final-link for the exe). The app host links with the
+    // platform toolchain, so install libzstd.a alongside for it to link too.
+    mobile_lib_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
