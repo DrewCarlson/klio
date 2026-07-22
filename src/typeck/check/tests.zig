@@ -1253,6 +1253,28 @@ test "lambda_param_types_from_expected" {
     try testing.expect(!c.hasErrors());
 }
 
+test "implicit it remains resolvable while a generic lambda shape is unknown" {
+    // fun main() { val predicates = listOf({ it }) }
+    // The generic collection call loses its outer expected element type
+    // during its first inference pass. That must not make `it` an unresolved
+    // name inside the lambda body.
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    var predicate = b.lambda(&.{"it"}, &.{b.exprStmt(b.path("it"))});
+    predicate.Lambda.implicit_it = true;
+    const predicate_span = predicate.Lambda.span;
+    const main = b.funBlock("main", &.{}, null, &.{
+        b.valDecl("predicates", null, b.call(b.path("listOf"), &.{predicate})),
+    });
+    const f = b.file(&.{.{ .Function = main }});
+    var c = checkFile(testing.allocator, &f);
+    defer c.deinit();
+    try testing.expect(!c.hasCode(codes.TYPE_UNRESOLVED_REFERENCE));
+    const predicate_ty = c.tc.types.get(predicate_span).?;
+    try testing.expect(predicate_ty == .Function);
+    try testing.expectEqual(@as(usize, 1), predicate_ty.Function.params.len);
+}
+
 test "abstract_member_not_implemented" {
     // abstract class Shape { abstract fun area(): Int }
     // class Square : Shape()

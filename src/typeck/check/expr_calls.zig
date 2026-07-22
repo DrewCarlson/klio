@@ -2212,6 +2212,10 @@ pub fn checkLambda(
     return checkLambdaShaped(self, params, body, expected, false);
 }
 
+fn resolvedParamIsReferenced(self: *const Checker, param_span: Span) bool {
+    return self.resolution.referenced_decls.contains(param_span);
+}
+
 pub fn checkLambdaShaped(
     self: *Checker,
     params: []const Ident,
@@ -2299,7 +2303,15 @@ pub fn checkLambdaShaped(
     const synthetic_it = params.len == 1 and implicit_it and
         !(expected_arity != null and expected_arity.? >= 1);
     const effective_empty = params.len == 0 or synthetic_it;
-    const bind_it = effective_empty and expected_arity != null and expected_arity.? >= 1;
+    const expected_binds_it = effective_empty and expected_arity != null and expected_arity.? >= 1;
+    // A generic parameter (`listOf({ it })`) has no callable shape until its
+    // argument contributes one. Resolution identifies whether the parser's
+    // synthetic parameter is actually read. Infer Function1 only in that
+    // unknown-shape case and only when there is no enclosing `it` to capture.
+    const inferred_it = effective_empty and expected_arity == null and
+        narrowing.lookup(self, "it") == null and params.len == 1 and
+        resolvedParamIsReferenced(self, params[0].span);
+    const bind_it = expected_binds_it or inferred_it;
     if (bind_it) {
         const it_ty = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
         try narrowing.currentFrame(self).bindings.put("it", .{
@@ -2337,7 +2349,7 @@ pub fn checkLambdaShaped(
         params_out.deinit(self.allocator);
     }
     if (effective_empty) {
-        if (bind_it) {
+        if (expected_binds_it or inferred_it) {
             const first = if (param_tys.items.len > 0) try param_tys.items[0].clone(self.allocator) else Type.Unresolved;
             try params_out.append(self.allocator, first);
         }
