@@ -105,10 +105,10 @@ fn fnArityOfType(ty: ast.TypeRef) ?usize {
 }
 
 /// Simple names that a default-imported host binding owns (e.g.
-/// `kotlin.synchronized`, `kotlin.arrayOf`). Any inline fn sharing a
-/// simple name with one of these must NOT shadow Kotlin's default-import
-/// resolution at a bare call site; the lowerer skips inline expansion so
-/// the call falls through to the normal call path.
+/// `kotlin.synchronized`, `kotlin.arrayOf`). An inline declaration sharing
+/// one of these names cannot be selected from the ad-hoc simple-name table;
+/// ordinary calls fall through to the host binding, while scope-aware exact
+/// resolution can still recover the corresponding source declaration.
 threadlocal var shadowed_inline_names: ?StringSet = null;
 
 /// `inline fun` ASTs keyed by the phase-1 header stub's `FuncId`, so a
@@ -238,15 +238,9 @@ pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
     return null;
 }
 
-/// Whether a default-imported host binding owns this simple name (see
-/// `shadowed_inline_names`); such a name never splices.
-pub fn isShadowedInlineName(name: []const u8) bool {
-    return isShadowed(name);
-}
-
-/// Install the set of simple names owned by default-imported host
-/// bindings. Inline expansion is skipped for these names so the call
-/// site dispatches through the binding. Takes ownership of `names`.
+/// Install the set of simple names owned by default-imported host bindings.
+/// Ad-hoc name lookup is skipped for these names so ordinary calls dispatch
+/// through the binding. Takes ownership of `names`.
 pub fn setShadowedInlineNames(names: StringSet) void {
     if (shadowed_inline_names) |*old| old.deinit();
     shadowed_inline_names = names;
@@ -786,14 +780,14 @@ test "top-level prop names round-trip" {
     try testing.expect(!isTopLevelProp("other"));
 }
 
-test "shadowed name suppresses inline lookup" {
+test "shadowed host name suppresses simple-name inline lookup" {
     defer resetForTest();
     var shadowed = StringSet.init(testing.allocator);
     try shadowed.put("synchronized", {});
     setShadowedInlineNames(shadowed);
     try testing.expect(inlineFnAst("synchronized") == null);
-    try testing.expect(isShadowedInlineName("synchronized"));
-    try testing.expect(!isShadowedInlineName("other"));
+    try testing.expect(isShadowed("synchronized"));
+    try testing.expect(!isShadowed("other"));
 }
 
 test "inline fn ids register, look up, and reset with the table" {

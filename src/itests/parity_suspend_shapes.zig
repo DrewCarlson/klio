@@ -470,6 +470,31 @@ test "suspension survives nested inline lambda forwarding" {
     try assertKlio("nested_inline_suspend_forward", src, "before;after;\ndone;\n");
 }
 
+test "suspension survives host-backed inline lambda forwarding" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\inline fun <reified T> capture(block: () -> Unit): Result<Unit> {
+        \\    T::class
+        \\    return runCatching(block)
+        \\}
+        \\fun main() = runBlocking {
+        \\    val result = capture<String> {
+        \\        print("before;")
+        \\        delay(1)
+        \\        println("after;")
+        \\    }
+        \\    println("success=" + result.isSuccess)
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "host_backed_inline_suspend_forward",
+        src,
+        "before;after;\nsuccess=true\n",
+    );
+}
+
 // The same shape parking multiple times across one body: the continuation
 // re-enters the closure body at each suspension point and threads the bound
 // receiver `this` through every resume.

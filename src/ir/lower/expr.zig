@@ -5672,7 +5672,6 @@ fn inlineTargetForBareCall(
     shape: CallShape,
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
-    if (inline_state.isShadowedInlineName(nm)) return null;
     // The active splice's declared receiver serves as evidence when the
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
@@ -5682,6 +5681,12 @@ fn inlineTargetForBareCall(
         try recvChainOf(b, srt)
     else
         null;
+    // Host-backed default imports suppress the simple-name candidate table,
+    // but not an exact FuncId resolved by the scope-aware index below. The
+    // source declaration remains the semantic target of an inline call and
+    // must be available when reification, non-local return, or suspension
+    // requires a splice; ordinary calls still fall through to the host binding
+    // because `bareInlineNeedsSplice` rejects them.
     const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
     const ires = b.module.resolveBareCallIndexed(
         nm,
