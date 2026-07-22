@@ -84,6 +84,24 @@ test "inner_class_captures_outer_this" {
     try assertKlio("inner_class", src, "outer=hello\n");
 }
 
+test "inner class reads outer private computed property" {
+    const src =
+        \\
+        \\open class Outer(private val cause: String?) {
+        \\    private val receiveException: String get() = cause ?: "closed"
+        \\    inner class Iterator {
+        \\        fun next(): String = receiveException
+        \\    }
+        \\}
+        \\class Derived : Outer(null)
+        \\fun main() {
+        \\    println(Derived().Iterator().next())
+        \\}
+        \\
+    ;
+    try assertKlio("inner_outer_private_getter", src, "closed\n");
+}
+
 test "this_at_label_in_inner_class" {
     const src =
         \\
@@ -531,4 +549,20 @@ test "inner_class_init_block_sees_outer_field" {
         \\
     ;
     try assertKlio("inner_init_outer", src, "2\n1\n0\n");
+}
+
+test "inner_class_super_constructor_reads_outer_field" {
+    const src =
+        \\
+        \\open class Base(val value: Int)
+        \\class Outer(val seed: Int) {
+        \\    inner class Derived : Base(seed)
+        \\    fun make(): Derived = Derived()
+        \\}
+        \\fun main() {
+        \\    println(Outer(42).make().value)
+        \\}
+        \\
+    ;
+    try assertKlio("inner_super_outer", src, "42\n");
 }

@@ -14,6 +14,19 @@ const ObjRef = objcell.ObjRef;
 const Env = env_mod.Env;
 const Value = value_mod.Value;
 
+/// One implicit receiver captured from a lexical scope. Storage order is
+/// outermost first, innermost last.
+pub const ImplicitReceiver = struct {
+    v: Value,
+    kind: Kind = .receiver,
+
+    pub const Kind = enum { receiver, subject, access };
+
+    pub fn isSubject(self: ImplicitReceiver) bool {
+        return self.kind == .subject;
+    }
+};
+
 /// A declared Kotlin class as the interpreter sees it at runtime.
 pub const ClassDef = struct {
     /// A class definition is built once and, after two-phase linking backpatches
@@ -394,6 +407,10 @@ pub const InstanceData = struct {
     /// site-stable and shared across instances. Names are borrowed
     /// (program-lifetime); the slice and the values are owned by the instance.
     anon_captures: []Capture = &.{},
+    /// Lexical implicit receivers visible where an anonymous-object expression
+    /// was created. Anonymous method frames are seeded from this snapshot so
+    /// nested receiver lambdas do not hide an outer dispatch receiver.
+    anon_enclosing: []ImplicitReceiver = &.{},
     /// For a user `Throwable` subclass instance, the call stack captured when it
     /// was first thrown (`fillInStackTrace`). Null for every non-throwable
     /// instance and until the throwable is thrown.
@@ -451,6 +468,8 @@ pub const InstanceData = struct {
         if (self.outer) |o| o.release(allocator);
         for (self.anon_captures) |c| c.value.release(allocator);
         if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
+        for (self.anon_enclosing) |e| e.v.release(allocator);
+        if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         if (self.stack) |*s| s.deinit();
         self.fields.deinit(allocator);
         self.class.deinit();
@@ -463,6 +482,7 @@ pub const InstanceData = struct {
         for (self.fields.items) |f| f.value.gcMark(m);
         if (self.outer) |o| o.gcMark(m);
         for (self.anon_captures) |c| c.value.gcMark(m);
+        for (self.anon_enclosing) |e| e.v.gcMark(m);
         if (self.stack) |s| m.shade(&s.cell.hdr);
         // `native_state` is host-owned; value-bearing bindings install a
         // NativeBox gc_trace (none today — kotlinx.io.Buffer is value-free).
@@ -473,6 +493,7 @@ pub const InstanceData = struct {
     /// reachability, so they are NOT released here.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
         if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
+        if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         self.fields.deinit(allocator);
     }
 
@@ -933,6 +954,36 @@ test "instance release recursively frees a retained instance field" {
     // and no double-free.
     a_val.release(allocator);
     b_val.release(allocator);
+}
+
+test "instance release frees its anonymous lexical receiver snapshot" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    const outer = try objcell.ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const outer_value = Value{ .Instance = outer };
+    const chain = try allocator.alloc(ImplicitReceiver, 1);
+    outer_value.retain();
+    chain[0] = .{ .v = outer_value, .kind = .receiver };
+
+    const anon = try objcell.ObjRef(InstanceData).init(allocator, .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 2,
+        .native_state = null,
+        .anon_enclosing = chain,
+    });
+    const anon_value = Value{ .Instance = anon };
+    anon_value.release(allocator);
+    outer_value.release(allocator);
 }
 
 test "list release recursively frees retained instance elements" {

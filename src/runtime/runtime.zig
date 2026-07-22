@@ -118,6 +118,7 @@ pub const ValueSlice = value_mod.ValueSlice;
 
 // class
 pub const ClassDef = class_mod.ClassDef;
+pub const ImplicitReceiver = class_mod.ImplicitReceiver;
 pub const SupertypeDelegate = class_mod.SupertypeDelegate;
 pub const ClassParamDef = class_mod.ClassParamDef;
 pub const TypeShape = class_mod.TypeShape;
