@@ -799,3 +799,14 @@ test "infix_extension_over_inapplicable_intrinsic" {
         \\
     );
 }
+
+test "imported_overload_in_captured_receiver" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/imported_overload_in_captured_receiver/lib.kt",
+        CORPUS_DIR ++ "/imported_overload_in_captured_receiver/app.kt",
+    },
+        \\short:1
+        \\content
+        \\
+    );
+}
