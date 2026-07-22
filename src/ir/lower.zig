@@ -70,6 +70,7 @@ pub const lowerAccessorBlock = mod.lowerAccessorBlock;
 pub const lowerAccessorExpr = mod.lowerAccessorExpr;
 pub const lowerAccessorExprWithExpected = mod.lowerAccessorExprWithExpected;
 pub const lowerAccessorExprEnclosing = mod.lowerAccessorExprEnclosing;
+pub const lowerPropertyInitExpr = mod.lowerPropertyInitExpr;
 pub const lowerBinaryExprAsThunk = mod.lowerBinaryExprAsThunk;
 pub const lowerBlockAsThunk = mod.lowerBlockAsThunk;
 pub const lowerBlockAsUnaryThunk = mod.lowerBlockAsUnaryThunk;

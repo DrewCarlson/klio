@@ -645,11 +645,12 @@ const ModuleImage = struct {
     deferred_func_section: []const u8,
 };
 
-/// Name-level projection of `Module.DeclSig` for the image: the runtime
-/// consumers read the receiver head, arity, kind flags and has_body —
-/// the structural `sig`/`enclosing_class` graphs stay bake-only.
+/// Name-level projection of `Module.DeclSig` for the image: runtime consumers
+/// read the receiver head, arity, owner, kind flags, and body status. The full
+/// structural parameter graph stays lowering-only.
 pub const DeclSigLite = struct {
     fid: u32,
+    enclosing_class: ?ir.ClassId,
     /// Receiver type head; empty = no declared receiver.
     recv_head: []const u8,
     recv_nullable: bool,
@@ -1256,6 +1257,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             const ds = e.value_ptr.*;
             try lites.append(a, .{
                 .fid = e.key_ptr.*,
+                .enclosing_class = ds.enclosing_class,
                 .recv_head = if (ds.receiver_ty) |rt| rt.name else "",
                 .recv_nullable = if (ds.receiver_ty) |rt| rt.nullable else false,
                 .required = @intCast(ds.arity.required),
@@ -2030,7 +2032,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         else
             null;
         try out.decl_sigs.put(l.fid, .{
-            .enclosing_class = null,
+            .enclosing_class = l.enclosing_class,
             .receiver_ty = rt,
             .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
             .sig = &.{},
@@ -2041,6 +2043,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         });
     }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
+    try out.rebuildMemberNameIndex(a);
 
     const r = &out.registry;
     const ri = &img.registry;
