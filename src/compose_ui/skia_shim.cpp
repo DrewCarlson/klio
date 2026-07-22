@@ -2067,12 +2067,11 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
     if (!kw) return nullptr;
 #if defined(KLIO_METAL)
     if (kw->grContext && kw->metalLayer) {
-        // Wrap the layer's next drawable as a fresh GPU surface. Drop the previous
-        // frame's surface/drawable if they were never presented.
-        if (kw->surface) {
-            klio_skia_free(kw->surface);
-            kw->surface = nullptr;
-        }
+        // Idempotent within a frame: the frame acquires the surface once, then
+        // clears + draws into it (winClear re-requests it), then presents (which
+        // frees it). Return the live surface so the drawing code never sees a
+        // freed one; only wrap a fresh drawable when there is no current surface.
+        if (kw->surface) return kw->surface;
         if (kw->drawable) {
             CFRelease(kw->drawable);
             kw->drawable = nullptr;
@@ -2340,7 +2339,11 @@ KlioWindow* klio_win_attach(void* caMetalLayer, int w, int h, double scale) {
 
 KlioSurface* klio_win_surface(KlioWindow* kw) {
     if (!kw || !kw->grContext || !kw->metalLayer) return nullptr;
-    if (kw->surface) { klio_skia_free(kw->surface); kw->surface = nullptr; }
+    // Idempotent within a frame: a frame acquires the surface once (winSurface),
+    // then clears + draws into that same surface (winClear re-requests it), and
+    // finally presents (which frees it). Freeing + re-acquiring here instead
+    // would hand the drawing code a dangling surface.
+    if (kw->surface) return kw->surface;
     if (kw->drawable) { CFRelease(kw->drawable); kw->drawable = nullptr; }
     id<CAMetalDrawable> d = [kw->metalLayer nextDrawable];
     const int pw = static_cast<int>(kw->metalLayer.drawableSize.width);

@@ -648,6 +648,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "cli", .module = mods.get("cli").? },
                 .{ .name = "runtime", .module = mods.get("runtime").? },
+                .{ .name = "compose_ui", .module = mods.get("compose_ui").? },
             },
         }),
     });
