@@ -42,11 +42,12 @@ LIB="$(pwd)/zig-out/lib/libklio-android.a"; ZSTD="$(pwd)/zig-out/lib/libzstd.a";
 
 echo "==> compile shim (EGL/GLES backend) + native host, link the .so"
 "$CC"  -O2 -fPIC -fno-emulated-tls -I"$GLUE" -c mobile/android/host/native_activity.c -o "$OUT/nact.o"
+"$CC"  -O2 -fPIC -fno-emulated-tls -I"$GLUE" -c mobile/android/host/jni_input.c -o "$OUT/jni.o"
 "$CC"  -O2 -fPIC -I"$GLUE" -c "$GLUE/android_native_app_glue.c" -o "$OUT/glue.o"
 "$CXX" -std=c++17 -O2 -DNDEBUG -DKLIO_ANDROID -fPIC -I"$SK" -c src/compose_ui/skia_shim.cpp -o "$OUT/shim.o"
 "$CXX" -std=c++17 -O2 -DNDEBUG -DKLIO_ANDROID -fPIC -I"$SK" -c src/compose_ui/font_data.cpp -o "$OUT/font.o"
 "$CXX" -shared -fPIC -static-libstdc++ -o "$OUT/libklio_android.so" \
-  "$OUT/nact.o" "$OUT/glue.o" "$OUT/shim.o" "$OUT/font.o" \
+  "$OUT/nact.o" "$OUT/jni.o" "$OUT/glue.o" "$OUT/shim.o" "$OUT/font.o" \
   "$LIB" "$ZSTD" $SKO/*.a -llog -landroid -lEGL -lGLESv2 -lm -u ANativeActivity_onCreate
 [ -f "$OUT/libklio_android.so" ] || fail "native lib did not link"
 
@@ -69,17 +70,55 @@ DEV="$("$ADB" devices | awk 'NR>1 && $2=="device"{print $1; exit}')"
 [ -n "$DEV" ] || skip "no booted emulator/device"
 
 echo "==> install + launch on $DEV"
-"$ADB" -s "$DEV" install -r -g "$OUT/klio-onscreen.apk" >/dev/null 2>&1 || fail "install failed"
+# A prior differently-signed build can block -r; fall back to a clean reinstall.
+"$ADB" -s "$DEV" install -r -g "$OUT/klio-onscreen.apk" >/dev/null 2>&1 \
+  || { "$ADB" -s "$DEV" uninstall "$PKG" >/dev/null 2>&1; "$ADB" -s "$DEV" install -g "$OUT/klio-onscreen.apk" >/dev/null 2>&1; } \
+  || fail "install failed"
 "$ADB" -s "$DEV" logcat -c >/dev/null 2>&1 || true
 "$ADB" -s "$DEV" shell am start -n "$PKG/android.app.NativeActivity" >/dev/null 2>&1
-sleep 6
+# Poll for the frame heartbeat rather than a fixed sleep — a busy emulator can take
+# well over 6s to log its first frames= (60 vsyncs), and a fixed wait races it.
+LOG=""
+for _ in $(seq 1 30); do
+  LOG="$("$ADB" -s "$DEV" logcat -d -s klio-host 2>/dev/null || true)"
+  N="$(printf '%s' "$LOG" | grep -oE 'frames=[0-9]+' | tail -1 || true)"; N="${N#frames=}"
+  [ "${N:-0}" -gt 120 ] && break
+  sleep 1
+done
 "$ADB" -s "$DEV" exec-out screencap -p > "$OUT/screen.png" 2>/dev/null || true
-LOG="$("$ADB" -s "$DEV" logcat -d -s klio-host 2>/dev/null)"
-echo "--- klio-host log ---"; echo "$LOG" | grep -E "run-image|frames=" | tail -6; echo "---------------------"
+echo "--- klio-host log ---"; printf '%s\n' "$LOG" | grep -E "run-image|frames=" | tail -6 || true; echo "---------------------"
 "$ADB" -s "$DEV" shell am force-stop "$PKG" >/dev/null 2>&1 || true
 
-echo "$LOG" | grep -q "frame_active=1" || fail "on-screen path did not activate (see logcat)"
-FRAMES="$(echo "$LOG" | grep -oE 'frames=[0-9]+' | tail -1)"; FRAME_N="${FRAMES#frames=}"
+printf '%s\n' "$LOG" | grep -q "frame_active=1" || fail "on-screen path did not activate (see logcat)"
+FRAME_N="$(printf '%s' "$LOG" | grep -oE 'frames=[0-9]+' | tail -1 || true)"; FRAME_N="${FRAME_N#frames=}"
+FRAMES="frames=${FRAME_N:-0}"
 [ "${FRAME_N:-0}" -gt 120 ] || fail "frame loop did not advance past the injected UI ($FRAMES)"
 SHOT="no"; [ -f "$OUT/screen.png" ] && [ "$(stat -f%z "$OUT/screen.png")" -gt 1000 ] && SHOT="yes ($OUT/screen.png)"
+
+# Input coverage: with the self-test property set, the host synthesizes a scroll,
+# a two-finger touch, and a text/keyboard event once the UI is up. Assert every
+# input path reached the resident VM (scroll -> bar, multi-touch -> circles,
+# KeyCharacterMap -> Unicode) and the IME bridge came up.
+echo "==> input self-test"
+"$ADB" -s "$DEV" shell setprop debug.klio.selftest 1 >/dev/null 2>&1
+"$ADB" -s "$DEV" logcat -c >/dev/null 2>&1 || true
+"$ADB" -s "$DEV" shell am start -n "$PKG/android.app.NativeActivity" >/dev/null 2>&1
+ILOG=""
+for _ in $(seq 1 40); do
+  ILOG="$("$ADB" -s "$DEV" logcat -d -s klio-host 2>/dev/null || true)"
+  printf '%s\n' "$ILOG" | grep -q "selftest show keyboard" && break
+  sleep 1
+done
+sleep 1
+"$ADB" -s "$DEV" exec-out screencap -p > "$OUT/input.png" 2>/dev/null || true
+echo "--- input self-test log ---"; printf '%s\n' "$ILOG" | grep -E "jni:|selftest" | tail -8 || true; echo "---------------------------"
+"$ADB" -s "$DEV" shell am force-stop "$PKG" >/dev/null 2>&1 || true
+"$ADB" -s "$DEV" shell setprop debug.klio.selftest 0 >/dev/null 2>&1
+
+echo "$ILOG" | grep -q "jni: keyboard bridge ready" || fail "JNI keyboard bridge did not come up"
+echo "$ILOG" | grep -q "selftest scroll"           || fail "scroll self-test did not run"
+echo "$ILOG" | grep -q "selftest touch: 2 pointers" || fail "multi-touch self-test did not run"
+echo "$ILOG" | grep -q "key_unicode(A)=97"          || fail "KeyCharacterMap did not resolve 'A' to Unicode"
+ISHOT="no"; [ -f "$OUT/input.png" ] && [ "$(stat -f%z "$OUT/input.png")" -gt 1000 ] && ISHOT="yes ($OUT/input.png)"
 echo "PASS android-onscreen-smoke: Compose drove on-screen frames ($FRAMES); screenshot=$SHOT"
+echo "PASS android-onscreen-smoke: input (scroll + multi-touch + keyboard) reached the VM; screenshot=$ISHOT"

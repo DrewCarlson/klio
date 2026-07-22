@@ -313,3 +313,35 @@ and the `klio-mobile` dev-host push loop reuse `bake-image` + `run-image`.
 - **P4** Dev-host + fast run loop (Layer 4) + hot reload.
 - **P5** Second platform parity across P2–P4.
 - **P6** Signing/store polish, docs, examples, CI gates.
+
+## P5 — Android parity (done)
+
+Android reaches iOS parity across the whole stack, all sharing the platform-agnostic
+resident-VM + input-snapshot ABI (no per-platform interpreter branching):
+
+- **Headless / offscreen / on-screen** — cross-compiled `.so` (NDK clang links the
+  host; the interpreter + Skia shim are a zig static archive). On-screen is a
+  `NativeActivity` (no Java) driving an EGL/GLES **Ganesh** surface wrapped over
+  FBO 0; `AChoreographer` is the frame source (the `CADisplayLink` analogue).
+  Smokes: `android-smoke.sh`, `android-render-smoke.sh`, `android-onscreen-smoke.sh`.
+- **Input (full parity with iOS)** — `native_activity.c` routes the OS input queue
+  into the shared snapshot ABI: `AMotionEvent` touches → `klio_dispatch_touches`
+  (multi-touch, per-finger stable id), `ACTION_SCROLL` axes → `klio_dispatch_scroll`,
+  and `AINPUT_EVENT_TYPE_KEY` → text/edit keys. The soft keyboard + Unicode key
+  resolution need Java the NativeActivity lacks, so `jni_input.c` bridges them via
+  JNI on the activity object: `InputMethodManager` show/hide (with a
+  `toggleSoftInput` fallback for the non-editor decor view) and `KeyCharacterMap`
+  for keycode→Unicode. `android-onscreen-smoke.sh` sets `debug.klio.selftest 1` and
+  asserts every path reaches the VM (scroll → bar, two pointers → two circles,
+  `key_unicode(A)=97`, JNI bridge up).
+
+Caveats (shared with the iOS simulator, not code bugs):
+- **Software GLES (`-gpu swiftshader_indirect`) mis-renders** some Ganesh paths (a
+  touch-driven recompose can flash black). The **host GPU** (`-gpu host`) and real
+  devices render correctly — verify demos on host-GPU emulators.
+- **Soft keyboard is suppressed when the emulator has a hardware keyboard**
+  (`hw.keyboard=yes`), same as a Mac keyboard connected to the iOS simulator; the
+  hardware/injected key path still delivers text.
+- Full **text-field** round-trip (BasicTextField) is gated on the shared
+  `@ReadOnlyComposable` composer fix, same as iOS; the raw text/key plumbing to the
+  VM boundary is proven independently.
