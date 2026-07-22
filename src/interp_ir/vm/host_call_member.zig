@@ -9116,6 +9116,16 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         const user_ext_shadows = try userToplevelExtShadows(self, allocator, receiver, name, args);
         for (probes[0..n], probe_is_member[0..n]) |probe, is_member| {
             if (user_ext_shadows and !is_member) continue;
+            // A member outranks an extension only while its host binding is
+            // applicable. Intrinsics whose Kotlin declarations are pruned
+            // from the runtime image carry this small predicate alongside
+            // the binding, so `Int.or(Int)` cannot capture the distinct
+            // `Int.or(NodeKind)` overload.
+            if (user_ext_shadows and is_member) {
+                if (stdlib.implementationApplicable(probe, args)) |applies| {
+                    if (!applies) continue;
+                }
+            }
             if (lookupIntrinsic(self, probe)) |func| {
                 if (effective_cache_key) |key| memberCachePut(self, key, func, probe);
                 return try dispatchWithReceiver(self, allocator, probe, func, receiver, args);

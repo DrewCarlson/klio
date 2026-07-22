@@ -7621,7 +7621,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the splice path because reification, suspension, and non-local returns
     // may require the source body at this call site.
     if (!shadowed_by_class and segments.len == 1 and
-        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+        !b.callableMemberApplicable(name0, args.len))
     {
         if (try renamedImportDirectTarget(b, segments[0], args, ast_arg_names)) |target| {
             const f = b.module.funcById(target) orelse return null;
@@ -7726,13 +7726,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // the invisible candidate. Order-independent (decided from this file's imports)
     // and gated on the import actually naming in-scope funcs, so it never invents
     // a target.
-    // A member of the enclosing class (or an own member) shadows a top-level
-    // import for a bare call — Kotlin resolves `circle()` inside a class whose
-    // companion declares `fun circle()` to that member, never to an
-    // `import ....circle`. Leave the shadowed name for the member-dispatch
-    // paths below instead of qualifying it to the import's FQN.
+    // An applicable function in the enclosing class hierarchy shadows a
+    // top-level import. A same-named non-callable property does not participate
+    // in call resolution, so it must not block the imported function.
     if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
-        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+        !b.callableMemberApplicable(name0, args.len))
     {
         const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
         if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
@@ -7891,6 +7889,25 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
                 std.debug.print("[EAGER-AUDIT] call '{s}': eager={d}({s}) lazy={d}({s})\n", .{ name0, eager_fid.int(), efqn, lazy_str, lfqn });
             }
         }
+    }
+
+    // An exact explicit import remains a static call after overload
+    // resolution, even inside a captured receiver context, when that receiver
+    // has no applicable member or extension of the imported name. The earlier
+    // import fast path intentionally defers an overloaded FQN so the shared
+    // resolver can choose its sibling; once that choice is made there is no
+    // runtime member-vs-global decision left to perform.
+    if (res_final.target) |target| static_import: {
+        if (res_final.emit_form != .CallMemberOrGlobal or shadowed_by_class or
+            segments.len != 1 or b.callableMemberApplicable(name0, args.len) or
+            extOnEnclosingReceiverApplies(b, name0, args.len)) break :static_import;
+        const paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
+        if (paths.len != 1) break :static_import;
+        const f = b.module.funcById(target) orelse break :static_import;
+        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) break :static_import;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) break :static_import;
+        res_final.emit_form = .Call;
+        res_final.ty_proven = true;
     }
     defer b.allocator.free(res_final.candidate_set);
     const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
@@ -8667,7 +8684,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
         const c0 = call.callee;
         if (c0.* == .Path and c0.Path.segments.len == 1 and std.mem.eql(u8, c0.Path.segments[0].name, "remember") and @intFromEnum(c0.Path.segments[0].span.file) == 0) {
             std.debug.print("[emitCall] remember -> #{d} nargs={d}\n", .{ func_id.int(), call.args.len });
-            std.debug.dumpCurrentStackTrace(.{});
+            runtime.trace.dumpCurrent(.{});
         }
     }
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);

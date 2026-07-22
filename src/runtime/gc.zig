@@ -14,6 +14,7 @@
 //! analysis this implements.
 
 const std = @import("std");
+const trace = @import("trace.zig");
 const clock_mod = @import("clock.zig");
 const Allocator = std.mem.Allocator;
 
@@ -49,7 +50,7 @@ pub const Marker = struct {
     pub fn shade(self: *Marker, h: *GcHeader) void {
         if (gc_poison and h.gc_trace == poisonTrap) {
             std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s}\n", .{h.gc_type});
-            std.debug.dumpCurrentStackTrace(.{});
+            trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
@@ -463,7 +464,7 @@ pub var gc_poison: bool = false;
 /// value referenced a cell the prior collection swept — a missing-root UAF.
 pub fn poisonTrap(h: *GcHeader, _: *Marker) void {
     std.debug.print("\n[GC-POISON] live reference to SWEPT cell: type={s}\n", .{h.gc_type});
-    std.debug.dumpCurrentStackTrace(.{});
+    trace.dumpCurrent(.{});
     @panic("KGC: use-after-free — a live value referenced a swept cell (incomplete root)");
 }
 

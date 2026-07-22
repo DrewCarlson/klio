@@ -44,6 +44,7 @@ pub const gc = objcell.gc;
 // live set; smp/libc free-lists never return reclaimed pages to the OS).
 pub const slab = @import("slab.zig");
 pub const leaktrack = @import("leaktrack.zig");
+pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");
 pub const prof = @import("prof.zig");
 // Host-op temporary keepalive (a GC root for accumulators/snapshots held across
