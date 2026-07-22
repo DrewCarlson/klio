@@ -52,7 +52,7 @@ fn classify(inst: *const Inst) ?Kind {
         .Call => .direct,
         .NewInstance => .direct,
         .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
-        .CallSpread => |c| if (c.candidates != null) .dyn_bound else .dyn_unbound,
+        .CallSpread => |c| if (c.virtual_slot != null) .virtual else if (c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallVirtual => .virtual,
         .CallMember,
         .CallValue,
@@ -138,9 +138,9 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CallVirtual => |c| {
             try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
             try argRun(w, c.args, c.n_args);
-            if (c.arg_params.len != 0) {
+            if (c.arg_params) |params| {
                 try w.writeAll(" params=[");
-                for (c.arg_params, 0..) |param, i| {
+                for (params, 0..) |param, i| {
                     if (i != 0) try w.writeByte(',');
                     try w.print("{d}", .{param});
                 }
@@ -168,7 +168,18 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         ),
         .CallSpread => |c| {
             try w.print("r{d} <- CallSpread r{d} (parts={d})", .{ reg(c.dst), reg(c.callee), c.parts.len });
-            if (c.member) |mid| {
+            if (c.virtual_slot) |slot| {
+                try w.print(" slot#{d}", .{slot.int()});
+                if (c.arg_params) |params| {
+                    try w.writeAll(" params=[");
+                    for (params, 0..) |param, i| {
+                        if (i != 0) try w.writeByte(',');
+                        try w.print("{d}", .{param});
+                    }
+                    try w.writeByte(']');
+                }
+                try w.writeAll("        [VIRTUAL]");
+            } else if (c.member) |mid| {
                 try w.print("        [DYN member '{s}']", .{constStr(m, mid)});
             } else if (c.candidates) |ids| {
                 const name = if (c.name) |nid| constStr(m, nid) else "<missing-name>";

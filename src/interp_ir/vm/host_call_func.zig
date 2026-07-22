@@ -1676,12 +1676,32 @@ pub fn bindFuncIndexedArgs(
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = null;
     slots[0] = receiver.*;
+
+    var vararg_param: ?usize = null;
+    for (f.params, 0..) |param, i| if (param.is_vararg) {
+        vararg_param = i;
+        break;
+    };
+    var vararg_values: std.ArrayList(Value) = .empty;
+    defer vararg_values.deinit(allocator);
     for (args, arg_params) |arg, user_index| {
         const param_index: usize = @as(usize, user_index) + 1;
-        if (param_index >= slots.len or slots[param_index] != null) {
+        if (param_index >= slots.len) {
+            return .{ .err = typeErr(allocator, "indexed-call parameter map is invalid", .{}) };
+        }
+        if (f.params[param_index].is_vararg) {
+            try vararg_values.append(allocator, arg);
+            continue;
+        }
+        if (slots[param_index] != null) {
             return .{ .err = typeErr(allocator, "indexed-call parameter map is invalid", .{}) };
         }
         slots[param_index] = arg;
+    }
+    if (vararg_param) |param_index| {
+        var packed_values: std.ArrayList(Value) = .empty;
+        try packed_values.appendSlice(allocator, vararg_values.items);
+        slots[param_index] = try packVarargArray(allocator, f.params[param_index].ty.name, packed_values);
     }
 
     const defaults = funcDefaults(self, defaults_from);

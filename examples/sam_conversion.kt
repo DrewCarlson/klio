@@ -19,11 +19,17 @@ fun interface DefaultCombiner {
     fun combine(left: Int, middle: Int = 3, right: Int): Int
 }
 
+fun interface IntFolder {
+    fun fold(vararg values: Int): Int
+}
+
 fun acceptsPredicate(predicate: IntPredicate): Boolean = predicate.test(8)
 
 fun namedCombine(combiner: IntCombiner): Int = combiner.combine(right = 2, left = 10)
 
 fun namedDefaultCombine(combiner: DefaultCombiner): Int = combiner.combine(right = 2, left = 10)
+
+fun namedSpreadSize(folder: IntFolder): Int = folder.fold(values = *intArrayOf(6, 7, 8))
 
 fun main() {
     val isEven: IntPredicate = IntPredicate { x -> x % 2 == 0 }
@@ -46,4 +52,10 @@ fun main() {
     val weighted: DefaultCombiner = DefaultCombiner { left, middle, right -> left + middle * 10 + right }
     println(weighted.combine(right = 2, left = 10))
     println(namedDefaultCombine { left, middle, right -> left + middle * 10 + right })
+
+    val size: IntFolder = IntFolder { values -> values.size }
+    println(size.fold())
+    println(size.fold(1, 2, 3))
+    println(size.fold(*intArrayOf(4, 5)))
+    println(namedSpreadSize { values -> values.size })
 }

@@ -3046,8 +3046,10 @@ fn mapArgsToParams(
         while (pidx < params.len and used[pidx]) pidx += 1;
         if (pidx < params.len) {
             out[j] = pidx;
-            used[pidx] = true;
-            pidx += 1;
+            if (!params[pidx].is_vararg) {
+                used[pidx] = true;
+                pidx += 1;
+            }
         }
     }
     return out;
@@ -4181,6 +4183,18 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Calls containing a `*spread` argument.
     if (anySpread(args)) {
+        if (callee.* == .Member and !callee.Member.safe) {
+            const member = callee.Member;
+            if (try lowerResolvedMemberCall(
+                b,
+                member.receiver,
+                member.name,
+                args,
+                ast_arg_names,
+                ast_type_args,
+                argDeclTypeRef(b, member.receiver),
+            )) |reg| return reg;
+        }
         return lowerCallSpread(b, callee, args, ast_arg_names);
     }
 
@@ -4691,6 +4705,18 @@ fn packContiguous(b: *FuncBuilder, regs: []const Reg) Allocator.Error!Reg {
     return start;
 }
 
+fn lowerSpreadParts(b: *FuncBuilder, args: []const Expr) Allocator.Error![]SpreadPart {
+    const parts = try b.allocator.alloc(SpreadPart, args.len);
+    for (args, parts) |*arg, *part| {
+        if (arg.* == .Spread) {
+            part.* = .{ .reg = try lowerExpr(b, arg.Spread.expr), .is_spread = true };
+        } else {
+            part.* = .{ .reg = try lowerExpr(b, arg), .is_spread = false };
+        }
+    }
+    return parts;
+}
+
 /// Resolve a `this` reg for a bare extension call: bound local, else a
 /// capture inside a lambda body, else null. Binds the recovered capture
 /// locally so later references reuse it.
@@ -4773,16 +4799,7 @@ fn lowerCallSpread(
         }
         break :blk try lowerExpr(b, callee);
     };
-    const parts = try b.allocator.alloc(SpreadPart, args.len);
-    for (args, parts) |*a, *p| {
-        if (a.* == .Spread) {
-            const r = try lowerExpr(b, a.Spread.expr);
-            p.* = .{ .reg = r, .is_spread = true };
-        } else {
-            const r = try lowerExpr(b, a);
-            p.* = .{ .reg = r, .is_spread = false };
-        }
-    }
+    const parts = try lowerSpreadParts(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     try b.push(.{ .CallSpread = .{
@@ -10196,28 +10213,17 @@ fn lowerResolvedMemberCall(
     const func_id = resolved.target orelse return null;
     if (resolved.dispatch == .deferred) return null;
     const target = b.module.funcById(func_id) orelse return null;
+    const has_spread = anySpread(args);
+    if (resolved.dispatch == .direct and has_spread) return null;
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Value classes, unresolved shells, and declarations in the
         // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`. Named interface calls
-        // carry a numeric parameter map and fill declaration defaults by slot;
-        // vararg interface forms remain on the compatibility path for now.
-        var has_named = false;
-        for (ast_arg_names) |arg_name| if (arg_name != null) {
-            has_named = true;
-            break;
-        };
-        var interface_named_supported = true;
-        if (has_named) {
-            for (target.params[1..]) |param| if (param.is_vararg) {
-                interface_named_supported = false;
-                break;
-            };
-        }
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and !interface_named_supported) or
+        // already guaranteed to use `Value.Instance`. Named, defaulted, and
+        // vararg interface calls bind against the numeric declaration ABI.
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
             std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
     }
 
@@ -10233,9 +10239,13 @@ fn lowerResolvedMemberCall(
 
     const recv_reg = try lowerReceiver(b, receiver);
     if (resolved.dispatch == .virtual) {
-        const run = try lowerArgRunWithArity(b, args, arg_arity);
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
-        const arg_params: []u32 = if (anyNamedArg(ast_arg_names)) blk: {
+        var has_vararg = false;
+        for (target.params[1..]) |param| if (param.is_vararg) {
+            has_vararg = true;
+            break;
+        };
+        const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
             if (target.params.len == 0) return null;
             const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return null;
             defer b.allocator.free(mapped);
@@ -10243,8 +10253,20 @@ fn lowerResolvedMemberCall(
             const indices = try b.allocator.alloc(u32, mapped.len);
             for (mapped, indices) |param, *out| out.* = @intCast(param.?);
             break :blk indices;
-        } else &.{};
+        } else null;
         const dst = b.allocReg();
+        if (has_spread) {
+            try b.push(.{ .CallSpread = .{
+                .dst = dst,
+                .callee = recv_reg,
+                .parts = try lowerSpreadParts(b, args),
+                .virtual_slot = ir.MethodSlotId.fromFunc(func_id),
+                .arg_params = arg_params,
+                .trailing_lambda = b.callTrailingLambda(),
+            } });
+            return dst;
+        }
+        const run = try lowerArgRunWithArity(b, args, arg_arity);
         try b.push(.{ .CallVirtual = .{
             .dst = dst,
             .receiver = recv_reg,
@@ -10252,7 +10274,7 @@ fn lowerResolvedMemberCall(
             .args = run[0],
             .n_args = run[1],
             .arg_params = arg_params,
-            .arg_names = if (arg_params.len == 0) arg_names else &.{},
+            .arg_names = if (arg_params == null) arg_names else &.{},
             .trailing_lambda = b.callTrailingLambda(),
         } });
         return dst;
@@ -10874,6 +10896,29 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     } };
     const call_shape = shapeOfAstArg(&b, &predicate_call, null);
     try testing.expectEqualStrings("Boolean", call_shape.ty.?.name);
+}
+
+test "argument maps repeat a vararg slot before a trailing lambda" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+
+    const params = [_]ir.Param{
+        .{ .name = "head", .ty = build.typeInt(), .default = null },
+        .{ .name = "values", .ty = build.typeInt(), .default = null, .is_vararg = true },
+        .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null },
+    };
+    var lambda_params: [0]ast.Ident = .{};
+    const args = [_]Expr{
+        .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 2, .kind = .Int, .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 3, .kind = .Int, .span = dummySpan() } },
+        .{ .Lambda = .{ .params = &lambda_params, .body = .{ .stmts = &.{}, .span = dummySpan() }, .span = dummySpan() } },
+    };
+    const mapped = (try mapArgsToParams(&b, &params, &args, &.{})).?;
+    defer testing.allocator.free(mapped);
+    try testing.expectEqualSlices(?usize, &.{ 0, 1, 1, 2 }, mapped);
 }
 
 test "lowers null literal" {

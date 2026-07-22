@@ -195,11 +195,12 @@ the fun-interface classifier call itself lowers directly to `NewInstance` with
 its resolved `ClassId`. Named open-class calls carry source-argument to
 declaration-parameter indices in `CallVirtual`, so override selection never
 rebinds names against the leaf implementation.
-Kotlin runtime classes with specialized scalar/collection representations and
-vararg named interface calls remain on the compatibility path until their ABI
-and argument binder are explicit. Named interface calls, including wrapped and
-callable-backed SAM receivers, use the numeric `CallVirtual` parameter map and
-evaluate omitted defaults from the exact slot-root declaration. Abstract
+Kotlin runtime classes with specialized scalar/collection representations
+remain on the compatibility path until their ABI is explicit. Named,
+defaulted, and vararg interface calls, including wrapped and callable-backed
+SAM receivers, use numeric declaration-parameter maps. Static spread calls
+retain their virtual slot while expansion duplicates the selected vararg index,
+and omitted defaults come from the exact slot-root declaration. Abstract
 default thunks are keyed by their reserved `FuncId`, avoiding the prior
 class/name collision between overloads. `dump-ir` reports virtual calls
 separately from name-dynamic calls so migration coverage is measurable.

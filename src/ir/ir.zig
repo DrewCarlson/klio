@@ -276,6 +276,12 @@ pub const Inst = union(enum) {
         callee: Reg,
         parts: []SpreadPart,
         arg_names: []?ConstId = &.{},
+        /// Statically resolved member slot for a spread call. When present,
+        /// `callee` is the receiver and `arg_params` maps each source part to
+        /// its declaration parameter before spread expansion duplicates it.
+        virtual_slot: ?MethodSlotId = null,
+        arg_params: ?[]u32 = null,
+        trailing_lambda: bool = false,
         /// When set, this is a member-dispatched spread call: the
         /// flattened args are passed to method `member` on the value in
         /// `callee` (the receiver), rather than invoking `callee` as a
@@ -386,11 +392,12 @@ pub const Inst = union(enum) {
         slot: MethodSlotId,
         args: Reg,
         n_args: u32,
-        /// For a named call, the declaration parameter index filled by each
-        /// source-order argument (receiver excluded). Empty for positional
-        /// calls. This is resolved against the slot root during lowering, so
-        /// an override's parameter names are irrelevant at runtime.
-        arg_params: []u32 = &.{},
+        /// The declaration parameter index filled by each source-order
+        /// argument (receiver excluded). Null selects ordinary positional
+        /// binding; a non-null empty map represents an indexed zero-argument
+        /// call such as an empty vararg. This is resolved against the slot root
+        /// during lowering, so override parameter names are irrelevant.
+        arg_params: ?[]u32 = null,
         arg_names: []?ConstId = &.{},
         trailing_lambda: bool = false,
     },
