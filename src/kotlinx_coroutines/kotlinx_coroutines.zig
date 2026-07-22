@@ -856,6 +856,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // `__pending__` field and resume with Bool(true).
         if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+            try setIteratorNextState(w.iter, .value_ready);
             outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
@@ -966,6 +967,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .Closed;
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+            try setIteratorNextState(w.iter, .value_ready);
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = .{ .Bool = true }, .catching = false, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
@@ -1221,6 +1223,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // Iterator-style waiters resume with `Bool(false)` so the
     // for-loop hasNext() returns false and the loop exits.
     for (iters) |w| {
+        try setIteratorNextState(w.iter, .closed_ready);
         resumeWaiterNormal(ctx, w.slot, .{ .Bool = false }, w.scope);
     }
     const send_exc = try closedSendExc(ctx.allocator);
@@ -1486,6 +1489,7 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             outcome = .Closed;
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+            try setIteratorNextState(w.iter, .value_ready);
             outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
@@ -1559,9 +1563,30 @@ fn channelIterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // registered `onSend` select (the offer needs the clause object).
         .{ .name = "__channel__", .value = recv },
         .{ .name = "__pending__", .value = .Null },
+        .{ .name = "__next_state__", .value = Value.newInt(@intFromEnum(IteratorNextState.needs_has_next)) },
     };
     const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannelIterator", id, &fields);
     return .{ .ok = inst };
+}
+
+const IteratorNextState = enum(i32) {
+    needs_has_next = 0,
+    value_ready = 1,
+    closed_ready = 2,
+};
+
+fn setIteratorNextState(iter: ObjRef(InstanceData), state: IteratorNextState) std.mem.Allocator.Error!void {
+    try iter.asPtr().define(regAllocator(), "__next_state__", Value.newInt(@intFromEnum(state)));
+}
+
+fn iteratorNextState(iter: ObjRef(InstanceData)) IteratorNextState {
+    const value = iter.asPtr().get("__next_state__") orelse return .needs_has_next;
+    const raw: i32 = switch (value) {
+        .Int => |n| n,
+        .Long => |n| @intCast(n),
+        else => return .needs_has_next,
+    };
+    return std.enums.fromInt(IteratorNextState, raw) orelse .needs_has_next;
 }
 
 fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1582,7 +1607,10 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // Already have a cached pending value? Report true without touching
     // the channel.
     if (iter_inst.asPtr().get("__pending__")) |c| {
-        if (c != .Null) return .{ .ok = .{ .Bool = true } };
+        if (c != .Null) {
+            try setIteratorNextState(iter_inst, .value_ready);
+            return .{ .ok = .{ .Bool = true } };
+        }
     }
     // Try a synchronous pull. If the buffer holds a value, cache it and
     // return true; if the channel is drained-and-closed, return false;
@@ -1630,9 +1658,13 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Got => |g| {
             if (g.resumed) |slot| resumeWaiterNormal(ctx, slot, .Unit, g.resumed_scope);
             try iter_inst.asPtr().define(regAllocator(), "__pending__", g.value);
+            try setIteratorNextState(iter_inst, .value_ready);
             return .{ .ok = .{ .Bool = true } };
         },
-        .Closed, .NoState => return .{ .ok = .{ .Bool = false } },
+        .Closed, .NoState => {
+            try setIteratorNextState(iter_inst, .closed_ready);
+            return .{ .ok = .{ .Bool = false } };
+        },
         .ParkOnSlot => |slot| {
             ctx.host.coroutineArmSlot(slot);
             if (iter_inst.asPtr().get("__channel__")) |chan| {
@@ -1654,11 +1686,19 @@ fn channelIterNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Instance => |i| i,
         else => return .{ .err = .{ .Type = "next: bad receiver" } },
     };
-    if (inst.asPtr().get("__pending__")) |v| {
-        if (v != .Null) {
+    switch (iteratorNextState(inst)) {
+        .needs_has_next => return channelIllegalState(ctx, "`hasNext()` has not been invoked"),
+        .value_ready => {
+            const value = inst.asPtr().get("__pending__") orelse
+                return channelIllegalState(ctx, "`hasNext()` has not produced an element");
+            if (value == .Null) {
+                return channelIllegalState(ctx, "`hasNext()` has not produced an element");
+            }
             try inst.asPtr().define(regAllocator(), "__pending__", .Null);
-            return .{ .ok = v };
-        }
+            try setIteratorNextState(inst, .needs_has_next);
+            return .{ .ok = value };
+        },
+        .closed_ready => try setIteratorNextState(inst, .needs_has_next),
     }
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
@@ -2277,7 +2317,7 @@ test "current time millis returns a long" {
     try testing.expect(r.ok.Long > 0);
 }
 
-test "channel iter next without pending throws NoSuchElementException" {
+test "channel iterator next distinguishes unchecked, ready, and closed states" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2287,10 +2327,11 @@ test "channel iter next without pending throws NoSuchElementException" {
     var cap = CaptureOutput.init(testing.allocator);
     defer cap.deinit();
 
-    // A bare iterator instance with `__pending__` == Null.
+    // A new iterator rejects next() until hasNext establishes a result.
     const cls = try makeClassDef(a, "kotlinx.coroutines.channels.KlioChannelIterator");
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.append(a, .{ .name = "__pending__", .value = .Null });
+    try fields.append(a, .{ .name = "__next_state__", .value = Value.newInt(@intFromEnum(IteratorNextState.needs_has_next)) });
     const inst = try ObjRef(InstanceData).init(a, .{
         .class = cls,
         .fields = fields,
@@ -2300,9 +2341,22 @@ test "channel iter next without pending throws NoSuchElementException" {
     });
     const args = [_]Value{.{ .Instance = inst }};
     var ctx: CallCtx = .{ .args = &args, .out = cap.output(), .host = host.host(), .allocator = a };
-    const r = try channelIterNext(&ctx);
-    try testing.expect(r == .err and r.err == .Thrown);
-    try testing.expectEqualStrings("kotlin.NoSuchElementException", r.err.Thrown.Exception.fqn.asPtr().bytes);
+    const unchecked = try channelIterNext(&ctx);
+    try testing.expect(unchecked == .err and unchecked.err == .Thrown);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", unchecked.err.Thrown.Exception.fqn.asPtr().bytes);
+
+    try inst.asPtr().define(a, "__pending__", Value.newInt(42));
+    try setIteratorNextState(inst, .value_ready);
+    const ready = try channelIterNext(&ctx);
+    try testing.expect(ready == .ok and ready.ok.Int == 42);
+
+    try setIteratorNextState(inst, .closed_ready);
+    const closed = try channelIterNext(&ctx);
+    try testing.expect(closed == .err and closed.err == .Thrown);
+    try testing.expectEqualStrings("kotlin.NoSuchElementException", closed.err.Thrown.Exception.fqn.asPtr().bytes);
+    const consumed = try channelIterNext(&ctx);
+    try testing.expect(consumed == .err and consumed.err == .Thrown);
+    try testing.expectEqualStrings("kotlin.IllegalStateException", consumed.err.Thrown.Exception.fqn.asPtr().bytes);
 }
 
 /// Build a `KlioChannel` Instance keyed on `id` and register a channel
