@@ -447,6 +447,29 @@ test "receiver_bound_suspend_value_call_parks" {
     try assertKlio("receiver_bound_suspend_value_call", src, "a7|b7\n");
 }
 
+test "suspension survives nested inline lambda forwarding" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\inline fun <reified T> outer(block: () -> Unit) {
+        \\    T::class
+        \\    middle(block)
+        \\}
+        \\inline fun middle(block: () -> Unit) = leaf(block)
+        \\inline fun leaf(block: () -> Unit) = block()
+        \\fun main() = runBlocking {
+        \\    outer<String> {
+        \\        print("before;")
+        \\        delay(1)
+        \\        println("after;")
+        \\    }
+        \\    println("done;")
+        \\}
+        \\
+    ;
+    try assertKlio("nested_inline_suspend_forward", src, "before;after;\ndone;\n");
+}
+
 // The same shape parking multiple times across one body: the continuation
 // re-enters the closure body at each suspension point and threads the bound
 // receiver `this` through every resume.

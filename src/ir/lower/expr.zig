@@ -6029,7 +6029,8 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         break :blk companionOwnerInEnclosingHierarchy(b, owner);
     };
     return !recv_mismatch and
-        (f.is_suspend or argLambdaHasNonlocalReturn(args) or has_reified or shadowed_by_member or
+        (f.is_suspend or argLambdaHasNonlocalReturn(args) or
+            inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
             companion_super_member);
 }
 

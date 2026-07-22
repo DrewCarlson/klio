@@ -42,6 +42,11 @@ const InlineLambdaFrame = struct {
     caller_scope_depth: usize,
 };
 
+const InlineCallFrame = struct {
+    name: []const u8,
+    decl: *const ast.Function,
+};
+
 /// One `(result reg, join block)` entry on the `inline_return` stack:
 /// a `return` inside an inlined body assigns the result and jumps to
 /// the join (the inline call's value).
@@ -576,9 +581,10 @@ pub const FuncBuilder = struct {
     /// Inline-expansion state. `inline_return` is a stack of
     /// (result reg, join block): a `return` inside an inlined body
     /// assigns the result and jumps to the join. `inline_stack`
-    /// guards recursive inline.
+    /// guards recursive inline by declaration identity. Same-named overloads
+    /// may delegate to one another and must remain spliceable.
     inline_return: std.ArrayList(InlineReturn) = .empty,
-    inline_stack: std.ArrayList([]const u8) = .empty,
+    inline_stack: std.ArrayList(InlineCallFrame) = .empty,
     /// Per inline-fn-splice frame: the lambda-param substitution map
     /// *and* a snapshot of `inline_return` as it was when this frame
     /// was pushed. An unlabeled `return` inside a spliced lambda must
@@ -842,7 +848,7 @@ pub const FuncBuilder = struct {
 
     pub fn currentInlineFn(self: *const FuncBuilder) ?[]const u8 {
         if (self.inline_stack.items.len == 0) return null;
-        return self.inline_stack.items[self.inline_stack.items.len - 1];
+        return self.inline_stack.items[self.inline_stack.items.len - 1].name;
     }
     pub fn pushInlineLambdaRet(self: *FuncBuilder, label: []const u8, r: Reg, end: BlockId) Allocator.Error!void {
         try self.inline_lambda_ret.append(self.allocator, .{ .label = label, .reg = r, .end = end });
@@ -883,15 +889,21 @@ pub const FuncBuilder = struct {
         self.allocator.free(saved);
     }
     pub fn inlineInProgress(self: *const FuncBuilder, name: []const u8) bool {
-        for (self.inline_stack.items) |n| {
-            if (std.mem.eql(u8, n, name)) return true;
+        for (self.inline_stack.items) |frame| {
+            if (std.mem.eql(u8, frame.name, name)) return true;
         }
         return false;
     }
-    pub fn pushInlineName(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
-        try self.inline_stack.append(self.allocator, name);
+    pub fn inlineDeclInProgress(self: *const FuncBuilder, decl: *const ast.Function) bool {
+        for (self.inline_stack.items) |frame| {
+            if (frame.decl == decl) return true;
+        }
+        return false;
     }
-    pub fn popInlineName(self: *FuncBuilder) void {
+    pub fn pushInlineDecl(self: *FuncBuilder, name: []const u8, decl: *const ast.Function) Allocator.Error!void {
+        try self.inline_stack.append(self.allocator, .{ .name = name, .decl = decl });
+    }
+    pub fn popInlineDecl(self: *FuncBuilder) void {
         _ = self.inline_stack.pop();
     }
     /// Push an inline-fn-splice frame. Takes ownership of `m`; a
