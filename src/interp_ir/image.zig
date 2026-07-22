@@ -657,6 +657,10 @@ pub const DeclSigLite = struct {
     required: u32,
     total: u32,
     has_vararg: bool,
+    /// Full structural user-parameter signature. Virtual-slot linking on an
+    /// image-loaded pack must make the same generic override associations as
+    /// source lowering, so this is part of the executable image contract.
+    sig: []const ir.TypeRef,
     kind: ir.FuncKind,
     is_private: bool,
     is_inline: bool,
@@ -1264,6 +1268,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
                 .required = @intCast(ds.arity.required),
                 .total = @intCast(ds.arity.total),
                 .has_vararg = ds.arity.has_vararg,
+                .sig = ds.sig,
                 .kind = ds.kind,
                 .is_private = ds.is_private,
                 .is_inline = ds.is_inline,
@@ -2037,7 +2042,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             .enclosing_class = l.enclosing_class,
             .receiver_ty = rt,
             .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
-            .sig = &.{},
+            .sig = l.sig,
             .kind = l.kind,
             .is_private = l.is_private,
             .is_inline = l.is_inline,
@@ -2047,6 +2052,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
     try out.rebuildMemberNameIndex(a);
+    try out.linkMethodSlots(a);
 
     const r = &out.registry;
     const ri = &img.registry;

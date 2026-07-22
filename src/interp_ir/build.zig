@@ -3442,6 +3442,10 @@ fn buildModuleWithOverrides(
     // Rebuild the name index so funcId lookups see every registered stub.
     try module.rebuildFuncNameIndex(a);
 
+    // Settle virtual override families after every class/member header is
+    // complete. Runtime member dispatch can then use only class + slot ids.
+    try module.linkMethodSlots(a);
+
     // Static dispatch bake: resolve provably-monomorphic explicit-receiver
     // member calls to their target at lower time (see `bakeStaticMemberCalls`).
     bakeStaticMemberCalls(module, a);

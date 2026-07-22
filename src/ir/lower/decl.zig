@@ -635,6 +635,9 @@ pub fn lowerClassWithExtras(
 ) Allocator.Error!ClassId {
     const a = module.registry.allocator;
 
+    const class_type_params = try a.alloc([]const u8, c.type_params.len);
+    for (c.type_params, class_type_params) |*param, *out| out.* = param.name.name;
+
     // Register the class shell first so the class name resolves inside
     // its own method bodies (`class Foo { fun copy() = Foo(...) }`).
     const class_fqn = lower_class_fqn orelse c.name.name;
@@ -648,6 +651,8 @@ pub fn lowerClassWithExtras(
         .init_block = null,
         .companion = null,
         .supertypes = &.{},
+        .type_params = class_type_params,
+        .supertype_refs = &.{},
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
         .is_interface = c.is_interface,
@@ -767,6 +772,8 @@ pub fn lowerClassWithExtras(
     }
     var supertypes: std.ArrayList(ClassId) = .empty;
     errdefer supertypes.deinit(a);
+    var supertype_refs: std.ArrayList(TypeRef) = .empty;
+    errdefer supertype_refs.deinit(a);
     // A supertype reference resolves from the declaring class's own
     // scope (its package + its file's imports), so a cross-package
     // simple-name collision binds the supertype this class can see.
@@ -780,11 +787,13 @@ pub fn lowerClassWithExtras(
         if (t.qualified_path) |qp| {
             if (module.classIdByQualifiedSuffix(qp)) |cid| {
                 try supertypes.append(a, cid);
+                try supertype_refs.append(a, try loweredTypeRef(a, t, false));
                 continue;
             }
         }
         if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
             try supertypes.append(a, cid);
+            try supertype_refs.append(a, try loweredTypeRef(a, t, false));
         }
     }
     // Patch the registered class with its now-known method list and
@@ -793,6 +802,7 @@ pub fn lowerClassWithExtras(
         const slot = &module.classes.items[class_id.int()];
         slot.methods = try methods.toOwnedSlice(a);
         slot.supertypes = try supertypes.toOwnedSlice(a);
+        slot.supertype_refs = try supertype_refs.toOwnedSlice(a);
     }
     return class_id;
 }

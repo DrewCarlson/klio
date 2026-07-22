@@ -94,6 +94,24 @@ pub const FuncId = enum(u32) {
     }
 };
 
+/// Stable identity of one virtual override family. A slot is rooted at the
+/// declaration selected against the call site's static receiver type; the
+/// link step maps `(runtime ClassId, MethodSlotId)` to the concrete `FuncId`.
+/// Keeping this distinct from `FuncId` makes the bytecode contract explicit
+/// even though the initial stable numbering reuses the root declaration id.
+pub const MethodSlotId = enum(u32) {
+    _,
+    pub fn from(v: u32) MethodSlotId {
+        return @enumFromInt(v);
+    }
+    pub fn fromFunc(id: FuncId) MethodSlotId {
+        return @enumFromInt(id.int());
+    }
+    pub fn int(self: MethodSlotId) u32 {
+        return @intFromEnum(self);
+    }
+};
+
 /// Identifier for a class declared in the IR module.
 pub const ClassId = enum(u32) {
     _,
@@ -1015,6 +1033,14 @@ pub const Class = struct {
     init_block: ?FuncId,
     companion: ?ClassId,
     supertypes: []ClassId,
+    /// Declared class type parameters, in source order. Virtual-slot linking
+    /// uses declaration position rather than a simple-name lookup when it
+    /// substitutes an inherited generic member signature.
+    type_params: []const []const u8 = &.{},
+    /// Declared supertype references parallel to `supertypes`, retaining their
+    /// type arguments. The resolved `ClassId` supplies nominal identity; this
+    /// structural half supplies the substitution along each inheritance edge.
+    supertype_refs: []TypeRef = &.{},
     /// `inner class` — instances capture an enclosing-class instance.
     /// Construction-site lowering consults this so a lambda building a
     /// bare `Inner()` captures the enclosing `this` it depends on.
@@ -1354,6 +1380,10 @@ pub const Module = struct {
     /// candidate source for member resolution; `member_method_fids` remains
     /// only as a compatibility index for older lowering helpers.
     member_name_index: StrPairMap(std.ArrayList(FuncId)),
+    /// Link-time virtual dispatch table. Keys pack a runtime `ClassId` in the
+    /// high word and a declaration-rooted `MethodSlotId` in the low word.
+    /// Calls consult this table directly; method names never enter dispatch.
+    method_dispatch: std.AutoHashMap(u64, FuncId),
     /// Lowering-time resolution diagnostics: ambiguous bare calls the
     /// symbol index refused to pick among. Recorded during lowering and
     /// surfaced by the build driver before the program runs. The name
@@ -1517,6 +1547,7 @@ pub const Module = struct {
             .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
             .decl_sigs = std.AutoHashMap(u32, DeclSig).init(allocator),
             .member_name_index = StrPairMap(std.ArrayList(FuncId)).init(allocator),
+            .method_dispatch = std.AutoHashMap(u64, FuncId).init(allocator),
         };
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
@@ -1734,6 +1765,183 @@ pub const Module = struct {
         }
     }
 
+    fn methodDispatchKey(class: ClassId, slot: MethodSlotId) u64 {
+        return (@as(u64, class.int()) << 32) | slot.int();
+    }
+
+    /// Concrete implementation selected for `slot` on `runtime_class`.
+    pub fn methodSlotTarget(self: *const Module, runtime_class: ClassId, slot: MethodSlotId) ?FuncId {
+        return self.method_dispatch.get(methodDispatchKey(runtime_class, slot));
+    }
+
+    const TypeBinding = struct {
+        name: []const u8,
+        ty: TypeRef,
+    };
+
+    fn bindingType(bindings: []const TypeBinding, name: []const u8) ?TypeRef {
+        for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding.ty;
+        }
+        return null;
+    }
+
+    fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
+        if (bindingType(bindings, ty.name)) |replacement| {
+            var out = replacement;
+            out.nullable = out.nullable or ty.nullable;
+            return out;
+        }
+        const args = try allocator.alloc(TypeRef, ty.args.len);
+        for (ty.args, args) |arg, *out| out.* = try substituteType(allocator, arg, bindings);
+        return .{ .name = ty.name, .nullable = ty.nullable, .args = args };
+    }
+
+    fn ancestorBindings(
+        self: *const Module,
+        allocator: Allocator,
+        current: ClassId,
+        target: ClassId,
+        current_bindings: []const TypeBinding,
+        depth: u8,
+    ) Allocator.Error!?[]const TypeBinding {
+        if (current.int() == target.int()) return try allocator.dupe(TypeBinding, current_bindings);
+        if (depth > 64 or current.int() >= self.classes.items.len) return null;
+        const class = &self.classes.items[current.int()];
+        for (class.supertypes, 0..) |super_id, edge| {
+            if (super_id.int() >= self.classes.items.len) continue;
+            const super = &self.classes.items[super_id.int()];
+            const super_ref: ?TypeRef = if (edge < class.supertype_refs.len) class.supertype_refs[edge] else null;
+            const next = try allocator.alloc(TypeBinding, super.type_params.len);
+            for (super.type_params, 0..) |param, i| {
+                const supplied: TypeRef = if (super_ref) |ref|
+                    (if (i < ref.args.len) ref.args[i] else .{ .name = param, .nullable = false, .args = &.{} })
+                else
+                    .{ .name = param, .nullable = false, .args = &.{} };
+                next[i] = .{ .name = param, .ty = try substituteType(allocator, supplied, current_bindings) };
+            }
+            if (try self.ancestorBindings(allocator, super_id, target, next, depth + 1)) |found| return found;
+        }
+        return null;
+    }
+
+    fn funcTypeParamIndex(self: *const Module, fid: FuncId, name: []const u8) ?usize {
+        const params = self.registry.func_type_params.get(fid) orelse return null;
+        for (params.items, 0..) |param, i| {
+            if (std.mem.eql(u8, param, name)) return i;
+        }
+        return null;
+    }
+
+    fn overrideTypeEql(
+        self: *const Module,
+        candidate: FuncId,
+        base: FuncId,
+        candidate_ty: TypeRef,
+        base_ty: TypeRef,
+    ) bool {
+        const candidate_tp = self.funcTypeParamIndex(candidate, candidate_ty.name);
+        const base_tp = self.funcTypeParamIndex(base, base_ty.name);
+        if (candidate_tp != null or base_tp != null) return candidate_tp != null and candidate_tp == base_tp;
+        if (!std.mem.eql(u8, candidate_ty.name, base_ty.name)) return false;
+        if (candidate_ty.nullable != base_ty.nullable or candidate_ty.args.len != base_ty.args.len) return false;
+        for (candidate_ty.args, base_ty.args) |ca, ba| {
+            if (!self.overrideTypeEql(candidate, base, ca, ba)) return false;
+        }
+        return true;
+    }
+
+    fn overridesSlot(
+        self: *const Module,
+        allocator: Allocator,
+        owner: ClassId,
+        candidate: FuncId,
+        base: FuncId,
+    ) Allocator.Error!bool {
+        const candidate_func = self.funcById(candidate) orelse return false;
+        const base_func = self.funcById(base) orelse return false;
+        if (!candidate_func.is_override or !std.mem.eql(u8, candidate_func.name, base_func.name)) return false;
+        const candidate_sig = self.decl_sigs.get(candidate.int()) orelse return false;
+        const base_sig = self.decl_sigs.get(base.int()) orelse return false;
+        if (candidate_sig.kind != .instance_method or base_sig.kind != .instance_method) return false;
+        if (candidate_sig.is_suspend != base_sig.is_suspend or candidate_sig.sig.len != base_sig.sig.len) return false;
+        const base_owner = base_sig.enclosing_class orelse return false;
+
+        const owner_class = &self.classes.items[owner.int()];
+        const identity = try allocator.alloc(TypeBinding, owner_class.type_params.len);
+        for (owner_class.type_params, 0..) |param, i| {
+            identity[i] = .{ .name = param, .ty = .{ .name = param, .nullable = false, .args = &.{} } };
+        }
+        const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse return false;
+        for (candidate_sig.sig, base_sig.sig) |candidate_ty, raw_base_ty| {
+            const base_ty = try substituteType(allocator, raw_base_ty, bindings);
+            if (!self.overrideTypeEql(candidate, base, candidate_ty, base_ty)) return false;
+        }
+        return true;
+    }
+
+    fn linkMethodClass(
+        self: *Module,
+        allocator: Allocator,
+        maps: []std.AutoHashMap(u32, FuncId),
+        state: []u8,
+        cid: ClassId,
+    ) Allocator.Error!void {
+        if (cid.int() >= self.classes.items.len or state[cid.int()] == 2) return;
+        if (state[cid.int()] == 1) return;
+        state[cid.int()] = 1;
+        const class = &self.classes.items[cid.int()];
+        for (class.supertypes) |super_id| {
+            try self.linkMethodClass(allocator, maps, state, super_id);
+            if (super_id.int() >= maps.len) continue;
+            var inherited = maps[super_id.int()].iterator();
+            while (inherited.next()) |entry| try maps[cid.int()].put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        for (class.methods) |fid| {
+            const sig = self.decl_sigs.get(fid.int()) orelse continue;
+            if (sig.kind != .instance_method or sig.is_private) continue;
+            const inherited_count = maps[cid.int()].count();
+            if (inherited_count != 0) {
+                const slots = try allocator.alloc(u32, inherited_count);
+                var slot_it = maps[cid.int()].keyIterator();
+                var i: usize = 0;
+                while (slot_it.next()) |slot| : (i += 1) slots[i] = slot.*;
+                for (slots) |slot| {
+                    const base = FuncId.from(slot);
+                    if (try self.overridesSlot(allocator, cid, fid, base)) try maps[cid.int()].put(slot, fid);
+                }
+            }
+            try maps[cid.int()].put(MethodSlotId.fromFunc(fid).int(), fid);
+        }
+        state[cid.int()] = 2;
+    }
+
+    /// Build every `(runtime class, virtual slot) -> implementation` entry once
+    /// after class and member headers are complete. Generic substitutions are
+    /// composed along resolved `ClassId` inheritance edges; runtime dispatch is
+    /// consequently numeric and performs no overload or name resolution.
+    pub fn linkMethodSlots(self: *Module, allocator: Allocator) Allocator.Error!void {
+        self.method_dispatch.clearRetainingCapacity();
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const maps = try sa.alloc(std.AutoHashMap(u32, FuncId), self.classes.items.len);
+        for (maps) |*map| map.* = std.AutoHashMap(u32, FuncId).init(sa);
+        const state = try sa.alloc(u8, self.classes.items.len);
+        @memset(state, 0);
+        for (self.classes.items) |class| try self.linkMethodClass(sa, maps, state, class.id);
+        for (maps, 0..) |*map, raw_cid| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                try self.method_dispatch.put(
+                    methodDispatchKey(ClassId.from(@intCast(raw_cid)), MethodSlotId.from(entry.key_ptr.*)),
+                    entry.value_ptr.*,
+                );
+            }
+        }
+    }
+
     /// Number of functions addressable by id (eager table length, or the lazy
     /// offset-table length when loaded from an image).
     pub fn funcCount(self: *const Module) usize {
@@ -1800,6 +2008,7 @@ pub const Module = struct {
             while (member_it.next()) |list| list.deinit(allocator);
             self.member_name_index.deinit();
         }
+        self.method_dispatch.deinit();
         self.resolve_diags.deinit(allocator);
         if (self.pending_lambda_nonfn_locals) |*names| names.deinit();
         if (self.pending_lambda_local_decl_types) |*locals| {
@@ -1884,6 +2093,10 @@ pub const Module = struct {
                 try list.appendSlice(a, e.value_ptr.items);
                 try out.member_name_index.put(e.key_ptr.*, list);
             }
+        }
+        {
+            var it = self.method_dispatch.iterator();
+            while (it.next()) |e| try out.method_dispatch.put(e.key_ptr.*, e.value_ptr.*);
         }
         try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
         return out;
@@ -5196,6 +5409,79 @@ test "packageOfFqn strips the trailing simple name" {
     try testing.expectEqualStrings("kotlin.math", packageOfFqn("kotlin.math.abs", "abs"));
     // A mangled nested FQN: the package is everything up to the last dot.
     try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
+}
+
+test "method slots link generic overrides and multiple interface roots" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const base = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Base", .fqn = "sample.Base", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{},
+        .type_params = &.{"T"}, .is_abstract = true,
+    });
+    const base_args = try a.alloc(TypeRef, 1);
+    base_args[0] = .{ .name = "String", .nullable = false, .args = &.{} };
+    const child_supers = try a.alloc(TypeRef, 1);
+    child_supers[0] = .{ .name = "Base", .nullable = false, .args = base_args };
+    const child_super_ids = try a.dupe(ClassId, &.{base});
+    const child = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Child", .fqn = "sample.Child", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = child_super_ids,
+        .supertype_refs = child_supers,
+    });
+    const left = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Left", .fqn = "sample.Left", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{}, .is_abstract = true, .is_interface = true,
+    });
+    const right = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Right", .fqn = "sample.Right", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{}, .is_abstract = true, .is_interface = true,
+    });
+    const both_supers = try a.alloc(TypeRef, 2);
+    both_supers[0] = .{ .name = "Left", .nullable = false, .args = &.{} };
+    both_supers[1] = .{ .name = "Right", .nullable = false, .args = &.{} };
+    const both_super_ids = try a.dupe(ClassId, &.{ left, right });
+    const both = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Both", .fqn = "sample.Both", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = both_super_ids,
+        .supertype_refs = both_supers,
+    });
+
+    const base_put = try pushTestFuncOpts(&m, a, "put", "sample.Base.put", "sample", 1, .{ .stub = true, .param_ty = "T" });
+    const child_put = try pushTestFuncOpts(&m, a, "put", "sample.Child.put", "sample", 1, .{ .param_ty = "String" });
+    const left_run = try pushTestFuncOpts(&m, a, "run", "sample.Left.run", "sample", 1, .{ .stub = true, .param_ty = "Int" });
+    const right_run = try pushTestFuncOpts(&m, a, "run", "sample.Right.run", "sample", 1, .{ .stub = true, .param_ty = "Int" });
+    const both_run = try pushTestFuncOpts(&m, a, "run", "sample.Both.run", "sample", 1, .{ .param_ty = "Int" });
+    for ([_]FuncId{ base_put, child_put, left_run, right_run, both_run }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[child_put.int()].is_override = true;
+    m.funcs.items[both_run.int()].is_override = true;
+    m.classes.items[base.int()].methods = try a.dupe(FuncId, &.{base_put});
+    m.classes.items[child.int()].methods = try a.dupe(FuncId, &.{child_put});
+    m.classes.items[left.int()].methods = try a.dupe(FuncId, &.{left_run});
+    m.classes.items[right.int()].methods = try a.dupe(FuncId, &.{right_run});
+    m.classes.items[both.int()].methods = try a.dupe(FuncId, &.{both_run});
+
+    const owners = [_]ClassId{ base, child, left, right, both };
+    const funcs = [_]FuncId{ base_put, child_put, left_run, right_run, both_run };
+    const types = [_][]const u8{ "T", "String", "Int", "Int", "Int" };
+    for (funcs, owners, types) |fid, owner, ty| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+            .sig = &.{.{ .name = ty, .nullable = false, .args = &.{} }},
+            .kind = .instance_method,
+            .has_body = m.funcs.items[fid.int()].hasBody(),
+        });
+    }
+
+    try m.linkMethodSlots(a);
+    try testing.expectEqual(child_put, m.methodSlotTarget(child, MethodSlotId.fromFunc(base_put)).?);
+    try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(left_run)).?);
+    try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(right_run)).?);
 }
 
 /// Options for the symbol-index test func pusher.
