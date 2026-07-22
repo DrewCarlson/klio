@@ -2101,6 +2101,7 @@ pub fn resumeContinuation(
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
+    var pending_unwind_from_inner: ?EvalError = null;
     _ = &resume_route;
     while (true) {
         if (head >= frames.items.len) {
@@ -2182,9 +2183,13 @@ pub fn resumeContinuation(
         // suspending call's value, so a cancellation preempts a parked
         // `delay`/acquire rather than letting it complete.
         var resume_throw: ?Value = null;
+        var resume_unwind: ?EvalError = null;
         if (pending_throw_from_inner) |exc| {
             pending_throw_from_inner = null;
             resume_throw = exc;
+        } else if (pending_unwind_from_inner) |e| {
+            pending_unwind_from_inner = null;
+            resume_unwind = e;
         } else if (first) {
             if (carry == .Result and !carry.Result.ok) {
                 resume_throw = carry.Result.payload.asPtr().*;
@@ -2204,7 +2209,18 @@ pub fn resumeContinuation(
         // references (released by its teardown). Free the snapshot's own slice
         // buffers — but not its values, which moved into the frame.
         freeSnapshotBuffers(snap, allocator);
-        const r = try runFrameInner(H, allocator, m, &frame, &try_stack, snap.block, snap.inst_idx, resume_throw, host);
+        const r = try runFrameInner(
+            H,
+            allocator,
+            m,
+            &frame,
+            &try_stack,
+            snap.block,
+            snap.inst_idx,
+            resume_throw,
+            resume_unwind,
+            host,
+        );
         switch (r) {
             .ok => |v| carry = v,
             .err => |e| switch (e) {
@@ -2238,6 +2254,17 @@ pub fn resumeContinuation(
                         return errResult(.{ .Throw = exc });
                     }
                     pending_throw_from_inner = exc;
+                },
+                .NonLocalReturn, .LabeledReturn => {
+                    // The return was raised after the innermost frame resumed.
+                    // Re-enter each still-snapshotted caller with the control
+                    // event, just as a resumed throw re-enters its callers.
+                    // This lets the target frame absorb a labeled return and
+                    // lets every intervening frame run its finally blocks.
+                    if (head >= frames.items.len and tails == null) {
+                        return errResult(e);
+                    }
+                    pending_unwind_from_inner = e;
                 },
                 // A resumed frame ran; its unresolved-operation failure is
                 // real, never a dispatch miss (see `CalleeFailed`).
@@ -2277,7 +2304,7 @@ fn runFrame(
         // the stack, so the JIT cache can be trimmed if it has grown past its cap.
         if (eval_depth == 0) jit_loop.evictIfOverBudget();
     }
-    return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, host);
+    return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }
 
 fn typeRefName(name: []const u8) TypeRef {
@@ -2681,6 +2708,9 @@ fn LoopTramp(comptime H: type) type {
 /// this frame's restored try-stack instead of being delivered as the
 /// suspending call's value. This makes a cancellation actually preempt
 /// a parked `delay` / acquire.
+/// `resume_unwind` is the corresponding path for a non-local return raised
+/// by a resumed inner frame; it crosses the restored frame's finally stack
+/// and is absorbed when this frame carries its target label.
 fn runFrameInner(
     comptime H: type,
     allocator: Allocator,
@@ -2690,11 +2720,13 @@ fn runFrameInner(
     cur_in: BlockId,
     resume_idx_in: usize,
     resume_throw_in: ?Value,
+    resume_unwind_in: ?EvalError,
     host: *H,
 ) Allocator.Error!EvalResult {
     var cur = cur_in;
     var resume_idx = resume_idx_in;
     var resume_throw = resume_throw_in;
+    var resume_unwind = resume_unwind_in;
     // Pending throw/return state lives on `frame`: a finally body may suspend,
     // and the frame snapshot must carry both its continuation point and the
     // control flow that caused the finally to run.
@@ -2741,11 +2773,18 @@ fn runFrameInner(
         }
         // GC safe point: at an opcode boundary all live Values are in registered
         // frames/globals (no host op mid-flight), so the collector can run.
-        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        // A resumed throw/return payload is transiently held by this native
+        // activation until it is moved into a frame register or pending-finally
+        // state. Route it before collecting so the payload remains rooted.
+        if (runtime.gc.gc_enabled and runtime.gc.pending() and
+            resume_throw == null and resume_unwind == null)
+        {
+            runtime.gc.safePoint();
+        }
         // Loop JIT (KLIO_JIT): a hot loop header compiles to native code; on
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
-        if (jit_on and resume_idx == 0 and resume_throw == null) {
+        if (jit_on and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
             if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
@@ -2850,6 +2889,14 @@ fn runFrameInner(
             // of the suspending block and route the throw through the
             // restored try-stack exactly as a mid-block throw would.
             thrown = exc;
+            start_idx = insts.len;
+        } else if (resume_unwind) |e| {
+            resume_unwind = null;
+            // Resume the caller as though its suspending call instruction
+            // raised this non-local return. Catch clauses do not intercept it;
+            // the ordinary unwind path below runs finally blocks and checks
+            // whether this frame owns the label.
+            unwound = e;
             start_idx = insts.len;
         }
         var idx: usize = 0;
@@ -7610,6 +7657,100 @@ test "suspend liveness keeps only values read on reachable resume paths" {
     // At the terminator the branch condition is also live.
     const before_term = try suspendLiveRegs(&func, .from(0), entry_insts.len);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, before_term);
+}
+
+test "resumed labeled return reaches its snapshotted target frame" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+
+    const inner_blocks = [_]ir.Block{.{
+        .id = .from(0),
+        .insts = &.{},
+        .terminator = .{ .LabeledReturn = .{
+            .label = "hasNext",
+            .value = .from(0),
+        } },
+    }};
+    const outer_blocks = [_]ir.Block{.{
+        .id = .from(0),
+        .insts = &.{},
+        .terminator = .{ .Return = .from(0) },
+    }};
+    try m.funcs.append(testing.allocator, .{
+        .id = .from(0),
+        .name = "<lambda>",
+        .fqn = "test.hasNext.<lambda>",
+        .params = &.{},
+        .return_ty = ir.build.typeBool(),
+        .n_locals = 1,
+        .blocks = @constCast(&inner_blocks),
+        .entry = .from(0),
+        .is_suspend = false,
+        .is_lambda = true,
+    });
+    try m.funcs.append(testing.allocator, .{
+        .id = .from(1),
+        .name = "hasNext",
+        .fqn = "test.hasNext",
+        .params = &.{},
+        .return_ty = ir.build.typeBool(),
+        .n_locals = 1,
+        .blocks = @constCast(&outer_blocks),
+        .entry = .from(0),
+        .is_suspend = true,
+    });
+
+    var state = SuspendState{ .token = 1 };
+    const inner_regs = try testing.allocator.dupe(Value, &.{.{ .Bool = true }});
+    const outer_regs = try testing.allocator.dupe(Value, &.{Value.Unit});
+    const inner_params = try testing.allocator.alloc(Value, 0);
+    const inner_captures = try testing.allocator.alloc(Value, 0);
+    const inner_enclosing = try testing.allocator.alloc(EnclosingEntry, 0);
+    const inner_try = try testing.allocator.alloc(TryFrame, 0);
+    const outer_params = try testing.allocator.alloc(Value, 0);
+    const outer_captures = try testing.allocator.alloc(Value, 0);
+    const outer_enclosing = try testing.allocator.alloc(EnclosingEntry, 0);
+    const outer_try = try testing.allocator.alloc(TryFrame, 0);
+    try state.frames.append(testing.allocator, .{
+        .func = .from(0),
+        .module = null,
+        .block = .from(0),
+        .inst_idx = 0,
+        .regs = .{ .dense = inner_regs },
+        .params = inner_params,
+        .captures = inner_captures,
+        .enclosing_this = inner_enclosing,
+        .try_stack = inner_try,
+        .is_lambda = true,
+        .resume_reg = null,
+    });
+    try state.frames.append(testing.allocator, .{
+        .func = .from(1),
+        .module = null,
+        .block = .from(0),
+        .inst_idx = 0,
+        .regs = .{ .dense = outer_regs },
+        .params = outer_params,
+        .captures = outer_captures,
+        .enclosing_this = outer_enclosing,
+        .try_stack = outer_try,
+        .is_lambda = false,
+        .resume_reg = .from(0),
+    });
+
+    var host = nullHost();
+    const result = try resumeContinuation(
+        NullHost,
+        testing.allocator,
+        &m,
+        &state,
+        Value.Unit,
+        &host,
+    );
+    // `resumeContinuation` consumes the frame list; clear the moved handle.
+    state.frames = .empty;
+    try testing.expect(result == .ok);
+    try testing.expect(result.ok == .Bool and result.ok.Bool);
 }
 
 test "enclosing chain tags subjects and projects innermost-first" {
