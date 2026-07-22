@@ -24,3 +24,13 @@ pub inline fn dumpCurrent(options: std.debug.StackUnwindOptions) void {
 pub inline fn dump(stack_trace: anytype) void {
     if (comptime !mobile) std.debug.dumpStackTrace(stack_trace);
 }
+
+/// Minimal panic handler for mobile app targets: write the message to stderr and
+/// abort so the OS crash reporter records it. No stack symbolization (see the
+/// module doc). Used as the `FullPanic` handler by the mobile exe and the
+/// static-library app host. Only ever instantiated on a libc-linked mobile build.
+pub fn panicFn(msg: []const u8, _: ?usize) noreturn {
+    _ = std.c.write(2, msg.ptr, msg.len);
+    _ = std.c.write(2, "\n".ptr, 1);
+    std.c.abort();
+}

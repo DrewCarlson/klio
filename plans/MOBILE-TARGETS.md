@@ -186,8 +186,34 @@ packaged app / device — deferred to the packaging phase: sandbox path redirect
 (`~/.klio` cache, `/tmp`, zoneinfo, fonts), RSS-cap/abort tuning, in-app stdout
 sink, `selfExePathZ` iOS branch.
 
-Next in P1: a sim/emulator smoke itest (skips cleanly without xcrun/adb), then
-Android emulator bring-up.
+Locked in by `scripts/mobile-smoke.sh` (builds + runs on the sim, asserts vs
+baseline, skips cleanly without xcrun).
+
+### P2 iOS app packaging — interpreter runs inside a real .app (DONE, headless proof)
+
+The interpreter now runs in-process inside a genuine installed iOS app on the
+simulator (`UIApplicationMain` lifecycle), not just via `simctl spawn`. A bundled
+Kotlin program's output shows in the app console and matches the baseline.
+Locked in by `scripts/ios-app-smoke.sh`.
+
+Landed:
+- **C-ABI entry.** `cli.run` split into `run` (native argv) + `runArgv`
+  (pre-built argv); `src/mobile_lib.zig` exports `klio_run(argc, argv)` which
+  synthesizes `{"klio","run",path}` and calls `runArgv` on a process-lifetime
+  arena. Profile: `fast` (JIT) on the simulator, `safe` (interpreter) on device.
+- **Static interpreter library.** `zig build mobile-lib -Dtarget=<mobile triple>`
+  produces `libklio-<suffix>.a` (shares the target module universe → embedded
+  stdlib pack, Apple SDK wiring). `bundle_compiler_rt`/`bundle_ubsan_rt` set so
+  the archive carries Zig's builtins for a foreign (clang/NDK) link; the target
+  `libzstd.a` is installed alongside for the app link.
+- **iOS app host.** `mobile/ios/AppHost/{main.m,Info.plist}` — a minimal ObjC
+  shell (`UIApplicationMain` + delegate) that redirects `HOME` to the app
+  sandbox, runs the bundled program via `klio_run`, logs output, and exits.
+  Assembled + ad-hoc-signed + installed + launched by `scripts/ios-app-smoke.sh`.
+
+Next: generalize the hand-assembled `.app` into `klio bundle --target ios-sim`
+(and reuse the baked `.klio-image` instead of shipping `.kt` source); then the
+render surface (P3) and the dev-host + fast run loop (P4).
 
 ## Phase map (initial)
 

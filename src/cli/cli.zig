@@ -91,14 +91,20 @@ const USAGE =
 /// subcommand, and returns the process exit code. The exe's `main`
 /// calls this, passing the entry-point command-line arguments.
 pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
+    const argv = try io.processArgs(gpa, args_in);
+    defer io.freeArgs(gpa, argv);
+    return runArgv(gpa, argv);
+}
+
+/// Run the CLI over a pre-built argv (argv[0] is the program name). The native
+/// entry (`run`) builds argv from the OS process args; the mobile C-ABI entry
+/// (`klio_run`, in the app host) synthesizes an argv and calls this directly.
+pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     // Host-protection backstops: cap the process's RSS (default 6 GiB) so a
     // runaway program aborts before OOMing the machine, and arm the opt-in
     // wall-clock run deadline. Both are call-once and default-safe.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
-
-    const argv = try io.processArgs(gpa, args_in);
-    defer io.freeArgs(gpa, argv);
 
     // A bundle payload appended to this executable takes over the whole
     // process: argv[1..] belongs to the embedded program and klio
