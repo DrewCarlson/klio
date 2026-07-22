@@ -498,6 +498,7 @@ pub const FuncBuilder = struct {
     /// used by inline-overload receiver narrowing.
     local_decl_types: std.StringHashMap([]const u8),
     local_decl_nullable: std.StringHashMap(void),
+    local_call_returns: std.StringHashMap(ir.EagerTypeHead),
     local_decl_recv_fn: std.StringHashMap(void),
     /// Recorded initializer expression per un-annotated local, so the
     /// narrowing can infer a type from the init call's return type. The
@@ -716,6 +717,7 @@ pub const FuncBuilder = struct {
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap([]const u8).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
+            .local_call_returns = std.StringHashMap(ir.EagerTypeHead).init(allocator),
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
@@ -799,6 +801,7 @@ pub const FuncBuilder = struct {
         }
         self.local_decl_types.deinit();
         self.local_decl_nullable.deinit();
+        self.local_call_returns.deinit();
         self.local_decl_recv_fn.deinit();
         self.local_init_exprs.deinit();
         self.local_ext_fns.deinit();
@@ -1407,13 +1410,25 @@ pub const FuncBuilder = struct {
         errdefer nullable.deinit();
         var null_it = self.local_decl_nullable.keyIterator();
         while (null_it.next()) |name| try nullable.put(name.*, {});
-        return .{ .types = types, .nullable = nullable };
+        var call_returns = std.StringHashMap(ir.EagerTypeHead).init(self.allocator);
+        errdefer call_returns.deinit();
+        var return_it = self.local_call_returns.iterator();
+        while (return_it.next()) |entry| try call_returns.put(entry.key_ptr.*, entry.value_ptr.*);
+        return .{ .types = types, .nullable = nullable, .call_returns = call_returns };
     }
     pub fn inheritLocalDeclTypes(self: *FuncBuilder, inherited: *const ir.PendingLocalDeclTypes) Allocator.Error!void {
         var type_it = inherited.types.iterator();
         while (type_it.next()) |entry| try self.local_decl_types.put(entry.key_ptr.*, entry.value_ptr.*);
         var null_it = inherited.nullable.keyIterator();
         while (null_it.next()) |name| try self.local_decl_nullable.put(name.*, {});
+        var return_it = inherited.call_returns.iterator();
+        while (return_it.next()) |entry| try self.local_call_returns.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    pub fn setLocalCallReturn(self: *FuncBuilder, name: []const u8, ty: []const u8, nullable: bool) Allocator.Error!void {
+        try self.local_call_returns.put(name, .{ .name = ty, .nullable = nullable });
+    }
+    pub fn localCallReturn(self: *const FuncBuilder, name: []const u8) ?ir.EagerTypeHead {
+        return self.local_call_returns.get(name);
     }
     /// Record that the local's declared type is a RECEIVER function type
     /// (`suspend Scope.() -> Unit`), so a bare invocation binds the
@@ -2286,6 +2301,7 @@ test "captured local type metadata transfers to a lambda builder" {
     defer {
         snapshot.types.deinit();
         snapshot.nullable.deinit();
+        snapshot.call_returns.deinit();
     }
 
     var inner = try FuncBuilder.init(testing.allocator, &m);

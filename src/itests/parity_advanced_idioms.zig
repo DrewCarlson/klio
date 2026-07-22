@@ -73,6 +73,24 @@ test "result equality dispatches payload equals" {
     try assertKlio("result_payload_equality", src, "true,false,true,false\n");
 }
 
+test "overload delegation uses callable parameter return type" {
+    const src =
+        \\
+        \\class Marker
+        \\inline fun verify(message: String? = null, block: () -> Boolean): Boolean =
+        \\    verify(block(), message)
+        \\fun verify(actual: Boolean, message: String? = null): Boolean = actual
+        \\fun consume(value: Any?, action: (Any?) -> Unit) = action(value)
+        \\fun main() {
+        \\    consume(Marker()) {
+        \\        println(verify { it is Marker })
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("callable_return_overload", src, "true\n");
+}
+
 test "lateinit_var_with_is_initialized" {
     const alt =
         \\

@@ -1132,6 +1132,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         if (p.ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (p.ty.function) |ft| {
             if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);
+            try b.setLocalCallReturn(p.name.name, ft.ret.name.name, ft.ret.nullable);
         }
     }
     // Labeled-receiver alias: `this@<fn>` names this function's receiver. A
