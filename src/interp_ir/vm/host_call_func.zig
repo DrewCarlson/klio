@@ -897,12 +897,12 @@ fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8)
 
 /// Per-candidate `SigView` for the shared applicability scorer, read straight
 /// off the `Func` (the same sources the legacy `overloadScore` reads).
-fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId) ?applicability.SigView {
+fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId, argc: usize) ?applicability.SigView {
     const f = funcAt(module, cand) orelse return null;
     return .{
         .params = f.params,
         .defaults = funcDefaults(self, cand),
-        .has_body = f.hasBody(),
+        .has_body = executableForm(self, module, cand, argc),
         .low_priority = f.low_priority,
     };
 }
@@ -911,7 +911,7 @@ fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId) ?applicabil
 /// null when it does not bind. The `-1` under-application penalty is folded into
 /// `points` by `applicable()`, so the caller keys directly on the result.
 fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
-    const sig = sigViewOfFunc(self, module, cand) orelse return null;
+    const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
     const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
     return sc.points;
 }
@@ -2225,10 +2225,13 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // positional namesake and silently defaults the mismatched parameter
     // (`ParagraphIntrinsics(annotations = …)` picked the deprecated
     // `spanStyles` overload and dropped the annotations).
-    if (args.len > 24) return .{ .ok = null };
     var any_named = false;
     var shapes_buf: [24]applicability.ArgShape = undefined;
-    const shapes = shapes_buf[0..args.len];
+    const shapes = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else
+        try allocator.alloc(applicability.ArgShape, args.len);
+    defer if (args.len > shapes_buf.len) allocator.free(shapes);
     for (args, 0..) |*a, i| {
         shapes[i] = shapeOfValue(self, a);
         shapes[i].named = if (i < arg_names.len) arg_names[i] else null;

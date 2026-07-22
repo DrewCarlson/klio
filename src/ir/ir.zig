@@ -1450,6 +1450,10 @@ pub const Module = struct {
         is_suspend: bool = false,
         /// The declaration carries a source body.
         has_body: bool = false,
+        /// The declaration has an exact fully-qualified host binding. A
+        /// bodyless declaration with this bit uses the ordinary FuncId call
+        /// ABI; link finalization attaches the host function to that identity.
+        host_backed: bool = false,
     };
 
     pub const MemberDispatch = enum {
@@ -3052,8 +3056,11 @@ pub const Module = struct {
     /// (`paramHasDefault`'s null-`defaults` fallback).
     fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
-        const declared_body = if (self.decl_sigs.get(id.int())) |ds| ds.has_body else false;
-        if (!f.hasBody() and !declared_body) return null;
+        const declared_executable = if (self.decl_sigs.get(id.int())) |ds|
+            ds.has_body or ds.host_backed
+        else
+            false;
+        if (!f.hasBody() and !declared_executable) return null;
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
         return .{
             .params = f.params[off..],
@@ -4038,7 +4045,7 @@ pub const Module = struct {
     /// is their positive complement for the no-exact-fit fallback.
     fn varargArityFits(self: *const Module, id: FuncId, want: usize) bool {
         if (self.decl_sigs.get(id.int())) |ds| {
-            if (!ds.has_body) return false;
+            if (!ds.has_body and !ds.host_backed) return false;
             if (!ds.arity.has_vararg) return false;
             return want >= ds.arity.required;
         }
@@ -4293,7 +4300,9 @@ pub const Module = struct {
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
         var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file, ctx.owner_class, ctx.receiver_known);
-        if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
+        if (heur == null and ctx.cast_pick == null and
+            (!isAliasName(name) or self.hasHostBackedCandidate(name)))
+        {
             heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args, ctx.owner_class, ctx.receiver_known);
         }
         // Prefer the same-name extension overload whose declared receiver
@@ -4381,9 +4390,51 @@ pub const Module = struct {
                 (if (heur) |h| t.int() == h.int() else false)
             else
                 false;
-            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args) or recv_final;
+            if (res.target) |t| {
+                res.ty_proven = self.tyProvenPick(t, args) or recv_final or
+                    self.uniqueHostBackedPick(t, name, caller_pkg, caller_file, args);
+            }
         }
         return res;
+    }
+
+    fn hasHostBackedCandidate(self: *const Module, name: []const u8) bool {
+        for (self.funcsBySimpleName(name)) |id| {
+            if (self.decl_sigs.get(id.int())) |ds| {
+                if (ds.host_backed) return true;
+            }
+        }
+        return false;
+    }
+
+    /// A unique applicable host declaration is overload-final at lowering.
+    /// This makes the exact FuncId call skip the VM's value-typed overload
+    /// retry while preserving that retry for source families whose static
+    /// evidence is still incomplete.
+    fn uniqueHostBackedPick(
+        self: *const Module,
+        target: FuncId,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+    ) bool {
+        const target_sig = self.decl_sigs.get(target.int()) orelse return false;
+        if (!target_sig.host_backed) return false;
+        const target_func = self.funcById(target) orelse return false;
+        const tier = self.bareCallTier(target_func, name, caller_pkg, caller_file);
+        var applicable_count: usize = 0;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            const ds = self.decl_sigs.get(id.int()) orelse continue;
+            if (!ds.host_backed or ds.kind != .plain) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) != tier) continue;
+            const sv = self.sigViewForApplicability(id) orelse continue;
+            if (applicability.applicable(&sv, args, .{}) == null) continue;
+            applicable_count += 1;
+            if (applicable_count > 1) return false;
+        }
+        return applicable_count == 1;
     }
 
     /// Whether every positional argument carries declared-type evidence whose
@@ -6377,6 +6428,54 @@ test "resolveCall: an exact non-extension resolves to a static Call" {
     try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
     try testing.expectEqual(Module.Confidence.exact, res.confidence);
     try testing.expectEqual(g.int(), res.target.?.int());
+}
+
+test "resolveCall binds bodyless host declarations by FuncId" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const println = try pushTestFuncOpts(&m, a, "println", "kotlin.io.println", "kotlin.io", 1, .{ .stub = true });
+    try m.decl_user_arity.put(println.int(), .{ .required = 1, .total = 1, .has_vararg = false });
+    try putTestDeclSig(&m, a, println, "Any", 1);
+    try m.decl_sigs.put(println.int(), .{
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = m.decl_user_sig.get(println.int()).?,
+        .host_backed = true,
+    });
+
+    const ints = try pushTestFuncOpts(&m, a, "intArrayOf", "kotlin.intArrayOf", "kotlin", 1, .{
+        .stub = true,
+        .last_vararg = true,
+    });
+    try m.decl_user_arity.put(ints.int(), .{ .required = 0, .total = 1, .has_vararg = true });
+    try putTestDeclSig(&m, a, ints, "Int", 1);
+    try m.decl_sigs.put(ints.int(), .{
+        .arity = .{ .required = 0, .total = 1, .has_vararg = true },
+        .sig = m.decl_user_sig.get(ints.int()).?,
+        .host_backed = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const println_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+    }};
+    const print_res = try m.resolveCall(a, "println", "app", FileId.from(0), &println_args, false, .{});
+    defer a.free(print_res.candidate_set);
+    try testing.expectEqual(println.int(), print_res.target.?.int());
+    try testing.expectEqual(Module.EmitForm.Call, print_res.emit_form);
+    try testing.expect(print_res.ty_proven);
+
+    const int_args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    const ints_res = try m.resolveCall(a, "intArrayOf", "app", FileId.from(0), &int_args, false, .{});
+    defer a.free(ints_res.candidate_set);
+    try testing.expectEqual(ints.int(), ints_res.target.?.int());
+    try testing.expectEqual(Module.EmitForm.Call, ints_res.emit_form);
+    try testing.expect(ints_res.ty_proven);
 }
 
 test "resolveCall: a resolved extension in a receiver context defers to CallMemberOrGlobal" {

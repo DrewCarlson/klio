@@ -220,6 +220,21 @@ while `kotlin` declarations need P10's host ABI manifest; neither category may
 be emitted as an ordinary direct call. The 117-file stdlib sweep is unchanged
 in both eager modes, including the single existing ULong range-sort failure.
 
+The first host-ABI slice is also live for receiverless declarations. A retained
+bodyless header now records `DeclSig.host_backed` only when its lowered FQN has
+an exact registry entry. It remains an ordinary declaration for scope and
+overload resolution, lowers to `Call(FuncId)`, survives image serialization,
+and link finalization attaches the host function to that identity. A unique
+applicable host overload is marked exact so the VM does not repeat overload
+selection. Receiver-formed expects remain deferred: their package-level source
+FQN and receiver-qualified host ABI are not interchangeable, and that mapping
+must be represented explicitly before those headers can safely participate.
+Runtime applicability consults that link-settled executable form, and its
+argument-shape storage grows past the stack fast path instead of reopening an
+unbounded name lookup for large calls. The embedded source set now includes
+`unsigned/src/kotlin/UMath.kt`, so the bounded `kotlin.math.min`/`max` families
+contain their real UInt and ULong overloads.
+
 The concrete correctness canary for item 1 is a class containing two private
 same-name, same-arity overloads (`pick(Int)` and `pick(String)`). Today the
 declaration-order map keeps one `FuncId`, so both calls can reach that sibling. The
@@ -245,12 +260,15 @@ fix is the complete owner-scoped overload index, not another arity/name exceptio
       `emptyList`/`emptySet`/`emptyMap` drops) are deleted; the declarations lower
       like any other source and `linkResolvedForms` binds them `resolved_native` —
       the mechanism that already works for `require`/`minOf`-with-source.
-      `expect` drops remain only where an `actual` replaces the declaration (the
-      remaining expect-with-impl drops are step 2's manifest territory:
-      `nativeIndexOf` et al). First unlocked hatch deletions shipped with it:
+      `expect` drops remain where an `actual` replaces the declaration and for
+      receiver-formed host declarations whose ABI identity is not represented
+      yet (`nativeIndexOf` et al). Receiverless exact-FQN host expects now retain
+      their header and carry `DeclSig.host_backed`; this is the first manifest
+      slice. First unlocked hatch deletions shipped with it:
       `inline_state.isDroppedStdlibFactory` (its premise — no lowered `FuncId` —
-      is now false) and both factory name-list helpers. Verified: full dual gate
-      green, inventory unchanged at 117, eager ON/OFF byte-identical.
+      is now false) and both factory name-list helpers. Verified: the full dual
+      gate is at the existing baseline, inventory unchanged at 117, and eager
+      ON/OFF results are identical.
 
       *Step-2, first slice — LANDED (2026-07-04): headers stay bodyless.*
       Phase 2 of the module build SKIPS body-null functions (`f.body ==

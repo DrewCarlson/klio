@@ -64,7 +64,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 26;
+pub const FORMAT_VERSION: u32 = 27;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -666,6 +666,7 @@ pub const DeclSigLite = struct {
     is_inline: bool,
     is_suspend: bool,
     has_body: bool,
+    host_backed: bool,
 };
 
 /// Build-time `Value` reachable from an enum entry or a primitive-zero
@@ -1274,6 +1275,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
                 .is_inline = ds.is_inline,
                 .is_suspend = ds.is_suspend,
                 .has_body = ds.has_body,
+                .host_backed = ds.host_backed,
             });
         }
         out.decl_sigs = try lites.toOwnedSlice(a);
@@ -2048,6 +2050,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             .is_inline = l.is_inline,
             .is_suspend = l.is_suspend,
             .has_body = l.has_body,
+            .host_backed = l.host_backed,
         });
     }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
