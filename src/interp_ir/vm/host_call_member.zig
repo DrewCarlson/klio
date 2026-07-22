@@ -7788,6 +7788,12 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
+    const chain_seed: []const ir.eval.EnclosingEntry = blk: {
+        if (capture_src.* != .Instance) break :blk &.{};
+        const g = capture_src.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().anon_enclosing;
+    };
     const caps: []const NameValue = if (inst_caps.len != 0) @ptrCast(inst_caps) else hit.captures;
 
     // Layer captured outer-env names onto globals + build the capture vec.
@@ -7827,7 +7833,7 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (runtime.freeScratch()) allocator.free(packed_args);
     _ = &packed_list;
     vmhost.emitPath(allocator, "member_anon", f.fqn, f.id, receiver, args);
-    return ir.eval.evalWithCapturesIn(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, self);
+    return ir.eval.evalWithCapturesChained(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, chain_seed, null, self);
 }
 
 /// Build the `n_params`-length argument vector, filling positions past

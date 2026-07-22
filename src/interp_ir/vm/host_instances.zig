@@ -4178,6 +4178,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // at function exit; the values live on in `anon_caps`.
     const anon_caps = try allocator.alloc(InstanceData.Capture, capture_pairs.len);
     for (capture_pairs, 0..) |p, i| anon_caps[i] = .{ .name = p.name, .value = p.value };
+    const anon_enclosing = try ir.eval.captureChainAlloc(allocator);
+    if (runtime.reclaimEnabled()) {
+        for (anon_enclosing) |e| e.v.retain();
+    }
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def,
         .fields = fields,
@@ -4185,6 +4189,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         .identity = identity,
         .native_state = null,
         .anon_captures = anon_caps,
+        .anon_enclosing = anon_enclosing,
     });
     const inst_value: Value = .{ .Instance = inst.clone() };
 

@@ -335,6 +335,32 @@ test "anon_object_evaluates_transitive_parent_ctor_args" {
     );
 }
 
+// An anonymous method retains every implicit receiver visible at the object
+// expression, including an outer class receiver displaced by a receiver
+// lambda's subject.
+test "anon_object_method_retains_lexical_receiver_chain" {
+    const src =
+        \\
+        \\open class Action { open fun fire() {} }
+        \\class Scope
+        \\class Owner(private val prefix: String) {
+        \\    private fun emit(value: String) { println(prefix + value) }
+        \\    fun make(): Action = Scope().run {
+        \\        object : Action() {
+        \\            override fun fire() { emit("ready") }
+        \\        }
+        \\    }
+        \\}
+        \\fun main() { Owner("outer ").make().fire() }
+        \\
+    ;
+    try assertKlio(
+        "anon_lexical_receiver_chain",
+        src,
+        "outer ready\n",
+    );
+}
+
 // kotlinc-native: a throw inside an object initializer surfaces at the
 // access site as FileFailedToInitializeException with the user exception
 // as its cause; a second access throws the same wrapper without the cause

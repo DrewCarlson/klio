@@ -162,16 +162,7 @@ threadlocal var eval_depth_cap: usize = 0;
 /// member-extension visibility filter consults it); it is never part of
 /// any frame's lexical receiver scope, so it neither transfers into a
 /// callee frame nor survives into a closure's creation-chain snapshot.
-pub const EnclosingEntry = struct {
-    v: Value,
-    kind: Kind = .receiver,
-
-    pub const Kind = enum { receiver, subject, access };
-
-    pub fn isSubject(self: EnclosingEntry) bool {
-        return self.kind == .subject;
-    }
-};
+pub const EnclosingEntry = runtime.ImplicitReceiver;
 
 /// The enclosing-`this` chain of the *currently executing* frame.
 ///
