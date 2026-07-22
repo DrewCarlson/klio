@@ -12,6 +12,20 @@ the internal-invariant `Check failed` tests become reachable).
 Directed by the user (2026-07-15): the faithful path over the pragmatic
 reimplementation.
 
+## Status (2026-07-22)
+
+- Bodyless `@Composable` declarations now receive the same
+  `$composer`/`$changed` ABI as concrete bodies while remaining bodyless.
+  Abstract and `expect` headers therefore agree with their overrides and
+  `actual`s during resolution, slot linking, named binding, and pack loading;
+  the synthetic composer arguments can no longer be discarded against the
+  shorter declaration header and padded as `kotlin.Nothing` at entry.
+- The focused lowering test covers a bodyless `@ReadOnlyComposable expect`
+  declaration. End-to-end checks cover top-level, member, interface-dispatched,
+  property-getter, and expect/actual read-only calls through a CompositionLocal.
+  A freshly serialized runtime-engine pack runs `compose_locals.kt` and
+  `compose_counter.kt` successfully.
+
 ## Current state (being replaced)
 
 - klio ships a **klio-authored** composer in `klioMain/` (KlioComposer,

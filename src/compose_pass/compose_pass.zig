@@ -946,7 +946,6 @@ fn transformDecl(
 ) std.mem.Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| {
-            if (f.body == null) return;
             if (isComposable(f.annotations)) {
                 if (isRestartableComposable(f)) {
                     f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks, in_class, null, enclosing_class);
@@ -954,6 +953,7 @@ fn transformDecl(
                     f.* = try transformThreadedComposable(a, f, NameSetOracle.isComposableCall, oracle, sinks, null);
                 }
             } else {
+                if (f.body == null) return;
                 // Not composable: still walk the body so a `compose { … }` /
                 // `setContent { … }` composable-lambda argument is transformed.
                 const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
@@ -2732,7 +2732,9 @@ fn trailingLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
 }
 
 fn signatureOnly(f: *const Function, params: []Param) Function {
-    return withBody(f, params, f.body orelse .{ .Block = .{ .stmts = &.{}, .span = f.span } });
+    var out = f.*;
+    out.params = params;
+    return out;
 }
 
 /// A copy of `f` with new params + body; all other fields preserved. Clears
@@ -2885,6 +2887,42 @@ test "isComposable detects the annotation" {
     const pf = emptyFn("plain", &noargs, null, false);
     try testing.expect(isComposable(cf.annotations));
     try testing.expect(!isComposable(pf.annotations));
+}
+
+test "bodyless composable declarations keep their header and gain the threaded ABI" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var readonly_path = [_]Ident{dummyIdent("ReadOnlyComposable")};
+    var annotations = [_]ast.Annotation{
+        composableAnno[0],
+        .{
+            .use_site = null,
+            .path = &readonly_path,
+            .type_args = &.{},
+            .args = &.{},
+            .arg_names = &.{},
+            .span = Span.init(span_mod.FileId.from(0), 0, 0),
+        },
+    };
+    var f = emptyFn("readValue", &.{}, null, false);
+    f.annotations = &annotations;
+    f.is_expect = true;
+    var decls = [_]Decl{.{ .Function = f }};
+
+    var names = try collectComposableNames(a, &decls);
+    defer names.deinit();
+    var sinks = std.StringHashMap(void).init(a);
+    defer sinks.deinit();
+    try transformDecls(a, &decls, &names, &sinks);
+
+    const out = decls[0].Function;
+    try testing.expect(out.body == null);
+    try testing.expect(out.is_expect);
+    try testing.expectEqual(@as(usize, 2), out.params.len);
+    try testing.expectEqualStrings(composer_param, out.params[0].name.name);
+    try testing.expectEqualStrings(changed_param, out.params[1].name.name);
 }
 
 fn noComposable(_: *anyopaque, _: []const u8) bool {
