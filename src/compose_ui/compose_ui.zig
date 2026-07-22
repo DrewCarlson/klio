@@ -69,6 +69,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_touchX", touchX);
     try b.register("androidx.compose.ui.window.__composeui_touchY", touchY);
     try b.register("androidx.compose.ui.window.__composeui_touchDown", touchDown);
+    try b.register("androidx.compose.ui.window.__composeui_touchScrollX", touchScrollX);
+    try b.register("androidx.compose.ui.window.__composeui_touchScrollY", touchScrollY);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -897,10 +899,11 @@ pub export fn klio_frame_active() c_int {
 }
 
 /// One pointer in the current multi-touch snapshot: a stable per-finger `id`,
-/// its position in surface points, and whether it is currently down. Compose
-/// wants ALL active pointers in one event and diffs snapshots, so the app hands
-/// the whole set each event and the Kotlin callback reads it back by index.
-const TouchPoint = struct { id: c_int, x: c_int, y: c_int, down: bool };
+/// its position in surface points, whether it is currently down, and any scroll
+/// delta (nonzero only for a Scroll event from a wheel / trackpad). Compose wants
+/// ALL active pointers in one event and diffs snapshots, so the app hands the
+/// whole set each event and the Kotlin callback reads it back by index.
+const TouchPoint = struct { id: c_int, x: c_int, y: c_int, down: bool, sdx: c_int = 0, sdy: c_int = 0 };
 var touch_points: [16]TouchPoint = undefined;
 var touch_count: usize = 0;
 
@@ -932,6 +935,18 @@ pub export fn klio_dispatch_touches(
     runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, phase);
 }
 
+/// Route a discrete scroll (wheel / trackpad) into the resident VM as a single
+/// unpressed pointer carrying a scroll delta, dispatched with phase 4 (Scroll).
+/// `x`/`y` are the pointer position in surface points; `dx`/`dy` the scroll
+/// amount. Touch-drag scrolling needs none of this — it falls out of the normal
+/// pointer stream; this is only for indirect scroll devices.
+pub export fn klio_dispatch_scroll(x: c_int, y: c_int, dx: c_int, dy: c_int) void {
+    if (!input_cb.set) return;
+    touch_count = 1;
+    touch_points[0] = .{ .id = 0, .x = x, .y = y, .down = false, .sdx = dx, .sdy = dy };
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, 4);
+}
+
 fn touchIndex(ctx: *CallCtx) ?usize {
     if (ctx.args.len < 1) return null;
     const i: i64 = ctx.args[0].asI64() orelse return null;
@@ -960,6 +975,14 @@ fn touchY(ctx: *CallCtx) Error!EvalResult {
 fn touchDown(ctx: *CallCtx) Error!EvalResult {
     const i = touchIndex(ctx) orelse return ok(Value{ .Bool = false });
     return ok(Value{ .Bool = touch_points[i].down });
+}
+fn touchScrollX(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].sdx));
+}
+fn touchScrollY(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].sdy));
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
@@ -1508,7 +1531,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 71), b.len());
+    try testing.expectEqual(@as(usize, 73), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

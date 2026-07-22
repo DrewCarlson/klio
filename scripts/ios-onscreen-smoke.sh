@@ -95,11 +95,12 @@ grep -Eq "frames=[0-9]+" "$LOG" || fail "no frame heartbeat — the resident VM 
 FRAMES="$(grep -oE 'frames=[0-9]+' "$LOG" | tail -1)"
 FRAME_N="${FRAMES#frames=}"
 
-# Touch: the self-test injected a tap at frame 120. It must have logged, and the
-# app must have kept rendering past it (a crash in touch dispatch would freeze
-# the frame heartbeat at ~120).
+# Input: the self-test injected a scroll (frame 120) then a 2-finger touch (frame
+# 180). Both must have logged, and the app must have kept rendering past them (a
+# crash in input dispatch would freeze the frame heartbeat near the injection).
+grep -Fq "selftest scroll" "$LOG" || fail "scroll self-test did not fire — see $LOG"
 grep -Fq "selftest touch" "$LOG" || fail "touch self-test did not fire — see $LOG"
-[ "${FRAME_N:-0}" -gt 120 ] || fail "frame loop stopped at/near the injected touch ($FRAMES) — touch dispatch likely crashed (see $LOG)"
+[ "${FRAME_N:-0}" -gt 180 ] || fail "frame loop stopped near an injected input event ($FRAMES) — input dispatch likely crashed (see $LOG)"
 
 SHOT_OK="no"
 if [ -f "$OUT/screen.png" ]; then

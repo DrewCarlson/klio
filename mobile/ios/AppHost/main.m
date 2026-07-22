@@ -22,6 +22,7 @@ extern void klio_render_frame(void);
 extern int klio_frame_active(void);
 extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
                                   const int *ys, const int *downs, int phase);
+extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
 
 // A UIView whose backing layer is a CAMetalLayer: the resident Compose UI draws
 // into its per-frame drawables through the statically-linked Skia Ganesh-Metal
@@ -61,6 +62,7 @@ extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
 @property (strong, nonatomic) KlioMetalView *metalView;
 @property (strong, nonatomic) CADisplayLink *displayLink;
 @property (assign, nonatomic) unsigned long frameCount;
+@property (assign, nonatomic) CGPoint lastScroll;
 @end
 
 @implementation KlioAppDelegate
@@ -74,19 +76,37 @@ extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
     if (self.frameCount % 60 == 0) {
         NSLog(@"[klio-host] frames=%lu", self.frameCount);
     }
-    // Headless touch self-test (KLIO_TOUCH_SELFTEST): the simulator has no tap
-    // injection, so once the UI is running, synthesize two simultaneous pressed
-    // pointers. A touch-reactive scene draws one circle per finger, proving the
-    // whole multi-touch path: UITouch snapshot -> klio_dispatch_touches ->
-    // resident VM -> pointer processor.
-    if (self.frameCount == 120 && getenv("KLIO_TOUCH_SELFTEST")) {
-        int ids[2] = {101, 202};
-        int xs[2] = {120, 280};
-        int ys[2] = {500, 720};
-        int downs[2] = {1, 1};
-        NSLog(@"[klio-host] selftest touch: 2 pointers");
-        klio_dispatch_touches(2, ids, xs, ys, downs, 0);  // both down
+    // Headless input self-test (KLIO_TOUCH_SELFTEST): the simulator has no tap
+    // injection, so synthesize input once the UI is running. A scroll slides the
+    // scene's bar; two simultaneous pressed pointers draw a circle each — proving
+    // the scroll + multi-touch paths end to end (event -> resident VM -> pointer
+    // processor).
+    if (getenv("KLIO_TOUCH_SELFTEST")) {
+        if (self.frameCount == 120) {
+            NSLog(@"[klio-host] selftest scroll dy=300");
+            klio_dispatch_scroll(200, 400, 0, 300);
+        }
+        if (self.frameCount == 180) {
+            int ids[2] = {101, 202};
+            int xs[2] = {110, 290};
+            int ys[2] = {680, 680};
+            int downs[2] = {1, 1};
+            NSLog(@"[klio-host] selftest touch: 2 pointers");
+            klio_dispatch_touches(2, ids, xs, ys, downs, 0);
+        }
     }
+}
+
+// Indirect scroll (wheel / trackpad) -> Compose Scroll events. Feed the per-step
+// delta (in points) at the cursor location.
+- (void)onScroll:(UIPanGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) self.lastScroll = CGPointZero;
+    CGPoint t = [g translationInView:self.metalView];
+    CGPoint loc = [g locationInView:self.metalView];
+    int dx = (int)(t.x - self.lastScroll.x);
+    int dy = (int)(t.y - self.lastScroll.y);
+    self.lastScroll = t;
+    if (dx != 0 || dy != 0) klio_dispatch_scroll((int)loc.x, (int)loc.y, dx, dy);
 }
 
 - (BOOL)application:(UIApplication *)application
@@ -112,6 +132,14 @@ extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
         self.metalView.autoresizingMask =
             UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [vc.view addSubview:self.metalView];
+        // Indirect scroll (wheel / trackpad) as Compose Scroll events. A pan
+        // recognizer with 0 touches only fires for indirect scroll, so finger
+        // drags still flow through the touch handlers (direct manipulation).
+        UIPanGestureRecognizer *scrollPan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onScroll:)];
+        scrollPan.allowedScrollTypesMask = UIScrollTypeMaskAll;
+        scrollPan.maximumNumberOfTouches = 0;
+        [self.metalView addGestureRecognizer:scrollPan];
         CAMetalLayer *layer = (CAMetalLayer *)self.metalView.layer;
         layer.contentsScale = scale;
 

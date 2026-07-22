@@ -392,8 +392,10 @@ private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
     val eventType = when (phase) {
         0 -> PointerEventType.Press
         1 -> PointerEventType.Move
+        4 -> PointerEventType.Scroll
         else -> PointerEventType.Release
     }
+    val scroll = phase == 4
     for (holder in scope.windows) {
         if (holder.closed) continue
         holder.uptime += 8
@@ -403,6 +405,9 @@ private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
             val down = __composeui_touchDown(i)
             if (down) anyDown = true
             val position = Offset(__composeui_touchX(i).toFloat(), __composeui_touchY(i).toFloat())
+            val scrollDelta = if (scroll)
+                Offset(__composeui_touchScrollX(i).toFloat(), __composeui_touchScrollY(i).toFloat())
+            else Offset.Zero
             pointers.add(
                 PointerInputEventData(
                     id = PointerId(__composeui_touchId(i).toLong()),
@@ -413,6 +418,7 @@ private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
                     pressure = 1f,
                     type = PointerType.Touch,
                     activeHover = false,
+                    scrollDelta = scrollDelta,
                     scaleGestureFactor = 1f,
                     panGestureOffset = Offset.Zero,
                 ),
@@ -546,6 +552,12 @@ internal fun __composeui_touchY(index: Int): Int =
     error("intrinsic androidx.compose.ui.window.__composeui_touchY not installed")
 internal fun __composeui_touchDown(index: Int): Boolean =
     error("intrinsic androidx.compose.ui.window.__composeui_touchDown not installed")
+
+// The scroll delta (surface points) for a Scroll event (phase 4); 0 otherwise.
+internal fun __composeui_touchScrollX(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchScrollX not installed")
+internal fun __composeui_touchScrollY(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchScrollY not installed")
 
 // The hosted surface's size in points (mobile), or 0 when none is installed. A
 // hosted Window fills these instead of its requested size.

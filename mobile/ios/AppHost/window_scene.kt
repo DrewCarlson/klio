@@ -18,6 +18,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -27,8 +28,11 @@ fun main() {
         // width/height are placeholders: a hosted (mobile) Window fills the
         // device surface, so these matter only on desktop.
         Window(onCloseRequest = ::exitApplication, title = "klio", width = 390, height = 844) {
-            // One circle per active finger — a multi-touch snapshot draws several.
-            var points by remember { mutableStateOf(listOf(Offset(195f, 220f))) }
+            // One circle per active finger (multi-touch); a bar that tracks
+            // accumulated scroll (wheel / trackpad). Both read the raw pointer
+            // stream, so no CompositionLocal-heavy widgets are involved.
+            var points by remember { mutableStateOf(listOf<Offset>()) }
+            var scrollY by remember { mutableStateOf(0f) }
             Box(
                 Modifier.fillMaxSize()
                     .background(Color(0xFF102A44))
@@ -36,13 +40,17 @@ fun main() {
                         awaitPointerEventScope {
                             while (true) {
                                 val e = awaitPointerEvent()
-                                val pressed = e.changes.filter { it.pressed }.map { it.position }
-                                if (pressed.isNotEmpty()) points = pressed
+                                if (e.type == PointerEventType.Scroll) {
+                                    scrollY += e.changes.first().scrollDelta.y
+                                } else {
+                                    points = e.changes.filter { it.pressed }.map { it.position }
+                                }
                             }
                         }
                     }
                     .drawBehind {
-                        drawRect(Color(0xFF1E88E5), topLeft = Offset(48f, 96f), size = Size(size.width - 96f, 160f))
+                        // Scroll indicator: a blue bar that slides with scroll.
+                        drawRect(Color(0xFF1E88E5), topLeft = Offset(40f, 200f + scrollY), size = Size(size.width - 80f, 80f))
                         for (p in points) drawCircle(Color(0xFFFFC107), radius = 90f, center = p)
                     },
             )
