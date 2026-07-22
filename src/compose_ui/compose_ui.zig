@@ -61,6 +61,20 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winClear", winClear);
     try b.register("androidx.compose.ui.window.__composeui_isHosted", isHosted);
     try b.register("androidx.compose.ui.window.__composeui_setFrameCallback", setFrameCallback);
+    try b.register("androidx.compose.ui.window.__composeui_surfaceWidth", surfaceWidth);
+    try b.register("androidx.compose.ui.window.__composeui_surfaceHeight", surfaceHeight);
+    try b.register("androidx.compose.ui.window.__composeui_setInputCallback", setInputCallback);
+    try b.register("androidx.compose.ui.window.__composeui_touchCount", touchCount);
+    try b.register("androidx.compose.ui.window.__composeui_touchId", touchId);
+    try b.register("androidx.compose.ui.window.__composeui_touchX", touchX);
+    try b.register("androidx.compose.ui.window.__composeui_touchY", touchY);
+    try b.register("androidx.compose.ui.window.__composeui_touchDown", touchDown);
+    try b.register("androidx.compose.ui.window.__composeui_touchScrollX", touchScrollX);
+    try b.register("androidx.compose.ui.window.__composeui_touchScrollY", touchScrollY);
+    try b.register("androidx.compose.ui.window.__composeui_showKeyboard", showKeyboard);
+    try b.register("androidx.compose.ui.window.__composeui_hideKeyboard", hideKeyboard);
+    try b.register("androidx.compose.ui.window.__composeui_setTextCallback", setTextCallback);
+    try b.register("androidx.compose.ui.window.__composeui_textInput", textInput);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -278,14 +292,16 @@ fn loadSkia() ?*Skia {
     if (skia_tried) return null;
     skia_tried = true;
 
-    // iOS bans dlopen of a runtime-written dylib, so the shim is linked
-    // statically and resolved from symbols rather than a DynLib — but only when
-    // the app host opts in (it links libklio_skia.a). The plain interpreter exe
-    // does not, so it emits no shim references and renders headless there.
-    if (comptime @import("builtin").os.tag == .ios) {
-        if (comptime use_static_skia) return loadSkiaStatic();
-        return null;
-    }
+    // Mobile app hosts (iOS, Android) link the shim statically and opt in via
+    // `klio_skia_static` — resolve from symbols, not dlopen (iOS bans dlopen of a
+    // runtime-written dylib; the Android host ships no separate .so).
+    if (comptime use_static_skia) return loadSkiaStatic();
+    // A mobile target WITHOUT the static opt-in (the plain interpreter) has no
+    // shim to dlopen, so it renders headless rather than searching for one.
+    const mobile_os = @import("builtin").os.tag == .ios or
+        (@import("builtin").os.tag == .linux and
+            (@import("builtin").abi == .android or @import("builtin").abi == .androideabi));
+    if (comptime mobile_os) return null;
 
     var lib = openSkiaLib() orelse return null;
     const F = struct {
@@ -489,7 +505,41 @@ fn openSkiaLib() ?std.DynLib {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
     if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
+    // The install layout puts the shim in `lib/` next to the binary's `bin/`;
+    // resolve it relative to the executable so a plain `zig-out/bin/klio`
+    // renders without loader-path setup.
+    const exe_dir = selfExeDir() orelse return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "../lib", "." }) |rel| {
+        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ exe_dir, rel, skia_lib_name }) catch continue;
+        if (std.DynLib.open(p)) |l| return l else |_| {}
+    }
     return null;
+}
+
+var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+/// The directory holding the running executable (no trailing slash), or null
+/// where the platform offers no way to ask.
+fn selfExeDir() ?[]const u8 {
+    const os = @import("builtin").os.tag;
+    var len: usize = 0;
+    switch (os) {
+        .linux => {
+            const n = std.os.linux.readlink("/proc/self/exe", &self_exe_buf, self_exe_buf.len - 1);
+            if (@as(isize, @bitCast(n)) <= 0) return null;
+            len = n;
+        },
+        .macos => {
+            var l: u32 = self_exe_buf.len;
+            if (std.c._NSGetExecutablePath(&self_exe_buf, &l) != 0) return null;
+            len = std.mem.len(@as([*:0]const u8, @ptrCast(&self_exe_buf)));
+        },
+        else => return null,
+    }
+    const path = self_exe_buf[0..len];
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+    return path[0..slash];
 }
 
 fn parseU32Hex(s: []const u8) u32 {
@@ -811,6 +861,11 @@ const FrameCb = struct {
 };
 var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 
+/// The resident input callback: the Kotlin lambda that routes a platform touch
+/// (iOS UITouch) into the live windows' pointer processors. Same residency
+/// contract as `frame_cb` — persisted so it outlives the run that registered it.
+var input_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+
 /// `__composeui_isHosted(): Boolean` — true when the platform owns the frame loop
 /// (an app surface has been installed). `application` then registers a frame
 /// callback and returns instead of running its own loop.
@@ -819,22 +874,252 @@ fn isHosted(ctx: *CallCtx) Error!EvalResult {
     return ok(Value{ .Bool = surface_layer != null });
 }
 
+/// `__composeui_surfaceWidth(): Int` / `__composeui_surfaceHeight(): Int` — the
+/// hosted surface's size in points (the OS owns the geometry on mobile). A
+/// hosted `Window` sizes itself to these so its Metal drawable matches the view;
+/// `0` when no surface is installed.
+fn surfaceWidth(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(surface_w));
+}
+fn surfaceHeight(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(surface_h));
+}
+
 /// `__composeui_setFrameCallback(cb: () -> Boolean): Long` — store the render
-/// callback the platform frame source invokes each frame.
+/// callback the platform frame source invokes each frame. The host handed to a
+/// native intrinsic is transient (it dies when `main`'s activation returns), so
+/// `persist()` it into a resident copy the frame loop can re-enter later. The
+/// callback lambda and its captured composition live on the run's process-
+/// lifetime arena, so storing the `Value` by itself is safe across frames.
 fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 1) return ok(Value.newLong(0));
-    frame_cb = .{ .host = ctx.host, .callback = ctx.args[0], .out = ctx.out, .set = true };
+    frame_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
     return ok(Value.newLong(1));
+}
+
+/// `__composeui_setInputCallback(cb: (x: Int, y: Int, phase: Int) -> Unit): Long`
+/// — store the callback the platform input source invokes on each touch. Same
+/// persisted-host residency contract as `setFrameCallback`.
+fn setInputCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    input_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
+/// True once `application` has registered a hosted frame callback: the run must
+/// stay resident (its VM, arena, and reclaim mode are kept alive) so the
+/// platform frame source can re-enter each vsync.
+pub fn hostedActive() bool {
+    return frame_cb.set;
+}
+
+/// Whether the resident VM still needs a frame: the last `frameHosted` reported
+/// pending work (a recomposition, running effect, or dirty window), or an input
+/// event has arrived since. The app shell's frame source reads this and skips
+/// re-entering the VM when clean — a static scene between changes then costs no
+/// per-vsync interpreter re-entry. Starts true (the first frame must render).
+var frame_needs_render: bool = true;
+
+fn renderFrameBody(_: void) void {
+    var args = [_]Value{};
+    const res = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {
+        frame_needs_render = true; // errored: render again rather than stall
+        return;
+    };
+    // `frameHosted` returns whether the VM still has pending work; when false the
+    // shell may skip the next re-entry until input or a periodic pump.
+    frame_needs_render = switch (res) {
+        .ok => |v| v == .Bool and v.Bool,
+        .err => true,
+    };
 }
 
 /// Render one frame: invoke the resident Kotlin render callback. Called by the
 /// app shell's frame source (iOS CADisplayLink) on the main thread — the same
-/// thread the resident VM ran main on, so it is a plain same-thread re-entry
-/// (the resizeTrampoline mechanism).
+/// thread the resident VM ran main on, so it is a plain same-thread re-entry.
+/// The platform callback arrives on the UI thread's small stack, so the frame
+/// body runs on the persistent interpreter stack (a deep composition would
+/// otherwise overflow).
 pub export fn klio_render_frame() void {
     if (!frame_cb.set) return;
-    var args = [_]Value{};
-    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
+    runtime.runOnPersistentBigStack(void, void, renderFrameBody, {});
+}
+
+/// C query for the app shell: nonzero when the resident VM needs the next frame
+/// rendered (pending compose work or fresh input). The shell skips the (costly)
+/// `klio_render_frame` re-entry while this is zero — see `frame_needs_render`.
+pub export fn klio_frame_needs_render() c_int {
+    return if (frame_needs_render) 1 else 0;
+}
+
+/// Force the next frame to render (input dispatch marks the VM dirty this way).
+fn markFrameDirty() void {
+    frame_needs_render = true;
+}
+
+/// C query for the app shell: nonzero once the program registered a hosted frame
+/// callback (a Compose UI opened). The shell starts its frame source (iOS
+/// CADisplayLink) only then; a non-UI program leaves it zero and the shell exits.
+pub export fn klio_frame_active() c_int {
+    return if (frame_cb.set) 1 else 0;
+}
+
+/// One pointer in the current multi-touch snapshot: a stable per-finger `id`,
+/// its position in surface points, whether it is currently down, and any scroll
+/// delta (nonzero only for a Scroll event from a wheel / trackpad). Compose wants
+/// ALL active pointers in one event and diffs snapshots, so the app hands the
+/// whole set each event and the Kotlin callback reads it back by index.
+const TouchPoint = struct { id: c_int, x: c_int, y: c_int, down: bool, sdx: c_int = 0, sdy: c_int = 0 };
+var touch_points: [16]TouchPoint = undefined;
+var touch_count: usize = 0;
+
+fn dispatchTouchBody(phase: c_int) void {
+    var args = [_]Value{Value.newInt(phase)};
+    _ = input_cb.host.invokeCallable(&input_cb.callback, &args, input_cb.out) catch {};
+}
+
+/// Route a multi-touch snapshot into the resident VM's input callback. `ids` are
+/// stable per finger across its lifecycle; `xs`/`ys` are in surface points;
+/// `downs[i] != 0` means that pointer is pressed. `phase` is the primary event
+/// type (0=down, 1=move, 2=up, 3=cancel). Called by the app shell on the main
+/// thread — same-thread re-entry, so it runs on the persistent interpreter stack
+/// like the frame callback (touch and frame never overlap: both are serviced
+/// serially by the platform run loop). The callback reads the snapshot back via
+/// `__composeui_touchCount` / `__composeui_touch{Id,X,Y,Down}`.
+pub export fn klio_dispatch_touches(
+    count: c_int,
+    ids: [*]const c_int,
+    xs: [*]const c_int,
+    ys: [*]const c_int,
+    downs: [*]const c_int,
+    phase: c_int,
+) void {
+    if (!input_cb.set) return;
+    const n = @min(@as(usize, @intCast(@max(count, 0))), touch_points.len);
+    touch_count = n;
+    for (0..n) |i| touch_points[i] = .{ .id = ids[i], .x = xs[i], .y = ys[i], .down = downs[i] != 0 };
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, phase);
+    markFrameDirty();
+}
+
+/// Route a discrete scroll (wheel / trackpad) into the resident VM as a single
+/// unpressed pointer carrying a scroll delta, dispatched with phase 4 (Scroll).
+/// `x`/`y` are the pointer position in surface points; `dx`/`dy` the scroll
+/// amount. Touch-drag scrolling needs none of this — it falls out of the normal
+/// pointer stream; this is only for indirect scroll devices.
+pub export fn klio_dispatch_scroll(x: c_int, y: c_int, dx: c_int, dy: c_int) void {
+    if (!input_cb.set) return;
+    touch_count = 1;
+    touch_points[0] = .{ .id = 0, .x = x, .y = y, .down = false, .sdx = dx, .sdy = dy };
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, 4);
+    markFrameDirty();
+}
+
+fn touchIndex(ctx: *CallCtx) ?usize {
+    if (ctx.args.len < 1) return null;
+    const i: i64 = ctx.args[0].asI64() orelse return null;
+    if (i < 0 or @as(usize, @intCast(i)) >= touch_count) return null;
+    return @intCast(i);
+}
+
+/// Snapshot query intrinsics the hosted input callback reads to rebuild the
+/// pointer set: `__composeui_touchCount(): Int` plus per-index accessors.
+fn touchCount(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(@intCast(touch_count)));
+}
+fn touchId(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].id));
+}
+fn touchX(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].x));
+}
+fn touchY(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].y));
+}
+fn touchDown(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value{ .Bool = false });
+    return ok(Value{ .Bool = touch_points[i].down });
+}
+fn touchScrollX(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].sdx));
+}
+fn touchScrollY(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].sdy));
+}
+
+// --- Keyboard / text input --------------------------------------------------
+
+/// Platform keyboard show/hide, provided by the app shell (iOS: become/resign
+/// first responder on a UIKeyInput view). Compose's text-input service calls the
+/// `__composeui_show/hideKeyboard` intrinsics when a text field gains/loses focus.
+const KbFn = *const fn () callconv(.c) void;
+var keyboard_show_fn: ?KbFn = null;
+var keyboard_hide_fn: ?KbFn = null;
+
+pub export fn klio_set_keyboard_handler(show: ?KbFn, hide: ?KbFn) void {
+    keyboard_show_fn = show;
+    keyboard_hide_fn = hide;
+}
+
+fn showKeyboard(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    if (keyboard_show_fn) |f| f();
+    return ok(Value.newLong(1));
+}
+fn hideKeyboard(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    if (keyboard_hide_fn) |f| f();
+    return ok(Value.newLong(1));
+}
+
+/// The resident text-input callback plus the staged text bytes for one event.
+/// Same persisted-host residency contract as `frame_cb` / `input_cb`.
+var text_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+var staged_text: [512]u8 = undefined;
+var staged_text_len: usize = 0;
+
+fn setTextCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    text_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
+fn dispatchTextBody(kind: c_int) void {
+    var args = [_]Value{Value.newInt(kind)};
+    _ = text_cb.host.invokeCallable(&text_cb.callback, &args, text_cb.out) catch {};
+}
+
+/// Commit inserted UTF-8 text (kind 0). The callback reads it via
+/// `__composeui_textInput`. Called by the app shell on the main thread.
+pub export fn klio_dispatch_text(bytes: [*]const u8, len: c_int) void {
+    if (!text_cb.set) return;
+    const n = @min(@as(usize, @intCast(@max(len, 0))), staged_text.len);
+    @memcpy(staged_text[0..n], bytes[0..n]);
+    staged_text_len = n;
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, 0);
+    markFrameDirty();
+}
+
+/// A key edit with no text payload: 1=backspace, 2=ime action (enter/done).
+pub export fn klio_dispatch_key(kind: c_int) void {
+    if (!text_cb.set) return;
+    staged_text_len = 0;
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, kind);
+    markFrameDirty();
+}
+
+/// `__composeui_textInput(): String` — the staged inserted text (kind 0).
+fn textInput(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, staged_text[0..staged_text_len])) });
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
@@ -1236,6 +1521,12 @@ fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
 
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
+        std.debug.print("[draw] rect surf={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} color={x:0>8}\n", .{
+            argInt(ctx.args[0]), argFloat(ctx.args[1]), argFloat(ctx.args[2]),
+            argFloat(ctx.args[3]), argFloat(ctx.args[4]), argU32(ctx.args[5]),
+        });
+    }
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 11) return ok(Value.newLong(0));
     const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
@@ -1383,7 +1674,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 61), b.len());
+    try testing.expectEqual(@as(usize, 77), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

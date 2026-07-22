@@ -505,6 +505,30 @@ fn ivOsThreadAlive(ctx: *anyopaque, id: u64) bool {
 fn ivBuilderStep(ctx: *anyopaque, state: runtime.BuilderStateRef, out: Output) Allocator.Error!runtime.BuilderStepResult {
     return @import("coroutines.zig").builderStep(ip(ctx), state, out);
 }
+fn ivPersist(ctx: *anyopaque) IntrinsicHost {
+    const src = ip(ctx);
+    // Clone the shared handles into an allocator-owned host so it outlives the
+    // `main` activation whose transient host this was. Refcounts hold the
+    // module / globals / closures / object-states alive; the copy is never
+    // released — an OS-driven frame loop owns it until the process exits.
+    const p = src.allocator.create(VmIntrinsicHost) catch return .{ .ctx = src, .vtable = &intrinsic_vtable };
+    p.* = .{
+        .module = src.module.clone(),
+        .closures = src.closures.clone(),
+        .globals = src.globals.clone(),
+        .classes = src.classes.clone(),
+        .prog = src.prog.clone(),
+        .anon_methods = src.anon_methods.clone(),
+        .class_default_outer = src.class_default_outer.clone(),
+        .instance_id_counter = src.instance_id_counter.clone(),
+        .out_sink = src.out_sink.clone(),
+        .threads = src.threads.clone(),
+        .object_states = src.object_states.clone(),
+        .singletons_by_id = src.singletons_by_id.clone(),
+        .allocator = src.allocator,
+    };
+    return .{ .ctx = p, .vtable = &intrinsic_vtable };
+}
 fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
     const self = ip(ctx);
     if (callable.* != .IrClosure) return null;
@@ -549,6 +573,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .os_thread_alive = ivOsThreadAlive,
     .builder_step = ivBuilderStep,
     .callable_return_ty = ivCallableReturnTy,
+    .persist = ivPersist,
 };
 
 const testing = std.testing;

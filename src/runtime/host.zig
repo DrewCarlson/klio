@@ -130,10 +130,24 @@ pub const IntrinsicHost = struct {
         /// an empty-receiver accumulator with the right kind. `null`
         /// slot => default (`null`).
         callable_return_ty: ?*const fn (ctx: *anyopaque, callable: *const Value) ?[]const u8 = null,
+        /// Return a stable `IntrinsicHost` that outlives the current activation.
+        /// A platform-driven frame loop (an OS vsync callback) re-enters the VM
+        /// after `main` has returned, so the transient per-call host it was
+        /// handed is gone; this hands back a resident copy that stays valid for
+        /// the process lifetime. `null` => default (returns `self` unchanged;
+        /// only the VM host builds a resident copy).
+        persist: ?*const fn (ctx: *anyopaque) IntrinsicHost = null,
     };
 
     pub fn invokeCallable(self: IntrinsicHost, callable: *const Value, args: []const Value, out: Output) !EvalResult {
         return self.vtable.invoke_callable(self.ctx, callable, args, out);
+    }
+
+    /// A resident host bound to the same VM state, safe to store and re-enter
+    /// across activations (see `VTable.persist`).
+    pub fn persist(self: IntrinsicHost) IntrinsicHost {
+        if (self.vtable.persist) |f| return f(self.ctx);
+        return self;
     }
 
     pub fn invokeCallableWithThis(self: IntrinsicHost, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) !EvalResult {

@@ -352,6 +352,55 @@ pub fn runOnBigStackMainThread(
     return runner.result;
 }
 
+/// A process-lifetime interpreter stack for an OS-driven frame loop. The
+/// platform re-enters the VM on its own (small) UI-thread stack each vsync;
+/// `runOnPersistentBigStack` switches onto this large stack so a deep
+/// composition recomposes without overflowing that stack. Mapped once on first
+/// use and never unmapped — the frame loop runs until the process exits. Only
+/// the hosted-UI frame callback maps it, so every non-UI run leaves it null.
+var persistent_stack: ?[]align(std.heap.page_size_min) u8 = null;
+
+/// Run `func(ctx)` on the shared persistent interpreter stack, returning its
+/// result. Each call starts at the top of that stack, so this is valid only for
+/// a body that fully returns (one frame): the interpreter's suspension state is
+/// heap-resident, never on the C stack, so nothing must survive across the
+/// switch back. Falls back to an inline call on the current stack if the
+/// mapping fails or the arch is unsupported (same behavior, smaller stack).
+pub fn runOnPersistentBigStack(
+    comptime Ctx: type,
+    comptime Ret: type,
+    comptime func: fn (Ctx) Ret,
+    ctx: Ctx,
+) Ret {
+    if (comptime builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64) {
+        return func(ctx);
+    }
+    const stack = persistent_stack orelse blk: {
+        const s = std.posix.mmap(
+            null,
+            INTERPRET_STACK_SIZE,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return func(ctx);
+        persistent_stack = s;
+        break :blk s;
+    };
+    const Runner = struct {
+        ctx: Ctx,
+        result: Ret = undefined,
+        fn entry(arg: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(arg));
+            self.result = func(self.ctx);
+        }
+    };
+    var runner = Runner{ .ctx = ctx };
+    const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
+    callOnStack(sp_top, Runner.entry, &runner);
+    return runner.result;
+}
+
 /// Write directly to the stderr fd. Used on the abort path, so it must not
 /// allocate (a memory breach has already fired). Linux issues the raw
 /// syscall; other platforms fall back to the buffered file writer.

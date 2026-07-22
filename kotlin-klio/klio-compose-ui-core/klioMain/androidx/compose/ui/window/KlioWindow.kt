@@ -251,17 +251,24 @@ fun ApplicationScope.Window(
 ) {
     val scope = this
     if (scope !is KlioApplicationScope) return
-    val holder = remember { scope.open(title, width, height, content) }
+    // On a hosted (mobile) surface the OS owns the geometry: fill it and ignore
+    // the requested size, so the composition lays out at — and its Metal
+    // drawable matches — the actual view. Desktop keeps the requested size.
+    val sw = __composeui_surfaceWidth()
+    val sh = __composeui_surfaceHeight()
+    val w = if (sw > 0) sw else width
+    val h = if (sh > 0) sh else height
+    val holder = remember { scope.open(title, w, h, content) }
     if (holder != null) {
         holder.onCloseRequest = onCloseRequest
         if (holder.title != title) {
             holder.title = title
             __composeui_winSetTitle(holder.handle, title)
         }
-        if (holder.w != width || holder.h != height) {
-            holder.w = width
-            holder.h = height
-            __composeui_winSetSize(holder.handle, width, height)
+        if (holder.w != w || holder.h != h) {
+            holder.w = w
+            holder.h = h
+            __composeui_winSetSize(holder.handle, w, h)
             holder.dirty = true
         }
         DisposableEffect(Unit) {
@@ -361,13 +368,79 @@ private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
  * loop minus the blocking event poll (input arrives via a separate callback).
  */
 private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioApplicationScope): Boolean {
-    if (recomposerDriver.frame()) {
+    val changed = recomposerDriver.frame()
+    if (changed) {
         for (win in scope.windows) if (!win.closed) win.dirty = true
     }
     val live = scope.windows.filter { !it.closed }
     if (live.isEmpty()) return false
-    for (win in live) renderWindowFrame(win)
-    return true
+    // Redraw only windows with pending work (a recomposition this vsync, or an
+    // input event marked them dirty), like the desktop loop.
+    for (win in live) if (win.dirty) renderWindowFrame(win)
+    // Report whether the VM still needs the next frame: pending recomposition /
+    // effects, or a window left un-rendered (e.g. no surface yet). When false the
+    // OS frame source can skip re-entering the VM until input or a periodic pump.
+    return recomposerDriver.recomposer.hasPendingWork || live.any { it.dirty }
+}
+
+/**
+ * Dispatch the current hosted (mobile) multi-touch snapshot into every live
+ * window's pointer processor. The host holds the snapshot; this reads it back
+ * as one [PointerInputEventData] per active finger (each with its stable
+ * [PointerId]) so gestures spanning several fingers — drag, pinch, multi-tap —
+ * resolve. [phase] is the primary event type (0=down, 1=move, 2=up, 3=cancel);
+ * positions are in the window's point coordinate space. The redraw happens on
+ * the next frame callback (the pointer only marks the window dirty).
+ */
+private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
+    val n = __composeui_touchCount()
+    if (n <= 0) return
+    val eventType = when (phase) {
+        0 -> PointerEventType.Press
+        1 -> PointerEventType.Move
+        4 -> PointerEventType.Scroll
+        else -> PointerEventType.Release
+    }
+    val scroll = phase == 4
+    for (holder in scope.windows) {
+        if (holder.closed) continue
+        holder.uptime += 8
+        val pointers = ArrayList<PointerInputEventData>(n)
+        var anyDown = false
+        for (i in 0 until n) {
+            val down = __composeui_touchDown(i)
+            if (down) anyDown = true
+            val position = Offset(__composeui_touchX(i).toFloat(), __composeui_touchY(i).toFloat())
+            val scrollDelta = if (scroll)
+                Offset(__composeui_touchScrollX(i).toFloat(), __composeui_touchScrollY(i).toFloat())
+            else Offset.Zero
+            pointers.add(
+                PointerInputEventData(
+                    id = PointerId(__composeui_touchId(i).toLong()),
+                    uptime = holder.uptime,
+                    positionOnScreen = position,
+                    position = position,
+                    down = down,
+                    pressure = 1f,
+                    type = PointerType.Touch,
+                    activeHover = false,
+                    scrollDelta = scrollDelta,
+                    scaleGestureFactor = 1f,
+                    panGestureOffset = Offset.Zero,
+                ),
+            )
+        }
+        holder.processor.process(
+            PointerInputEvent(
+                eventType,
+                holder.uptime,
+                pointers,
+                buttons = PointerButtons(isPrimaryPressed = anyDown),
+            ),
+            IdentityPositionCalculator,
+        )
+        holder.dirty = true
+    }
 }
 
 /**
@@ -401,6 +474,7 @@ fun application(
         // recomposer + windows captured by the callback stay alive because the
         // VM stays resident.
         __composeui_setFrameCallback { frameHosted(recomposerDriver, scope) }
+        __composeui_setInputCallback { phase -> inputHosted(scope, phase) }
         return openedAny
     }
     var frame = 0
@@ -465,3 +539,51 @@ internal fun __composeui_isHosted(): Boolean =
 // source invokes it once per vsync on the resident VM.
 internal fun __composeui_setFrameCallback(callback: () -> Boolean): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_setFrameCallback not installed")
+
+// Register the touch callback with the host; the platform input source invokes
+// it with the primary phase (0=down, 1=move, 2=up, 3=cancel) once the current
+// multi-touch snapshot is staged, which the callback reads via the accessors below.
+internal fun __composeui_setInputCallback(callback: (Int) -> Unit): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_setInputCallback not installed")
+
+// The staged multi-touch snapshot: the number of active pointers and, per index,
+// each pointer's stable id, position (surface points), and pressed state.
+internal fun __composeui_touchCount(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchCount not installed")
+internal fun __composeui_touchId(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchId not installed")
+internal fun __composeui_touchX(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchX not installed")
+internal fun __composeui_touchY(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchY not installed")
+internal fun __composeui_touchDown(index: Int): Boolean =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchDown not installed")
+
+// The scroll delta (surface points) for a Scroll event (phase 4); 0 otherwise.
+internal fun __composeui_touchScrollX(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchScrollX not installed")
+internal fun __composeui_touchScrollY(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchScrollY not installed")
+
+// Show/hide the platform soft keyboard (driven by Compose text-field focus).
+internal fun __composeui_showKeyboard(): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_showKeyboard not installed")
+internal fun __composeui_hideKeyboard(): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_hideKeyboard not installed")
+
+// Register the text-input callback; the platform invokes it with a kind
+// (0=commit staged text, 1=backspace, 2=ime action) on each key event.
+internal fun __composeui_setTextCallback(callback: (Int) -> Unit): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_setTextCallback not installed")
+
+// The staged inserted text for a commit (kind 0).
+internal fun __composeui_textInput(): String =
+    error("intrinsic androidx.compose.ui.window.__composeui_textInput not installed")
+
+// The hosted surface's size in points (mobile), or 0 when none is installed. A
+// hosted Window fills these instead of its requested size.
+internal fun __composeui_surfaceWidth(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_surfaceWidth not installed")
+
+internal fun __composeui_surfaceHeight(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_surfaceHeight not installed")

@@ -46,10 +46,10 @@ fi
 # iOS simulator) and to the local directory name. iOS builds are arm64-only.
 ASSET_OS="${OS}"; DIR_OS="${OS}"
 case "${OS}" in
-    linux|macos|windows) ;;
+    linux|macos|windows|android) ;;
     ios) ASSET_OS="ios"; DIR_OS="ios" ;;
     iossim|ios-sim|iosSim) OS="iossim"; ASSET_OS="iosSim"; DIR_OS="iossim" ;;
-    *) echo "os must be linux|macos|windows|ios|iossim (got '${OS}')" >&2; exit 1 ;;
+    *) echo "os must be linux|macos|windows|ios|iossim|android (got '${OS}')" >&2; exit 1 ;;
 esac
 case "${ARCH}" in x64|arm64) ;; *) echo "arch must be x64|arm64 (got '${ARCH}')" >&2; exit 1 ;; esac
 
