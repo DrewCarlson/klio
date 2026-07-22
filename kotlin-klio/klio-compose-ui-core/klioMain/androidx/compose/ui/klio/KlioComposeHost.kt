@@ -89,6 +89,14 @@ import androidx.compose.ui.spatial.RectManager
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.createFontFamilyResolver
 import androidx.compose.ui.text.input.TextInputService
+import androidx.compose.ui.text.input.EditCommand
+import androidx.compose.ui.text.input.CommitTextCommand
+import androidx.compose.ui.text.input.BackspaceCommand
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.window.__composeui_showKeyboard
+import androidx.compose.ui.window.__composeui_hideKeyboard
+import androidx.compose.ui.window.__composeui_setTextCallback
+import androidx.compose.ui.window.__composeui_textInput
 import androidx.compose.ui.text.intl.LocaleList
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
@@ -271,8 +279,8 @@ internal object KlioViewConfiguration : ViewConfiguration {
 }
 
 internal object KlioSoftwareKeyboardController : androidx.compose.ui.platform.SoftwareKeyboardController {
-    override fun show() {}
-    override fun hide() {}
+    override fun show() { __composeui_showKeyboard() }
+    override fun hide() { __composeui_hideKeyboard() }
 }
 
 internal object KlioPointerIconService : PointerIconService {
@@ -286,16 +294,47 @@ internal class KlioUriHandler : UriHandler {
 }
 
 internal object KlioPlatformTextInputService : androidx.compose.ui.text.input.PlatformTextInputService {
+    private var editCommand: ((List<EditCommand>) -> Unit)? = null
+    private var imeAction: ((ImeAction) -> Unit)? = null
+    private var callbackInstalled = false
+
+    // The platform (iOS UIKeyInput) invokes this with a kind after staging any
+    // text: 0=commit inserted text, 1=backspace, 2=ime action (enter/done).
+    private fun onKey(kind: Int) {
+        val edit = editCommand ?: return
+        when (kind) {
+            0 -> {
+                val text = __composeui_textInput()
+                if (text.isNotEmpty()) edit(listOf(CommitTextCommand(text, 1)))
+            }
+            1 -> edit(listOf(BackspaceCommand()))
+            2 -> imeAction?.invoke(ImeAction.Done)
+        }
+    }
+
     override fun startInput(
         value: androidx.compose.ui.text.input.TextFieldValue,
         imeOptions: androidx.compose.ui.text.input.ImeOptions,
-        onEditCommand: (List<androidx.compose.ui.text.input.EditCommand>) -> Unit,
-        onImeActionPerformed: (androidx.compose.ui.text.input.ImeAction) -> Unit,
-    ) {}
+        onEditCommand: (List<EditCommand>) -> Unit,
+        onImeActionPerformed: (ImeAction) -> Unit,
+    ) {
+        editCommand = onEditCommand
+        imeAction = onImeActionPerformed
+        if (!callbackInstalled) {
+            __composeui_setTextCallback { kind -> onKey(kind) }
+            callbackInstalled = true
+        }
+        __composeui_showKeyboard()
+    }
 
-    override fun stopInput() {}
-    override fun showSoftwareKeyboard() {}
-    override fun hideSoftwareKeyboard() {}
+    override fun stopInput() {
+        editCommand = null
+        imeAction = null
+        __composeui_hideKeyboard()
+    }
+
+    override fun showSoftwareKeyboard() { __composeui_showKeyboard() }
+    override fun hideSoftwareKeyboard() { __composeui_hideKeyboard() }
     override fun updateState(
         oldValue: androidx.compose.ui.text.input.TextFieldValue?,
         newValue: androidx.compose.ui.text.input.TextFieldValue,

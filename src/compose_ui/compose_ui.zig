@@ -71,6 +71,10 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_touchDown", touchDown);
     try b.register("androidx.compose.ui.window.__composeui_touchScrollX", touchScrollX);
     try b.register("androidx.compose.ui.window.__composeui_touchScrollY", touchScrollY);
+    try b.register("androidx.compose.ui.window.__composeui_showKeyboard", showKeyboard);
+    try b.register("androidx.compose.ui.window.__composeui_hideKeyboard", hideKeyboard);
+    try b.register("androidx.compose.ui.window.__composeui_setTextCallback", setTextCallback);
+    try b.register("androidx.compose.ui.window.__composeui_textInput", textInput);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -985,6 +989,71 @@ fn touchScrollY(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newInt(touch_points[i].sdy));
 }
 
+// --- Keyboard / text input --------------------------------------------------
+
+/// Platform keyboard show/hide, provided by the app shell (iOS: become/resign
+/// first responder on a UIKeyInput view). Compose's text-input service calls the
+/// `__composeui_show/hideKeyboard` intrinsics when a text field gains/loses focus.
+const KbFn = *const fn () callconv(.c) void;
+var keyboard_show_fn: ?KbFn = null;
+var keyboard_hide_fn: ?KbFn = null;
+
+pub export fn klio_set_keyboard_handler(show: ?KbFn, hide: ?KbFn) void {
+    keyboard_show_fn = show;
+    keyboard_hide_fn = hide;
+}
+
+fn showKeyboard(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    if (keyboard_show_fn) |f| f();
+    return ok(Value.newLong(1));
+}
+fn hideKeyboard(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    if (keyboard_hide_fn) |f| f();
+    return ok(Value.newLong(1));
+}
+
+/// The resident text-input callback plus the staged text bytes for one event.
+/// Same persisted-host residency contract as `frame_cb` / `input_cb`.
+var text_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+var staged_text: [512]u8 = undefined;
+var staged_text_len: usize = 0;
+
+fn setTextCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    text_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
+fn dispatchTextBody(kind: c_int) void {
+    var args = [_]Value{Value.newInt(kind)};
+    _ = text_cb.host.invokeCallable(&text_cb.callback, &args, text_cb.out) catch {};
+}
+
+/// Commit inserted UTF-8 text (kind 0). The callback reads it via
+/// `__composeui_textInput`. Called by the app shell on the main thread.
+pub export fn klio_dispatch_text(bytes: [*]const u8, len: c_int) void {
+    if (!text_cb.set) return;
+    const n = @min(@as(usize, @intCast(@max(len, 0))), staged_text.len);
+    @memcpy(staged_text[0..n], bytes[0..n]);
+    staged_text_len = n;
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, 0);
+}
+
+/// A key edit with no text payload: 1=backspace, 2=ime action (enter/done).
+pub export fn klio_dispatch_key(kind: c_int) void {
+    if (!text_cb.set) return;
+    staged_text_len = 0;
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, kind);
+}
+
+/// `__composeui_textInput(): String` — the staged inserted text (kind 0).
+fn textInput(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    return ok(Value{ .String = try runtime.strInitOwned(a, try a.dupe(u8, staged_text[0..staged_text_len])) });
+}
+
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
 //// The host OS, as a lowercase name. foundation's `DesktopPlatform` needs it: the
 /// desktop key mapping is genuinely different per platform (macOS binds the text
@@ -1531,7 +1600,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 73), b.len());
+    try testing.expectEqual(@as(usize, 77), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

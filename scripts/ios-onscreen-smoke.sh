@@ -95,12 +95,14 @@ grep -Eq "frames=[0-9]+" "$LOG" || fail "no frame heartbeat — the resident VM 
 FRAMES="$(grep -oE 'frames=[0-9]+' "$LOG" | tail -1)"
 FRAME_N="${FRAMES#frames=}"
 
-# Input: the self-test injected a scroll (frame 120) then a 2-finger touch (frame
-# 180). Both must have logged, and the app must have kept rendering past them (a
-# crash in input dispatch would freeze the frame heartbeat near the injection).
+# Input: the self-test injected a scroll (120), a 2-finger touch (180), and a
+# keyboard focus (220). All must have logged, the keyboard view must have become
+# first responder (ready for text; the soft keyboard is suppressed on a sim with
+# a hardware keyboard), and the app must have kept rendering past them.
 grep -Fq "selftest scroll" "$LOG" || fail "scroll self-test did not fire — see $LOG"
 grep -Fq "selftest touch" "$LOG" || fail "touch self-test did not fire — see $LOG"
-[ "${FRAME_N:-0}" -gt 180 ] || fail "frame loop stopped near an injected input event ($FRAMES) — input dispatch likely crashed (see $LOG)"
+grep -Fq "firstResponder=1" "$LOG" || fail "keyboard view did not become first responder — see $LOG"
+[ "${FRAME_N:-0}" -gt 220 ] || fail "frame loop stopped near an injected input event ($FRAMES) — input dispatch likely crashed (see $LOG)"
 
 SHOT_OK="no"
 if [ -f "$OUT/screen.png" ]; then

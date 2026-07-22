@@ -559,6 +559,21 @@ internal fun __composeui_touchScrollX(index: Int): Int =
 internal fun __composeui_touchScrollY(index: Int): Int =
     error("intrinsic androidx.compose.ui.window.__composeui_touchScrollY not installed")
 
+// Show/hide the platform soft keyboard (driven by Compose text-field focus).
+internal fun __composeui_showKeyboard(): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_showKeyboard not installed")
+internal fun __composeui_hideKeyboard(): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_hideKeyboard not installed")
+
+// Register the text-input callback; the platform invokes it with a kind
+// (0=commit staged text, 1=backspace, 2=ime action) on each key event.
+internal fun __composeui_setTextCallback(callback: (Int) -> Unit): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_setTextCallback not installed")
+
+// The staged inserted text for a commit (kind 0).
+internal fun __composeui_textInput(): String =
+    error("intrinsic androidx.compose.ui.window.__composeui_textInput not installed")
+
 // The hosted surface's size in points (mobile), or 0 when none is installed. A
 // hosted Window fills these instead of its requested size.
 internal fun __composeui_surfaceWidth(): Int =

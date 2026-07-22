@@ -23,16 +23,30 @@ extern int klio_frame_active(void);
 extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
                                   const int *ys, const int *downs, int phase);
 extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
+extern void klio_set_keyboard_handler(void (*show)(void), void (*hide)(void));
+extern void klio_dispatch_text(const char *bytes, int len);
+extern void klio_dispatch_key(int kind);
 
 // A UIView whose backing layer is a CAMetalLayer: the resident Compose UI draws
 // into its per-frame drawables through the statically-linked Skia Ganesh-Metal
 // backend (klio_win_attach / klio_win_surface / klio_win_present). Touches on the
 // view forward a snapshot of every active finger into the resident VM's pointer
-// processor via klio_dispatch_touches, so multi-finger gestures resolve.
-@interface KlioMetalView : UIView
+// processor via klio_dispatch_touches, so multi-finger gestures resolve. The
+// view also conforms to UIKeyInput so Compose text fields drive the soft
+// keyboard: focusing one makes the view first responder (keyboard shows), and
+// typed text / backspace / return route back through klio_dispatch_text/_key.
+@interface KlioMetalView : UIView <UIKeyInput>
 @end
 @implementation KlioMetalView
 + (Class)layerClass { return [CAMetalLayer class]; }
+- (BOOL)canBecomeFirstResponder { return YES; }
+- (BOOL)hasText { return YES; }
+- (void)insertText:(NSString *)text {
+    if ([text isEqualToString:@"\n"]) { klio_dispatch_key(2); return; }  // return -> ime action
+    const char *utf8 = [text UTF8String];
+    if (utf8) klio_dispatch_text(utf8, (int)strlen(utf8));
+}
+- (void)deleteBackward { klio_dispatch_key(1); }
 - (void)dispatchEvent:(UIEvent *)event phase:(int)phase {
     NSArray<UITouch *> *all = [[event allTouches] allObjects];
     int ids[16], xs[16], ys[16], downs[16];
@@ -56,6 +70,13 @@ extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
 - (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:2]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:3]; }
 @end
+
+// The resident VM calls these (via the registered keyboard handler) when a
+// Compose text field gains/loses focus. Making the Metal view first responder
+// shows/hides the soft keyboard.
+static KlioMetalView *gMetalView = nil;
+static void klio_kb_show(void) { [gMetalView becomeFirstResponder]; }
+static void klio_kb_hide(void) { [gMetalView resignFirstResponder]; }
 
 @interface KlioAppDelegate : UIResponder <UIApplicationDelegate>
 @property (strong, nonatomic) UIWindow *window;
@@ -93,6 +114,14 @@ extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
             int downs[2] = {1, 1};
             NSLog(@"[klio-host] selftest touch: 2 pointers");
             klio_dispatch_touches(2, ids, xs, ys, downs, 0);
+        }
+        if (self.frameCount == 220) {
+            // Platform keyboard show (what klio_kb_show does when a Compose text
+            // field focuses). becomeFirstResponder==YES means the view is ready
+            // to receive text; the soft keyboard slides up unless the simulator
+            // has a hardware keyboard connected (which suppresses it).
+            BOOL fr = [self.metalView becomeFirstResponder];
+            NSLog(@"[klio-host] selftest keyboard: firstResponder=%d", (int)fr);
         }
     }
 }
@@ -142,6 +171,10 @@ extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
         [self.metalView addGestureRecognizer:scrollPan];
         CAMetalLayer *layer = (CAMetalLayer *)self.metalView.layer;
         layer.contentsScale = scale;
+
+        // Let the resident VM drive the soft keyboard for Compose text fields.
+        gMetalView = self.metalView;
+        klio_set_keyboard_handler(klio_kb_show, klio_kb_hide);
 
         klio_set_surface((__bridge void *)layer,
                          (int)bounds.size.width, (int)bounds.size.height, (double)scale);
