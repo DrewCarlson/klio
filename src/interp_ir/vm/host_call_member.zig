@@ -3993,7 +3993,13 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (!std.mem.eql(u8, name, "invoke") and !has_ext and arity_ok and !toplevel_serves) {
             if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
             const r = try callValueRec(self, allocator, receiver, args);
-            if (r == .ok) return r;
+            switch (r) {
+                .ok => return r,
+                .err => |e| switch (e) {
+                    .Suspended, .CalleeFailed, .Throw, .NonLocalReturn, .LabeledReturn => return r,
+                    else => {},
+                },
+            }
         }
     }
 

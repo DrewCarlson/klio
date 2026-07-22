@@ -95,6 +95,30 @@ test "suspend_in_lambda" {
     try assertKlio("suspend_lambda", src, "[10, 20, 30]\n");
 }
 
+test "suspend SAM member propagates suspension" {
+    const src =
+        \\
+        \\import kotlinx.coroutines.*
+        \\fun interface SuspendSink {
+        \\    suspend fun emit(value: Int)
+        \\}
+        \\class Source {
+        \\    suspend fun collect(sink: SuspendSink) {
+        \\        sink.emit(1)
+        \\        println("after")
+        \\    }
+        \\}
+        \\fun main() = runBlocking {
+        \\    Source().collect { value ->
+        \\        delay(1)
+        \\        println("value=$value")
+        \\    }
+        \\}
+        \\
+    ;
+    try assertKlio("suspend_sam_member", src, "value=1\nafter\n");
+}
+
 test "suspend_with_try_catch" {
     const src =
         \\
