@@ -2269,6 +2269,7 @@ void klio_win_close(void*) {}
 void klio_win_set_title(void*, const char*) {}
 void klio_win_set_size(void*, int, int) {}
 void klio_win_set_icon_png(void*, const unsigned char*, size_t) {}
+void klio_win_set_resize_cb(void*, void (*)(void*, int, int), void*) {}
 }  // extern "C"
 
 #endif

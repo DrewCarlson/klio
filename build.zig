@@ -595,7 +595,7 @@ pub fn build(b: *std.Build) void {
     // ABI); the resulting .so is self-contained (static Skia + deps linked in).
     const skia_lib_step = b.step("skia-lib", "Build + install the Compose-UI Skia backend shared library");
     if (want_skia) {
-        if (buildSkiaShim(b, target)) |so| {
+        if (buildSkiaShim(b, target, apple_sdk)) |so| {
             const inst = b.addInstallFileWithDir(so, .lib, skiaLibName(target.result.os.tag));
             skia_lib_step.dependOn(&inst.step);
             b.getInstallStep().dependOn(&inst.step);
@@ -1127,6 +1127,21 @@ fn skiaLibInfo(b: *std.Build, target: std.Build.ResolvedTarget) ?struct {
     ext: []const u8,
 } {
     const os = target.result.os.tag;
+    // iOS (arm64 only): skia-pack uses the camelCase `iosSim`/`ios` build token
+    // in the out/ dir name, but a lowercase directory name locally. Simulator vs
+    // device splits on the target abi (fetch-skia.sh iossim|ios).
+    if (os == .ios) {
+        if (target.result.cpu.arch != .aarch64) return null;
+        const sim = target.result.abi == .simulator;
+        const dir: []const u8 = if (sim) "iossim-arm64" else "ios-arm64";
+        const tok: []const u8 = if (sim) "iosSim" else "ios";
+        const base = b.fmt("third_party/skia/{s}", .{dir});
+        return .{
+            .base = base,
+            .lib_dir = b.fmt("{s}/out/Release-{s}-arm64", .{ base, tok }),
+            .ext = "a",
+        };
+    }
     const os_name: []const u8 = switch (os) {
         .linux => "linux",
         .macos => "macos",
@@ -1218,8 +1233,49 @@ fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
     return switch (os) {
         .macos => "libklio_skia.dylib",
         .windows => "klio_skia.dll",
+        // iOS links the shim statically into the app (no dlopen), so it is a
+        // static archive rather than a shared library.
+        .ios => "libklio_skia.a",
         else => "libklio_skia.so",
     };
+}
+
+/// Build the iOS Compose-UI Skia shim as a STATIC archive (libklio_skia.a) of the
+/// shim's own objects, compiled with the platform clang++ against the iOS SDK.
+/// iOS bans dlopen of a runtime-written dylib, so the shim links into the app
+/// statically; libskia + its sibling dep archives + the Apple frameworks are
+/// added at the app link, not here. Offscreen/raster only for now (no window
+/// backend) — the on-screen UIView + Metal surface comes later.
+fn buildSkiaShimIos(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    sdk: []const u8,
+    base: []const u8,
+) ?std.Build.LazyPath {
+    const sim = target.result.abi == .simulator;
+    const min_flag: []const u8 = if (sim)
+        "-mios-simulator-version-min=15.0"
+    else
+        "-miphoneos-version-min=15.0";
+    const inc = b.fmt("-I{s}", .{base});
+
+    const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64" });
+    c1.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc, "-c" });
+    c1.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
+    c1.addArg("-o");
+    const shim_o = c1.addOutputFileArg("skia_shim.o");
+
+    const c2 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64" });
+    c2.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc, "-c" });
+    c2.addFileArg(b.path("src/compose_ui/font_data.cpp"));
+    c2.addArg("-o");
+    const font_o = c2.addOutputFileArg("font_data.o");
+
+    const ar = b.addSystemCommand(&.{ "libtool", "-static", "-o" });
+    const out = ar.addOutputFileArg("libklio_skia.a");
+    ar.addFileArg(shim_o);
+    ar.addFileArg(font_o);
+    return out;
 }
 
 /// Build the Compose-UI Skia backend shared library for `target` with the system
@@ -1235,7 +1291,7 @@ fn skiaLibName(os: std.Target.Os.Tag) []const u8 {
 ///
 /// Verified on linux-x64. macOS/windows use the standard per-platform link recipe
 /// (clang++ + frameworks / clang-cl + system libs) but are unverified here.
-fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget, apple_sdk: ?[]const u8) ?std.Build.LazyPath {
     const io = b.graph.io;
     const os = target.result.os.tag;
     const info = skiaLibInfo(b, target) orelse return null;
@@ -1243,6 +1299,11 @@ fn buildSkiaShim(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.Laz
     const lib_dir = info.lib_dir;
     const ext = info.ext;
     b.build_root.handle.access(io, b.fmt("{s}/libskia.{s}", .{ lib_dir, ext }), .{}) catch return null;
+
+    // iOS: the shim is a static archive of just its own objects (offscreen /
+    // raster; no window backend yet). libskia + its sibling dep archives + the
+    // Apple frameworks are linked into the app alongside it, not into the shim.
+    if (os == .ios) return buildSkiaShimIos(b, target, apple_sdk orelse return null, base);
 
     // Compiler: -Dskia-cxx → per-OS default. The override lets a cross toolchain
     // (osxcross clang++, a mingw/clang-cl wrapper, …) build for a non-host target.

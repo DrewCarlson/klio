@@ -16,6 +16,12 @@ const runtime = @import("runtime");
 /// the `SelfInfo` symbolizer is never pulled in.
 pub const panic = std.debug.FullPanic(runtime.trace.panicFn);
 
+/// Opt into the statically-linked Skia shim (compose_ui reads this off the root).
+/// The app host links libklio_skia.a, so on iOS the interpreter resolves the shim
+/// from those symbols instead of dlopen. The plain interpreter exe omits this and
+/// stays headless.
+pub const klio_skia_static = true;
+
 /// Interpret a program in-process. `argc`/`argv` are the CLI arguments *after*
 /// the program name (e.g. the host passes `{"run", "<path>"}`); a synthetic
 /// `"klio"` program name is prepended. Returns the process exit code. Safe to

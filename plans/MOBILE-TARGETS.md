@@ -235,22 +235,35 @@ render unknown — Skia compiles/links/runs on iOS.
   `{CoreFoundation, CoreGraphics, CoreText, Foundation, ImageIO}` + `-lc++`
   directly into the app. Drop `AppKit`/`IOKit`/`CoreServices` (macOS-only).
 
-Remaining P3 work, in order:
-1. **build.zig integration**: `skiaLibInfo` `.ios` case (base
+**Steps 1–2 DONE** — the interpreter + statically-linked Skia shim + libskia +
+deps + Apple frameworks link into the iOS app and run (`scripts/ios-ui-smoke.sh`
+passes headless).
+
+1. **build.zig integration (done).** `skiaLibInfo` `.ios` case (base
    `third_party/skia/iossim-arm64`, lib_dir `.../out/Release-iosSim-arm64`);
-   `buildSkiaShim` iOS branch emitting a static archive (not a dylib).
-2. **`compose_ui.zig` static-link path**: `loadSkia` binds the `Skia` struct from
-   statically-linked `extern fn` addresses on iOS instead of `std.DynLib`
-   (`.lib` is unused post-load, so bind it `undefined`). Gate on `os.tag == .ios`.
-3. **Compose packs on device** (new dependency surfaced): running a Compose
-   program needs the compose packs available to the interpreter. The app sets
-   `HOME` to the sandbox, so `~/.klio` installed packs are not visible — the packs
-   must be embedded/bundled into the app (ties into `klio bundle --target ios`).
-   This is the gate for an end-to-end Compose→pixels render inside the app.
+   `skiaLibName` `.ios → libklio_skia.a`; `buildSkiaShimIos` compiles the shim
+   (offscreen/raster, no window backend) with the platform clang++ against the
+   iOS SDK and archives it with `libtool -static`. `zig build skia-lib
+   -Dtarget=aarch64-ios-simulator`. Added a `klio_win_set_resize_cb` no-op to the
+   shim's stub backend so the offscreen build exports the full window ABI.
+2. **`compose_ui.zig` static-link path (done).** On iOS `loadSkia` binds the
+   `Skia` struct from statically-linked `@extern` symbols (`.lib` bound
+   `undefined`), gated on `use_static_skia = @hasDecl(@import("root"),
+   "klio_skia_static")`. The app host (`mobile_lib.zig`) opts in and links
+   `libklio_skia.a`, resolving the symbols; the plain interpreter exe omits the
+   decl → emits no shim references → links and renders headless. This avoids the
+   mach-o "weak import of an absent symbol" link error entirely.
+
+Remaining P3 work (to regroup on), in order:
+3. **Compose packs on device**: running a Compose program needs the compose packs
+   available to the interpreter. The app sets `HOME` to the sandbox, so `~/.klio`
+   installed packs are not visible — the packs must be embedded/bundled into the
+   app (ties into `klio bundle --target ios`). Gate for an end-to-end
+   Compose→pixels render inside the app.
 4. **On-screen surface (P3b)**: `UIView`-owned `CAMetalLayer` + Ganesh-Metal
-   (reuse the macOS Metal bring-up), a `klio_win_attach` extern, and invert the
-   VM poll loop into a `CADisplayLink` frame callback (the resize-callback
-   trampoline is the template).
+   (reuse the macOS Metal bring-up + a `KLIO_UIKIT`/Metal backend in the shim), a
+   `klio_win_attach` extern, and invert the VM poll loop into a `CADisplayLink`
+   frame callback (the resize-callback trampoline is the template).
 5. **Touch (P3c)**: `UITouch` phases → multi-touch pointer events.
 
 ## Phase map (initial)

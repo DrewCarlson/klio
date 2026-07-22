@@ -251,6 +251,11 @@ const ParaPhRectFn = *const fn (?*KlioPara, i32, i32) callconv(.c) f32;
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
 
+/// The app host (an iOS `.app`) that statically links the Skia shim opts in by
+/// declaring `pub const klio_skia_static` in its root; the plain interpreter does
+/// not, so on iOS it emits no shim symbol references and stays headless.
+const use_static_skia = @hasDecl(@import("root"), "klio_skia_static");
+
 /// The platform shared-library file name build.zig installs.
 const skia_lib_name = switch (@import("builtin").os.tag) {
     .macos => "libklio_skia.dylib",
@@ -265,6 +270,15 @@ fn loadSkia() ?*Skia {
     if (skia_state) |*s| return s;
     if (skia_tried) return null;
     skia_tried = true;
+
+    // iOS bans dlopen of a runtime-written dylib, so the shim is linked
+    // statically and resolved from symbols rather than a DynLib — but only when
+    // the app host opts in (it links libklio_skia.a). The plain interpreter exe
+    // does not, so it emits no shim references and renders headless there.
+    if (comptime @import("builtin").os.tag == .ios) {
+        if (comptime use_static_skia) return loadSkiaStatic();
+        return null;
+    }
 
     var lib = openSkiaLib() orelse return null;
     const F = struct {
@@ -347,6 +361,88 @@ fn loadSkia() ?*Skia {
 fn skiaLoadFail(lib: *std.DynLib) ?*Skia {
     lib.close();
     return null;
+}
+
+/// Reference a statically-linked shim symbol directly. Reached only from the app
+/// host (which links libklio_skia.a and opts in via `use_static_skia`), so the
+/// symbol is always defined at the app link — the plain interpreter never emits
+/// these references.
+fn externSym(comptime T: type, comptime name: [:0]const u8) T {
+    return @extern(T, .{ .name = name });
+}
+
+/// iOS resolution of the shim from statically-linked symbols (no dlopen). Mirrors
+/// `loadSkia`'s field set. The shim ships with the interpreter, so every symbol
+/// is present; optional fields are bound directly too.
+fn loadSkiaStatic() ?*Skia {
+    const s = Skia{
+        .lib = undefined,
+        .new = externSym(@FieldType(Skia, "new"), "klio_skia_new"),
+        .newGpu = externSym(@FieldType(Skia, "newGpu"), "klio_skia_new_gpu"),
+        .free = externSym(@FieldType(Skia, "free"), "klio_skia_free"),
+        .clear = externSym(@FieldType(Skia, "clear"), "klio_skia_clear"),
+        .fillRect = externSym(@FieldType(Skia, "fillRect"), "klio_skia_fill_rect"),
+        .strokeRect = externSym(@FieldType(Skia, "strokeRect"), "klio_skia_stroke_rect"),
+        .fillRRect = externSym(@FieldType(Skia, "fillRRect"), "klio_skia_fill_rrect"),
+        .fillCircle = externSym(@FieldType(Skia, "fillCircle"), "klio_skia_fill_circle"),
+        .drawLine = externSym(@FieldType(Skia, "drawLine"), "klio_skia_draw_line"),
+        .drawText = externSym(@FieldType(Skia, "drawText"), "klio_skia_draw_text"),
+        .drawParagraph = externSym(@FieldType(Skia, "drawParagraph"), "klio_skia_draw_paragraph"),
+        .measureParagraph = externSym(@FieldType(Skia, "measureParagraph"), "klio_skia_measure_paragraph"),
+        .savePng = externSym(@FieldType(Skia, "savePng"), "klio_skia_save_png"),
+        .encodePng = externSym(@FieldType(Skia, "encodePng"), "klio_skia_encode_png"),
+        .freeBuffer = externSym(@FieldType(Skia, "freeBuffer"), "klio_skia_free_buffer"),
+        .pathOp = externSym(PathOpFn, "klio_skia_path_op"),
+        .freeCstr = externSym(FreeCstrFn, "klio_skia_free_cstr"),
+        .cSave = externSym(CVoidFn, "klio_skia_c_save"),
+        .cRestore = externSym(CVoidFn, "klio_skia_c_restore"),
+        .cTranslate = externSym(CXYFn, "klio_skia_c_translate"),
+        .cScale = externSym(CXYFn, "klio_skia_c_scale"),
+        .cRotate = externSym(CRotateFn, "klio_skia_c_rotate"),
+        .cSkew = externSym(CXYFn, "klio_skia_c_skew"),
+        .cClipRect = externSym(CClipRectFn, "klio_skia_c_clip_rect"),
+        .cClipPath = externSym(CClipPathFn, "klio_skia_c_clip_path"),
+        .cSetShader = externSym(CSetShaderFn, "klio_skia_c_set_shader"),
+        .cDrawRect = externSym(CDrawRectFn, "klio_skia_c_draw_rect"),
+        .cDrawRRect = externSym(CDrawRRectFn, "klio_skia_c_draw_rrect"),
+        .cDrawOval = externSym(CDrawRectFn, "klio_skia_c_draw_oval"),
+        .cDrawCircle = externSym(CDrawCircleFn, "klio_skia_c_draw_circle"),
+        .cDrawLine = externSym(CDrawLineFn, "klio_skia_c_draw_line"),
+        .cDrawPath = externSym(CDrawPathFn, "klio_skia_c_draw_path"),
+        .cMeasureTextWidth = externSym(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
+        .cFontMetric = externSym(CFontMetricFn, "klio_skia_font_metric"),
+        .cConcat = externSym(CConcatFn, "klio_skia_c_concat"),
+        .surfPixel = externSym(SurfPixelFn, "klio_skia_surf_pixel"),
+        .cDrawText2 = externSym(CDrawText2Fn, "klio_skia_c_draw_text2"),
+        .cDrawSurface = externSym(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
+        .cDrawSurfaceRect = externSym(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
+        .paraNew = externSym(ParaNewFn, "klio_skia_para_new"),
+        .paraLayout = externSym(ParaLayoutFn, "klio_skia_para_layout"),
+        .paraMetric = externSym(ParaMetricFn, "klio_skia_para_metric"),
+        .paraLineMetric = externSym(ParaLineMetricFn, "klio_skia_para_line_metric"),
+        .paraOffsetAt = externSym(ParaOffsetAtFn, "klio_skia_para_offset_at"),
+        .paraBox = externSym(ParaBoxFn, "klio_skia_para_box"),
+        .paraRangeRect = externSym(ParaRangeRectFn, "klio_skia_para_range_rect"),
+        .paraRangeRectCount = externSym(ParaRangeRectCountFn, "klio_skia_para_range_rect_count"),
+        .paraWord = externSym(ParaWordFn, "klio_skia_para_word"),
+        .paraLineFor = externSym(ParaLineForFn, "klio_skia_para_line_for"),
+        .paraPaint = externSym(ParaPaintFn, "klio_skia_para_paint"),
+        .paraFree = externSym(ParaFreeFn, "klio_skia_para_free"),
+        .fontRegister = externSym(FontRegisterFn, "klio_skia_font_register"),
+        .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
+        .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .winOpen = externSym(@FieldType(Skia, "winOpen"), "klio_win_open"),
+        .winSurface = externSym(@FieldType(Skia, "winSurface"), "klio_win_surface"),
+        .winPresent = externSym(@FieldType(Skia, "winPresent"), "klio_win_present"),
+        .winPoll = externSym(@FieldType(Skia, "winPoll"), "klio_win_poll"),
+        .winClose = externSym(@FieldType(Skia, "winClose"), "klio_win_close"),
+        .winSetResizeCb = externSym(ResizeCbFn, "klio_win_set_resize_cb"),
+        .winSetTitle = externSym(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
+        .winSetSize = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
+        .winSetIconPng = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
+    };
+    skia_state = s;
+    return &skia_state.?;
 }
 
 // ---------------------------------------------------------------------------
