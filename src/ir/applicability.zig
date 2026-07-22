@@ -974,6 +974,52 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
         // legacy loop does not `continue` here).
     }
 
+    // Positional member varargs bind every argument from the vararg position
+    // onward as an element. A spread is scored against the declared array
+    // type, and zero elements materialize an empty array. Parameters after the
+    // vararg cannot be supplied positionally in this branch and therefore
+    // must be defaultable (a trailing lambda was handled above).
+    var vararg_pos: ?usize = null;
+    for (effective, 0..) |param, i| if (param.is_vararg) {
+        vararg_pos = i;
+        break;
+    };
+    if (vararg_pos) |vp| {
+        var total: i32 = -1;
+        var proven: u16 = 0;
+        var unknown: u16 = 0;
+        var i: usize = 0;
+        while (i < vp and i < args.len) : (i += 1) {
+            const sc = scoreArg(sig, &effective[i].ty, &args[i], &scope) orelse return null;
+            total += sc;
+            if (argIsProven(&args[i])) proven += 1 else unknown += 1;
+        }
+        while (i < vp) : (i += 1) {
+            if (!paramHasDefault(sig, skip + i)) return null;
+        }
+        var tail = vp + 1;
+        while (tail < effective.len) : (tail += 1) {
+            if (!paramHasDefault(sig, skip + tail)) return null;
+        }
+        const elem = varargElementRef(&effective[vp].ty);
+        var k = vp;
+        while (k < args.len) : (k += 1) {
+            const target: *const TypeRef = if (args[k].is_spread) &effective[vp].ty else &elem;
+            const sc = scoreArg(sig, target, &args[k], &scope) orelse return null;
+            total += sc;
+            if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+        }
+        return .{
+            .points = total,
+            .proven_args = proven,
+            .unknown_args = unknown,
+            .exact_arity = false,
+            .low_priority = sig.low_priority,
+            .is_member = sig.is_member,
+            .binding = .{},
+        };
+    }
+
     // Over-supply with no vararg tail cannot bind (the multi-candidate member
     // path does not pack a trailing vararg here).
     if (args.len > effective.len) return null;
@@ -1495,6 +1541,25 @@ test "applicable member: under-application via the defaults table is applicable"
     // Member base is 0 (no -1); only one arg scored (100), y defaulted.
     try testing.expectEqual(@as(i32, 100), sc.points);
     try testing.expect(!sc.exact_arity);
+}
+
+test "applicable member: positional varargs accept zero or many elements" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Folder"), .default = null },
+        .{ .name = "values", .ty = tref("Int"), .default = null, .is_vararg = true },
+    };
+    const sig = SigView{ .params = &p, .is_member = true };
+    const empty = applicable(&sig, &.{}, .{ .member = true }).?;
+    try testing.expect(!empty.exact_arity);
+
+    const many = [_]ArgShape{
+        .{ .runtime_class = "Int" },
+        .{ .runtime_class = "Int" },
+        .{ .runtime_class = "Int" },
+    };
+    const scored = applicable(&sig, &many, .{ .member = true }).?;
+    try testing.expectEqual(@as(i32, 299), scored.points);
+    try testing.expect(!scored.exact_arity);
 }
 
 test "applicable: callable arg cannot bind a concrete non-function param" {

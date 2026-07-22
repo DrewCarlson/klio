@@ -3046,8 +3046,10 @@ fn mapArgsToParams(
         while (pidx < params.len and used[pidx]) pidx += 1;
         if (pidx < params.len) {
             out[j] = pidx;
-            used[pidx] = true;
-            pidx += 1;
+            if (!params[pidx].is_vararg) {
+                used[pidx] = true;
+                pidx += 1;
+            }
         }
     }
     return out;
@@ -4181,6 +4183,18 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Calls containing a `*spread` argument.
     if (anySpread(args)) {
+        if (callee.* == .Member and !callee.Member.safe) {
+            const member = callee.Member;
+            if (try lowerResolvedMemberCall(
+                b,
+                member.receiver,
+                member.name,
+                args,
+                ast_arg_names,
+                ast_type_args,
+                argDeclTypeRef(b, member.receiver),
+            )) |reg| return reg;
+        }
         return lowerCallSpread(b, callee, args, ast_arg_names);
     }
 
@@ -4691,6 +4705,18 @@ fn packContiguous(b: *FuncBuilder, regs: []const Reg) Allocator.Error!Reg {
     return start;
 }
 
+fn lowerSpreadParts(b: *FuncBuilder, args: []const Expr) Allocator.Error![]SpreadPart {
+    const parts = try b.allocator.alloc(SpreadPart, args.len);
+    for (args, parts) |*arg, *part| {
+        if (arg.* == .Spread) {
+            part.* = .{ .reg = try lowerExpr(b, arg.Spread.expr), .is_spread = true };
+        } else {
+            part.* = .{ .reg = try lowerExpr(b, arg), .is_spread = false };
+        }
+    }
+    return parts;
+}
+
 /// Resolve a `this` reg for a bare extension call: bound local, else a
 /// capture inside a lambda body, else null. Binds the recovered capture
 /// locally so later references reuse it.
@@ -4773,16 +4799,7 @@ fn lowerCallSpread(
         }
         break :blk try lowerExpr(b, callee);
     };
-    const parts = try b.allocator.alloc(SpreadPart, args.len);
-    for (args, parts) |*a, *p| {
-        if (a.* == .Spread) {
-            const r = try lowerExpr(b, a.Spread.expr);
-            p.* = .{ .reg = r, .is_spread = true };
-        } else {
-            const r = try lowerExpr(b, a);
-            p.* = .{ .reg = r, .is_spread = false };
-        }
-    }
+    const parts = try lowerSpreadParts(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     try b.push(.{ .CallSpread = .{
@@ -7074,6 +7091,9 @@ fn typeheadAuditOn() bool {
 }
 
 fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (arg.* == .StringTemplate) {
+        return .{ .name = "String", .nullable = false, .args = &.{} };
+    }
     // An unsafe cast fixes the argument's static type for overload
     // resolution — kotlinc sees exactly the cast target. That is the
     // documented way to force a sibling overload (ktor's deprecated
@@ -7084,8 +7104,36 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
-        if (b.localCallReturn(arg.Call.callee.Path.segments[0].name)) |ret| {
+        const seg = arg.Call.callee.Path.segments[0];
+        if (b.localCallReturn(seg.name)) |ret| {
             return .{ .name = ret.name, .nullable = ret.nullable, .args = &.{} };
+        }
+        // A unique concrete classifier with no same-named plain function is
+        // a constructor call, so its result head is statically authoritative.
+        // The conservative function gate leaves factory/class collisions for
+        // the ordinary call resolver instead of inventing a receiver type.
+        if (b.resolve(seg.name) == null and !b.isLocalFn(seg.name)) {
+            var same_named_function = false;
+            for (b.module.funcsBySimpleName(seg.name)) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                if (f.kind == .plain and
+                    (f.hasBody() or b.module.decl_ast_body.contains(fid.int())))
+                {
+                    same_named_function = true;
+                    break;
+                }
+            }
+            if (!same_named_function) {
+                const pkg = b.module.packageOfFile(seg.span.file) orelse b.self_package;
+                if (b.module.classIdIndexed(seg.name, pkg, seg.span.file)) |cid| {
+                    if (cid.int() < b.module.classes.items.len) {
+                        const class = &b.module.classes.items[cid.int()];
+                        if (!class.is_object and !class.is_interface and !class.is_abstract) {
+                            return .{ .name = class.fqn, .nullable = false, .args = &.{} };
+                        }
+                    }
+                }
+            }
         }
     }
     // A qualified object/class property read (`Nodes.Traversable`, parsed
@@ -10196,28 +10244,17 @@ fn lowerResolvedMemberCall(
     const func_id = resolved.target orelse return null;
     if (resolved.dispatch == .deferred) return null;
     const target = b.module.funcById(func_id) orelse return null;
+    const has_spread = anySpread(args);
+    if (resolved.dispatch == .direct and has_spread) return null;
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Value classes, unresolved shells, and declarations in the
         // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`. Named interface calls
-        // carry a numeric parameter map and fill declaration defaults by slot;
-        // vararg interface forms remain on the compatibility path for now.
-        var has_named = false;
-        for (ast_arg_names) |arg_name| if (arg_name != null) {
-            has_named = true;
-            break;
-        };
-        var interface_named_supported = true;
-        if (has_named) {
-            for (target.params[1..]) |param| if (param.is_vararg) {
-                interface_named_supported = false;
-                break;
-            };
-        }
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and !interface_named_supported) or
+        // already guaranteed to use `Value.Instance`. Named, defaulted, and
+        // vararg interface calls bind against the numeric declaration ABI.
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
             std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
     }
 
@@ -10233,9 +10270,13 @@ fn lowerResolvedMemberCall(
 
     const recv_reg = try lowerReceiver(b, receiver);
     if (resolved.dispatch == .virtual) {
-        const run = try lowerArgRunWithArity(b, args, arg_arity);
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
-        const arg_params: []u32 = if (anyNamedArg(ast_arg_names)) blk: {
+        var has_vararg = false;
+        for (target.params[1..]) |param| if (param.is_vararg) {
+            has_vararg = true;
+            break;
+        };
+        const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
             if (target.params.len == 0) return null;
             const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return null;
             defer b.allocator.free(mapped);
@@ -10243,8 +10284,20 @@ fn lowerResolvedMemberCall(
             const indices = try b.allocator.alloc(u32, mapped.len);
             for (mapped, indices) |param, *out| out.* = @intCast(param.?);
             break :blk indices;
-        } else &.{};
+        } else null;
         const dst = b.allocReg();
+        if (has_spread) {
+            try b.push(.{ .CallSpread = .{
+                .dst = dst,
+                .callee = recv_reg,
+                .parts = try lowerSpreadParts(b, args),
+                .virtual_slot = ir.MethodSlotId.fromFunc(func_id),
+                .arg_params = arg_params,
+                .trailing_lambda = b.callTrailingLambda(),
+            } });
+            return dst;
+        }
+        const run = try lowerArgRunWithArity(b, args, arg_arity);
         try b.push(.{ .CallVirtual = .{
             .dst = dst,
             .receiver = recv_reg,
@@ -10252,7 +10305,7 @@ fn lowerResolvedMemberCall(
             .args = run[0],
             .n_args = run[1],
             .arg_params = arg_params,
-            .arg_names = if (arg_params.len == 0) arg_names else &.{},
+            .arg_names = if (arg_params == null) arg_names else &.{},
             .trailing_lambda = b.callTrailingLambda(),
         } });
         return dst;
@@ -10284,6 +10337,86 @@ fn lowerResolvedMemberCall(
         .exact = true,
     } });
     return dst;
+}
+
+/// Bind an explicit-receiver top-level extension to its declaration identity.
+/// Extensions are statically dispatched in Kotlin; the module resolver only
+/// returns a target when receiver compatibility, visibility, and overload
+/// ranking are all provable without a runtime value.
+fn lowerResolvedExtensionCall(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    declared_ty: ?TypeRef,
+) Allocator.Error!?Reg {
+    const recv_ty = declared_ty orelse return null;
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const caller_file = name.span.file;
+    const resolution = b.module.resolveExtensionCall(name.name, recv_ty, shapes, .{
+        .caller_file = caller_file,
+        .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
+    });
+    const func_id = resolution.target orelse return null;
+    const target = b.module.funcById(func_id) orelse return null;
+    // Inline declarations require their own resolved-target lowering strategy:
+    // an ordinary exact call executes InlineOnly wrapper bodies, while a splice
+    // can change lexical lookup for body-local helpers. Keep the declaration
+    // identity on the compatibility path until that strategy consumes FuncId.
+    if (target.is_inline) return null;
+
+    recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
+    const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
+    defer if (broad_masks) |masks| b.allocator.free(masks);
+    b.pending_arg_broad_masks = broad_masks;
+    const arg_arity = try argFnArities(b, target, args, ast_arg_names, 1);
+    defer if (arg_arity) |arities| b.allocator.free(arities);
+    const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
+    defer if (arg_generic) |flags| b.allocator.free(flags);
+    b.pending_arg_fn_generic = arg_generic;
+
+    const recv_reg = try lowerReceiver(b, receiver);
+    const args_start = b.allocReg();
+    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
+
+    const user_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+    const arg_names: []?ConstId = if (user_names.len == 0)
+        &.{}
+    else blk: {
+        const names = try b.allocator.alloc(?ConstId, user_names.len + 1);
+        names[0] = null;
+        @memcpy(names[1..], user_names);
+        break :blk names;
+    };
+    const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
+    const dst = b.allocReg();
+    try b.push(.{ .Call = .{
+        .dst = dst,
+        .func = func_id,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = args_start,
+        .n_args = run[1] + 1,
+        .arg_names = arg_names,
+        .type_args = type_args,
+        .exact = true,
+    } });
+    return dst;
+}
+
+fn staticReceiverHasNoCompetingCallable(
+    b: *FuncBuilder,
+    receiver_ty: ?TypeRef,
+    name: []const u8,
+) bool {
+    const ty = receiver_ty orelse return false;
+    const head = typeHead(ty.name);
+    const hierarchy = b.module.registry.hierarchy_shadow_names.get(head) orelse return false;
+    if (!hierarchy.complete or hierarchy.names.contains(name)) return false;
+    return !b.module.extCouldApply(b.allocator, head, name);
 }
 
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -10355,13 +10488,29 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
         const dst = b.allocReg();
-        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
         // A receiver whose static type is an unbounded type parameter declares
         // no members, so the runtime class must not be consulted at all: the
         // in-scope callable is the only candidate Kotlin ever had.
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
             b.isErasedRecvParam(receiver.Path.segments[0].name);
+        const callable_shape_known = b.isReceiverLambdaParam(name.name) or
+            b.isLocalExtFn(name.name);
+        if (recv_erased or
+            (callable_shape_known and staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
+        {
+            orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = local_reg,
+                .receiver = recv,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
         try b.push(.{ .CallMemberOrValue = .{
             .dst = dst,
             .receiver = recv,
@@ -10573,6 +10722,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             }
         }
     }
+
+    if (try lowerResolvedExtensionCall(
+        b,
+        receiver,
+        name,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        declared_ty,
+    )) |reg| return reg;
 
     const recv = try lowerReceiver(b, receiver);
     // A class-named receiver (`Snapshot.withMutableSnapshot { … }`, or an
@@ -10874,6 +11033,29 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     } };
     const call_shape = shapeOfAstArg(&b, &predicate_call, null);
     try testing.expectEqualStrings("Boolean", call_shape.ty.?.name);
+}
+
+test "argument maps repeat a vararg slot before a trailing lambda" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+
+    const params = [_]ir.Param{
+        .{ .name = "head", .ty = build.typeInt(), .default = null },
+        .{ .name = "values", .ty = build.typeInt(), .default = null, .is_vararg = true },
+        .{ .name = "block", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null },
+    };
+    var lambda_params: [0]ast.Ident = .{};
+    const args = [_]Expr{
+        .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 2, .kind = .Int, .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 3, .kind = .Int, .span = dummySpan() } },
+        .{ .Lambda = .{ .params = &lambda_params, .body = .{ .stmts = &.{}, .span = dummySpan() }, .span = dummySpan() } },
+    };
+    const mapped = (try mapArgsToParams(&b, &params, &args, &.{})).?;
+    defer testing.allocator.free(mapped);
+    try testing.expectEqualSlices(?usize, &.{ 0, 1, 1, 2 }, mapped);
 }
 
 test "lowers null literal" {
@@ -11781,6 +11963,94 @@ test "shared member resolution selects overloads and dispatch forms" {
     const bodyless_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, bodyless_result.dispatch);
     try testing.expectEqual(final_pick, bodyless_result.target.?);
+}
+
+test "receiver callable emission respects members and lazy extensions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    var names = std.StringHashMap(void).init(a);
+    try names.put("member", {});
+    try m.registry.hierarchy_shadow_names.put("Target", .{
+        .names = names,
+        .complete = true,
+    });
+
+    const ext = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = ext,
+        .name = "extension",
+        .fqn = "sample.extension",
+        .package = "sample",
+        .params = &.{},
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "extension", .id = ext });
+    try m.decl_sigs.put(ext.int(), .{
+        .receiver_ty = .{ .name = "Target", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const target_reg = b.allocReg();
+    try b.bind("target", target_reg);
+    try b.setLocalDeclType("target", "Target");
+    for ([_][]const u8{ "value", "member", "extension" }) |name| {
+        try b.bind(name, b.allocReg());
+        try b.markParam(name);
+        try b.markReceiverLambdaParam(name);
+        try b.markReceiverLambdaArity(name, 0);
+    }
+
+    var receiver_segments = [_]ast.Ident{.{
+        .name = "target",
+        .span = dummySpan(),
+    }};
+    var receiver = Expr{ .Path = .{
+        .segments = &receiver_segments,
+        .span = dummySpan(),
+    } };
+
+    const Expect = struct {
+        fn lower(
+            builder: *FuncBuilder,
+            recv: *Expr,
+            name: []const u8,
+            tag: std.meta.Tag(ir.Inst),
+        ) !void {
+            var callee = Expr{ .Member = .{
+                .receiver = recv,
+                .name = .{ .name = name, .span = dummySpan() },
+                .safe = false,
+                .span = dummySpan(),
+            } };
+            const call = Expr{ .Call = .{
+                .callee = &callee,
+                .args = &.{},
+                .arg_names = &.{},
+                .type_args = &.{},
+                .is_infix = false,
+                .span = dummySpan(),
+            } };
+            _ = try lowerExpr(builder, &call);
+            const insts = builder.blocks.items[builder.cur.int()].insts;
+            try testing.expectEqual(tag, std.meta.activeTag(insts[insts.len - 1]));
+        }
+    };
+
+    try Expect.lower(&b, &receiver, "value", .CallValueWithThis);
+    try Expect.lower(&b, &receiver, "member", .CallMemberOrValue);
+    try Expect.lower(&b, &receiver, "extension", .CallMemberOrValue);
 }
 
 test "lowers postfix not-null assert" {

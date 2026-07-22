@@ -153,6 +153,7 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "unsigned/src/kotlin/UProgressionUtil.kt",
     "unsigned/src/kotlin/UIntRange.kt",
     "unsigned/src/kotlin/ULongRange.kt",
+    "unsigned/src/kotlin/UMath.kt",
     "src/kotlin/util/KotlinVersion.kt",
     "src/kotlin/collections/PrimitiveIterators.kt",
     "src/kotlin/collections/Arrays.kt",

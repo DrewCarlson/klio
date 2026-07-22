@@ -458,6 +458,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
+        var receiver_names = try compose_pass.collectComposableReceiverNames(allocator, decls.items);
+        defer receiver_names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
         var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
@@ -479,6 +481,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             // every collector below must read the decoded section instead.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
+            try composeBaseReceiverNames(&receiver_names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
             try composeBaseFactories(&factories, base_decls);
             try composeBaseSinkArity(&sink_arity, base_decls);
@@ -506,6 +509,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_last_param = null;
         compose_pass.active_sink_content_reach = &sink_content_reach;
         defer compose_pass.active_sink_content_reach = null;
+        compose_pass.active_composable_receiver_names = &receiver_names;
+        defer compose_pass.active_composable_receiver_names = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -2150,7 +2155,8 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
-        if (module.classIndexEntryByName(c.name.name)) |cid| {
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        if (module.classIdByFqn(cfqn)) |cid| {
             if (cid.int() < module.classes.items.len and module.classes.items[cid.int()].primary_params.len == 0) {
                 module.classes.items[cid.int()].primary_params = try ir.lower.decl.classPrimaryParams(a, c);
             }
@@ -2170,6 +2176,7 @@ fn buildModuleWithOverrides(
             const f = &d.Function;
             const id = module.nextFuncId();
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
+            const host_backed = f.receiver_type == null and stdlib.implementation(fqn) != null;
             // The header stub carries the full declared parameter list (the
             // same `loweredTypeRef` rendering the phase-2 body install uses),
             // not just a receiver placeholder: class methods lower between
@@ -2268,6 +2275,7 @@ fn buildModuleWithOverrides(
                 .is_inline = f.is_inline,
                 .is_suspend = f.is_suspend,
                 .has_body = f.body != null,
+                .host_backed = host_backed,
             });
             try module.decl_span.put(id.int(), f.span);
             if (f.body != null) try module.decl_ast_body.put(id.int(), {});
@@ -2513,7 +2521,7 @@ fn buildModuleWithOverrides(
 
         const body_prop_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const body_prop_dual = !std.mem.eql(u8, body_prop_cfqn, c.name.name);
-        const body_prop_class_id = module.classId(body_prop_cfqn) orelse module.classId(c.name.name);
+        const body_prop_class_id = module.classIdByFqn(body_prop_cfqn);
         const body_prop_param_types: []const ir.Param = if (body_prop_class_id) |cid|
             module.classes.items[cid.int()].primary_params
         else
@@ -4239,15 +4247,12 @@ fn retainDecl(
             // construction): a same-named actual elsewhere implements a
             // different declaration.
             if (actual_func_names.contains(fqn)) return false;
-            // Expect-with-implementation drops remain — the next no-holes
-            // slice. Retaining them requires the link to bind each header
-            // under its LOWERED fqn, and the registry's member-form
-            // registrations (`kotlin.String.repeat`) do not align with the
-            // receiverless lowered form (`kotlin.text.repeat`); a retained
-            // header the link cannot bind hijacks member dispatch. The
-            // registry needs declaration-aligned entries (or the manifest)
-            // before these drops can die.
-            if (stdlib.implementation(fqn) != null) return false;
+            // A receiverless declaration whose exact FQN is in the host
+            // registry has the ordinary FuncId ABI and survives. Receiver-
+            // formed expects stay deferred until their declaration identity
+            // carries the receiver-qualified host ABI; treating the package
+            // FQN as that ABI would collapse unrelated receiver overloads.
+            if (stdlib.implementation(fqn) != null) return f.receiver_type == null;
             if (f.receiver_type == null) {
                 const kotlin_fqn = try std.fmt.allocPrint(a, "kotlin.{s}", .{f.name.name});
                 if (stdlib.implementation(kotlin_fqn) != null) return false;
@@ -4520,6 +4525,13 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
         .Object => |*o| for (o.members) |*m| try composeBaseNameDecl(names, m),
         else => {},
     }
+}
+
+/// Baked-base equivalent of `collectComposableReceiverNames`: names of
+/// `@Composable` functions reachable via member syntax (extensions or
+/// class/object members).
+fn composeBaseReceiverNames(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try compose_pass.collectReceiverInto(set, @as([*]const Decl, @ptrCast(d))[0..1], false);
 }
 
 /// Add the names of baked-base functions with a `@Composable`-typed lambda

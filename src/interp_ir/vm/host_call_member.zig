@@ -8458,7 +8458,7 @@ pub fn invokeVirtualMember(
     slot: MethodSlotId,
     args: []const Value,
     arg_names: []const ?[]const u8,
-    arg_params: []const u32,
+    arg_params: ?[]const u32,
 ) Allocator.Error!EvalResult {
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
@@ -8473,8 +8473,8 @@ pub fn invokeVirtualMember(
             if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
                 return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
             }
-            if (arg_params.len != 0) {
-                return callCallableIndexed(self, allocator, module, root, receiver, receiver, args, arg_params);
+            if (arg_params) |params| {
+                return callCallableIndexed(self, allocator, module, root, receiver, receiver, args, params);
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
@@ -8495,7 +8495,7 @@ pub fn invokeVirtualMember(
     const target = module.methodSlotTarget(runtime_class, slot) orelse
         return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
 
-    if (arg_params.len != 0) {
+    if (arg_params) |params| {
         const sig = module.decl_sigs.get(target.int());
         if (sig != null and !sig.?.has_body) {
             const instance = receiver.Instance.borrow();
@@ -8503,10 +8503,10 @@ pub fn invokeVirtualMember(
             instance.deinit();
             if (sam_target) |callable| {
                 const root = FuncId.from(slot.int());
-                return callCallableIndexed(self, allocator, module, root, receiver, &callable, args, arg_params);
+                return callCallableIndexed(self, allocator, module, root, receiver, &callable, args, params);
             }
         }
-        return callFuncIndexedRec(self, allocator, module, target, FuncId.from(slot.int()), receiver, args, arg_params);
+        return callFuncIndexedRec(self, allocator, module, target, FuncId.from(slot.int()), receiver, args, params);
     }
 
     var any_named = false;

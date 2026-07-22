@@ -276,6 +276,12 @@ pub const Inst = union(enum) {
         callee: Reg,
         parts: []SpreadPart,
         arg_names: []?ConstId = &.{},
+        /// Statically resolved member slot for a spread call. When present,
+        /// `callee` is the receiver and `arg_params` maps each source part to
+        /// its declaration parameter before spread expansion duplicates it.
+        virtual_slot: ?MethodSlotId = null,
+        arg_params: ?[]u32 = null,
+        trailing_lambda: bool = false,
         /// When set, this is a member-dispatched spread call: the
         /// flattened args are passed to method `member` on the value in
         /// `callee` (the receiver), rather than invoking `callee` as a
@@ -386,11 +392,12 @@ pub const Inst = union(enum) {
         slot: MethodSlotId,
         args: Reg,
         n_args: u32,
-        /// For a named call, the declaration parameter index filled by each
-        /// source-order argument (receiver excluded). Empty for positional
-        /// calls. This is resolved against the slot root during lowering, so
-        /// an override's parameter names are irrelevant at runtime.
-        arg_params: []u32 = &.{},
+        /// The declaration parameter index filled by each source-order
+        /// argument (receiver excluded). Null selects ordinary positional
+        /// binding; a non-null empty map represents an indexed zero-argument
+        /// call such as an empty vararg. This is resolved against the slot root
+        /// during lowering, so override parameter names are irrelevant.
+        arg_params: ?[]u32 = null,
         arg_names: []?ConstId = &.{},
         trailing_lambda: bool = false,
     },
@@ -1443,6 +1450,10 @@ pub const Module = struct {
         is_suspend: bool = false,
         /// The declaration carries a source body.
         has_body: bool = false,
+        /// The declaration has an exact fully-qualified host binding. A
+        /// bodyless declaration with this bit uses the ordinary FuncId call
+        /// ABI; link finalization attaches the host function to that identity.
+        host_backed: bool = false,
     };
 
     pub const MemberDispatch = enum {
@@ -1467,6 +1478,15 @@ pub const Module = struct {
         /// Restrict the query to private declarations. Used by bare own-member
         /// calls, which can commit directly without considering virtual peers.
         private_only: bool = false,
+    };
+
+    pub const ExtensionResolveCtx = struct {
+        caller_file: FileId,
+        caller_package: []const u8,
+    };
+
+    pub const ExtensionResolution = struct {
+        target: ?FuncId = null,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -1714,6 +1734,213 @@ pub const Module = struct {
         }
     }
 
+    fn staticTypeHead(name: []const u8) []const u8 {
+        var head = applicability.simpleName(name);
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        return std.mem.trimEnd(u8, head, "?");
+    }
+
+    fn staticSubtypeName(raw: *anyopaque, sub_name: []const u8, super_name: []const u8) bool {
+        const self: *const Module = @ptrCast(@alignCast(raw));
+        const sub = staticTypeHead(sub_name);
+        const super = staticTypeHead(super_name);
+        if (std.mem.eql(u8, sub, super)) return false;
+        if (self.classIsOrExtends(sub, super)) return true;
+        for (applicability.builtinSupersOf(sub)) |candidate| {
+            if (std.mem.eql(u8, candidate, super)) return true;
+        }
+        return false;
+    }
+
+    fn staticTypeVar(raw: *anyopaque, fid: FuncId, name: []const u8) bool {
+        const self: *const Module = @ptrCast(@alignCast(raw));
+        return self.funcTypeParamIndex(fid, staticTypeHead(name)) != null;
+    }
+
+    fn staticReceiverAccepts(self: *const Module, fid: FuncId, receiver: TypeRef, param: TypeRef) bool {
+        if (receiver.nullable and !param.nullable) return false;
+        const actual = staticTypeHead(receiver.name);
+        const declared = staticTypeHead(param.name);
+        if (actual.len == 0 or declared.len == 0) return false;
+        if (std.mem.eql(u8, declared, "Any")) return true;
+        if (self.funcTypeParamIndex(fid, declared) != null) {
+            if (self.registry.func_type_param_bounds.get(fid)) |bounds| {
+                for (bounds) |bound| {
+                    if (!std.mem.eql(u8, bound.param, declared)) continue;
+                    if (!self.staticReceiverAccepts(fid, receiver, .{
+                        .name = bound.bound,
+                        .nullable = false,
+                        .args = &.{},
+                    })) return false;
+                }
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, actual, declared)) {
+            const actual_qualified = std.mem.indexOfScalar(u8, receiver.name, '.') != null;
+            const declared_qualified = std.mem.indexOfScalar(u8, param.name, '.') != null;
+            if (actual_qualified and declared_qualified and !std.mem.eql(u8, receiver.name, param.name)) return false;
+            return true;
+        }
+        if (self.classIsOrExtends(actual, declared)) return true;
+        for (applicability.builtinSupersOf(actual)) |candidate| {
+            if (std.mem.eql(u8, candidate, declared)) return true;
+        }
+        return false;
+    }
+
+    fn staticArgAccepts(self: *const Module, fid: FuncId, arg: applicability.ArgShape, param: TypeRef) bool {
+        if (arg.ty) |ty| return self.staticReceiverAccepts(fid, ty, param);
+        const declared = staticTypeHead(param.name);
+        if (std.mem.eql(u8, declared, "Any")) return true;
+        if (self.funcTypeParamIndex(fid, declared) != null) return false;
+        if (arg.literal_kind) |kind| return switch (kind) {
+            .numeric => std.mem.eql(u8, declared, "Byte") or
+                std.mem.eql(u8, declared, "Short") or
+                std.mem.eql(u8, declared, "Int") or
+                std.mem.eql(u8, declared, "Long") or
+                std.mem.eql(u8, declared, "Float") or
+                std.mem.eql(u8, declared, "Double") or
+                std.mem.eql(u8, declared, "UByte") or
+                std.mem.eql(u8, declared, "UShort") or
+                std.mem.eql(u8, declared, "UInt") or
+                std.mem.eql(u8, declared, "ULong") or
+                std.mem.eql(u8, declared, "Number"),
+            .string => std.mem.eql(u8, declared, "String") or std.mem.eql(u8, declared, "CharSequence"),
+            .boolean => std.mem.eql(u8, declared, "Boolean"),
+            .char => std.mem.eql(u8, declared, "Char"),
+        };
+        if (arg.is_lambda) {
+            return std.mem.startsWith(u8, declared, "Function") or std.mem.indexOf(u8, param.name, "->") != null;
+        }
+        return false;
+    }
+
+    fn extensionKeyGreater(a: [8]i32, b: [8]i32) bool {
+        inline for (0..7) |i| {
+            if (a[i] != b[i]) return a[i] > b[i];
+        }
+        return false;
+    }
+
+    fn extensionKeyEquivalent(a: [8]i32, b: [8]i32) bool {
+        return std.mem.eql(i32, a[0..7], b[0..7]);
+    }
+
+    /// Resolve an explicit-receiver top-level extension call from declaration
+    /// metadata alone. Only a statically proven receiver and a unique overload
+    /// at the innermost visible scope produce a target; runtime-value evidence
+    /// and declaration-order tie breaking are deliberately unavailable here.
+    pub fn resolveExtensionCall(
+        self: *const Module,
+        name: []const u8,
+        receiver: TypeRef,
+        args: []const applicability.ArgShape,
+        ctx: ExtensionResolveCtx,
+    ) ExtensionResolution {
+        for (args) |arg| {
+            if (arg.named != null or arg.is_spread) return .{};
+        }
+
+        var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var ids: std.ArrayList(FuncId) = .empty;
+        var best_tier: u8 = 255;
+        for (self.funcsBySimpleName(name)) |fid| {
+            const f = self.funcById(fid) orelse continue;
+            const ds = self.decl_sigs.get(fid.int());
+            const kind = if (ds) |decl| decl.kind else f.kind;
+            if (kind != .top_level_extension or f.params.len == 0 or
+                !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            // Kotlin runtime declarations still mix source bodies with host
+            // representations and name-based lexical globals. Their callable
+            // ABI becomes statically bindable with the host symbol manifest;
+            // ordinary user and library declarations already use the IR ABI.
+            if (pkgHeadIs(f.package, "kotlin")) continue;
+            const has_body = f.hasBody() or (if (ds) |decl| decl.has_body else false) or
+                self.decl_ast_body.contains(fid.int());
+            if (!has_body) continue;
+            if (self.registry.private_fn_files.get(fid)) |decl_file| {
+                if (decl_file.int() != ctx.caller_file.int()) continue;
+            }
+            const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
+            if (!self.staticReceiverAccepts(fid, receiver, recv_param)) continue;
+            if (f.params.len != args.len + 1) continue;
+            var has_vararg = false;
+            for (f.params[1..]) |param| {
+                if (param.is_vararg) {
+                    has_vararg = true;
+                    break;
+                }
+            }
+            if (has_vararg) continue;
+            var args_proven = true;
+            for (args, f.params[1..]) |arg, param| {
+                if (!self.staticArgAccepts(fid, arg, param.ty)) {
+                    args_proven = false;
+                    break;
+                }
+            }
+            if (!args_proven) continue;
+            const tier = self.scopeTier(f.fqn, f.package, name, ctx.caller_package, ctx.caller_file);
+            if (tier > 3 or tier > best_tier) continue;
+            if (tier < best_tier) {
+                ids.clearRetainingCapacity();
+                best_tier = tier;
+            }
+            ids.append(sa, fid) catch return .{};
+        }
+        if (ids.items.len == 0) return .{};
+
+        const sigs = sa.alloc(applicability.SigView, ids.items.len) catch return .{};
+        for (ids.items, 0..) |fid, i| {
+            const f = self.funcById(fid).?;
+            sigs[i] = .{
+                .params = f.params,
+                .has_body = true,
+                .low_priority = f.low_priority,
+                .is_extension = true,
+                .fid = fid,
+                .package = f.package,
+            };
+        }
+        const scope = applicability.ApplicabilityScope{
+            .member = true,
+            .rank_extensions = true,
+            .is_extension = true,
+            .receiver = .{ .ty = receiver },
+            .all_candidates = sigs,
+            .ctx = @ptrCast(@constCast(self)),
+            .ext_is_subtype_name = staticSubtypeName,
+            .ext_known_package = isShippedPackage,
+            .type_var = staticTypeVar,
+        };
+
+        var any_ordinary = false;
+        for (sigs) |*sig| {
+            const score = applicability.applicable(sig, args, scope) orelse continue;
+            if (score.ext_key.?[0] != 0 and !score.low_priority) any_ordinary = true;
+        }
+        var best: ?FuncId = null;
+        var best_key: [8]i32 = .{std.math.minInt(i32)} ** 8;
+        var tied = false;
+        for (sigs, ids.items) |*sig, fid| {
+            const score = applicability.applicable(sig, args, scope) orelse continue;
+            const key = score.ext_key.?;
+            if (key[0] == 0 or (any_ordinary and score.low_priority)) continue;
+            if (best == null or extensionKeyGreater(key, best_key)) {
+                best = fid;
+                best_key = key;
+                tied = false;
+            } else if (extensionKeyEquivalent(key, best_key)) {
+                tied = true;
+            }
+        }
+        if (tied) return .{};
+        return .{ .target = best };
+    }
+
     /// Resolve one member name against the declarations owned by the static
     /// receiver class. Candidate applicability and overload ranking are shared
     /// with runtime dispatch; this function additionally classifies whether
@@ -1946,6 +2173,35 @@ pub const Module = struct {
         return true;
     }
 
+    fn mergeInheritedMethod(
+        self: *const Module,
+        allocator: Allocator,
+        map: *std.AutoHashMap(u32, FuncId),
+        slot: u32,
+        incoming: FuncId,
+    ) Allocator.Error!void {
+        const gop = try map.getOrPut(slot);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = incoming;
+            return;
+        }
+        const existing = gop.value_ptr.*;
+        if (existing.int() == incoming.int()) return;
+
+        if (self.decl_sigs.get(existing.int())) |sig| {
+            if (sig.enclosing_class) |owner| {
+                if (try self.overridesSlot(allocator, owner, existing, incoming)) return;
+            }
+        }
+        if (self.decl_sigs.get(incoming.int())) |sig| {
+            if (sig.enclosing_class) |owner| {
+                if (try self.overridesSlot(allocator, owner, incoming, existing)) {
+                    gop.value_ptr.* = incoming;
+                }
+            }
+        }
+    }
+
     fn linkMethodClass(
         self: *Module,
         allocator: Allocator,
@@ -1961,7 +2217,14 @@ pub const Module = struct {
             try self.linkMethodClass(allocator, maps, state, super_id);
             if (super_id.int() >= maps.len) continue;
             var inherited = maps[super_id.int()].iterator();
-            while (inherited.next()) |entry| try maps[cid.int()].put(entry.key_ptr.*, entry.value_ptr.*);
+            while (inherited.next()) |entry| {
+                try self.mergeInheritedMethod(
+                    allocator,
+                    &maps[cid.int()],
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                );
+            }
         }
 
         // `Class.methods` contains executable bodies only; abstract/interface
@@ -2829,8 +3092,11 @@ pub const Module = struct {
     /// (`paramHasDefault`'s null-`defaults` fallback).
     fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
-        const declared_body = if (self.decl_sigs.get(id.int())) |ds| ds.has_body else false;
-        if (!f.hasBody() and !declared_body) return null;
+        const declared_executable = if (self.decl_sigs.get(id.int())) |ds|
+            ds.has_body or ds.host_backed
+        else
+            false;
+        if (!f.hasBody() and !declared_executable) return null;
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
         return .{
             .params = f.params[off..],
@@ -3815,7 +4081,7 @@ pub const Module = struct {
     /// is their positive complement for the no-exact-fit fallback.
     fn varargArityFits(self: *const Module, id: FuncId, want: usize) bool {
         if (self.decl_sigs.get(id.int())) |ds| {
-            if (!ds.has_body) return false;
+            if (!ds.has_body and !ds.host_backed) return false;
             if (!ds.arity.has_vararg) return false;
             return want >= ds.arity.required;
         }
@@ -4070,7 +4336,9 @@ pub const Module = struct {
         // then a declared-arity fallback covers the header-stub / intrinsic-
         // backed forms the ladder (body-only) cannot rank.
         var heur: ?FuncId = if (ctx.cast_pick) |cp| cp else self.phaseBLadder(name, args, caller_pkg, caller_file, ctx.owner_class, ctx.receiver_known);
-        if (heur == null and ctx.cast_pick == null and !isAliasName(name)) {
+        if (heur == null and ctx.cast_pick == null and
+            (!isAliasName(name) or self.hasHostBackedCandidate(name)))
+        {
             heur = self.phaseBFallback(name, caller_pkg, caller_file, args.len, args, ctx.owner_class, ctx.receiver_known);
         }
         // Prefer the same-name extension overload whose declared receiver
@@ -4158,9 +4426,51 @@ pub const Module = struct {
                 (if (heur) |h| t.int() == h.int() else false)
             else
                 false;
-            if (res.target) |t| res.ty_proven = self.tyProvenPick(t, args) or recv_final;
+            if (res.target) |t| {
+                res.ty_proven = self.tyProvenPick(t, args) or recv_final or
+                    self.uniqueHostBackedPick(t, name, caller_pkg, caller_file, args);
+            }
         }
         return res;
+    }
+
+    fn hasHostBackedCandidate(self: *const Module, name: []const u8) bool {
+        for (self.funcsBySimpleName(name)) |id| {
+            if (self.decl_sigs.get(id.int())) |ds| {
+                if (ds.host_backed) return true;
+            }
+        }
+        return false;
+    }
+
+    /// A unique applicable host declaration is overload-final at lowering.
+    /// This makes the exact FuncId call skip the VM's value-typed overload
+    /// retry while preserving that retry for source families whose static
+    /// evidence is still incomplete.
+    fn uniqueHostBackedPick(
+        self: *const Module,
+        target: FuncId,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+    ) bool {
+        const target_sig = self.decl_sigs.get(target.int()) orelse return false;
+        if (!target_sig.host_backed) return false;
+        const target_func = self.funcById(target) orelse return false;
+        const tier = self.bareCallTier(target_func, name, caller_pkg, caller_file);
+        var applicable_count: usize = 0;
+        for (self.funcsBySimpleName(name)) |id| {
+            const f = self.funcById(id) orelse continue;
+            const ds = self.decl_sigs.get(id.int()) orelse continue;
+            if (!ds.host_backed or ds.kind != .plain) continue;
+            if (self.bareCallTier(f, name, caller_pkg, caller_file) != tier) continue;
+            const sv = self.sigViewForApplicability(id) orelse continue;
+            if (applicability.applicable(&sv, args, .{}) == null) continue;
+            applicable_count += 1;
+            if (applicable_count > 1) return false;
+        }
+        return applicable_count == 1;
     }
 
     /// Whether every positional argument carries declared-type evidence whose
@@ -5516,6 +5826,15 @@ test "method slots link generic overrides and multiple interface roots" {
         .methods = &.{}, .init_block = null, .companion = null, .supertypes = child_super_ids,
         .supertype_refs = child_supers, .is_open = true,
     });
+    const redundant_supers = try a.alloc(TypeRef, 2);
+    redundant_supers[0] = .{ .name = "Child", .nullable = false, .args = &.{} };
+    redundant_supers[1] = .{ .name = "Base", .nullable = false, .args = base_args };
+    const redundant_super_ids = try a.dupe(ClassId, &.{ child, base });
+    const redundant = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Redundant", .fqn = "sample.Redundant", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = redundant_super_ids,
+        .supertype_refs = redundant_supers,
+    });
     const left = try m.addClass(a, .{
         .id = ClassId.from(0), .name = "Left", .fqn = "sample.Left", .primary_params = &.{},
         .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{}, .is_abstract = true, .is_interface = true,
@@ -5562,6 +5881,7 @@ test "method slots link generic overrides and multiple interface roots" {
 
     try m.linkMethodSlots(a);
     try testing.expectEqual(child_put, m.methodSlotTarget(child, MethodSlotId.fromFunc(base_put)).?);
+    try testing.expectEqual(child_put, m.methodSlotTarget(redundant, MethodSlotId.fromFunc(base_put)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(left_run)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(right_run)).?);
     const string_args = [_]applicability.ArgShape{.{
@@ -5684,6 +6004,48 @@ test "a bare call never binds a member extension of an unrelated class" {
     defer a.free(own.candidate_set);
     try testing.expect(own.target != null);
     try testing.expectEqual(member_with.int(), own.target.?.int());
+}
+
+test "extension resolver proves receiver, scope, and overload identity" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const int_arg = try pushTestFuncOpts(&m, a, "paint", "app.paint", "app", 1, .{ .extension = true });
+    m.funcs.items[int_arg.int()].kind = .top_level_extension;
+    const string_arg = try pushTestFuncOpts(&m, a, "paint", "app.paint", "app", 1, .{ .extension = true, .param_ty = "String" });
+    m.funcs.items[string_arg.int()].kind = .top_level_extension;
+    const int_receiver = try pushTestFuncOpts(&m, a, "paint", "app.paint", "app", 1, .{ .extension = true });
+    m.funcs.items[int_receiver.int()].kind = .top_level_extension;
+    m.funcs.items[int_receiver.int()].params[0].ty.name = "Int";
+    _ = try pushTestFuncOpts(&m, a, "hidden", "other.hidden", "other", 0, .{ .extension = true });
+    m.funcs.items[m.funcs.items.len - 1].kind = .top_level_extension;
+    try m.rebuildFuncNameIndex(a);
+
+    const typed_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
+    }};
+    const resolved = m.resolveExtensionCall("paint", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &typed_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
+    try testing.expect(resolved.target != null);
+    try testing.expectEqual(int_arg.int(), resolved.target.?.int());
+
+    const ambiguous = m.resolveExtensionCall("paint", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &.{.{}}, .{ .caller_file = FileId.from(0), .caller_package = "app" });
+    try testing.expect(ambiguous.target == null);
+
+    const out_of_scope = m.resolveExtensionCall("hidden", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &.{}, .{ .caller_file = FileId.from(0), .caller_package = "app" });
+    try testing.expect(out_of_scope.target == null);
 }
 
 test "symbol index prefers the caller's own package" {
@@ -6112,6 +6474,54 @@ test "resolveCall: an exact non-extension resolves to a static Call" {
     try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
     try testing.expectEqual(Module.Confidence.exact, res.confidence);
     try testing.expectEqual(g.int(), res.target.?.int());
+}
+
+test "resolveCall binds bodyless host declarations by FuncId" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const println = try pushTestFuncOpts(&m, a, "println", "kotlin.io.println", "kotlin.io", 1, .{ .stub = true });
+    try m.decl_user_arity.put(println.int(), .{ .required = 1, .total = 1, .has_vararg = false });
+    try putTestDeclSig(&m, a, println, "Any", 1);
+    try m.decl_sigs.put(println.int(), .{
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = m.decl_user_sig.get(println.int()).?,
+        .host_backed = true,
+    });
+
+    const ints = try pushTestFuncOpts(&m, a, "intArrayOf", "kotlin.intArrayOf", "kotlin", 1, .{
+        .stub = true,
+        .last_vararg = true,
+    });
+    try m.decl_user_arity.put(ints.int(), .{ .required = 0, .total = 1, .has_vararg = true });
+    try putTestDeclSig(&m, a, ints, "Int", 1);
+    try m.decl_sigs.put(ints.int(), .{
+        .arity = .{ .required = 0, .total = 1, .has_vararg = true },
+        .sig = m.decl_user_sig.get(ints.int()).?,
+        .host_backed = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const println_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+    }};
+    const print_res = try m.resolveCall(a, "println", "app", FileId.from(0), &println_args, false, .{});
+    defer a.free(print_res.candidate_set);
+    try testing.expectEqual(println.int(), print_res.target.?.int());
+    try testing.expectEqual(Module.EmitForm.Call, print_res.emit_form);
+    try testing.expect(print_res.ty_proven);
+
+    const int_args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    const ints_res = try m.resolveCall(a, "intArrayOf", "app", FileId.from(0), &int_args, false, .{});
+    defer a.free(ints_res.candidate_set);
+    try testing.expectEqual(ints.int(), ints_res.target.?.int());
+    try testing.expectEqual(Module.EmitForm.Call, ints_res.emit_form);
+    try testing.expect(ints_res.ty_proven);
 }
 
 test "resolveCall: a resolved extension in a receiver context defers to CallMemberOrGlobal" {

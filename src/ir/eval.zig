@@ -4381,11 +4381,17 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
     defer arg_values.deinit(allocator);
     var effective_names: std.ArrayList(?[]const u8) = .empty;
     defer effective_names.deinit(allocator);
+    var effective_params: std.ArrayList(u32) = .empty;
+    defer effective_params.deinit(allocator);
     const in_names = try resolveArgNames(allocator, frame.module, cs.arg_names);
     defer allocator.free(in_names);
     for (cs.parts, 0..) |part, i| {
         const v = frame.read(part.reg);
         const name: ?[]const u8 = if (i < in_names.len) in_names[i] else null;
+        const param: ?u32 = if (cs.arg_params) |params|
+            (if (i < params.len) params[i] else null)
+        else
+            null;
         if (part.is_spread) {
             switch (try spreadItems(allocator, &v)) {
                 .ok => |items| {
@@ -4393,6 +4399,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
                     for (items) |item| {
                         try arg_values.append(allocator, item);
                         try effective_names.append(allocator, null);
+                        if (param) |index| try effective_params.append(allocator, index);
                     }
                 },
                 .err => |e| return raiseStep(frame, e),
@@ -4400,9 +4407,38 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
         } else {
             try arg_values.append(allocator, v);
             try effective_names.append(allocator, name);
+            if (param) |index| try effective_params.append(allocator, index);
         }
     }
-    if (cs.member) |mid| {
+    if (cs.virtual_slot) |slot| {
+        if (comptime !@hasDecl(H, "invokeVirtualMember")) {
+            return raiseStep(frame, .{ .Type = "virtual CallSpread is unsupported by this host" });
+        }
+        if (cs.arg_params == null or effective_params.items.len != arg_values.items.len) {
+            return raiseStep(frame, .{ .Type = "virtual CallSpread has an invalid parameter map" });
+        }
+        callee_v.retain();
+        defer callee_v.release(allocator);
+        const prev_tl = if (cs.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
+            H.setTrailingMemberCall(true)
+        else
+            false;
+        const result = host.invokeVirtualMember(
+            allocator,
+            &callee_v,
+            slot,
+            arg_values.items,
+            &.{},
+            effective_params.items,
+        );
+        if (cs.trailing_lambda) {
+            if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
+        }
+        switch (try result) {
+            .ok => |rv| try frame.write(cs.dst, rv),
+            .err => |e| return raiseStep(frame, e),
+        }
+    } else if (cs.member) |mid| {
         const mname = constStr(frame.module, mid) orelse
             return raiseStep(frame, .{ .Type = "CallSpread: member not a string const" });
         // The receiver is borrowed for the call's whole duration;

@@ -127,6 +127,7 @@ Run any program with:
 | `local_fun_type_shadowing.kt` | Same-arity shadowing resolves by parameter TYPE: a lambda argument cannot bind a local `validate(state: Int)`, so `validate { … }` inside it resolves outward to `Checker.validate(block)` instead of recursing. |
 | `labeled_this_in_object_literal.kt` | Inside an object literal written in a receiver lambda, `this@build` names the lambda's receiver, and a bare name the object does not own resolves against it. |
 | `delegated_var_reads_through.kt` | A `var x by D` local reads through the delegate on every read (including inside a string template and a lambda), rather than caching the value at the declaration. |
+| `atomic_ctor_param_overload.kt` | A property initializer retains its constructor parameter's static type and selects the matching overload even when a dependency exports a same-simple-name class. |
 | `atomic_named_compare_and_set.kt` | A named-argument call into a host-backed library member (`compareAndSet(expect = …, update = …)`) binds exactly as the positional form does. |
 | `member_wins_over_extension.kt` | A member wins over a same-named extension, including on builtin types, so an extension that forwards to `this.<member>()` reaches the member instead of itself. |
 | `scalar_typealias_overload.kt` | A scalar typealias (`= Long`) is transparent for overload resolution, so a Long argument matches an aliased parameter even against a zero-arg overload of the same name. |
