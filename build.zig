@@ -377,6 +377,9 @@ pub fn build(b: *std.Build) void {
     // every other target; wired onto the target module universe + target zstd +
     // the klio executables below, never onto the host-run build tools.
     const apple_sdk: ?[]const u8 = resolveAppleSdk(b, target);
+    // Android NDK sysroot for the target artifacts (see resolveAndroidNdk). Null
+    // for every other target; wired onto the same artifacts as apple_sdk.
+    const android_ndk: ?AndroidNdk = resolveAndroidNdk(b, target);
 
     // The Compose-UI Skia backend: libklio_skia.so (the compose_ui module
     // dlopens it) is built by the system C++ toolchain because the prebuilt
@@ -410,6 +413,10 @@ pub fn build(b: *std.Build) void {
         var it = mods.valueIterator();
         while (it.next()) |m| wireAppleSdk(b, m.*, sdk);
     }
+    if (android_ndk) |ndk| {
+        var it = mods.valueIterator();
+        while (it.next()) |m| wireAndroidNdk(b, m.*, ndk);
+    }
 
     // The pack format compresses sections with zstd. Zig std ships only a
     // zstd decoder, so the encoder is linked from the vendored zstd C
@@ -418,6 +425,7 @@ pub fn build(b: *std.Build) void {
     // attached to the pack module flow into every artifact that imports it.
     const zstd = buildZstd(b, target, optimize);
     if (apple_sdk) |sdk| wireAppleSdk(b, zstd.root_module, sdk);
+    if (android_ndk) |ndk| wireAndroidNdk(b, zstd.root_module, ndk);
     const pack_mod = mods.get("pack").?;
     pack_mod.link_libc = true;
     pack_mod.linkLibrary(zstd);
@@ -588,6 +596,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     if (apple_sdk) |sdk| wireAppleSdk(b, exe.root_module, sdk);
+    if (android_ndk) |ndk| wireAndroidNdk(b, exe.root_module, ndk);
     b.installArtifact(exe);
 
     // Build + install the Compose-UI Skia backend as a shared library the
@@ -628,6 +637,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     if (apple_sdk) |sdk| wireAppleSdk(b, harness_exe.root_module, sdk);
+    if (android_ndk) |ndk| wireAndroidNdk(b, harness_exe.root_module, ndk);
     const harness_exe_step = b.step("klio-harness", "Build+install the harness-optimized klio binary");
     harness_exe_step.dependOn(&b.addInstallArtifact(harness_exe, .{}).step);
 
@@ -653,6 +663,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     if (apple_sdk) |sdk| wireAppleSdk(b, mobile_lib.root_module, sdk);
+    if (android_ndk) |ndk| wireAndroidNdk(b, mobile_lib.root_module, ndk);
     // The app host links this archive with the platform toolchain (clang/NDK),
     // not zig, so the Zig compiler-rt/ubsan builtins must travel inside the
     // archive (zig bundles them into an executable, but not a static lib).
@@ -1081,6 +1092,60 @@ fn wireAppleSdk(b: *std.Build, mod: *std.Build.Module, sdk: []const u8) void {
     mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
     mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+}
+
+/// The resolved Android NDK bits an artifact needs to compile C (bionic libc
+/// headers) and link (the per-API libc/crt objects) for an android target.
+const AndroidNdk = struct { sysroot: []const u8, triple: []const u8, api: u32 };
+
+/// Resolve the Android NDK for an android target (null for every other target,
+/// so it is only ever wired onto the target artifacts, never the host tools).
+/// The NDK path comes from `-Dandroid-ndk`, then `$ANDROID_NDK_HOME`, then the
+/// newest `~/Library/Android/sdk/ndk/<version>`. `-Dandroid-api` sets the
+/// platform level (default 24).
+fn resolveAndroidNdk(b: *std.Build, target: std.Build.ResolvedTarget) ?AndroidNdk {
+    const t = target.result;
+    const is_android = t.os.tag == .linux and (t.abi == .android or t.abi == .androideabi);
+    if (!is_android) return null;
+    const ndk = b.option([]const u8, "android-ndk", "Android NDK path (default: $ANDROID_NDK_HOME or the newest ~/Library/Android/sdk/ndk)") orelse
+        defaultAndroidNdk(b) orelse @panic("android target needs -Dandroid-ndk=<path> or ANDROID_NDK_HOME");
+    const api = b.option(u32, "android-api", "Android platform API level (default 24)") orelse 24;
+    // The NDK toolchain prebuilt is a darwin-x86_64 host dir even on Apple silicon.
+    const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot", .{ndk});
+    const triple = switch (t.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .arm => "arm-linux-androideabi",
+        .x86 => "i686-linux-android",
+        else => "aarch64-linux-android",
+    };
+    return .{ .sysroot = sysroot, .triple = triple, .api = api };
+}
+
+/// `$ANDROID_NDK_HOME`, else the newest `~/Library/Android/sdk/ndk/*` (found via a
+/// configure-time shell glob, like `resolveAppleSdk` uses `xcrun`).
+fn defaultAndroidNdk(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("ANDROID_NDK_HOME")) |v| return b.dupe(v);
+    const home = b.graph.environ_map.get("HOME") orelse return null;
+    const ndk_root = b.fmt("{s}/Library/Android/sdk/ndk", .{home});
+    // Pipeline exit is `tail`'s (0) even when the glob matches nothing.
+    const out = b.run(&.{ "sh", "-c", b.fmt("ls -d {s}/*/ 2>/dev/null | sort | tail -1", .{ndk_root}) });
+    var trimmed = std.mem.trim(u8, out, " \n\r\t");
+    if (std.mem.endsWith(u8, trimmed, "/")) trimmed = trimmed[0 .. trimmed.len - 1];
+    if (trimmed.len == 0) return null;
+    return b.dupe(trimmed);
+}
+
+/// Attach the NDK sysroot's header + library search paths to a module so a
+/// C-compiling / libc-linking android artifact resolves `<stdio.h>` and the
+/// bionic libc without a global `--sysroot` (which would poison host tools).
+fn wireAndroidNdk(b: *std.Build, mod: *std.Build.Module, ndk: AndroidNdk) void {
+    mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{ndk.sysroot}) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include/{s}", .{ ndk.sysroot, ndk.triple }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib/{s}/{d}", .{ ndk.sysroot, ndk.triple, ndk.api }) });
+    // Android is PIC/PIE throughout; the static archive links into a PIE host, so
+    // every object (including the vendored zstd C) must be position-independent.
+    mod.pic = true;
 }
 
 /// Build the vendored zstd C library as a static library statically linked
