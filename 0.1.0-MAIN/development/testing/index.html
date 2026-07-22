@@ -1751,6 +1751,11 @@ auto-install (the parity tests then skip).</p>
 checked-in expected output under <code>tests/corpus/expected/</code>, so the
 example corpus is part of <code>zig build itest</code> (it interprets programs,
 so it rides the integration suite, not the fast unit step).</p>
+<p>In-process parity/e2e execution uses the same runtime profile as the CLI:
+<code>safe</code> by default (interpreter plus tracing GC), <code>fast</code> when requested, and
+the no-GC phase arena only under the explicit <code>off</code> profile. Parsing and IR
+lowering remain arena-scoped compiler phases; VM cells use the production
+page-returning slab allocator and are collected at each program boundary.</p>
 <p>The corpus only grows. Removing a <code>.kt</code> from it is a deliberate act
 that requires reviewer sign-off.</p>
 <h2 id="4-stdlib-commontest-suite">4. Stdlib commonTest suite<a class="headerlink" href="#4-stdlib-commontest-suite" title="Permanent link">&para;</a></h2>
