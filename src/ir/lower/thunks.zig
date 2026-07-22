@@ -303,7 +303,7 @@ pub fn lowerAccessorExpr(
     expr: *const Expr,
     name: []const u8,
 ) Allocator.Error!FuncId {
-    return lowerAccessorExprFull(module, owner_class, own_members, null, params, expr, name, null);
+    return lowerAccessorExprFull(module, owner_class, own_members, null, params, null, expr, name, null);
 }
 
 /// Like [`lowerAccessorExpr`] but seeds the lexically-enclosing class's
@@ -322,7 +322,25 @@ pub fn lowerAccessorExprEnclosing(
     name: []const u8,
     expected: ?TypeRef,
 ) Allocator.Error!FuncId {
-    return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, expr, name, expected);
+    return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, null, expr, name, expected);
+}
+
+/// Lower a body-property initializer while preserving the declared types of
+/// the primary-constructor parameters captured by its synthetic function.
+/// Those static types participate in overload resolution inside the
+/// initializer just as they do in an ordinary function body.
+pub fn lowerPropertyInitExpr(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    enclosing_members: ?*const StringSet,
+    params: []const []const u8,
+    declared_params: []const Param,
+    expr: *const Expr,
+    name: []const u8,
+    expected: ?TypeRef,
+) Allocator.Error!FuncId {
+    return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, declared_params, expr, name, expected);
 }
 
 /// Like [`lowerAccessorExpr`] but seeds the tail-position expected
@@ -339,7 +357,7 @@ pub fn lowerAccessorExprWithExpected(
     name: []const u8,
     expected: ?TypeRef,
 ) Allocator.Error!FuncId {
-    return lowerAccessorExprFull(module, owner_class, own_members, null, params, expr, name, expected);
+    return lowerAccessorExprFull(module, owner_class, own_members, null, params, null, expr, name, expected);
 }
 
 fn lowerAccessorExprFull(
@@ -348,6 +366,7 @@ fn lowerAccessorExprFull(
     own_members: *const StringSet,
     enclosing_members: ?*const StringSet,
     params: []const []const u8,
+    declared_params: ?[]const Param,
     expr: *const Expr,
     name: []const u8,
     expected: ?TypeRef,
@@ -366,6 +385,14 @@ fn lowerAccessorExprFull(
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     try bindParams(&b, params);
+    if (declared_params) |typed| {
+        try b.setLocalDeclType("this", owner_class);
+        for (typed) |p| {
+            if (b.resolve(p.name) == null) continue;
+            try b.setLocalDeclType(p.name, p.ty.name);
+            if (p.ty.nullable) try b.setLocalDeclNullable(p.name);
+        }
+    }
     const prev = b.pushExpected(expected);
     // `var first: Long = 0` — the initializer literal takes the property's
     // declared type, exactly as a local `val x: Long = 0` does.

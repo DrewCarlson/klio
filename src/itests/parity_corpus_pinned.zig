@@ -810,3 +810,14 @@ test "imported_overload_in_captured_receiver" {
         \\
     );
 }
+
+test "imported_specific_overload_after_generic" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/imported_specific_overload_after_generic/lib.kt",
+        CORPUS_DIR ++ "/imported_specific_overload_after_generic/app.kt",
+    },
+        \\generic
+        \\int
+        \\
+    );
+}
