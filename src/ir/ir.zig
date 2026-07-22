@@ -1102,6 +1102,7 @@ pub const SelfLocalFn = struct {
 pub const PendingLocalDeclTypes = struct {
     types: std.StringHashMap([]const u8),
     nullable: std.StringHashMap(void),
+    call_returns: std.StringHashMap(EagerTypeHead),
 };
 
 pub const Module = struct {
@@ -1609,6 +1610,7 @@ pub const Module = struct {
         if (self.pending_lambda_local_decl_types) |*locals| {
             locals.types.deinit();
             locals.nullable.deinit();
+            locals.call_returns.deinit();
         }
     }
 
@@ -2318,15 +2320,18 @@ pub const Module = struct {
     /// (distinct from the module-internal `SigView` above, which the
     /// index uses only for the `sameUserSig` identity check). Strips a
     /// leading synthesized `this` so the shared scorer ranks value args
-    /// against user parameters, and returns null for a bodyless stub —
-    /// those are ranked by the INDEX arity gate, never here.
+    /// against user parameters. A phase-one header whose declaration has a
+    /// body is equally rankable: its params already carry the complete types,
+    /// defaults, and vararg flags even though its IR blocks are not lowered
+    /// yet. Truly bodyless declarations remain ineligible.
     ///
     /// `func_defaults` lives on `ProgramImage`, not on `Module`, so the
     /// lowering adapter cannot read it; it carries defaults on the params
     /// (`paramHasDefault`'s null-`defaults` fallback).
     fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
-        if (!f.hasBody()) return null;
+        const declared_body = if (self.decl_sigs.get(id.int())) |ds| ds.has_body else false;
+        if (!f.hasBody() and !declared_body) return null;
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
         return .{
             .params = f.params[off..],
@@ -3333,9 +3338,31 @@ pub const Module = struct {
     /// index's unique FQN target, except a receiver-matched extension the
     /// index (blind to receivers) would override with its non-extension
     /// namesake, which the extension retains (`preferredBareTarget`).
-    fn preferredBareTargetLike(self: *const Module, heur: FuncId, index_pick: ?FuncId) FuncId {
+    fn preferredBareTargetLike(
+        self: *const Module,
+        heur: FuncId,
+        index_pick: ?FuncId,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+    ) FuncId {
         const idx = index_pick orelse return heur;
         if (!self.isNonExtFid(heur) and self.isNonExtFid(idx)) return heur;
+        // The index ranks package and arity but not argument types. Within
+        // the same scope tier it must not replace the applicability pick with
+        // a candidate the static argument shape disproves. This occurs when
+        // a trailing lambda binds a default-gap function parameter while a
+        // sibling overload has the same positional arity but a scalar head.
+        const hf = self.funcById(heur);
+        const inf = self.funcById(idx);
+        if (hf != null and inf != null and
+            self.bareCallTier(hf.?, name, caller_pkg, caller_file) ==
+                self.bareCallTier(inf.?, name, caller_pkg, caller_file) and
+            !self.declSigCompatible(idx, args))
+        {
+            return heur;
+        }
         return idx;
     }
 
@@ -3600,7 +3627,7 @@ pub const Module = struct {
                     false;
                 if (!idx_also_matches) break :blk h;
             }
-            break :blk self.preferredBareTargetLike(h, index_pick);
+            break :blk self.preferredBareTargetLike(h, index_pick, name, caller_pkg, caller_file, args);
         } else null;
         // A `@LowPriorityInOverloadResolution` / deprecated-stub function never
         // statically binds when a same-name class constructor exists: kotlinc
@@ -5373,6 +5400,56 @@ test "symbol index proves stub signatures through the declared record" {
     try putTestDeclSig(&m, a, stub, "Int", 1);
     const proven = m.resolveBareCallIndexed("g", "app", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.ambiguous_tier, deferReasonOf(proven).?);
+}
+
+test "resolveCall ranks a body-declared forward overload" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    _ = try pushTestFuncOpts(&m, a, "choose", "app.choose", "app", 1, .{ .param_ty = "String" });
+    const forward = try pushTestFuncOpts(&m, a, "choose", "app.choose", "app", 1, .{ .stub = true, .param_ty = "Boolean" });
+    try m.decl_user_arity.put(forward.int(), .{ .required = 1, .total = 1, .has_vararg = false });
+    try putTestDeclSig(&m, a, forward, "Boolean", 1);
+    try m.decl_sigs.put(forward.int(), .{
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = m.decl_user_sig.get(forward.int()).?,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} },
+    }};
+    const resolved = try m.resolveCall(a, "choose", "app", FileId.from(0), &args, false, .{});
+    defer a.free(resolved.candidate_set);
+    try testing.expectEqual(forward.int(), resolved.target.?.int());
+    try testing.expectEqual(Module.Confidence.exact, resolved.confidence);
+}
+
+test "resolveCall keeps an applicable trailing-lambda overload over the arity index" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const trailing = try pushTestFuncOpts(&m, a, "verify", "app.verify", "app", 2, .{
+        .fn_tail_with_defaults = true,
+    });
+    const scalar = try pushTestFuncOpts(&m, a, "verify", "app.verify", "app", 2, .{
+        .param_ty = "Boolean",
+    });
+    m.funcs.items[scalar.int()].params[1].ty.name = "String";
+    m.funcs.items[scalar.int()].params[1].has_default = true;
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{.{
+        .is_lambda = true,
+        .lambda_arity = 0,
+        .lambda_is_literal = true,
+    }};
+    const indexed = m.resolveBareCallIndexed("verify", "app", FileId.from(0), 1, true);
+    try testing.expectEqual(scalar.int(), indexed.pick().?.int());
+    const resolved = try m.resolveCall(a, "verify", "app", FileId.from(0), &args, true, .{});
+    defer a.free(resolved.candidate_set);
+    try testing.expectEqual(trailing.int(), resolved.target.?.int());
 }
 
 test "symbol index distinguishes overloads by generic arguments" {

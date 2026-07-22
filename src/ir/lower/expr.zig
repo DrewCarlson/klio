@@ -6998,6 +6998,11 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .As and !arg.As.safe) {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
+    if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
+        if (b.localCallReturn(arg.Call.callee.Path.segments[0].name)) |ret| {
+            return .{ .name = ret.name, .nullable = ret.nullable, .args = &.{} };
+        }
+    }
     // A qualified object/class property read (`Nodes.Traversable`, parsed
     // as a Member access on a bare class-name receiver): the registered
     // per-class property type head is the argument's static type —
@@ -10477,6 +10482,20 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     try testing.expect(shapes[2].is_spread);
     try testing.expect(!shapes[2].is_lambda);
     try testing.expect(shapes[2].named == null);
+
+    try b.setLocalCallReturn("predicate", "Boolean", false);
+    var predicate_segments = [_]ast.Ident{.{ .name = "predicate", .span = dummySpan() }};
+    var predicate = Expr{ .Path = .{ .segments = &predicate_segments, .span = dummySpan() } };
+    const predicate_call = Expr{ .Call = .{
+        .callee = &predicate,
+        .args = &.{},
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = dummySpan(),
+    } };
+    const call_shape = shapeOfAstArg(&b, &predicate_call, null);
+    try testing.expectEqualStrings("Boolean", call_shape.ty.?.name);
 }
 
 test "lowers null literal" {

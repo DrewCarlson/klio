@@ -2106,6 +2106,17 @@ fn buildModuleWithOverrides(
         const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         _ = try module.reserveClassFqn(a, c.name.name, cfqn, cls_pkg, c.is_inner);
     }
+    // Member extensions participate in bare-call resolution from class and
+    // receiver-lambda bodies. Reserve their complete headers globally, after
+    // every class shell exists but before any method body lowers, so a helper
+    // declared later in the same class or in a base class has a stable target.
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        try ir.lower.decl.reserveMemberExtensionHeaders(module, c, cfqn, cls_pkg);
+    }
     // Register typealias → head tags BEFORE phase-2 body lowering so the
     // lambda-arity detection (`argFnArities`) resolves an aliased
     // function-typed parameter (`RoutingHandler = RoutingContext.() -> Unit`)

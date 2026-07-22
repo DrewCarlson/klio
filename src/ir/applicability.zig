@@ -362,9 +362,8 @@ fn isTopOrGenericType(ty_name: []const u8) bool {
     return false;
 }
 
-/// Port of `host_call_member.zig` `isDefinitelyNonFunctionTypeName`: a
-/// concrete builtin a callable argument can never satisfy, so the member
-/// scorer disqualifies the candidate (a sibling function-typed overload wins).
+/// A concrete builtin a callable argument can never satisfy. User class
+/// heads remain eligible for SAM conversion; scalars and containers do not.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
         "String",         "CharSequence",     "Boolean",  "Char",        "Byte",  "Short",
@@ -574,11 +573,16 @@ pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scop
 fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
     const nm = param_ty.name;
     const member = scope.member;
+    const shape_callable = arg.lambda_arity != null or arg.func_typed or arg.is_lambda;
 
     // Runtime head of the argument. A caller that could not prove one
     // (lowering / eager) scores from declared-type evidence when the shape
     // carries it — additive-only, never disqualifying — else as unknown.
-    const v_ty = arg.runtime_class orelse {
+    const v_ty = arg.runtime_class orelse blk: {
+        // AST lowering has no runtime class for a lambda literal, but its
+        // callable shape is already authoritative. Keep it on the callable
+        // scoring path instead of returning the generic unknown score.
+        if (shape_callable) break :blk "$callable$";
         if (arg.ty) |aty| {
             if (tyEvidenceScore(nm, aty.name, member)) |s| return s;
             // Hierarchy evidence: a declared head that is a SUBTYPE of the
@@ -630,7 +634,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     // scorer does not treat a `$bound_ref$` head as callable.
     const arg_arity: ?usize = if (arg.lambda_arity) |n| @as(usize, n) else null;
     const is_bound_ref = !member and std.mem.startsWith(u8, v_ty, "$bound_ref$");
-    const is_callable = arg_arity != null or is_bound_ref or arg.func_typed;
+    const is_callable = shape_callable or is_bound_ref;
     if (is_callable) {
         if (std.mem.startsWith(u8, nm, "Function")) {
             const expected = nm["Function".len..];
@@ -674,10 +678,10 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
                 if (member) return 20;
             }
         }
-        // Member only: a callable can never bind a concrete non-function
-        // parameter type, so the candidate is disqualified (a sibling
-        // function-typed overload wins).
-        if (member and isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
+        // A callable can never bind a concrete builtin scalar or container.
+        // Unknown user heads remain eligible because they may be fun
+        // interfaces and accept SAM conversion.
+        if (isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
         return 8;
     }
 
@@ -1493,21 +1497,17 @@ test "applicable member: under-application via the defaults table is applicable"
     try testing.expect(!sc.exact_arity);
 }
 
-test "applicable member: callable arg vs concrete non-function param disqualifies (global scores 8)" {
+test "applicable: callable arg cannot bind a concrete non-function param" {
     const p = [_]Param{
         .{ .name = "this", .ty = tref("Logger"), .default = null },
         .{ .name = "msg", .ty = tref("String"), .default = null },
     };
     const sig = SigView{ .params = &p, .is_member = true };
-    const args = [_]ArgShape{.{ .runtime_class = "Function0", .func_typed = true, .is_lambda = true }};
-    // Member: `isDefinitelyNonFunctionTypeName("String")` disqualifies.
+    const args = [_]ArgShape{.{ .is_lambda = true, .lambda_arity = 0, .lambda_is_literal = true }};
     try testing.expect(applicable(&sig, &args, .{ .member = true }) == null);
-    // Global: the same callable arg scores the SAM-conversion 8 (no receiver
-    // skip, so use a one-param sig).
     const gp = oneParam("String");
     const gsig = SigView{ .params = &gp };
-    const gsc = applicable(&gsig, &args, .{}).?;
-    try testing.expectEqual(@as(i32, 8), gsc.points);
+    try testing.expect(applicable(&gsig, &args, .{}) == null);
 }
 
 var mock_subtype_depth: i32 = 3;

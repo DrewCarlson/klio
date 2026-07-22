@@ -283,6 +283,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         var owned = locals.*;
         owned.types.deinit();
         owned.nullable.deinit();
+        owned.call_returns.deinit();
         module.pending_lambda_local_decl_types = null;
     }
     // A local `fun`'s BLOCK body returns Unit on fall-through, never the
@@ -375,6 +376,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    for (params, 0..) |p, i| {
+        if (i >= param_tys.len) break;
+        const ty = param_tys[i] orelse continue;
+        if (ty.function) |ft| {
+            try b.setLocalCallReturn(p.name, ft.ret.name.name, ft.ret.nullable);
+        }
+    }
     // A local contextual function's context parameters, stashed by its
     // declaration lowering, bind here before the body statements lower.
     if (module.pending_ctx) |pc| {
