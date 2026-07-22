@@ -734,6 +734,9 @@ pub const Expr = union(enum) {
         /// A parenthesized lambda (`f(x, { … })`) binds positionally and
         /// leaves this false.
         has_trailing_lambda: bool = false,
+        /// True when parentheses enclosed this complete call expression.
+        /// A following lambda then invokes the call's result.
+        grouped: bool = false,
         span: Span,
     },
     Index: struct {

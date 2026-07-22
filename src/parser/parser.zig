@@ -970,6 +970,21 @@ test "infix_call_chain_left_assoc" {
     try testing.expect(p.init.?.Call.args[0] == .Call);
 }
 
+test "a trailing lambda invokes a parenthesized call result" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "fun main() { (factory()) { 1 } }\n");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const stmts = bodyStmts(out.file.decls[0].Function);
+    const outer = stmts[0].Expr.Call;
+    try testing.expect(outer.has_trailing_lambda);
+    try testing.expectEqual(@as(usize, 1), outer.args.len);
+    try testing.expect(outer.callee.* == .Call);
+    try testing.expect(outer.callee.Call.grouped);
+    try testing.expectEqual(@as(usize, 0), outer.callee.Call.args.len);
+}
+
 test "return_with_label" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

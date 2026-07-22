@@ -106,6 +106,19 @@ test "forward member extension resolves in a receiver lambda" {
     try assertKlio("forward_member_extension", src, "42\n");
 }
 
+test "a parenthesized factory result accepts a trailing lambda" {
+    const src =
+        \\
+        \\class CallableResult {
+        \\    operator fun invoke(block: () -> Int): Int = block()
+        \\}
+        \\fun callableResult(): CallableResult = CallableResult()
+        \\fun main() = println((callableResult()) { 42 })
+        \\
+    ;
+    try assertKlio("parenthesized_callable_result", src, "42\n");
+}
+
 test "lateinit_var_with_is_initialized" {
     const alt =
         \\

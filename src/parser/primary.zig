@@ -130,11 +130,12 @@ pub fn parsePrimary(p: *Parser) ?Expr {
         .LParen => {
             _ = support.bump(p);
             support.skipNl(p);
-            const inner = exprmod.parseExpr(p) orelse return null;
+            var inner = exprmod.parseExpr(p) orelse return null;
             support.skipNl(p);
             support.rejectTrailingAssignment(p);
             support.skipNl(p);
             _ = support.expect(p, .RParen, "`)`") orelse return null;
+            if (inner == .Call) inner.Call.grouped = true;
             return inner;
         },
         .LBrace => {
