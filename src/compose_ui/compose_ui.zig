@@ -64,6 +64,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_surfaceWidth", surfaceWidth);
     try b.register("androidx.compose.ui.window.__composeui_surfaceHeight", surfaceHeight);
     try b.register("androidx.compose.ui.window.__composeui_setInputCallback", setInputCallback);
+    try b.register("androidx.compose.ui.window.__composeui_touchCount", touchCount);
+    try b.register("androidx.compose.ui.window.__composeui_touchId", touchId);
+    try b.register("androidx.compose.ui.window.__composeui_touchX", touchX);
+    try b.register("androidx.compose.ui.window.__composeui_touchY", touchY);
+    try b.register("androidx.compose.ui.window.__composeui_touchDown", touchDown);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -891,22 +896,70 @@ pub export fn klio_frame_active() c_int {
     return if (frame_cb.set) 1 else 0;
 }
 
-const TouchArgs = struct { x: c_int, y: c_int, phase: c_int };
+/// One pointer in the current multi-touch snapshot: a stable per-finger `id`,
+/// its position in surface points, and whether it is currently down. Compose
+/// wants ALL active pointers in one event and diffs snapshots, so the app hands
+/// the whole set each event and the Kotlin callback reads it back by index.
+const TouchPoint = struct { id: c_int, x: c_int, y: c_int, down: bool };
+var touch_points: [16]TouchPoint = undefined;
+var touch_count: usize = 0;
 
-fn dispatchTouchBody(ta: TouchArgs) void {
-    var args = [_]Value{ Value.newInt(ta.x), Value.newInt(ta.y), Value.newInt(ta.phase) };
+fn dispatchTouchBody(phase: c_int) void {
+    var args = [_]Value{Value.newInt(phase)};
     _ = input_cb.host.invokeCallable(&input_cb.callback, &args, input_cb.out) catch {};
 }
 
-/// Route a platform touch into the resident VM's input callback. `x`/`y` are in
-/// the surface's point coordinate space; `phase` is 0=down, 1=move, 2=up,
-/// 3=cancel (matching UITouch's Began/Moved/Ended/Cancelled). Called by the app
-/// shell on the main thread — same-thread re-entry, so it runs on the persistent
-/// interpreter stack like the frame callback (touch and frame never overlap:
-/// both are serviced serially by the platform run loop).
-pub export fn klio_dispatch_touch(x: c_int, y: c_int, phase: c_int) void {
+/// Route a multi-touch snapshot into the resident VM's input callback. `ids` are
+/// stable per finger across its lifecycle; `xs`/`ys` are in surface points;
+/// `downs[i] != 0` means that pointer is pressed. `phase` is the primary event
+/// type (0=down, 1=move, 2=up, 3=cancel). Called by the app shell on the main
+/// thread — same-thread re-entry, so it runs on the persistent interpreter stack
+/// like the frame callback (touch and frame never overlap: both are serviced
+/// serially by the platform run loop). The callback reads the snapshot back via
+/// `__composeui_touchCount` / `__composeui_touch{Id,X,Y,Down}`.
+pub export fn klio_dispatch_touches(
+    count: c_int,
+    ids: [*]const c_int,
+    xs: [*]const c_int,
+    ys: [*]const c_int,
+    downs: [*]const c_int,
+    phase: c_int,
+) void {
     if (!input_cb.set) return;
-    runtime.runOnPersistentBigStack(TouchArgs, void, dispatchTouchBody, .{ .x = x, .y = y, .phase = phase });
+    const n = @min(@as(usize, @intCast(@max(count, 0))), touch_points.len);
+    touch_count = n;
+    for (0..n) |i| touch_points[i] = .{ .id = ids[i], .x = xs[i], .y = ys[i], .down = downs[i] != 0 };
+    runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, phase);
+}
+
+fn touchIndex(ctx: *CallCtx) ?usize {
+    if (ctx.args.len < 1) return null;
+    const i: i64 = ctx.args[0].asI64() orelse return null;
+    if (i < 0 or @as(usize, @intCast(i)) >= touch_count) return null;
+    return @intCast(i);
+}
+
+/// Snapshot query intrinsics the hosted input callback reads to rebuild the
+/// pointer set: `__composeui_touchCount(): Int` plus per-index accessors.
+fn touchCount(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.newInt(@intCast(touch_count)));
+}
+fn touchId(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].id));
+}
+fn touchX(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].x));
+}
+fn touchY(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value.newInt(0));
+    return ok(Value.newInt(touch_points[i].y));
+}
+fn touchDown(ctx: *CallCtx) Error!EvalResult {
+    const i = touchIndex(ctx) orelse return ok(Value{ .Bool = false });
+    return ok(Value{ .Bool = touch_points[i].down });
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
@@ -1455,7 +1508,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 66), b.len());
+    try testing.expectEqual(@as(usize, 71), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

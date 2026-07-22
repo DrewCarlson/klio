@@ -27,7 +27,8 @@ fun main() {
         // width/height are placeholders: a hosted (mobile) Window fills the
         // device surface, so these matter only on desktop.
         Window(onCloseRequest = ::exitApplication, title = "klio", width = 390, height = 844) {
-            var tap by remember { mutableStateOf(Offset(195f, 220f)) }
+            // One circle per active finger — a multi-touch snapshot draws several.
+            var points by remember { mutableStateOf(listOf(Offset(195f, 220f))) }
             Box(
                 Modifier.fillMaxSize()
                     .background(Color(0xFF102A44))
@@ -35,13 +36,14 @@ fun main() {
                         awaitPointerEventScope {
                             while (true) {
                                 val e = awaitPointerEvent()
-                                tap = e.changes.first().position
+                                val pressed = e.changes.filter { it.pressed }.map { it.position }
+                                if (pressed.isNotEmpty()) points = pressed
                             }
                         }
                     }
                     .drawBehind {
-                        drawRect(Color(0xFF1E88E5), topLeft = Offset(48f, 96f), size = Size(size.width - 96f, 200f))
-                        drawCircle(Color(0xFFFFC107), radius = 100f, center = tap)
+                        drawRect(Color(0xFF1E88E5), topLeft = Offset(48f, 96f), size = Size(size.width - 96f, 160f))
+                        for (p in points) drawCircle(Color(0xFFFFC107), radius = 90f, center = p)
                     },
             )
         }

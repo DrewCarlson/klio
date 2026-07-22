@@ -20,26 +20,40 @@ extern int klio_run(int argc, const char *const *argv);
 extern void klio_set_surface(void *layer, int w, int h, double scale);
 extern void klio_render_frame(void);
 extern int klio_frame_active(void);
-extern void klio_dispatch_touch(int x, int y, int phase);
+extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
+                                  const int *ys, const int *downs, int phase);
 
 // A UIView whose backing layer is a CAMetalLayer: the resident Compose UI draws
 // into its per-frame drawables through the statically-linked Skia Ganesh-Metal
 // backend (klio_win_attach / klio_win_surface / klio_win_present). Touches on the
-// view forward into the resident VM's pointer processor via klio_dispatch_touch.
+// view forward a snapshot of every active finger into the resident VM's pointer
+// processor via klio_dispatch_touches, so multi-finger gestures resolve.
 @interface KlioMetalView : UIView
 @end
 @implementation KlioMetalView
 + (Class)layerClass { return [CAMetalLayer class]; }
-- (void)forwardTouches:(NSSet<UITouch *> *)touches phase:(int)phase {
-    UITouch *t = [touches anyObject];
-    if (!t) return;
-    CGPoint p = [t locationInView:self];  // points, the composition's coordinate space
-    klio_dispatch_touch((int)p.x, (int)p.y, phase);
+- (void)dispatchEvent:(UIEvent *)event phase:(int)phase {
+    NSArray<UITouch *> *all = [[event allTouches] allObjects];
+    int ids[16], xs[16], ys[16], downs[16];
+    int n = 0;
+    for (UITouch *t in all) {
+        if (n >= 16) break;
+        CGPoint p = [t locationInView:self];  // points, the composition's space
+        BOOL down = (t.phase != UITouchPhaseEnded && t.phase != UITouchPhaseCancelled);
+        // UITouch object identity is stable across a finger's lifecycle; use its
+        // low pointer bits as a stable per-pointer id.
+        ids[n] = (int)((intptr_t)t & 0x3fffffff);
+        xs[n] = (int)p.x;
+        ys[n] = (int)p.y;
+        downs[n] = down ? 1 : 0;
+        n++;
+    }
+    klio_dispatch_touches(n, ids, xs, ys, downs, phase);
 }
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:0]; }
-- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:1]; }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:2]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:3]; }
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:0]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:1]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:2]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self dispatchEvent:e phase:3]; }
 @end
 
 @interface KlioAppDelegate : UIResponder <UIApplicationDelegate>
@@ -61,17 +75,17 @@ extern void klio_dispatch_touch(int x, int y, int phase);
         NSLog(@"[klio-host] frames=%lu", self.frameCount);
     }
     // Headless touch self-test (KLIO_TOUCH_SELFTEST): the simulator has no tap
-    // injection, so once the UI is running, synthesize one tap (down + up) at a
-    // known point. A touch-reactive scene moves to it, proving the whole path:
-    // UITouch -> klio_dispatch_touch -> resident VM -> pointer processor.
+    // injection, so once the UI is running, synthesize two simultaneous pressed
+    // pointers. A touch-reactive scene draws one circle per finger, proving the
+    // whole multi-touch path: UITouch snapshot -> klio_dispatch_touches ->
+    // resident VM -> pointer processor.
     if (self.frameCount == 120 && getenv("KLIO_TOUCH_SELFTEST")) {
-        const char *xs = getenv("KLIO_TOUCH_X");
-        const char *ys = getenv("KLIO_TOUCH_Y");
-        int tx = xs ? atoi(xs) : 300;
-        int ty = ys ? atoi(ys) : 640;
-        NSLog(@"[klio-host] selftest touch x=%d y=%d", tx, ty);
-        klio_dispatch_touch(tx, ty, 0);  // down
-        klio_dispatch_touch(tx, ty, 2);  // up
+        int ids[2] = {101, 202};
+        int xs[2] = {120, 280};
+        int ys[2] = {500, 720};
+        int downs[2] = {1, 1};
+        NSLog(@"[klio-host] selftest touch: 2 pointers");
+        klio_dispatch_touches(2, ids, xs, ys, downs, 0);  // both down
     }
 }
 

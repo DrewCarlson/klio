@@ -378,40 +378,52 @@ private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioAppli
 }
 
 /**
- * Dispatch one hosted (mobile) touch into every live window's pointer processor.
- * [phase] is 0=down, 1=move, 2=up, 3=cancel (iOS UITouch Began/Moved/Ended/
- * Cancelled). Positions are in the window's point coordinate space. The redraw
- * happens on the next frame callback (the pointer only marks the window dirty).
+ * Dispatch the current hosted (mobile) multi-touch snapshot into every live
+ * window's pointer processor. The host holds the snapshot; this reads it back
+ * as one [PointerInputEventData] per active finger (each with its stable
+ * [PointerId]) so gestures spanning several fingers — drag, pinch, multi-tap —
+ * resolve. [phase] is the primary event type (0=down, 1=move, 2=up, 3=cancel);
+ * positions are in the window's point coordinate space. The redraw happens on
+ * the next frame callback (the pointer only marks the window dirty).
  */
-private fun inputHosted(scope: KlioApplicationScope, x: Int, y: Int, phase: Int) {
-    val down = phase == 0 || phase == 1
+private fun inputHosted(scope: KlioApplicationScope, phase: Int) {
+    val n = __composeui_touchCount()
+    if (n <= 0) return
     val eventType = when (phase) {
         0 -> PointerEventType.Press
         1 -> PointerEventType.Move
         else -> PointerEventType.Release
     }
-    val position = Offset(x.toFloat(), y.toFloat())
     for (holder in scope.windows) {
         if (holder.closed) continue
         holder.uptime += 8
-        val data = PointerInputEventData(
-            id = PointerId(0),
-            uptime = holder.uptime,
-            positionOnScreen = position,
-            position = position,
-            down = down,
-            pressure = 1f,
-            type = PointerType.Touch,
-            activeHover = false,
-            scaleGestureFactor = 1f,
-            panGestureOffset = Offset.Zero,
-        )
+        val pointers = ArrayList<PointerInputEventData>(n)
+        var anyDown = false
+        for (i in 0 until n) {
+            val down = __composeui_touchDown(i)
+            if (down) anyDown = true
+            val position = Offset(__composeui_touchX(i).toFloat(), __composeui_touchY(i).toFloat())
+            pointers.add(
+                PointerInputEventData(
+                    id = PointerId(__composeui_touchId(i).toLong()),
+                    uptime = holder.uptime,
+                    positionOnScreen = position,
+                    position = position,
+                    down = down,
+                    pressure = 1f,
+                    type = PointerType.Touch,
+                    activeHover = false,
+                    scaleGestureFactor = 1f,
+                    panGestureOffset = Offset.Zero,
+                ),
+            )
+        }
         holder.processor.process(
             PointerInputEvent(
                 eventType,
                 holder.uptime,
-                listOf(data),
-                buttons = PointerButtons(isPrimaryPressed = down),
+                pointers,
+                buttons = PointerButtons(isPrimaryPressed = anyDown),
             ),
             IdentityPositionCalculator,
         )
@@ -450,7 +462,7 @@ fun application(
         // recomposer + windows captured by the callback stay alive because the
         // VM stays resident.
         __composeui_setFrameCallback { frameHosted(recomposerDriver, scope) }
-        __composeui_setInputCallback { x, y, phase -> inputHosted(scope, x, y, phase) }
+        __composeui_setInputCallback { phase -> inputHosted(scope, phase) }
         return openedAny
     }
     var frame = 0
@@ -517,9 +529,23 @@ internal fun __composeui_setFrameCallback(callback: () -> Boolean): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_setFrameCallback not installed")
 
 // Register the touch callback with the host; the platform input source invokes
-// it on each touch with (x, y, phase) — phase 0=down, 1=move, 2=up, 3=cancel.
-internal fun __composeui_setInputCallback(callback: (Int, Int, Int) -> Unit): Long =
+// it with the primary phase (0=down, 1=move, 2=up, 3=cancel) once the current
+// multi-touch snapshot is staged, which the callback reads via the accessors below.
+internal fun __composeui_setInputCallback(callback: (Int) -> Unit): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_setInputCallback not installed")
+
+// The staged multi-touch snapshot: the number of active pointers and, per index,
+// each pointer's stable id, position (surface points), and pressed state.
+internal fun __composeui_touchCount(): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchCount not installed")
+internal fun __composeui_touchId(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchId not installed")
+internal fun __composeui_touchX(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchX not installed")
+internal fun __composeui_touchY(index: Int): Int =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchY not installed")
+internal fun __composeui_touchDown(index: Int): Boolean =
+    error("intrinsic androidx.compose.ui.window.__composeui_touchDown not installed")
 
 // The hosted surface's size in points (mobile), or 0 when none is installed. A
 // hosted Window fills these instead of its requested size.
