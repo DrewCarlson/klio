@@ -309,6 +309,48 @@ fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorE
     return null;
 }
 
+/// Expand a superclass constructor call that selects a secondary
+/// `this(...)` constructor into the primary arguments used to initialize that
+/// class. This is required when an expect constructor maps to an actual
+/// secondary constructor with a differently shaped primary constructor.
+fn expandParentSecondaryThisArgs(
+    self: *VmHost,
+    allocator: Allocator,
+    class_fqn: ?[]const u8,
+    class_name: []const u8,
+    args: *std.ArrayList(Value),
+) Allocator.Error!UnitOrErr {
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
+        const primary_count = classDefPrimaryParamCount(def);
+        def.deinit();
+        const entries = secondaryCtors(self, class_fqn, class_name);
+        const entry = chooseSecondaryCtor(self, entries, args.items) orelse return .{ .ok = {} };
+        if (args.items.len == primary_count and primary_count != 0) return .{ .ok = {} };
+        if (!entry.is_this) return .{ .ok = {} };
+
+        var target: std.ArrayList(Value) = .empty;
+        errdefer target.deinit(allocator);
+        for (entry.delegation_arg_thunks) |fid| {
+            const fr = try funcAt(self, fid, "secondary ctor arg");
+            switch (fr) {
+                .err => |e| return .{ .err = e },
+                .ok => |func| {
+                    switch (try evalThunk(self, func, args.items)) {
+                        .ok => |v| try target.append(allocator, v),
+                        .err => |e| return .{ .err = e },
+                    }
+                },
+            }
+        }
+        args.deinit(allocator);
+        args.* = target;
+        runtime.keepalivePushSlice(args.items);
+    }
+    return .{ .err = try typeErr(allocator, "secondary constructor delegation for `{s}` is recursive", .{class_name}) };
+}
+
 fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
@@ -2881,6 +2923,14 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             if (parent_def) |d| d.deinit();
             parent_args.deinit(allocator);
             break;
+        }
+        switch (try expandParentSecondaryThisArgs(self, allocator, pref.fqn, pname, &parent_args)) {
+            .ok => {},
+            .err => |e| {
+                if (parent_def) |d| d.deinit();
+                parent_args.deinit(allocator);
+                return .{ .err = e };
+            },
         }
         // Reorder any named super-constructor arguments into the parent's
         // parameter order before the positional field-binding below reads

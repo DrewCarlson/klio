@@ -128,6 +128,15 @@ fn simpleName(name: []const u8) []const u8 {
     return name;
 }
 
+/// Remove nullability and type arguments from a declared receiver name so it
+/// can address the host binding registered for the receiver's class.
+fn staticReceiverBindingHead(name: []const u8) []const u8 {
+    var head = std.mem.trim(u8, name, " ");
+    head = std.mem.trimEnd(u8, head, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |i| head = head[0..i];
+    return std.mem.trim(u8, head, " ");
+}
+
 /// The Kotlin simple name shown by `toString`/`KClass.simpleName` for a
 /// class whose internal `name` may be a lifted-nested mangle. A nested
 /// class lifts to a flat top-level name like `Outer$Data`; Kotlin reports
@@ -3478,6 +3487,12 @@ fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value
     return null;
 }
 
+/// Select the innermost implicit receiver satisfying `head`, starting with
+/// `receiver` and then walking the frame's enclosing-receiver tower.
+pub fn implicitReceiverForHead(self: *VmHost, allocator: Allocator, receiver: *const Value, head: []const u8) Allocator.Error!?Value {
+    return recvFnReceiverFor(self, allocator, receiver, head);
+}
+
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance) return null;
     const head = recvFnPropHeadOf(self, receiver, name) orelse return null;
@@ -3887,6 +3902,29 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Companion forwarding + enum values/valueOf for a class receiver.
     if (receiver.* == .Class) {
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
+    }
+
+    // A null value has no useful runtime type, but a statically-directed call
+    // still has an exact declared receiver. Use that receiver to address its
+    // host binding before the runtime-type member ladder. This is how a
+    // `String?::plus` reference invokes `kotlin.String.plus` when its eventual
+    // receiver is null, without widening to unrelated `plus` extensions.
+    if (receiver.* == .Null) {
+        if (static_recv) |declared| {
+            const head = staticReceiverBindingHead(declared);
+            if (head.len != 0) {
+                var fqn_buf: [256]u8 = undefined;
+                const fqn = if (std.mem.indexOfScalar(u8, head, '.') != null)
+                    std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ head, name }) catch null
+                else
+                    std.fmt.bufPrint(&fqn_buf, "kotlin.{s}.{s}", .{ head, name }) catch null;
+                if (fqn) |binding_fqn| {
+                    if (lookupIntrinsic(self, binding_fqn)) |func| {
+                        return dispatchWithReceiver(self, allocator, binding_fqn, func, receiver, args);
+                    }
+                }
+            }
+        }
     }
 
     // Null-receiver `equals` — 1-arg `Any?.equals` and 2-arg
@@ -8713,6 +8751,9 @@ fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Val
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
+        if (instanceIsThrowable(self, allocator, inst)) {
+            return .{ .ok = try inheritedInstanceToString(allocator, inst, true) };
+        }
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         defer {
@@ -9220,6 +9261,31 @@ pub fn instanceIsThrowable(self: *VmHost, allocator: Allocator, inst: ObjRef(Ins
         cg.deinit();
     }
     return false;
+}
+
+fn inheritedInstanceToString(allocator: Allocator, inst: ObjRef(InstanceData), is_throwable: bool) Allocator.Error!Value {
+    const ig = inst.borrow();
+    defer ig.deinit();
+    const cg = ig.get().class.borrow();
+    const fqn = cg.get().fqn;
+    cg.deinit();
+    if (is_throwable) {
+        const msg: ?[]const u8 = if (ig.get().get("message")) |mv| switch (mv) {
+            .String => |s| blk: {
+                const sg = s.borrow();
+                defer sg.deinit();
+                break :blk try allocator.dupe(u8, sg.get().bytes);
+            },
+            else => null,
+        } else null;
+        const rendered = if (msg) |m|
+            try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
+        else
+            try allocator.dupe(u8, fqn);
+        return .{ .String = try runtime.strInitOwned(allocator, rendered) };
+    }
+    const rendered = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
+    return .{ .String = try runtime.strInitOwned(allocator, rendered) };
 }
 
 /// Whether `fid` is a member extension. Authoritative via the func's
@@ -11992,31 +12058,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     if (receiver.* == .Instance) {
         const inst = receiver.Instance;
         if (std.mem.eql(u8, name, "toString") and args.len == 0) {
-            const is_throwable = instanceIsThrowable(self, allocator, inst);
-            const ig = inst.borrow();
-            defer ig.deinit();
-            const fqn = blk: {
-                const cg = ig.get().class.borrow();
-                defer cg.deinit();
-                break :blk cg.get().fqn;
-            };
-            if (is_throwable) {
-                const msg: ?[]const u8 = if (ig.get().get("message")) |mv| switch (mv) {
-                    .String => |s| blk2: {
-                        const sg = s.borrow();
-                        defer sg.deinit();
-                        break :blk2 try allocator.dupe(u8, sg.get().bytes);
-                    },
-                    else => null,
-                } else null;
-                const s = if (msg) |m|
-                    try std.fmt.allocPrint(allocator, "{s}: {s}", .{ fqn, m })
-                else
-                    try allocator.dupe(u8, fqn);
-                return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
-            }
-            const s = try std.fmt.allocPrint(allocator, "{s}@{x}", .{ fqn, ig.get().identity });
-            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, s) } };
+            return .{ .ok = try inheritedInstanceToString(allocator, inst, instanceIsThrowable(self, allocator, inst)) };
         }
         if (std.mem.eql(u8, name, "hashCode") and args.len == 0) {
             const ig = inst.borrow();
@@ -12235,6 +12277,11 @@ test "simpleName returns the trailing dotted segment" {
     try testing.expectEqualStrings("C", simpleName("a.b.C"));
     try testing.expectEqualStrings("C", simpleName("C"));
     try testing.expectEqualStrings("", simpleName("a."));
+}
+
+test "static receiver binding head removes Kotlin type suffixes" {
+    try testing.expectEqualStrings("kotlin.String", staticReceiverBindingHead("kotlin.String?"));
+    try testing.expectEqualStrings("List", staticReceiverBindingHead(" List<String>? "));
 }
 
 test "allUppercase recognizes type-parameter-style names" {

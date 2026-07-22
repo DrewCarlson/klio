@@ -913,6 +913,11 @@ pub const Func = struct {
     /// propagates as a non-local return through this frame instead
     /// of being caught locally.
     is_lambda: bool = false,
+    /// Declared receiver head of a receiver-lambda body. Unlike a local
+    /// extension function this receiver is supplied at invocation rather
+    /// than occupying a parameter slot; the VM uses the head to select the
+    /// compatible receiver from the implicit-receiver tower.
+    lambda_receiver_ty: ?[]const u8 = null,
     /// True for `inline fun`. A non-local `return` from a lambda
     /// passed to an inline function unwinds *through* this frame
     /// (back to the function that wrote the lambda) rather than
@@ -3172,9 +3177,13 @@ pub const Module = struct {
     /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
     /// inside `fun Box(s: String)` self-recursing past the constructor). No
     /// signature view, or no refuting evidence, keeps the candidate.
+    pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
+        const sv = self.sigViewForApplicability(fid) orelse return .{ .points = 0 };
+        return applicability.applicable(&sv, args, .{});
+    }
+
     pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
-        const sv = self.sigViewForApplicability(fid) orelse return true;
-        return applicability.applicable(&sv, args, .{}) != null;
+        return self.declSigScore(fid, args) != null;
     }
 
     /// Among the exact-declared-arity, non-extension candidates, the one whose

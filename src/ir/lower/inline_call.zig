@@ -828,6 +828,49 @@ pub fn reifiedParamsUnusedInBody(allocator: Allocator, f: *const Function) Alloc
     return true;
 }
 
+fn inlineVarargFactory(elem: []const u8) []const u8 {
+    const eq = std.mem.eql;
+    if (eq(u8, elem, "Byte")) return "byteArrayOf";
+    if (eq(u8, elem, "Short")) return "shortArrayOf";
+    if (eq(u8, elem, "Int")) return "intArrayOf";
+    if (eq(u8, elem, "Long")) return "longArrayOf";
+    if (eq(u8, elem, "Char")) return "charArrayOf";
+    if (eq(u8, elem, "Boolean")) return "booleanArrayOf";
+    if (eq(u8, elem, "Float")) return "floatArrayOf";
+    if (eq(u8, elem, "Double")) return "doubleArrayOf";
+    if (eq(u8, elem, "UByte")) return "ubyteArrayOf";
+    if (eq(u8, elem, "UShort")) return "ushortArrayOf";
+    if (eq(u8, elem, "UInt")) return "uintArrayOf";
+    if (eq(u8, elem, "ULong")) return "ulongArrayOf";
+    return "arrayOf";
+}
+
+/// Materialize the array value a vararg parameter denotes inside an inline
+/// body. Keeping this as an ordinary factory call reuses the call spread path,
+/// so `inlineFn(*values)` flattens the supplied array exactly once.
+fn inlineVarargArrayExpr(
+    b: *FuncBuilder,
+    param: *const ast.Param,
+    elems: []const Expr,
+) Allocator.Error!*const Expr {
+    const factory = inlineVarargFactory(param.ty.name.name);
+    const segs = try b.allocator.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = factory, .span = param.span };
+    const callee = try b.allocator.create(Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = param.span } };
+    const copied = try b.allocator.dupe(Expr, elems);
+    const out = try b.allocator.create(Expr);
+    out.* = .{ .Call = .{
+        .callee = callee,
+        .args = copied,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = param.span,
+    } };
+    return out;
+}
+
 /// Expand a call to a `suspend inline fun` by splicing its body into
 /// the caller. `type_args` carries the call-site `<T = SomeType>` for
 /// reified type parameters so the splice can bind each reified
@@ -905,6 +948,7 @@ pub fn tryInlineCallWithTypeArgs(
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);
     for (ordered) |*slot| slot.* = null;
+    var vararg_value: ?*const Expr = null;
     // A trailing lambda fills the last parameter even when earlier
     // defaulted parameters are omitted (`assertFailsWith<T> { … }` skips
     // the defaulted `message` and binds the lambda to `block`). Mapping it
@@ -916,33 +960,65 @@ pub fn tryInlineCallWithTypeArgs(
             .Lambda, .AnonFun => true,
             else => false,
         };
-    const lambda_to_last = last_is_trailing_lambda and
-        args.len <= f.params.len and
-        f.params.len > 0;
+    const lambda_to_last = last_is_trailing_lambda and f.params.len > 0 and
+        !f.params[f.params.len - 1].is_vararg;
     if (lambda_to_last) {
         ordered[f.params.len - 1] = &args[args.len - 1];
     }
     const positional_n = if (lambda_to_last) args.len - 1 else args.len;
-    var next_pos: usize = 0;
-    for (args[0..positional_n], 0..) |*a, i| {
-        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
-        if (nm) |name| {
-            const idx = paramIndex(f, name) orelse return null;
-            ordered[idx] = a;
-        } else {
-            while (next_pos < ordered.len and ordered[next_pos] != null) {
+    const vararg_idx: ?usize = blk: {
+        for (f.params, 0..) |p, i| {
+            if (p.is_vararg) break :blk i;
+        }
+        break :blk null;
+    };
+    if (vararg_idx) |vi| {
+        // Parameters after a vararg can only be supplied by name, apart from
+        // a trailing lambda. All remaining positional arguments are vararg
+        // elements and are materialized into the array the inline body sees.
+        var elem_start: usize = 0;
+        while (elem_start < positional_n and elem_start < vi) : (elem_start += 1) {
+            const nm: ?[]const u8 = if (elem_start < arg_names.len) arg_names[elem_start] else null;
+            if (nm != null) break;
+            ordered[elem_start] = &args[elem_start];
+        }
+        var elem_end = positional_n;
+        for (args[elem_start..positional_n], elem_start..) |*a, ai| {
+            const nm: ?[]const u8 = if (ai < arg_names.len) arg_names[ai] else null;
+            if (nm) |name| {
+                const idx = paramIndex(f, name) orelse return null;
+                if (idx == vi) return null;
+                ordered[idx] = a;
+                elem_end = @min(elem_end, ai);
+            }
+        }
+        const elems = args[elem_start..elem_end];
+        if (elems.len != 0) ordered[vi] = &elems[0];
+        vararg_value = try inlineVarargArrayExpr(b, &f.params[vi], elems);
+    } else {
+        var next_pos: usize = 0;
+        for (args[0..positional_n], 0..) |*a, i| {
+            const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+            if (nm) |name| {
+                const idx = paramIndex(f, name) orelse return null;
+                ordered[idx] = a;
+            } else {
+                while (next_pos < ordered.len and ordered[next_pos] != null) {
+                    next_pos += 1;
+                }
+                if (next_pos >= ordered.len) {
+                    return null;
+                }
+                ordered[next_pos] = a;
                 next_pos += 1;
             }
-            if (next_pos >= ordered.len) {
-                return null;
-            }
-            ordered[next_pos] = a;
-            next_pos += 1;
         }
     }
     for (ordered, 0..) |*slot, i| {
         if (slot.* == null) {
-            if (f.params[i].default) |d| {
+            if (f.params[i].is_vararg) {
+                continue;
+            } else if (f.params[i].default) |d| {
                 slot.* = d;
             } else {
                 return null;
@@ -1023,7 +1099,7 @@ pub fn tryInlineCallWithTypeArgs(
     const arg_regs = try b.allocator.alloc(Reg, f.params.len);
     defer b.allocator.free(arg_regs);
     for (f.params, 0..) |*p, i| {
-        const a = ordered[i].?; // filled above
+        const a = if (p.is_vararg) vararg_value.? else ordered[i].?;
         const forwarded_lambda = forwardedInlineLambda(b, a);
         // A numeric literal argument re-types to its declared primitive
         // parameter (kotlinc literal typing): `f(1)` for `f(x: Long)`
