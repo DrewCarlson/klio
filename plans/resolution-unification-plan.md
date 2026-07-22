@@ -205,6 +205,17 @@ default thunks are keyed by their reserved `FuncId`, avoiding the prior
 class/name collision between overloads. `dump-ir` reports virtual calls
 separately from name-dynamic calls so migration coverage is measurable.
 
+Runtime-defined anonymous and local classes now participate in the same numeric
+slot contract. Their first `(runtime class identity, MethodSlotId)` call links
+either to the exact override body in its side module or to the most-specific
+already-linked supertype implementation, then caches that typed target. The hot
+path is consequently a class/slot hash lookup followed by direct execution; it
+does not reopen method-name lookup or overload selection. Named/defaulted calls
+bind against the slot-root declaration before entering an anonymous override,
+so inherited defaults retain Kotlin's declaration semantics. The corpus pins
+both an inherited interface default and an anonymous override in eager-emitted
+`CallVirtual` form, with and without a named argument.
+
 Explicit-receiver top-level extensions now resolve through
 `Module.resolveExtensionCall`, using the same declaration index and shared
 applicability engine as the other call forms. A direct target requires an

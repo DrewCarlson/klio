@@ -25,6 +25,12 @@ reimplementation.
   property-getter, and expect/actual read-only calls through a CompositionLocal.
   A freshly serialized runtime-engine pack runs `compose_locals.kt` and
   `compose_counter.kt` successfully.
+- Numeric virtual calls now link anonymous/local runtime classes by exact slot,
+  selecting either their side-module override or the most-specific inherited
+  implementation and caching the result. This removes the empty-header panic
+  on Compose's anonymous `FlowCollector.emit`; upstream
+  `CompositionTests.simple` now passes. `CompositionTests.simpleChanges`
+  proceeds to the older `AtomicRef.addAndGet` host-surface gap.
 
 ## Current state (being replaced)
 

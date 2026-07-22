@@ -2188,18 +2188,33 @@ pub const Module = struct {
         const existing = gop.value_ptr.*;
         if (existing.int() == incoming.int()) return;
 
+        gop.value_ptr.* = try self.preferredMethodSlotTarget(allocator, existing, incoming);
+    }
+
+    /// Choose the more-specific implementation of one inherited virtual slot.
+    /// Runtime-defined classes use the same rule when merging the already-linked
+    /// slot tables of their declared supertypes.
+    pub fn preferredMethodSlotTarget(
+        self: *const Module,
+        allocator: Allocator,
+        existing: FuncId,
+        incoming: FuncId,
+    ) Allocator.Error!FuncId {
+        if (existing.int() == incoming.int()) return existing;
+
         if (self.decl_sigs.get(existing.int())) |sig| {
             if (sig.enclosing_class) |owner| {
-                if (try self.overridesSlot(allocator, owner, existing, incoming)) return;
+                if (try self.overridesSlot(allocator, owner, existing, incoming)) return existing;
             }
         }
         if (self.decl_sigs.get(incoming.int())) |sig| {
             if (sig.enclosing_class) |owner| {
                 if (try self.overridesSlot(allocator, owner, incoming, existing)) {
-                    gop.value_ptr.* = incoming;
+                    return incoming;
                 }
             }
         }
+        return existing;
     }
 
     fn linkMethodClass(

@@ -7802,6 +7802,17 @@ fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8,
     return null;
 }
 
+/// Exact anonymous/local-class method lookup used while linking a numeric
+/// virtual slot. Unlike the legacy named-member path, this never falls back to
+/// the arity-agnostic key.
+fn lookupAnonMethodExact(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8) ?AnonMethodEntry {
+    const tbl = self.anon_methods.borrow();
+    defer tbl.deinit();
+    const key = anonKey(allocator, class_name, arity_name) catch return null;
+    defer allocator.free(key);
+    return tbl.get().get(key);
+}
+
 fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Value, hit: AnonMethodEntry, args: []const Value, padding_inst: ?ObjRef(InstanceData)) Allocator.Error!EvalResult {
     return invokeAnonMethodFrom(self, allocator, receiver, receiver, hit, args, padding_inst);
 }
@@ -8448,9 +8459,176 @@ pub fn invokeResolvedMember(self: *VmHost, allocator: Allocator, receiver: *cons
     return invokeMethodFuncId(self, allocator, receiver, fid, args);
 }
 
+fn runtimeVirtualCacheGet(self: *VmHost, key: root_mod.ProgramImage.RuntimeVirtualKey) ?root_mod.ProgramImage.RuntimeVirtualTarget {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().runtime_virtual_cache.get(key);
+}
+
+fn runtimeVirtualCachePut(self: *VmHost, key: root_mod.ProgramImage.RuntimeVirtualKey, target: root_mod.ProgramImage.RuntimeVirtualTarget) void {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    pg.get().runtime_virtual_cache.put(key, target) catch {};
+}
+
+/// Resolve a runtime class-table entry without a simple-name fallback when the
+/// caller supplied an FQN. Runtime-defined classes record their resolved
+/// supertypes in this table even though they have no main-module `ClassId`.
+fn runtimeClassDef(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
+    const classes = self.classes.borrow();
+    defer classes.deinit();
+    if (classes.get().get(name)) |def| return def.clone();
+    var it = classes.get().valueIterator();
+    while (it.next()) |def| {
+        const dg = def.borrow();
+        const matches = std.mem.eql(u8, dg.get().fqn, name);
+        dg.deinit();
+        if (matches) return def.clone();
+    }
+    return null;
+}
+
+/// Find this runtime class's body for a numeric slot. The slot root fixes the
+/// method family; the exact arity-qualified side-table key only locates the
+/// already-lowered body belonging to that family.
+fn runtimeVirtualOverride(
+    self: *VmHost,
+    allocator: Allocator,
+    runtime_def: ObjRef(ClassDef),
+    root_func: Func,
+) Allocator.Error!?AnonMethodEntry {
+    const class_name = blk: {
+        const dg = runtime_def.borrow();
+        defer dg.deinit();
+        break :blk dg.get().name;
+    };
+    const receiver_count: usize = if (root_func.params.len != 0 and
+        std.mem.eql(u8, root_func.params[0].name, "this")) 1 else 0;
+    const arity_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}#{d}",
+        .{ root_func.name, root_func.params.len - receiver_count },
+    );
+    defer if (runtime.freeScratch()) allocator.free(arity_name);
+    const hit = lookupAnonMethodExact(self, allocator, class_name, arity_name) orelse return null;
+    const hg = hit.module.borrow();
+    defer hg.deinit();
+    const candidate = funcAt(hg.get(), hit.func) orelse return null;
+    if (!candidate.is_override or !std.mem.eql(u8, candidate.name, root_func.name)) return null;
+    const candidate_receiver_count: usize = if (candidate.params.len != 0 and
+        std.mem.eql(u8, candidate.params[0].name, "this")) 1 else 0;
+    if (candidate.params.len - candidate_receiver_count != root_func.params.len - receiver_count) return null;
+    return hit;
+}
+
+/// Merge the complete slot tables of a runtime class's resolved direct
+/// supertypes. Named supertypes stop the walk because their main-module vtable
+/// already contains their transitive inheritance; runtime supertypes continue
+/// through their recorded names.
+fn runtimeInheritedVirtualTarget(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    runtime_def: ObjRef(ClassDef),
+    slot: MethodSlotId,
+) Allocator.Error!?FuncId {
+    var queue: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    defer {
+        while (queue.pop()) |def| def.deinit();
+        queue.deinit(allocator);
+    }
+    var seen = std.AutoHashMap(usize, void).init(allocator);
+    defer seen.deinit();
+    {
+        const dg = runtime_def.borrow();
+        defer dg.deinit();
+        for (dg.get().supertype_names) |name| {
+            if (runtimeClassDef(self, name)) |def| try queue.append(allocator, def);
+        }
+    }
+
+    var best: ?FuncId = null;
+    while (queue.pop()) |def| {
+        defer def.deinit();
+        const identity = def.identity();
+        const gop = try seen.getOrPut(identity);
+        if (gop.found_existing) continue;
+
+        const dg = def.borrow();
+        const fqn = dg.get().fqn;
+        const class_name = dg.get().name;
+        if (module.classIdByFqn(fqn) orelse
+            (if (std.mem.eql(u8, fqn, class_name)) module.classId(class_name) else null)) |cid|
+        {
+            dg.deinit();
+            if (module.methodSlotTarget(cid, slot)) |target| {
+                best = if (best) |existing|
+                    try module.preferredMethodSlotTarget(allocator, existing, target)
+                else
+                    target;
+            }
+            continue;
+        }
+        for (dg.get().supertype_names) |name| {
+            if (runtimeClassDef(self, name)) |parent| try queue.append(allocator, parent);
+        }
+        dg.deinit();
+    }
+    return best;
+}
+
+fn linkRuntimeVirtualTarget(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    runtime_def: ObjRef(ClassDef),
+    slot: MethodSlotId,
+) Allocator.Error!?root_mod.ProgramImage.RuntimeVirtualTarget {
+    const root_func = funcAt(module, FuncId.from(slot.int())) orelse return null;
+    if (try runtimeVirtualOverride(self, allocator, runtime_def, root_func)) |hit| {
+        return .{ .side_func = hit };
+    }
+    if (try runtimeInheritedVirtualTarget(self, allocator, module, runtime_def, slot)) |target| {
+        return .{ .main_func = target.int() };
+    }
+    return null;
+}
+
+fn invokeRuntimeVirtualSide(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    receiver: *const Value,
+    root: FuncId,
+    hit: AnonMethodEntry,
+    args: []const Value,
+    arg_params: ?[]const u32,
+) Allocator.Error!EvalResult {
+    if (arg_params) |params| {
+        const bound = try host_call_func.bindFuncIndexedArgs(
+            self,
+            allocator,
+            module,
+            root,
+            root,
+            receiver,
+            args,
+            params,
+        );
+        switch (bound) {
+            .ok => |ordered| {
+                defer allocator.free(ordered);
+                return invokeAnonMethod(self, allocator, receiver, hit, ordered[1..], receiver.Instance);
+            },
+            .err => |err| return .{ .err = err },
+        }
+    }
+    return invokeAnonMethod(self, allocator, receiver, hit, args, receiver.Instance);
+}
+
 /// Invoke a statically resolved virtual family by numeric slot. The runtime
-/// receiver contributes only its exact `ClassId`; overload selection and
-/// method names are absent from this path.
+/// receiver contributes its exact class identity; named and runtime-defined
+/// classes both resolve to an O(1) `(class, slot)` target.
 pub fn invokeVirtualMember(
     self: *VmHost,
     allocator: Allocator,
@@ -8480,20 +8658,48 @@ pub fn invokeVirtualMember(
         }
         return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
     }
-    const recv_fqn = blk: {
+    const runtime_def = blk: {
         const instance = receiver.Instance.borrow();
         defer instance.deinit();
-        const class = instance.get().class.borrow();
+        break :blk instance.get().class.clone();
+    };
+    defer runtime_def.deinit();
+    const recv_fqn = blk: {
+        const class = runtime_def.borrow();
         defer class.deinit();
         break :blk class.get().fqn;
     };
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
-    const runtime_class = module.classIdByFqn(recv_fqn) orelse
-        return .{ .err = .{ .Type = "virtual call receiver class is not linked" } };
-    const target = module.methodSlotTarget(runtime_class, slot) orelse
-        return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
+    const linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
+        .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse
+            return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } }).int() }
+    else blk: {
+        const key: root_mod.ProgramImage.RuntimeVirtualKey = .{
+            .class_p = runtime_def.identity(),
+            .slot = slot.int(),
+        };
+        if (runtimeVirtualCacheGet(self, key)) |cached| break :blk cached;
+        const target = (try linkRuntimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse
+            return .{ .err = .{ .Type = "virtual method slot is not linked for runtime class" } };
+        runtimeVirtualCachePut(self, key, target);
+        break :blk target;
+    };
+
+    if (linked == .side_func) {
+        return invokeRuntimeVirtualSide(
+            self,
+            allocator,
+            module,
+            receiver,
+            FuncId.from(slot.int()),
+            linked.side_func,
+            args,
+            arg_params,
+        );
+    }
+    const target = FuncId.from(linked.main_func);
 
     if (arg_params) |params| {
         const sig = module.decl_sigs.get(target.int());
