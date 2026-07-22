@@ -215,6 +215,44 @@ Next: generalize the hand-assembled `.app` into `klio bundle --target ios-sim`
 (and reuse the baked `.klio-image` instead of shipping `.kt` source); then the
 render surface (P3) and the dev-host + fast run loop (P4).
 
+### P3 iOS render surface (in progress)
+
+**Skia renders on the iOS simulator (proven).** The prebuilt JetBrains Skia for
+iOS-sim links and renders offscreen on the simulator: the shim + `libskia.a` draw
+a rect to a valid `PNG 64x64 RGBA` via `simctl spawn`. This clears the biggest
+render unknown — Skia compiles/links/runs on iOS.
+
+- **Skia prebuilts.** `scripts/fetch-skia.sh` extended for the skia-pack iOS
+  tokens (`iosSim`/`ios`, arm64-only): `scripts/fetch-skia.sh iossim arm64`
+  fetches `Skia-<tag>-iosSim-Release-arm64.zip` →
+  `third_party/skia/iossim-arm64/{include,modules,out/Release-iosSim-arm64,src}`.
+- **Proven iOS shim recipe** (for the build.zig integration to follow): compile
+  `src/compose_ui/skia_shim.cpp` (+ `font_data.cpp`) with `clang++ -x
+  objective-c++ -std=c++17 -O2 -DNDEBUG -isysroot <iPhoneSimulator.sdk> -arch
+  arm64 -mios-simulator-version-min=15.0 -I third_party/skia/iossim-arm64`, no
+  backend define (offscreen/raster). On iOS the shim must be **static** (no
+  dlopen): link its objects + `libskia.a` + the sibling dep archives + frameworks
+  `{CoreFoundation, CoreGraphics, CoreText, Foundation, ImageIO}` + `-lc++`
+  directly into the app. Drop `AppKit`/`IOKit`/`CoreServices` (macOS-only).
+
+Remaining P3 work, in order:
+1. **build.zig integration**: `skiaLibInfo` `.ios` case (base
+   `third_party/skia/iossim-arm64`, lib_dir `.../out/Release-iosSim-arm64`);
+   `buildSkiaShim` iOS branch emitting a static archive (not a dylib).
+2. **`compose_ui.zig` static-link path**: `loadSkia` binds the `Skia` struct from
+   statically-linked `extern fn` addresses on iOS instead of `std.DynLib`
+   (`.lib` is unused post-load, so bind it `undefined`). Gate on `os.tag == .ios`.
+3. **Compose packs on device** (new dependency surfaced): running a Compose
+   program needs the compose packs available to the interpreter. The app sets
+   `HOME` to the sandbox, so `~/.klio` installed packs are not visible — the packs
+   must be embedded/bundled into the app (ties into `klio bundle --target ios`).
+   This is the gate for an end-to-end Compose→pixels render inside the app.
+4. **On-screen surface (P3b)**: `UIView`-owned `CAMetalLayer` + Ganesh-Metal
+   (reuse the macOS Metal bring-up), a `klio_win_attach` extern, and invert the
+   VM poll loop into a `CADisplayLink` frame callback (the resize-callback
+   trampoline is the template).
+5. **Touch (P3c)**: `UITouch` phases → multi-touch pointer events.
+
 ## Phase map (initial)
 
 - **P1** Runtime portability + headless run on sim + emulator (Layer 1). Decision-independent. *(iOS sim: done; Android: pending.)*

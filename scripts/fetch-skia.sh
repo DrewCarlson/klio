@@ -42,14 +42,22 @@ if [ -z "${ARCH}" ]; then
     esac
 fi
 
-case "${OS}" in linux|macos|windows) ;; *) echo "os must be linux|macos|windows (got '${OS}')" >&2; exit 1 ;; esac
+# Map the logical OS to the skia-pack asset token (camelCase `iosSim` for the
+# iOS simulator) and to the local directory name. iOS builds are arm64-only.
+ASSET_OS="${OS}"; DIR_OS="${OS}"
+case "${OS}" in
+    linux|macos|windows) ;;
+    ios) ASSET_OS="ios"; DIR_OS="ios" ;;
+    iossim|ios-sim|iosSim) OS="iossim"; ASSET_OS="iosSim"; DIR_OS="iossim" ;;
+    *) echo "os must be linux|macos|windows|ios|iossim (got '${OS}')" >&2; exit 1 ;;
+esac
 case "${ARCH}" in x64|arm64) ;; *) echo "arch must be x64|arm64 (got '${ARCH}')" >&2; exit 1 ;; esac
 
-DEST="${ROOT}/${OS}-${ARCH}"
-ASSET="Skia-${SKIA_TAG}-${OS}-Release-${ARCH}.zip"
+DEST="${ROOT}/${DIR_OS}-${ARCH}"
+ASSET="Skia-${SKIA_TAG}-${ASSET_OS}-Release-${ARCH}.zip"
 URL="https://github.com/${REPO}/releases/download/${SKIA_TAG}/${ASSET}"
 EXT="a"; [ "${OS}" = "windows" ] && EXT="lib"
-MAIN="${DEST}/out/Release-${OS}-${ARCH}/libskia.${EXT}"
+MAIN="${DEST}/out/Release-${ASSET_OS}-${ARCH}/libskia.${EXT}"
 # The prebuilt's public module headers (skunicode/skparagraph/skresources/svg/
 # skottie) transitively `#include "src/..."` internal headers, so the archive's
 # headers-only src/ tree is required to compile the shim. Use one such header as
