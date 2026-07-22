@@ -17,6 +17,12 @@ class Dot : Circle() {
     override fun sides(): Int = 0
 }
 
+open class InheritedShape : Shape()
+
+class NamedInheritedShape : InheritedShape() {
+    override fun name(): String = "inherited"
+}
+
 class FinalOverloads {
     fun pick(value: Int): String = "int:$value"
     fun pick(value: String): String = "string:$value"
@@ -27,8 +33,11 @@ fun pickBoth(target: FinalOverloads): String =
 
 fun describe(shape: Shape): String = "${shape.name()} ${shape.sides()}"
 
+fun inheritedName(shape: InheritedShape): String = shape.name()
+
 fun main() {
     val shapes: List<Shape> = listOf(Shape(), Circle(), Dot())
     for (s in shapes) println(describe(s))
+    println(inheritedName(NamedInheritedShape()))
     println(pickBoth(FinalOverloads()))
 }

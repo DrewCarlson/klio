@@ -1671,6 +1671,40 @@ pub const Module = struct {
         return list.items;
     }
 
+    const MemberCandidate = struct {
+        fid: FuncId,
+        depth: u16,
+    };
+
+    fn collectMemberCandidates(
+        self: *const Module,
+        allocator: Allocator,
+        owner: ClassId,
+        name: []const u8,
+        depth: u16,
+        seen: *std.AutoHashMap(u32, void),
+        out: *std.ArrayList(MemberCandidate),
+    ) Allocator.Error!void {
+        if (owner.int() >= self.classes.items.len or seen.contains(owner.int())) return;
+        try seen.put(owner.int(), {});
+        const class = &self.classes.items[owner.int()];
+        for (self.memberDecls(class.fqn, name)) |fid| {
+            var shadowed = false;
+            for (out.items) |existing| {
+                const existing_sig = self.decl_sigs.get(existing.fid.int()) orelse continue;
+                const existing_owner = existing_sig.enclosing_class orelse continue;
+                if (try self.overridesSlot(allocator, existing_owner, existing.fid, fid)) {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if (!shadowed) try out.append(allocator, .{ .fid = fid, .depth = depth });
+        }
+        for (class.supertypes) |super_id| {
+            try self.collectMemberCandidates(allocator, super_id, name, depth + 1, seen, out);
+        }
+    }
+
     /// Resolve one member name against the declarations owned by the static
     /// receiver class. Candidate applicability and overload ranking are shared
     /// with runtime dispatch; this function additionally classifies whether
@@ -1685,8 +1719,13 @@ pub const Module = struct {
     ) MemberResolution {
         if (owner.int() >= self.classes.items.len) return .{};
         const class = &self.classes.items[owner.int()];
-        const candidates = self.memberDecls(class.fqn, name);
-        if (candidates.len == 0) return .{};
+        var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var candidates: std.ArrayList(MemberCandidate) = .empty;
+        var seen = std.AutoHashMap(u32, void).init(sa);
+        self.collectMemberCandidates(sa, owner, name, 0, &seen, &candidates) catch return .{};
+        if (candidates.items.len == 0) return .{};
 
         var named = false;
         for (args) |arg| {
@@ -1703,7 +1742,8 @@ pub const Module = struct {
         var best: ?FuncId = null;
         var best_score: i32 = std.math.minInt(i32);
         var tied = false;
-        for (candidates) |fid| {
+        for (candidates.items) |candidate| {
+            const fid = candidate.fid;
             const ds = self.decl_sigs.get(fid.int()) orelse continue;
             if (ds.kind != .instance_method) continue;
             if (ds.is_private and (ctx.lexical_owner == null or ctx.lexical_owner.?.int() != owner.int())) continue;
@@ -1748,7 +1788,12 @@ pub const Module = struct {
         // overload, but dispatch must remain virtual until the class is filled.
         if (class.is_stub) return .{ .target = target, .dispatch = .virtual };
         if (class.is_value) return .{ .target = target, .dispatch = .virtual };
-        if (!class.is_interface and (!class.is_open and !class.is_abstract or methodIsFinal(f))) {
+        const declaring_class = if (ds.enclosing_class) |decl_owner|
+            (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
+        else
+            null;
+        const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
+        if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
             return .{ .target = target, .dispatch = .direct };
         }
         return .{ .target = target, .dispatch = .virtual };
@@ -5443,7 +5488,7 @@ test "method slots link generic overrides and multiple interface roots" {
     const child = try m.addClass(a, .{
         .id = ClassId.from(0), .name = "Child", .fqn = "sample.Child", .primary_params = &.{},
         .methods = &.{}, .init_block = null, .companion = null, .supertypes = child_super_ids,
-        .supertype_refs = child_supers,
+        .supertype_refs = child_supers, .is_open = true,
     });
     const left = try m.addClass(a, .{
         .id = ClassId.from(0), .name = "Left", .fqn = "sample.Left", .primary_params = &.{},
@@ -5488,12 +5533,19 @@ test "method slots link generic overrides and multiple interface roots" {
             .kind = .instance_method,
             .has_body = m.funcs.items[fid.int()].hasBody(),
         });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, m.funcs.items[fid.int()].name, fid);
     }
 
     try m.linkMethodSlots(a);
     try testing.expectEqual(child_put, m.methodSlotTarget(child, MethodSlotId.fromFunc(base_put)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(left_run)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(right_run)).?);
+    const string_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+    }};
+    const inherited = m.resolveMemberCall(child, "put", &string_args, .{});
+    try testing.expectEqual(Module.MemberDispatch.virtual, inherited.dispatch);
+    try testing.expectEqual(child_put, inherited.target.?);
 }
 
 /// Options for the symbol-index test func pusher.
