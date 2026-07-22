@@ -437,6 +437,20 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
 }
 
+fn evalParentCtorThunk(
+    self: *VmHost,
+    func: *const ir.Func,
+    args: []const Value,
+    outer_hint: ?*const Value,
+) Allocator.Error!EvalResult {
+    if (!func.has_receiver_param) return evalThunk(self, func, args);
+    var all: std.ArrayList(Value) = .empty;
+    defer all.deinit(self.allocator);
+    try all.append(self.allocator, if (outer_hint) |outer| outer.* else .Null);
+    try all.appendSlice(self.allocator, args);
+    return evalThunk(self, func, all.items);
+}
+
 // -------------------------------------------------------------------------
 // Free helpers used only by the construction flow.
 // -------------------------------------------------------------------------
@@ -764,17 +778,16 @@ fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) 
 
 fn isBuiltinThrowableName(name: []const u8) bool {
     const names = [_][]const u8{
-        "Throwable",                "Exception",
-        "RuntimeException",         "Error",
-        "IllegalArgumentException", "IllegalStateException",
-        "IndexOutOfBoundsException", "NullPointerException",
-        "ClassCastException",       "ArithmeticException",
-        "NumberFormatException",    "NoSuchElementException",
+        "Throwable",                       "Exception",
+        "RuntimeException",                "Error",
+        "IllegalArgumentException",        "IllegalStateException",
+        "IndexOutOfBoundsException",       "NullPointerException",
+        "ClassCastException",              "ArithmeticException",
+        "NumberFormatException",           "NoSuchElementException",
         "ConcurrentModificationException", "UnsupportedOperationException",
-        "CancellationException",
-        "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException",
-        "UninitializedPropertyAccessException", "NoWhenBranchMatchedException",
-        "NegativeArraySizeException",
+        "CancellationException",           "ArrayIndexOutOfBoundsException",
+        "StringIndexOutOfBoundsException", "UninitializedPropertyAccessException",
+        "NoWhenBranchMatchedException",    "NegativeArraySizeException",
     };
     for (names) |n| {
         if (std.mem.eql(u8, name, n)) return true;
@@ -837,7 +850,15 @@ fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Va
 const UnitOrErr = union(enum) { ok: void, err: EvalError };
 
 /// Dispatch the parent's matching secondary-ctor chain on the same leaf.
-fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, class_name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!UnitOrErr {
+fn runSuperCtorChain(
+    self: *VmHost,
+    leaf: *const Value,
+    class_fqn: ?[]const u8,
+    class_name: []const u8,
+    args: []const Value,
+    arg_names: ?[]const ?[]const u8,
+    outer_hint: ?*const Value,
+) Allocator.Error!UnitOrErr {
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
@@ -890,7 +911,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
             switch (fr) {
                 .err => |e| return .{ .err = e },
                 .ok => |func| {
-                    switch (try evalThunk(self, func, args)) {
+                    switch (try evalParentCtorThunk(self, func, args, outer_hint)) {
                         .ok => |v| try parent_args.append(self.allocator, v),
                         .err => |e| return .{ .err = e },
                     }
@@ -902,7 +923,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         // The labels of this class's super-constructor call apply to the
         // parent's parameters, so thread them into the parent's frame.
         const parent_names = parentCtorArgNames(self, class_fqn, class_name);
-        return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items, parent_names);
+        return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items, parent_names, outer_hint);
     };
 
     var next_args: std.ArrayList(Value) = .empty;
@@ -920,7 +941,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
         }
     }
     if (entry.is_this) {
-        switch (try runSuperCtorChain(self, leaf, class_fqn, class_name, next_args.items, null)) {
+        switch (try runSuperCtorChain(self, leaf, class_fqn, class_name, next_args.items, null, outer_hint)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -941,7 +962,7 @@ fn runSuperCtorChain(self: *VmHost, leaf: *const Value, class_fqn: ?[]const u8, 
             def.deinit();
         }
         if (parent_name) |p| {
-            switch (try runSuperCtorChain(self, leaf, parent_fqn, p, next_args.items, null)) {
+            switch (try runSuperCtorChain(self, leaf, parent_fqn, p, next_args.items, null, outer_hint)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -1004,7 +1025,7 @@ fn extendAnonymousParentCtorArgs(
                     parent_args.deinit(allocator);
                     return .{ .err = e };
                 },
-                .ok => |func| switch (try evalThunk(self, func, cur_args)) {
+                .ok => |func| switch (try evalParentCtorThunk(self, func, cur_args, outer_hint)) {
                     .ok => |v| try parent_args.append(allocator, v),
                     .err => |e| {
                         parent_args.deinit(allocator);
@@ -1600,17 +1621,17 @@ fn findNamedFactory(self: *VmHost, class_name: []const u8, arg_names: []const ?[
 
 fn isIntrinsicClass(fqn: []const u8) bool {
     const names = [_][]const u8{
-        "kotlin.text.StringBuilder",      "kotlin.text.Regex",
-        "kotlin.collections.HashMap",     "kotlin.collections.HashSet",
+        "kotlin.text.StringBuilder",        "kotlin.text.Regex",
+        "kotlin.collections.HashMap",       "kotlin.collections.HashSet",
         "kotlin.collections.LinkedHashMap", "kotlin.collections.LinkedHashSet",
-        "kotlin.collections.ArrayList",
-        "kotlin.IntArray",                "kotlin.LongArray",
-        "kotlin.ShortArray",              "kotlin.ByteArray",
-        "kotlin.FloatArray",              "kotlin.DoubleArray",
-        "kotlin.BooleanArray",            "kotlin.CharArray",
-        "kotlin.UIntArray",               "kotlin.ULongArray",
-        "kotlin.UShortArray",             "kotlin.UByteArray",
-        "kotlin.Array",                   "kotlin.String",
+        "kotlin.collections.ArrayList",     "kotlin.IntArray",
+        "kotlin.LongArray",                 "kotlin.ShortArray",
+        "kotlin.ByteArray",                 "kotlin.FloatArray",
+        "kotlin.DoubleArray",               "kotlin.BooleanArray",
+        "kotlin.CharArray",                 "kotlin.UIntArray",
+        "kotlin.ULongArray",                "kotlin.UShortArray",
+        "kotlin.UByteArray",                "kotlin.Array",
+        "kotlin.String",
     };
     for (names) |n| {
         if (std.mem.eql(u8, fqn, n)) return true;
@@ -2145,7 +2166,7 @@ fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_de
             pg.deinit();
             g.deinit();
         }
-        switch (try runSuperCtorChain(self, &leaf, classDefFqn(pdef), pname, target_args, cur_names)) {
+        switch (try runSuperCtorChain(self, &leaf, classDefFqn(pdef), pname, target_args, cur_names, outer_hint)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -2792,7 +2813,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         switch (fr) {
                             .err => {},
                             .ok => |func| {
-                                switch (try evalThunk(self, func, cur_args)) {
+                                switch (try evalParentCtorThunk(self, func, cur_args, outer_hint)) {
                                     .ok => |v| {
                                         if (idx == 0) throwable_message = v else if (idx == 1) throwable_cause = v;
                                         runtime.keepalivePush(v);
@@ -2830,7 +2851,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                 .ok => |func| {
                     const parent_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(parent_args.items);
-                    const evaluated = evalThunk(self, func, cur_args);
+                    const evaluated = evalParentCtorThunk(self, func, cur_args, outer_hint);
                     runtime.keepaliveRestore(parent_keepalive);
                     switch (try evaluated) {
                         .ok => |v| parent_args.append(allocator, v) catch {},

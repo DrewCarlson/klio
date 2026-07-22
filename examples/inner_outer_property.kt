@@ -18,6 +18,13 @@ class Impl : Base() {
     override val tag: Int get() = 100
 }
 
+open class OuterValue(val value: Int)
+
+class OuterSource(val source: Int) {
+    inner class Derived : OuterValue(source)
+    fun derived() = Derived()
+}
+
 class MyList<T> : AbstractMutableList<T>() {
     private val backing = ArrayList<T>()
     override val size: Int get() = backing.size
@@ -31,6 +38,7 @@ fun main() {
     val v = Impl().view()
     println("viaAbstract=${v.viaAbstract()}")
     println("viaOpen=${v.viaOpen()}")
+    println("superArg=${OuterSource(77).derived().value}")
 
     val l = MyList<Int>()
     l.add(1); l.add(2); l.add(3)

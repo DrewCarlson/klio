@@ -2818,17 +2818,27 @@ fn buildModuleWithOverrides(
             if (first_idx < c.supertype_arg_names.len) c.supertype_arg_names[first_idx] else null;
         var param_refs: std.ArrayList([]const u8) = .empty;
         defer param_refs.deinit(a);
+        if (c.is_inner) try param_refs.append(a, "this");
         for (c.primary_params) |*p| try param_refs.append(a, p.name.name);
         var own = StringSet.init(a);
         defer own.deinit();
         try collectCompanionOwnMembers(c, &own);
+        const parent_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
         var fids = try a.alloc(FuncId, parent_args.len);
         const pca_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         const prev_pca_pkg = ir.lower.decl.setLowerSelfPackage(pca_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_pca_pkg);
         for (parent_args, 0..) |*e, idx| {
             const nm = try std.fmt.allocPrint(a, "__parent_ctor_arg_{s}_{d}", .{ c.name.name, idx });
-            fids[idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_refs.items, e, nm, c.name.name, &own);
+            fids[idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(
+                module,
+                param_refs.items,
+                e,
+                nm,
+                c.name.name,
+                &own,
+                parent_enclosing,
+            );
         }
         try parent_ctor_args.put(c.name.name, fids);
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
@@ -4262,8 +4272,6 @@ fn transplantExpectMemberDefaults(actual: *ast.Function, expected: *const ast.Fu
     }
     return true;
 }
-
-
 
 // -------------------------------------------------------------------------
 // Once-per-process dependency base: the stdlib (+ pack) files are lowered

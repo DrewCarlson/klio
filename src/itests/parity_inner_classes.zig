@@ -532,3 +532,19 @@ test "inner_class_init_block_sees_outer_field" {
     ;
     try assertKlio("inner_init_outer", src, "2\n1\n0\n");
 }
+
+test "inner_class_super_constructor_reads_outer_field" {
+    const src =
+        \\
+        \\open class Base(val value: Int)
+        \\class Outer(val seed: Int) {
+        \\    inner class Derived : Base(seed)
+        \\    fun make(): Derived = Derived()
+        \\}
+        \\fun main() {
+        \\    println(Outer(42).make().value)
+        \\}
+        \\
+    ;
+    try assertKlio("inner_super_outer", src, "42\n");
+}
