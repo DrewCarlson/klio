@@ -3305,31 +3305,25 @@ fn prependReceiver(allocator: Allocator, receiver: *const Value, args: []const V
     return all;
 }
 
-fn reorderIndexedArgs(
+fn callCallableIndexed(
+    self: *VmHost,
     allocator: Allocator,
+    module: *const Module,
+    root: FuncId,
+    receiver: *const Value,
+    callable: *const Value,
     args: []const Value,
     arg_params: []const u32,
-    param_count: usize,
-) Allocator.Error!?[]Value {
-    if (args.len != param_count or arg_params.len != args.len) return null;
-    const ordered = try allocator.alloc(Value, param_count);
-    const filled = try allocator.alloc(bool, param_count);
-    defer allocator.free(filled);
-    for (filled) |*slot| slot.* = false;
-    for (args, arg_params) |arg, raw_index| {
-        const index: usize = raw_index;
-        if (index >= ordered.len or filled[index]) {
-            allocator.free(ordered);
-            return null;
-        }
-        ordered[index] = arg;
-        filled[index] = true;
+) Allocator.Error!EvalResult {
+    const bound = try host_call_func.bindFuncIndexedArgs(self, allocator, module, root, root, receiver, args, arg_params);
+    switch (bound) {
+        .ok => |ordered| {
+            defer allocator.free(ordered);
+            if (ordered.len == 0) return .{ .err = .{ .Type = "virtual callable slot has no receiver" } };
+            return host_call_value.callValue(self, allocator, callable, ordered[1..]);
+        },
+        .err => |err| return .{ .err = err },
     }
-    for (filled) |slot| if (!slot) {
-        allocator.free(ordered);
-        return null;
-    };
-    return ordered;
 }
 
 /// Dispatch an intrinsic with the receiver prepended to `args`, using a stack
@@ -8480,13 +8474,7 @@ pub fn invokeVirtualMember(
                 return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
             }
             if (arg_params.len != 0) {
-                const root_func = module.funcById(root) orelse
-                    return .{ .err = .{ .Type = "virtual callable slot has no function header" } };
-                if (root_func.params.len == 0) return .{ .err = .{ .Type = "virtual callable slot has no receiver" } };
-                const ordered = (try reorderIndexedArgs(allocator, args, arg_params, root_func.params.len - 1)) orelse
-                    return .{ .err = .{ .Type = "virtual callable parameter map is invalid" } };
-                defer allocator.free(ordered);
-                return host_call_value.callValue(self, allocator, receiver, ordered);
+                return callCallableIndexed(self, allocator, module, root, receiver, receiver, args, arg_params);
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
@@ -8515,13 +8503,7 @@ pub fn invokeVirtualMember(
             instance.deinit();
             if (sam_target) |callable| {
                 const root = FuncId.from(slot.int());
-                const root_func = module.funcById(root) orelse
-                    return .{ .err = .{ .Type = "virtual SAM slot has no function header" } };
-                if (root_func.params.len == 0) return .{ .err = .{ .Type = "virtual SAM slot has no receiver" } };
-                const ordered = (try reorderIndexedArgs(allocator, args, arg_params, root_func.params.len - 1)) orelse
-                    return .{ .err = .{ .Type = "virtual SAM parameter map is invalid" } };
-                defer allocator.free(ordered);
-                return host_call_value.callValue(self, allocator, &callable, ordered);
+                return callCallableIndexed(self, allocator, module, root, receiver, &callable, args, arg_params);
             }
         }
         return callFuncIndexedRec(self, allocator, module, target, FuncId.from(slot.int()), receiver, args, arg_params);
@@ -12494,17 +12476,6 @@ test "compareValuesBuiltin orders scalars and strings" {
     const b = try runtime.strInit(testing.allocator, "abd");
     defer b.deinit();
     try testing.expectEqual(Ordering.lt, compareValuesBuiltin(&.{ .String = a }, &.{ .String = b }).?);
-}
-
-test "indexed interface arguments follow declaration parameter order" {
-    const source = [_]Value{ .{ .Int = 2 }, .{ .Int = 10 } };
-    const ordered = (try reorderIndexedArgs(testing.allocator, &source, &.{ 1, 0 }, 2)).?;
-    defer testing.allocator.free(ordered);
-    try testing.expectEqual(@as(i64, 10), ordered[0].asI64().?);
-    try testing.expectEqual(@as(i64, 2), ordered[1].asI64().?);
-
-    try testing.expect((try reorderIndexedArgs(testing.allocator, &source, &.{ 0, 0 }, 2)) == null);
-    try testing.expect((try reorderIndexedArgs(testing.allocator, &source, &.{1}, 2)) == null);
 }
 
 test "discarded member probes release their owned miss message" {

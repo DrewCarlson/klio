@@ -1647,10 +1647,16 @@ pub fn pickNamedOverloadIdRecv(
     return best_ord orelse best_low;
 }
 
-/// Invoke a member target using declaration parameter indices already resolved
-/// by lowering. `arg_params` is parallel to the source-order user arguments;
-/// the receiver occupies parameter zero in the executable member ABI.
-pub fn callFuncIndexed(
+pub const IndexedArgsResult = union(enum) {
+    ok: []Value,
+    err: EvalError,
+};
+
+/// Bind source-order member arguments to the declaration ABI selected by
+/// lowering. The returned slice includes the receiver at parameter zero and
+/// is owned by the caller. Omitted parameters are evaluated from the slot-root
+/// declaration so an override body never changes its inherited defaults.
+pub fn bindFuncIndexedArgs(
     self: *VmHost,
     allocator: Allocator,
     module: *const Module,
@@ -1659,7 +1665,7 @@ pub fn callFuncIndexed(
     receiver: *const Value,
     args: []const Value,
     arg_params: []const u32,
-) Allocator.Error!EvalResult {
+) Allocator.Error!IndexedArgsResult {
     const f = funcAt(module, func) orelse
         return .{ .err = typeErr(allocator, "indexed-call FuncId {d} out of range", .{func.int()}) };
     if (f.params.len == 0 or arg_params.len != args.len) {
@@ -1700,7 +1706,30 @@ pub fn callFuncIndexed(
             .err => |err| return .{ .err = err },
         }
     }
-    return callFunc(self, allocator, module, func, ordered.items);
+    return .{ .ok = try ordered.toOwnedSlice(allocator) };
+}
+
+/// Invoke a member target using declaration parameter indices already resolved
+/// by lowering. `arg_params` is parallel to the source-order user arguments;
+/// the receiver occupies parameter zero in the executable member ABI.
+pub fn callFuncIndexed(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    func: FuncId,
+    defaults_from: FuncId,
+    receiver: *const Value,
+    args: []const Value,
+    arg_params: []const u32,
+) Allocator.Error!EvalResult {
+    const bound = try bindFuncIndexedArgs(self, allocator, module, func, defaults_from, receiver, args, arg_params);
+    switch (bound) {
+        .ok => |ordered| {
+            defer allocator.free(ordered);
+            return callFunc(self, allocator, module, func, ordered);
+        },
+        .err => |err| return .{ .err = err },
+    }
 }
 
 pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func_in: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {

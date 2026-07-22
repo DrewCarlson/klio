@@ -196,11 +196,13 @@ its resolved `ClassId`. Named open-class calls carry source-argument to
 declaration-parameter indices in `CallVirtual`, so override selection never
 rebinds names against the leaf implementation.
 Kotlin runtime classes with specialized scalar/collection representations and
-defaulted/vararg named interface calls remain on the compatibility path until
-their ABI and argument binders are explicit. Fully supplied named interface
-calls, including wrapped and callable-backed SAM receivers, use the numeric
-`CallVirtual` parameter map. `dump-ir` reports virtual calls separately from
-name-dynamic calls so migration coverage is measurable.
+vararg named interface calls remain on the compatibility path until their ABI
+and argument binder are explicit. Named interface calls, including wrapped and
+callable-backed SAM receivers, use the numeric `CallVirtual` parameter map and
+evaluate omitted defaults from the exact slot-root declaration. Abstract
+default thunks are keyed by their reserved `FuncId`, avoiding the prior
+class/name collision between overloads. `dump-ir` reports virtual calls
+separately from name-dynamic calls so migration coverage is measurable.
 
 The concrete correctness canary for item 1 is a class containing two private
 same-name, same-arity overloads (`pick(Int)` and `pick(String)`). Today the

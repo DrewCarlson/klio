@@ -10202,16 +10202,16 @@ fn lowerResolvedMemberCall(
         // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`. Fully supplied named
-        // interface calls carry a numeric parameter map; defaulted/vararg
-        // interface forms remain on the compatibility path for now.
+        // already guaranteed to use `Value.Instance`. Named interface calls
+        // carry a numeric parameter map and fill declaration defaults by slot;
+        // vararg interface forms remain on the compatibility path for now.
         var has_named = false;
         for (ast_arg_names) |arg_name| if (arg_name != null) {
             has_named = true;
             break;
         };
-        var interface_named_supported = !has_named or target.params.len == args.len + 1;
-        if (interface_named_supported) {
+        var interface_named_supported = true;
+        if (has_named) {
             for (target.params[1..]) |param| if (param.is_vararg) {
                 interface_named_supported = false;
                 break;
