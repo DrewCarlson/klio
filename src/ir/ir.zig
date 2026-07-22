@@ -3177,9 +3177,13 @@ pub const Module = struct {
     /// `Int` argument binds a same-arity `String` parameter (`Box(s.length)`
     /// inside `fun Box(s: String)` self-recursing past the constructor). No
     /// signature view, or no refuting evidence, keeps the candidate.
+    pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
+        const sv = self.sigViewForApplicability(fid) orelse return .{ .points = 0 };
+        return applicability.applicable(&sv, args, .{});
+    }
+
     pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
-        const sv = self.sigViewForApplicability(fid) orelse return true;
-        return applicability.applicable(&sv, args, .{}) != null;
+        return self.declSigScore(fid, args) != null;
     }
 
     /// Among the exact-declared-arity, non-extension candidates, the one whose

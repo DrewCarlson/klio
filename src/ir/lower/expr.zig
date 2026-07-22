@@ -4868,6 +4868,26 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
         .trailing_lambda_arity = trailingLambdaArity(args),
     };
+    // A renamed import is indexed under its declaration's original leaf, not
+    // the source alias. Resolve the exact imported overload first, then hand
+    // its registered AST to the ordinary splice path. This keeps reified
+    // vararg/iterable adapters static without widening the alias into a
+    // simple-name lookup.
+    if (try renamedImportDirectTarget(b, callee.Path.segments[0], args, ast_arg_names)) |fid| {
+        if (b.module.funcById(fid)) |target_func| {
+            if (target_func.is_inline) {
+                if (inline_state.inlineAstById(fid.int())) |target_ast| {
+                    if (bareInlineNeedsSplice(b, nm, target_ast, args)) {
+                        const expected = b.peekExpected();
+                        const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+                        if (try tryInlineCallWithTypeArgs(b, nm, target_ast, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                            return r;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // An explicit `<T>` argument binds a reified parameter, so a reified
     // inline overload of this shape outranks a non-reified `KClass<T>`
     // namesake (which would lower `<T>` as a constructor value instead of
@@ -6950,19 +6970,23 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
 /// the scorer: it can promote a head-matching candidate but never
 /// disqualify one.
 fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
+    const ty = argDeclTypeRef(b, arg);
+    const declared_fn_arity = if (ty) |t| fnTypeArityAlias(b, t) else null;
+    const literal_callable = arg.* == .Lambda or arg.* == .AnonFun;
     return .{
         .named = name,
         .is_spread = arg.* == .Spread,
-        .is_lambda = arg.* == .Lambda or arg.* == .AnonFun,
-        .lambda_arity = astArgLambdaArity(arg),
-        .lambda_is_literal = arg.* == .Lambda or arg.* == .AnonFun,
+        .is_lambda = literal_callable or declared_fn_arity != null,
+        .lambda_arity = astArgLambdaArity(arg) orelse if (declared_fn_arity) |n| @intCast(n) else null,
+        .func_typed = declared_fn_arity != null,
+        .lambda_is_literal = literal_callable,
         .literal_kind = if (argEvidenceLitKind(b, arg)) |k| switch (k) {
             .numeric => .numeric,
             .string => .string,
             .boolean => .boolean,
             .char => .char,
         } else null,
-        .ty = argDeclTypeRef(b, arg),
+        .ty = ty,
     };
 }
 
@@ -7430,14 +7454,20 @@ fn renamedImportDirectTarget(
         b.capturesThisSlot();
 
     var best: ?FuncId = null;
-    var best_rank: i16 = -1;
+    var best_recv_rank: i16 = -1;
+    var best_sig_rank: i32 = std.math.minInt(i32);
+    var best_shape_rank: i16 = -1;
     var tied = false;
+    const trace = if (runtime.getenvSlice("KLIO_BARE_TRACE")) |wanted|
+        std.mem.eql(u8, wanted, ident.name)
+    else
+        false;
     for (b.module.funcsBySimpleName(target_leaf)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) continue;
         if (f.low_priority) continue;
         if (!fqnCallArityFits(b, fid, args.len)) continue;
-        if (!b.module.declSigCompatible(fid, shapes)) continue;
+        const sig_score = b.module.declSigScore(fid, shapes) orelse continue;
 
         const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         var recv_match = false;
@@ -7453,21 +7483,33 @@ fn renamedImportDirectTarget(
         }
 
         const arity = b.module.decl_user_arity.get(fid.int()) orelse continue;
-        var rank: i16 = if (arity.has_vararg)
+        const shape_rank: i16 = if (arity.has_vararg)
             1
         else if (arity.total == args.len)
             4
         else
             2;
-        // Kotlin resolves the applicable implicit-receiver group before a
-        // receiverless sibling from the same imported overload family.
-        if (recv_match) rank += 8;
+        // Static argument compatibility selects the overload first. An
+        // implicit receiver breaks a score tie, but cannot make
+        // `Flow.combine(Flow, ...)` outrank `combine(Iterable<Flow>, ...)`
+        // when the first supplied argument is statically a List.
+        const recv_rank: i16 = if (recv_match) 1 else 0;
+        if (trace) std.debug.print("[alias-pick] {s} fid={d} inline={} recv={d} score={d} shape={d}\n", .{
+            f.fqn, fid.int(), f.is_inline, recv_rank, sig_score.points, shape_rank,
+        });
 
-        if (rank > best_rank) {
+        if (sig_score.points > best_sig_rank or
+            (sig_score.points == best_sig_rank and recv_rank > best_recv_rank) or
+            (sig_score.points == best_sig_rank and recv_rank == best_recv_rank and shape_rank > best_shape_rank))
+        {
             best = fid;
-            best_rank = rank;
+            best_recv_rank = recv_rank;
+            best_sig_rank = sig_score.points;
+            best_shape_rank = shape_rank;
             tied = false;
-        } else if (rank == best_rank) {
+        } else if (recv_rank == best_recv_rank and
+            sig_score.points == best_sig_rank and shape_rank == best_shape_rank)
+        {
             tied = true;
         }
     }
@@ -10815,6 +10857,17 @@ test "renamed overloaded import binds exact extension and plain identities" {
             });
             try module.func_index.append(alloc, .{ .name = "combine", .id = id });
             try module.decl_user_arity.put(id.int(), arity);
+            const off: usize = if (kind == .top_level_extension) 1 else 0;
+            const sig = try alloc.alloc(ir.TypeRef, params.len - off);
+            for (params[off..], sig) |p, *ty| ty.* = p.ty;
+            try module.decl_sigs.put(id.int(), .{
+                .receiver_ty = if (off == 1) params[0].ty else null,
+                .arity = arity,
+                .sig = sig,
+                .kind = kind,
+                .is_inline = is_inline,
+                .has_body = true,
+            });
             return id;
         }
     };
@@ -10842,7 +10895,7 @@ test "renamed overloaded import binds exact extension and plain identities" {
     const inline_params = try a.alloc(ir.Param, 2);
     inline_params[0] = .{ .name = "flows", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null, .is_vararg = true };
     inline_params[1] = .{ .name = "transform", .ty = .{ .name = "Function1", .nullable = false, .args = &.{} }, .default = null };
-    _ = try Add.func(&m, a, inline_params, .plain, true, .{
+    const inline_id = try Add.func(&m, a, inline_params, .plain, true, .{
         .required = 1,
         .total = 2,
         .has_vararg = true,
@@ -10863,9 +10916,11 @@ test "renamed overloaded import binds exact extension and plain identities" {
     try b.bind("first", b.allocReg());
     try b.bind("other", b.allocReg());
     try b.bind("transform", b.allocReg());
+    try b.bind("arrayTransform", b.allocReg());
     try b.setLocalDeclType("first", "Flow");
     try b.setLocalDeclType("other", "Flow");
     try b.setLocalDeclType("transform", "Function2");
+    try b.setLocalDeclType("arrayTransform", "Function1");
 
     var callee_segs = [_]ast.Ident{.{ .name = "combineOriginal", .span = sp }};
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = sp } };
@@ -10910,6 +10965,16 @@ test "renamed overloaded import binds exact extension and plain identities" {
     try testing.expect(plain_inst == .Call);
     try testing.expectEqual(plain_id, plain_inst.Call.func);
     try testing.expect(plain_inst.Call.exact);
+
+    var array_transform_segs = [_]ast.Ident{.{ .name = "arrayTransform", .span = sp }};
+    var inline_args = [_]Expr{
+        .{ .Path = .{ .segments = &first_segs, .span = sp } },
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &array_transform_segs, .span = sp } },
+    };
+    const inline_pick = try renamedImportDirectTarget(&b, callee_segs[0], &inline_args, &.{});
+    try testing.expect(inline_pick != null);
+    try testing.expectEqual(inline_id, inline_pick.?);
 }
 
 test "scope getter owner follows the class contributing an enclosing property" {
