@@ -809,8 +809,8 @@ pub fn parsePostfix(p: *Parser) ?Expr {
 }
 
 /// Attach `lam` as the trailing-lambda argument of `expr`, folding into an
-/// existing `Call` when `expr` already is one (so `f(a) { … }` stays a
-/// single call) and otherwise wrapping `expr` in a fresh `Call`.
+/// ungrouped `Call` so `f(a) { … }` stays a single call. A grouped call such
+/// as `(factory()) { … }` is wrapped because the lambda invokes its result.
 fn appendTrailingLambda(
     p: *Parser,
     expr: Expr,
@@ -820,39 +820,40 @@ fn appendTrailingLambda(
 ) Expr {
     switch (expr) {
         .Call => |c| {
-            var args: std.ArrayList(Expr) = .empty;
-            args.appendSlice(p.allocator, c.args) catch @panic("OOM");
-            args.append(p.allocator, lam) catch @panic("OOM");
-            var arg_names: std.ArrayList(?[]const u8) = .empty;
-            arg_names.appendSlice(p.allocator, c.arg_names) catch @panic("OOM");
-            arg_names.append(p.allocator, null) catch @panic("OOM");
-            const type_args = if (c.type_args.len == 0) extra_type_args else c.type_args;
-            return Expr{ .Call = .{
-                .callee = c.callee,
-                .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                .type_args = type_args,
-                .is_infix = c.is_infix,
-                .has_trailing_lambda = true,
-                .span = sp,
-            } };
+            if (!c.grouped) {
+                var args: std.ArrayList(Expr) = .empty;
+                args.appendSlice(p.allocator, c.args) catch @panic("OOM");
+                args.append(p.allocator, lam) catch @panic("OOM");
+                var arg_names: std.ArrayList(?[]const u8) = .empty;
+                arg_names.appendSlice(p.allocator, c.arg_names) catch @panic("OOM");
+                arg_names.append(p.allocator, null) catch @panic("OOM");
+                const type_args = if (c.type_args.len == 0) extra_type_args else c.type_args;
+                return Expr{ .Call = .{
+                    .callee = c.callee,
+                    .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+                    .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
+                    .type_args = type_args,
+                    .is_infix = c.is_infix,
+                    .has_trailing_lambda = true,
+                    .span = sp,
+                } };
+            }
         },
-        else => {
-            const args = p.allocator.alloc(Expr, 1) catch @panic("OOM");
-            args[0] = lam;
-            const arg_names = p.allocator.alloc(?[]const u8, 1) catch @panic("OOM");
-            arg_names[0] = null;
-            return Expr{ .Call = .{
-                .callee = boxExpr(p, expr),
-                .args = args,
-                .arg_names = arg_names,
-                .type_args = extra_type_args,
-                .is_infix = false,
-                .has_trailing_lambda = true,
-                .span = sp,
-            } };
-        },
+        else => {},
     }
+    const args = p.allocator.alloc(Expr, 1) catch @panic("OOM");
+    args[0] = lam;
+    const arg_names = p.allocator.alloc(?[]const u8, 1) catch @panic("OOM");
+    arg_names[0] = null;
+    return Expr{ .Call = .{
+        .callee = boxExpr(p, expr),
+        .args = args,
+        .arg_names = arg_names,
+        .type_args = extra_type_args,
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = sp,
+    } };
 }
 
 /// Parse a single value-argument at a call site. Accepts a leading `*` as
