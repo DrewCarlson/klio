@@ -68,22 +68,19 @@ internal fun __kxco_chanResumeNow(slot: Long) {}
 //       ordered with everything else on the virtual scheduler.
 //   2 — the dispatcher needs no dispatch (`Dispatchers.Unconfined`): the host
 //       resumes the waiter immediately on the delivering stack.
-//   0 — no dispatcher, or a klio pump-backed one (`KlioDispatcher`, Main,
-//       Default, IO): the host's pump/mailbox route IS that dispatcher's
-//       queue, so the pre-existing native route already dispatches correctly.
+//   3 — a klio pump-backed dispatcher accepted a task; unlike the external
+//       route, its task shares the owning pump and needs no scheduler marker.
+//   0 — no dispatcher, or a worker dispatcher (Default, IO): the host's
+//       pump/mailbox route is that dispatcher's queue.
 internal fun __kxco_chanResumeRoute(scope: Any?, slot: Long): Int {
     val context = (scope as? CoroutineScope)?.coroutineContext ?: return 0
     val dispatcher = context[ContinuationInterceptor] as? CoroutineDispatcher ?: return 0
-    if (
-        dispatcher === KlioDispatcher ||
-        dispatcher === KlioMainDispatcher ||
-        dispatcher === KlioDefaultDispatcher ||
-        dispatcher === KlioIoDispatcher
-    ) {
+    if (dispatcher === KlioDefaultDispatcher || dispatcher === KlioIoDispatcher) {
         return 0
     }
     if (!dispatcher.isDispatchNeeded(context)) return 2
     dispatcher.dispatch(context, KlioChanResumeTask(slot))
+    if (dispatcher === KlioDispatcher || dispatcher === KlioMainDispatcher) return 3
     return 1
 }
 

@@ -600,8 +600,10 @@ fn takePendingResume(slot: i64) ?Value {
 ///       the starved pump after the body finished.
 ///   2 — the dispatcher needs no dispatch (`Unconfined`): run the waiter now,
 ///       on this stack, exactly as `executeUnconfined` would.
-///   0 — no dispatcher / a pump-backed klio dispatcher: the pump queue IS the
-///       dispatch (the pre-existing route).
+///   3 — a pump-backed klio dispatcher accepted a runnable. It shares the
+///       owning pump but must stay in the dispatch FIFO with `yield()` tasks.
+///   0 — no dispatcher / a worker dispatcher whose pump mailbox is already
+///       the dispatch queue.
 fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void {
     route: {
         if (scope != .Instance) break :route;
@@ -637,6 +639,13 @@ fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void
                 // so mark the owning pump: its dispatched resumes (a `yield`)
                 // must keep the inline shortcut rather than defer to `drv.ready`.
                 ctx.host.markSlotOwnerSchedulerBacked(slot);
+                dropWatcher(ctx, slot);
+                return;
+            },
+            3 => {
+                // The runnable is ordered with every other KlioDispatcher
+                // task on the pump. Unlike an external scheduler, it does not
+                // change how the pump's own ready queue is drained.
                 dropWatcher(ctx, slot);
                 return;
             },
