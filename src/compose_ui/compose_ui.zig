@@ -59,6 +59,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSurface", winSurfaceOf);
     try b.register("androidx.compose.ui.window.__composeui_winPresent", winPresent);
     try b.register("androidx.compose.ui.window.__composeui_winClear", winClear);
+    try b.register("androidx.compose.ui.window.__composeui_isHosted", isHosted);
+    try b.register("androidx.compose.ui.window.__composeui_setFrameCallback", setFrameCallback);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -193,6 +195,10 @@ const Skia = struct {
     paraPhCount: ?ParaPhCountFn,
     paraPhRect: ?ParaPhRectFn,
     winOpen: *const fn (c_int, c_int, [*:0]const u8) callconv(.c) ?*SkWindow,
+    /// Optional: mobile backends (iOS) attach to an OS-provided surface layer
+    /// instead of creating a window. Null on desktop backends (Cocoa/SDL), where
+    /// `winOpen` creates the window.
+    winAttach: ?WinAttachFn,
     winSurface: *const fn (?*SkWindow) callconv(.c) ?*SkSurface,
     winPresent: *const fn (?*SkWindow) callconv(.c) void,
     winPoll: *const fn (?*SkWindow, c_int, *c_int, *c_int) callconv(.c) c_int,
@@ -206,6 +212,7 @@ const Skia = struct {
     winSetIconPng: ?*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void,
 };
 
+const WinAttachFn = *const fn (?*anyopaque, c_int, c_int, f64) callconv(.c) ?*SkWindow;
 const ResizeCbFn = *const fn (?*SkWindow, ?*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, ?*anyopaque) callconv(.c) void;
 const PathOpFn = *const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) ?[*:0]u8;
 const FreeCstrFn = *const fn ([*:0]u8) callconv(.c) void;
@@ -251,6 +258,11 @@ const ParaPhRectFn = *const fn (?*KlioPara, i32, i32) callconv(.c) f32;
 var skia_state: ?Skia = null;
 var skia_tried: bool = false;
 
+/// The app host (an iOS `.app`) that statically links the Skia shim opts in by
+/// declaring `pub const klio_skia_static` in its root; the plain interpreter does
+/// not, so on iOS it emits no shim symbol references and stays headless.
+const use_static_skia = @hasDecl(@import("root"), "klio_skia_static");
+
 /// The platform shared-library file name build.zig installs.
 const skia_lib_name = switch (@import("builtin").os.tag) {
     .macos => "libklio_skia.dylib",
@@ -265,6 +277,15 @@ fn loadSkia() ?*Skia {
     if (skia_state) |*s| return s;
     if (skia_tried) return null;
     skia_tried = true;
+
+    // iOS bans dlopen of a runtime-written dylib, so the shim is linked
+    // statically and resolved from symbols rather than a DynLib — but only when
+    // the app host opts in (it links libklio_skia.a). The plain interpreter exe
+    // does not, so it emits no shim references and renders headless there.
+    if (comptime @import("builtin").os.tag == .ios) {
+        if (comptime use_static_skia) return loadSkiaStatic();
+        return null;
+    }
 
     var lib = openSkiaLib() orelse return null;
     const F = struct {
@@ -329,6 +350,7 @@ fn loadSkia() ?*Skia {
         .paraPhCount = lib.lookup(ParaPhCountFn, "klio_skia_para_ph_count"),
         .paraPhRect = lib.lookup(ParaPhRectFn, "klio_skia_para_ph_rect"),
         .winOpen = F.get(&lib, "winOpen", "klio_win_open") orelse return skiaLoadFail(&lib),
+        .winAttach = lib.lookup(WinAttachFn, "klio_win_attach"),
         .winSurface = F.get(&lib, "winSurface", "klio_win_surface") orelse return skiaLoadFail(&lib),
         .winPresent = F.get(&lib, "winPresent", "klio_win_present") orelse return skiaLoadFail(&lib),
         .winPoll = F.get(&lib, "winPoll", "klio_win_poll") orelse return skiaLoadFail(&lib),
@@ -347,6 +369,89 @@ fn loadSkia() ?*Skia {
 fn skiaLoadFail(lib: *std.DynLib) ?*Skia {
     lib.close();
     return null;
+}
+
+/// Reference a statically-linked shim symbol directly. Reached only from the app
+/// host (which links libklio_skia.a and opts in via `use_static_skia`), so the
+/// symbol is always defined at the app link — the plain interpreter never emits
+/// these references.
+fn externSym(comptime T: type, comptime name: [:0]const u8) T {
+    return @extern(T, .{ .name = name });
+}
+
+/// iOS resolution of the shim from statically-linked symbols (no dlopen). Mirrors
+/// `loadSkia`'s field set. The shim ships with the interpreter, so every symbol
+/// is present; optional fields are bound directly too.
+fn loadSkiaStatic() ?*Skia {
+    const s = Skia{
+        .lib = undefined,
+        .new = externSym(@FieldType(Skia, "new"), "klio_skia_new"),
+        .newGpu = externSym(@FieldType(Skia, "newGpu"), "klio_skia_new_gpu"),
+        .free = externSym(@FieldType(Skia, "free"), "klio_skia_free"),
+        .clear = externSym(@FieldType(Skia, "clear"), "klio_skia_clear"),
+        .fillRect = externSym(@FieldType(Skia, "fillRect"), "klio_skia_fill_rect"),
+        .strokeRect = externSym(@FieldType(Skia, "strokeRect"), "klio_skia_stroke_rect"),
+        .fillRRect = externSym(@FieldType(Skia, "fillRRect"), "klio_skia_fill_rrect"),
+        .fillCircle = externSym(@FieldType(Skia, "fillCircle"), "klio_skia_fill_circle"),
+        .drawLine = externSym(@FieldType(Skia, "drawLine"), "klio_skia_draw_line"),
+        .drawText = externSym(@FieldType(Skia, "drawText"), "klio_skia_draw_text"),
+        .drawParagraph = externSym(@FieldType(Skia, "drawParagraph"), "klio_skia_draw_paragraph"),
+        .measureParagraph = externSym(@FieldType(Skia, "measureParagraph"), "klio_skia_measure_paragraph"),
+        .savePng = externSym(@FieldType(Skia, "savePng"), "klio_skia_save_png"),
+        .encodePng = externSym(@FieldType(Skia, "encodePng"), "klio_skia_encode_png"),
+        .freeBuffer = externSym(@FieldType(Skia, "freeBuffer"), "klio_skia_free_buffer"),
+        .pathOp = externSym(PathOpFn, "klio_skia_path_op"),
+        .freeCstr = externSym(FreeCstrFn, "klio_skia_free_cstr"),
+        .cSave = externSym(CVoidFn, "klio_skia_c_save"),
+        .cRestore = externSym(CVoidFn, "klio_skia_c_restore"),
+        .cTranslate = externSym(CXYFn, "klio_skia_c_translate"),
+        .cScale = externSym(CXYFn, "klio_skia_c_scale"),
+        .cRotate = externSym(CRotateFn, "klio_skia_c_rotate"),
+        .cSkew = externSym(CXYFn, "klio_skia_c_skew"),
+        .cClipRect = externSym(CClipRectFn, "klio_skia_c_clip_rect"),
+        .cClipPath = externSym(CClipPathFn, "klio_skia_c_clip_path"),
+        .cSetShader = externSym(CSetShaderFn, "klio_skia_c_set_shader"),
+        .cDrawRect = externSym(CDrawRectFn, "klio_skia_c_draw_rect"),
+        .cDrawRRect = externSym(CDrawRRectFn, "klio_skia_c_draw_rrect"),
+        .cDrawOval = externSym(CDrawRectFn, "klio_skia_c_draw_oval"),
+        .cDrawCircle = externSym(CDrawCircleFn, "klio_skia_c_draw_circle"),
+        .cDrawLine = externSym(CDrawLineFn, "klio_skia_c_draw_line"),
+        .cDrawPath = externSym(CDrawPathFn, "klio_skia_c_draw_path"),
+        .cMeasureTextWidth = externSym(CMeasureTextWidthFn, "klio_skia_measure_text_width"),
+        .cFontMetric = externSym(CFontMetricFn, "klio_skia_font_metric"),
+        .cConcat = externSym(CConcatFn, "klio_skia_c_concat"),
+        .surfPixel = externSym(SurfPixelFn, "klio_skia_surf_pixel"),
+        .cDrawText2 = externSym(CDrawText2Fn, "klio_skia_c_draw_text2"),
+        .cDrawSurface = externSym(CDrawSurfaceFn, "klio_skia_c_draw_surface"),
+        .cDrawSurfaceRect = externSym(CDrawSurfaceRectFn, "klio_skia_c_draw_surface_rect"),
+        .paraNew = externSym(ParaNewFn, "klio_skia_para_new"),
+        .paraLayout = externSym(ParaLayoutFn, "klio_skia_para_layout"),
+        .paraMetric = externSym(ParaMetricFn, "klio_skia_para_metric"),
+        .paraLineMetric = externSym(ParaLineMetricFn, "klio_skia_para_line_metric"),
+        .paraOffsetAt = externSym(ParaOffsetAtFn, "klio_skia_para_offset_at"),
+        .paraBox = externSym(ParaBoxFn, "klio_skia_para_box"),
+        .paraRangeRect = externSym(ParaRangeRectFn, "klio_skia_para_range_rect"),
+        .paraRangeRectCount = externSym(ParaRangeRectCountFn, "klio_skia_para_range_rect_count"),
+        .paraWord = externSym(ParaWordFn, "klio_skia_para_word"),
+        .paraLineFor = externSym(ParaLineForFn, "klio_skia_para_line_for"),
+        .paraPaint = externSym(ParaPaintFn, "klio_skia_para_paint"),
+        .paraFree = externSym(ParaFreeFn, "klio_skia_para_free"),
+        .fontRegister = externSym(FontRegisterFn, "klio_skia_font_register"),
+        .paraPhCount = externSym(ParaPhCountFn, "klio_skia_para_ph_count"),
+        .paraPhRect = externSym(ParaPhRectFn, "klio_skia_para_ph_rect"),
+        .winOpen = externSym(@FieldType(Skia, "winOpen"), "klio_win_open"),
+        .winAttach = externSym(WinAttachFn, "klio_win_attach"),
+        .winSurface = externSym(@FieldType(Skia, "winSurface"), "klio_win_surface"),
+        .winPresent = externSym(@FieldType(Skia, "winPresent"), "klio_win_present"),
+        .winPoll = externSym(@FieldType(Skia, "winPoll"), "klio_win_poll"),
+        .winClose = externSym(@FieldType(Skia, "winClose"), "klio_win_close"),
+        .winSetResizeCb = externSym(ResizeCbFn, "klio_win_set_resize_cb"),
+        .winSetTitle = externSym(*const fn (?*SkWindow, [*:0]const u8) callconv(.c) void, "klio_win_set_title"),
+        .winSetSize = externSym(*const fn (?*SkWindow, c_int, c_int) callconv(.c) void, "klio_win_set_size"),
+        .winSetIconPng = externSym(*const fn (?*SkWindow, [*]const u8, usize) callconv(.c) void, "klio_win_set_icon_png"),
+    };
+    skia_state = s;
+    return &skia_state.?;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +693,14 @@ fn winOpen(ctx: *CallCtx) Error!EvalResult {
         kotlin_title;
     const title_z = std.fmt.allocPrintSentinel(ctx.allocator, "{s}", .{title_bytes}, 0) catch return ok(Value.newLong(0));
     defer ctx.allocator.free(title_z);
-    const win = skia.winOpen(w, h, title_z.ptr) orelse return ok(Value.newLong(0));
+    // Mobile: attach to the app-provided surface layer instead of creating a
+    // window (the OS owns the view). Desktop backends have no winAttach and
+    // create the window via winOpen.
+    var win_opt: ?*SkWindow = null;
+    if (surface_layer) |layer| {
+        if (skia.winAttach) |attach| win_opt = attach(layer, w, h, surface_scale);
+    }
+    const win = (win_opt orelse skia.winOpen(w, h, title_z.ptr)) orelse return ok(Value.newLong(0));
     if (window_icon_png) |png| {
         if (skia.winSetIconPng) |set_icon| set_icon(win, png.ptr, png.len);
     }
@@ -660,6 +772,69 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
         (@as(i64, @intCast(std.math.clamp(x, 0, 0xFFFF))) << 16) |
         @as(i64, @intCast(std.math.clamp(y, 0, 0xFFFF)));
     return ok(Value.newLong(packed_ev));
+}
+
+// ---------------------------------------------------------------------------
+// OS-driven frame loop (mobile): the platform owns the run loop and calls
+// klio_render_frame each vsync on the resident VM. `application` (KlioWindow)
+// registers a per-frame render callback and returns instead of looping; the app
+// shell drives it (iOS CADisplayLink). See plans/MOBILE-TARGETS.md.
+// ---------------------------------------------------------------------------
+
+// The OS-provided surface layer + geometry the app installs before running the
+// program. When set, winOpen attaches to it (klio_win_attach) instead of
+// creating a window, and __composeui_isHosted reports true.
+var surface_layer: ?*anyopaque = null;
+var surface_w: c_int = 0;
+var surface_h: c_int = 0;
+var surface_scale: f64 = 1.0;
+
+/// Install the app-provided surface layer (an iOS CAMetalLayer) + geometry. The
+/// app shell calls this before running the program.
+pub export fn klio_set_surface(layer: ?*anyopaque, w: c_int, h: c_int, scale: f64) void {
+    surface_layer = layer;
+    surface_w = w;
+    surface_h = h;
+    surface_scale = scale;
+}
+
+/// The resident per-frame render callback: the Kotlin render lambda plus the host
+/// and output to invoke it through. Unlike ResizeCb this outlives the call that
+/// registered it — the program's main returns while the VM stays resident, and
+/// the mobile run keeps everything on a process-lifetime arena, so the captured
+/// composition survives across frames.
+const FrameCb = struct {
+    host: IntrinsicHost,
+    callback: Value,
+    out: Output,
+    set: bool = false,
+};
+var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+
+/// `__composeui_isHosted(): Boolean` — true when the platform owns the frame loop
+/// (an app surface has been installed). `application` then registers a frame
+/// callback and returns instead of running its own loop.
+fn isHosted(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value{ .Bool = surface_layer != null });
+}
+
+/// `__composeui_setFrameCallback(cb: () -> Boolean): Long` — store the render
+/// callback the platform frame source invokes each frame.
+fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    frame_cb = .{ .host = ctx.host, .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
+/// Render one frame: invoke the resident Kotlin render callback. Called by the
+/// app shell's frame source (iOS CADisplayLink) on the main thread — the same
+/// thread the resident VM ran main on, so it is a plain same-thread re-entry
+/// (the resizeTrampoline mechanism).
+pub export fn klio_render_frame() void {
+    if (!frame_cb.set) return;
+    var args = [_]Value{};
+    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,

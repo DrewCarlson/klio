@@ -31,6 +31,7 @@ import androidx.compose.ui.input.pointer.PointerInputEventProcessor
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.PositionCalculator
 import androidx.compose.ui.klio.KlioComposeOwner
+import androidx.compose.ui.klio.KlioRecomposerDriver
 import androidx.compose.ui.klio.KlioUiApplier
 import androidx.compose.ui.klio.ProvideKlioCompositionLocals
 import androidx.compose.ui.unit.Constraints
@@ -60,7 +61,8 @@ fun runComposeWindow(
     val handle = __composeui_winOpen(width, height, title)
     if (handle == 0L) return false
 
-    val recomposer = Recomposer()
+    val recomposerDriver = KlioRecomposerDriver()
+    val recomposer = recomposerDriver.recomposer
     val owner = KlioComposeOwner(Density(density), LayoutDirection.Ltr)
     val composition = Composition(KlioUiApplier(owner.root), recomposer)
     composition.setContent {
@@ -72,7 +74,7 @@ fun runComposeWindow(
     var uptime = 0L
 
     fun renderFrame() {
-        recomposer.recompose()
+        recomposerDriver.frame()
         owner.setRootConstraints(Constraints(maxWidth = w, maxHeight = h))
         owner.measureAndLayoutForFrame()
         val surface = __composeui_winSurface(handle)
@@ -157,7 +159,7 @@ fun runComposeWindow(
     }
     __composeui_winClose(handle)
     composition.dispose()
-    recomposer.close()
+    recomposerDriver.close()
     return true
 }
 
@@ -353,6 +355,22 @@ private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
 }
 
 /**
+ * One frame under an OS-driven frame source: advance recomposition and redraw
+ * every live window. Called by the platform's frame callback (not a loop);
+ * returns true while any window is live. Mirrors one iteration of [application]'s
+ * loop minus the blocking event poll (input arrives via a separate callback).
+ */
+private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioApplicationScope): Boolean {
+    if (recomposerDriver.frame()) {
+        for (win in scope.windows) if (!win.closed) win.dirty = true
+    }
+    val live = scope.windows.filter { !it.closed }
+    if (live.isEmpty()) return false
+    for (win in live) renderWindowFrame(win)
+    return true
+}
+
+/**
  * Run a compose application: [content] is a COMPOSABLE block whose [Window]
  * declarations manage native windows — multiple windows compose side by side,
  * state-gated windows open/close with recomposition, and window parameters
@@ -368,19 +386,29 @@ fun application(
     density: Float = 1f,
     content: @Composable ApplicationScope.() -> Unit,
 ): Boolean {
-    val recomposer = Recomposer()
+    val recomposerDriver = KlioRecomposerDriver()
+    val recomposer = recomposerDriver.recomposer
     val scope = KlioApplicationScope(recomposer, density)
     val appComposition = Composition(KlioNoopApplier(), recomposer)
     appComposition.setContent {
         scope.content()
     }
     val openedAny = scope.windows.isNotEmpty()
+    if (__composeui_isHosted()) {
+        // OS-driven (mobile): the platform's frame source (e.g. iOS
+        // CADisplayLink) calls the registered callback once per vsync on the
+        // resident interpreter. Register it and return without a loop; the
+        // recomposer + windows captured by the callback stay alive because the
+        // VM stays resident.
+        __composeui_setFrameCallback { frameHosted(recomposerDriver, scope) }
+        return openedAny
+    }
     var frame = 0
     while (!scope.exited && (maxFrames < 0 || frame < maxFrames)) {
         // One recomposition frame: state invalidated by effects or events
         // (not only input) marks every live window for redraw — a title
         // counter driven by LaunchedEffect repaints without a pointer.
-        if (recomposer.pumpFrame()) {
+        if (recomposerDriver.frame()) {
             for (win in scope.windows) {
                 if (!win.closed) win.dirty = true
             }
@@ -398,7 +426,7 @@ fun application(
     }
     for (win in scope.windows) scope.close(win)
     appComposition.dispose()
-    recomposer.close()
+    recomposerDriver.close()
     return openedAny
 }
 
@@ -427,3 +455,13 @@ internal fun __composeui_winSetTitle(handle: Long, title: String): Long =
 
 internal fun __composeui_winSetSize(handle: Long, width: Int, height: Int): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_winSetSize not installed")
+
+// True when the platform owns the frame loop (mobile): [application] then
+// registers a per-frame callback and returns instead of running its own loop.
+internal fun __composeui_isHosted(): Boolean =
+    error("intrinsic androidx.compose.ui.window.__composeui_isHosted not installed")
+
+// Register the per-frame render callback with the host; the platform frame
+// source invokes it once per vsync on the resident VM.
+internal fun __composeui_setFrameCallback(callback: () -> Boolean): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_setFrameCallback not installed")
