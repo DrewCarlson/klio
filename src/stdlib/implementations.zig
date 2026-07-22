@@ -13,6 +13,7 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 const StdlibFn = runtime.StdlibFn;
+const Value = runtime.Value;
 
 // Per-area intrinsic submodules.
 pub const atomics = @import("implementations/atomics.zig");
@@ -48,9 +49,16 @@ pub const concurrent_lock_enter = concurrent.concurrent_lock_enter;
 pub const concurrent_lock_try_enter = concurrent.concurrent_lock_try_enter;
 pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
 
-/// One registered intrinsic: a fully qualified Kotlin name and the host
-/// function that implements it.
-const Entry = struct { fqn: []const u8, f: StdlibFn };
+/// Optional argument-only applicability predicate for a host-backed member
+/// whose Kotlin declaration is not retained in the runtime image. Most
+/// bindings need none; overloaded scalar operators use it when a distinct
+/// extension with the same receiver and name competes.
+const ApplicableFn = *const fn (args: []const Value) bool;
+const Entry = struct { fqn: []const u8, f: StdlibFn, applicable: ?ApplicableFn = null };
+
+fn integerBinaryApplicable(args: []const Value) bool {
+    return args.len == 1 and args[0].asI64() != null;
+}
 
 const TABLE = [_]Entry{
     // kotlin.concurrent.atomics — composite read-modify-write under the cell
@@ -291,12 +299,12 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Char.toLowerCase", .f = char.char_lowercase_char },
     .{ .fqn = "kotlin.Char.toTitleCase", .f = char.char_titlecase_char },
     .{ .fqn = "kotlin.Char.isISOControl", .f = char.char_is_iso_control },
-    .{ .fqn = "kotlin.Int.and", .f = numeric.int_and },
+    .{ .fqn = "kotlin.Int.and", .f = numeric.int_and, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Int.compareTo", .f = numeric.int_compare_to },
     .{ .fqn = "kotlin.Int.inv", .f = numeric.int_inv },
-    .{ .fqn = "kotlin.Int.or", .f = numeric.int_or },
-    .{ .fqn = "kotlin.Int.shl", .f = numeric.int_shl },
-    .{ .fqn = "kotlin.Int.shr", .f = numeric.int_shr },
+    .{ .fqn = "kotlin.Int.or", .f = numeric.int_or, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Int.shl", .f = numeric.int_shl, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Int.shr", .f = numeric.int_shr, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Int.toByte", .f = numeric.int_to_byte },
     .{ .fqn = "kotlin.Int.toDouble", .f = numeric.int_to_double },
     .{ .fqn = "kotlin.Int.toFloat", .f = numeric.int_to_float },
@@ -304,14 +312,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Int.toLong", .f = numeric.int_to_long },
     .{ .fqn = "kotlin.Int.toShort", .f = numeric.int_to_short },
     .{ .fqn = "kotlin.Int.toString", .f = numeric.int_to_string },
-    .{ .fqn = "kotlin.Int.ushr", .f = numeric.int_ushr },
-    .{ .fqn = "kotlin.Int.xor", .f = numeric.int_xor },
-    .{ .fqn = "kotlin.Long.and", .f = numeric.long_and },
+    .{ .fqn = "kotlin.Int.ushr", .f = numeric.int_ushr, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Int.xor", .f = numeric.int_xor, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Long.and", .f = numeric.long_and, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Long.compareTo", .f = numeric.long_compare_to },
     .{ .fqn = "kotlin.Long.inv", .f = numeric.long_inv },
-    .{ .fqn = "kotlin.Long.or", .f = numeric.long_or },
-    .{ .fqn = "kotlin.Long.shl", .f = numeric.long_shl },
-    .{ .fqn = "kotlin.Long.shr", .f = numeric.long_shr },
+    .{ .fqn = "kotlin.Long.or", .f = numeric.long_or, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Long.shl", .f = numeric.long_shl, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Long.shr", .f = numeric.long_shr, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Long.toByte", .f = numeric.long_to_byte },
     .{ .fqn = "kotlin.Long.toDouble", .f = numeric.long_to_double },
     .{ .fqn = "kotlin.Long.toFloat", .f = numeric.long_to_float },
@@ -319,8 +327,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Long.toLong", .f = numeric.long_to_long },
     .{ .fqn = "kotlin.Long.toShort", .f = numeric.long_to_short },
     .{ .fqn = "kotlin.Long.toString", .f = numeric.long_to_string },
-    .{ .fqn = "kotlin.Long.ushr", .f = numeric.long_ushr },
-    .{ .fqn = "kotlin.Long.xor", .f = numeric.long_xor },
+    .{ .fqn = "kotlin.Long.ushr", .f = numeric.long_ushr, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.Long.xor", .f = numeric.long_xor, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Short.compareTo", .f = numeric.int_compare_to },
     .{ .fqn = "kotlin.Short.toByte", .f = numeric.int_to_byte },
     .{ .fqn = "kotlin.Short.toDouble", .f = numeric.int_to_double },
@@ -1695,6 +1703,15 @@ pub fn lookup(fqn: []const u8) ?StdlibFn {
     return TABLE_MAP.get(fqn);
 }
 
+pub fn applicable(fqn: []const u8, args: []const Value) ?bool {
+    for (TABLE) |entry| {
+        if (!std.mem.eql(u8, entry.fqn, fqn)) continue;
+        const predicate = entry.applicable orelse return null;
+        return predicate(args);
+    }
+    return null;
+}
+
 /// Iterator over every registered intrinsic FQN.
 pub const FqnIterator = struct {
     i: usize = 0,
@@ -1733,6 +1750,17 @@ test "lookup returns null for unknown" {
 test "lookup finds a registered intrinsic" {
     try testing.expect(lookup("kotlin.math.abs") != null);
     try testing.expect(lookup("kotlin.io.println") != null);
+}
+
+test "integer member applicability rejects non-numeric overload arguments" {
+    const numeric_args = [_]Value{.{ .Int = 2 }};
+    try testing.expectEqual(true, applicable("kotlin.Int.or", &numeric_args).?);
+
+    const text = try runtime.strInit(testing.allocator, "bits");
+    defer text.deinit();
+    const other_args = [_]Value{.{ .String = text }};
+    try testing.expectEqual(false, applicable("kotlin.Int.or", &other_args).?);
+    try testing.expect(applicable("kotlin.Int.compareTo", &numeric_args) == null);
 }
 
 test "param names round trip" {

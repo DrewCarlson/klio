@@ -791,3 +791,11 @@ test "expect_actual_superclass_delegate" {
         \\
     );
 }
+
+test "infix_extension_over_inapplicable_intrinsic" {
+    try check("infix_extension_over_inapplicable_intrinsic",
+        \\3
+        \\5
+        \\
+    );
+}

@@ -557,6 +557,13 @@ pub fn implementation(fqn: []const u8) ?StdlibFn {
     return implementations.lookup(fqn);
 }
 
+/// Return whether a host-backed member accepts this argument run when the
+/// binding carries explicit applicability metadata. Null means the binding
+/// has no extra predicate and ordinary member precedence applies.
+pub fn implementationApplicable(fqn: []const u8, args: []const runtime.Value) ?bool {
+    return implementations.applicable(fqn, args);
+}
+
 /// Registry of native bindings — `host_symbol` -> `StdlibFn`. A pack carries
 /// the FQN -> `host_symbol` mapping; the host populates this registry with the
 /// actual function pointers; the interpreter joins them at load time.
