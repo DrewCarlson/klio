@@ -201,6 +201,19 @@ test "captured receiver alias retains its type through nested lambdas" {
     try assertKlio("captured_receiver_alias_type", src, "OK\n");
 }
 
+test "receiver extension shadows a same-named global in eager lowering" {
+    const src =
+        \\
+        \\class Scope
+        \\fun launch(block: () -> Unit) { block(); println("global") }
+        \\fun Scope.launch(block: () -> Unit) { block(); println("extension") }
+        \\fun withScope(block: Scope.() -> Unit) { Scope().block() }
+        \\fun main() { withScope { launch {} } }
+        \\
+    ;
+    try assertKlio("receiver_extension_shadow", src, "extension\n");
+}
+
 test "higher_order_local_fn_dispatch" {
     const src =
         \\
