@@ -2173,6 +2173,35 @@ pub const Module = struct {
         return true;
     }
 
+    fn mergeInheritedMethod(
+        self: *const Module,
+        allocator: Allocator,
+        map: *std.AutoHashMap(u32, FuncId),
+        slot: u32,
+        incoming: FuncId,
+    ) Allocator.Error!void {
+        const gop = try map.getOrPut(slot);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = incoming;
+            return;
+        }
+        const existing = gop.value_ptr.*;
+        if (existing.int() == incoming.int()) return;
+
+        if (self.decl_sigs.get(existing.int())) |sig| {
+            if (sig.enclosing_class) |owner| {
+                if (try self.overridesSlot(allocator, owner, existing, incoming)) return;
+            }
+        }
+        if (self.decl_sigs.get(incoming.int())) |sig| {
+            if (sig.enclosing_class) |owner| {
+                if (try self.overridesSlot(allocator, owner, incoming, existing)) {
+                    gop.value_ptr.* = incoming;
+                }
+            }
+        }
+    }
+
     fn linkMethodClass(
         self: *Module,
         allocator: Allocator,
@@ -2188,7 +2217,14 @@ pub const Module = struct {
             try self.linkMethodClass(allocator, maps, state, super_id);
             if (super_id.int() >= maps.len) continue;
             var inherited = maps[super_id.int()].iterator();
-            while (inherited.next()) |entry| try maps[cid.int()].put(entry.key_ptr.*, entry.value_ptr.*);
+            while (inherited.next()) |entry| {
+                try self.mergeInheritedMethod(
+                    allocator,
+                    &maps[cid.int()],
+                    entry.key_ptr.*,
+                    entry.value_ptr.*,
+                );
+            }
         }
 
         // `Class.methods` contains executable bodies only; abstract/interface
@@ -5790,6 +5826,15 @@ test "method slots link generic overrides and multiple interface roots" {
         .methods = &.{}, .init_block = null, .companion = null, .supertypes = child_super_ids,
         .supertype_refs = child_supers, .is_open = true,
     });
+    const redundant_supers = try a.alloc(TypeRef, 2);
+    redundant_supers[0] = .{ .name = "Child", .nullable = false, .args = &.{} };
+    redundant_supers[1] = .{ .name = "Base", .nullable = false, .args = base_args };
+    const redundant_super_ids = try a.dupe(ClassId, &.{ child, base });
+    const redundant = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Redundant", .fqn = "sample.Redundant", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = redundant_super_ids,
+        .supertype_refs = redundant_supers,
+    });
     const left = try m.addClass(a, .{
         .id = ClassId.from(0), .name = "Left", .fqn = "sample.Left", .primary_params = &.{},
         .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{}, .is_abstract = true, .is_interface = true,
@@ -5836,6 +5881,7 @@ test "method slots link generic overrides and multiple interface roots" {
 
     try m.linkMethodSlots(a);
     try testing.expectEqual(child_put, m.methodSlotTarget(child, MethodSlotId.fromFunc(base_put)).?);
+    try testing.expectEqual(child_put, m.methodSlotTarget(redundant, MethodSlotId.fromFunc(base_put)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(left_run)).?);
     try testing.expectEqual(both_run, m.methodSlotTarget(both, MethodSlotId.fromFunc(right_run)).?);
     const string_args = [_]applicability.ArgShape{.{
