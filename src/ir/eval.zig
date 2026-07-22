@@ -2734,7 +2734,21 @@ fn runFrameInner(
     // Lazy IR: materialise a deferred function's blocks before the dispatch
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
-    if (func.deferred_offset != 0) frame.module.ensureFuncBody(@constCast(func));
+    const deferred_offset = func.deferred_offset;
+    if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
+        const sig = frame.module.decl_sigs.get(func.id.int());
+        std.debug.print(
+            "[empty-body] {s}#{d} has_body_sig={?} deferred_offset={d} section_len={d}\n",
+            .{
+                func.fqn,
+                func.id.int(),
+                if (sig) |s| s.has_body else null,
+                deferred_offset,
+                frame.module.deferred_func_section.len,
+            },
+        );
+        return errResult(.{ .Type = "virtual method target is not executable" });
+    }
     const jit_on = jit_loop.enabled();
     // Loop-JIT call trampoline wiring (only hosts that can run a callee qualify).
     const tramp_ok = comptime @hasDecl(H, "callFunc");
@@ -7640,6 +7654,27 @@ test "eval_int_const" {
     const res = try eval(testing.allocator, &m, &func, .empty);
     try testing.expect(res == .ok);
     try testing.expect(res.ok == .Int and res.ok.Int == 7);
+}
+
+test "eval reports a bodyless function instead of indexing empty blocks" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const r = try lit(&b, 7);
+    b.terminate(.{ .Return = r });
+    var func = try b.finish("missing", "test.missing", ir.build.typeInt());
+    const blocks = func.blocks;
+    defer {
+        func.blocks = blocks;
+        freeFunc(func);
+    }
+    func.blocks = &.{};
+
+    const result = try eval(testing.allocator, &m, &func, .empty);
+    try testing.expect(result == .err);
+    try testing.expect(result.err == .CalleeFailed);
+    try testing.expectEqualStrings("virtual method target is not executable", result.err.CalleeFailed);
 }
 
 test "eval_int_add" {

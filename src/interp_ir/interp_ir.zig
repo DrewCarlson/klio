@@ -205,6 +205,11 @@ pub const ProgramImage = struct {
     /// the method body. Keyed by identity: the class cell pointer and interned
     /// method-name pointer are stable for the program's lifetime.
     instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
+    /// Linked target for a numeric virtual slot on a runtime-defined class.
+    /// Anonymous-object/local-class bodies still live in side modules, while
+    /// inherited bodies live in the main module; settle that distinction once
+    /// per `(runtime class identity, slot)` so steady-state dispatch is O(1).
+    runtime_virtual_cache: std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget),
     /// Inline cache for a member-miss that resolves to a top-level *extension*
     /// function. Same key as `instance_method_cache`; the value is the resolved
     /// extension `FuncId`. Only owner-independent picks (no member-extension
@@ -265,6 +270,11 @@ pub const ProgramImage = struct {
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
+    pub const RuntimeVirtualKey = struct { class_p: usize, slot: u32 };
+    pub const RuntimeVirtualTarget = union(enum) {
+        main_func: u32,
+        side_func: AnonMethodEntry,
+    };
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
     pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
@@ -341,6 +351,7 @@ pub const ProgramImage = struct {
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
             .member_names = std.StringHashMap(void).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
+            .runtime_virtual_cache = std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget).init(allocator),
             .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
@@ -388,6 +399,7 @@ pub const ProgramImage = struct {
         }
         self.member_names.deinit();
         self.instance_method_cache.deinit();
+        self.runtime_virtual_cache.deinit();
         self.ext_method_cache.deinit();
         {
             var it = self.instance_intrinsic_cache.valueIterator();

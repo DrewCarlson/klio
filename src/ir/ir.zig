@@ -1337,12 +1337,12 @@ pub const Module = struct {
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     /// Extension-candidate index: receiver head -> the extension NAMES
     /// declared on it, plus the generic-receiver names (`fun <T> T.also`)
-    /// that apply to every head. Rebuilt lazily when the func table has
-    /// grown. Answers the E4c membership question the hierarchy sets
+    /// that apply to every head. Rebuilt lazily when the declaration index
+    /// has grown. Answers the E4c membership question the hierarchy sets
     /// cannot: could ANY extension named N serve receiver head H?
     ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
     generic_ext_names: ?std.StringHashMap(void) = null,
-    ext_index_funcs_len: usize = 0,
+    ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
@@ -1622,13 +1622,15 @@ pub const Module = struct {
     /// Materialise `func`'s deferred `blocks` from the lazy-IR section, clearing
     /// `deferred_offset` so it is a no-op afterwards. Decoded into the module's
     /// process-lifetime arena so the patch persists across per-program builds.
-    pub fn ensureFuncBody(self: *const Module, func: *Func) void {
-        if (func.deferred_offset == 0) return;
-        const decode = self.deferred_func_decode orelse return;
+    pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
+        if (func.blocks.len != 0) return true;
+        if (func.deferred_offset == 0) return false;
+        const decode = self.deferred_func_decode orelse return false;
         if (decode(self.deferred_func_arena, self.deferred_func_section, func.deferred_offset - 1)) |blocks| {
             func.blocks = blocks;
             func.deferred_offset = 0;
         }
+        return func.blocks.len != 0;
     }
 
     /// Look up a function by id. Eager path (fresh build): direct table index.
@@ -1698,6 +1700,26 @@ pub const Module = struct {
     pub fn memberDecls(self: *const Module, owner_fqn: []const u8, name: []const u8) []const FuncId {
         const list = self.member_name_index.get(.{ .a = owner_fqn, .b = name }) orelse return &.{};
         return list.items;
+    }
+
+    pub const MemberDeclGroup = struct {
+        owner_fqn: []const u8,
+        name: []const u8,
+        fids: []const FuncId,
+    };
+
+    pub fn memberDeclGroups(self: *const Module, allocator: Allocator) Allocator.Error![]MemberDeclGroup {
+        const groups = try allocator.alloc(MemberDeclGroup, self.member_name_index.count());
+        var it = self.member_name_index.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            groups[i] = .{
+                .owner_fqn = entry.key_ptr.a,
+                .name = entry.key_ptr.b,
+                .fids = entry.value_ptr.items,
+            };
+        }
+        return groups;
     }
 
     const MemberCandidate = struct {
@@ -2067,6 +2089,37 @@ pub const Module = struct {
         return self.method_dispatch.get(methodDispatchKey(runtime_class, slot));
     }
 
+    pub const MethodDispatchEntry = struct {
+        runtime_class: ClassId,
+        slot: MethodSlotId,
+        target: FuncId,
+    };
+
+    pub fn methodDispatchEntries(self: *const Module, allocator: Allocator) Allocator.Error![]MethodDispatchEntry {
+        const entries = try allocator.alloc(MethodDispatchEntry, self.method_dispatch.count());
+        var it = self.method_dispatch.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            const runtime_class = ClassId.from(@intCast(entry.key_ptr.* >> 32));
+            const slot = MethodSlotId.from(@truncate(entry.key_ptr.*));
+            entries[i] = .{
+                .runtime_class = runtime_class,
+                .slot = slot,
+                .target = entry.value_ptr.*,
+            };
+        }
+        return entries;
+    }
+
+    pub fn registerMethodSlotTarget(
+        self: *Module,
+        runtime_class: ClassId,
+        slot: MethodSlotId,
+        target: FuncId,
+    ) Allocator.Error!void {
+        try self.method_dispatch.put(methodDispatchKey(runtime_class, slot), target);
+    }
+
     const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
@@ -2126,6 +2179,38 @@ pub const Module = struct {
         return null;
     }
 
+    fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?ClassId {
+        if (self.classIdByFqn(name) orelse self.classIdByQualifiedSuffix(name)) |id| return id;
+        const sig = self.decl_sigs.get(fid.int()) orelse return null;
+        const owner = sig.enclosing_class orelse return null;
+        if (self.classIdNestedIn(owner, applicability.simpleName(name))) |id| return id;
+        if (owner.int() >= self.classes.items.len) return null;
+        const owner_fqn = self.classes.items[owner.int()].fqn;
+        for (self.classes.items) |class| {
+            if (class.fqn.len != owner_fqn.len + name.len + 1) continue;
+            if (std.mem.startsWith(u8, class.fqn, owner_fqn) and
+                class.fqn[owner_fqn.len] == '.' and
+                std.mem.eql(u8, class.fqn[owner_fqn.len + 1 ..], name))
+            {
+                return class.id;
+            }
+        }
+        return null;
+    }
+
+    fn overrideQualifiedPath(ty: TypeRef) ?[]const u8 {
+        for (ty.args) |arg| {
+            if (std.mem.startsWith(u8, arg.name, "#qual:")) return arg.name["#qual:".len..];
+        }
+        return null;
+    }
+
+    fn overrideArgs(ty: TypeRef) []TypeRef {
+        var end = ty.args.len;
+        while (end > 0 and std.mem.startsWith(u8, ty.args[end - 1].name, "#qual:")) end -= 1;
+        return ty.args[0..end];
+    }
+
     fn overrideTypeEql(
         self: *const Module,
         candidate: FuncId,
@@ -2136,9 +2221,25 @@ pub const Module = struct {
         const candidate_tp = self.funcTypeParamIndex(candidate, candidate_ty.name);
         const base_tp = self.funcTypeParamIndex(base, base_ty.name);
         if (candidate_tp != null or base_tp != null) return candidate_tp != null and candidate_tp == base_tp;
-        if (!std.mem.eql(u8, candidate_ty.name, base_ty.name)) return false;
-        if (candidate_ty.nullable != base_ty.nullable or candidate_ty.args.len != base_ty.args.len) return false;
-        for (candidate_ty.args, base_ty.args) |ca, ba| {
+        const candidate_qualified = overrideQualifiedPath(candidate_ty);
+        const base_qualified = overrideQualifiedPath(base_ty);
+        if (!std.mem.eql(u8, candidate_ty.name, base_ty.name) or
+            candidate_qualified != null or base_qualified != null)
+        {
+            const candidate_class = self.overrideTypeClassId(
+                candidate,
+                candidate_qualified orelse candidate_ty.name,
+            ) orelse return false;
+            const base_class = self.overrideTypeClassId(
+                base,
+                base_qualified orelse base_ty.name,
+            ) orelse return false;
+            if (candidate_class.int() != base_class.int()) return false;
+        }
+        const candidate_args = overrideArgs(candidate_ty);
+        const base_args = overrideArgs(base_ty);
+        if (candidate_ty.nullable != base_ty.nullable or candidate_args.len != base_args.len) return false;
+        for (candidate_args, base_args) |ca, ba| {
             if (!self.overrideTypeEql(candidate, base, ca, ba)) return false;
         }
         return true;
@@ -2188,18 +2289,33 @@ pub const Module = struct {
         const existing = gop.value_ptr.*;
         if (existing.int() == incoming.int()) return;
 
+        gop.value_ptr.* = try self.preferredMethodSlotTarget(allocator, existing, incoming);
+    }
+
+    /// Choose the more-specific implementation of one inherited virtual slot.
+    /// Runtime-defined classes use the same rule when merging the already-linked
+    /// slot tables of their declared supertypes.
+    pub fn preferredMethodSlotTarget(
+        self: *const Module,
+        allocator: Allocator,
+        existing: FuncId,
+        incoming: FuncId,
+    ) Allocator.Error!FuncId {
+        if (existing.int() == incoming.int()) return existing;
+
         if (self.decl_sigs.get(existing.int())) |sig| {
             if (sig.enclosing_class) |owner| {
-                if (try self.overridesSlot(allocator, owner, existing, incoming)) return;
+                if (try self.overridesSlot(allocator, owner, existing, incoming)) return existing;
             }
         }
         if (self.decl_sigs.get(incoming.int())) |sig| {
             if (sig.enclosing_class) |owner| {
                 if (try self.overridesSlot(allocator, owner, incoming, existing)) {
-                    gop.value_ptr.* = incoming;
+                    return incoming;
                 }
             }
         }
+        return existing;
     }
 
     fn linkMethodClass(
@@ -2562,9 +2678,9 @@ pub const Module = struct {
     /// Chain-aware: the head's supertype chain and the builtin-supertype
     /// table are consulted, and generic-receiver extensions answer true
     /// for every head. Conservative on staleness: the index rebuilds when
-    /// the func table has grown since the last build.
+    /// the declaration index has grown since the last build.
     pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
-        if (self.ext_names_by_recv_head == null or self.ext_index_funcs_len != self.funcs.items.len) {
+        if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
             self.rebuildExtIndex(allocator) catch return true;
         }
         if (self.generic_ext_names.?.contains(name)) return true;
@@ -2596,24 +2712,33 @@ pub const Module = struct {
         if (self.generic_ext_names) |*m| m.deinit();
         var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
         var gen = std.StringHashMap(void).init(allocator);
-        for (self.funcs.items) |*f| {
-            const is_ext = f.kind == .top_level_extension or f.kind == .member_extension;
+        for (self.func_index.items) |entry| {
+            const ds = self.decl_sigs.get(entry.id.int());
+            const f = if (ds == null) self.funcById(entry.id) else null;
+            const kind = if (ds) |sig| sig.kind else if (f) |func| func.kind else continue;
+            const is_ext = kind == .top_level_extension or kind == .member_extension;
             if (!is_ext) continue;
-            if (f.params.len == 0) continue;
-            const head = f.params[0].ty.name;
-            // A short all-uppercase head is a type parameter: the
-            // extension applies to every receiver.
-            if (head.len <= 2 and headAllUpper(head)) {
-                try gen.put(f.name, {});
+            const receiver_ty = if (ds) |sig|
+                sig.receiver_ty
+            else if (f) |func|
+                if (func.params.len != 0) func.params[0].ty else null
+            else
+                null;
+            const raw_head = (receiver_ty orelse continue).name;
+            const head = staticTypeHead(raw_head);
+            if (self.funcTypeParamIndex(entry.id, head) != null or
+                (head.len <= 2 and headAllUpper(head)))
+            {
+                try gen.put(entry.name, {});
                 continue;
             }
             const gop = try idx.getOrPut(head);
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-            try gop.value_ptr.put(f.name, {});
+            try gop.value_ptr.put(entry.name, {});
         }
         self.ext_names_by_recv_head = idx;
         self.generic_ext_names = gen;
-        self.ext_index_funcs_len = self.funcs.items.len;
+        self.ext_index_decl_count = self.func_index.items.len;
     }
 
     /// The receiver class head typeck bound for the lambda body at `sp`.
@@ -5804,6 +5929,35 @@ test "packageOfFqn strips the trailing simple name" {
     try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
 }
 
+test "extension candidate index uses declaration metadata for bodyless headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const min = try pushTestFuncOpts(
+        &m,
+        a,
+        "min",
+        "sample.min",
+        "sample",
+        0,
+        .{ .extension = true, .stub = true },
+    );
+    m.funcs.items[min.int()].params = &.{};
+    try m.decl_sigs.put(min.int(), .{
+        .receiver_ty = .{ .name = "IntArray", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+
+    try testing.expect(m.extCouldApply(a, "IntArray", "min"));
+    try testing.expect(!m.extCouldApply(a, "String", "min"));
+    try testing.expect(!m.extCouldApply(a, "IntArray", "max"));
+}
+
 test "method slots link generic overrides and multiple interface roots" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5890,6 +6044,68 @@ test "method slots link generic overrides and multiple interface roots" {
     const inherited = m.resolveMemberCall(child, "put", &string_args, .{});
     try testing.expectEqual(Module.MemberDispatch.virtual, inherited.dispatch);
     try testing.expectEqual(child_put, inherited.target.?);
+
+    const modifier = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Modifier", .fqn = "sample.Modifier", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{},
+        .is_abstract = true, .is_interface = true,
+    });
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Modifier.Element", .fqn = "sample.Modifier.Element", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{},
+        .is_abstract = true, .is_interface = true,
+    });
+    const combined = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Combined", .fqn = "sample.Combined", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{modifier}),
+        .supertype_refs = try a.dupe(TypeRef, &.{.{
+            .name = "Modifier", .nullable = false, .args = &.{},
+        }}),
+    });
+    const root_all = try pushTestFuncOpts(&m, a, "all", "sample.Modifier.all", "sample", 1, .{
+        .stub = true, .param_ty = "Element",
+    });
+    const combined_all = try pushTestFuncOpts(&m, a, "all", "sample.Combined.all", "sample", 1, .{
+        .param_ty = "Modifier.Element",
+    });
+    m.funcs.items[root_all.int()].kind = .instance_method;
+    m.funcs.items[combined_all.int()].kind = .instance_method;
+    m.funcs.items[combined_all.int()].is_override = true;
+    m.classes.items[modifier.int()].methods = try a.dupe(FuncId, &.{root_all});
+    m.classes.items[combined.int()].methods = try a.dupe(FuncId, &.{combined_all});
+    const qualified_element_args = try a.dupe(TypeRef, &.{.{
+        .name = "#qual:Modifier.Element",
+        .nullable = false,
+        .args = &.{},
+    }});
+    const all_types = [_]TypeRef{
+        .{ .name = "Element", .nullable = false, .args = &.{} },
+        .{
+            .name = "Element",
+            .nullable = false,
+            .args = qualified_element_args,
+        },
+    };
+    for (
+        [_]FuncId{ root_all, combined_all },
+        [_]ClassId{ modifier, combined },
+        all_types,
+    ) |fid, owner, ty| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+            .sig = try a.dupe(TypeRef, &.{ty}),
+            .kind = .instance_method,
+            .has_body = m.funcs.items[fid.int()].hasBody(),
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "all", fid);
+    }
+    try m.linkMethodSlots(a);
+    try testing.expectEqual(
+        combined_all,
+        m.methodSlotTarget(combined, MethodSlotId.fromFunc(root_all)).?,
+    );
 }
 
 /// Options for the symbol-index test func pusher.
