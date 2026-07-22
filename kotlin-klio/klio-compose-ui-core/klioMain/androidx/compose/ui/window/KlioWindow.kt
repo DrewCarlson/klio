@@ -378,6 +378,48 @@ private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioAppli
 }
 
 /**
+ * Dispatch one hosted (mobile) touch into every live window's pointer processor.
+ * [phase] is 0=down, 1=move, 2=up, 3=cancel (iOS UITouch Began/Moved/Ended/
+ * Cancelled). Positions are in the window's point coordinate space. The redraw
+ * happens on the next frame callback (the pointer only marks the window dirty).
+ */
+private fun inputHosted(scope: KlioApplicationScope, x: Int, y: Int, phase: Int) {
+    val down = phase == 0 || phase == 1
+    val eventType = when (phase) {
+        0 -> PointerEventType.Press
+        1 -> PointerEventType.Move
+        else -> PointerEventType.Release
+    }
+    val position = Offset(x.toFloat(), y.toFloat())
+    for (holder in scope.windows) {
+        if (holder.closed) continue
+        holder.uptime += 8
+        val data = PointerInputEventData(
+            id = PointerId(0),
+            uptime = holder.uptime,
+            positionOnScreen = position,
+            position = position,
+            down = down,
+            pressure = 1f,
+            type = PointerType.Touch,
+            activeHover = false,
+            scaleGestureFactor = 1f,
+            panGestureOffset = Offset.Zero,
+        )
+        holder.processor.process(
+            PointerInputEvent(
+                eventType,
+                holder.uptime,
+                listOf(data),
+                buttons = PointerButtons(isPrimaryPressed = down),
+            ),
+            IdentityPositionCalculator,
+        )
+        holder.dirty = true
+    }
+}
+
+/**
  * Run a compose application: [content] is a COMPOSABLE block whose [Window]
  * declarations manage native windows — multiple windows compose side by side,
  * state-gated windows open/close with recomposition, and window parameters
@@ -408,6 +450,7 @@ fun application(
         // recomposer + windows captured by the callback stay alive because the
         // VM stays resident.
         __composeui_setFrameCallback { frameHosted(recomposerDriver, scope) }
+        __composeui_setInputCallback { x, y, phase -> inputHosted(scope, x, y, phase) }
         return openedAny
     }
     var frame = 0
@@ -472,6 +515,11 @@ internal fun __composeui_isHosted(): Boolean =
 // source invokes it once per vsync on the resident VM.
 internal fun __composeui_setFrameCallback(callback: () -> Boolean): Long =
     error("intrinsic androidx.compose.ui.window.__composeui_setFrameCallback not installed")
+
+// Register the touch callback with the host; the platform input source invokes
+// it on each touch with (x, y, phase) — phase 0=down, 1=move, 2=up, 3=cancel.
+internal fun __composeui_setInputCallback(callback: (Int, Int, Int) -> Unit): Long =
+    error("intrinsic androidx.compose.ui.window.__composeui_setInputCallback not installed")
 
 // The hosted surface's size in points (mobile), or 0 when none is installed. A
 // hosted Window fills these instead of its requested size.

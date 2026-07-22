@@ -20,14 +20,26 @@ extern int klio_run(int argc, const char *const *argv);
 extern void klio_set_surface(void *layer, int w, int h, double scale);
 extern void klio_render_frame(void);
 extern int klio_frame_active(void);
+extern void klio_dispatch_touch(int x, int y, int phase);
 
 // A UIView whose backing layer is a CAMetalLayer: the resident Compose UI draws
 // into its per-frame drawables through the statically-linked Skia Ganesh-Metal
-// backend (klio_win_attach / klio_win_surface / klio_win_present).
+// backend (klio_win_attach / klio_win_surface / klio_win_present). Touches on the
+// view forward into the resident VM's pointer processor via klio_dispatch_touch.
 @interface KlioMetalView : UIView
 @end
 @implementation KlioMetalView
 + (Class)layerClass { return [CAMetalLayer class]; }
+- (void)forwardTouches:(NSSet<UITouch *> *)touches phase:(int)phase {
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint p = [t locationInView:self];  // points, the composition's coordinate space
+    klio_dispatch_touch((int)p.x, (int)p.y, phase);
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:0]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:1]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:2]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self forwardTouches:t phase:3]; }
 @end
 
 @interface KlioAppDelegate : UIResponder <UIApplicationDelegate>
@@ -47,6 +59,19 @@ extern int klio_frame_active(void);
     self.frameCount += 1;
     if (self.frameCount % 60 == 0) {
         NSLog(@"[klio-host] frames=%lu", self.frameCount);
+    }
+    // Headless touch self-test (KLIO_TOUCH_SELFTEST): the simulator has no tap
+    // injection, so once the UI is running, synthesize one tap (down + up) at a
+    // known point. A touch-reactive scene moves to it, proving the whole path:
+    // UITouch -> klio_dispatch_touch -> resident VM -> pointer processor.
+    if (self.frameCount == 120 && getenv("KLIO_TOUCH_SELFTEST")) {
+        const char *xs = getenv("KLIO_TOUCH_X");
+        const char *ys = getenv("KLIO_TOUCH_Y");
+        int tx = xs ? atoi(xs) : 300;
+        int ty = ys ? atoi(ys) : 640;
+        NSLog(@"[klio-host] selftest touch x=%d y=%d", tx, ty);
+        klio_dispatch_touch(tx, ty, 0);  // down
+        klio_dispatch_touch(tx, ty, 2);  // up
     }
 }
 

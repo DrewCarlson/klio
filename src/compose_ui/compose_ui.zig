@@ -63,6 +63,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_setFrameCallback", setFrameCallback);
     try b.register("androidx.compose.ui.window.__composeui_surfaceWidth", surfaceWidth);
     try b.register("androidx.compose.ui.window.__composeui_surfaceHeight", surfaceHeight);
+    try b.register("androidx.compose.ui.window.__composeui_setInputCallback", setInputCallback);
     try b.register("androidx.compose.ui.graphics.__skia_path_op", pathOp);
     try b.register("androidx.compose.ui.graphics.__skia_surf_new", surfNew);
     try b.register("androidx.compose.ui.graphics.__skia_surf_save_png", surfSavePng);
@@ -813,6 +814,11 @@ const FrameCb = struct {
 };
 var frame_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
 
+/// The resident input callback: the Kotlin lambda that routes a platform touch
+/// (iOS UITouch) into the live windows' pointer processors. Same residency
+/// contract as `frame_cb` — persisted so it outlives the run that registered it.
+var input_cb: FrameCb = .{ .host = undefined, .callback = undefined, .out = undefined };
+
 /// `__composeui_isHosted(): Boolean` — true when the platform owns the frame loop
 /// (an app surface has been installed). `application` then registers a frame
 /// callback and returns instead of running its own loop.
@@ -846,6 +852,15 @@ fn setFrameCallback(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newLong(1));
 }
 
+/// `__composeui_setInputCallback(cb: (x: Int, y: Int, phase: Int) -> Unit): Long`
+/// — store the callback the platform input source invokes on each touch. Same
+/// persisted-host residency contract as `setFrameCallback`.
+fn setInputCallback(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return ok(Value.newLong(0));
+    input_cb = .{ .host = ctx.host.persist(), .callback = ctx.args[0], .out = ctx.out, .set = true };
+    return ok(Value.newLong(1));
+}
+
 /// True once `application` has registered a hosted frame callback: the run must
 /// stay resident (its VM, arena, and reclaim mode are kept alive) so the
 /// platform frame source can re-enter each vsync.
@@ -874,6 +889,24 @@ pub export fn klio_render_frame() void {
 /// CADisplayLink) only then; a non-UI program leaves it zero and the shell exits.
 pub export fn klio_frame_active() c_int {
     return if (frame_cb.set) 1 else 0;
+}
+
+const TouchArgs = struct { x: c_int, y: c_int, phase: c_int };
+
+fn dispatchTouchBody(ta: TouchArgs) void {
+    var args = [_]Value{ Value.newInt(ta.x), Value.newInt(ta.y), Value.newInt(ta.phase) };
+    _ = input_cb.host.invokeCallable(&input_cb.callback, &args, input_cb.out) catch {};
+}
+
+/// Route a platform touch into the resident VM's input callback. `x`/`y` are in
+/// the surface's point coordinate space; `phase` is 0=down, 1=move, 2=up,
+/// 3=cancel (matching UITouch's Began/Moved/Ended/Cancelled). Called by the app
+/// shell on the main thread — same-thread re-entry, so it runs on the persistent
+/// interpreter stack like the frame callback (touch and frame never overlap:
+/// both are serviced serially by the platform run loop).
+pub export fn klio_dispatch_touch(x: c_int, y: c_int, phase: c_int) void {
+    if (!input_cb.set) return;
+    runtime.runOnPersistentBigStack(TouchArgs, void, dispatchTouchBody, .{ .x = x, .y = y, .phase = phase });
 }
 
 /// `__composeui_winSurface(handle): Long` — the window's Skia surface handle,
@@ -1422,7 +1455,7 @@ test "hostBindings registers the skia render + windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_text_width") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__composeui_font_metric") != null);
     try testing.expect(b.resolve("androidx.compose.ui.graphics.__skia_c_concat") != null);
-    try testing.expectEqual(@as(usize, 65), b.len());
+    try testing.expectEqual(@as(usize, 66), b.len());
 }
 
 test "skiaRender guards arg shapes and no-ops without the library" {

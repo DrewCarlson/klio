@@ -73,23 +73,37 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> install + launch (app stays resident; drive frames, then screenshot)"
+echo "==> install + launch (app stays resident; drive frames, inject a tap, screenshot)"
 xcrun simctl install "$DEV" "$APP"
 LOG="$OUT/launch.log"
+# The simulator has no tap injection, so drive the app's built-in touch self-test
+# (SIMCTL_CHILD_* env reaches the launched app): it synthesizes one tap after the
+# UI is up, and the reactive scene moves its circle to it.
+export SIMCTL_CHILD_KLIO_TOUCH_SELFTEST=1
+export SIMCTL_CHILD_KLIO_TOUCH_X=300
+export SIMCTL_CHILD_KLIO_TOUCH_Y=640
 # Launch detached (the on-screen app never exits); stream its console to LOG.
 ( xcrun simctl launch --console-pty "$DEV" "$BUNDLE_ID" >"$LOG" 2>&1 & echo $! >"$OUT/launch.pid" ) || true
-sleep 6   # let CADisplayLink drive several seconds of frames
+sleep 6   # let CADisplayLink drive several seconds of frames (tap fires at frame 120)
 xcrun simctl io "$DEV" screenshot "$OUT/screen.png" >/dev/null 2>&1 || true
 LP="$(cat "$OUT/launch.pid" 2>/dev/null || true)"; [ -n "$LP" ] && kill "$LP" 2>/dev/null || true
 
-echo "--- app console (first lines) ---"; head -8 "$LOG" 2>/dev/null || true; echo "-------------------"
+echo "--- app console (first lines) ---"; head -12 "$LOG" 2>/dev/null || true; echo "-------------------"
 
 grep -Fq "driving CADisplayLink" "$LOG" || fail "on-screen path did not activate (no CADisplayLink) — see $LOG"
 grep -Eq "frames=[0-9]+" "$LOG" || fail "no frame heartbeat — the resident VM did not render repeated frames (see $LOG)"
 FRAMES="$(grep -oE 'frames=[0-9]+' "$LOG" | tail -1)"
+FRAME_N="${FRAMES#frames=}"
+
+# Touch: the self-test injected a tap at frame 120. It must have logged, and the
+# app must have kept rendering past it (a crash in touch dispatch would freeze
+# the frame heartbeat at ~120).
+grep -Fq "selftest touch" "$LOG" || fail "touch self-test did not fire — see $LOG"
+[ "${FRAME_N:-0}" -gt 120 ] || fail "frame loop stopped at/near the injected touch ($FRAMES) — touch dispatch likely crashed (see $LOG)"
+
 SHOT_OK="no"
 if [ -f "$OUT/screen.png" ]; then
   SZ=$(stat -f%z "$OUT/screen.png" 2>/dev/null || echo 0)
   [ "$SZ" -gt 1000 ] && SHOT_OK="yes ($SZ bytes -> $OUT/screen.png)"
 fi
-echo "PASS ios-onscreen-smoke: Compose drove on-screen frames ($FRAMES); screenshot=$SHOT_OK"
+echo "PASS ios-onscreen-smoke: Compose drove on-screen frames ($FRAMES) + survived an injected touch; screenshot=$SHOT_OK"
