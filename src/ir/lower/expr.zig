@@ -7402,6 +7402,78 @@ fn simpleTypeHead(name: []const u8) []const u8 {
     return n;
 }
 
+/// Resolve a renamed import against the exact FQN the import denotes while
+/// retaining the implicit receiver of a bare extension call.  Qualifying the
+/// callee path is not equivalent: `import p.f as g; recv.g(x)` can be written
+/// as bare `g(x)` inside an extension body, and `p.f(x)` would drop `recv`.
+/// Null means the imported overload set is not statically unique from the
+/// evidence available at lowering time.
+fn renamedImportDirectTarget(
+    b: *FuncBuilder,
+    ident: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?FuncId {
+    const paths = b.module.importAliasPathsIn(ident.span.file, ident.name);
+    if (paths.len != 1 or paths[0].segs.len < 2) return null;
+    const target_leaf = paths[0].segs[paths[0].segs.len - 1];
+    if (std.mem.eql(u8, target_leaf, ident.name)) return null;
+
+    // A real member named by the alias remains in the implicit-receiver
+    // candidate group ahead of the imported extension.
+    if (inReceiverContext(b) and anyReceiverClassDeclares(b, ident.name)) return null;
+
+    const shapes = try buildArgShapes(b, args, ast_arg_names);
+    defer b.allocator.free(shapes);
+    const recv = b.enclosingRecvTy() orelse b.recvTy() orelse b.ownerClass();
+    const can_supply_this = b.resolve("this") != null or b.knowsOuter("this") or
+        b.capturesThisSlot();
+
+    var best: ?FuncId = null;
+    var best_rank: i16 = -1;
+    var tied = false;
+    for (b.module.funcsBySimpleName(target_leaf)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) continue;
+        if (f.low_priority) continue;
+        if (!fqnCallArityFits(b, fid, args.len)) continue;
+        if (!b.module.declSigCompatible(fid, shapes)) continue;
+
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        var recv_match = false;
+        if (is_ext) {
+            if (!can_supply_this) continue;
+            if (recv) |r| {
+                const actual = simpleTypeHead(r);
+                const declared = simpleTypeHead(f.params[0].ty.name);
+                recv_match = std.mem.eql(u8, actual, declared) or
+                    b.module.classIsOrExtends(actual, declared);
+                if (!recv_match) continue;
+            }
+        }
+
+        const arity = b.module.decl_user_arity.get(fid.int()) orelse continue;
+        var rank: i16 = if (arity.has_vararg)
+            1
+        else if (arity.total == args.len)
+            4
+        else
+            2;
+        // Kotlin resolves the applicable implicit-receiver group before a
+        // receiverless sibling from the same imported overload family.
+        if (recv_match) rank += 8;
+
+        if (rank > best_rank) {
+            best = fid;
+            best_rank = rank;
+            tied = false;
+        } else if (rank == best_rank) {
+            tied = true;
+        }
+    }
+    return if (tied) null else best;
+}
+
 fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -7499,6 +7571,20 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             } });
         }
         return dst;
+    }
+
+    // A renamed import whose exact overload is an ordinary function binds
+    // directly.  This preserves an implicit extension receiver and is also
+    // immune to unrelated same-simple-name globals. Inline targets stay with
+    // the splice path because reification, suspension, and non-local returns
+    // may require the source body at this call site.
+    if (!shadowed_by_class and segments.len == 1 and
+        !b.hasEnclosingMember(name0) and !b.hasOwnMember(name0))
+    {
+        if (try renamedImportDirectTarget(b, segments[0], args, ast_arg_names)) |target| {
+            const f = b.module.funcById(target) orelse return null;
+            if (!f.is_inline) return try emitCall(b, expr, target, true);
+        }
     }
 
     // FQN-precedence: a UNIQUE explicit import routes a collision call.
@@ -10684,6 +10770,138 @@ test "calling an object loads its exact singleton for operator invoke" {
     try testing.expectEqual(cid, func.blocks[0].insts[0].LoadGlobal.class.?);
     try testing.expect(func.blocks[0].insts[func.blocks[0].insts.len - 1] == .CallValue);
     for (func.blocks[0].insts) |inst| try testing.expect(inst != .NewInstance);
+}
+
+test "renamed overloaded import binds exact extension and plain identities" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+
+    const Add = struct {
+        fn func(
+            module: *Module,
+            alloc: Allocator,
+            params: []ir.Param,
+            kind: ir.FuncKind,
+            is_inline: bool,
+            arity: Module.DeclArity,
+        ) !FuncId {
+            const id = module.nextFuncId();
+            try module.funcs.append(alloc, .{
+                .id = id,
+                .name = "combine",
+                .fqn = "sample.combine",
+                .package = "sample",
+                .params = params,
+                .return_ty = .{ .name = "Flow", .nullable = false, .args = &.{} },
+                .n_locals = 0,
+                .blocks = &.{},
+                .entry = ir.BlockId.from(0),
+                .is_suspend = false,
+                .kind = kind,
+                .has_receiver_param = kind == .top_level_extension,
+                .is_inline = is_inline,
+            });
+            try module.func_index.append(alloc, .{ .name = "combine", .id = id });
+            try module.decl_user_arity.put(id.int(), arity);
+            return id;
+        }
+    };
+
+    const ext_params = try a.alloc(ir.Param, 3);
+    ext_params[0] = .{ .name = "this", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    const ext_id = try Add.func(&m, a, ext_params, .top_level_extension, false, .{
+        .required = 2,
+        .total = 2,
+        .has_vararg = false,
+    });
+
+    const plain_params = try a.alloc(ir.Param, 3);
+    plain_params[0] = .{ .name = "flow", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    const plain_id = try Add.func(&m, a, plain_params, .plain, false, .{
+        .required = 3,
+        .total = 3,
+        .has_vararg = false,
+    });
+
+    const inline_params = try a.alloc(ir.Param, 2);
+    inline_params[0] = .{ .name = "flows", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null, .is_vararg = true };
+    inline_params[1] = .{ .name = "transform", .ty = .{ .name = "Function1", .nullable = false, .args = &.{} }, .default = null };
+    _ = try Add.func(&m, a, inline_params, .plain, true, .{
+        .required = 1,
+        .total = 2,
+        .has_vararg = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    var paths: std.ArrayList(ir.ModuleRegistry.ImportPath) = .empty;
+    const import_segs = try a.dupe([]const u8, &.{ "sample", "combine" });
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "sample.combine"), .segs = import_segs });
+    var imports = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
+    try imports.put("combineOriginal", paths);
+    try m.registry.import_aliases.put(sp.file, imports);
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setRecvTy("Flow");
+    try b.bind("this", b.allocReg());
+    try b.bind("first", b.allocReg());
+    try b.bind("other", b.allocReg());
+    try b.bind("transform", b.allocReg());
+    try b.setLocalDeclType("first", "Flow");
+    try b.setLocalDeclType("other", "Flow");
+    try b.setLocalDeclType("transform", "Function2");
+
+    var callee_segs = [_]ast.Ident{.{ .name = "combineOriginal", .span = sp }};
+    var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = sp } };
+    var other_segs = [_]ast.Ident{.{ .name = "other", .span = sp }};
+    var transform_segs = [_]ast.Ident{.{ .name = "transform", .span = sp }};
+    var ext_args = [_]Expr{
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &transform_segs, .span = sp } },
+    };
+    const ext_call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &ext_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &ext_call);
+    const ext_insts = b.blocks.items[b.cur.int()].insts;
+    const ext_inst = ext_insts[ext_insts.len - 1];
+    try testing.expect(ext_inst == .Call);
+    try testing.expectEqual(ext_id, ext_inst.Call.func);
+    try testing.expect(ext_inst.Call.exact);
+
+    var first_segs = [_]ast.Ident{.{ .name = "first", .span = sp }};
+    var plain_args = [_]Expr{
+        .{ .Path = .{ .segments = &first_segs, .span = sp } },
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &transform_segs, .span = sp } },
+    };
+    const plain_call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &plain_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &plain_call);
+    const plain_insts = b.blocks.items[b.cur.int()].insts;
+    const plain_inst = plain_insts[plain_insts.len - 1];
+    try testing.expect(plain_inst == .Call);
+    try testing.expectEqual(plain_id, plain_inst.Call.func);
+    try testing.expect(plain_inst.Call.exact);
 }
 
 test "scope getter owner follows the class contributing an enclosing property" {
