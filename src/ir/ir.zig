@@ -4361,6 +4361,12 @@ pub const ModuleRegistry = struct {
     /// plus whether the supertype chain fully resolved (`complete`). An
     /// incomplete set must not prove non-shadowability. Lowering-only.
     hierarchy_shadow_names: std.StringHashMap(HierarchyShadowSet),
+    /// `(declaring class, method name)` → trailing-lambda shapes collected
+    /// from every member declaration before any body lowers. This keeps
+    /// receiver-lambda typing independent of source order when a subclass
+    /// calls an inherited method whose body has not produced a `FuncId` yet.
+    /// Lowering-only; installed packs use their serialized lowered methods.
+    member_trailing_lambda_shapes: StrPairMap(std.ArrayList(MemberTrailingLambdaShape)),
     /// `"<class>\x00<method>\x00<userArity>"` → the lowered method's FuncId,
     /// populated incrementally as each class's method bodies are lowered. Lets
     /// a method body statically reach a SIBLING member method's lowered
@@ -4511,6 +4517,14 @@ pub const ModuleRegistry = struct {
         complete: bool,
     };
 
+    pub const MemberTrailingLambdaShape = struct {
+        /// Bit `n` is set when `n` positional user arguments, including the
+        /// trailing lambda, can bind this declaration.
+        accepted_arities: u64,
+        value_arity: i16,
+        receiver_head: ?[]const u8,
+    };
+
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
@@ -4521,6 +4535,7 @@ pub const ModuleRegistry = struct {
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
+            .member_trailing_lambda_shapes = StrPairMap(std.ArrayList(MemberTrailingLambdaShape)).init(allocator),
             .private_shadow_props = std.StringHashMap(void).init(allocator),
             .override_cell_props = std.StringHashMap(void).init(allocator),
             .member_method_fids = std.StringHashMap(FuncId).init(allocator),
@@ -4579,6 +4594,11 @@ pub const ModuleRegistry = struct {
             var itsn = self.hierarchy_shadow_names.valueIterator();
             while (itsn.next()) |v| v.names.deinit();
             self.hierarchy_shadow_names.deinit();
+        }
+        {
+            var it = self.member_trailing_lambda_shapes.valueIterator();
+            while (it.next()) |list| list.deinit(a);
+            self.member_trailing_lambda_shapes.deinit();
         }
         {
             var it = self.hierarchy_methods.valueIterator();
@@ -4696,6 +4716,14 @@ pub const ModuleRegistry = struct {
         {
             var it = self.hierarchy_methods.iterator();
             while (it.next()) |e| try out.hierarchy_methods.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.member_trailing_lambda_shapes.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(MemberTrailingLambdaShape) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.member_trailing_lambda_shapes.put(e.key_ptr.*, list);
+            }
         }
         {
             var it = self.member_method_fids.iterator();

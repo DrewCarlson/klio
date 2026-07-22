@@ -145,6 +145,30 @@ test "lambda_in_subclass_calls_super" {
     try assertKlio("lambda_super", src, "sub-base-1,sub-base-2\n");
 }
 
+test "captured receiver alias retains its type through nested lambdas" {
+    const src =
+        \\
+        \\class Test : Base() {
+        \\    fun result(): String = runTest {
+        \\        val outerScope = this
+        \\        with("nested") {
+        \\            listOf("OK").map {
+        \\                outerScope.launch { it }
+        \\            }.single()
+        \\        }
+        \\    }
+        \\}
+        \\open class Base {
+        \\    fun runTest(prefix: String = "", block: Scope.() -> String): String = Scope().block()
+        \\}
+        \\class Scope
+        \\fun Scope.launch(block: Scope.() -> String): String = block()
+        \\fun main() { println(Test().result()) }
+        \\
+    ;
+    try assertKlio("captured_receiver_alias_type", src, "OK\n");
+}
+
 test "higher_order_local_fn_dispatch" {
     const src =
         \\

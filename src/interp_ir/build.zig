@@ -1009,6 +1009,73 @@ fn collectHierarchyMethodNames(start: []const u8, by_name: *const FileClasses, o
     for (c.supertypes) |*st| try collectHierarchyMethodNames(st.name.name, by_name, out, seen);
 }
 
+fn memberTrailingLambdaShape(module: *const ir.Module, f: *const ast.Function) ?ir.ModuleRegistry.MemberTrailingLambdaShape {
+    if (f.params.len == 0) return null;
+    const last_ty = f.params[f.params.len - 1].ty;
+    const value_arity: i16 = if (last_ty.function) |ft|
+        @intCast(@min(ft.params.len + ft.context_params.len, std.math.maxInt(i16)))
+    else blk: {
+        const tag = module.registry.type_aliases.get(last_ty.name.name) orelse return null;
+        if (!std.mem.startsWith(u8, tag, "Function")) return null;
+        break :blk std.fmt.parseInt(i16, tag["Function".len..], 10) catch return null;
+    };
+    const receiver_head: ?[]const u8 = if (last_ty.function) |ft|
+        if (ft.receiver) |rt| rt.name.name else null
+    else
+        null;
+
+    var accepted: u64 = 0;
+    var nargs: usize = 1;
+    while (nargs <= f.params.len and nargs < 63) : (nargs += 1) {
+        const leading = nargs - 1;
+        var fits = true;
+        for (f.params[leading .. f.params.len - 1]) |*p| {
+            if (p.default == null and !p.is_vararg) {
+                fits = false;
+                break;
+            }
+        }
+        if (fits) accepted |= @as(u64, 1) << @intCast(nargs);
+    }
+    if (accepted == 0) return null;
+    return .{
+        .accepted_arities = accepted,
+        .value_arity = value_arity,
+        .receiver_head = receiver_head,
+    };
+}
+
+fn collectMemberTrailingLambdaShapes(module: *ir.Module, by_name: *const FileClasses) Allocator.Error!void {
+    const a = module.registry.allocator;
+    var it = by_name.iterator();
+    while (it.next()) |entry| {
+        const cls = entry.key_ptr.*;
+        const c = entry.value_ptr.get();
+        for (c.members) |*member| {
+            if (member.* != .Function) continue;
+            const f = &member.Function;
+            const shape = memberTrailingLambdaShape(module, f) orelse continue;
+            const key = ir.StrPair{ .a = cls, .b = f.name.name };
+            const gop = try module.registry.member_trailing_lambda_shapes.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            var duplicate = false;
+            for (gop.value_ptr.items) |old| {
+                const same_recv = if (old.receiver_head == null or shape.receiver_head == null)
+                    old.receiver_head == null and shape.receiver_head == null
+                else
+                    std.mem.eql(u8, old.receiver_head.?, shape.receiver_head.?);
+                if (old.accepted_arities == shape.accepted_arities and
+                    old.value_arity == shape.value_arity and same_recv)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try gop.value_ptr.append(a, shape);
+        }
+    }
+}
+
 /// Transitive member-NAME set for the member-shadow gate: every kind a bare
 /// name could bind through the implicit receiver (functions, properties,
 /// primary-ctor `val`/`var` params, nested-object/companion members), walked
@@ -2057,6 +2124,11 @@ fn buildModuleWithOverrides(
         }
     }
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
+    // Member signatures need the same source-order independence as top-level
+    // headers. Record the trailing receiver-lambda portion now, before any
+    // class body lowers, so inherited calls in earlier source files still
+    // receive their declaration-site lambda shape.
+    try collectMemberTrailingLambdaShapes(module, &file_classes);
     // Fill every reserved class's primary-constructor parameters BEFORE any
     // class method body is lowered. Class method bodies lower inside the loop
     // below in declaration order, so a constructor call to a class declared
@@ -4928,4 +5000,44 @@ test "expect class member defaults transplant to the matching actual signature" 
     actual.params[0].ty.name.name = "String";
     try testing.expect(!transplantExpectMemberDefaults(&actual, &expected));
     try testing.expect(actual.params[0].default == null);
+}
+
+test "member receiver-lambda shape records omitted leading defaults" {
+    var module = ir.Module.init(testing.allocator);
+    defer module.deinit(testing.allocator);
+    const s = span.Span.init(span.FileId.from(0), 0, 1);
+    var default_expr = ast.Expr{ .NullLit = .{ .span = s } };
+    var scope_ty: ast.TypeRef = undefined;
+    scope_ty.name = .{ .name = "CoroutineScope", .span = s };
+    var unit_ty: ast.TypeRef = undefined;
+    unit_ty.name = .{ .name = "Unit", .span = s };
+    var fn_ty: ast.FunctionTypeRef = .{
+        .receiver = scope_ty,
+        .params = &.{},
+        .ret = unit_ty,
+        .is_suspend = true,
+        .context_params = &.{},
+        .span = s,
+    };
+    var block_ty: ast.TypeRef = undefined;
+    block_ty.name = .{ .name = "<function>", .span = s };
+    block_ty.function = &fn_ty;
+
+    var params: [3]ast.Param = undefined;
+    params[0].default = &default_expr;
+    params[0].is_vararg = false;
+    params[1].default = &default_expr;
+    params[1].is_vararg = false;
+    params[2].ty = block_ty;
+    params[2].default = null;
+    params[2].is_vararg = false;
+    var f: ast.Function = undefined;
+    f.params = &params;
+
+    const shape = memberTrailingLambdaShape(&module, &f).?;
+    try testing.expectEqual(@as(i16, 0), shape.value_arity);
+    try testing.expectEqualStrings("CoroutineScope", shape.receiver_head.?);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 1) != 0);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 2) != 0);
+    try testing.expect(shape.accepted_arities & (@as(u64, 1) << 3) != 0);
 }
