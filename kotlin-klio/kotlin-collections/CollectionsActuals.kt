@@ -19,40 +19,46 @@ internal actual fun checkCountOverflow(count: Int): Int {
 
 internal actual fun mapCapacity(expectedSize: Int): Int = expectedSize
 
+private fun <E> __klio_buildList(builderAction: MutableList<E>.() -> Unit): List<E> =
+    error("intrinsic kotlin.collections.__klio_buildList not installed")
+
+private fun <E> __klio_buildList(capacity: Int, builderAction: MutableList<E>.() -> Unit): List<E> =
+    error("intrinsic kotlin.collections.__klio_buildList not installed")
+
+private fun <E> __klio_buildSet(builderAction: MutableSet<E>.() -> Unit): Set<E> =
+    error("intrinsic kotlin.collections.__klio_buildSet not installed")
+
+private fun <E> __klio_buildSet(capacity: Int, builderAction: MutableSet<E>.() -> Unit): Set<E> =
+    error("intrinsic kotlin.collections.__klio_buildSet not installed")
+
+private fun <K, V> __klio_buildMap(builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> =
+    error("intrinsic kotlin.collections.__klio_buildMap not installed")
+
+private fun <K, V> __klio_buildMap(capacity: Int, builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> =
+    error("intrinsic kotlin.collections.__klio_buildMap not installed")
+
 internal actual inline fun <E> buildListInternal(builderAction: MutableList<E>.() -> Unit): List<E> {
-    val list = ArrayList<E>()
-    list.builderAction()
-    return list
+    return __klio_buildList(builderAction)
 }
 
 internal actual inline fun <E> buildListInternal(capacity: Int, builderAction: MutableList<E>.() -> Unit): List<E> {
-    val list = ArrayList<E>(capacity)
-    list.builderAction()
-    return list
+    return __klio_buildList(capacity, builderAction)
 }
 
 internal actual inline fun <E> buildSetInternal(builderAction: MutableSet<E>.() -> Unit): Set<E> {
-    val set = LinkedHashSet<E>()
-    set.builderAction()
-    return set
+    return __klio_buildSet(builderAction)
 }
 
 internal actual inline fun <E> buildSetInternal(capacity: Int, builderAction: MutableSet<E>.() -> Unit): Set<E> {
-    val set = LinkedHashSet<E>(capacity)
-    set.builderAction()
-    return set
+    return __klio_buildSet(capacity, builderAction)
 }
 
 internal actual inline fun <K, V> buildMapInternal(builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    val map = LinkedHashMap<K, V>()
-    map.builderAction()
-    return map
+    return __klio_buildMap(builderAction)
 }
 
 internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    val map = LinkedHashMap<K, V>(capacity)
-    map.builderAction()
-    return map
+    return __klio_buildMap(capacity, builderAction)
 }
 
 // The interpreter's arrays are exact-sized; collection-to-array
