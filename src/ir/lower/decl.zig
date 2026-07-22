@@ -243,6 +243,129 @@ var lower_class_pkg: ?[]const u8 = null;
 /// reads it on init); re-exported here for the build drivers.
 pub const setLowerSelfPackage = build.setLowerSelfPackage;
 
+fn memberDeclKey(a: Allocator, owner: []const u8, f: *const ast.Function) Allocator.Error![]u8 {
+    const s = f.name.span;
+    return std.fmt.allocPrint(a, "$decl$\x00{s}\x00{s}\x00{d}:{d}:{d}", .{
+        owner,
+        f.name.name,
+        s.file.int(),
+        s.start,
+        s.end,
+    });
+}
+
+/// Reserve concrete member-extension signatures before any class body lowers.
+/// Their calls need both the extension receiver and the enclosing dispatch
+/// receiver, so source-order fallback through an unresolved global cannot
+/// reproduce Kotlin resolution. Phase-two method lowering replaces each stub
+/// in place through its declaration span.
+pub fn reserveMemberExtensionHeaders(
+    module: *Module,
+    c: *const ast.Class,
+    class_fqn: []const u8,
+    class_pkg: []const u8,
+) Allocator.Error!void {
+    const a = module.registry.allocator;
+    const owner_id = module.classIdByFqn(class_fqn) orelse module.classId(c.name.name);
+    for (c.members) |*member| {
+        if (member.* != .Function) continue;
+        const f = &member.Function;
+        if (f.receiver_type == null or f.body == null) continue;
+        const decl_key = try memberDeclKey(a, c.name.name, f);
+        if (module.registry.member_method_fids.contains(decl_key)) {
+            a.free(decl_key);
+            continue;
+        }
+
+        const id = module.nextFuncId();
+        const params = try a.alloc(Param, f.params.len + 1);
+        params[0] = .{
+            .name = "this",
+            .ty = try loweredTypeRef(a, &f.receiver_type.?, false),
+            .default = null,
+            .is_property = false,
+            .is_vararg = false,
+            .has_default = false,
+        };
+        for (f.params, 0..) |*p, i| {
+            params[i + 1] = .{
+                .name = p.name.name,
+                .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
+                .default = null,
+                .is_property = false,
+                .is_vararg = p.is_vararg,
+                .has_default = p.default != null,
+            };
+        }
+        const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ class_fqn, f.name.name });
+        const return_ty = if (f.return_type) |*rt|
+            try loweredTypeRef(a, rt, false)
+        else
+            build.typeUnit();
+        try module.funcs.append(a, .{
+            .id = id,
+            .name = f.name.name,
+            .fqn = fqn,
+            .package = class_pkg,
+            .params = params,
+            .return_ty = return_ty,
+            .n_locals = 0,
+            .blocks = &.{},
+            .entry = ir.BlockId.from(0),
+            .is_suspend = f.is_suspend,
+            .kind = .member_extension,
+            .is_tailrec = f.is_tailrec,
+            .has_receiver_param = true,
+            .is_inline = f.is_inline,
+            .low_priority = isLowPriorityOverload(f),
+            .is_expect = f.is_expect,
+        });
+        try module.func_index.append(a, .{ .name = f.name.name, .id = id });
+        try funcNameIndexPush(module, f.name.name, id);
+        try module.recordFuncDeclSpan(a, f.name.span, id);
+        try module.registry.member_ext_owner_class.put(id, c.name.name);
+        try registerFuncTypeParams(module, f, id);
+
+        var has_vararg = false;
+        var required: u32 = 0;
+        for (f.params) |*p| {
+            if (p.is_vararg) has_vararg = true;
+            if (p.default == null and !p.is_vararg) required += 1;
+        }
+        const arity: Module.DeclArity = .{
+            .required = required,
+            .total = @intCast(f.params.len),
+            .has_vararg = has_vararg,
+        };
+        const sig = try a.alloc(TypeRef, f.params.len);
+        for (f.params, 0..) |*p, i| sig[i] = try loweredTypeRef(a, &p.ty, true);
+        try module.decl_user_params.put(id.int(), @intCast(f.params.len));
+        try module.decl_user_arity.put(id.int(), arity);
+        try module.decl_user_sig.put(id.int(), sig);
+        try module.decl_sigs.put(id.int(), .{
+            .enclosing_class = owner_id,
+            .receiver_ty = try loweredTypeRef(a, &f.receiver_type.?, true),
+            .arity = arity,
+            .sig = sig,
+            .kind = .member_extension,
+            .is_inline = f.is_inline,
+            .is_suspend = f.is_suspend,
+            .has_body = true,
+        });
+        try module.decl_span.put(id.int(), f.span);
+        try module.decl_ast_body.put(id.int(), {});
+        try module.registry.member_method_fids.put(decl_key, id);
+
+        const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
+        const gop = try module.registry.member_method_fids.getOrPut(key);
+        if (gop.found_existing) {
+            a.free(key);
+        } else {
+            gop.value_ptr.* = id;
+        }
+    }
+}
+
 /// Names captured by the anonymous object whose method is being lowered
 /// (`object : Flow { collect(c) { c.block() } }` where `block` is an
 /// enclosing inline fn's crossinline param). These reach the method
@@ -608,7 +731,7 @@ pub fn lowerClassWithExtras(
             // index (the split decl_user_* tables cover only top-level
             // declarations). Keys receiver-type membership queries and
             // exact static member binds.
-            {
+            if (!module.decl_sigs.contains(placed.id.int())) {
                 var has_vararg = false;
                 var required: u32 = 0;
                 for (f.params) |*p| {
@@ -972,16 +1095,26 @@ pub fn lowerMethodWithPrivate(
         // receiver via the qualified-this walk, and the ref lowering
         // keys that on the owner-class name.
         const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null, null);
-        const id = module.nextFuncId();
+        const decl_key = try memberDeclKey(a, owner_class, f);
+        defer a.free(decl_key);
+        const reserved_id = module.registry.member_method_fids.get(decl_key);
+        const id = reserved_id orelse module.nextFuncId();
         var placed = func;
         placed.id = id;
-        try module.recordFuncDeclSpan(a, f.name.span, id);
         placed.kind = .member_extension;
-        try module.funcs.append(a, placed);
-        try registerFuncTypeParams(module, f, id);
-        const nm = f.name.name;
-        try module.func_index.append(a, .{ .name = nm, .id = id });
-        try funcNameIndexPush(module, nm, id);
+        if (reserved_id != null) {
+            const stub = module.funcById(id).?;
+            placed.fqn = stub.fqn;
+            placed.package = stub.package;
+            module.funcByIdMut(id).?.* = placed;
+        } else {
+            try module.recordFuncDeclSpan(a, f.name.span, id);
+            try module.funcs.append(a, placed);
+            try registerFuncTypeParams(module, f, id);
+            const nm = f.name.name;
+            try module.func_index.append(a, .{ .name = nm, .id = id });
+            try funcNameIndexPush(module, nm, id);
+        }
         // Tag this member-extension with its declaring class so the
         // runtime extension-fallback dispatch can filter it out at call
         // sites whose enclosing class chain doesn't include the
@@ -1568,6 +1701,91 @@ test "resolveAnnotationNames yields fqn candidates from imports" {
     try expectContains(got, "Ignore");
     // Qualified path passes through verbatim.
     try expectContains(got, "kotlin.test.AfterTest");
+}
+
+test "member extension headers are reserved before their bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = ast.Span{ .file = ir.FileId.from(0), .start = 10, .end = 20 };
+    const scope_ty: ast.TypeRef = .{
+        .name = .{ .name = "Scope", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const body: ast.FunctionBody = .{ .Block = .{ .stmts = &.{}, .span = sp } };
+    const helper: ast.Function = .{
+        .name = .{ .name = "helper", .span = sp },
+        .receiver_type = scope_ty,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = body,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Private,
+        .annotations = &.{},
+        .span = sp,
+    };
+    var members = [_]ast.Decl{.{ .Function = helper }};
+    const cls: ast.Class = .{
+        .name = .{ .name = "Host", .span = sp },
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .primary_params = &.{},
+        .init_blocks = &.{},
+        .init_block_positions = &.{},
+        .supertypes = &.{},
+        .supertype_args = &.{},
+        .supertype_delegates = &.{},
+        .is_data = false,
+        .is_companion = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .secondary_ctors = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .is_value = false,
+        .is_annotation = false,
+        .is_expect = false,
+        .is_actual = false,
+        .enum_entries = &.{},
+        .members = &members,
+        .visibility = .Public,
+        .primary_ctor_visibility = null,
+        .annotations = &.{},
+        .span = sp,
+    };
+    const owner = try m.reserveClassFqn(a, "Host", "sample.Host", "sample", false);
+    try reserveMemberExtensionHeaders(&m, &cls, "sample.Host", "sample");
+
+    const id = m.funcByDeclSpan(sp).?;
+    const f = m.funcById(id).?;
+    try std.testing.expectEqual(ir.FuncKind.member_extension, f.kind);
+    try std.testing.expectEqualStrings("sample.Host.helper", f.fqn);
+    try std.testing.expectEqualStrings("Scope", f.params[0].ty.name);
+    try std.testing.expectEqual(owner, m.decl_sigs.get(id.int()).?.enclosing_class.?);
+    try std.testing.expectEqualStrings("Host", m.registry.member_ext_owner_class.get(id).?);
+    try std.testing.expectEqual(@as(usize, 1), m.funcsBySimpleName("helper").len);
 }
 
 fn expectContains(haystack: []const []const u8, needle: []const u8) !void {
