@@ -1646,17 +1646,13 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
             const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
-            // Inside a lambda body the lexical `this` is the lambda's own
-            // receiver, which for a scope function (`buildString { … }`,
-            // `with(x) { … }`) is the scope receiver — not the enclosing class
-            // instance. A bare read of an enclosing-class member must not bind
-            // directly to that scope receiver: defer to the implicit-receiver
-            // walk below, which carries the owner-qualified getter and tries
-            // the scope receiver before the captured enclosing `this`. A member
-            // the scope receiver itself owns still resolves there (it is the
-            // innermost candidate), so a non-scope lambda is unaffected.
-            const lambda_encl_member = b.isLambdaBody() and b.hasEnclosingMember(name0);
-            if (!is_known_global and !lambda_encl_member) {
+            // A name declared only by an outer class must not become a plain
+            // field read on the inner `this`. Defer it to the implicit-receiver
+            // walk below, which carries the declaring class in the scoped
+            // getter name. The same rule handles receiver lambdas, where the
+            // innermost candidate may instead be a scope-function receiver.
+            const enclosing_only_member = !b.hasOwnMember(name0) and b.hasEnclosingMember(name0);
+            if (!is_known_global and !enclosing_only_member) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
                 try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
@@ -1771,10 +1767,32 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     return cur;
 }
 
+/// The nearest lexical class whose hierarchy declares `name`. A lambda keeps
+/// its enclosing class as `ownerClass`, while a lifted inner class reaches its
+/// outer classes through `enclosing_class`; consulting both gives a scoped
+/// getter the class that actually contributes the bare property.
+fn sgetterOwner(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
+    const lexical_owner = b.ownerClass() orelse return null;
+    var owner: ?[]const u8 = lexical_owner;
+    var hops: usize = 0;
+    while (owner) |o| : (hops += 1) {
+        if (hops > 32) break;
+        const own = std.mem.eql(u8, o, lexical_owner) and b.hasOwnMember(name);
+        const hierarchy_has = if (b.module.registry.hierarchy_shadow_names.get(o)) |hierarchy|
+            hierarchy.names.contains(name)
+        else
+            false;
+        if (own) return o;
+        if (hierarchy_has) return o;
+        owner = b.module.registry.enclosing_class.get(o);
+    }
+    return lexical_owner;
+}
+
 /// Intern the scope-qualified getter field name `$sgetter$<owner>\u{1f}<name>`
 /// when an enclosing class is known, else the plain name.
 fn sgetterName(b: *FuncBuilder, name: []const u8) Allocator.Error!ConstId {
-    if (b.ownerClass()) |owner| {
+    if (sgetterOwner(b, name)) |owner| {
         // The const pool stores the slice by reference, so the buffer must
         // live for the module's lifetime — let the module allocator own it
         // rather than freeing it here (which would leave a dangling field
@@ -10520,6 +10538,75 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     // The lambda's bound receiver is unknowable statically; the Or form
     // keeps the runtime member arm.
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
+}
+
+test "scope getter owner follows the class contributing an enclosing property" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+
+    var inner_names = std.StringHashMap(void).init(testing.allocator);
+    try inner_names.put("innerValue", {});
+    try m.registry.hierarchy_shadow_names.put("Outer$Inner", .{
+        .names = inner_names,
+        .complete = true,
+    });
+    var outer_names = std.StringHashMap(void).init(testing.allocator);
+    try outer_names.put("receiveException", {});
+    try m.registry.hierarchy_shadow_names.put("Outer", .{
+        .names = outer_names,
+        .complete = true,
+    });
+    try m.registry.enclosing_class.put("Outer$Inner", "Outer");
+
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Outer$Inner");
+
+    try testing.expectEqualStrings("Outer$Inner", sgetterOwner(&b, "innerValue").?);
+    try testing.expectEqualStrings("Outer", sgetterOwner(&b, "receiveException").?);
+}
+
+test "bare enclosing property lowers with its outer getter owner" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var inner_names = std.StringHashMap(void).init(a);
+    try inner_names.put("next", {});
+    try m.registry.hierarchy_shadow_names.put("Outer$Inner", .{
+        .names = inner_names,
+        .complete = true,
+    });
+    var outer_names = std.StringHashMap(void).init(a);
+    try outer_names.put("receiveException", {});
+    try m.registry.hierarchy_shadow_names.put("Outer", .{
+        .names = outer_names,
+        .complete = true,
+    });
+    try m.registry.enclosing_class.put("Outer$Inner", "Outer");
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setOwnerClass("Outer$Inner");
+    var enclosing = StringSet.init(a);
+    try enclosing.put("receiveException", {});
+    b.setEnclosingMembers(enclosing);
+    try b.bind("this", b.allocReg());
+
+    var seg = [_]ast.Ident{.{ .name = "receiveException", .span = dummySpan() }};
+    const e = Expr{ .Path = .{ .segments = &seg, .span = dummySpan() } };
+    const result = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = result });
+    const func = try b.finish("next", "Outer.Inner.next", build.typeString());
+
+    try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
+    const field = func.blocks[0].insts[0].LoadFromThisOrGlobal.name;
+    try testing.expectEqualStrings(
+        "$sgetter$Outer\u{1f}receiveException",
+        m.consts.items[field.int()].String,
+    );
 }
 
 test "super property in a lambda uses the enclosing this capture" {

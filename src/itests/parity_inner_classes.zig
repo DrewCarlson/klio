@@ -84,6 +84,24 @@ test "inner_class_captures_outer_this" {
     try assertKlio("inner_class", src, "outer=hello\n");
 }
 
+test "inner class reads outer private computed property" {
+    const src =
+        \\
+        \\open class Outer(private val cause: String?) {
+        \\    private val receiveException: String get() = cause ?: "closed"
+        \\    inner class Iterator {
+        \\        fun next(): String = receiveException
+        \\    }
+        \\}
+        \\class Derived : Outer(null)
+        \\fun main() {
+        \\    println(Derived().Iterator().next())
+        \\}
+        \\
+    ;
+    try assertKlio("inner_outer_private_getter", src, "closed\n");
+}
+
 test "this_at_label_in_inner_class" {
     const src =
         \\

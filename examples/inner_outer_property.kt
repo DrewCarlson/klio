@@ -25,6 +25,15 @@ class OuterSource(val source: Int) {
     fun derived() = Derived()
 }
 
+open class PrivateOuter(private val cause: String?) {
+    private val closeMessage: String get() = cause ?: "closed"
+    inner class Result {
+        fun message(): String = closeMessage
+    }
+}
+
+class PrivateDerived : PrivateOuter(null)
+
 class MyList<T> : AbstractMutableList<T>() {
     private val backing = ArrayList<T>()
     override val size: Int get() = backing.size
@@ -39,6 +48,7 @@ fun main() {
     println("viaAbstract=${v.viaAbstract()}")
     println("viaOpen=${v.viaOpen()}")
     println("superArg=${OuterSource(77).derived().value}")
+    println("privateOuter=${PrivateDerived().Result().message()}")
 
     val l = MyList<Int>()
     l.add(1); l.add(2); l.add(3)
