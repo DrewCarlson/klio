@@ -1259,7 +1259,11 @@ fn buildSkiaShimIos(
         "-miphoneos-version-min=15.0";
     const inc = b.fmt("-I{s}", .{base});
 
-    const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64" });
+    // KLIO_UIKIT enables the iOS on-screen backend (attach to an app CAMetalLayer,
+    // Ganesh-Metal). Offscreen raster + PNG still work alongside it; the app links
+    // Metal/QuartzCore/UIKit. The shim is still compiled Objective-C++ for the
+    // Metal/UIKit glue.
+    const c1 = b.addSystemCommand(&.{ "clang++", "-std=c++17", "-O2", "-DNDEBUG", "-fPIC", "-arch", "arm64", "-DKLIO_UIKIT", "-DKLIO_METAL" });
     c1.addArgs(&.{ min_flag, "-isysroot", sdk, "-x", "objective-c++", inc, "-c" });
     c1.addFileArg(b.path("src/compose_ui/skia_shim.cpp"));
     c1.addArg("-o");

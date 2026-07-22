@@ -2258,6 +2258,150 @@ void klio_win_close(KlioWindow* kw) {
 
 }  // extern "C"
 
+#elif defined(__APPLE__) && defined(KLIO_UIKIT)
+
+// iOS backend (compiled as Objective-C++). The OS owns the view and the run
+// loop, so the shim ATTACHES to an app-provided CAMetalLayer (from a UIView)
+// rather than creating a window, and the app's CADisplayLink drives frames by
+// calling the runtime's render entry, which calls klio_win_surface/present
+// here. Same Ganesh-Metal path as the macOS Cocoa+Metal backend.
+#import <UIKit/UIKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include <cstdio>
+#include "include/core/SkColorSpace.h"
+#include "include/gpu/GpuTypes.h"
+#include "include/gpu/ganesh/GrBackendSurface.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlBackendSurface.h"
+#include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlTypes.h"
+#include "include/gpu/ganesh/mtl/SkSurfaceMetal.h"
+#include "include/ports/SkCFObject.h"
+
+struct KlioWindow {
+    CAMetalLayer* metalLayer;
+    id<MTLDevice> device;
+    id<MTLCommandQueue> queue;
+    sk_sp<GrDirectContext> grContext;
+    GrMTLHandle drawable;   // this frame's CAMetalDrawable, held until present
+    CGFloat backingScale;   // points -> pixels
+    int w;
+    int h;
+    KlioSurface* surface;
+};
+
+extern "C" {
+
+// Attach to an app-provided CAMetalLayer. `w`/`h` are in points, `scale` is the
+// screen's contentsScale (UIScreen.scale). Brings up a Metal device + Ganesh
+// context rendering into the layer's drawables. Null on failure.
+KlioWindow* klio_win_attach(void* caMetalLayer, int w, int h, double scale) {
+    if (!caMetalLayer) return nullptr;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) return nullptr;
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue) { [device release]; return nullptr; }
+    CGFloat s = scale < 1.0 ? 1.0 : scale;
+    CAMetalLayer* layer = (__bridge CAMetalLayer*)caMetalLayer;
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = NO;
+    layer.contentsScale = s;
+    layer.drawableSize = CGSizeMake(w * s, h * s);
+    layer.opaque = YES;
+
+    GrMtlBackendContext backend = {};
+    backend.fDevice.retain((GrMTLHandle)(__bridge void*)device);
+    backend.fQueue.retain((GrMTLHandle)(__bridge void*)queue);
+    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend);
+    if (!ctx) { [queue release]; [device release]; return nullptr; }
+
+    KlioWindow* kw = new KlioWindow();
+    kw->metalLayer = [layer retain];
+    kw->device = device;
+    kw->queue = queue;
+    kw->grContext = ctx;
+    kw->drawable = nullptr;
+    kw->backingScale = s;
+    kw->w = w;
+    kw->h = h;
+    kw->surface = nullptr;
+    // The GPU surface never goes through klio_skia_new, so load the typeface
+    // here or text draws are silently skipped.
+    ensureFonts();
+    if (std::getenv("KLIO_SKIA_VERBOSE"))
+        fprintf(stderr, "[klio-skia] ios backend: Metal (GPU)\n");
+    return kw;
+}
+
+KlioSurface* klio_win_surface(KlioWindow* kw) {
+    if (!kw || !kw->grContext || !kw->metalLayer) return nullptr;
+    if (kw->surface) { klio_skia_free(kw->surface); kw->surface = nullptr; }
+    if (kw->drawable) { CFRelease(kw->drawable); kw->drawable = nullptr; }
+    id<CAMetalDrawable> d = [kw->metalLayer nextDrawable];
+    const int pw = static_cast<int>(kw->metalLayer.drawableSize.width);
+    const int ph = static_cast<int>(kw->metalLayer.drawableSize.height);
+    sk_sp<SkSurface> surf;
+    if (d && d.texture) {
+        GrMtlTextureInfo texInfo;
+        texInfo.fTexture.retain((GrMTLHandle)d.texture);
+        GrBackendRenderTarget backendRT = GrBackendRenderTargets::MakeMtl(pw, ph, texInfo);
+        surf = SkSurfaces::WrapBackendRenderTarget(
+            kw->grContext.get(), backendRT, kTopLeft_GrSurfaceOrigin,
+            kBGRA_8888_SkColorType, nullptr, nullptr);
+    }
+    if (!surf) return nullptr;
+    if (kw->backingScale != 1.0)
+        surf->getCanvas()->scale(kw->backingScale, kw->backingScale);
+    kw->drawable = (GrMTLHandle)CFRetain((CFTypeRef)d);
+    kw->surface = new KlioSurface();
+    kw->surface->surface = surf;
+    return kw->surface;
+}
+
+void klio_win_present(KlioWindow* kw) {
+    if (!kw || !kw->grContext || !kw->metalLayer) return;
+    if (!kw->surface || !kw->drawable) return;
+    kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+    @autoreleasepool {
+        id<CAMetalDrawable> d = (id<CAMetalDrawable>)kw->drawable;
+        id<MTLCommandBuffer> cmd = [kw->queue commandBuffer];
+        [cmd presentDrawable:d];
+        [cmd commit];
+    }
+    klio_skia_free(kw->surface);
+    kw->surface = nullptr;
+    CFRelease(kw->drawable);
+    kw->drawable = nullptr;
+}
+
+void klio_win_close(KlioWindow* kw) {
+    if (!kw) return;
+    if (kw->surface) klio_skia_free(kw->surface);
+    if (kw->drawable) { CFRelease(kw->drawable); kw->drawable = nullptr; }
+    kw->grContext.reset();
+    if (kw->metalLayer) { [kw->metalLayer release]; kw->metalLayer = nil; }
+    if (kw->queue) { [kw->queue release]; kw->queue = nil; }
+    if (kw->device) { [kw->device release]; kw->device = nil; }
+    delete kw;
+}
+
+// The OS owns the run loop on iOS: no shim-side window creation or event poll.
+// These satisfy the C ABI the interpreter resolves; input arrives via the app's
+// UITouch handling, not a poll.
+KlioWindow* klio_win_open(int, int, const char*) { return nullptr; }
+int klio_win_poll(void*, int, int*, int*) { return 0; }
+void klio_win_set_title(KlioWindow*, const char*) {}
+void klio_win_set_size(KlioWindow* kw, int w, int h) { if (kw) { kw->w = w; kw->h = h; } }
+void klio_win_set_icon_png(KlioWindow*, const unsigned char*, size_t) {}
+void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
+
+}  // extern "C"
+
 #else  // no windowing backend
 
 extern "C" {

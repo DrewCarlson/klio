@@ -272,15 +272,37 @@ renders a valid PNG on the simulator (`scripts/ios-ui-smoke.sh` asserts PNG_OK).
   compose/skia intrinsics) + the image's replayed `binding_fqns` wire the host
   side; the interpreter runs on the app main thread.
 
-Remaining P3 work (to regroup on), in order:
-4. **On-screen surface (P3b)**: `UIView`-owned `CAMetalLayer` + Ganesh-Metal
-   (reuse the macOS Metal bring-up + a `KLIO_UIKIT`/Metal backend in the shim), a
-   `klio_win_attach` extern, and invert the VM poll loop into a `CADisplayLink`
-   frame callback (the resize-callback trampoline is the template).
-5. **Touch (P3c)**: `UITouch` phases → multi-touch pointer events.
-6. **Productize** the hand-assembled `.app` into `klio bundle --target ios` (and
-   the `klio-mobile` dev-host push loop, P4) — now unblocked: bake-image +
-   run-image are the pieces; the app assembly in `ios-ui-smoke.sh` is the recipe.
+## P3b/P3c — on-screen surface + touch (option B: OS-driven, chosen)
+
+Design (locked): the **platform owns the frame loop and calls back into a
+resident VM to render each frame** — the resize-callback trampoline generalized
+to a per-frame callback. iOS is OS-driven (`CADisplayLink`); desktop converges to
+the same model (the shim's Cocoa/SDL loop becomes the frame source) so all
+platforms stay correct + optimal. Touch is folded in (multi-touch).
+
+Checkpoints:
+- **CP1 DONE — shim iOS Metal backend.** A `KLIO_UIKIT`+Metal `#elif` in
+  `skia_shim.cpp`: `klio_win_attach(caMetalLayer, w, h, scale)` attaches to an
+  app-provided `CAMetalLayer` (vs creating a window) and reuses the macOS
+  Ganesh-Metal surface/present. `buildSkiaShimIos` compiles it with
+  `-DKLIO_UIKIT -DKLIO_METAL`; offscreen raster + PNG still work alongside it.
+- **CP2 — VM persistence + frame entry.** For a UI program, `runApp {}` sets up
+  the composition (heap-resident, GC-rooted) + registers instead of blocking; the
+  run path keeps the `Vm` + arena alive after `main` returns; a new
+  `klio_render_frame` re-enters the resident VM to recompose + draw one frame.
+- **CP3 — Kotlin loop inversion.** Split `KlioWindow`'s blocking loop into
+  `setup()` + `renderFrame()` + `dispatchInput(events)`; `renderFrame` is what the
+  frame source calls. Desktop + iOS share this; only the frame *source* differs.
+- **CP4 — app shell frame source + surface.** `main.m` builds a `UIView` +
+  `CAMetalLayer`, hands it to the shim (via a runtime setter), and drives
+  `CADisplayLink` → `klio_render_frame`.
+- **CP5 — touch.** `UITouch` phases → an event queue the frame callback drains →
+  distinct `PointerId`s (widen the single-pointer event ABI).
+
+## P4 / productize (unblocked)
+
+`klio bundle --target ios` (assemble the `.app` — recipe is `ios-ui-smoke.sh`)
+and the `klio-mobile` dev-host push loop reuse `bake-image` + `run-image`.
 
 ## Phase map (initial)
 
