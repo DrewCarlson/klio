@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 extern int klio_run(int argc, const char *const *argv);
 
@@ -29,12 +30,33 @@ extern int klio_run(int argc, const char *const *argv);
     // Redirect HOME-derived writes (stdlib image cache, temp) to the app sandbox.
     setenv("HOME", [NSHomeDirectory() UTF8String], 1);
 
+    int rc;
+    // UI render path: a baked base image + a Compose scene ship as resources.
+    // Run the scene against the base (run-image) and render a PNG to the
+    // sandbox, proving the Compose -> Skia -> pixels pipeline on device.
+    NSString *base = [[NSBundle mainBundle] pathForResource:@"base" ofType:@"klio-image"];
+    NSString *scene = [[NSBundle mainBundle] pathForResource:@"scene" ofType:@"kt"];
+    if (base && scene) {
+        NSString *outPng = [NSTemporaryDirectory() stringByAppendingPathComponent:@"render.png"];
+        const char *argv[] = {"run-image", [base UTF8String], [scene UTF8String], [outPng UTF8String]};
+        fflush(stdout);
+        rc = klio_run(4, argv);
+        fflush(stdout);
+        fflush(stderr);
+        NSData *png = [NSData dataWithContentsOfFile:outPng];
+        BOOL ok = png.length >= 8 &&
+                  memcmp(png.bytes, "\x89PNG\r\n\x1a\n", 8) == 0;
+        NSLog(@"[klio-host] run-image rc=%d render %s bytes=%lu",
+              rc, ok ? "PNG_OK" : "PNG_MISSING", (unsigned long)png.length);
+        exit(rc);
+    }
+
     NSString *prog = [[NSBundle mainBundle] pathForResource:@"program" ofType:@"kt"];
     const char *path = prog ? [prog UTF8String] : "program.kt";
     const char *argv[] = {"run", path};
 
     fflush(stdout);
-    int rc = klio_run(2, argv);
+    rc = klio_run(2, argv);
     fflush(stdout);
     fflush(stderr);
     NSLog(@"[klio-host] klio_run exit=%d", rc);

@@ -33,6 +33,7 @@ const RequestedFeatures = pack_cache.RequestedFeatures;
 const stdlib_image = @import("stdlib_image.zig");
 const project = @import("project.zig");
 const macho_sign = @import("macho_sign.zig");
+const ir = @import("ir");
 
 /// Parsed `klio bundle` command line.
 pub const Options = struct {
@@ -75,6 +76,79 @@ const USAGE =
     \\                             and projected size without writing
     \\
 ;
+
+/// `klio bake-image <program> -o <out>`: bake the dependency base (the embedded
+/// stdlib plus the packs the program pulls in) to a standalone `.klio-image`
+/// file. A mobile app host ships this as a resource and loads it with
+/// `run-image`, so the heavy stdlib + pack lowering happens once at build time
+/// instead of on device. The program's own code is NOT baked in — it is run
+/// against the base by `run-image`, which is what makes a fast reload cycle
+/// possible (the base is stable; only the small program is re-pushed).
+pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
+    var scratch_map = SourceMap.init(gpa);
+    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
+        return commands.runCheck(gpa, paths, .Plain, requested);
+    };
+    var report = pack_cache.EmbeddedReport{};
+    var selection = pack_cache.Selection{};
+    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, requested, &report, &selection) orelse return 1;
+    const bb = stdlib_image.bundleBaseImage(gpa, &deps, &report, &selection) orelse {
+        io.writeStderr("error: the dependency base for this program cannot bake to an image\n");
+        return 1;
+    };
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = out_path, .data = bb.bytes }) catch {
+        io.printStderr(gpa, "error: cannot write {s}\n", .{out_path});
+        return 1;
+    };
+    io.printStdout(gpa, "wrote {s} ({d} bytes)\n", .{ out_path, bb.bytes.len });
+    return 0;
+}
+
+/// `klio run-image <base.klio-image> <program.kt> [args...]`: load a pre-baked
+/// dependency base from a file and run the program against it. The heavy
+/// stdlib + pack lowering is already in the base, so only the small program is
+/// parsed and lowered — the fast path a mobile host uses, and the hot-reload
+/// primitive (keep the base resident, re-extend a new program source). Mirrors
+/// the bundle base-image + program-src boot (see bundle_boot.bootRest).
+pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8, program_args: []const []const u8) u8 {
+    // The image buffer must outlive the base (decoded slices borrow it), so it
+    // is read into the process-lifetime allocator and never freed.
+    const bytes = blk: {
+        var threaded: std.Io.Threaded = .init(gpa, .{});
+        defer threaded.deinit();
+        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), base_path, gpa, .unlimited) catch {
+            io.printStderr(gpa, "error: cannot read base image {s}\n", .{base_path});
+            return 1;
+        };
+    };
+    const loaded = (image.load(gpa, bytes) catch null) orelse {
+        io.printStderr(gpa, "error: base image rejected ({s})\n", .{image.lastLoadFailure()});
+        return 1;
+    };
+    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+
+    const map = gpa.create(SourceMap) catch return 1;
+    map.* = SourceMap.init(gpa);
+    map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return 1;
+    const user = stdlib_image.parseUserFiles(gpa, map, paths, null) orelse {
+        io.writeStderr("error: program fails to parse\n");
+        return 1;
+    };
+    if (!interp_ir.build.canExtendBase(loaded.base, user.asts)) {
+        io.writeStderr("error: program cannot extend the base image (it redeclares a base name)\n");
+        return 1;
+    }
+    if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return 1;
+
+    var bindings = pack_cache.mergedHostBindings(gpa);
+    for (loaded.binding_fqns) |fqn| {
+        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
+    }
+    return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", program_args);
+}
 
 pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {
     var opts = Options{};

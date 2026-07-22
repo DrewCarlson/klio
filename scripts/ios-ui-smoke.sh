@@ -23,17 +23,24 @@ SDK="$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null || true)"
 [ -n "$SDK" ] || skip "iphonesimulator SDK not found"
 [ -f "$SKIA_OUT/libskia.a" ] || skip "iOS Skia not fetched (scripts/fetch-skia.sh iossim arm64)"
 
+SCENE="mobile/ios/AppHost/scene.kt"
+
+echo "==> build host klio for baking (separate prefix so zig-out stays iOS)"
+HOST_PREFIX="${IOS_HOST_PREFIX:-$(pwd)/zig-out/host}"
+zig build -Doptimize=ReleaseFast -p "$HOST_PREFIX"   # base image is target-portable
 echo "==> build interpreter lib + Skia shim for ios-sim"
 zig build mobile-lib skia-lib -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseFast
 LIB="$(pwd)/zig-out/lib/libklio-ios-sim.a"
 ZSTD="$(pwd)/zig-out/lib/libzstd.a"
 SHIM="$(pwd)/zig-out/lib/libklio_skia.a"
-for f in "$LIB" "$ZSTD" "$SHIM"; do [ -f "$f" ] || fail "expected $f"; done
+HOSTKLIO="$HOST_PREFIX/bin/klio"
+for f in "$LIB" "$ZSTD" "$SHIM" "$HOSTKLIO"; do [ -f "$f" ] || fail "expected $f"; done
 
-echo "==> assemble $APP"
+echo "==> assemble $APP (bake the compose base image + ship the scene)"
 rm -rf "$APP"; mkdir -p "$APP"
 cp mobile/ios/AppHost/Info.plist "$APP/Info.plist"
-cp "$FIXTURE" "$APP/program.kt"
+cp "$SCENE" "$APP/scene.kt"
+"$HOSTKLIO" bake-image "$SCENE" -o "$APP/base.klio-image" || fail "bake-image failed"
 
 echo "==> compile + link the app (interpreter + Skia)"
 xcrun -sdk iphonesimulator clang \
@@ -70,8 +77,8 @@ LOG="$OUT/launch.log"
 xcrun simctl launch --console-pty "$DEV" "$BUNDLE_ID" >"$LOG" 2>&1 || true
 echo "--- app console ---"; cat "$LOG"; echo "-------------------"
 
-MISS=0
-while IFS= read -r line; do
-  grep -Fq "$line" "$LOG" || { echo "missing: $line"; MISS=1; }
-done < "$EXPECTED"
-[ "$MISS" = 0 ] && echo "PASS ios-ui-smoke: UI-linked app runs (headless)" || fail "output mismatch (see $LOG)"
+if grep -Fq "PNG_OK" "$LOG"; then
+  echo "PASS ios-ui-smoke: Compose rendered a PNG on the simulator ($(grep -oE 'bytes=[0-9]+' "$LOG" | tail -1))"
+else
+  fail "no PNG_OK in the app log — Compose render did not produce a valid PNG (see $LOG)"
+fi

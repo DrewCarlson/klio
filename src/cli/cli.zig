@@ -60,6 +60,9 @@ const USAGE =
     \\  bundle <file|dir> [opts]   Package a program (with its baked
     \\                             dependencies, resources, and rendering
     \\                             backend) into one self-contained executable.
+    \\  bake-image <file> -o <p>   Bake the dependency base (stdlib + the
+    \\                             program's packs) to a standalone .klio-image.
+    \\  run-image <base> <file>    Run a program against a pre-baked base image.
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
@@ -152,10 +155,55 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         return runBakeCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "bundle")) {
         return bundle.runBundle(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "bake-image")) {
+        return runBakeImageCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "run-image")) {
+        return runRunImageCmd(gpa, rest);
     }
 
     printErr(gpa, "error: unknown command `{s}`\n\n{s}", .{ cmd, USAGE });
     return 2;
+}
+
+fn usageBakeImage(gpa: std.mem.Allocator) u8 {
+    printErr(gpa, "usage: klio bake-image <program.kt> -o <base.klio-image> [--feature <pack>/<feat>]\n", .{});
+    return 2;
+}
+
+fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    var out: ?[]const u8 = null;
+    var program: ?[]const u8 = null;
+    var feature_specs: std.ArrayList([]const u8) = .empty;
+    defer feature_specs.deinit(gpa);
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageBakeImage(gpa);
+            out = args[i];
+        } else if (std.mem.eql(u8, a, "--feature")) {
+            i += 1;
+            if (i >= args.len) return usageBakeImage(gpa);
+            feature_specs.append(gpa, args[i]) catch return 1;
+        } else if (program == null) {
+            program = a;
+        } else {
+            return usageBakeImage(gpa);
+        }
+    }
+    if (program == null or out == null) return usageBakeImage(gpa);
+    var requested = parseRequestedFeatures(gpa, feature_specs.items);
+    defer deinitRequestedFeatures(&requested);
+    return bundle.bakeImage(gpa, &.{program.?}, &requested, out.?);
+}
+
+fn runRunImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    if (args.len < 2) {
+        printErr(gpa, "usage: klio run-image <base.klio-image> <program.kt> [args...]\n", .{});
+        return 2;
+    }
+    return bundle.runImage(gpa, args[0], &.{args[1]}, args[2..]);
 }
 
 fn runLexCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {

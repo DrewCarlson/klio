@@ -254,17 +254,33 @@ passes headless).
    decl → emits no shim references → links and renders headless. This avoids the
    mach-o "weak import of an absent symbol" link error entirely.
 
+**Step 3 DONE — Compose renders offscreen inside the iOS app.** A Compose scene
+renders a valid PNG on the simulator (`scripts/ios-ui-smoke.sh` asserts PNG_OK).
+
+- **Base/program split, built for the fast reload cycle.** Two CLI commands
+  (src/cli/bundle.zig, wired in cli.zig): `klio bake-image <prog> -o <base>` bakes
+  the dependency base (stdlib + the program's pack closure) to a standalone
+  `.klio-image` via `bundleBaseImage`; `klio run-image <base> <prog> [args]` loads
+  the base and runs the program against it (`buildModuleFilesExtend`). The base is
+  target-portable (lowered IR, one FORMAT_VERSION), so it is baked once on the
+  host and shipped in the app. `run-image` is exactly the hot-reload primitive:
+  keep the base resident, re-extend a small program — the substrate P4 pushes.
+- **Compose on device.** The app ships the baked `base.klio-image` (compose
+  6-pack closure) + the scene source; `main.m` runs `run-image` and the scene's
+  `savePng` drives `__composeui_skiaRender` → the static shim → Skia offscreen
+  raster → a real PNG in the sandbox. `mergedHostBindings` (already carrying the
+  compose/skia intrinsics) + the image's replayed `binding_fqns` wire the host
+  side; the interpreter runs on the app main thread.
+
 Remaining P3 work (to regroup on), in order:
-3. **Compose packs on device**: running a Compose program needs the compose packs
-   available to the interpreter. The app sets `HOME` to the sandbox, so `~/.klio`
-   installed packs are not visible — the packs must be embedded/bundled into the
-   app (ties into `klio bundle --target ios`). Gate for an end-to-end
-   Compose→pixels render inside the app.
 4. **On-screen surface (P3b)**: `UIView`-owned `CAMetalLayer` + Ganesh-Metal
    (reuse the macOS Metal bring-up + a `KLIO_UIKIT`/Metal backend in the shim), a
    `klio_win_attach` extern, and invert the VM poll loop into a `CADisplayLink`
    frame callback (the resize-callback trampoline is the template).
 5. **Touch (P3c)**: `UITouch` phases → multi-touch pointer events.
+6. **Productize** the hand-assembled `.app` into `klio bundle --target ios` (and
+   the `klio-mobile` dev-host push loop, P4) — now unblocked: bake-image +
+   run-image are the pieces; the app assembly in `ios-ui-smoke.sh` is the recipe.
 
 ## Phase map (initial)
 
