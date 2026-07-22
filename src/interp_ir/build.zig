@@ -2108,16 +2108,15 @@ fn buildModuleWithOverrides(
         module.classes.items[cid.int()].is_object = module.classes.items[cid.int()].is_object or
             spanNamesObject(object_spans.items, c.span);
     }
-    // Member extensions participate in bare-call resolution from class and
-    // receiver-lambda bodies. Reserve their complete headers globally, after
-    // every class shell exists but before any method body lowers, so a helper
-    // declared later in the same class or in a base class has a stable target.
+    // Reserve complete member headers globally after every class shell exists
+    // but before any method body lowers. Forward references, inherited calls,
+    // and same-arity overloads then share stable declaration identities.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
-        try ir.lower.decl.reserveMemberExtensionHeaders(module, c, cfqn, cls_pkg);
+        try ir.lower.decl.reserveMemberHeaders(module, c, cfqn, cls_pkg);
     }
     // Register typealias → head tags BEFORE phase-2 body lowering so the
     // lambda-arity detection (`argFnArities`) resolves an aliased

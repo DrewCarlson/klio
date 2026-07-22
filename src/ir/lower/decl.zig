@@ -254,12 +254,11 @@ fn memberDeclKey(a: Allocator, owner: []const u8, f: *const ast.Function) Alloca
     });
 }
 
-/// Reserve concrete member-extension signatures before any class body lowers.
-/// Their calls need both the extension receiver and the enclosing dispatch
-/// receiver, so source-order fallback through an unresolved global cannot
-/// reproduce Kotlin resolution. Phase-two method lowering replaces each stub
-/// in place through its declaration span.
-pub fn reserveMemberExtensionHeaders(
+/// Reserve every member-function signature before any class body lowers.
+/// The declaration-span identity remains stable when the body replaces the
+/// stub, and the owner-scoped index retains the full overload set instead of
+/// collapsing same-name/same-arity declarations into one map entry.
+pub fn reserveMemberHeaders(
     module: *Module,
     c: *const ast.Class,
     class_fqn: []const u8,
@@ -270,18 +269,20 @@ pub fn reserveMemberExtensionHeaders(
     for (c.members) |*member| {
         if (member.* != .Function) continue;
         const f = &member.Function;
-        if (f.receiver_type == null or f.body == null) continue;
-        const decl_key = try memberDeclKey(a, c.name.name, f);
-        if (module.registry.member_method_fids.contains(decl_key)) {
-            a.free(decl_key);
+        if (module.funcByDeclSpan(f.name.span)) |id| {
+            try module.registerMemberDecl(a, class_fqn, f.name.name, id);
             continue;
         }
+        const decl_key = try memberDeclKey(a, c.name.name, f);
 
         const id = module.nextFuncId();
         const params = try a.alloc(Param, f.params.len + 1);
         params[0] = .{
             .name = "this",
-            .ty = try loweredTypeRef(a, &f.receiver_type.?, false),
+            .ty = if (f.receiver_type) |*rt|
+                try loweredTypeRef(a, rt, false)
+            else
+                .{ .name = c.name.name, .nullable = false, .args = &.{} },
             .default = null,
             .is_property = false,
             .is_vararg = false,
@@ -313,17 +314,22 @@ pub fn reserveMemberExtensionHeaders(
             .blocks = &.{},
             .entry = ir.BlockId.from(0),
             .is_suspend = f.is_suspend,
-            .kind = .member_extension,
+            .kind = if (f.receiver_type != null) .member_extension else .instance_method,
             .is_tailrec = f.is_tailrec,
             .has_receiver_param = true,
             .is_inline = f.is_inline,
             .low_priority = isLowPriorityOverload(f),
             .is_expect = f.is_expect,
+            .is_override = f.is_override,
+            .is_open = f.is_open,
+            .is_final = f.is_final,
         });
-        try module.func_index.append(a, .{ .name = f.name.name, .id = id });
-        try funcNameIndexPush(module, f.name.name, id);
+        if (f.receiver_type != null) {
+            try module.func_index.append(a, .{ .name = f.name.name, .id = id });
+            try funcNameIndexPush(module, f.name.name, id);
+        }
         try module.recordFuncDeclSpan(a, f.name.span, id);
-        try module.registry.member_ext_owner_class.put(id, c.name.name);
+        if (f.receiver_type != null) try module.registry.member_ext_owner_class.put(id, c.name.name);
         try registerFuncTypeParams(module, f, id);
 
         var has_vararg = false;
@@ -344,17 +350,18 @@ pub fn reserveMemberExtensionHeaders(
         try module.decl_user_sig.put(id.int(), sig);
         try module.decl_sigs.put(id.int(), .{
             .enclosing_class = owner_id,
-            .receiver_ty = try loweredTypeRef(a, &f.receiver_type.?, true),
+            .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
             .arity = arity,
             .sig = sig,
-            .kind = .member_extension,
+            .kind = if (f.receiver_type != null) .member_extension else .instance_method,
             .is_inline = f.is_inline,
             .is_suspend = f.is_suspend,
-            .has_body = true,
+            .has_body = f.body != null,
         });
         try module.decl_span.put(id.int(), f.span);
-        try module.decl_ast_body.put(id.int(), {});
+        if (f.body != null) try module.decl_ast_body.put(id.int(), {});
         try module.registry.member_method_fids.put(decl_key, id);
+        try module.registerMemberDecl(a, class_fqn, f.name.name, id);
 
         const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
         const gop = try module.registry.member_method_fids.getOrPut(key);
@@ -364,6 +371,17 @@ pub fn reserveMemberExtensionHeaders(
             gop.value_ptr.* = id;
         }
     }
+}
+
+/// Compatibility entry point for callers that only need the earlier
+/// member-extension reservation behavior. All member headers are now reserved.
+pub fn reserveMemberExtensionHeaders(
+    module: *Module,
+    c: *const ast.Class,
+    class_fqn: []const u8,
+    class_pkg: []const u8,
+) Allocator.Error!void {
+    return reserveMemberHeaders(module, c, class_fqn, class_pkg);
 }
 
 /// Names captured by the anonymous object whose method is being lowered
@@ -1095,9 +1113,7 @@ pub fn lowerMethodWithPrivate(
         // receiver via the qualified-this walk, and the ref lowering
         // keys that on the owner-class name.
         const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null, null);
-        const decl_key = try memberDeclKey(a, owner_class, f);
-        defer a.free(decl_key);
-        const reserved_id = module.registry.member_method_fids.get(decl_key);
+        const reserved_id = module.funcByDeclSpan(f.name.span);
         const id = reserved_id orelse module.nextFuncId();
         var placed = func;
         placed.id = id;
@@ -1136,13 +1152,21 @@ pub fn lowerMethodWithPrivate(
         private_method_fids,
         own_member_arity,
     );
-    const id = module.nextFuncId();
+    const reserved_id = module.funcByDeclSpan(f.name.span);
+    const id = reserved_id orelse module.nextFuncId();
     var placed = func;
     placed.id = id;
-    try module.recordFuncDeclSpan(a, f.name.span, id);
     placed.kind = .instance_method;
-    try module.funcs.append(a, placed);
-    try registerFuncTypeParams(module, f, id);
+    if (reserved_id) |_| {
+        const stub = module.funcById(id).?;
+        placed.fqn = stub.fqn;
+        placed.package = stub.package;
+        module.funcByIdMut(id).?.* = placed;
+    } else {
+        try module.recordFuncDeclSpan(a, f.name.span, id);
+        try module.funcs.append(a, placed);
+        try registerFuncTypeParams(module, f, id);
+    }
     try recordMethodParamDefaults(module, f, id, owner_class, own_members);
     return placed;
 }
@@ -1703,7 +1727,7 @@ test "resolveAnnotationNames yields fqn candidates from imports" {
     try expectContains(got, "kotlin.test.AfterTest");
 }
 
-test "member extension headers are reserved before their bodies" {
+test "member headers reserve stable ids and preserve same-arity overloads" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1743,7 +1767,49 @@ test "member extension headers are reserved before their bodies" {
         .annotations = &.{},
         .span = sp,
     };
-    var members = [_]ast.Decl{.{ .Function = helper }};
+    const sp_int = ast.Span{ .file = ir.FileId.from(0), .start = 30, .end = 40 };
+    const sp_string = ast.Span{ .file = ir.FileId.from(0), .start = 50, .end = 60 };
+    var int_ty = scope_ty;
+    int_ty.name = .{ .name = "Int", .span = sp_int };
+    int_ty.span = sp_int;
+    var string_ty = scope_ty;
+    string_ty.name = .{ .name = "String", .span = sp_string };
+    string_ty.span = sp_string;
+    var int_params = [_]ast.Param{.{
+        .name = .{ .name = "value", .span = sp_int },
+        .ty = int_ty,
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = sp_int,
+    }};
+    var string_params = [_]ast.Param{.{
+        .name = .{ .name = "value", .span = sp_string },
+        .ty = string_ty,
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = sp_string,
+    }};
+    var int_overload = helper;
+    int_overload.name.span = sp_int;
+    int_overload.receiver_type = null;
+    int_overload.params = &int_params;
+    int_overload.span = sp_int;
+    var string_overload = helper;
+    string_overload.name.span = sp_string;
+    string_overload.receiver_type = null;
+    string_overload.params = &string_params;
+    string_overload.span = sp_string;
+    var members = [_]ast.Decl{
+        .{ .Function = helper },
+        .{ .Function = int_overload },
+        .{ .Function = string_overload },
+    };
     const cls: ast.Class = .{
         .name = .{ .name = "Host", .span = sp },
         .type_params = &.{},
@@ -1776,7 +1842,7 @@ test "member extension headers are reserved before their bodies" {
         .span = sp,
     };
     const owner = try m.reserveClassFqn(a, "Host", "sample.Host", "sample", false);
-    try reserveMemberExtensionHeaders(&m, &cls, "sample.Host", "sample");
+    try reserveMemberHeaders(&m, &cls, "sample.Host", "sample");
 
     const id = m.funcByDeclSpan(sp).?;
     const f = m.funcById(id).?;
@@ -1786,6 +1852,12 @@ test "member extension headers are reserved before their bodies" {
     try std.testing.expectEqual(owner, m.decl_sigs.get(id.int()).?.enclosing_class.?);
     try std.testing.expectEqualStrings("Host", m.registry.member_ext_owner_class.get(id).?);
     try std.testing.expectEqual(@as(usize, 1), m.funcsBySimpleName("helper").len);
+    const overloads = m.memberDecls("sample.Host", "helper");
+    try std.testing.expectEqual(@as(usize, 3), overloads.len);
+    try std.testing.expectEqual(ir.FuncKind.instance_method, m.funcById(overloads[1]).?.kind);
+    try std.testing.expectEqual(ir.FuncKind.instance_method, m.funcById(overloads[2]).?.kind);
+    try std.testing.expectEqualStrings("Int", m.funcById(overloads[1]).?.params[1].ty.name);
+    try std.testing.expectEqualStrings("String", m.funcById(overloads[2]).?.params[1].ty.name);
 }
 
 fn expectContains(haystack: []const []const u8, needle: []const u8) !void {

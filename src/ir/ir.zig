@@ -1343,6 +1343,14 @@ pub const Module = struct {
     /// split `decl_user_*` tables never covered). Lowering-only; not
     /// serialized.
     decl_sigs: std.AutoHashMap(u32, DeclSig),
+    /// Complete owner-scoped member overload sets. The key is
+    /// `(declaring-class FQN, source name)` and the value retains every
+    /// declaration in source order, including same-arity overloads. Member
+    /// headers populate this before any body lowers; image-loaded modules
+    /// rebuild it from their declaration records. This is the authoritative
+    /// candidate source for member resolution; `member_method_fids` remains
+    /// only as a compatibility index for older lowering helpers.
+    member_name_index: StrPairMap(std.ArrayList(FuncId)),
     /// Lowering-time resolution diagnostics: ambiguous bare calls the
     /// symbol index refused to pick among. Recorded during lowering and
     /// surfaced by the build driver before the program runs. The name
@@ -1478,6 +1486,7 @@ pub const Module = struct {
             .decl_span = std.AutoHashMap(u32, Span).init(allocator),
             .decl_ast_body = std.AutoHashMap(u32, void).init(allocator),
             .decl_sigs = std.AutoHashMap(u32, DeclSig).init(allocator),
+            .member_name_index = StrPairMap(std.ArrayList(FuncId)).init(allocator),
         };
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
@@ -1564,6 +1573,48 @@ pub const Module = struct {
         return FuncId.from(@intCast(self.func_header_offsets.len + self.funcs.items.len));
     }
 
+    /// Add one declaration to its owner-scoped overload set. Re-registering
+    /// the same declaration is harmless: header reservation and body
+    /// placement both pass through this API while preserving one stable id.
+    pub fn registerMemberDecl(
+        self: *Module,
+        allocator: Allocator,
+        owner_fqn: []const u8,
+        name: []const u8,
+        id: FuncId,
+    ) Allocator.Error!void {
+        const gop = try self.member_name_index.getOrPut(.{ .a = owner_fqn, .b = name });
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (gop.value_ptr.items) |existing| {
+            if (existing.int() == id.int()) return;
+        }
+        try gop.value_ptr.append(allocator, id);
+    }
+
+    /// Every member declaration named `name` directly owned by `owner_fqn`,
+    /// in declaration order. An empty slice means the class declares none.
+    pub fn memberDecls(self: *const Module, owner_fqn: []const u8, name: []const u8) []const FuncId {
+        const list = self.member_name_index.get(.{ .a = owner_fqn, .b = name }) orelse return &.{};
+        return list.items;
+    }
+
+    /// Reconstruct the owner-scoped index from serialized declaration records.
+    /// Pack images do not serialize this derived table; loading calls this
+    /// once after functions, classes, and declaration signatures are available.
+    pub fn rebuildMemberNameIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
+        var old_it = self.member_name_index.valueIterator();
+        while (old_it.next()) |list| list.deinit(allocator);
+        self.member_name_index.clearRetainingCapacity();
+        var sig_it = self.decl_sigs.iterator();
+        while (sig_it.next()) |entry| {
+            const owner = entry.value_ptr.enclosing_class orelse continue;
+            if (owner.int() >= self.classes.items.len) continue;
+            const fid = FuncId.from(entry.key_ptr.*);
+            const f = self.funcById(fid) orelse continue;
+            try self.registerMemberDecl(allocator, self.classes.items[owner.int()].fqn, f.name, fid);
+        }
+    }
+
     /// Number of functions addressable by id (eager table length, or the lazy
     /// offset-table length when loaded from an image).
     pub fn funcCount(self: *const Module) usize {
@@ -1625,6 +1676,11 @@ pub const Module = struct {
         self.decl_span.deinit();
         self.decl_ast_body.deinit();
         self.decl_sigs.deinit();
+        {
+            var member_it = self.member_name_index.valueIterator();
+            while (member_it.next()) |list| list.deinit(allocator);
+            self.member_name_index.deinit();
+        }
         self.resolve_diags.deinit(allocator);
         if (self.pending_lambda_nonfn_locals) |*names| names.deinit();
         if (self.pending_lambda_local_decl_types) |*locals| {
@@ -1701,6 +1757,14 @@ pub const Module = struct {
         {
             var it = self.decl_sigs.iterator();
             while (it.next()) |e| try out.decl_sigs.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.member_name_index.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(FuncId) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.member_name_index.put(e.key_ptr.*, list);
+            }
         }
         try out.resolve_diags.appendSlice(a, self.resolve_diags.items);
         return out;
