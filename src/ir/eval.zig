@@ -3862,11 +3862,26 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
         try frame.write(bo.dst, .{ .Bool = b });
         return .cont;
     }
-    // COROUTINE_SUSPENDED and Result have no user `equals`
-    // surface: any equality against them is structural /
-    // identity, never a `call_member("equals")` dispatch.
+    // Result wrappers have no user `equals` surface of their own, but their
+    // payload equality still follows Kotlin `==`. This matters for value-class
+    // wrappers such as ChannelResult, whose closed holder defines `equals`.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
-        (l == .CoroutineSuspended or r == .CoroutineSuspended or l == .Result or r == .Result))
+        (l == .Result or r == .Result))
+    {
+        const eq = if (l == .Result and r == .Result and l.Result.ok == r.Result.ok)
+            if (comptime @hasDecl(H, "deepValueEquals"))
+                try host.deepValueEquals(allocator, l.Result.payload.asPtr(), r.Result.payload.asPtr())
+            else
+                Value.structuralEq(l.Result.payload.asPtr(), r.Result.payload.asPtr())
+        else
+            false;
+        const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
+        try frame.write(bo.dst, .{ .Bool = b });
+        return .cont;
+    }
+    // The suspension marker has identity-only equality and no member surface.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        (l == .CoroutineSuspended or r == .CoroutineSuspended))
     {
         const eq = Value.structuralEq(&l, &r);
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;

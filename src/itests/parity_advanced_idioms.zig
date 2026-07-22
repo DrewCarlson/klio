@@ -52,6 +52,27 @@ test "data_class_equality_and_copy" {
     try assertKlio("data_eq_copy", src, "true,false,1,y\n");
 }
 
+test "result equality dispatches payload equals" {
+    const src =
+        \\
+        \\class Token(val value: Int) {
+        \\    override fun equals(other: Any?): Boolean =
+        \\        other is Token && value == other.value
+        \\}
+        \\@JvmInline value class WrappedToken(val token: Token)
+        \\fun main() {
+        \\    val first = Result.success(Token(7))
+        \\    val same = Result.success(Token(7))
+        \\    val different = Result.success(Token(8))
+        \\    val wrapped = WrappedToken(Token(7))
+        \\    println("${first == same},${first == different}," +
+        \\        "${wrapped == WrappedToken(Token(7))},${wrapped == WrappedToken(Token(8))}")
+        \\}
+        \\
+    ;
+    try assertKlio("result_payload_equality", src, "true,false,true,false\n");
+}
+
 test "lateinit_var_with_is_initialized" {
     const alt =
         \\

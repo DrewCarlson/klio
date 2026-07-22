@@ -7449,6 +7449,28 @@ fn classHasUserMethod(self: *VmHost, allocator: Allocator, start: []const u8, mn
     return false;
 }
 
+fn dataValueInstanceEquals(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), other: *const Value) Allocator.Error!bool {
+    if (other.* != .Instance) return false;
+    const rhs = other.Instance;
+    const lg = inst.borrow();
+    const lcg = lg.get().class.borrow();
+    const rg = rhs.borrow();
+    const rcg = rg.get().class.borrow();
+    defer {
+        rcg.deinit();
+        rg.deinit();
+        lcg.deinit();
+        lg.deinit();
+    }
+    if (!std.mem.eql(u8, lcg.get().fqn, rcg.get().fqn)) return false;
+    for (lcg.get().primary_params) |p| {
+        const left = lg.get().get(p.name) orelse Value.Null;
+        const right = rg.get().get(p.name) orelse Value.Null;
+        if (!try deepValueEquals(self, allocator, &left, &right)) return false;
+    }
+    return true;
+}
+
 fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var is_data = false;
@@ -7540,38 +7562,7 @@ fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
         }
     }
     if ((is_data or is_value) and !has_user_override and args.len == 1 and std.mem.eql(u8, name, "equals")) {
-        var class_fqn: []const u8 = undefined;
-        {
-            const g = inst.borrow();
-            const cg = g.get().class.borrow();
-            class_fqn = cg.get().fqn;
-            cg.deinit();
-            g.deinit();
-        }
-        const same = args[0] == .Instance and blk: {
-            const og = args[0].Instance.borrow();
-            const ocg = og.get().class.borrow();
-            const r = std.mem.eql(u8, ocg.get().fqn, class_fqn);
-            ocg.deinit();
-            og.deinit();
-            break :blk r;
-        };
-        if (!same) return .{ .ok = boolVal(false) };
-        const o = args[0].Instance;
-        const lg = inst.borrow();
-        const lcg = lg.get().class.borrow();
-        const rg = o.borrow();
-        defer {
-            rg.deinit();
-            lcg.deinit();
-            lg.deinit();
-        }
-        for (lcg.get().primary_params) |p| {
-            const a = lg.get().get(p.name) orelse Value.Null;
-            const b = rg.get().get(p.name) orelse Value.Null;
-            if (!Value.structuralEq(&a, &b)) return .{ .ok = boolVal(false) };
-        }
-        return .{ .ok = boolVal(true) };
+        return .{ .ok = boolVal(try dataValueInstanceEquals(self, allocator, inst, &args[0])) };
     }
     return null;
 }
@@ -8714,7 +8705,6 @@ fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Val
 }
 
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    _ = self;
     const inst = receiver.Instance;
     if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
         const g = inst.borrow();
@@ -8776,7 +8766,7 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             cg.deinit();
             g.deinit();
             if (structural) {
-                return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
+                return .{ .ok = boolVal(try dataValueInstanceEquals(self, allocator, inst, &args[0])) };
             }
         }
         if (args[0] == .Instance) {
