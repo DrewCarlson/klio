@@ -10195,23 +10195,31 @@ fn lowerResolvedMemberCall(
     });
     const func_id = resolved.target orelse return null;
     if (resolved.dispatch == .deferred) return null;
+    const target = b.module.funcById(func_id) orelse return null;
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Value classes, unresolved shells, and declarations in the
         // host-backed Kotlin runtime use specialized value ABIs. Those
         // declarations gain numeric slots after the symbol manifest records
         // their representation explicitly; ordinary user/library classes are
-        // already guaranteed to use `Value.Instance`. Interface SAM values use
-        // the same slot but need a declaration-order named-argument binder.
+        // already guaranteed to use `Value.Instance`. Fully supplied named
+        // interface calls carry a numeric parameter map; defaulted/vararg
+        // interface forms remain on the compatibility path for now.
         var has_named = false;
         for (ast_arg_names) |arg_name| if (arg_name != null) {
             has_named = true;
             break;
         };
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and has_named) or
+        var interface_named_supported = !has_named or target.params.len == args.len + 1;
+        if (interface_named_supported) {
+            for (target.params[1..]) |param| if (param.is_vararg) {
+                interface_named_supported = false;
+                break;
+            };
+        }
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or (owner.is_interface and !interface_named_supported) or
             std.mem.eql(u8, owner.package, "kotlin") or std.mem.startsWith(u8, owner.package, "kotlin.")) return null;
     }
-    const target = b.module.funcById(func_id) orelse return null;
 
     recordLambdaArgReceivers(b, target, args, ast_arg_names, 1);
     const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
