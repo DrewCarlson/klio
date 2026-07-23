@@ -26,7 +26,13 @@ reconcile_sparse_submodule() {
     shift 4
     local want=("$@")
 
-    if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # An unpopulated submodule placeholder is an empty dir with no `.git` of its
+    # own, so `git -C "$path" ...` walks up to the PARENT repo and every query
+    # answers about it — `rev-parse --is-inside-work-tree` says true, and the
+    # widen path below then runs `git checkout <ref>` against the parent, which
+    # tries to fetch the submodule's tag from the parent's remote and hangs.
+    # Require the submodule to have its own gitdir before treating it as present.
+    if [ -e "$path/.git" ] && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         # Existing checkout: reconcile its sparse set to `want`.
         local current desired
         current="$(git -C "$path" sparse-checkout list 2>/dev/null | LC_ALL=C sort)"
