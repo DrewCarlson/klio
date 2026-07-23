@@ -2415,6 +2415,7 @@ void klio_win_set_resize_cb(KlioWindow*, void (*)(void*, int, int), void*) {}
 #include <android/native_window.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
+#include <time.h>
 #include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/GrTypes.h"
@@ -2438,6 +2439,20 @@ struct KlioWindow {
 };
 
 extern "C" {
+
+// Frame-time perf split for the native host: monotonic timestamps captured at
+// the shim boundaries. renderWindowFrame runs recompose+layout, then calls
+// klio_win_surface, then records the draw, then klio_win_present (flush+swap).
+// So surface-frameStart = recompose+layout, present-surface = draw, and
+// klio_perf_swap_ns = the eglSwapBuffers wait.
+long klio_perf_surface_ns = 0;
+long klio_perf_present_ns = 0;
+long klio_perf_swap_ns = 0;
+static long klio_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
 
 // Attach to an ANativeWindow. `w`/`h` are in points, `scale` the display density.
 KlioWindow* klio_win_attach(void* nativeWindow, int w, int h, double scale) {
@@ -2495,6 +2510,7 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
     // Idempotent within a frame: acquire once, clear + draw into it, then present
     // (which frees it). Wrap the window's default framebuffer (FBO 0).
     if (kw->surface) return kw->surface;
+    klio_perf_surface_ns = klio_now_ns();
     EGLint pw = 0, ph = 0;
     eglQuerySurface(kw->display, kw->eglSurface, EGL_WIDTH, &pw);
     eglQuerySurface(kw->display, kw->eglSurface, EGL_HEIGHT, &ph);
@@ -2516,8 +2532,11 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
 
 void klio_win_present(KlioWindow* kw) {
     if (!kw || !kw->grContext || !kw->surface) return;
+    klio_perf_present_ns = klio_now_ns();
     kw->grContext->flushAndSubmit(kw->surface->surface.get(), GrSyncCpu::kNo);
+    long swap0 = klio_now_ns();
     eglSwapBuffers(kw->display, kw->eglSurface);
+    klio_perf_swap_ns = klio_now_ns() - swap0;
     klio_skia_free(kw->surface);
     kw->surface = nullptr;
 }

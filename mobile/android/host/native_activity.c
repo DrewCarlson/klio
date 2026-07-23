@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 extern int klio_run(int argc, const char *const *argv);
@@ -49,10 +50,44 @@ static int g_started = 0;
 static int g_selftest = 0;
 static unsigned long g_frames = 0;
 
+static long now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
+
+// Shim-recorded boundary timestamps (src/compose_ui/skia_shim.cpp), used to split
+// the frame into recompose+layout / draw / swap.
+extern long klio_perf_surface_ns, klio_perf_present_ns, klio_perf_swap_ns;
+
+// Rolling per-60-frame timing: render = time inside klio_render_frame (VM
+// recompose + draw + eglSwapBuffers); gap = wall time between frame callbacks;
+// compose/draw/swap = the shim-boundary split of render.
+static long g_render_ns = 0, g_gap_ns = 0, g_last_cb_ns = 0;
+static long g_compose_ns = 0, g_draw_ns = 0, g_swap_ns = 0;
+static long g_input_ns = 0, g_input_count = 0;   // input-callback cost per 60 frames
+
 static void onFrame(long frameTimeNanos, void *data) {
     (void)frameTimeNanos; (void)data;
+    long t0 = now_ns();
+    if (g_last_cb_ns) g_gap_ns += t0 - g_last_cb_ns;
+    g_last_cb_ns = t0;
     klio_render_frame();
-    if (++g_frames % 60 == 0) LOG("frames=%lu", g_frames);
+    g_render_ns += now_ns() - t0;
+    if (klio_perf_surface_ns > t0) {           // a window drew this frame
+        g_compose_ns += klio_perf_surface_ns - t0;
+        g_draw_ns += klio_perf_present_ns - klio_perf_surface_ns;
+        g_swap_ns += klio_perf_swap_ns;
+    }
+    if (++g_frames % 60 == 0) {
+        LOG("frames=%lu render=%.1fms (compose=%.1f draw=%.1f swap=%.1f) gap=%.1fms (%.0ffps) input=%.1fms/%ldev",
+            g_frames, g_render_ns / 60.0 / 1e6,
+            g_compose_ns / 60.0 / 1e6, g_draw_ns / 60.0 / 1e6, g_swap_ns / 60.0 / 1e6,
+            g_gap_ns / 60.0 / 1e6, g_gap_ns > 0 ? 60.0 * 1e9 / (double)g_gap_ns : 0.0,
+            g_input_ns / 60.0 / 1e6, g_input_count);
+        g_render_ns = g_gap_ns = g_compose_ns = g_draw_ns = g_swap_ns = 0;
+        g_input_ns = g_input_count = 0;
+    }
     // Headless input self-test (`adb shell setprop debug.klio.selftest 1`): the
     // emulator screenshot path has no gesture injection into a NativeActivity
     // surface, so synthesize input once the UI is running — a scroll slides the
@@ -143,7 +178,7 @@ static void onCmd(struct android_app *app, int32_t cmd) {
 // delta so a notch slides content a comfortable amount (matches the iOS pan feel).
 #define SCROLL_STEP_PX 60.0f
 
-static int32_t onInput(struct android_app *app, AInputEvent *event) {
+static int32_t onInputImpl(struct android_app *app, AInputEvent *event) {
     (void)app;
     int type = AInputEvent_getType(event);
 
@@ -198,6 +233,14 @@ static int32_t onInput(struct android_app *app, AInputEvent *event) {
               : 3;
     klio_dispatch_touches(n, ids, xs, ys, downs, phase);
     return 1;
+}
+
+static int32_t onInput(struct android_app *app, AInputEvent *event) {
+    long i0 = now_ns();
+    int32_t r = onInputImpl(app, event);
+    g_input_ns += now_ns() - i0;
+    g_input_count++;
+    return r;
 }
 
 void android_main(struct android_app *app) {
