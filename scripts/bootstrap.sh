@@ -92,10 +92,11 @@ git submodule update --init --recursive
 note "done"
 
 # --- 3. sparse upstream checkouts ------------------------------------------
-step "sparse upstream sources (kotlin stdlib, compose, androidx.collection)"
+step "sparse upstream sources (kotlin stdlib, compose, androidx.collection, mosaic)"
 ./scripts/init-kotlin-submodule.sh
 ./scripts/init-compose-submodule.sh
 ./scripts/init-androidx-collection-submodule.sh
+./scripts/init-mosaic-submodule.sh
 
 # --- 4. skia prebuilt (Compose-UI backend) ---------------------------------
 if [ "$DO_SKIA" -eq 1 ]; then
