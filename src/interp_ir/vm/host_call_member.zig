@@ -6218,6 +6218,11 @@ fn compareValuesBuiltin(a: *const Value, b: *const Value) ?Ordering {
         const y = floatOf(b) orelse return null;
         return kotlinFloatTotalCmp(x, y);
     }
+    if (a.isUnsigned() and b.isUnsigned()) {
+        const x = a.asU64() orelse return null;
+        const y = b.asU64() orelse return null;
+        return if (x < y) .lt else if (x > y) .gt else .eq;
+    }
     const x = a.asI64() orelse (if (a.* == .Char) @as(i64, a.Char) else return null);
     const y = b.asI64() orelse (if (b.* == .Char) @as(i64, b.Char) else return null);
     return if (x < y) .lt else if (x > y) .gt else .eq;

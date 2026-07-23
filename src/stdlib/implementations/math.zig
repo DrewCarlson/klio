@@ -967,6 +967,9 @@ fn kotlin_float_total_cmp(a: f64, b: f64) std.math.Order {
 fn compare_values(ctx: *CallCtx, a: *const Value, b: *const Value) std.mem.Allocator.Error!OrderResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
+            if (a.isUnsigned() and b.isUnsigned()) {
+                return .{ .ok = std.math.order(a.asU64().?, b.asU64().?) };
+            }
             return .{ .ok = std.math.order(a.asI64().?, b.asI64().?) };
         }
         return .{ .ok = kotlin_float_total_cmp(a.asF64().?, b.asF64().?) };
@@ -1211,6 +1214,20 @@ test "pow for double and float" {
     const r2 = try float_pow(&c2);
     try testing.expect(r2.ok == .Float);
     try testing.expectApproxEqAbs(@as(f32, 9.0), r2.ok.Float, 1e-5);
+}
+
+test "natural ordering compares unsigned magnitudes" {
+    var h = NoopHost.init(testing.allocator);
+    defer h.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    var ctx = makeCtx(&.{}, &h, &cap);
+    const max = Value{ .ULong = std.math.maxInt(u64) };
+    const zero = Value{ .ULong = 0 };
+    const result = try compare_values(&ctx, &max, &zero);
+    try testing.expect(result == .ok);
+    try testing.expectEqual(std.math.Order.gt, result.ok);
 }
 
 test "sign preserves signed and NaN zero" {

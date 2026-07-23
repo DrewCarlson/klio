@@ -8113,4 +8113,10 @@ test "compare values natural order" {
     const a = arena.allocator();
     const r = try compare_values(a, Value.newInt(1), Value.newInt(2));
     try testing.expect(r == .order and r.order == .lt);
+    const unsigned = try compare_values(
+        a,
+        .{ .ULong = std.math.maxInt(u64) },
+        .{ .ULong = 0 },
+    );
+    try testing.expect(unsigned == .order and unsigned.order == .gt);
 }

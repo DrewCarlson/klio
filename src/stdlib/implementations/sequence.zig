@@ -1501,6 +1501,9 @@ const CmpResult = union(enum) {
 fn compareValues(a: *const Value, b: *const Value) CmpResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
+            if (a.isUnsigned() and b.isUnsigned()) {
+                return .{ .order = std.math.order(a.asU64().?, b.asU64().?) };
+            }
             return .{ .order = std.math.order(a.asI64().?, b.asI64().?) };
         }
         return .{ .order = kotlinFloatTotalCmp(a.asF64().?, b.asF64().?) };
@@ -1924,4 +1927,12 @@ test "compare_utf16 orders bmp and supplementary chars" {
     try testing.expectEqual(std.math.Order.gt, compareUtf16("abd", "abc"));
     try testing.expectEqual(std.math.Order.lt, compareUtf16("", "a"));
     try testing.expectEqual(std.math.Order.lt, compareUtf16("hello", "hello!"));
+}
+
+test "sequence natural order compares unsigned magnitudes" {
+    const max = Value{ .ULong = std.math.maxInt(u64) };
+    const zero = Value{ .ULong = 0 };
+    const result = compareValues(&max, &zero);
+    try testing.expect(result == .order);
+    try testing.expectEqual(std.math.Order.gt, result.order);
 }

@@ -540,6 +540,13 @@ test "generic_factory_return_extension" {
     );
 }
 
+test "unsigned_array_sort_descending_range" {
+    try check("unsigned_array_sort_descending_range",
+        \\OK
+        \\
+    );
+}
+
 test "sequence_argument_extension_overload" {
     try check("sequence_argument_extension_overload",
         \\[1, 0, 1, 1, 2]

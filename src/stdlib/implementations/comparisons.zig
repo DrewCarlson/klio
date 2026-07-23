@@ -40,6 +40,9 @@ fn kotlinFloatTotalCmp(a: f64, b: f64) std.math.Order {
 fn compareValues(a: *const Value, b: *const Value) CmpResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
+            if (a.isUnsigned() and b.isUnsigned()) {
+                return .{ .ord = std.math.order(a.asU64().?, b.asU64().?) };
+            }
             return .{ .ord = std.math.order(a.asI64().?, b.asI64().?) };
         }
         return .{ .ord = kotlinFloatTotalCmp(a.asF64().?, b.asF64().?) };
@@ -313,6 +316,13 @@ test "compareValues orders numerics" {
     try testing.expectEqual(@as(i32, 0), r.ok.Int);
 
     ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Long = 9 }, .{ .Int = 2 } });
+    r = try cmp_compare_values(&ctx);
+    try testing.expectEqual(@as(i32, 1), r.ok.Int);
+
+    ctx = makeCtx(h.host(), cap.output(), &.{
+        .{ .ULong = std.math.maxInt(u64) },
+        .{ .ULong = 0 },
+    });
     r = try cmp_compare_values(&ctx);
     try testing.expectEqual(@as(i32, 1), r.ok.Int);
 }
