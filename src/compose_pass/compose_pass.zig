@@ -348,6 +348,12 @@ fn isComposableFnType(t: *const ast.TypeRef) bool {
     return t.function != null and isComposable(t.annotations);
 }
 
+fn lambdaHasComposerParams(lam: anytype) bool {
+    if (lam.params.len < 2) return false;
+    return std.mem.eql(u8, lam.params[lam.params.len - 2].name, composer_param) and
+        std.mem.eql(u8, lam.params[lam.params.len - 1].name, changed_param);
+}
+
 /// Names of functions returning a `@Composable` function type, installed by
 /// the build driver around `transformDecls` (module decls + baked base). A
 /// val initialized from one holds a composable lambda; the walker records
@@ -526,6 +532,15 @@ fn calleeInlinesLambda(name: []const u8) bool {
         if (std.mem.eql(u8, n, name)) return true;
     }
     return false;
+}
+
+/// Calls whose trailing calculation produces their result value. An expected
+/// composable function type on the call therefore flows into the calculation
+/// lambda's result expression, as it does for a direct conditional initializer.
+fn callPropagatesExpectedValue(name: []const u8) bool {
+    return std.mem.eql(u8, name, "remember") or
+        std.mem.eql(u8, name, "rememberSaveable") or
+        std.mem.eql(u8, name, "rememberRetained");
 }
 
 /// Names of class PROPERTIES declared with a `@Composable` function type
@@ -1555,8 +1570,11 @@ const Walker = struct {
                 // or `val content = @Composable { … }`, where the literal
                 // carries the annotation itself.
                 if (p.init) |*ini| {
-                    if (ini.* == .Lambda and p.ty != null and isComposableFnType(&p.ty.?)) {
-                        try w.transformComposableLambda(&ini.Lambda, @intCast(@min(p.ty.?.function.?.params.len, 255)), null);
+                    if (p.ty != null and isComposableFnType(&p.ty.?)) {
+                        try w.walkComposableValueExpr(
+                            ini,
+                            @intCast(@min(p.ty.?.function.?.params.len, 255)),
+                        );
                     } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
                         // No declared type: the literal's own header is the
                         // arity, and a headerless literal is `() -> Unit`
@@ -1663,6 +1681,90 @@ const Walker = struct {
                 };
             },
             else => {},
+        }
+    }
+
+    /// Walk an expression under an expected `@Composable` function type.
+    /// Kotlin propagates that expected type through value-producing control
+    /// flow, so every lambda leaf gains the hidden composer ABI even when the
+    /// property initializer is an `if`, `when`, `try`, or block rather than a
+    /// lambda directly.
+    fn walkComposableValueExpr(
+        w: *Walker,
+        e: *Expr,
+        expected_params: u8,
+    ) std.mem.Allocator.Error!void {
+        switch (e.*) {
+            .Lambda => |*lam| try w.transformComposableLambda(lam, expected_params, null),
+            .If => |*f| {
+                try w.walkExpr(f.cond);
+                try w.walkComposableValueExpr(f.then_branch, expected_params);
+                if (f.else_branch) |else_branch|
+                    try w.walkComposableValueExpr(else_branch, expected_params);
+            },
+            .When => |*wh| {
+                if (wh.subject) |subject| try w.walkExpr(subject);
+                for (wh.branches) |*branch| {
+                    for (branch.patterns) |*pattern| switch (pattern.kind) {
+                        .Value => |*value| try w.walkExpr(value),
+                        .InRange => |*value| try w.walkExpr(value),
+                        else => {},
+                    };
+                    try w.walkComposableValueExpr(&branch.body, expected_params);
+                }
+            },
+            .Try => |*tr| {
+                try w.walkComposableValueBlock(&tr.body, expected_params);
+                for (tr.catches) |*catch_clause|
+                    try w.walkComposableValueBlock(&catch_clause.body, expected_params);
+                if (tr.finally) |*finally_block| try w.walkBlock(finally_block);
+            },
+            .Block => |*block| try w.walkComposableValueBlock(block, expected_params),
+            .Labeled => |*labeled| {
+                if (labeled.expr.* == .Lambda) {
+                    try w.transformComposableLambda(
+                        &labeled.expr.Lambda,
+                        expected_params,
+                        labeled.label.name,
+                    );
+                } else {
+                    try w.walkComposableValueExpr(labeled.expr, expected_params);
+                }
+            },
+            .As => |*cast| try w.walkComposableValueExpr(cast.expr, expected_params),
+            .Binary => |*binary| {
+                if (binary.op == .Elvis) {
+                    try w.walkComposableValueExpr(binary.lhs, expected_params);
+                    try w.walkComposableValueExpr(binary.rhs, expected_params);
+                } else {
+                    try w.walkExpr(e);
+                }
+            },
+            .Call => |*call| {
+                if (calleeSimpleName(call.callee)) |name| {
+                    if (callPropagatesExpectedValue(name) and call.args.len != 0) {
+                        if (trailingLambda(&call.args[call.args.len - 1])) |calculation| {
+                            try w.walkComposableValueBlock(&calculation.body, expected_params);
+                        }
+                    }
+                }
+                try w.walkExpr(e);
+            },
+            else => try w.walkExpr(e),
+        }
+    }
+
+    fn walkComposableValueBlock(
+        w: *Walker,
+        block: *Block,
+        expected_params: u8,
+    ) std.mem.Allocator.Error!void {
+        if (block.stmts.len == 0) return;
+        for (block.stmts[0 .. block.stmts.len - 1]) |*stmt| try w.walkStmt(stmt);
+        const last = &block.stmts[block.stmts.len - 1];
+        switch (last.*) {
+            .Expr => |*expr| try w.walkComposableValueExpr(expr, expected_params),
+            else => try w.walkStmt(last),
         }
     }
 
@@ -2236,7 +2338,13 @@ const Walker = struct {
                 .Interp => |ie| try w.walkExpr(ie),
                 else => {},
             },
-            .Lambda => |*lam| try w.walkBlock(&lam.body),
+            .Lambda => |*lam| {
+                // `transformComposableLambda` walks the body against the
+                // lambda's own composer immediately. A surrounding expression
+                // walk may encounter that shared node again; do not thread or
+                // bracket its body a second time.
+                if (!lambdaHasComposerParams(lam)) try w.walkBlock(&lam.body);
+            },
             .AnonFun => |*af| if (af.body) |ab| switch (ab.*) {
                 .Block => |*blk| try w.walkBlock(blk),
                 .Expr => |*ex| try w.walkExpr(ex),
@@ -2253,8 +2361,7 @@ const Walker = struct {
         if (dbg_lambda) std.debug.print("[compose-pass] transform composable lambda ({d} params)\n", .{lam.params.len});
         // Idempotence: a lambda already carrying a trailing `$composer` param
         // (a shared node reached twice) is left alone.
-        if (lam.params.len >= 2 and std.mem.eql(u8, lam.params[lam.params.len - 1].name, changed_param))
-            return;
+        if (lambdaHasComposerParams(lam)) return;
         // A lambda with only the synthetic `it` (a header-less `{ … }` bound to a
         // `() -> R` sink) has no real parameters: the composer/changed pair
         // replaces `it`, not follows it. A header-declared lambda keeps its
@@ -2352,6 +2459,16 @@ const Walker = struct {
     /// into the first omitted param. Named, the binder slots the pair exactly
     /// and the omitted params take their defaults.
     fn threadCall(w: *Walker, c: anytype, positional: bool) std.mem.Allocator.Error!void {
+        if (c.arg_names.len >= 2) {
+            const composer_name = c.arg_names[c.arg_names.len - 2];
+            const changed_name = c.arg_names[c.arg_names.len - 1];
+            if (composer_name != null and changed_name != null and
+                std.mem.eql(u8, composer_name.?, composer_param) and
+                std.mem.eql(u8, changed_name.?, changed_param))
+            {
+                return;
+            }
+        }
         const had_trailing = c.has_trailing_lambda;
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
@@ -3281,6 +3398,110 @@ test "threadCall appends the composer pair as named args" {
     try testing.expectEqual(@as(usize, 2), c.args.len);
     try testing.expectEqualStrings(composer_param, c.arg_names[0].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[1].?);
+}
+
+test "a conditional initializer propagates its composable function type to lambda branches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    const b = B{ .a = a, .gen_span = gsp };
+
+    var lambda_params: [0]Ident = .{};
+    var lambda_param_tys: [0]?TypeRef = .{};
+    var body_stmts = [_]Stmt{.{ .Expr = b.call(
+        b.pathExpr("ReusableContentHost"),
+        a.alloc(Expr, 0) catch @panic("oom"),
+    ) }};
+    const lambda = Expr{ .Lambda = .{
+        .params = &lambda_params,
+        .param_tys = &lambda_param_tys,
+        .body = .{ .stmts = &body_stmts, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } };
+    var value = Expr{ .If = .{
+        .cond = b.box(.{ .BoolLit = .{ .value = true, .span = gsp } }),
+        .then_branch = b.box(b.pathExpr("content")),
+        .else_branch = b.box(lambda),
+        .span = gsp,
+    } };
+
+    var ctx: u8 = 0;
+    var w = Walker{
+        .a = a,
+        .b = b,
+        .oracle = allComposable,
+        .oracle_ctx = &ctx,
+        .thread = false,
+    };
+    try w.walkComposableValueExpr(&value, 0);
+
+    const transformed = value.If.else_branch.?.Lambda;
+    try testing.expectEqual(@as(usize, 2), transformed.params.len);
+    try testing.expectEqualStrings(composer_param, transformed.params[0].name);
+    try testing.expectEqualStrings(changed_param, transformed.params[1].name);
+    const call = transformed.body.stmts[0].Expr.Call;
+    try testing.expectEqual(@as(usize, 2), call.args.len);
+    try testing.expectEqualStrings(composer_param, call.arg_names[0].?);
+    try testing.expectEqualStrings(changed_param, call.arg_names[1].?);
+}
+
+test "remember propagates a composable result type into its calculation result" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    const b = B{ .a = a, .gen_span = gsp };
+
+    var content_params: [0]Ident = .{};
+    var content_param_tys: [0]?TypeRef = .{};
+    var content_stmts = [_]Stmt{.{ .Expr = b.call(
+        b.pathExpr("Box"),
+        a.alloc(Expr, 0) catch @panic("oom"),
+    ) }};
+    const content = Expr{ .Lambda = .{
+        .params = &content_params,
+        .param_tys = &content_param_tys,
+        .body = .{ .stmts = &content_stmts, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } };
+
+    var calculation_params: [0]Ident = .{};
+    var calculation_param_tys: [0]?TypeRef = .{};
+    var calculation_stmts = [_]Stmt{.{ .Expr = content }};
+    const calculation = Expr{ .Lambda = .{
+        .params = &calculation_params,
+        .param_tys = &calculation_param_tys,
+        .body = .{ .stmts = &calculation_stmts, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } };
+    const remember_args = try a.alloc(Expr, 1);
+    remember_args[0] = calculation;
+    var value = b.call(b.pathExpr("remember"), remember_args);
+    value.Call.has_trailing_lambda = true;
+
+    var ctx: u8 = 0;
+    var w = Walker{
+        .a = a,
+        .b = b,
+        .oracle = allComposable,
+        .oracle_ctx = &ctx,
+        .thread = true,
+    };
+    try w.walkComposableValueExpr(&value, 0);
+
+    const transformed = value.Call.args[0].Lambda.body.stmts[0].Expr.Lambda;
+    try testing.expectEqual(@as(usize, 2), transformed.params.len);
+    try testing.expectEqualStrings(composer_param, transformed.params[0].name);
+    try testing.expectEqualStrings(changed_param, transformed.params[1].name);
+    const box_call = transformed.body.stmts[0].Expr.Call;
+    try testing.expectEqual(@as(usize, 2), box_call.args.len);
+    try testing.expectEqualStrings(composer_param, box_call.arg_names[0].?);
+    try testing.expectEqualStrings(changed_param, box_call.arg_names[1].?);
+    try testing.expectEqual(@as(usize, 3), value.Call.args.len);
 }
 
 test "threadCall re-names a trailing lambda across a defaulted gap" {
