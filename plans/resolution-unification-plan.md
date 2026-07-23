@@ -210,6 +210,15 @@ default thunks are keyed by their reserved `FuncId`, avoiding the prior
 class/name collision between overloads. `dump-ir` reports virtual calls
 separately from name-dynamic calls so migration coverage is measurable.
 
+Executable images now preserve both the owner-scoped declaration groups and the
+fully linked `(runtime ClassId, MethodSlotId) -> FuncId` table. Loaders restore
+those exact host-baked identities while function bodies remain lazy; they do not
+repeat override resolution from header-only image state. Override linking compares
+nominal `ClassId` identity when source spellings differ, including qualified nested
+class paths retained in structural type markers. The Android ARM64 on-screen smoke
+loads a host-baked Compose image, executes virtual calls through that table, and
+drives rendered frames and input without a bodyless dispatch target.
+
 Runtime-defined anonymous and local classes now participate in the same numeric
 slot contract. Their first `(runtime class identity, MethodSlotId)` call links
 either to the exact override body in its side module or to the most-specific

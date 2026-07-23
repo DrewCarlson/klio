@@ -12,8 +12,14 @@ the internal-invariant `Check failed` tests become reachable).
 Directed by the user (2026-07-15): the faithful path over the pragmatic
 reimplementation.
 
-## Status (2026-07-22)
+## Status (2026-07-23)
 
+- Host-baked executable images carry the exact linked virtual dispatch table and
+  owner-scoped member groups into Android rather than rebuilding them from lazy
+  function headers. Qualified nested override types resolve by nominal class
+  identity, so `Modifier.all(Element)` links `CombinedModifier` and the Android
+  on-screen Compose scene renders and processes input through the same slots as
+  the host runtime.
 - Bodyless `@Composable` declarations now receive the same
   `$composer`/`$changed` ABI as concrete bodies while remaining bodyless.
   Abstract and `expect` headers therefore agree with their overrides and

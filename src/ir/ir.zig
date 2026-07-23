@@ -1702,6 +1702,26 @@ pub const Module = struct {
         return list.items;
     }
 
+    pub const MemberDeclGroup = struct {
+        owner_fqn: []const u8,
+        name: []const u8,
+        fids: []const FuncId,
+    };
+
+    pub fn memberDeclGroups(self: *const Module, allocator: Allocator) Allocator.Error![]MemberDeclGroup {
+        const groups = try allocator.alloc(MemberDeclGroup, self.member_name_index.count());
+        var it = self.member_name_index.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            groups[i] = .{
+                .owner_fqn = entry.key_ptr.a,
+                .name = entry.key_ptr.b,
+                .fids = entry.value_ptr.items,
+            };
+        }
+        return groups;
+    }
+
     const MemberCandidate = struct {
         fid: FuncId,
         depth: u16,
@@ -2069,6 +2089,37 @@ pub const Module = struct {
         return self.method_dispatch.get(methodDispatchKey(runtime_class, slot));
     }
 
+    pub const MethodDispatchEntry = struct {
+        runtime_class: ClassId,
+        slot: MethodSlotId,
+        target: FuncId,
+    };
+
+    pub fn methodDispatchEntries(self: *const Module, allocator: Allocator) Allocator.Error![]MethodDispatchEntry {
+        const entries = try allocator.alloc(MethodDispatchEntry, self.method_dispatch.count());
+        var it = self.method_dispatch.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            const runtime_class = ClassId.from(@intCast(entry.key_ptr.* >> 32));
+            const slot = MethodSlotId.from(@truncate(entry.key_ptr.*));
+            entries[i] = .{
+                .runtime_class = runtime_class,
+                .slot = slot,
+                .target = entry.value_ptr.*,
+            };
+        }
+        return entries;
+    }
+
+    pub fn registerMethodSlotTarget(
+        self: *Module,
+        runtime_class: ClassId,
+        slot: MethodSlotId,
+        target: FuncId,
+    ) Allocator.Error!void {
+        try self.method_dispatch.put(methodDispatchKey(runtime_class, slot), target);
+    }
+
     const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
@@ -2128,6 +2179,38 @@ pub const Module = struct {
         return null;
     }
 
+    fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?ClassId {
+        if (self.classIdByFqn(name) orelse self.classIdByQualifiedSuffix(name)) |id| return id;
+        const sig = self.decl_sigs.get(fid.int()) orelse return null;
+        const owner = sig.enclosing_class orelse return null;
+        if (self.classIdNestedIn(owner, applicability.simpleName(name))) |id| return id;
+        if (owner.int() >= self.classes.items.len) return null;
+        const owner_fqn = self.classes.items[owner.int()].fqn;
+        for (self.classes.items) |class| {
+            if (class.fqn.len != owner_fqn.len + name.len + 1) continue;
+            if (std.mem.startsWith(u8, class.fqn, owner_fqn) and
+                class.fqn[owner_fqn.len] == '.' and
+                std.mem.eql(u8, class.fqn[owner_fqn.len + 1 ..], name))
+            {
+                return class.id;
+            }
+        }
+        return null;
+    }
+
+    fn overrideQualifiedPath(ty: TypeRef) ?[]const u8 {
+        for (ty.args) |arg| {
+            if (std.mem.startsWith(u8, arg.name, "#qual:")) return arg.name["#qual:".len..];
+        }
+        return null;
+    }
+
+    fn overrideArgs(ty: TypeRef) []TypeRef {
+        var end = ty.args.len;
+        while (end > 0 and std.mem.startsWith(u8, ty.args[end - 1].name, "#qual:")) end -= 1;
+        return ty.args[0..end];
+    }
+
     fn overrideTypeEql(
         self: *const Module,
         candidate: FuncId,
@@ -2138,9 +2221,25 @@ pub const Module = struct {
         const candidate_tp = self.funcTypeParamIndex(candidate, candidate_ty.name);
         const base_tp = self.funcTypeParamIndex(base, base_ty.name);
         if (candidate_tp != null or base_tp != null) return candidate_tp != null and candidate_tp == base_tp;
-        if (!std.mem.eql(u8, candidate_ty.name, base_ty.name)) return false;
-        if (candidate_ty.nullable != base_ty.nullable or candidate_ty.args.len != base_ty.args.len) return false;
-        for (candidate_ty.args, base_ty.args) |ca, ba| {
+        const candidate_qualified = overrideQualifiedPath(candidate_ty);
+        const base_qualified = overrideQualifiedPath(base_ty);
+        if (!std.mem.eql(u8, candidate_ty.name, base_ty.name) or
+            candidate_qualified != null or base_qualified != null)
+        {
+            const candidate_class = self.overrideTypeClassId(
+                candidate,
+                candidate_qualified orelse candidate_ty.name,
+            ) orelse return false;
+            const base_class = self.overrideTypeClassId(
+                base,
+                base_qualified orelse base_ty.name,
+            ) orelse return false;
+            if (candidate_class.int() != base_class.int()) return false;
+        }
+        const candidate_args = overrideArgs(candidate_ty);
+        const base_args = overrideArgs(base_ty);
+        if (candidate_ty.nullable != base_ty.nullable or candidate_args.len != base_args.len) return false;
+        for (candidate_args, base_args) |ca, ba| {
             if (!self.overrideTypeEql(candidate, base, ca, ba)) return false;
         }
         return true;
@@ -5907,6 +6006,68 @@ test "method slots link generic overrides and multiple interface roots" {
     const inherited = m.resolveMemberCall(child, "put", &string_args, .{});
     try testing.expectEqual(Module.MemberDispatch.virtual, inherited.dispatch);
     try testing.expectEqual(child_put, inherited.target.?);
+
+    const modifier = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Modifier", .fqn = "sample.Modifier", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{},
+        .is_abstract = true, .is_interface = true,
+    });
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Modifier.Element", .fqn = "sample.Modifier.Element", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null, .supertypes = &.{},
+        .is_abstract = true, .is_interface = true,
+    });
+    const combined = try m.addClass(a, .{
+        .id = ClassId.from(0), .name = "Combined", .fqn = "sample.Combined", .primary_params = &.{},
+        .methods = &.{}, .init_block = null, .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{modifier}),
+        .supertype_refs = try a.dupe(TypeRef, &.{.{
+            .name = "Modifier", .nullable = false, .args = &.{},
+        }}),
+    });
+    const root_all = try pushTestFuncOpts(&m, a, "all", "sample.Modifier.all", "sample", 1, .{
+        .stub = true, .param_ty = "Element",
+    });
+    const combined_all = try pushTestFuncOpts(&m, a, "all", "sample.Combined.all", "sample", 1, .{
+        .param_ty = "Modifier.Element",
+    });
+    m.funcs.items[root_all.int()].kind = .instance_method;
+    m.funcs.items[combined_all.int()].kind = .instance_method;
+    m.funcs.items[combined_all.int()].is_override = true;
+    m.classes.items[modifier.int()].methods = try a.dupe(FuncId, &.{root_all});
+    m.classes.items[combined.int()].methods = try a.dupe(FuncId, &.{combined_all});
+    const qualified_element_args = try a.dupe(TypeRef, &.{.{
+        .name = "#qual:Modifier.Element",
+        .nullable = false,
+        .args = &.{},
+    }});
+    const all_types = [_]TypeRef{
+        .{ .name = "Element", .nullable = false, .args = &.{} },
+        .{
+            .name = "Element",
+            .nullable = false,
+            .args = qualified_element_args,
+        },
+    };
+    for (
+        [_]FuncId{ root_all, combined_all },
+        [_]ClassId{ modifier, combined },
+        all_types,
+    ) |fid, owner, ty| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+            .sig = try a.dupe(TypeRef, &.{ty}),
+            .kind = .instance_method,
+            .has_body = m.funcs.items[fid.int()].hasBody(),
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "all", fid);
+    }
+    try m.linkMethodSlots(a);
+    try testing.expectEqual(
+        combined_all,
+        m.methodSlotTarget(combined, MethodSlotId.fromFunc(root_all)).?,
+    );
 }
 
 /// Options for the symbol-index test func pusher.

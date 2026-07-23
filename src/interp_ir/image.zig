@@ -24,11 +24,12 @@
 //!   CLI keeps it on the same process-lifetime arena as the base itself.
 //!
 //! What is serialized: the SourceMap files, the post-lift AST decls, the
-//! lowered `ir.Module` (registry flattened to index/pair tables), every
-//! `BuiltModule` side table, the runtime `ClassDef` graph (ObjRef edges as
-//! def-table indexes), and the `StdlibBase` gate sets. What is rebuilt at
-//! load: hash-map spines, `func_name_index`, ObjRef cells, and the
-//! run-mutable `ClassDef` cells (companion/object singletons, captured
+//! lowered `ir.Module` (registry flattened to index/pair tables), its
+//! owner-scoped member groups and linked numeric method dispatch table,
+//! every `BuiltModule` side table, the runtime `ClassDef` graph (ObjRef
+//! edges as def-table indexes), and the `StdlibBase` gate sets. What is
+//! rebuilt at load: hash-map spines, `func_name_index`, ObjRef cells, and
+//! the run-mutable `ClassDef` cells (companion/object singletons, captured
 //! envs) that `cloneBuiltForRun` resets per run anyway.
 //!
 //! `bake` refuses (returns null) when the base holds anything outside the
@@ -64,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 27;
+pub const FORMAT_VERSION: u32 = 28;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -639,6 +640,8 @@ const ModuleImage = struct {
     decl_user_sig: []KV(u32, []ir.TypeRef),
     decl_sigs: []DeclSigLite,
     decl_span: []KV(u32, Span),
+    member_decl_groups: []Module.MemberDeclGroup,
+    method_dispatch: []Module.MethodDispatchEntry,
     /// Lazy IR: the self-contained `blocks` of AST-free functions, decoded on
     /// first execution. A deferred function carries its `offset + 1` into this
     /// section in `Func.deferred_offset` (its `blocks` is empty in the image).
@@ -1281,6 +1284,8 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         out.decl_sigs = try lites.toOwnedSlice(a);
     }
     out.decl_span = try autoMapToSlice(u32, Span, a, &m.decl_span);
+    out.member_decl_groups = try m.memberDeclGroups(a);
+    out.method_dispatch = try m.methodDispatchEntries(a);
 
     const r = &m.registry;
     out.registry = .{
@@ -2054,8 +2059,12 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         });
     }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
-    try out.rebuildMemberNameIndex(a);
-    try out.linkMethodSlots(a);
+    for (img.member_decl_groups) |group| {
+        for (group.fids) |fid| try out.registerMemberDecl(a, group.owner_fqn, group.name, fid);
+    }
+    for (img.method_dispatch) |entry| {
+        try out.registerMethodSlotTarget(entry.runtime_class, entry.slot, entry.target);
+    }
 
     const r = &out.registry;
     const ri = &img.registry;
@@ -2453,6 +2462,53 @@ test "codec preserves shared slices as one decoded slice" {
     const got = try decodeOne(Shared, a, bytes);
     try testing.expectEqualSlices(u32, &data, got.first);
     try testing.expect(got.first.ptr == got.second.ptr);
+}
+
+test "module image preserves linked method slots with lazy function headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var source = Module.default(a);
+    defer source.deinit(a);
+    const element = try source.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Element",
+        .fqn = "sample.Element",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const abstract_all = FuncId.from(10);
+    const element_all = FuncId.from(11);
+    try source.registerMemberDecl(a, "sample.Modifier", "all", abstract_all);
+    try source.registerMethodSlotTarget(
+        element,
+        ir.MethodSlotId.fromFunc(abstract_all),
+        element_all,
+    );
+
+    var image: ModuleImage = undefined;
+    try testing.expect(try moduleToImage(a, &source, &image));
+    image.funcs = &.{};
+    const bytes = try encodeOne(ModuleImage, a, &image);
+    const decoded = try decodeOne(ModuleImage, a, bytes);
+
+    var loaded = Module.default(a);
+    defer loaded.deinit(a);
+    try moduleFromImage(a, &decoded, &loaded);
+
+    try testing.expectEqualSlices(
+        FuncId,
+        &.{abstract_all},
+        loaded.memberDecls("sample.Modifier", "all"),
+    );
+    try testing.expectEqual(
+        element_all,
+        loaded.methodSlotTarget(element, ir.MethodSlotId.fromFunc(abstract_all)).?,
+    );
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {
