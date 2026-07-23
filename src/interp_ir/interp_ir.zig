@@ -456,6 +456,23 @@ pub const ProgramImage = struct {
         defer bg.deinit();
         const bindings = bg.get();
 
+        // The declaration manifest is authoritative for bodyless declarations:
+        // join each such FuncId directly to its exact host ABI symbol before
+        // compatibility linking considers FQN groups or bare aliases. A
+        // body-bearing receiver declaration keeps its Kotlin body because the
+        // native representation may cover only builtin receiver values, while
+        // Kotlin's declaration also accepts user-defined subtypes.
+        {
+            var decl_it = module.decl_sigs.iterator();
+            while (decl_it.next()) |entry| {
+                const symbol = entry.value_ptr.host_symbol orelse continue;
+                if (entry.value_ptr.has_body) continue;
+                const intrinsic = bindings.resolve(symbol) orelse
+                    stdlib.implementation(symbol) orelse continue;
+                try self.resolved_native.put(entry.key_ptr.*, intrinsic);
+            }
+        }
+
         // Bare-name maps: one deterministic name → FQN edge per simple
         // name, settled here instead of probed per call. Sources are the
         // embedded intrinsic registry and the installed overlay; ties
@@ -1668,6 +1685,42 @@ test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, ma
     // Map-resolved native: `sqrt` maps to kotlin.math.sqrt.
     try testing.expect(prog.resolvedNativeForm(sqrt_decl) != null);
     try testing.expectEqualStrings("kotlin.math.sqrt", prog.defaultImportGlobal("sqrt").?);
+}
+
+test "linkResolvedForms joins a receiver declaration through its exact host symbol" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    const repeat = try pushLinkTestFuncOpts(&m, a, "repeat", "kotlin.text.repeat", true);
+    const repeat_body = try pushLinkTestFunc(&m, a, "repeat", "kotlin.text.repeat");
+    try m.decl_sigs.put(repeat.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &.{.{ .name = "Int", .nullable = false, .args = &.{} }},
+        .kind = .top_level_extension,
+        .host_symbol = "kotlin.String.repeat",
+    });
+    try m.decl_sigs.put(repeat_body.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &.{.{ .name = "Int", .nullable = false, .args = &.{} }},
+        .kind = .top_level_extension,
+        .has_body = true,
+        .host_symbol = "kotlin.String.repeat",
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    try prog.linkResolvedForms(&m);
+
+    try testing.expect(prog.resolvedNativeForm(repeat) != null);
+    try testing.expect(prog.resolvedNativeForm(repeat).? ==
+        stdlib.implementation("kotlin.String.repeat").?);
+    try testing.expect(prog.resolvedNativeForm(repeat_body) == null);
 }
 
 test "bodyless redirect dispatch picks by exact arity, then vararg" {

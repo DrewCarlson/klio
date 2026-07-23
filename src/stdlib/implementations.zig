@@ -224,6 +224,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.equals", .f = string.string_equals },
     .{ .fqn = "kotlin.text.equals", .f = string.string_equals },
     .{ .fqn = "kotlin.String.repeat", .f = string.string_repeat },
+    .{ .fqn = "kotlin.CharSequence.repeat", .f = string.string_repeat },
     .{ .fqn = "kotlin.String.replace", .f = string.string_replace },
     .{ .fqn = "kotlin.String.reversed", .f = string.string_reversed },
     .{ .fqn = "kotlin.String.startsWith", .f = string.string_starts_with },
@@ -1598,6 +1599,7 @@ const PARAM_NAMES = [_]ParamEntry{
     // `compareTo(other)`, so a hand entry is needed for `ignoreCase` to reorder.
     .{ .fqn = "kotlin.String.compareTo", .names = &.{ "other", "ignoreCase" } },
     .{ .fqn = "kotlin.String.repeat", .names = &.{"n"} },
+    .{ .fqn = "kotlin.CharSequence.repeat", .names = &.{"n"} },
     .{ .fqn = "kotlin.String.replace", .names = &.{"oldValue", "newValue", "ignoreCase"} },
     .{ .fqn = "kotlin.String.replaceFirst", .names = &.{ "oldValue", "newValue", "ignoreCase" } },
     .{ .fqn = "kotlin.String.split", .names = &.{"delimiters", "ignoreCase", "limit"} },
@@ -1703,6 +1705,49 @@ pub fn lookup(fqn: []const u8) ?StdlibFn {
     return TABLE_MAP.get(fqn);
 }
 
+/// Resolve one Kotlin source declaration to the exact host ABI symbol that
+/// implements it. Receiverless declarations normally match `source_fqn`
+/// directly. Receiver-formed declarations may instead use the runtime
+/// receiver-qualified form (`kotlin.String.nativeIndexOf`,
+/// `kotlin.collections.MutableList.fill`, and so on).
+///
+/// A receiver-qualified result is returned only when exactly one registered
+/// symbol has the requested receiver/name suffix. The chosen FQN can therefore
+/// be stored on the declaration and linked by FuncId without recreating the
+/// runtime's package/type probe ladder.
+pub fn declarationHostSymbol(
+    source_fqn: []const u8,
+    receiver_name: ?[]const u8,
+    name: []const u8,
+) ?[]const u8 {
+    if (lookup(source_fqn) != null) return source_fqn;
+    if (!std.mem.eql(u8, source_fqn, "kotlin") and
+        !std.mem.startsWith(u8, source_fqn, "kotlin.")) return null;
+    var recv = receiver_name orelse return null;
+    recv = std.mem.trim(u8, recv, " ");
+    if (std.mem.startsWith(u8, recv, "in#")) recv = recv["in#".len..];
+    if (std.mem.startsWith(u8, recv, "out#")) recv = recv["out#".len..];
+    if (std.mem.indexOfScalar(u8, recv, '<')) |lt| recv = recv[0..lt];
+    recv = std.mem.trimEnd(u8, recv, "?");
+    if (recv.len == 0) return null;
+
+    var found: ?[]const u8 = null;
+    for (TABLE) |entry| {
+        const name_at = std.mem.lastIndexOfScalar(u8, entry.fqn, '.') orelse continue;
+        if (!std.mem.eql(u8, entry.fqn[name_at + 1 ..], name)) continue;
+        const owner = entry.fqn[0..name_at];
+        if (!std.mem.eql(u8, owner, recv) and
+            !(owner.len > recv.len and owner[owner.len - recv.len - 1] == '.' and
+                std.mem.eql(u8, owner[owner.len - recv.len ..], recv)))
+        {
+            continue;
+        }
+        if (found != null and !std.mem.eql(u8, found.?, entry.fqn)) return null;
+        found = entry.fqn;
+    }
+    return found;
+}
+
 pub fn applicable(fqn: []const u8, args: []const Value) ?bool {
     for (TABLE) |entry| {
         if (!std.mem.eql(u8, entry.fqn, fqn)) continue;
@@ -1750,6 +1795,29 @@ test "lookup returns null for unknown" {
 test "lookup finds a registered intrinsic" {
     try testing.expect(lookup("kotlin.math.abs") != null);
     try testing.expect(lookup("kotlin.io.println") != null);
+}
+
+test "source declarations resolve exact host ABI symbols" {
+    try testing.expectEqualStrings(
+        "kotlin.io.println",
+        declarationHostSymbol("kotlin.io.println", null, "println").?,
+    );
+    try testing.expectEqualStrings(
+        "kotlin.String.nativeIndexOf",
+        declarationHostSymbol("kotlin.text.missingNativeIndexOf", "String", "nativeIndexOf").?,
+    );
+    try testing.expectEqualStrings(
+        "kotlin.CharSequence.repeat",
+        declarationHostSymbol("kotlin.text.repeat", "CharSequence", "repeat").?,
+    );
+    try testing.expect(
+        declarationHostSymbol("sample.repeat", "CharSequence", "repeat") == null,
+    );
+    try testing.expectEqualStrings(
+        "kotlin.Double.Companion.fromBits",
+        declarationHostSymbol("kotlin.missingFromBits", "Double.Companion", "fromBits").?,
+    );
+    try testing.expect(declarationHostSymbol("kotlin.missing", "T", "missing") == null);
 }
 
 test "integer member applicability rejects non-numeric overload arguments" {

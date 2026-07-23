@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 31;
+pub const FORMAT_VERSION: u32 = 32;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -669,7 +669,8 @@ pub const DeclSigLite = struct {
     is_inline: bool,
     is_suspend: bool,
     has_body: bool,
-    host_backed: bool,
+    /// Exact host ABI symbol; empty = ordinary source declaration.
+    host_symbol: []const u8,
 };
 
 /// Build-time `Value` reachable from an enum entry or a primitive-zero
@@ -1278,7 +1279,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
                 .is_inline = ds.is_inline,
                 .is_suspend = ds.is_suspend,
                 .has_body = ds.has_body,
-                .host_backed = ds.host_backed,
+                .host_symbol = ds.host_symbol orelse "",
             });
         }
         out.decl_sigs = try lites.toOwnedSlice(a);
@@ -2055,7 +2056,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             .is_inline = l.is_inline,
             .is_suspend = l.is_suspend,
             .has_body = l.has_body,
-            .host_backed = l.host_backed,
+            .host_symbol = if (l.host_symbol.len != 0) l.host_symbol else null,
         });
     }
     for (img.decl_span) |kv| try out.decl_span.put(kv.k, kv.v);
@@ -2522,6 +2523,7 @@ test "module image preserves linked identities with lazy function headers" {
         .arity = .{ .required = 0, .total = 0, .has_vararg = false },
         .kind = .top_level_extension,
         .has_body = true,
+        .host_symbol = "kotlin.IntArray.min",
     });
 
     var image: ModuleImage = undefined;
@@ -2545,6 +2547,10 @@ test "module image preserves linked identities with lazy function headers" {
     );
     try testing.expect(loaded.extCouldApply(a, "IntArray", "min"));
     try testing.expect(!loaded.extCouldApply(a, "String", "min"));
+    try testing.expectEqualStrings(
+        "kotlin.IntArray.min",
+        loaded.decl_sigs.get(min.int()).?.host_symbol.?,
+    );
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {

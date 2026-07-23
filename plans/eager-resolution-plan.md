@@ -126,18 +126,18 @@ the `hasOwnMember` implicit-this arm → typeck's member answer; the CMG
 unknown-receiver fallbacks and `class_member_names` → deleted once receiver
 types cover the corpus.
 
-### E5 — registry systems (typeck-independent, start immediately)
+### E5 — registry systems (typeck-independent)
 
-Two structural fixes the heuristics currently paper over; unstarted:
+Current status:
 
-1. **One mangling, one lookup.** Nested classifiers register under a single
-   canonical qualified form; every simple-name probe goes through one
-   scope-walking lookup function (subsuming the `$`/`.` double-probe).
-2. **Id-keyed globals.** Class/object/companion singletons are keyed by
-   `ClassId` in an id-keyed table; the name-keyed `globals` map becomes a view
-   for user bindings only. Kills publication shadowing (a companion init can
-   never change what a committed class read yields) and removes hash-order
-   sensitivity from classifier reads.
+1. **Canonical nested identity — partial.** `class_parent`, `class_children`,
+   and `classIdNestedIn` provide the id-keyed nesting tree used by lowering and
+   runtime lookup. Remaining `$`/`.` compatibility probes must move behind this
+   single scope-walking identity lookup before this item is complete.
+2. **Id-keyed globals — landed.** Class/object/companion singletons are keyed by
+   `ClassId` in `singletons_by_id`, and committed classifier reads use
+   `lookupGlobalById`. The name-keyed globals map remains for user bindings and
+   compatibility-only unresolved reads.
 
 ## Verification
 

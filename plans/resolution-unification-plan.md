@@ -238,25 +238,32 @@ for every value argument, and a unique overload before the stable `FuncId`
 tiebreak. Non-inline user and library extensions then emit exact
 `Call(FuncId)` instructions; the extension canary's `shout`, inherited-receiver
 `greet`, and generic-receiver `doubled` calls are all direct in eager-on and
-eager-off lowering. Named/spread calls, inline extensions, and `kotlin`
-runtime declarations remain deferred. Inline targets need a resolved inline
-lowering strategy that preserves the declaration's lexical helper identities,
-while `kotlin` declarations need P10's host ABI manifest; neither category may
-be emitted as an ordinary direct call. The 117-file stdlib sweep is unchanged
-in both eager modes, including the single existing ULong range-sort failure.
+eager-off lowering. Named/spread calls and inline extensions remain deferred.
+Inline targets still need a resolved inline lowering strategy that preserves
+the declaration's lexical helper identities.
 
-The first host-ABI slice is also live for receiverless declarations. A retained
-bodyless header now records `DeclSig.host_backed` only when its lowered FQN has
-an exact registry entry. It remains an ordinary declaration for scope and
-overload resolution, lowers to `Call(FuncId)`, survives image serialization,
-and link finalization attaches the host function to that identity. A unique
-applicable host overload is marked exact so the VM does not repeat overload
-selection. Receiver-formed expects remain deferred: their package-level source
-FQN and receiver-qualified host ABI are not interchangeable, and that mapping
-must be represented explicitly before those headers can safely participate.
-Runtime applicability consults that link-settled executable form, and its
-argument-shape storage grows past the stack fast path instead of reopening an
-unbounded name lookup for large calls. The embedded source set now includes
+The exact host-ABI identity slice is now live for receiverless and
+receiver-formed declarations. `DeclSig.host_symbol` records the exact
+fully-qualified host ABI symbol selected for each source declaration; an absent
+value means the declaration has no proven host form. The mapping is computed
+once while headers register, is restricted to the Kotlin host surface, and is
+serialized in image format 32. A proven non-inline Kotlin extension therefore
+resolves through `Module.resolveExtensionCall` and emits `Call(FuncId)` without
+a runtime receiver/name probe. The `stdlib_string_ops.kt` main now reports
+50 direct and 22 dynamic calls, improved from 36 direct and 36 dynamic; this
+gives the slice a repeatable static-dispatch coverage measure.
+
+Host identity and executable-form selection remain separate. A body-bearing
+receiver declaration keeps its Kotlin body because that declaration accepts
+user-defined subtypes while a native implementation may cover only KLIO's
+builtin value representation. A bodyless declaration links its `FuncId`
+directly to `host_symbol`. This distinction is structural and tested with two
+declarations carrying the same host symbol. `CharSequence.repeat` also has an
+ABI-aligned registry identity, so `"xy".repeat(3)` is direct IR while
+StringBuilder and user-defined CharSequence receivers remain correct. Runtime
+applicability consults the link-settled executable form, and its argument-shape
+storage grows past the stack fast path instead of reopening an unbounded name
+lookup for large calls. The embedded source set includes
 `unsigned/src/kotlin/UMath.kt`, so the bounded `kotlin.math.min`/`max` families
 contain their real UInt and ULong overloads.
 
@@ -285,11 +292,12 @@ fix is the complete owner-scoped overload index, not another arity/name exceptio
       `emptyList`/`emptySet`/`emptyMap` drops) are deleted; the declarations lower
       like any other source and `linkResolvedForms` binds them `resolved_native` —
       the mechanism that already works for `require`/`minOf`-with-source.
-      `expect` drops remain where an `actual` replaces the declaration and for
-      receiver-formed host declarations whose ABI identity is not represented
-      yet (`nativeIndexOf` et al). Receiverless exact-FQN host expects now retain
-      their header and carry `DeclSig.host_backed`; this is the first manifest
-      slice. First unlocked hatch deletions shipped with it:
+      `expect` drops remain where an `actual` replaces the declaration.
+      Receiverless and uniquely mapped receiver-formed host declarations retain
+      their headers and carry `DeclSig.host_symbol`; bodyless headers link by
+      this exact identity, while body-bearing headers retain their source body.
+      This removes package-FQN versus receiver-ABI guessing from call dispatch.
+      First unlocked hatch deletions shipped with it:
       `inline_state.isDroppedStdlibFactory` (its premise — no lowered `FuncId` —
       is now false) and both factory name-list helpers. Verified: the full dual
       gate is at the existing baseline, inventory unchanged at 117, and eager

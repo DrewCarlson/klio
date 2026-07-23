@@ -1470,10 +1470,10 @@ pub const Module = struct {
         is_suspend: bool = false,
         /// The declaration carries a source body.
         has_body: bool = false,
-        /// The declaration has an exact fully-qualified host binding. A
-        /// bodyless declaration with this bit uses the ordinary FuncId call
-        /// ABI; link finalization attaches the host function to that identity.
-        host_backed: bool = false,
+        /// Exact fully-qualified host ABI symbol for this declaration. A
+        /// bodyless declaration with this identity uses the ordinary FuncId
+        /// call ABI; link finalization attaches the host function once.
+        host_symbol: ?[]const u8 = null,
     };
 
     pub const MemberDispatch = enum {
@@ -1895,13 +1895,15 @@ pub const Module = struct {
             const kind = if (ds) |decl| decl.kind else f.kind;
             if (kind != .top_level_extension or f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            // Kotlin runtime declarations still mix source bodies with host
-            // representations and name-based lexical globals. Their callable
-            // ABI becomes statically bindable with the host symbol manifest;
-            // ordinary user and library declarations already use the IR ABI.
-            if (pkgHeadIs(f.package, "kotlin")) continue;
+            // A Kotlin runtime declaration is statically callable only when
+            // its exact host ABI symbol is attached to this declaration.
+            // The remaining mixed runtime declarations stay on the
+            // compatibility path until their callable ABI is classified.
+            if (pkgHeadIs(f.package, "kotlin") and
+                (ds == null or ds.?.host_symbol == null)) continue;
             const has_body = f.hasBody() or (if (ds) |decl| decl.has_body else false) or
-                self.decl_ast_body.contains(fid.int());
+                self.decl_ast_body.contains(fid.int()) or
+                (if (ds) |decl| decl.host_symbol != null else false);
             if (!has_body) continue;
             if (self.registry.private_fn_files.get(fid)) |decl_file| {
                 if (decl_file.int() != ctx.caller_file.int()) continue;
@@ -3238,7 +3240,7 @@ pub const Module = struct {
     fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
         const declared_executable = if (self.decl_sigs.get(id.int())) |ds|
-            ds.has_body or ds.host_backed
+            ds.has_body or ds.host_symbol != null
         else
             false;
         if (!f.hasBody() and !declared_executable) return null;
@@ -4226,7 +4228,7 @@ pub const Module = struct {
     /// is their positive complement for the no-exact-fit fallback.
     fn varargArityFits(self: *const Module, id: FuncId, want: usize) bool {
         if (self.decl_sigs.get(id.int())) |ds| {
-            if (!ds.has_body and !ds.host_backed) return false;
+            if (!ds.has_body and ds.host_symbol == null) return false;
             if (!ds.arity.has_vararg) return false;
             return want >= ds.arity.required;
         }
@@ -4582,7 +4584,7 @@ pub const Module = struct {
     fn hasHostBackedCandidate(self: *const Module, name: []const u8) bool {
         for (self.funcsBySimpleName(name)) |id| {
             if (self.decl_sigs.get(id.int())) |ds| {
-                if (ds.host_backed) return true;
+                if (ds.host_symbol != null) return true;
             }
         }
         return false;
@@ -4601,14 +4603,14 @@ pub const Module = struct {
         args: []const applicability.ArgShape,
     ) bool {
         const target_sig = self.decl_sigs.get(target.int()) orelse return false;
-        if (!target_sig.host_backed) return false;
+        if (target_sig.host_symbol == null) return false;
         const target_func = self.funcById(target) orelse return false;
         const tier = self.bareCallTier(target_func, name, caller_pkg, caller_file);
         var applicable_count: usize = 0;
         for (self.funcsBySimpleName(name)) |id| {
             const f = self.funcById(id) orelse continue;
             const ds = self.decl_sigs.get(id.int()) orelse continue;
-            if (!ds.host_backed or ds.kind != .plain) continue;
+            if (ds.host_symbol == null or ds.kind != .plain) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != tier) continue;
             const sv = self.sigViewForApplicability(id) orelse continue;
             if (applicability.applicable(&sv, args, .{}) == null) continue;
@@ -6256,6 +6258,19 @@ test "extension resolver proves receiver, scope, and overload identity" {
     m.funcs.items[int_receiver.int()].params[0].ty.name = "Int";
     _ = try pushTestFuncOpts(&m, a, "hidden", "other.hidden", "other", 0, .{ .extension = true });
     m.funcs.items[m.funcs.items.len - 1].kind = .top_level_extension;
+    const repeat = try pushTestFuncOpts(&m, a, "repeat", "kotlin.text.repeat", "kotlin.text", 1, .{
+        .stub = true,
+        .extension = true,
+    });
+    m.funcs.items[repeat.int()].kind = .top_level_extension;
+    m.funcs.items[repeat.int()].params[0].ty.name = "CharSequence";
+    try m.decl_sigs.put(repeat.int(), .{
+        .receiver_ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &.{.{ .name = "Int", .nullable = false, .args = &.{} }},
+        .kind = .top_level_extension,
+        .host_symbol = "kotlin.CharSequence.repeat",
+    });
     try m.rebuildFuncNameIndex(a);
 
     const typed_args = [_]applicability.ArgShape{.{
@@ -6282,6 +6297,13 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .args = &.{},
     }, &.{}, .{ .caller_file = FileId.from(0), .caller_package = "app" });
     try testing.expect(out_of_scope.target == null);
+
+    const host_backed = m.resolveExtensionCall("repeat", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &typed_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
+    try testing.expectEqual(repeat.int(), host_backed.target.?.int());
 }
 
 test "symbol index prefers the caller's own package" {
@@ -6723,7 +6745,7 @@ test "resolveCall binds bodyless host declarations by FuncId" {
     try m.decl_sigs.put(println.int(), .{
         .arity = .{ .required = 1, .total = 1, .has_vararg = false },
         .sig = m.decl_user_sig.get(println.int()).?,
-        .host_backed = true,
+        .host_symbol = "kotlin.io.println",
     });
 
     const ints = try pushTestFuncOpts(&m, a, "intArrayOf", "kotlin.intArrayOf", "kotlin", 1, .{
@@ -6735,7 +6757,7 @@ test "resolveCall binds bodyless host declarations by FuncId" {
     try m.decl_sigs.put(ints.int(), .{
         .arity = .{ .required = 0, .total = 1, .has_vararg = true },
         .sig = m.decl_user_sig.get(ints.int()).?,
-        .host_backed = true,
+        .host_symbol = "kotlin.intArrayOf",
     });
     try m.rebuildFuncNameIndex(a);
 
