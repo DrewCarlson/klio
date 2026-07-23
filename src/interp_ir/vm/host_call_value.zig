@@ -579,7 +579,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
         // `R.(P) -> T`): the lambda's value params are `[p]`, so being
         // called with exactly one *extra* leading arg means arg0 is the
-        // extension receiver. Bind it into the closure's `this` capture
+        // extension receiver when the lowered callable explicitly carries
+        // receiver shape. Bind it into the closure's `this` capture
         // and re-run on this same (main-evaluator) path — which snapshots
         // frames so a suspension inside the body (`delay`) parks
         // correctly, unlike the intrinsic-host invoke. The body resolves
@@ -587,10 +588,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // (`func.capture_order`), so overriding the closure value's
         // captures (not the side-table `info.captures`, which this path
         // ignores) is what reaches the evaluator. Valid Kotlin never
-        // over-supplies a non-receiver lambda, so the `+1` arity is
-        // unambiguous; vararg targets (legitimately variadic) are
-        // excluded; and a `this` capture must exist (a genuine receiver
-        // lambda) so a 2-param lambda invoked with 3 args isn't misread.
+        // over-supplies a non-receiver lambda, and receiver-ness is never
+        // inferred from a `this` capture (which may instead be lexical).
+        // Vararg targets (legitimately variadic) are excluded.
         const last_vararg = func.params.len != 0 and func.params[func.params.len - 1].is_vararg;
         const this_cap_idx: ?usize = blk: {
             for (info.capture_names, 0..) |n, i| {
@@ -598,12 +598,20 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             break :blk null;
         };
-        if (!last_vararg and args.len == info.n_params + 1 and this_cap_idx != null) {
-            // E4b instrument: measure how often the runtime arity-guess
-            // rebind still fires — the lowering's declared-shape emission
-            // should shrink this to lambdas with no recorded shape.
+        if (info.has_receiver and !last_vararg and args.len == info.n_params + 1) {
             if (runtime.getenvSlice("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
+            }
+            // A receiver lambda need not read its receiver. Such a body has
+            // no `this` capture, but the leading receiver argument must still
+            // be removed before its value parameters are bound.
+            if (this_cap_idx == null) {
+                const receiver = args[0];
+                const pushed = receiver == .Instance or receiver == .Null;
+                if (pushed) host_call_member.pushAccessEnclosingSubject(self, &receiver);
+                const r = try callValue(self, allocator, callee, args[1..]);
+                if (pushed) host_call_member.popAccessEnclosing(self);
+                return r;
             }
             const this_idx = this_cap_idx.?;
             // The closure's captured `this` (before the explicit
@@ -1233,7 +1241,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 // e.g. `getOrBuildCachedDrawBlock(this).block(this)`) supplies
                 // its receiver positionally, and the value-call path
                 // (`callValueRec`) already splits it that way.
-                const explicit_receiver = info.n_params >= 1 and args.len == info.n_params + 1;
+                const explicit_receiver = info.has_receiver and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
                 var body_args: []const Value = if (explicit_receiver) args[1..] else args;
                 // The receiver-prepended buffer below is a borrowed-into-call
@@ -1248,7 +1256,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 // positionally too — `client.apply(it)` over a stored
                 // `(HttpClient) -> Unit` must fill `it`'s param, not pad
                 // it with Null.
-                if (!explicit_receiver and args.len + 1 == info.n_params) {
+                if (!info.has_receiver and args.len + 1 == info.n_params) {
                     const with_recv = try allocator.alloc(Value, args.len + 1);
                     with_recv[0] = receiver;
                     @memcpy(with_recv[1..], args);
@@ -1327,7 +1335,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
             // `Context.(A, B, C) -> R` whose body reads no receiver
             // member): arg0 is the receiver, not a positional param —
             // split it off and keep it reachable as the innermost subject.
-            if (!takes_this_param and info.n_params >= 1 and args.len == info.n_params + 1) {
+            if (info.has_receiver and !takes_this_param and args.len == info.n_params + 1) {
                 const recv0 = args[0];
                 const pushed = recv0 == .Instance or recv0 == .Null;
                 if (pushed) host_call_member.pushAccessEnclosingSubject(self, &recv0);
@@ -1339,7 +1347,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
             // expected declares one more positional param than the call
             // supplies; the receiver fills it (kotlinc: the receiver IS
             // the underlying function's first param).
-            const recv_fills_param = !takes_this_param and args.len + 1 == info.n_params;
+            const recv_fills_param = !info.has_receiver and !takes_this_param and args.len + 1 == info.n_params;
             var all_args: std.ArrayList(Value) = .empty;
             defer all_args.deinit(allocator);
             if (takes_this_param or recv_fills_param) try all_args.append(allocator, this_value.*);
@@ -1406,9 +1414,11 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     // Derive the lambda's param count + capture-name list from the body
     // func so `LoadCapture` reads the right snapshot per closure.
     var n_params: usize = 0;
+    var has_receiver = false;
     var capture_names: [][]const u8 = &.{};
     if (module.funcById(body_func)) |f| {
         n_params = f.params.len;
+        has_receiver = f.lambda_has_receiver;
         capture_names = try allocator.dupe([]const u8, f.capture_order);
     }
     // Canonical capture store for this closure (read by the HOF invoke
@@ -1421,6 +1431,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         .body_func = body_func,
         .module = if (module == self.module.asPtr()) null else module,
         .n_params = n_params,
+        .has_receiver = has_receiver,
         .capture_names = capture_names,
         .captures = cell,
         .chain = try ir.eval.captureChainAlloc(allocator),
@@ -1465,6 +1476,7 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
         .body_func = fid,
         .module = if (module == self.module.asPtr()) null else module,
         .n_params = params.len,
+        .has_receiver = if (module.funcById(fid)) |f| f.lambda_has_receiver else false,
         .capture_names = try allocator.dupe([]const u8, captured_names),
         .captures = cell,
         .chain = chain,

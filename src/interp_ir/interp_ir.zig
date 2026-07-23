@@ -793,6 +793,9 @@ pub const ClosureInfo = struct {
     /// anon-method table or the run arena).
     module: ?*const ir.Module = null,
     n_params: usize,
+    /// The callable declares an extension receiver outside `n_params`.
+    /// Invocation uses this bit rather than guessing from arity or captures.
+    has_receiver: bool = false,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,
     /// Live capture values. Stored behind a shared interior-mutable

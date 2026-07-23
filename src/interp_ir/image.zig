@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 28;
+pub const FORMAT_VERSION: u32 = 29;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -2462,6 +2462,30 @@ test "codec preserves shared slices as one decoded slice" {
     const got = try decodeOne(Shared, a, bytes);
     try testing.expectEqualSlices(u32, &data, got.first);
     try testing.expect(got.first.ptr == got.second.ptr);
+}
+
+test "codec preserves explicit receiver-lambda shape" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const func = ir.Func{
+        .id = FuncId.from(0),
+        .name = "<lambda>",
+        .fqn = "<lambda>",
+        .params = &.{},
+        .return_ty = .{ .name = "Unit", .nullable = false, .args = &.{} },
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .lambda_has_receiver = true,
+        .lambda_receiver_ty = "String",
+    };
+    const bytes = try encodeOne(ir.Func, a, &func);
+    const got = try decodeOne(ir.Func, a, bytes);
+    try testing.expect(got.lambda_has_receiver);
+    try testing.expectEqualStrings("String", got.lambda_receiver_ty.?);
 }
 
 test "module image preserves linked identities with lazy function headers" {
