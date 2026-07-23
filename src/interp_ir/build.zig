@@ -458,6 +458,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
+        var receiver_names = try compose_pass.collectComposableReceiverNames(allocator, decls.items);
+        defer receiver_names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
         var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
@@ -479,6 +481,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             // every collector below must read the decoded section instead.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
+            try composeBaseReceiverNames(&receiver_names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
             try composeBaseFactories(&factories, base_decls);
             try composeBaseSinkArity(&sink_arity, base_decls);
@@ -506,6 +509,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_last_param = null;
         compose_pass.active_sink_content_reach = &sink_content_reach;
         defer compose_pass.active_sink_content_reach = null;
+        compose_pass.active_composable_receiver_names = &receiver_names;
+        defer compose_pass.active_composable_receiver_names = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -4520,6 +4525,13 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
         .Object => |*o| for (o.members) |*m| try composeBaseNameDecl(names, m),
         else => {},
     }
+}
+
+/// Baked-base equivalent of `collectComposableReceiverNames`: names of
+/// `@Composable` functions reachable via member syntax (extensions or
+/// class/object members).
+fn composeBaseReceiverNames(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
+    for (base_decls) |*d| try compose_pass.collectReceiverInto(set, @as([*]const Decl, @ptrCast(d))[0..1], false);
 }
 
 /// Add the names of baked-base functions with a `@Composable`-typed lambda

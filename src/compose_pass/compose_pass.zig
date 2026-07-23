@@ -306,6 +306,36 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
     };
 }
 
+/// Simple names of `@Composable` functions reachable through MEMBER syntax
+/// (`receiver.name(...)`): extensions (a declared receiver type) and class /
+/// object member functions. A member-syntax call threads the composer only when
+/// the name is here — a name whose only `@Composable` overload is a top-level
+/// non-extension (`contentColorFor`, which ALSO has a non-composable
+/// `ColorScheme` extension) is reached, via member syntax, by that
+/// non-composable extension, so threading it corrupts the call.
+pub var active_composable_receiver_names: ?*const std.StringHashMap(void) = null;
+
+pub fn collectComposableReceiverNames(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(a);
+    try collectReceiverInto(&set, decls, false);
+    return set;
+}
+
+pub fn collectReceiverInto(set: *std.StringHashMap(void), decls: []const ast.Decl, in_type: bool) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (isComposable(f.annotations) and (in_type or f.receiver_type != null))
+                try set.put(f.name.name, {});
+        },
+        .Class => |*c| try collectReceiverInto(set, c.members, true),
+        .Object => |*o| try collectReceiverInto(set, o.members, true),
+        else => {},
+    };
+}
+
 /// Whether a parameter's type is a `@Composable`-annotated function type — a
 /// sink a lambda argument is transformed for.
 fn isComposableLambdaParam(p: *const Param) bool {
@@ -348,11 +378,24 @@ pub fn collectComposableSinkLastParam(
     return set;
 }
 
+/// Trailing parameter count with a compose-plugin `$composer, $changed` pair
+/// stripped. A baked-base decl was already threaded when its pack was built, so
+/// its real trailing content lambda sits BEFORE that synthetic pair; the sink
+/// collectors below must look past it to find the content parameter. A source
+/// (not-yet-transformed) decl has no such pair, so this is a no-op there.
+fn sinkParamCount(params: anytype) usize {
+    var n = params.len;
+    if (n >= 2 and std.mem.eql(u8, params[n - 2].name.name, composer_param) and
+        std.mem.eql(u8, params[n - 1].name.name, changed_param)) n -= 2;
+    return n;
+}
+
 pub fn collectSinkLastParamInto(set: *std.StringHashMap([]const u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
-            if (f.params.len != 0) {
-                const lp = &f.params[f.params.len - 1];
+            const n = sinkParamCount(f.params);
+            if (n != 0) {
+                const lp = &f.params[n - 1];
                 if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
                     try set.put(f.name.name, lp.name.name);
                 }
@@ -394,11 +437,12 @@ pub fn collectComposableSinkContentReach(
 /// `params` is `[]const Param` (a function) or `[]const ClassParam` (a primary
 /// constructor); both carry `.ty`, `.default`, `.is_vararg`.
 fn sinkContentReach(params: anytype) ?u8 {
-    if (params.len == 0) return null;
-    const lp = &params[params.len - 1];
+    const n = sinkParamCount(params);
+    if (n == 0) return null;
+    const lp = &params[n - 1];
     if (lp.ty.function == null or !isComposable(lp.ty.annotations)) return null;
     var required: u8 = 0;
-    for (params[0 .. params.len - 1]) |*p| {
+    for (params[0 .. n - 1]) |*p| {
         if (p.default == null and !p.is_vararg) required += 1;
     }
     return required + 1;
@@ -2049,7 +2093,18 @@ const Walker = struct {
                         // with literal `$composer`/`$changed` params — it
                         // keeps the named pair.
                         const positional = emit_lambda_memo and (is_lambda_param or is_composable_prop or is_composable_val or is_local_composable);
-                        if (positional or is_composable_val or is_local_composable or w.oracle(w.oracle_ctx, nm)) try w.threadCall(c, positional);
+                        // A value-receiver member call (`cs.contentColorFor(bg)`)
+                        // threads only when the name has a `@Composable`
+                        // receiver-taking overload — a name whose only composable
+                        // overload is a top-level non-extension is reached here by
+                        // a non-composable extension, which must NOT be threaded.
+                        // Bare / qualified names (`Text`, `pkg.Text`) keep the
+                        // general oracle.
+                        const oracle_hit = if (c.callee.* == .Member)
+                            (active_composable_receiver_names != null and active_composable_receiver_names.?.contains(nm))
+                        else
+                            w.oracle(w.oracle_ctx, nm);
+                        if (positional or is_composable_val or is_local_composable or oracle_hit) try w.threadCall(c, positional);
                     }
                 }
                 // `key(k…) { content }` is a COMPILER intrinsic: kotlinc
