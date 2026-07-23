@@ -3552,7 +3552,11 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvt.arg_names);
             defer allocator.free(names);
-            switch (try host.callValueWithThis(allocator, &callee_v, &recv, arg_values, names)) {
+            const result = if (cvt.receiver_shape_exact)
+                try host.callValueWithThisExact(allocator, &callee_v, &recv, arg_values, names)
+            else
+                try host.callValueWithThis(allocator, &callee_v, &recv, arg_values, names);
+            switch (result) {
                 .ok => |rv| try frame.write(cvt.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
@@ -4749,7 +4753,13 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
                 .ok => |rv| try frame.write(cmv.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
-        } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+        } else switch (if (cmv.fallback_takes_receiver)
+            try host.callValueWithThisExact(allocator, &fb, &recv, user_args, names)
+        else if (cmv.fallback_receiver_shape_known)
+            try host.callValueNamed(allocator, &fb, user_args, names)
+        else
+            try host.callValueWithThis(allocator, &fb, &recv, user_args, names))
+        {
             .ok => |rv| try frame.write(cmv.dst, rv),
             .err => |e| return raiseStep(frame, e),
         }
@@ -4780,7 +4790,13 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
                     .ok => |rv| try frame.write(cmv.dst, rv),
                     .err => |e| return raiseStep(frame, e),
                 }
-            } else switch (try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
+            } else switch (if (cmv.fallback_takes_receiver)
+                try host.callValueWithThisExact(allocator, &fb, &recv, user_args, names)
+            else if (cmv.fallback_receiver_shape_known)
+                try host.callValueNamed(allocator, &fb, user_args, names)
+            else
+                try host.callValueWithThis(allocator, &fb, &recv, user_args, names))
+            {
                 .ok => |rv| try frame.write(cmv.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }
@@ -7504,6 +7520,10 @@ pub const NullHost = struct {
     pub fn callValueWithThis(self: *NullHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
         _ = .{ self, allocator, callee, this_value, args, arg_names };
         return errResult(.{ .Unsupported = "Host.call_value_with_this" });
+    }
+
+    pub fn callValueWithThisExact(self: *NullHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+        return self.callValueWithThis(allocator, callee, this_value, args, arg_names);
     }
 
     pub fn callSuper(self: *NullHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {

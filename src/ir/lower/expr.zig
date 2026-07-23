@@ -2427,9 +2427,15 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         break :blk null;
     };
+    const expected_shape_known = if (b.peekExpected()) |exp|
+        exp.function != null
+    else
+        false;
     const receiver_head = expected_recv orelse
         recorded_recv orelse
         b.module.eagerRecvHeadOf(lam.body.span);
+    const lambda_receiver_shape_known = expected_shape_known or
+        recorded_recv != null or eager_shape != null;
     const lambda_has_receiver = receiver_head != null or
         (eager_shape != null and eager_shape.?.has_receiver);
     // Consume the per-argument expected lambda arity set by the call
@@ -2588,6 +2594,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const body_func = lowered.func;
     const captured_names = lowered.captures;
     if (b.module.funcByIdMut(body_func)) |f| {
+        f.lambda_receiver_shape_known = lambda_receiver_shape_known;
         f.lambda_has_receiver = lambda_has_receiver;
     }
 
@@ -2683,6 +2690,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     );
     const captured_names = lowered.captures;
     if (b.module.funcByIdMut(lowered.func)) |f| {
+        f.lambda_receiver_shape_known = true;
         f.lambda_has_receiver = receiver_head != null;
     }
     const captures = try b.allocator.alloc(Reg, captured_names.len);
@@ -10514,9 +10522,11 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
             b.isErasedRecvParam(receiver.Path.segments[0].name);
-        const callable_shape_known = b.isReceiverLambdaParam(name.name) or
-            b.isLocalExtFn(name.name);
-        if (callable_shape_known and
+        const callable_takes_receiver = b.isReceiverLambdaParam(name.name) or
+            b.isLocalExtFn(name.name) or b.localDeclRecvFn(name.name);
+        const callable_shape_known = callable_takes_receiver or
+            (b.isLocalFn(name.name) and !b.isLocalExtFn(name.name));
+        if (callable_takes_receiver and
             (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
         {
             orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
@@ -10527,6 +10537,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
+                .receiver_shape_exact = true,
             } });
             return dst;
         }
@@ -10540,6 +10551,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             .n_args = run[1],
             .arg_names = arg_names,
             .recv_erased = recv_erased,
+            .fallback_takes_receiver = callable_takes_receiver,
+            .fallback_receiver_shape_known = callable_shape_known,
         } });
         return dst;
     }
@@ -11053,6 +11066,95 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     } };
     const call_shape = shapeOfAstArg(&b, &predicate_call, null);
     try testing.expectEqualStrings("Boolean", call_shape.ty.?.name);
+}
+
+test "lambda lowering records unknown, plain, and receiver callable shapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const sp = dummySpan();
+    const unit_ty = ast.TypeRef{
+        .name = .{ .name = "Unit", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const string_ty = ast.TypeRef{
+        .name = .{ .name = "String", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var plain_fn = ast.FunctionTypeRef{
+        .receiver = null,
+        .params = &.{},
+        .ret = unit_ty,
+        .is_suspend = false,
+        .span = sp,
+    };
+    var receiver_fn = ast.FunctionTypeRef{
+        .receiver = string_ty,
+        .params = &.{},
+        .ret = unit_ty,
+        .is_suspend = false,
+        .span = sp,
+    };
+    const plain_ty = ast.TypeRef{
+        .name = .{ .name = "<function>", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = &plain_fn,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const receiver_ty = ast.TypeRef{
+        .name = .{ .name = "<function>", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = &receiver_fn,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const lambda = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &.{}, .span = sp },
+        .span = sp,
+    } };
+
+    _ = try lowerExpr(&b, &lambda);
+    const unknown = &m.funcs.items[m.funcs.items.len - 1];
+    try testing.expect(!unknown.lambda_receiver_shape_known);
+    try testing.expect(!unknown.lambda_has_receiver);
+
+    var prev = b.pushExpected(plain_ty);
+    _ = try lowerExpr(&b, &lambda);
+    b.restoreExpected(prev);
+    const plain = &m.funcs.items[m.funcs.items.len - 1];
+    try testing.expect(plain.lambda_receiver_shape_known);
+    try testing.expect(!plain.lambda_has_receiver);
+
+    prev = b.pushExpected(receiver_ty);
+    _ = try lowerExpr(&b, &lambda);
+    b.restoreExpected(prev);
+    const receiver = &m.funcs.items[m.funcs.items.len - 1];
+    try testing.expect(receiver.lambda_receiver_shape_known);
+    try testing.expect(receiver.lambda_has_receiver);
 }
 
 test "argument maps repeat a vararg slot before a trailing lambda" {
@@ -12071,6 +12173,33 @@ test "receiver callable emission respects members and lazy extensions" {
     try Expect.lower(&b, &receiver, "value", .CallValueWithThis);
     try Expect.lower(&b, &receiver, "member", .CallMemberOrValue);
     try Expect.lower(&b, &receiver, "extension", .CallMemberOrValue);
+    const receiver_fallback = b.blocks.items[b.cur.int()].insts[
+        b.blocks.items[b.cur.int()].insts.len - 1
+    ].CallMemberOrValue;
+    try testing.expect(receiver_fallback.fallback_takes_receiver);
+    try testing.expect(receiver_fallback.fallback_receiver_shape_known);
+
+    // A receiver-function-typed local is the same proven callable shape as a
+    // parameter, even when its underlying value is an ordinary function
+    // adapted at the assignment.
+    try b.bind("typed", b.allocReg());
+    try b.setLocalDeclRecvFn("typed");
+    try Expect.lower(&b, &receiver, "typed", .CallValueWithThis);
+    const typed_call = b.blocks.items[b.cur.int()].insts[
+        b.blocks.items[b.cur.int()].insts.len - 1
+    ].CallValueWithThis;
+    try testing.expect(typed_call.receiver_shape_exact);
+
+    // A plain local remains on the member-or-value compatibility form and
+    // never receives the call receiver positionally.
+    try b.bind("plain", b.allocReg());
+    try b.markLocalFn("plain");
+    try Expect.lower(&b, &receiver, "plain", .CallMemberOrValue);
+    const plain_fallback = b.blocks.items[b.cur.int()].insts[
+        b.blocks.items[b.cur.int()].insts.len - 1
+    ].CallMemberOrValue;
+    try testing.expect(!plain_fallback.fallback_takes_receiver);
+    try testing.expect(plain_fallback.fallback_receiver_shape_known);
 
     // An erased receiver removes the member leg, but does not by itself prove
     // that a same-named local is callable. Exact value dispatch still requires

@@ -253,6 +253,10 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId = &.{},
+        /// Lowering proved that the callee's declared type is a receiver
+        /// function. The VM may therefore adapt a plain underlying function
+        /// positionally instead of using compatibility receiver inference.
+        receiver_shape_exact: bool = false,
     },
     /// Call a callable value held in a register.
     CallValue: struct {
@@ -327,8 +331,7 @@ pub const Inst = union(enum) {
     },
     /// Explicit-receiver call `recv.name(args)` where `name` is also
     /// a callable local/param in scope. If `recv` has member `name`,
-    /// dispatch the member with `args`; otherwise invoke `fallback`
-    /// with `recv` prepended.
+    /// dispatch the member with `args`; otherwise invoke `fallback`.
     CallMemberOrValue: struct {
         dst: Reg,
         receiver: Reg,
@@ -346,6 +349,14 @@ pub const Inst = union(enum) {
         /// `with(node) { ... }` on a node that happens to own a `block` field
         /// ran that field instead of `with`'s own block.
         recv_erased: bool = false,
+        /// The fallback's declared type is a receiver function, so the call
+        /// receiver binds its extension receiver. A plain callable fallback
+        /// receives only `args`.
+        fallback_takes_receiver: bool = false,
+        /// Lowering proved whether the fallback is receiver-typed. When false,
+        /// invocation keeps the compatibility path for incomplete cross-pack
+        /// callable metadata.
+        fallback_receiver_shape_known: bool = false,
     },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
@@ -955,6 +966,10 @@ pub const Func = struct {
     /// propagates as a non-local return through this frame instead
     /// of being caught locally.
     is_lambda: bool = false,
+    /// True when lowering had a declared function-type shape for this
+    /// closure. When false, `lambda_has_receiver == false` means unknown
+    /// rather than a proven receiver-less function.
+    lambda_receiver_shape_known: bool = false,
     /// True when this callable's function type declares an extension
     /// receiver. The receiver is supplied at invocation and is not counted
     /// in `params`; keeping that shape explicitly prevents the VM from

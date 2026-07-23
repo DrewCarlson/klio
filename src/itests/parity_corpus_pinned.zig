@@ -830,6 +830,8 @@ test "receiver_lambda_invoke" {
         \\n=1 tag=k b=42
         \\5
         \\7
+        \\17
+        \\7
         \\
     );
 }

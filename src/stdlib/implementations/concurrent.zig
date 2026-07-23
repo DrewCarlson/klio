@@ -68,6 +68,7 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
 pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
     const mon = try monitorFor(key);
     const me = std.Thread.getCurrentId();
+    var rounds: u32 = 0;
     while (true) {
         mon.mutex.lock();
         if (mon.state.owner) |o| {
@@ -76,11 +77,24 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
                 mon.mutex.unlock();
                 return;
             }
-            // Held by another thread: release the guard and yield, then
-            // retry the acquire.
+            // Held by another thread. The owner is running an arbitrary
+            // interpreted `synchronized` body, so the wait is unbounded:
+            // spin briefly for short sections, then yield, then park at a
+            // millisecond cadence. A pure spin/yield loop here saturated
+            // every core whenever many dispatcher workers contended on one
+            // hot lock (the SnapshotStateMap concurrent tests drove the
+            // whole machine to 100% doing no useful work). The sleep
+            // brackets the GC blocking-safe region, so a parked waiter
+            // never stalls a collection.
             mon.mutex.unlock();
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
+            rounds +|= 1;
+            if (rounds <= 64) {
+                std.atomic.spinLoopHint();
+            } else if (rounds <= 128) {
+                std.Thread.yield() catch {};
+            } else {
+                runtime.clockSleepMillis(1);
+            }
         } else {
             mon.state.owner = me;
             mon.state.depth = 1;

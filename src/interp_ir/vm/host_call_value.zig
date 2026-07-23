@@ -1175,8 +1175,10 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 const m = info.module orelse module_g.get();
                 const f = m.funcById(info.body_func);
                 var prior_this: ?Value = null;
+                var has_this_capture = false;
                 for (info.capture_names, 0..) |capture_name, i| {
                     if (!std.mem.eql(u8, capture_name, "this")) continue;
+                    has_this_capture = true;
                     const captures_g = captures.borrow();
                     defer captures_g.deinit();
                     if (i < captures_g.get().*.len) prior_this = captures_g.get().*[i];
@@ -1184,14 +1186,21 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 }
                 const prior_name = if (prior_this) |*v| host_call_member.debugClassNameOf(self, v) else "-";
                 std.debug.print(
-                    "[callvalue-this] id={d} fn={s} recv={s} prior={s} args={d} params={d}\n",
+                    "[callvalue-this] id={d} fn={s} recv={s}/{s} prior={s}/{s} args={d} params={d} param0={s} shape_known={} shape_recv={} recv_ty={s} this_cap={}\n",
                     .{
                         id,
                         if (f) |func| func.fqn else "<unknown>",
                         host_call_member.debugClassNameOf(self, this_value),
+                        @tagName(this_value.*),
                         prior_name,
+                        if (prior_this) |v| @tagName(v) else "-",
                         args.len,
                         info.n_params,
+                        if (f) |func| if (func.params.len != 0) func.params[0].name else "-" else "-",
+                        info.receiver_shape_known,
+                        info.has_receiver,
+                        if (f) |func| func.lambda_receiver_ty orelse "-" else "-",
+                        has_this_capture,
                     },
                 );
             }
@@ -1212,6 +1221,18 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                         return callValue(self, allocator, callee, args);
                     }
                 }
+            }
+            // Kotlin function types with and without receivers are
+            // interchangeable: an ordinary `(R, P) -> T` closure used as
+            // `R.(P) -> T` receives the call receiver as its first positional
+            // argument. Its captured `this` remains the lexical receiver and
+            // must not be rebound to `R`.
+            if (info.receiver_shape_known and !info.has_receiver and args.len + 1 == info.n_params) {
+                const with_recv = try allocator.alloc(Value, args.len + 1);
+                defer if (runtime.freeScratch()) allocator.free(with_recv);
+                with_recv[0] = this_value.*;
+                @memcpy(with_recv[1..], args);
+                return callValue(self, allocator, callee, with_recv);
             }
             const this_idx: ?usize = blk: {
                 for (info.capture_names, 0..) |n, i| {
@@ -1243,26 +1264,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 // (`callValueRec`) already splits it that way.
                 const explicit_receiver = info.has_receiver and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
-                var body_args: []const Value = if (explicit_receiver) args[1..] else args;
-                // The receiver-prepended buffer below is a borrowed-into-call
-                // scratch slice the collector never owns; free it on the way out.
-                var body_args_owned: ?[]Value = null;
-                defer if (body_args_owned) |b| if (runtime.freeScratch()) allocator.free(b);
-                // Receiver-bound call of a closure that declares one more
-                // positional param than the call supplies: the callee is a
-                // plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
-                // expected (kotlinc: the receiver IS the underlying
-                // function's first param), so the receiver is delivered
-                // positionally too — `client.apply(it)` over a stored
-                // `(HttpClient) -> Unit` must fill `it`'s param, not pad
-                // it with Null.
-                if (!info.has_receiver and args.len + 1 == info.n_params) {
-                    const with_recv = try allocator.alloc(Value, args.len + 1);
-                    with_recv[0] = receiver;
-                    @memcpy(with_recv[1..], args);
-                    body_args = with_recv;
-                    body_args_owned = with_recv;
-                }
+                const body_args: []const Value = if (explicit_receiver) args[1..] else args;
 
                 // Bind the receiver into a fresh captures cell's `this` slot
                 // (the evaluator reads the closure value's captures, not the
@@ -1410,14 +1412,35 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
     };
 }
 
+/// Receiver-function invocation from an IR site whose declared callable shape
+/// is known. A plain function adapted to a receiver type receives the receiver
+/// positionally even when its body is a named local function; genuine receiver
+/// lambdas keep the receiver-binding path.
+pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    if (callee.* == .IrClosure) {
+        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            if (info.receiver_shape_known and !info.has_receiver and args.len + 1 == info.n_params) {
+                const with_recv = try allocator.alloc(Value, args.len + 1);
+                defer if (runtime.freeScratch()) allocator.free(with_recv);
+                with_recv[0] = this_value.*;
+                @memcpy(with_recv[1..], args);
+                return callValue(self, allocator, callee, with_recv);
+            }
+        }
+    }
+    return callValueWithThis(self, allocator, callee, this_value, args, arg_names);
+}
+
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
     // Derive the lambda's param count + capture-name list from the body
     // func so `LoadCapture` reads the right snapshot per closure.
     var n_params: usize = 0;
+    var receiver_shape_known = false;
     var has_receiver = false;
     var capture_names: [][]const u8 = &.{};
     if (module.funcById(body_func)) |f| {
         n_params = f.params.len;
+        receiver_shape_known = f.lambda_receiver_shape_known;
         has_receiver = f.lambda_has_receiver;
         capture_names = try allocator.dupe([]const u8, f.capture_order);
     }
@@ -1431,6 +1454,7 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         .body_func = body_func,
         .module = if (module == self.module.asPtr()) null else module,
         .n_params = n_params,
+        .receiver_shape_known = receiver_shape_known,
         .has_receiver = has_receiver,
         .capture_names = capture_names,
         .captures = cell,
@@ -1476,6 +1500,7 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
         .body_func = fid,
         .module = if (module == self.module.asPtr()) null else module,
         .n_params = params.len,
+        .receiver_shape_known = if (module.funcById(fid)) |f| f.lambda_receiver_shape_known else false,
         .has_receiver = if (module.funcById(fid)) |f| f.lambda_has_receiver else false,
         .capture_names = try allocator.dupe([]const u8, captured_names),
         .captures = cell,

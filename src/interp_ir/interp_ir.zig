@@ -793,6 +793,8 @@ pub const ClosureInfo = struct {
     /// anon-method table or the run arena).
     module: ?*const ir.Module = null,
     n_params: usize,
+    /// Whether lowering supplied a declared receiver-shape answer.
+    receiver_shape_known: bool = false,
     /// The callable declares an extension receiver outside `n_params`.
     /// Invocation uses this bit rather than guessing from arity or captures.
     has_receiver: bool = false,
