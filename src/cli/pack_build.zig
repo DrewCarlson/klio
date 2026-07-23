@@ -838,42 +838,53 @@ pub fn collectPackSources(
 
     for (roots) |sr| {
         const root_path = std.fs.path.join(a, &.{ dir, sr.root }) catch return .{ .err = fail(a, "out of memory", .{}) };
-        var root_dir = std.Io.Dir.cwd().openDir(tio, root_path, .{ .iterate = true }) catch continue;
-        defer root_dir.close(tio);
+        // .kt files under this root that pass its include/exclude rules. A
+        // declared source root that yields none means its sources are absent —
+        // almost always an `update = none` upstream submodule that was never
+        // checked out. Building would silently emit a missing-source pack that
+        // fails to resolve at load, so fail fast here instead. This is generic:
+        // no pack needs to name its own submodule.
+        var matched: usize = 0;
+        open: {
+            var root_dir = std.Io.Dir.cwd().openDir(tio, root_path, .{ .iterate = true }) catch break :open;
+            defer root_dir.close(tio);
 
-        // Collect this root's entries, then sort by file path so the order
-        // matches walkdir's `sort_by_file_name` before the final rel sort.
-        var paths: std.ArrayList([]const u8) = .empty;
-        defer paths.deinit(a);
-        var walker = root_dir.walk(a) catch return .{ .err = fail(a, "walk {s}: out of memory", .{root_path}) };
-        defer walker.deinit();
-        while (walker.next(tio) catch
-            return .{ .err = fail(a, "walk {s}: read error", .{root_path}) }) |entry|
-        {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.path, ".kt")) continue;
-            paths.append(a, a.dupe(u8, entry.path) catch return .{ .err = fail(a, "out of memory", .{}) }) catch
-                return .{ .err = fail(a, "out of memory", .{}) };
+            // Collect this root's entries, then sort by file path so the order
+            // matches walkdir's `sort_by_file_name` before the final rel sort.
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer paths.deinit(a);
+            var walker = root_dir.walk(a) catch return .{ .err = fail(a, "walk {s}: out of memory", .{root_path}) };
+            defer walker.deinit();
+            while (walker.next(tio) catch
+                return .{ .err = fail(a, "walk {s}: read error", .{root_path}) }) |entry|
+            {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, ".kt")) continue;
+                paths.append(a, a.dupe(u8, entry.path) catch return .{ .err = fail(a, "out of memory", .{}) }) catch
+                    return .{ .err = fail(a, "out of memory", .{}) };
+            }
+            std.mem.sort([]const u8, paths.items, {}, lessStr);
+
+            for (paths.items) |rel_to_root_raw| {
+                // Normalize backslashes (Windows) -> slashes for matching.
+                const rel_to_root = normalizeSlashes(a, rel_to_root_raw) catch return .{ .err = fail(a, "out of memory", .{}) };
+                const included = sr.include.len == 0 or anyMatch(rel_to_root, sr.include);
+                if (!included) continue;
+                if (anyMatch(rel_to_root, sr.exclude)) continue;
+                matched += 1;
+
+                // Crate-dir-relative path (`<root>/<rel_to_root>`).
+                const rel = std.fs.path.join(a, &.{ sr.root, rel_to_root }) catch return .{ .err = fail(a, "out of memory", .{}) };
+                const gop = seen.getOrPut(rel) catch return .{ .err = fail(a, "out of memory", .{}) };
+                if (gop.found_existing) continue;
+
+                const abs = std.fs.path.join(a, &.{ root_path, rel_to_root }) catch return .{ .err = fail(a, "out of memory", .{}) };
+                const bytes = std.Io.Dir.cwd().readFileAlloc(tio, abs, a, .unlimited) catch
+                    return .{ .err = fail(a, "read {s}: unreadable", .{abs}) };
+                files.append(a, .{ .rel_path = rel, .bytes = bytes }) catch return .{ .err = fail(a, "out of memory", .{}) };
+            }
         }
-        std.mem.sort([]const u8, paths.items, {}, lessStr);
-
-        for (paths.items) |rel_to_root_raw| {
-            // Normalize backslashes (Windows) -> slashes for matching.
-            const rel_to_root = normalizeSlashes(a, rel_to_root_raw) catch return .{ .err = fail(a, "out of memory", .{}) };
-            const included = sr.include.len == 0 or anyMatch(rel_to_root, sr.include);
-            if (!included) continue;
-            if (anyMatch(rel_to_root, sr.exclude)) continue;
-
-            // Crate-dir-relative path (`<root>/<rel_to_root>`).
-            const rel = std.fs.path.join(a, &.{ sr.root, rel_to_root }) catch return .{ .err = fail(a, "out of memory", .{}) };
-            const gop = seen.getOrPut(rel) catch return .{ .err = fail(a, "out of memory", .{}) };
-            if (gop.found_existing) continue;
-
-            const abs = std.fs.path.join(a, &.{ root_path, rel_to_root }) catch return .{ .err = fail(a, "out of memory", .{}) };
-            const bytes = std.Io.Dir.cwd().readFileAlloc(tio, abs, a, .unlimited) catch
-                return .{ .err = fail(a, "read {s}: unreadable", .{abs}) };
-            files.append(a, .{ .rel_path = rel, .bytes = bytes }) catch return .{ .err = fail(a, "out of memory", .{}) };
-        }
+        if (matched == 0) return .{ .err = fail(a, "source root '{s}' has no .kt files ({s}); an `update = none` upstream submodule is likely not checked out — run scripts/bootstrap.sh --packs or the matching scripts/init-*-submodule.sh", .{ sr.root, root_path }) };
     }
     const slice = files.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     std.mem.sort(schema.SourceFile, slice, {}, lessSourceFile);
