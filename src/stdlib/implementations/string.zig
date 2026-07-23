@@ -904,6 +904,9 @@ pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// `CharSequence.contentEquals(other: CharSequence?, ignoreCase = false)`.
 pub fn char_sequence_content_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return errType("contentEquals requires a receiver");
+    if (ctx.args[0] == .Null) {
+        return .{ .ok = .{ .Bool = ctx.args.len >= 2 and ctx.args[1] == .Null } };
+    }
     const ar = try charSeqToString(ctx.allocator, ctx.args[0], "contentEquals");
     const a = switch (ar) {
         .ok => |v| v,
@@ -3351,6 +3354,24 @@ test "contains and indexOf" {
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "abc"), try strVal(a, "z") });
         try testing.expectEqual(@as(i32, -1), (try string_index_of(&ctx)).ok.Int);
+    }
+}
+
+test "contentEquals implements nullable CharSequence equality" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    {
+        var ctx = ctxFor(a, &.{ .Null, .Null, .{ .Bool = true } });
+        try testing.expect((try char_sequence_content_equals(&ctx)).ok.Bool);
+    }
+    {
+        var ctx = ctxFor(a, &.{ .Null, try strVal(a, "sample"), .{ .Bool = true } });
+        try testing.expect(!(try char_sequence_content_equals(&ctx)).ok.Bool);
+    }
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "sample"), .Null, .{ .Bool = true } });
+        try testing.expect(!(try char_sequence_content_equals(&ctx)).ok.Bool);
     }
 }
 
