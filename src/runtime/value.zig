@@ -1290,6 +1290,163 @@ pub inline fn keepaliveRestore(mark: usize) void {
 
 /// The runtime value: a tagged union over every Kotlin value the
 /// interpreter manipulates.
+/// Receiver ABI required by a Kotlin classifier at the IR/runtime call
+/// boundary. `instance` classifiers use numeric virtual slots. `specialized`
+/// classifiers use the host member ABI, either because they have a dedicated
+/// `Value` tag or because they are host-synthesized `Value.Instance` values.
+pub const ReceiverAbi = enum {
+    instance,
+    specialized,
+};
+
+/// Canonical manifest of classifiers whose receivers have a specialized host
+/// representation. Interface entries are included whenever at least one
+/// specialized value implements them, so a call through that static interface
+/// never assumes `Value.Instance`.
+pub fn classifierReceiverAbi(fqn: []const u8) ReceiverAbi {
+    if (std.mem.eql(u8, fqn, "kotlin.Function")) return .specialized;
+    if (std.mem.startsWith(u8, fqn, "kotlin.Function") and
+        allAsciiDigits(fqn["kotlin.Function".len..])) return .specialized;
+
+    const specialized = [_][]const u8{
+        "kotlin.Any",
+        "kotlin.Nothing",
+        "kotlin.Unit",
+        "kotlin.Boolean",
+        "kotlin.Byte",
+        "kotlin.Short",
+        "kotlin.Int",
+        "kotlin.Long",
+        "kotlin.UByte",
+        "kotlin.UShort",
+        "kotlin.UInt",
+        "kotlin.ULong",
+        "kotlin.Float",
+        "kotlin.Double",
+        "kotlin.Char",
+        "kotlin.Number",
+        "kotlin.Comparable",
+        "kotlin.String",
+        "kotlin.CharSequence",
+        "kotlin.Pair",
+        "kotlin.Triple",
+        "kotlin.Result",
+        "kotlin.Array",
+        "kotlin.BooleanArray",
+        "kotlin.ByteArray",
+        "kotlin.ShortArray",
+        "kotlin.IntArray",
+        "kotlin.LongArray",
+        "kotlin.UByteArray",
+        "kotlin.UShortArray",
+        "kotlin.UIntArray",
+        "kotlin.ULongArray",
+        "kotlin.FloatArray",
+        "kotlin.DoubleArray",
+        "kotlin.CharArray",
+        "kotlin.Throwable",
+        "kotlin.Exception",
+        "kotlin.RuntimeException",
+        "kotlin.Error",
+        "kotlin.IllegalArgumentException",
+        "kotlin.IllegalStateException",
+        "kotlin.IndexOutOfBoundsException",
+        "kotlin.ArrayIndexOutOfBoundsException",
+        "kotlin.StringIndexOutOfBoundsException",
+        "kotlin.NullPointerException",
+        "kotlin.ArithmeticException",
+        "kotlin.ClassCastException",
+        "kotlin.NoSuchElementException",
+        "kotlin.NumberFormatException",
+        "kotlin.UnsupportedOperationException",
+        "kotlin.UninitializedPropertyAccessException",
+        "kotlin.ConcurrentModificationException",
+        "kotlin.NoWhenBranchMatchedException",
+        "kotlin.AssertionError",
+        "kotlin.NegativeArraySizeException",
+        "kotlin.collections.Iterable",
+        "kotlin.collections.MutableIterable",
+        "kotlin.collections.Collection",
+        "kotlin.collections.MutableCollection",
+        "kotlin.collections.List",
+        "kotlin.collections.MutableList",
+        "kotlin.collections.ArrayList",
+        "kotlin.collections.Set",
+        "kotlin.collections.MutableSet",
+        "kotlin.collections.HashSet",
+        "kotlin.collections.LinkedHashSet",
+        "kotlin.collections.Map",
+        "kotlin.collections.MutableMap",
+        "kotlin.collections.HashMap",
+        "kotlin.collections.LinkedHashMap",
+        "kotlin.collections.Map.Entry",
+        "kotlin.collections.MutableMap.MutableEntry",
+        "kotlin.collections.Grouping",
+        "kotlin.collections.Iterator",
+        "kotlin.collections.MutableIterator",
+        "kotlin.collections.ListIterator",
+        "kotlin.collections.MutableListIterator",
+        "kotlin.collections.BooleanIterator",
+        "kotlin.collections.ByteIterator",
+        "kotlin.collections.ShortIterator",
+        "kotlin.collections.IntIterator",
+        "kotlin.collections.LongIterator",
+        "kotlin.collections.UByteIterator",
+        "kotlin.collections.UShortIterator",
+        "kotlin.collections.UIntIterator",
+        "kotlin.collections.ULongIterator",
+        "kotlin.collections.FloatIterator",
+        "kotlin.collections.DoubleIterator",
+        "kotlin.collections.CharIterator",
+        "kotlin.collections.RandomAccess",
+        "kotlin.enums.EnumEntries",
+        "kotlin.sequences.Sequence",
+        "kotlin.ranges.ClosedRange",
+        "kotlin.ranges.OpenEndRange",
+        "kotlin.ranges.IntProgression",
+        "kotlin.ranges.LongProgression",
+        "kotlin.ranges.UIntProgression",
+        "kotlin.ranges.ULongProgression",
+        "kotlin.ranges.CharProgression",
+        "kotlin.ranges.IntRange",
+        "kotlin.ranges.LongRange",
+        "kotlin.ranges.UIntRange",
+        "kotlin.ranges.ULongRange",
+        "kotlin.ranges.CharRange",
+        "kotlin.reflect.KClassifier",
+        "kotlin.reflect.KClass",
+        "kotlin.reflect.KCallable",
+        "kotlin.reflect.KFunction",
+        "kotlin.reflect.KProperty",
+        "kotlin.reflect.KProperty0",
+        "kotlin.reflect.KProperty1",
+        "kotlin.reflect.KMutableProperty",
+        "kotlin.reflect.KMutableProperty0",
+        "kotlin.reflect.KMutableProperty1",
+        "kotlin.text.Appendable",
+        "kotlin.text.StringBuilder",
+        "kotlin.text.Regex",
+        "kotlin.text.MatchResult",
+        "kotlin.text.MatchGroup",
+        "kotlin.properties.ReadOnlyProperty",
+        "kotlin.properties.ReadWriteProperty",
+        "kotlin.time.TimeMark",
+        "kotlin.time.ComparableTimeMark",
+    };
+    for (specialized) |name| {
+        if (std.mem.eql(u8, fqn, name)) return .specialized;
+    }
+    return .instance;
+}
+
+fn allAsciiDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
 pub const Value = union(enum) {
     Unit,
     /// The `COROUTINE_SUSPENDED` singleton.
@@ -2085,7 +2242,7 @@ pub const Value = union(enum) {
             "NoSuchElementException",          "NumberFormatException",
             "UnsupportedOperationException",   "UninitializedPropertyAccessException",
             "ConcurrentModificationException", "NoWhenBranchMatchedException",
-            "NegativeArraySizeException",                "CancellationException",
+            "NegativeArraySizeException",      "CancellationException",
         };
         if (std.mem.eql(u8, name, "RuntimeException") and matchesAny(tail, &runtime_exc)) return true;
         if (std.mem.eql(u8, name, "IndexOutOfBoundsException") and
@@ -2827,7 +2984,7 @@ fn matchesAny(name: []const u8, candidates: []const []const u8) bool {
 
 fn throwableIsErrorSide(tail: []const u8) bool {
     return matchesAny(tail, &.{
-        "Error",            "AssertionError",
+        "Error",               "AssertionError",
         "NotImplementedError", "OutOfMemoryError",
         "StackOverflowError",  "FileFailedToInitializeException",
     });
@@ -3032,9 +3189,9 @@ pub const EvalResult = union(enum) {
 /// `List<String>` extension). Head names only — the lowering records what
 /// the source wrote, without nested generic arguments.
 const elem_typed_creators = [_][]const u8{
-    "listOf",       "mutableListOf", "emptyList",    "arrayListOf", "listOfNotNull",
-    "buildList",    "setOf",         "mutableSetOf", "emptySet",    "hashSetOf",
-    "linkedSetOf",  "sortedSetOf",   "buildSet",     "arrayOf",     "emptyArray",
+    "listOf",       "mutableListOf", "emptyList",     "arrayListOf", "listOfNotNull",
+    "buildList",    "setOf",         "mutableSetOf",  "emptySet",    "hashSetOf",
+    "linkedSetOf",  "sortedSetOf",   "buildSet",      "arrayOf",     "emptyArray",
     "arrayOfNulls", "sequenceOf",    "emptySequence",
 };
 
@@ -3133,6 +3290,15 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "classifier receiver ABI separates host values from source classes" {
+    try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.collections.Collection"));
+    try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.collections.Grouping"));
+    try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.sequences.Sequence"));
+    try testing.expectEqual(ReceiverAbi.specialized, classifierReceiverAbi("kotlin.Function2"));
+    try testing.expectEqual(ReceiverAbi.instance, classifierReceiverAbi("kotlin.sequences.DropTakeSequence"));
+    try testing.expectEqual(ReceiverAbi.instance, classifierReceiverAbi("sample.Collection"));
+}
 
 test "numeric type fqn and rank" {
     try testing.expectEqualStrings("kotlin.Int", (Value{ .Int = 1 }).typeFqn());

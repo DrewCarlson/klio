@@ -207,7 +207,10 @@ pub fn lowerWhenWithSubjectReg(
             .f = next_blk,
         } });
         b.switchTo(body_blk);
-        const narrowed = try narrowSubjectForBranch(b, subject, &branch);
+        const narrowed = if (subject != null)
+            try narrowSubjectForBranch(b, subject, &branch)
+        else
+            try narrowConditionForBranch(b, &branch);
         const v = try lowerExpr(b, &branch.body);
         if (narrowed) |n| b.restoreLocal(n);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
@@ -219,6 +222,18 @@ pub fn lowerWhenWithSubjectReg(
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
     return result;
+}
+
+/// A subjectless `when` branch whose sole condition is an `is` check carries
+/// the same smart-cast evidence as an `if` condition.
+fn narrowConditionForBranch(
+    b: *FuncBuilder,
+    branch: *const ast.WhenBranch,
+) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
+    if (branch.patterns.len != 1) return null;
+    const p = &branch.patterns[0];
+    if (p.kind != .Value) return null;
+    return expr_lower.narrowIsCheck(b, &p.kind.Value);
 }
 
 /// A single `is T` pattern over a bare-name subject smart-casts that name to

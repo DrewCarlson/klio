@@ -255,11 +255,20 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_enclosing_recv = null;
         b.setEnclosingRecvTy(rt);
     }
+    if (module.pending_lambda_receiver_tower) |tower| {
+        module.pending_lambda_receiver_tower = null;
+        defer moduleAllocator(module).free(tower);
+        try b.setImplicitReceiverTower(tower);
+    }
     // A local extension FUNCTION's body owns its declared receiver outright
     // (stashed by `lowerLocalFnDecl`): the same standing a top-level
     // extension body gets from `setRecvTy`, so bare-call resolution prefers
     // extensions on the receiver over same-named plain top-level functions.
-    if (module.pending_lambda_own_recv) |rt| {
+    if (module.pending_lambda_own_recv_type) |receiver| {
+        module.pending_lambda_own_recv_type = null;
+        module.pending_lambda_own_recv = null;
+        b.setRecvTypeRefOwned(receiver);
+    } else if (module.pending_lambda_own_recv) |rt| {
         module.pending_lambda_own_recv = null;
         b.setRecvTy(rt);
     }
@@ -281,6 +290,8 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     if (module.pending_lambda_local_decl_types) |*locals| {
         try b.inheritLocalDeclTypes(locals);
         var owned = locals.*;
+        var type_it = owned.types.valueIterator();
+        while (type_it.next()) |ty| ty.deinit(b.allocator);
         owned.types.deinit();
         owned.nullable.deinit();
         owned.call_returns.deinit();
@@ -296,7 +307,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // erased (see FuncBuilder.type_param_names).
     if (module.pending_lambda_type_params) |tps| {
         module.pending_lambda_type_params = null;
+        defer moduleAllocator(module).free(tps);
         for (tps) |tp| try b.addTypeParamName(tp);
+    }
+    if (module.pending_lambda_type_param_bounds) |bounds| {
+        module.pending_lambda_type_param_bounds = null;
+        defer moduleAllocator(module).free(bounds);
+        for (bounds) |bound| try b.addTypeParamBound(bound.param, bound.bound);
     }
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that
@@ -376,6 +393,18 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    if (module.pending_lambda_param_types) |expected_types| {
+        module.pending_lambda_param_types = null;
+        defer moduleAllocator(module).free(expected_types);
+        for (expected_types, names.items, 0..) |expected, name, i| {
+            var owned = expected;
+            if (i < param_tys.len and param_tys[i] != null) {
+                owned.deinit(b.allocator);
+                continue;
+            }
+            try b.setLocalDeclTypeOwned(name, owned);
+        }
+    }
     for (params, 0..) |p, i| {
         if (i >= param_tys.len) break;
         const ty = param_tys[i] orelse continue;

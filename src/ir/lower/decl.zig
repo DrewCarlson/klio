@@ -159,7 +159,10 @@ pub fn emitContextParamLoads(
         try b.push(.{ .CtxLoad = .{ .dst = dst, .ty = ty_const, .erased = erased } });
         if (!std.mem.eql(u8, cp.name.name, "_")) {
             try b.bind(cp.name.name, dst);
-            try b.setLocalDeclType(cp.name.name, cp.ty.name.name);
+            try b.setLocalDeclTypeOwned(
+                cp.name.name,
+                try loweredTypeRef(b.allocator, &cp.ty, true),
+            );
             if (cp.ty.nullable) try b.setLocalDeclNullable(cp.name.name);
             if (cp.ty.function) |ft| {
                 if (ft.receiver != null) try b.setLocalDeclRecvFn(cp.name.name);
@@ -353,7 +356,7 @@ pub fn reserveMemberHeaders(
             .arity = arity,
             .sig = sig,
             .kind = if (f.receiver_type != null) .member_extension else .instance_method,
-            .is_private = f.visibility == .Private,
+            .visibility = f.visibility,
             .is_inline = f.is_inline,
             .is_suspend = f.is_suspend,
             .has_body = f.body != null,
@@ -649,6 +652,8 @@ pub fn lowerClassWithExtras(
 
     const class_type_params = try a.alloc([]const u8, c.type_params.len);
     for (c.type_params, class_type_params) |*param, *out| out.* = param.name.name;
+    const class_type_param_variance = try a.alloc(ast.Variance, c.type_params.len);
+    for (c.type_params, class_type_param_variance) |*param, *out| out.* = param.variance;
 
     // Register the class shell first so the class name resolves inside
     // its own method bodies (`class Foo { fun copy() = Foo(...) }`).
@@ -664,6 +669,7 @@ pub fn lowerClassWithExtras(
         .companion = null,
         .supertypes = &.{},
         .type_params = class_type_params,
+        .type_param_variance = class_type_param_variance,
         .supertype_refs = &.{},
         .is_inner = c.is_inner,
         .is_abstract = c.is_abstract or c.is_interface or c.is_sealed,
@@ -671,6 +677,7 @@ pub fn lowerClassWithExtras(
         .is_fun_interface = c.is_fun_interface,
         .is_open = c.is_open,
         .is_value = c.is_value,
+        .receiver_abi = runtime.classifierReceiverAbi(class_fqn),
     });
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
@@ -775,7 +782,7 @@ pub fn lowerClassWithExtras(
                     .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
                     .sig = msig,
                     .kind = if (f.receiver_type != null) .member_extension else .instance_method,
-                    .is_private = f.visibility == .Private,
+                    .visibility = f.visibility,
                     .is_inline = f.is_inline,
                     .is_suspend = f.is_suspend,
                     .has_body = true,
@@ -905,25 +912,58 @@ fn renameParamHead(ty: ir.TypeRef, src: *const ast.TypeRef) ir.TypeRef {
 
 pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: bool) Allocator.Error!ir.TypeRef {
     var args: std.ArrayList(ir.TypeRef) = .empty;
-    errdefer args.deinit(allocator);
+    errdefer {
+        if (own_names) {
+            for (args.items) |*arg| arg.deinit(allocator);
+        }
+        args.deinit(allocator);
+    }
     var head: []const u8 = undefined;
+    var head_owned = false;
+    errdefer if (head_owned) allocator.free(head);
     if (ty.function) |ft| {
         head = try std.fmt.allocPrint(allocator, "Function{d}", .{ft.params.len});
-        if (ft.is_suspend) try args.append(allocator, try markerRef(allocator, "#suspend", own_names));
-        if (ft.receiver) |*recv| try args.append(allocator, try loweredTypeRef(allocator, recv, own_names));
-        for (ft.params) |*p| try args.append(allocator, try loweredTypeRef(allocator, p, own_names));
-        try args.append(allocator, try loweredTypeRef(allocator, &ft.ret, own_names));
+        head_owned = true;
+        if (ft.is_suspend) {
+            var marker = try markerRef(allocator, "#suspend", own_names);
+            errdefer if (own_names) marker.deinit(allocator);
+            try args.append(allocator, marker);
+        }
+        if (ft.receiver) |*recv| {
+            var receiver = try loweredTypeRef(allocator, recv, own_names);
+            errdefer if (own_names) receiver.deinit(allocator);
+            try args.append(allocator, receiver);
+        }
+        for (ft.params) |*p| {
+            var param = try loweredTypeRef(allocator, p, own_names);
+            errdefer if (own_names) param.deinit(allocator);
+            try args.append(allocator, param);
+        }
+        var ret = try loweredTypeRef(allocator, &ft.ret, own_names);
+        errdefer if (own_names) ret.deinit(allocator);
+        try args.append(allocator, ret);
     } else {
         head = if (own_names) try allocator.dupe(u8, ty.name.name) else ty.name.name;
-        for (ty.type_args) |*ta| try args.append(allocator, try loweredTypeArg(allocator, ta, own_names));
+        head_owned = own_names;
+        for (ty.type_args) |*ta| {
+            var arg = try loweredTypeArg(allocator, ta, own_names);
+            errdefer if (own_names) arg.deinit(allocator);
+            try args.append(allocator, arg);
+        }
     }
-    if (ty.definitely_non_null) try args.append(allocator, try markerRef(allocator, "#non-null", own_names));
+    if (ty.definitely_non_null) {
+        var marker = try markerRef(allocator, "#non-null", own_names);
+        errdefer if (own_names) marker.deinit(allocator);
+        try args.append(allocator, marker);
+    }
     if (ty.qualified_path) |qp| {
-        try args.append(allocator, .{
+        var marker = ir.TypeRef{
             .name = try std.fmt.allocPrint(allocator, "#qual:{s}", .{qp}),
             .nullable = false,
             .args = &.{},
-        });
+        };
+        errdefer if (own_names) marker.deinit(allocator);
+        try args.append(allocator, marker);
     }
     return .{ .name = head, .nullable = ty.nullable, .args = try args.toOwnedSlice(allocator) };
 }
@@ -931,6 +971,7 @@ pub fn loweredTypeRef(allocator: Allocator, ty: *const ast.TypeRef, own_names: b
 fn loweredTypeArg(allocator: Allocator, ta: *const ast.TypeArg, own_names: bool) Allocator.Error!ir.TypeRef {
     if (ta.is_star) return markerRef(allocator, "*", own_names);
     var lowered = try loweredTypeRef(allocator, &ta.ty, own_names);
+    errdefer if (own_names) lowered.deinit(allocator);
     const prefix: ?[]const u8 = switch (ta.variance) {
         .Invariant => null,
         .In => "in#",
@@ -1271,7 +1312,14 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // element type — recording the element head made `path.map { ... }`
     // carry `declared_recv=String` and bind CharSequence extensions.
     for (f.params) |*p| {
-        try b.setLocalDeclType(p.name.name, if (p.is_vararg) varargArrayHead(p.ty.name.name) else p.ty.name.name);
+        if (p.is_vararg) {
+            try b.setLocalDeclType(p.name.name, varargArrayHead(p.ty.name.name));
+        } else {
+            try b.setLocalDeclTypeOwned(
+                p.name.name,
+                try loweredTypeRef(b.allocator, &p.ty, true),
+            );
+        }
         if (p.ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (p.ty.function) |ft| {
             if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);
@@ -1389,11 +1437,20 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         // one is resolved by the reified splice) plus the enclosing class's
         // (never reified in Kotlin). A cast to such a name is unchecked/erased.
         for (f.type_params) |*tp| {
-            if (!tp.is_reified) try b.addTypeParamName(tp.name.name);
+            if (!tp.is_reified) {
+                var bound = if (tp.upper_bound) |upper| upper.name.name else "Any";
+                for (f.where_bounds) |where_bound| {
+                    if (std.mem.eql(u8, where_bound.name.name, tp.name.name)) {
+                        bound = where_bound.bound.name.name;
+                        break;
+                    }
+                }
+                try b.addTypeParamBound(tp.name.name, bound);
+            }
         }
         if (owner_class) |owner| {
             if (module.registry.class_type_param_bounds.get(owner)) |bounds| {
-                for (bounds) |bnd| try b.addTypeParamName(bnd.param);
+                for (bounds) |bnd| try b.addTypeParamBound(bnd.param, bnd.bound);
             }
         }
         for (f.params) |*p| {
@@ -1434,7 +1491,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // call to a same-named extension inside the body resolves to the
     // overload whose receiver type matches (e.g. `Source.takeWhile` over
     // `CharSequence.takeWhile` inside `fun Source.forEach`).
-    b.setRecvTy(if (f.receiver_type) |r| r.name.name else null);
+    if (f.receiver_type) |*receiver| {
+        b.setRecvTypeRefOwned(try loweredTypeRef(b.allocator, receiver, true));
+    } else {
+        b.setRecvTy(null);
+    }
     if (own_members) |set| {
         b.setOwnMembers(try cloneStringSet(a, set));
     }
@@ -1488,11 +1549,10 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // bare integer-literal result to a `Long` return slot (`fun f():
     // Long = 0`). Inferred returns (no annotation) stay `Unit` —
     // harmless, as the coercion only triggers on an explicit `Long`.
-    const return_ty: TypeRef = if (f.return_type) |*rt| .{
-        .name = try loweredTypeName(a, rt),
-        .nullable = rt.nullable,
-        .args = &.{},
-    } else build.typeUnit();
+    const return_ty: TypeRef = if (f.return_type) |*rt|
+        try loweredTypeRef(a, rt, false)
+    else
+        build.typeUnit();
     var func = try b.finish(f.name.name, fqn, return_ty);
 
     var params: std.ArrayList(Param) = .empty;

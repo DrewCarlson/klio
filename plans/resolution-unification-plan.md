@@ -200,8 +200,12 @@ the fun-interface classifier call itself lowers directly to `NewInstance` with
 its resolved `ClassId`. Named open-class calls carry source-argument to
 declaration-parameter indices in `CallVirtual`, so override selection never
 rebinds names against the leaf implementation.
-Kotlin runtime classes with specialized scalar/collection representations
-remain on the compatibility path until their ABI is explicit. Named,
+Every IR class now carries an explicit receiver ABI from the canonical runtime
+classifier manifest. Source-backed classes use numeric instance slots;
+specialized scalar/collection values and host-synthesized instances such as
+`Grouping` use the host member ABI. This replaces the former `kotlin.*`
+package heuristic while allowing source-backed stdlib interfaces such as
+`DropTakeSequence` to dispatch statically. Named,
 defaulted, and vararg interface calls, including wrapped and callable-backed
 SAM receivers, use numeric declaration-parameter maps. Static spread calls
 retain their virtual slot while expansion duplicates the selected vararg index,
@@ -249,11 +253,39 @@ receiver-formed declarations. `DeclSig.host_symbol` records the exact
 fully-qualified host ABI symbol selected for each source declaration; an absent
 value means the declaration has no proven host form. The mapping is computed
 once while headers register, is restricted to the Kotlin host surface, and is
-serialized in image format 32. A proven non-inline Kotlin extension therefore
+serialized in image format 33. The same declaration record now preserves all
+four Kotlin visibility levels instead of collapsing member visibility to a
+private bit. A proven non-inline Kotlin extension therefore
 resolves through `Module.resolveExtensionCall` and emits `Call(FuncId)` without
-a runtime receiver/name probe. The `stdlib_string_ops.kt` main now reports
-52 direct and 20 dynamic calls, improved from 36 direct and 36 dynamic; this
-gives the slice a repeatable static-dispatch coverage measure.
+a runtime receiver/name probe.
+
+Source-bodied Kotlin extensions use the same rule: their reserved `FuncId` is
+already their executable ABI, so they no longer need a host symbol to become an
+exact call. Scope selection now happens after applicability, keeping a
+non-applicable inner tier from hiding an applicable outer tier. Structural
+generic arguments must match exactly before this path commits; variance-aware
+substitution can relax that conservative boundary later. A possible member
+extension keeps the call deferred because its ABI also needs an implicit
+dispatch-owner receiver, and open member extensions select overrides on that
+owner. The `stdlib_string_ops.kt` main now reports 59 direct and 13 dynamic
+calls, improved from 36 direct and 36 dynamic; this gives the work a repeatable
+static-dispatch coverage measure.
+
+Structural type evidence now crosses locals, captures, lambda parameters,
+receiver functions, declaration return types, and image serialization without
+collapsing generic arguments to simple heads. Argument lowering snapshots this
+metadata per call, so lowering a nested earlier argument cannot erase the
+expected types of a later lambda. Smart casts of both named values and `this`
+update the same structural receiver channel in `if`, subject-bound `when`, and
+subjectless `when` branches.
+
+Binary `+` and `-` use the explicit-call resolver before the compatibility
+`BinOp` path. Chained operators recursively instantiate the selected
+declaration's return type, so `Iterable<T>.plus` followed by another `plus`
+continues from `List<T>`, and a `Sequence<T>` argument selects the sequence
+overload. Proven operators emit exact `Call(FuncId)` or
+`CallVirtual(MethodSlotId)` instructions instead of asking the runtime to
+select an overload by the receiver value.
 
 Host identity and executable-form selection remain separate. A body-bearing
 receiver declaration keeps its Kotlin body because that declaration accepts

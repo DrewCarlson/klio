@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 32;
+pub const FORMAT_VERSION: u32 = 33;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -605,6 +605,7 @@ const RegistryImage = struct {
     local_fn_defaults: []KV(FuncId, []const ?FuncId),
     abstract_member_defaults: []struct { a: []const u8, b: []const u8, slots: []const ?FuncId },
     type_aliases: []StrKV,
+    type_alias_types: []KV([]const u8, ir.ModuleRegistry.TypeAliasShape),
     import_aliases: []struct {
         file: FileId,
         leaves: []struct { leaf: []const u8, paths: []ir.ModuleRegistry.ImportPath },
@@ -665,7 +666,7 @@ pub const DeclSigLite = struct {
     /// source lowering, so this is part of the executable image contract.
     sig: []const ir.TypeRef,
     kind: ir.FuncKind,
-    is_private: bool,
+    visibility: ast.Visibility,
     is_inline: bool,
     is_suspend: bool,
     has_body: bool,
@@ -1275,7 +1276,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
                 .has_vararg = ds.arity.has_vararg,
                 .sig = ds.sig,
                 .kind = ds.kind,
-                .is_private = ds.is_private,
+                .visibility = ds.visibility,
                 .is_inline = ds.is_inline,
                 .is_suspend = ds.is_suspend,
                 .has_body = ds.has_body,
@@ -1348,6 +1349,11 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             break :blk list;
         },
         .type_aliases = try strMapToSlice([]const u8, a, &r.type_aliases),
+        .type_alias_types = try strMapToSliceKV(
+            ir.ModuleRegistry.TypeAliasShape,
+            a,
+            &r.type_alias_types,
+        ),
         .import_aliases = blk: {
             const E = @TypeOf(out.registry.import_aliases[0]);
             const L = @TypeOf(out.registry.import_aliases[0].leaves[0]);
@@ -2052,7 +2058,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
             .arity = .{ .required = l.required, .total = l.total, .has_vararg = l.has_vararg },
             .sig = l.sig,
             .kind = l.kind,
-            .is_private = l.is_private,
+            .visibility = l.visibility,
             .is_inline = l.is_inline,
             .is_suspend = l.is_suspend,
             .has_body = l.has_body,
@@ -2100,6 +2106,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
         try r.abstract_member_defaults.put(.{ .a = entry.a, .b = entry.b }, list);
     }
     for (ri.type_aliases) |kv| try r.type_aliases.put(kv.k, kv.v);
+    for (ri.type_alias_types) |kv| try r.type_alias_types.put(kv.k, kv.v);
     for (ri.import_aliases) |entry| {
         var inner = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         for (entry.leaves) |le| {
@@ -2507,6 +2514,9 @@ test "module image preserves linked identities with lazy function headers" {
         .init_block = null,
         .companion = null,
         .supertypes = &.{},
+        .type_params = &.{"T"},
+        .type_param_variance = &.{.Out},
+        .receiver_abi = .specialized,
     });
     const abstract_all = FuncId.from(10);
     const element_all = FuncId.from(11);
@@ -2524,6 +2534,18 @@ test "module image preserves linked identities with lazy function headers" {
         .kind = .top_level_extension,
         .has_body = true,
         .host_symbol = "kotlin.IntArray.min",
+    });
+    try source.registry.type_alias_types.put("Names", .{
+        .type_params = &.{},
+        .target = .{
+            .name = "List",
+            .nullable = false,
+            .args = @constCast(&[_]ir.TypeRef{.{
+                .name = "String",
+                .nullable = false,
+                .args = &.{},
+            }}),
+        },
     });
 
     var image: ModuleImage = undefined;
@@ -2551,6 +2573,11 @@ test "module image preserves linked identities with lazy function headers" {
         "kotlin.IntArray.min",
         loaded.decl_sigs.get(min.int()).?.host_symbol.?,
     );
+    try testing.expectEqual(ast.Variance.Out, loaded.classes.items[element.int()].type_param_variance[0]);
+    try testing.expectEqual(runtime.ReceiverAbi.specialized, loaded.classes.items[element.int()].receiver_abi);
+    const alias = loaded.registry.type_alias_types.get("Names").?;
+    try testing.expectEqualStrings("List", alias.target.name);
+    try testing.expectEqualStrings("String", alias.target.args[0].name);
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {

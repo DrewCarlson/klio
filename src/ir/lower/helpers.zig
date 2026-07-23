@@ -291,6 +291,12 @@ pub fn lowerArgRunFull(
     // the user wrote, not to its receiver.
     const call_label = b.current_call_label orelse b.pending_lambda_label;
     b.pending_lambda_label = null;
+    const arg_broad_masks = b.pending_arg_broad_masks;
+    const arg_fn_generic = b.pending_arg_fn_generic;
+    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    b.pending_arg_broad_masks = null;
+    b.pending_arg_fn_generic = null;
+    b.pending_arg_lambda_param_types = null;
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
         // A sibling-solved expected type applies to exactly one arg node.
@@ -299,8 +305,12 @@ pub fn lowerArgRunFull(
         }
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
-        b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
-        b.pending_ref_fn_generic = if (b.pending_arg_fn_generic) |g| (j < g.len and g[j]) else false;
+        b.pending_lambda_broad_mask = if (arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
+        b.pending_ref_fn_generic = if (arg_fn_generic) |g| (j < g.len and g[j]) else false;
+        b.pending_ref_lambda_param_types = if (arg_lambda_param_types) |types|
+            (if (j < types.len) types[j] else null)
+        else
+            null;
         const coerced: ?Reg = if (param_ty_names) |pts|
             (if (j < pts.len) (if (pts[j]) |tn| try coerceNumericLiteralArg(b, &args[j], tn) else null) else null)
         else
@@ -310,11 +320,10 @@ pub fn lowerArgRunFull(
         b.pending_lambda_arity = -1;
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
+        b.pending_ref_lambda_param_types = null;
         if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
-    b.pending_arg_broad_masks = null;
-    b.pending_arg_fn_generic = null;
     b.restoreExpected(prev_expected);
     return .{ first, @intCast(n) };
 }
@@ -345,6 +354,12 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
     // pending label, which a call-shaped receiver re-arms in passing.
     const call_label = b.current_call_label orelse b.pending_lambda_label;
     b.pending_lambda_label = null;
+    const arg_broad_masks = b.pending_arg_broad_masks;
+    const arg_fn_generic = b.pending_arg_fn_generic;
+    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    b.pending_arg_broad_masks = null;
+    b.pending_arg_fn_generic = null;
+    b.pending_arg_lambda_param_types = null;
     // Arguments are not in the call's tail position, so the enclosing
     // expected-type hint must not reach a reified inline call here.
     const prev_expected = b.pushExpected(null);
@@ -355,18 +370,21 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
         }
         b.pending_lambda_label = call_label;
         b.pending_lambda_arity = if (arg_arity) |aa| (if (j < aa.len) aa[j] else -1) else -1;
-        b.pending_lambda_broad_mask = if (b.pending_arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
-        b.pending_ref_fn_generic = if (b.pending_arg_fn_generic) |g| (j < g.len and g[j]) else false;
+        b.pending_lambda_broad_mask = if (arg_broad_masks) |m| (if (j < m.len) m[j] else 0) else 0;
+        b.pending_ref_fn_generic = if (arg_fn_generic) |g| (j < g.len and g[j]) else false;
+        b.pending_ref_lambda_param_types = if (arg_lambda_param_types) |types|
+            (if (j < types.len) types[j] else null)
+        else
+            null;
         const r = try expr_mod.lowerExpr(b, &args[j]);
         b.pending_lambda_label = null;
         b.pending_lambda_arity = -1;
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
+        b.pending_ref_lambda_param_types = null;
         if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
-    b.pending_arg_broad_masks = null;
-    b.pending_arg_fn_generic = null;
     b.restoreExpected(prev_expected);
     return .{ first, @intCast(n) };
 }

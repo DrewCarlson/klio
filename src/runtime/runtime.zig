@@ -69,6 +69,8 @@ pub const allocTrackReportPageStderr = alloc_track_mod.reportPageStderr;
 
 // value
 pub const Value = value_mod.Value;
+pub const ReceiverAbi = value_mod.ReceiverAbi;
+pub const classifierReceiverAbi = value_mod.classifierReceiverAbi;
 pub const StackFrame = value_mod.StackFrame;
 pub const StackTraceData = value_mod.StackTraceData;
 pub const StackRef = value_mod.StackRef;
