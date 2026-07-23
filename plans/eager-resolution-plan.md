@@ -71,16 +71,18 @@ covers the heuristic's full decision context first. Queue state:
   heuristic. The hardening path is to thread declared receiver-shapes into
   `ClosureInfo` (an explicit `has_receiver` bit from the lambda's declared type)
   so the binding stops being an arity+capture guess; queued as an enhancement.
-- **`CallMemberOrValue` exact emission: attempted twice, reverted twice.**
+- **`CallMemberOrValue` exact emission: metadata prerequisite landed.**
   First: the hierarchy sets cannot disprove EXTENSIONS (stdlib extensions on the
   receiver's type win over a local callable — the MinMax family measured it).
   Second: the extension-candidate index (`Module.extCouldApply` — landed, kept)
-  is itself unsound at lowering time against the image's lazily-decoded func
-  headers: a deferred `IntArray.min` header carries no receiver param until its
-  body decodes, so the index answered "no extension" while one existed
-  (`elements.min()` bound the Int param named `min`). The TRUE precondition is
-  header-complete func metadata at lowering time — the resolution plan's P10
-  step 2 / resolved-flat-sections territory. The race stays until then.
+  was unsound at lowering time against the image's lazily-decoded func headers:
+  a deferred `IntArray.min` header carried no receiver param until its body
+  decoded, so the index answered "no extension" while one existed
+  (`elements.min()` bound the Int param named `min`). The index now derives from
+  the complete declaration index and image-preserved `DeclSig.receiver_ty`,
+  including the lazy base-function range; it no longer reads materialized
+  function parameters. Source and image tests pin the bodyless-header case.
+  Exact emission can now advance behind this index with eager/lazy audit parity.
 - **literal-coercion gap: NEUTRALIZED** — the only live path was eager primitive
   fills, which the channel excludes. The enhancement that would let primitives
   fill is a numeric-family-aware evidence comparison in applicability (Int

@@ -1337,12 +1337,12 @@ pub const Module = struct {
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
     /// Extension-candidate index: receiver head -> the extension NAMES
     /// declared on it, plus the generic-receiver names (`fun <T> T.also`)
-    /// that apply to every head. Rebuilt lazily when the func table has
-    /// grown. Answers the E4c membership question the hierarchy sets
+    /// that apply to every head. Rebuilt lazily when the declaration index
+    /// has grown. Answers the E4c membership question the hierarchy sets
     /// cannot: could ANY extension named N serve receiver head H?
     ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
     generic_ext_names: ?std.StringHashMap(void) = null,
-    ext_index_funcs_len: usize = 0,
+    ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
     /// Top-level function declarations by simple name → `FuncId`.
@@ -2678,9 +2678,9 @@ pub const Module = struct {
     /// Chain-aware: the head's supertype chain and the builtin-supertype
     /// table are consulted, and generic-receiver extensions answer true
     /// for every head. Conservative on staleness: the index rebuilds when
-    /// the func table has grown since the last build.
+    /// the declaration index has grown since the last build.
     pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
-        if (self.ext_names_by_recv_head == null or self.ext_index_funcs_len != self.funcs.items.len) {
+        if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
             self.rebuildExtIndex(allocator) catch return true;
         }
         if (self.generic_ext_names.?.contains(name)) return true;
@@ -2712,24 +2712,33 @@ pub const Module = struct {
         if (self.generic_ext_names) |*m| m.deinit();
         var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
         var gen = std.StringHashMap(void).init(allocator);
-        for (self.funcs.items) |*f| {
-            const is_ext = f.kind == .top_level_extension or f.kind == .member_extension;
+        for (self.func_index.items) |entry| {
+            const ds = self.decl_sigs.get(entry.id.int());
+            const f = if (ds == null) self.funcById(entry.id) else null;
+            const kind = if (ds) |sig| sig.kind else if (f) |func| func.kind else continue;
+            const is_ext = kind == .top_level_extension or kind == .member_extension;
             if (!is_ext) continue;
-            if (f.params.len == 0) continue;
-            const head = f.params[0].ty.name;
-            // A short all-uppercase head is a type parameter: the
-            // extension applies to every receiver.
-            if (head.len <= 2 and headAllUpper(head)) {
-                try gen.put(f.name, {});
+            const receiver_ty = if (ds) |sig|
+                sig.receiver_ty
+            else if (f) |func|
+                if (func.params.len != 0) func.params[0].ty else null
+            else
+                null;
+            const raw_head = (receiver_ty orelse continue).name;
+            const head = staticTypeHead(raw_head);
+            if (self.funcTypeParamIndex(entry.id, head) != null or
+                (head.len <= 2 and headAllUpper(head)))
+            {
+                try gen.put(entry.name, {});
                 continue;
             }
             const gop = try idx.getOrPut(head);
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-            try gop.value_ptr.put(f.name, {});
+            try gop.value_ptr.put(entry.name, {});
         }
         self.ext_names_by_recv_head = idx;
         self.generic_ext_names = gen;
-        self.ext_index_funcs_len = self.funcs.items.len;
+        self.ext_index_decl_count = self.func_index.items.len;
     }
 
     /// The receiver class head typeck bound for the lambda body at `sp`.
@@ -5918,6 +5927,35 @@ test "packageOfFqn strips the trailing simple name" {
     try testing.expectEqualStrings("kotlin.math", packageOfFqn("kotlin.math.abs", "abs"));
     // A mangled nested FQN: the package is everything up to the last dot.
     try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
+}
+
+test "extension candidate index uses declaration metadata for bodyless headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const min = try pushTestFuncOpts(
+        &m,
+        a,
+        "min",
+        "sample.min",
+        "sample",
+        0,
+        .{ .extension = true, .stub = true },
+    );
+    m.funcs.items[min.int()].params = &.{};
+    try m.decl_sigs.put(min.int(), .{
+        .receiver_ty = .{ .name = "IntArray", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+
+    try testing.expect(m.extCouldApply(a, "IntArray", "min"));
+    try testing.expect(!m.extCouldApply(a, "String", "min"));
+    try testing.expect(!m.extCouldApply(a, "IntArray", "max"));
 }
 
 test "method slots link generic overrides and multiple interface roots" {

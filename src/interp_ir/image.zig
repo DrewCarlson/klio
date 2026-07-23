@@ -648,9 +648,9 @@ const ModuleImage = struct {
     deferred_func_section: []const u8,
 };
 
-/// Name-level projection of `Module.DeclSig` for the image: runtime consumers
-/// read the receiver head, arity, owner, kind flags, and body status. The full
-/// structural parameter graph stays lowering-only.
+/// Executable-image projection of `Module.DeclSig`: runtime and extending
+/// lowerers retain receiver identity, structural user parameters, arity,
+/// ownership, callable kind, and executable-form flags.
 pub const DeclSigLite = struct {
     fid: u32,
     enclosing_class: ?ir.ClassId,
@@ -2464,7 +2464,7 @@ test "codec preserves shared slices as one decoded slice" {
     try testing.expect(got.first.ptr == got.second.ptr);
 }
 
-test "module image preserves linked method slots with lazy function headers" {
+test "module image preserves linked identities with lazy function headers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2483,12 +2483,20 @@ test "module image preserves linked method slots with lazy function headers" {
     });
     const abstract_all = FuncId.from(10);
     const element_all = FuncId.from(11);
+    const min = FuncId.from(12);
     try source.registerMemberDecl(a, "sample.Modifier", "all", abstract_all);
     try source.registerMethodSlotTarget(
         element,
         ir.MethodSlotId.fromFunc(abstract_all),
         element_all,
     );
+    try source.func_index.append(a, .{ .name = "min", .id = min });
+    try source.decl_sigs.put(min.int(), .{
+        .receiver_ty = .{ .name = "IntArray", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
 
     var image: ModuleImage = undefined;
     try testing.expect(try moduleToImage(a, &source, &image));
@@ -2509,6 +2517,8 @@ test "module image preserves linked method slots with lazy function headers" {
         element_all,
         loaded.methodSlotTarget(element, ir.MethodSlotId.fromFunc(abstract_all)).?,
     );
+    try testing.expect(loaded.extCouldApply(a, "IntArray", "min"));
+    try testing.expect(!loaded.extCouldApply(a, "String", "min"));
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {
