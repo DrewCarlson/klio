@@ -396,13 +396,22 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     if (module.pending_lambda_param_types) |expected_types| {
         module.pending_lambda_param_types = null;
         defer moduleAllocator(module).free(expected_types);
-        for (expected_types, names.items, 0..) |expected, name, i| {
+        // The producer clamps the type list to `min(ref types, value params)`,
+        // so it may carry FEWER entries than this lambda's param names (an
+        // implicit-`it` / suppressed-`it` divergence, or a partially-typed SAM):
+        // bind the leading names that have a type and free any surplus type.
+        const bind_n = @min(expected_types.len, names.items.len);
+        for (expected_types[0..bind_n], names.items[0..bind_n], 0..) |expected, name, i| {
             var owned = expected;
             if (i < param_tys.len and param_tys[i] != null) {
                 owned.deinit(b.allocator);
                 continue;
             }
             try b.setLocalDeclTypeOwned(name, owned);
+        }
+        for (expected_types[bind_n..]) |surplus| {
+            var owned = surplus;
+            owned.deinit(b.allocator);
         }
     }
     for (params, 0..) |p, i| {
