@@ -22,7 +22,7 @@ SDK="$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null || true)"
 echo "==> build the static interpreter library (mobile-lib) for ios-sim"
 zig build mobile-lib -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseFast
 LIB="$(pwd)/zig-out/lib/libklio-ios-sim.a"
-ZSTD="$(pwd)/zig-out/lib/libzstd.a"
+ZSTD="$(pwd)/zig-out/lib/libzstd-ios-sim.a"
 [ -f "$LIB" ] || fail "expected $LIB"
 [ -f "$ZSTD" ] || fail "expected $ZSTD"
 

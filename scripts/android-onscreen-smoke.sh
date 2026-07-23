@@ -38,7 +38,7 @@ echo "==> cross-compile interpreter + host klio for baking"
 zig build mobile-lib -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast -Dandroid-api="$API"
 HOST_PREFIX="${ANDROID_HOST_PREFIX:-$(pwd)/zig-out/host}"
 zig build -Doptimize=ReleaseFast -p "$HOST_PREFIX"
-LIB="$(pwd)/zig-out/lib/libklio-android.a"; ZSTD="$(pwd)/zig-out/lib/libzstd.a"; HOSTKLIO="$HOST_PREFIX/bin/klio"
+LIB="$(pwd)/zig-out/lib/libklio-android.a"; ZSTD="$(pwd)/zig-out/lib/libzstd-android.a"; HOSTKLIO="$HOST_PREFIX/bin/klio"
 
 echo "==> compile shim (EGL/GLES backend) + native host, link the .so"
 "$CC"  -O2 -fPIC -fno-emulated-tls -I"$GLUE" -c mobile/android/host/native_activity.c -o "$OUT/nact.o"

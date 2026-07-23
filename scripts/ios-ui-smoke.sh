@@ -31,7 +31,7 @@ zig build -Doptimize=ReleaseFast -p "$HOST_PREFIX"   # base image is target-port
 echo "==> build interpreter lib + Skia shim for ios-sim"
 zig build mobile-lib skia-lib -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseFast
 LIB="$(pwd)/zig-out/lib/libklio-ios-sim.a"
-ZSTD="$(pwd)/zig-out/lib/libzstd.a"
+ZSTD="$(pwd)/zig-out/lib/libzstd-ios-sim.a"
 SHIM="$(pwd)/zig-out/lib/libklio_skia.a"
 HOSTKLIO="$HOST_PREFIX/bin/klio"
 for f in "$LIB" "$ZSTD" "$SHIM" "$HOSTKLIO"; do [ -f "$f" ] || fail "expected $f"; done

@@ -1157,8 +1157,12 @@ fn buildZstd(
 ) *std.Build.Step.Compile {
     const dep = b.dependency("zstd", .{});
 
+    // Suffix the installed archive by target (libzstd-android.a, libzstd-ios-sim.a,
+    // libzstd.a for the host) so a cross build's archive never clobbers the host's
+    // at zig-out/lib — an app host links the target archive with its own toolchain,
+    // and a wrong-arch libzstd.a fails cryptically at link time.
     const lib = b.addLibrary(.{
-        .name = "zstd",
+        .name = b.fmt("zstd{s}", .{targetBinSuffix(target)}),
         .linkage = .static,
         .root_module = b.createModule(.{
             .target = target,
