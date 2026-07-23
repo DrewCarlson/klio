@@ -60,6 +60,12 @@ static long now_ns(void) {
 // the frame into recompose+layout / draw / swap.
 extern long klio_perf_surface_ns, klio_perf_present_ns, klio_perf_swap_ns;
 extern long klio_perf_surface_calls;   // rendered-frame count (winSurface acquisitions)
+extern int klio_frame_needs_render(void);   // resident VM has pending work / fresh input
+
+// A static scene between changes needs no per-vsync VM re-entry; skip
+// klio_render_frame while the VM reports nothing pending, but re-enter every
+// IDLE_PUMP frames so time-driven work not tied to the render flag still runs.
+#define IDLE_PUMP 12
 
 // Rolling per-60-frame timing: render = time inside klio_render_frame (VM
 // recompose + draw + eglSwapBuffers); gap = wall time between frame callbacks;
@@ -73,13 +79,15 @@ static void onFrame(long frameTimeNanos, void *data) {
     long t0 = now_ns();
     if (g_last_cb_ns) g_gap_ns += t0 - g_last_cb_ns;
     g_last_cb_ns = t0;
-    klio_perf_surface_ns = 0;                   // reset so a skipped frame reads 0
-    klio_render_frame();
-    g_render_ns += now_ns() - t0;
-    if (klio_perf_surface_ns > t0) {           // a window drew this frame
-        g_compose_ns += klio_perf_surface_ns - t0;
-        g_draw_ns += klio_perf_present_ns - klio_perf_surface_ns;
-        g_swap_ns += klio_perf_swap_ns;
+    if (klio_frame_needs_render() || g_frames % IDLE_PUMP == 0) {
+        klio_perf_surface_ns = 0;              // reset so a skipped frame reads 0
+        klio_render_frame();
+        g_render_ns += now_ns() - t0;
+        if (klio_perf_surface_ns > t0) {       // a window drew this frame
+            g_compose_ns += klio_perf_surface_ns - t0;
+            g_draw_ns += klio_perf_present_ns - klio_perf_surface_ns;
+            g_swap_ns += klio_perf_swap_ns;
+        }
     }
     if (++g_frames % 60 == 0) {
         LOG("frames=%lu render=%.1fms (compose=%.1f draw=%.1f swap=%.1f) gap=%.1fms (%.0ffps) input=%.1fms/%ldev rendered=%ld/60",

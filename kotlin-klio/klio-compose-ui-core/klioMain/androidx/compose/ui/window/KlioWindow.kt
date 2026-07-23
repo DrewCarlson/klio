@@ -377,7 +377,10 @@ private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioAppli
     // Redraw only windows with pending work (a recomposition this vsync, or an
     // input event marked them dirty), like the desktop loop.
     for (win in live) if (win.dirty) renderWindowFrame(win)
-    return true
+    // Report whether the VM still needs the next frame: pending recomposition /
+    // effects, or a window left un-rendered (e.g. no surface yet). When false the
+    // OS frame source can skip re-entering the VM until input or a periodic pump.
+    return recomposerDriver.recomposer.hasPendingWork || live.any { it.dirty }
 }
 
 /**

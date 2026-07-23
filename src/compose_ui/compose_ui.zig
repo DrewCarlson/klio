@@ -881,9 +881,25 @@ pub fn hostedActive() bool {
     return frame_cb.set;
 }
 
+/// Whether the resident VM still needs a frame: the last `frameHosted` reported
+/// pending work (a recomposition, running effect, or dirty window), or an input
+/// event has arrived since. The app shell's frame source reads this and skips
+/// re-entering the VM when clean — a static scene between changes then costs no
+/// per-vsync interpreter re-entry. Starts true (the first frame must render).
+var frame_needs_render: bool = true;
+
 fn renderFrameBody(_: void) void {
     var args = [_]Value{};
-    _ = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {};
+    const res = frame_cb.host.invokeCallable(&frame_cb.callback, &args, frame_cb.out) catch {
+        frame_needs_render = true; // errored: render again rather than stall
+        return;
+    };
+    // `frameHosted` returns whether the VM still has pending work; when false the
+    // shell may skip the next re-entry until input or a periodic pump.
+    frame_needs_render = switch (res) {
+        .ok => |v| v == .Bool and v.Bool,
+        .err => true,
+    };
 }
 
 /// Render one frame: invoke the resident Kotlin render callback. Called by the
@@ -895,6 +911,18 @@ fn renderFrameBody(_: void) void {
 pub export fn klio_render_frame() void {
     if (!frame_cb.set) return;
     runtime.runOnPersistentBigStack(void, void, renderFrameBody, {});
+}
+
+/// C query for the app shell: nonzero when the resident VM needs the next frame
+/// rendered (pending compose work or fresh input). The shell skips the (costly)
+/// `klio_render_frame` re-entry while this is zero — see `frame_needs_render`.
+pub export fn klio_frame_needs_render() c_int {
+    return if (frame_needs_render) 1 else 0;
+}
+
+/// Force the next frame to render (input dispatch marks the VM dirty this way).
+fn markFrameDirty() void {
+    frame_needs_render = true;
 }
 
 /// C query for the app shell: nonzero once the program registered a hosted frame
@@ -939,6 +967,7 @@ pub export fn klio_dispatch_touches(
     touch_count = n;
     for (0..n) |i| touch_points[i] = .{ .id = ids[i], .x = xs[i], .y = ys[i], .down = downs[i] != 0 };
     runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, phase);
+    markFrameDirty();
 }
 
 /// Route a discrete scroll (wheel / trackpad) into the resident VM as a single
@@ -951,6 +980,7 @@ pub export fn klio_dispatch_scroll(x: c_int, y: c_int, dx: c_int, dy: c_int) voi
     touch_count = 1;
     touch_points[0] = .{ .id = 0, .x = x, .y = y, .down = false, .sdx = dx, .sdy = dy };
     runtime.runOnPersistentBigStack(c_int, void, dispatchTouchBody, 4);
+    markFrameDirty();
 }
 
 fn touchIndex(ctx: *CallCtx) ?usize {
@@ -1041,6 +1071,7 @@ pub export fn klio_dispatch_text(bytes: [*]const u8, len: c_int) void {
     @memcpy(staged_text[0..n], bytes[0..n]);
     staged_text_len = n;
     runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, 0);
+    markFrameDirty();
 }
 
 /// A key edit with no text payload: 1=backspace, 2=ime action (enter/done).
@@ -1048,6 +1079,7 @@ pub export fn klio_dispatch_key(kind: c_int) void {
     if (!text_cb.set) return;
     staged_text_len = 0;
     runtime.runOnPersistentBigStack(c_int, void, dispatchTextBody, kind);
+    markFrameDirty();
 }
 
 /// `__composeui_textInput(): String` — the staged inserted text (kind 0).

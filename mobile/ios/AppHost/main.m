@@ -20,6 +20,7 @@ extern int klio_run(int argc, const char *const *argv);
 extern void klio_set_surface(void *layer, int w, int h, double scale);
 extern void klio_render_frame(void);
 extern int klio_frame_active(void);
+extern int klio_frame_needs_render(void);
 extern void klio_dispatch_touches(int count, const int *ids, const int *xs,
                                   const int *ys, const int *downs, int phase);
 extern void klio_dispatch_scroll(int x, int y, int dx, int dy);
@@ -92,7 +93,12 @@ static void klio_kb_hide(void) { [gMetalView resignFirstResponder]; }
 // Log a heartbeat so a headless harness can confirm the loop keeps running
 // (repeated re-entry into the resident VM did not crash).
 - (void)onFrame:(CADisplayLink *)link {
-    klio_render_frame();
+    // Skip the VM re-entry while the resident VM reports nothing pending (a
+    // static scene between changes); a periodic pump every 12 frames still
+    // re-enters so time-driven work not tied to the render flag keeps running.
+    if (klio_frame_needs_render() || self.frameCount % 12 == 0) {
+        klio_render_frame();
+    }
     self.frameCount += 1;
     if (self.frameCount % 60 == 0) {
         NSLog(@"[klio-host] frames=%lu", self.frameCount);
