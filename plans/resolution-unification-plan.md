@@ -238,9 +238,11 @@ for every value argument, and a unique overload before the stable `FuncId`
 tiebreak. Non-inline user and library extensions then emit exact
 `Call(FuncId)` instructions; the extension canary's `shout`, inherited-receiver
 `greet`, and generic-receiver `doubled` calls are all direct in eager-on and
-eager-off lowering. Named/spread calls and inline extensions remain deferred.
-Inline targets still need a resolved inline lowering strategy that preserves
-the declaration's lexical helper identities.
+eager-off lowering. Positional calls may omit trailing default parameters once
+every omitted declaration slot is proven defaulted; execution then uses the
+selected `FuncId`'s default thunks. Named/spread calls and inline extensions
+remain deferred. Inline targets still need a resolved inline lowering strategy
+that preserves the declaration's lexical helper identities.
 
 The exact host-ABI identity slice is now live for receiverless and
 receiver-formed declarations. `DeclSig.host_symbol` records the exact
@@ -250,7 +252,7 @@ once while headers register, is restricted to the Kotlin host surface, and is
 serialized in image format 32. A proven non-inline Kotlin extension therefore
 resolves through `Module.resolveExtensionCall` and emits `Call(FuncId)` without
 a runtime receiver/name probe. The `stdlib_string_ops.kt` main now reports
-50 direct and 22 dynamic calls, improved from 36 direct and 36 dynamic; this
+52 direct and 20 dynamic calls, improved from 36 direct and 36 dynamic; this
 gives the slice a repeatable static-dispatch coverage measure.
 
 Host identity and executable-form selection remain separate. A body-bearing

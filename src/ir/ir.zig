@@ -1910,7 +1910,7 @@ pub const Module = struct {
             }
             const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
             if (!self.staticReceiverAccepts(fid, receiver, recv_param)) continue;
-            if (f.params.len != args.len + 1) continue;
+            if (args.len > f.params.len - 1) continue;
             var has_vararg = false;
             for (f.params[1..]) |param| {
                 if (param.is_vararg) {
@@ -1919,8 +1919,16 @@ pub const Module = struct {
                 }
             }
             if (has_vararg) continue;
+            var omitted_defaults = true;
+            for (f.params[1 + args.len ..]) |param| {
+                if (!param.has_default and param.default == null) {
+                    omitted_defaults = false;
+                    break;
+                }
+            }
+            if (!omitted_defaults) continue;
             var args_proven = true;
-            for (args, f.params[1..]) |arg, param| {
+            for (args, f.params[1 .. 1 + args.len]) |arg, param| {
                 if (!self.staticArgAccepts(fid, arg, param.ty)) {
                     args_proven = false;
                     break;
@@ -6271,6 +6279,24 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .kind = .top_level_extension,
         .host_symbol = "kotlin.CharSequence.repeat",
     });
+    const starts_with = try pushTestFuncOpts(&m, a, "startsWith", "kotlin.text.startsWith", "kotlin.text", 2, .{
+        .stub = true,
+        .extension = true,
+        .param_ty = "String",
+    });
+    m.funcs.items[starts_with.int()].kind = .top_level_extension;
+    m.funcs.items[starts_with.int()].params[2].ty.name = "Boolean";
+    m.funcs.items[starts_with.int()].params[2].has_default = true;
+    try m.decl_sigs.put(starts_with.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 2, .has_vararg = false },
+        .sig = &.{
+            .{ .name = "String", .nullable = false, .args = &.{} },
+            .{ .name = "Boolean", .nullable = false, .args = &.{} },
+        },
+        .kind = .top_level_extension,
+        .host_symbol = "kotlin.String.startsWith",
+    });
     try m.rebuildFuncNameIndex(a);
 
     const typed_args = [_]applicability.ArgShape{.{
@@ -6304,6 +6330,16 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .args = &.{},
     }, &typed_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
     try testing.expectEqual(repeat.int(), host_backed.target.?.int());
+
+    const string_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+    }};
+    const defaulted = m.resolveExtensionCall("startsWith", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &string_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
+    try testing.expectEqual(starts_with.int(), defaulted.target.?.int());
 }
 
 test "symbol index prefers the caller's own package" {
