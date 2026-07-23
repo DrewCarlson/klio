@@ -1627,6 +1627,15 @@ fn instanceHierarchyHasInvoke(self: *VmHost, v: *const Value) bool {
     return false;
 }
 
+fn valueNominalFqn(v: *const Value) []const u8 {
+    if (v.* != .Instance) return v.typeFqn();
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return cg.get().fqn;
+}
+
 fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bool {
     if (f.params.len <= 1 or args.len == 0) return false;
     // A vararg tail repositions everything after it; decline.
@@ -1647,7 +1656,12 @@ fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bo
         if (i + 1 >= f.params.len) break;
         const pty = &f.params[i + 1].ty;
         if (std.mem.startsWith(u8, pty.name, "Function") and instanceHierarchyHasInvoke(self, a)) continue;
-        if (argDefinitelyNotParamType(self, pty, a)) return true;
+        if (argDefinitelyNotParamType(self, pty, a)) {
+            if (missTraceWant(f.name)) {
+                std.debug.print("[extfb]  arg#{d} {s} rejects {s}\n", .{ i, pty.name, valueNominalFqn(a) });
+            }
+            return true;
+        }
     }
     return false;
 }
@@ -8692,7 +8706,15 @@ pub fn invokeVirtualMember(
             const module = mg.get();
             const root = FuncId.from(slot.int());
             const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
-            std.debug.print("[vcall-noinst] slot={d} method={s} recv_tag={s} recv_ty={s} nargs={d}\n", .{ slot.int(), mname, @tagName(std.meta.activeTag(receiver.*)), receiver.typeFqn(), args.len });
+            std.debug.print("[vcall-noinst] slot={d} method={s} recv_tag={s} recv_ty={s} nargs={d} caller={s}\n", .{
+                slot.int(),
+                mname,
+                @tagName(std.meta.activeTag(receiver.*)),
+                receiver.typeFqn(),
+                args.len,
+                if (ir.eval.currentFrameFunc()) |f| f.fqn else "<none>",
+            });
+            ir.eval.dumpFrameChainForDiagAlways();
         }
         return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
     }
