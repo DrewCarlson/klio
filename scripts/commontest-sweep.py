@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_ROOT = os.path.join(ROOT, "kotlin/libraries/stdlib/test")
@@ -42,10 +43,42 @@ TEST_FILTER = None
 
 
 def default_jobs():
-    """One child per core, less a couple for the driver and the OS. Each child is
-    a whole `klio test` process (its own stdlib load), so the sweep is
-    embarrassingly parallel and the old fixed 6 left most of a big box idle."""
-    return max(2, (os.cpu_count() or 4) - 2)
+    """Half the cores. Each child is a whole `klio test` process, so the sweep
+    is embarrassingly parallel — but wall time is floored by a few
+    compute-heavy straggler files, not by worker count, so using every core
+    buys almost nothing while saturating the machine for the sweep's whole
+    duration. Longest-first scheduling (the timing cache below) keeps the
+    tail overlapped at this width. `KLIO_SWEEP_JOBS` or `--jobs` overrides.
+    Children also run under `nice -n 10` so even a wide sweep yields to
+    interactive work."""
+    env = os.environ.get("KLIO_SWEEP_JOBS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return max(2, (os.cpu_count() or 4) // 2)
+
+
+TIMES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".sweep-times.json")
+
+
+def load_times():
+    try:
+        import json
+        with open(TIMES_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_times(times):
+    try:
+        import json
+        with open(TIMES_CACHE, "w") as f:
+            json.dump(times, f, indent=0, sort_keys=True)
+    except OSError:
+        pass
 
 
 def collect():
@@ -139,6 +172,7 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     argv += [s for s in targets if s != target and os.path.dirname(s) == tdir]
     argv += cross_dir_providers(target, provider, texts)
     argv.append(target)
+    argv = ["nice", "-n", "10"] + argv
     env = dict(os.environ, HOME=CHILD_HOME)
     if eager:
         env["KLIO_EAGER"] = "1"
@@ -195,6 +229,9 @@ def no_summary_detail(p):
     return f"exit={p.returncode}; last={last_test}; {reason}{gc}{poison}{cell}{out}"[:12000]
 
 
+run_dir_times = {}
+
+
 def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, eager):
     """Run EVERY run-target in one directory as a SINGLE `klio test` child:
     compile the directory's files (and cross-dir providers) ONCE, then discover
@@ -209,7 +246,7 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
     for t in dir_targets:
         cross += cross_dir_providers(t, provider, texts)
     compile_files = _dedup(list(support) + dir_all + cross)
-    argv = [binary, "test"] + [f"--only-file={t}" for t in dir_targets] + compile_files
+    argv = ["nice", "-n", "10", binary, "test"] + [f"--only-file={t}" for t in dir_targets] + compile_files
     if TEST_FILTER:
         argv.append(f"--filter={TEST_FILTER}")
     env = dict(os.environ, HOME=CHILD_HOME)
@@ -219,10 +256,12 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
         env.pop("KLIO_EAGER", None)
     if os.environ.get("KLIO_SWEEP_DEBUG"):
         print("ARGV", "\n".join(argv), file=sys.stderr)
+    t0 = time.monotonic()
     try:
         p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800, env=env)
     except subprocess.TimeoutExpired:
         return tdir, -1, [("__TIMEOUT__", "")]
+    run_dir_times[tdir] = time.monotonic() - t0
     passed = None
     m = re.search(rb"(\d+) passed,", p.stdout)
     if m:
@@ -254,13 +293,21 @@ def sweep(binary, run_targets, all_targets, support, provider, texts, eager, job
             by_dir = {}
             for t in run_targets:
                 by_dir.setdefault(os.path.dirname(t), []).append(t)
+            # Longest-first: a straggler directory started last serializes the
+            # whole tail. Prior-run durations (persisted in .sweep-times.json)
+            # order the submissions so the heavy directories overlap the rest.
+            known = load_times()
+            ordered = sorted(by_dir.items(), key=lambda kv: -known.get(kv[0], 0.0))
             futs = {
                 ex.submit(run_dir, binary, d, ts, support, all_targets, provider, texts, eager): d
-                for d, ts in by_dir.items()
+                for d, ts in ordered
             }
             for f in concurrent.futures.as_completed(futs):
                 d, passed, fails = f.result()
                 results[d] = (passed, fails)
+            merged = load_times()
+            merged.update(run_dir_times)
+            save_times(merged)
         else:
             futs = {
                 ex.submit(run_one, binary, t, support, all_targets, provider, texts, eager): t

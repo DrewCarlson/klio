@@ -76,7 +76,7 @@ fn findIn(gpa: Allocator, dir: []const u8, target: []const u8, names: []const []
 }
 
 fn stubCacheDir(gpa: Allocator, version: []const u8) ?[]const u8 {
-    const home = runtime.procEnvGetVar(gpa, "HOME") catch null orelse return null;
+    const home = runtime.procEnvKlioHome(gpa) catch null orelse return null;
     defer gpa.free(home);
     return std.fs.path.join(gpa, &.{ home, ".klio", "stubs", version }) catch null;
 }

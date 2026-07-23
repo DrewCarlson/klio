@@ -1515,8 +1515,8 @@ fn mergeInto(dst: *HostBindings, src_opt: ?HostBindings) void {
 // ---------------------------------------------------------------------
 
 fn klioCacheDir(allocator: Allocator) PathResult {
-    const home = getEnvVar(allocator, "HOME") orelse
-        return .{ .err = allocator.dupe(u8, "HOME env var unset") catch "" };
+    const home = (runtime.procEnvKlioHome(allocator) catch null) orelse
+        return .{ .err = allocator.dupe(u8, "HOME (or KLIO_HOME) env var unset") catch "" };
     defer allocator.free(home);
     const path = std.fs.path.join(allocator, &.{ home, ".klio", "packs" }) catch
         return .{ .err = allocator.dupe(u8, "out of memory") catch "" };

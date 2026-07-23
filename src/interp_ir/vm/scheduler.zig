@@ -128,15 +128,38 @@ pub const Pool = struct {
         return std.heap.page_allocator;
     }
 
+    /// `KLIO_MAX_WORKERS`: process-wide ceiling on dispatcher worker
+    /// threads. A test-fleet driver runs several klio processes at once;
+    /// without a ceiling each child's pool can fan out to 64 workers on a
+    /// concurrent burst and the fleet multiplies into full-machine
+    /// saturation. 0 = unset (built-in defaults).
+    fn envWorkerCap() usize {
+        const S = struct {
+            var cached = std.atomic.Value(usize).init(std.math.maxInt(usize));
+        };
+        const c = S.cached.load(.monotonic);
+        if (c != std.math.maxInt(usize)) return c;
+        var v: usize = 0;
+        if (runtime.getenvSlice("KLIO_MAX_WORKERS")) |raw| {
+            v = std.fmt.parseInt(usize, raw, 10) catch 0;
+        }
+        S.cached.store(v, .monotonic);
+        return v;
+    }
+
     pub fn defaultCap(self: *Pool) usize {
         if (self.default_cap_override != 0) return self.default_cap_override;
         const n = std.Thread.getCpuCount() catch 1;
+        const cap = envWorkerCap();
+        if (cap != 0) return @max(2, @min(cap, n));
         return @max(2, n);
     }
 
     pub fn maxWorkers(self: *Pool) usize {
         if (self.max_workers_override != 0) return self.max_workers_override;
         const n = std.Thread.getCpuCount() catch 1;
+        const cap = envWorkerCap();
+        if (cap != 0) return @max(2, cap);
         return @max(64, n);
     }
 

@@ -27,6 +27,19 @@ pub fn getVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.
     return null;
 }
 
+/// The base directory that holds klio's `.klio` data tree (packs, cache,
+/// registry, stubs). `KLIO_HOME` overrides `HOME`, so a project can point its
+/// dev/test data at a repo-local gitignored folder instead of the shared
+/// `~/.klio`, keeping parallel workstreams from clobbering each other's packs.
+/// Caller frees.
+pub fn klioHome(allocator: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
+    if (try getVar(allocator, "KLIO_HOME")) |v| {
+        if (v.len != 0) return v;
+        allocator.free(v);
+    }
+    return getVar(allocator, "HOME");
+}
+
 /// Whether the named environment variable is present.
 pub fn isSet(allocator: std.mem.Allocator, name: []const u8) bool {
     const v = getVar(allocator, name) catch return false;
