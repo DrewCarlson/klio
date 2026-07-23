@@ -2754,11 +2754,11 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
 /// predicate extension (`removeAll(predicate: (T) -> Boolean)`) binds.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
-        "String",     "CharSequence",      "Boolean",  "Char",          "Byte",    "Short",
-        "Int",        "Long",              "Float",    "Double",         "UByte",   "UShort",
-        "UInt",       "ULong",             "Number",   "Collection",     "MutableCollection",
-        "Iterable",   "MutableIterable",   "List",     "MutableList",    "Set",     "MutableSet",
-        "Map",        "MutableMap",        "Array",    "Sequence",
+        "String",          "CharSequence", "Boolean",     "Char",       "Byte",              "Short",
+        "Int",             "Long",         "Float",       "Double",     "UByte",             "UShort",
+        "UInt",            "ULong",        "Number",      "Collection", "MutableCollection", "Iterable",
+        "MutableIterable", "List",         "MutableList", "Set",        "MutableSet",        "Map",
+        "MutableMap",      "Array",        "Sequence",
     };
     for (names) |n| {
         if (std.mem.eql(u8, pn, n)) return true;
@@ -2771,8 +2771,9 @@ fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
 /// NOT a definite type mismatch, unlike an array vs an arbitrary user interface.
 fn isArrayRelatedIface(pn: []const u8) bool {
     const set = [_][]const u8{
-        "Iterable", "MutableIterable", "Collection", "MutableCollection",
-        "Sequence", "Comparable", "CharSequence", "Serializable", "Cloneable",
+        "Iterable",  "MutableIterable", "Collection",   "MutableCollection",
+        "Sequence",  "Comparable",      "CharSequence", "Serializable",
+        "Cloneable",
     };
     for (set) |s| {
         if (std.mem.eql(u8, pn, s)) return true;
@@ -2804,8 +2805,8 @@ fn scalarKindName(arg: *const Value) ?[]const u8 {
 
 fn isScalarKindName(n: []const u8) bool {
     const set = [_][]const u8{
-        "Boolean", "Char",  "Byte",   "Short", "Int",    "Long",  "Float",
-        "Double",  "UByte", "UShort", "UInt",  "ULong",  "String",
+        "Boolean", "Char",  "Byte",   "Short", "Int",   "Long",   "Float",
+        "Double",  "UByte", "UShort", "UInt",  "ULong", "String",
     };
     for (set) |s| {
         if (std.mem.eql(u8, n, s)) return true;
@@ -3796,7 +3797,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             .cursor = try newCursor(allocator, start, cap.exp_mod),
             .prim = null,
             .mod_count = cap.mod_count,
-                        .mutable = receiver.List.mutable and receiver.List.backing == null and
+            .mutable = receiver.List.mutable and receiver.List.backing == null and
                 !stdlib.implementations.collections.modCountFrozen(receiver.List.mod_count),
         } } };
     }
@@ -4132,7 +4133,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // `r.contains(x)` on a Range.
     if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range and
-        args[0] != .Range) {
+        args[0] != .Range)
+    {
         const r = receiver.Range;
         // A descending progression (step < 0) has start > end; the membership
         // bounds run low..high regardless of iteration direction.
@@ -4553,7 +4555,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         return r;
     }
 
-
     // Map fallback.
     if (receiver.* == .Instance and !map_fallback_active and
         hostHasMember(self, receiver, "entries") and !hostHasMember(self, receiver, "iterator"))
@@ -4616,38 +4617,38 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
         }
         {
-        const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
-        defer if (runtime.freeScratch()) allocator.free(p1);
-        var matched: []const u8 = p1;
-        var intrinsic = lookupIntrinsic(self, p1);
-        var p2_owned: ?[]const u8 = null;
-        defer if (runtime.freeScratch()) if (p2_owned) |p| allocator.free(p);
-        if (intrinsic == null) {
-            const p2 = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
-            p2_owned = p2;
-            intrinsic = lookupIntrinsic(self, p2);
-            matched = p2;
-        }
-        if (intrinsic) |f| {
-            // `toTypedArray` must observe a user `toArray()` override
-            // before any drain (JS/native `collectionToArray` semantics);
-            // its intrinsic handles Instance receivers itself.
-            if (std.mem.eql(u8, name, "toTypedArray")) {
-                return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
+            const p1 = try std.fmt.allocPrint(allocator, "kotlin.collections.Iterable.{s}", .{name});
+            defer if (runtime.freeScratch()) allocator.free(p1);
+            var matched: []const u8 = p1;
+            var intrinsic = lookupIntrinsic(self, p1);
+            var p2_owned: ?[]const u8 = null;
+            defer if (runtime.freeScratch()) if (p2_owned) |p| allocator.free(p);
+            if (intrinsic == null) {
+                const p2 = try std.fmt.allocPrint(allocator, "kotlin.collections.List.{s}", .{name});
+                p2_owned = p2;
+                intrinsic = lookupIntrinsic(self, p2);
+                matched = p2;
             }
-            const drained = blk: {
-                iterable_fallback_active = true;
-                defer iterable_fallback_active = false;
-                break :blk try drainIterableToList(self, allocator, receiver);
-            };
-            const dv = switch (drained) {
-                .ok => |v| v,
-                .err => |e| return .{ .err = e },
-            };
-            const new_args = try prependReceiver(allocator, &dv, args);
-            defer if (runtime.freeScratch()) allocator.free(new_args);
-            return dispatchIntrinsic(self, allocator, matched, f, new_args);
-        }
+            if (intrinsic) |f| {
+                // `toTypedArray` must observe a user `toArray()` override
+                // before any drain (JS/native `collectionToArray` semantics);
+                // its intrinsic handles Instance receivers itself.
+                if (std.mem.eql(u8, name, "toTypedArray")) {
+                    return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
+                }
+                const drained = blk: {
+                    iterable_fallback_active = true;
+                    defer iterable_fallback_active = false;
+                    break :blk try drainIterableToList(self, allocator, receiver);
+                };
+                const dv = switch (drained) {
+                    .ok => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                const new_args = try prependReceiver(allocator, &dv, args);
+                defer if (runtime.freeScratch()) allocator.free(new_args);
+                return dispatchIntrinsic(self, allocator, matched, f, new_args);
+            }
         }
     }
 
@@ -5479,14 +5480,13 @@ fn sequenceMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
 
 fn isSequenceTerminal(name: []const u8) bool {
     const terms = [_][]const u8{
-        "toList",          "toMutableList", "toSet",   "count",      "sum",        "average",
-        "sumOf",           "last",          "lastOrNull", "forEach", "fold",       "reduce",
-        "iterator",        "max",           "maxOrNull", "min",      "minOrNull",  "maxBy",
-        "minBy",           "maxByOrNull",   "minByOrNull", "maxOf",  "minOf",      "joinToString",
-        "all",             "contains",      "groupBy", "associate",  "associateBy", "associateWith",
-        "partition",       "indexOf",       "indexOfFirst", "toMap", "toHashSet",  "toMutableSet",
-        "zip",             "unzip",         "plus",    "reduceOrNull", "foldRight",
-        "reduceRight",
+        "toList",    "toMutableList", "toSet",        "count",        "sum",         "average",
+        "sumOf",     "last",          "lastOrNull",   "forEach",      "fold",        "reduce",
+        "iterator",  "max",           "maxOrNull",    "min",          "minOrNull",   "maxBy",
+        "minBy",     "maxByOrNull",   "minByOrNull",  "maxOf",        "minOf",       "joinToString",
+        "all",       "contains",      "groupBy",      "associate",    "associateBy", "associateWith",
+        "partition", "indexOf",       "indexOfFirst", "toMap",        "toHashSet",   "toMutableSet",
+        "zip",       "unzip",         "plus",         "reduceOrNull", "foldRight",   "reduceRight",
     };
     for (terms) |t| {
         if (std.mem.eql(u8, t, name)) return true;
@@ -8597,6 +8597,28 @@ fn linkRuntimeVirtualTarget(
     return null;
 }
 
+fn virtualTargetExecutable(module: *const Module, target: FuncId) bool {
+    const f = funcAt(module, target) orelse return false;
+    return f.hasBody();
+}
+
+fn runtimeVirtualTarget(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    runtime_def: ObjRef(ClassDef),
+    slot: MethodSlotId,
+) Allocator.Error!?root_mod.ProgramImage.RuntimeVirtualTarget {
+    const key: root_mod.ProgramImage.RuntimeVirtualKey = .{
+        .class_p = runtime_def.identity(),
+        .slot = slot.int(),
+    };
+    if (runtimeVirtualCacheGet(self, key)) |cached| return cached;
+    const target = (try linkRuntimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse return null;
+    runtimeVirtualCachePut(self, key, target);
+    return target;
+}
+
 fn invokeRuntimeVirtualSide(
     self: *VmHost,
     allocator: Allocator,
@@ -8683,20 +8705,22 @@ pub fn invokeVirtualMember(
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
-    const linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
+    var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
         .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse
             return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } }).int() }
-    else blk: {
-        const key: root_mod.ProgramImage.RuntimeVirtualKey = .{
-            .class_p = runtime_def.identity(),
-            .slot = slot.int(),
-        };
-        if (runtimeVirtualCacheGet(self, key)) |cached| break :blk cached;
-        const target = (try linkRuntimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse
+    else
+        (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse
             return .{ .err = .{ .Type = "virtual method slot is not linked for runtime class" } };
-        runtimeVirtualCachePut(self, key, target);
-        break :blk target;
-    };
+    // A runtime-defined or anonymous class can share the source interface's
+    // nominal FQN. The main-module table then identifies the correct slot
+    // family but lands on its bodyless declaration header; use the runtime
+    // class identity to locate the concrete override.
+    switch (linked) {
+        .main_func => |target| if (!virtualTargetExecutable(module, FuncId.from(target))) {
+            linked = (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse linked;
+        },
+        .side_func => {},
+    }
 
     if (linked == .side_func) {
         return invokeRuntimeVirtualSide(
@@ -8895,9 +8919,18 @@ fn methodArgSig(args: []const Value) ?u64 {
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15 +% args.len);
     for (args) |*a| {
         const tag: u8 = switch (a.*) {
-            .Int => 1,   .Long => 2,   .Double => 3,  .Float => 4,
-            .Short => 5, .Byte => 6,   .Char => 7,    .Bool => 8,
-            .UInt => 9,  .ULong => 10, .UShort => 11, .UByte => 12,
+            .Int => 1,
+            .Long => 2,
+            .Double => 3,
+            .Float => 4,
+            .Short => 5,
+            .Byte => 6,
+            .Char => 7,
+            .Bool => 8,
+            .UInt => 9,
+            .ULong => 10,
+            .UShort => 11,
+            .UByte => 12,
             .Instance => 13,
             // A `String` is always `kotlin.String` and a `Unit` always
             // `kotlin.Unit`: their runtime shape fully fixes the type the
@@ -9207,8 +9240,8 @@ inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
 /// erased receiver-type-arg ties resolution must refuse to guess.
 fn numericWidthKind(name: []const u8) bool {
     const kinds = [_][]const u8{
-        "Int",   "Long", "Short", "Byte",  "Double", "Float",
-        "UInt",  "ULong", "UShort", "UByte", "Char",
+        "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
+        "UInt", "ULong", "UShort", "UByte", "Char",
     };
     for (kinds) |k| {
         if (std.mem.eql(u8, name, k)) return true;
@@ -10748,11 +10781,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         if (trace.enabled(name)) {
             const d = funcDefaults(self, &c.func);
             trace.emit("map=ext_fallback_pick name={s} fqn={s} fid={d} strict={} nparams={d} ndefaults={d} recv_ty={s} p0={s} owner={s}", .{
-                name,                          c.func.fqn,
-                c.fid.int(),                   strict_ext,
-                c.func.params.len,             if (d) |dd| dd.len else 0,
-                c.func.params[0].ty.name,
-                c.func.params[0].name,
+                name,                     c.func.fqn,
+                c.fid.int(),              strict_ext,
+                c.func.params.len,        if (d) |dd| dd.len else 0,
+                c.func.params[0].ty.name, c.func.params[0].name,
                 blk: {
                     const mg2 = self.module.borrow();
                     defer mg2.deinit();
@@ -10918,7 +10950,8 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var shapes_buf: [24]applicability.ArgShape = undefined;
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
-    else try allocator.alloc(applicability.ArgShape, args.len);
+    else
+        try allocator.alloc(applicability.ArgShape, args.len);
     defer if (args.len > shapes_buf.len) allocator.free(shapes);
     for (args, 0..) |*a, i| shapes[i] = shapeOfValueMember(self, a);
 
@@ -12688,6 +12721,13 @@ test "materialiseRangeItems builds inclusive progressions" {
 test "compareValuesBuiltin orders scalars and strings" {
     try testing.expectEqual(Ordering.lt, compareValuesBuiltin(&.{ .Int = 1 }, &.{ .Int = 2 }).?);
     try testing.expectEqual(Ordering.gt, compareValuesBuiltin(&.{ .Double = 2.5 }, &.{ .Int = 2 }).?);
+    try testing.expectEqual(
+        Ordering.gt,
+        compareValuesBuiltin(
+            &.{ .ULong = std.math.maxInt(u64) },
+            &.{ .ULong = 0 },
+        ).?,
+    );
     const a = try runtime.strInit(testing.allocator, "abc");
     defer a.deinit();
     const b = try runtime.strInit(testing.allocator, "abd");

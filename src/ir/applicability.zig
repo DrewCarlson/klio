@@ -1226,8 +1226,12 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     }
 
     // A trailing positional callable binds to the last function-typed
-    // parameter, out of sequence.
+    // parameter, out of sequence. Compose lowering appends its named
+    // `$composer`/`$changed` pair after the source trailing lambda; for that
+    // generated shape, the last user parameter immediately before the pair is
+    // still the source trailing-lambda target.
     var trailing_lambda: ?usize = null;
+    var trailing_lambda_param: ?u16 = null;
     if (args.len > 0 and params.len > 0) {
         const last = args.len - 1;
         const last_named = args[last].named != null;
@@ -1239,8 +1243,45 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
             if (argIsProven(&args[last])) proven += 1 else unknown += 1;
             filled[last_param] = true;
             trailing_lambda = last;
+            trailing_lambda_param = @intCast(last_param);
             if (bind) |bb| {
                 if (last < bb.len) bb[last] = @intCast(last_param);
+            }
+        }
+        if (trailing_lambda == null and args.len >= 3 and params.len >= 3) {
+            const composer_arg = args[args.len - 2].named;
+            const changed_arg = args[args.len - 1].named;
+            const composer_param = params[params.len - 2].name;
+            const changed_param = params[params.len - 1].name;
+            const lambda_index = args.len - 3;
+            const user_param = params.len - 3;
+            if (composer_arg != null and changed_arg != null and
+                std.mem.eql(u8, composer_arg.?, "$composer") and
+                std.mem.eql(u8, changed_arg.?, "$changed") and
+                paramNameMatchesArg(composer_param, "$composer") and
+                paramNameMatchesArg(changed_param, "$changed") and
+                args[lambda_index].named == null and
+                args[lambda_index].is_lambda and
+                !filled[user_param] and
+                isFunctionTypeRef(&params[user_param].ty))
+            {
+                total += scoreArg(
+                    sig,
+                    &params[user_param].ty,
+                    &args[lambda_index],
+                    &scope,
+                ) orelse 0;
+                if (argIsProven(&args[lambda_index]))
+                    proven += 1
+                else
+                    unknown += 1;
+                filled[user_param] = true;
+                trailing_lambda = lambda_index;
+                trailing_lambda_param = @intCast(user_param);
+                if (bind) |bb| {
+                    if (lambda_index < bb.len)
+                        bb[lambda_index] = @intCast(user_param);
+                }
             }
         }
     }
@@ -1317,7 +1358,10 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         .exact_arity = false,
         .low_priority = sig.low_priority,
         .is_member = sig.is_member,
-        .binding = .{ .arg_to_param = if (bind) |bb| bb[0..@min(args.len, bb.len)] else &.{} },
+        .binding = .{
+            .trailing_lambda_param = trailing_lambda_param,
+            .arg_to_param = if (bind) |bb| bb[0..@min(args.len, bb.len)] else &.{},
+        },
     };
 }
 
@@ -1706,6 +1750,43 @@ test "applicable named: reordered named args bind by name and record the binding
     try testing.expectEqual(@as(i32, 200), sc.points);
     try testing.expectEqual(@as(u16, 1), sc.binding.arg_to_param[0]); // b -> param 1
     try testing.expectEqual(@as(u16, 0), sc.binding.arg_to_param[1]); // a -> param 0
+}
+
+test "applicable named: Compose pair preserves the source trailing lambda" {
+    const short = [_]Param{
+        .{ .name = "modifier", .ty = tref("Modifier"), .default = null },
+        .{ .name = "$composer", .ty = tref("Composer"), .default = null },
+        .{ .name = "$changed", .ty = tref("Int"), .default = null },
+    };
+    const content = [_]Param{
+        .{ .name = "modifier", .ty = tref("Modifier"), .default = null, .has_default = true },
+        .{ .name = "alignment", .ty = tref("Alignment"), .default = null, .has_default = true },
+        .{ .name = "propagate", .ty = tref("Boolean"), .default = null, .has_default = true },
+        .{ .name = "content", .ty = tref("Function0"), .default = null },
+        .{ .name = "$composer", .ty = tref("Composer"), .default = null },
+        .{ .name = "$changed", .ty = tref("Int"), .default = null },
+    };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Function0", .func_typed = true, .is_lambda = true },
+        .{ .runtime_class = "Composer", .named = "$composer" },
+        .{ .runtime_class = "Int", .named = "$changed" },
+    };
+    var short_bind: [3]u16 = undefined;
+    const short_score = applicable(
+        &.{ .params = &short },
+        &args,
+        .{ .named = true, .arg_to_param_buf = &short_bind },
+    ).?;
+    var content_bind: [3]u16 = undefined;
+    const content_score = applicable(
+        &.{ .params = &content },
+        &args,
+        .{ .named = true, .arg_to_param_buf = &content_bind },
+    ).?;
+
+    try testing.expect(content_score.points > short_score.points);
+    try testing.expectEqual(@as(?u16, 3), content_score.binding.trailing_lambda_param);
+    try testing.expectEqualSlices(u16, &.{ 3, 4, 5 }, content_score.binding.arg_to_param);
 }
 
 test "applicable named: non-final vararg absorbs values before a named tail" {

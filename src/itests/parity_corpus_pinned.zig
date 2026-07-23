@@ -454,6 +454,155 @@ test "named_arg_member_over_extension" {
     );
 }
 
+test "member_extension_shadows_stdlib" {
+    try check("member_extension_shadows_stdlib",
+        \\false
+        \\true
+        \\false
+        \\member:x
+        \\member:x
+        \\top
+        \\member:x
+        \\
+    );
+}
+
+test "source_body_extension_defaults" {
+    try check("source_body_extension_defaults",
+        \\abc
+        \\missing
+        \\abc
+        \\
+    );
+}
+
+test "local_extension_receiver_applicability" {
+    try check("local_extension_receiver_applicability",
+        \\true
+        \\false
+        \\
+    );
+}
+
+test "explicit_type_arg_receiver_lambda" {
+    try check("explicit_type_arg_receiver_lambda",
+        \\Any
+        \\nullable
+        \\
+    );
+}
+
+test "generic_local_extension" {
+    try check("generic_local_extension",
+        \\local
+        \\
+    );
+}
+
+test "local_extension_generic_argument_applicability" {
+    try check("local_extension_generic_argument_applicability",
+        \\outer
+        \\
+    );
+}
+
+test "local_extension_generic_applicability_matrix" {
+    try check("local_extension_generic_applicability_matrix",
+        \\local
+        \\outer
+        \\outer
+        \\outer
+        \\outer
+        \\outer
+        \\
+    );
+}
+
+test "bare_local_extension_receiver_applicability" {
+    try check("bare_local_extension_receiver_applicability",
+        \\outer
+        \\
+    );
+}
+
+test "local_extension_bound_applicability" {
+    try check("local_extension_bound_applicability",
+        \\outer
+        \\local
+        \\
+    );
+}
+
+test "generic_factory_return_extension" {
+    try check("generic_factory_return_extension",
+        \\0.0
+        \\
+    );
+}
+
+test "sequence_argument_extension_overload" {
+    try check("sequence_argument_extension_overload",
+        \\[1, 0, 1, 1, 2]
+        \\
+    );
+}
+
+test "static_operator_receiver_type" {
+    try check("static_operator_receiver_type",
+        \\[foo, bar, zoo, g]
+        \\true
+        \\[foo, bar, zoo, g]
+        \\true
+        \\
+    );
+}
+
+test "subjectless_when_this_smart_cast" {
+    try check("subjectless_when_this_smart_cast",
+        \\member:2
+        \\zero
+        \\
+    );
+}
+
+test "redundant_projection_static_applicability" {
+    try check("redundant_projection_static_applicability",
+        \\local
+        \\
+    );
+}
+
+test "qualified_alias_static_applicability" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/qualified_alias_static_applicability/alpha.kt",
+        CORPUS_DIR ++ "/qualified_alias_static_applicability/beta.kt",
+        CORPUS_DIR ++ "/qualified_alias_static_applicability/app.kt",
+    },
+        \\outer
+        \\
+    );
+}
+
+test "member_factory_constructor_shadow" {
+    try check("member_factory_constructor_shadow",
+        \\Bar
+        \\
+    );
+}
+
+test "unimported_object_member_extension" {
+    try check("unimported_object_member_extension",
+        \\true
+        \\false
+        \\true
+        \\false
+        \\true
+        \\false
+        \\false
+        \\
+    );
+}
+
 // kotlinc-native 2.3.10 is the oracle: kotlinc-jvm rejects this overload
 // pair under JVM erasure (platform declaration clash), the native compiler
 // resolves it by the full declared type.

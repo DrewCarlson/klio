@@ -37,6 +37,49 @@ const lowerLambdaBodyCapturingKindWith = lambda_body.lowerLambdaBodyCapturingKin
 const resolveCapture = lambda_body.resolveCapture;
 const lowerExprAsParamThunk = thunks.lowerExprAsParamThunk;
 
+fn typeRefMentionsParams(ty: *const ast.TypeRef, params: []const ast.TypeParam) bool {
+    for (params) |param| {
+        if (std.mem.eql(u8, ty.name.name, param.name.name)) return true;
+    }
+    for (ty.type_args) |*arg| {
+        if (!arg.is_star and typeRefMentionsParams(&arg.ty, params)) return true;
+    }
+    if (ty.function) |function| {
+        if (function.receiver) |*receiver| {
+            if (typeRefMentionsParams(receiver, params)) return true;
+        }
+        for (function.context_params) |*context| {
+            if (typeRefMentionsParams(context, params)) return true;
+        }
+        for (function.params) |*param| {
+            if (typeRefMentionsParams(param, params)) return true;
+        }
+        if (typeRefMentionsParams(&function.ret, params)) return true;
+    }
+    return false;
+}
+
+fn localTypeParamBounds(
+    allocator: Allocator,
+    function: *const ast.Function,
+) Allocator.Error![]const ir.ModuleRegistry.TypeParamBound {
+    const bounds = try allocator.alloc(
+        ir.ModuleRegistry.TypeParamBound,
+        function.type_params.len,
+    );
+    for (function.type_params, bounds) |*param, *out| {
+        var bound = if (param.upper_bound) |upper| upper.name.name else "Any";
+        for (function.where_bounds) |where_bound| {
+            if (std.mem.eql(u8, where_bound.name.name, param.name.name)) {
+                bound = where_bound.bound.name.name;
+                break;
+            }
+        }
+        out.* = .{ .param = param.name.name, .bound = bound };
+    }
+    return bounds;
+}
+
 /// Lower a statement. Returns the register holding the statement's value
 /// when it is an expression statement in tail position, else `null`.
 pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
@@ -178,7 +221,10 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // un-annotated) so inline-overload receiver narrowing can type a plain
     // local receiver (`val resp = client.get(url); resp.body<T>()`).
     if (p.ty) |ty| {
-        try b.setLocalDeclType(p.name.name, ty.name.name);
+        try b.setLocalDeclTypeOwned(
+            p.name.name,
+            try expr_mod.loweredOwnedLocalTypeRef(b, &ty),
+        );
         if (ty.nullable) try b.setLocalDeclNullable(p.name.name);
         if (ty.function) |ft| {
             if (ft.receiver != null) try b.setLocalDeclRecvFn(p.name.name);
@@ -294,7 +340,10 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         var mangled_name: []const u8 = undefined;
         const mangled_cell: Reg = mangled_blk: {
             const ov_tys = try b.allocator.alloc(?[]const u8, f.params.len);
+            var overload_transferred = false;
+            errdefer if (!overload_transferred) b.allocator.free(ov_tys);
             const ov_names = try b.allocator.alloc([]const u8, f.params.len);
+            errdefer if (!overload_transferred) b.allocator.free(ov_names);
             var n_required: usize = 0;
             var has_vararg = false;
             for (f.params, 0..) |p, j| {
@@ -315,8 +364,25 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             try b.markLocalFn(mangled);
             if (f.receiver_type != null) try b.markLocalExtFn(mangled);
             if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
+            const receiver_ty = if (f.receiver_type) |*source_receiver|
+                try expr_mod.loweredOwnedLocalTypeRef(b, source_receiver)
+            else
+                null;
+            errdefer if (!overload_transferred) if (receiver_ty) |receiver| {
+                var cleanup = receiver;
+                cleanup.deinit(b.allocator);
+            };
+            const local_type_params = try localTypeParamBounds(b.allocator, f);
+            errdefer if (!overload_transferred) b.allocator.free(local_type_params);
+            overload_transferred = true;
             try b.addLocalFnOverload(f.name.name, .{
                 .mangled = mangled,
+                .receiver_ty = receiver_ty,
+                .receiver_has_type_params = if (f.receiver_type) |*source_receiver|
+                    typeRefMentionsParams(source_receiver, f.type_params)
+                else
+                    false,
+                .type_params = local_type_params,
                 .param_tys = ov_tys,
                 .param_names = ov_names,
                 .n_required = n_required,
@@ -365,16 +431,49 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             b.module.has_context_decls = true;
             b.module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
         }
+        var pending_type_params: std.ArrayList([]const u8) = .empty;
+        if (try b.typeParamNamesSlice()) |outer_params| {
+            defer b.allocator.free(outer_params);
+            try pending_type_params.appendSlice(b.allocator, outer_params);
+        }
+        for (f.type_params) |param| try pending_type_params.append(b.allocator, param.name.name);
+        b.module.pending_lambda_type_params = if (pending_type_params.items.len == 0)
+            null
+        else
+            try pending_type_params.toOwnedSlice(b.allocator);
+        defer pending_type_params.deinit(b.allocator);
+
+        var pending_bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+        if (try b.typeParamBoundsSlice()) |outer_bounds| {
+            defer b.allocator.free(outer_bounds);
+            try pending_bounds.appendSlice(b.allocator, outer_bounds);
+        }
+        const own_bounds = try localTypeParamBounds(b.allocator, f);
+        defer b.allocator.free(own_bounds);
+        try pending_bounds.appendSlice(b.allocator, own_bounds);
+        b.module.pending_lambda_type_param_bounds = if (pending_bounds.items.len == 0)
+            null
+        else
+            try pending_bounds.toOwnedSlice(b.allocator);
+        defer pending_bounds.deinit(b.allocator);
         // The receiver type in scope inside this body: a local EXTENSION fn's
         // own declared receiver (innermost, wins bare-call disambiguation —
         // `fun MockViewValidator.value() { Text(…) }` must pick the
         // MockViewValidator ext over a same-named top-level fn), else the
         // enclosing receiver, exactly as a receiver lambda carries it.
+        b.module.pending_lambda_receiver_tower = try b.collectImplicitReceiverTower(
+            b.allocator,
+            if (f.receiver_type) |r| r.name.name else null,
+        );
         b.module.pending_lambda_enclosing_recv = if (f.receiver_type) |r|
             r.name.name
         else
             b.enclosingRecvTy();
-        if (f.receiver_type) |r| b.module.pending_lambda_own_recv = r.name.name;
+        if (f.receiver_type) |*receiver| {
+            b.module.pending_lambda_own_recv = receiver.name.name;
+            b.module.pending_lambda_own_recv_type =
+                try expr_mod.loweredOwnedLocalTypeRef(b, receiver);
+        }
         // A local `fun` with a BLOCK body returns Unit on fall-through,
         // never its tail statement's value (an expression body keeps the
         // expression as the return — it lowered to a single-statement
@@ -1587,9 +1686,9 @@ test "safe member assign branches on null" {
 /// with one never shadows a same-named function for a CALL.
 fn isDefiniteNonFnTypeName(name: []const u8) bool {
     const names = [_][]const u8{
-        "Int",    "Long",   "Short",  "Byte",  "Char",   "Boolean",
-        "Float",  "Double", "String", "UInt",  "ULong",  "UShort",
-        "UByte",  "Unit",
+        "Int",   "Long",   "Short",  "Byte", "Char",  "Boolean",
+        "Float", "Double", "String", "UInt", "ULong", "UShort",
+        "UByte", "Unit",
     };
     for (names) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;

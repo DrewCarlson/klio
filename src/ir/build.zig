@@ -326,6 +326,15 @@ pub fn anonScopeClass(name: []const u8) ?ir.ScopeClassRef {
 /// site selects on. Slices are owned by the declaring builder's allocator.
 pub const LocalFnOverload = struct {
     mangled: []const u8,
+    /// Declared extension receiver, preserving nullability and classifier
+    /// identity for explicit-receiver applicability checks.
+    receiver_ty: ?TypeRef = null,
+    /// The receiver shape mentions a type parameter declared by this local
+    /// function, so applicability requires a substitution environment.
+    receiver_has_type_params: bool = false,
+    /// Declared local-function type parameters and their effective upper
+    /// bounds. Unbounded parameters use `Any`.
+    type_params: []const ir.ModuleRegistry.TypeParamBound = &.{},
     /// Positional param type heads, leading `this` receiver dropped;
     /// null where the parameter is a vararg.
     param_tys: []const ?[]const u8,
@@ -426,6 +435,9 @@ pub const FuncBuilder = struct {
     /// matches the enclosing receiver instead of an arity-only pick.
     /// `null` for plain functions and class methods.
     recv_ty: ?[]const u8 = null,
+    /// Structural form of `recv_ty` when declaration/call-site metadata
+    /// preserves nullability, arguments, and classifier identity.
+    recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
     /// The receiver-type name in scope as the implicit `this` at this
     /// lambda body's construction site, carried across the lambda boundary
@@ -436,6 +448,9 @@ pub const FuncBuilder = struct {
     /// receiver still fires inside nested lambdas. Distinct from `recv_ty`
     /// so the two never conflate a decl receiver with a captured one.
     enclosing_recv_ty: ?[]const u8 = null,
+    /// Ordered implicit receiver heads, innermost first. Receiver lambdas
+    /// prepend their own head and retain the complete outer tower.
+    implicit_receiver_tower: std.ArrayList([]const u8) = .empty,
     /// The LOCAL `fun` this builder is lowering the body of (or a lambda
     /// nested inside that body). A bare call to `self_local_fn.name` binds
     /// the fn ITSELF through its mangled cell — the shared plain-name slot
@@ -506,7 +521,7 @@ pub const FuncBuilder = struct {
     local_fn_overloads: std.StringHashMap(std.ArrayList(LocalFnOverload)),
     /// Declared type annotation per local (`val resp: HttpResponse`),
     /// used by inline-overload receiver narrowing.
-    local_decl_types: std.StringHashMap([]const u8),
+    local_decl_types: std.StringHashMap(TypeRef),
     local_decl_nullable: std.StringHashMap(void),
     local_call_returns: std.StringHashMap(ir.EagerTypeHead),
     local_decl_recv_fn: std.StringHashMap(void),
@@ -660,7 +675,7 @@ pub const FuncBuilder = struct {
     /// the resolved callee's parameter type so the lambda body owns `T` as its
     /// extension receiver even when the call is deferred and no expected type
     /// reaches `lowerLambda` (e.g. `validate { … }`).
-    lambda_arg_recv: std.AutoHashMap(span_mod.Span, []const u8) = undefined,
+    lambda_arg_recv: std.AutoHashMap(span_mod.Span, TypeRef) = undefined,
 
     /// Per-argument bitmask: bit `i` set means the lambda value-parameter `i`
     /// of the argument currently being lowered has a broad-collection declared
@@ -678,7 +693,6 @@ pub const FuncBuilder = struct {
     sib_expected_site: ?*const anyopaque = null,
     sib_expected_ty: ?ast.TypeRef = null,
 
-
     /// Per-argument flags: the callee parameter's declared function type
     /// takes only values typed by the callee's own type parameters
     /// (`f2t: (T, T) -> T` on `fun <T : Comparable<T>> ...`). A `::name`
@@ -689,6 +703,11 @@ pub const FuncBuilder = struct {
     /// the per-argument source the arg-run reads, set by the call site.
     pending_ref_fn_generic: bool = false,
     pending_arg_fn_generic: ?[]const bool = null,
+    /// Instantiated value-parameter types for the lambda argument currently
+    /// lowering, plus the per-call parallel source from which it is selected.
+    /// Both borrow from the active call emitter.
+    pending_ref_lambda_param_types: ?[]const TypeRef = null,
+    pending_arg_lambda_param_types: ?[]const ?[]const TypeRef = null,
 
     /// See `setHasOwnTypeParams`.
     has_own_type_params: bool = false,
@@ -698,6 +717,7 @@ pub const FuncBuilder = struct {
     /// same-named concrete class. Reified type params are excluded — they are
     /// resolved by the reified splice, which substitutes the concrete type.
     type_param_names: StringSet,
+    type_param_bounds: std.StringHashMap([]const u8),
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
@@ -717,14 +737,15 @@ pub const FuncBuilder = struct {
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .type_param_names = StringSet.init(allocator),
+            .type_param_bounds = std.StringHashMap([]const u8).init(allocator),
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
-            .lambda_arg_recv = std.AutoHashMap(span_mod.Span, []const u8).init(allocator),
+            .lambda_arg_recv = std.AutoHashMap(span_mod.Span, TypeRef).init(allocator),
             .enclosing_members = StringSet.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
-            .local_decl_types = std.StringHashMap([]const u8).init(allocator),
+            .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
             .local_call_returns = std.StringHashMap(ir.EagerTypeHead).init(allocator),
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
@@ -769,7 +790,15 @@ pub const FuncBuilder = struct {
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
         self.lambda_arg_arity.deinit();
-        self.lambda_arg_recv.deinit();
+        {
+            var it = self.lambda_arg_recv.valueIterator();
+            while (it.next()) |receiver| receiver.deinit(a);
+            self.lambda_arg_recv.deinit();
+        }
+        if (self.recv_type_ref) |receiver| {
+            var owned_receiver = receiver;
+            owned_receiver.deinit(a);
+        }
         self.outer_names.deinit();
         self.capture_order.deinit(a);
         self.capture_regs.deinit();
@@ -785,6 +814,7 @@ pub const FuncBuilder = struct {
         self.object_init_locals.deinit();
         self.own_members.deinit();
         self.type_param_names.deinit();
+        self.type_param_bounds.deinit();
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
         self.param_names.deinit();
@@ -800,6 +830,11 @@ pub const FuncBuilder = struct {
             var it = self.local_fn_overloads.valueIterator();
             while (it.next()) |list| {
                 for (list.items) |ov| {
+                    if (ov.receiver_ty) |receiver| {
+                        var owned_receiver = receiver;
+                        owned_receiver.deinit(a);
+                    }
+                    a.free(ov.type_params);
                     a.free(ov.param_tys);
                     a.free(ov.param_names);
                 }
@@ -807,7 +842,11 @@ pub const FuncBuilder = struct {
             }
             self.local_fn_overloads.deinit();
         }
-        self.local_decl_types.deinit();
+        {
+            var it = self.local_decl_types.valueIterator();
+            while (it.next()) |ty| ty.deinit(self.allocator);
+            self.local_decl_types.deinit();
+        }
         self.local_decl_nullable.deinit();
         self.local_call_returns.deinit();
         self.local_decl_recv_fn.deinit();
@@ -825,6 +864,7 @@ pub const FuncBuilder = struct {
         self.reified_type_binds.deinit();
         self.reified_type_names.deinit();
         self.splice_param_tys.deinit();
+        self.implicit_receiver_tower.deinit(a);
         self.finally_stack.deinit(a);
         self.finally_body_stack.deinit(a);
         self.inline_return.deinit(a);
@@ -1198,7 +1238,20 @@ pub const FuncBuilder = struct {
         return self.owner_class;
     }
     pub fn setRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
+        if (self.recv_type_ref) |receiver| {
+            var owned_receiver = receiver;
+            owned_receiver.deinit(self.allocator);
+            self.recv_type_ref = null;
+        }
         self.recv_ty = name;
+    }
+    pub fn setRecvTypeRefOwned(self: *FuncBuilder, receiver: TypeRef) void {
+        if (self.recv_type_ref) |previous| {
+            var owned_previous = previous;
+            owned_previous.deinit(self.allocator);
+        }
+        self.recv_type_ref = receiver;
+        self.recv_ty = receiver.name;
     }
     /// The ACTIVE inline splice's declared extension receiver type.
     /// Distinct from `recv_ty` (the enclosing function's own receiver):
@@ -1215,6 +1268,11 @@ pub const FuncBuilder = struct {
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
     }
+    pub fn recvTypeRef(self: *const FuncBuilder) ?TypeRef {
+        if (self.recv_type_ref) |receiver| return receiver;
+        const head = self.recv_ty orelse return null;
+        return .{ .name = head, .nullable = false, .args = &.{} };
+    }
     /// The receiver type in scope as the implicit `this` at this body's
     /// site: the declaration's own extension receiver, else the receiver
     /// carried across a lambda boundary. Used by bare-call disambiguation
@@ -1225,6 +1283,41 @@ pub const FuncBuilder = struct {
     }
     pub fn setEnclosingRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
         self.enclosing_recv_ty = name;
+    }
+    pub fn setImplicitReceiverTower(self: *FuncBuilder, heads: []const []const u8) Allocator.Error!void {
+        self.implicit_receiver_tower.clearRetainingCapacity();
+        try self.implicit_receiver_tower.appendSlice(self.allocator, heads);
+    }
+    pub fn collectImplicitReceiverTower(
+        self: *const FuncBuilder,
+        allocator: Allocator,
+        innermost: ?[]const u8,
+    ) Allocator.Error![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (innermost) |head| try out.append(allocator, head);
+        const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
+        if (current) |head| {
+            var seen = false;
+            for (out.items) |existing| {
+                if (std.mem.eql(u8, existing, head)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try out.append(allocator, head);
+        }
+        for (self.implicit_receiver_tower.items) |head| {
+            var seen = false;
+            for (out.items) |existing| {
+                if (std.mem.eql(u8, existing, head)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try out.append(allocator, head);
+        }
+        return try out.toOwnedSlice(allocator);
     }
     pub fn selfLocalFn(self: *const FuncBuilder) ?ir.SelfLocalFn {
         return self.self_local_fn;
@@ -1352,13 +1445,21 @@ pub const FuncBuilder = struct {
         return self.lambda_arg_arity.get(sp);
     }
 
-    pub fn recordLambdaArgRecv(self: *FuncBuilder, sp: span_mod.Span, recv: []const u8) void {
-        self.lambda_arg_recv.put(sp, recv) catch {};
+    pub fn recordLambdaArgRecvOwned(
+        self: *FuncBuilder,
+        sp: span_mod.Span,
+        receiver: TypeRef,
+    ) Allocator.Error!void {
+        var owned = receiver;
+        errdefer owned.deinit(self.allocator);
+        if (try self.lambda_arg_recv.fetchPut(sp, owned)) |old| {
+            var owned_old = old.value;
+            owned_old.deinit(self.allocator);
+        }
     }
 
-    /// The declared receiver-type head for the receiver-lambda argument at
-    /// `sp`, if any.
-    pub fn lambdaArgRecv(self: *const FuncBuilder, sp: span_mod.Span) ?[]const u8 {
+    /// The declared receiver type for the receiver-lambda argument at `sp`.
+    pub fn lambdaArgRecv(self: *const FuncBuilder, sp: span_mod.Span) ?TypeRef {
         return self.lambda_arg_recv.get(sp);
     }
 
@@ -1380,7 +1481,22 @@ pub const FuncBuilder = struct {
     /// Record a local's declared type / initializer for inline-overload
     /// receiver narrowing.
     pub fn setLocalDeclType(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!void {
-        try self.local_decl_types.put(name, ty);
+        const owned = try (TypeRef{
+            .name = ty,
+            .nullable = false,
+            .args = &.{},
+        }).clone(self.allocator);
+        try self.setLocalDeclTypeOwned(name, owned);
+        _ = self.local_init_exprs.remove(name);
+    }
+    /// Record a complete declared type. Takes ownership of `ty`.
+    pub fn setLocalDeclTypeOwned(self: *FuncBuilder, name: []const u8, ty: TypeRef) Allocator.Error!void {
+        var owned = ty;
+        errdefer owned.deinit(self.allocator);
+        if (try self.local_decl_types.fetchPut(name, owned)) |old| {
+            var cleanup = old.value;
+            cleanup.deinit(self.allocator);
+        }
         _ = self.local_init_exprs.remove(name);
     }
     /// Record that the local's DECLARED type is nullable (`Array<String>?`);
@@ -1394,10 +1510,21 @@ pub const FuncBuilder = struct {
         return self.local_decl_nullable.contains(name);
     }
     pub fn localDeclTypesSnapshot(self: *const FuncBuilder) Allocator.Error!ir.PendingLocalDeclTypes {
-        var types = std.StringHashMap([]const u8).init(self.allocator);
-        errdefer types.deinit();
+        var types = std.StringHashMap(TypeRef).init(self.allocator);
+        errdefer {
+            var cleanup_it = types.valueIterator();
+            while (cleanup_it.next()) |ty| ty.deinit(self.allocator);
+            types.deinit();
+        }
         var type_it = self.local_decl_types.iterator();
-        while (type_it.next()) |entry| try types.put(entry.key_ptr.*, entry.value_ptr.*);
+        while (type_it.next()) |entry| {
+            const cloned = try entry.value_ptr.clone(self.allocator);
+            errdefer {
+                var cleanup = cloned;
+                cleanup.deinit(self.allocator);
+            }
+            try types.put(entry.key_ptr.*, cloned);
+        }
         var nullable = std.StringHashMap(void).init(self.allocator);
         errdefer nullable.deinit();
         var null_it = self.local_decl_nullable.keyIterator();
@@ -1410,7 +1537,10 @@ pub const FuncBuilder = struct {
     }
     pub fn inheritLocalDeclTypes(self: *FuncBuilder, inherited: *const ir.PendingLocalDeclTypes) Allocator.Error!void {
         var type_it = inherited.types.iterator();
-        while (type_it.next()) |entry| try self.local_decl_types.put(entry.key_ptr.*, entry.value_ptr.*);
+        while (type_it.next()) |entry| {
+            const cloned = try entry.value_ptr.clone(self.allocator);
+            try self.setLocalDeclTypeOwned(entry.key_ptr.*, cloned);
+        }
         var null_it = inherited.nullable.keyIterator();
         while (null_it.next()) |name| try self.local_decl_nullable.put(name.*, {});
         var return_it = inherited.call_returns.iterator();
@@ -1433,7 +1563,10 @@ pub const FuncBuilder = struct {
     }
     pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
         try self.local_init_exprs.put(name, e);
-        _ = self.local_decl_types.remove(name);
+        if (self.local_decl_types.fetchRemove(name)) |old| {
+            var cleanup = old.value;
+            cleanup.deinit(self.allocator);
+        }
     }
     /// A smart cast narrows the SUBJECT's static type for the guarded branch,
     /// and Kotlin resolves extensions against the static type: inside
@@ -1442,26 +1575,31 @@ pub const FuncBuilder = struct {
     /// Narrow the local for the branch body and restore it on the way out.
     pub const NarrowedLocal = struct {
         name: []const u8,
-        prev_ty: ?[]const u8,
+        prev_ty: ?TypeRef,
         prev_nullable: bool,
     };
 
     pub fn narrowLocal(self: *FuncBuilder, name: []const u8, ty: []const u8) Allocator.Error!NarrowedLocal {
         const saved: NarrowedLocal = .{
             .name = name,
-            .prev_ty = self.local_decl_types.get(name),
+            .prev_ty = if (self.local_decl_types.fetchRemove(name)) |old| old.value else null,
             .prev_nullable = self.local_decl_nullable.contains(name),
         };
-        try self.local_decl_types.put(name, ty);
+        try self.setLocalDeclType(name, ty);
         _ = self.local_decl_nullable.remove(name);
         return saved;
     }
 
     pub fn restoreLocal(self: *FuncBuilder, saved: NarrowedLocal) void {
+        if (self.local_decl_types.fetchRemove(saved.name)) |current| {
+            var cleanup = current.value;
+            cleanup.deinit(self.allocator);
+        }
         if (saved.prev_ty) |t| {
-            self.local_decl_types.put(saved.name, t) catch {};
-        } else {
-            _ = self.local_decl_types.remove(saved.name);
+            self.local_decl_types.put(saved.name, t) catch {
+                var cleanup = t;
+                cleanup.deinit(self.allocator);
+            };
         }
         if (saved.prev_nullable) {
             self.local_decl_nullable.put(saved.name, {}) catch {};
@@ -1471,6 +1609,9 @@ pub const FuncBuilder = struct {
     }
 
     pub fn localDeclType(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
+        return if (self.local_decl_types.get(name)) |ty| ty.name else null;
+    }
+    pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }
     pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
@@ -1495,9 +1636,21 @@ pub const FuncBuilder = struct {
     /// Register one same-named local-fn declaration. Takes ownership of
     /// `ov`'s slices (they must come from this builder's allocator).
     pub fn addLocalFnOverload(self: *FuncBuilder, name: []const u8, ov: LocalFnOverload) Allocator.Error!void {
+        const owned = ov;
+        var appended = false;
+        errdefer if (!appended) {
+            if (owned.receiver_ty) |receiver| {
+                var cleanup = receiver;
+                cleanup.deinit(self.allocator);
+            }
+            self.allocator.free(owned.type_params);
+            self.allocator.free(owned.param_tys);
+            self.allocator.free(owned.param_names);
+        };
         const gop = try self.local_fn_overloads.getOrPut(name);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(self.allocator, ov);
+        try gop.value_ptr.append(self.allocator, owned);
+        appended = true;
     }
     /// Every local-function declaration seen for `name`, in decl order —
     /// including a lone one. A call site checks these for APPLICABILITY: a
@@ -1527,10 +1680,27 @@ pub const FuncBuilder = struct {
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             for (e.value_ptr.items) |ov| {
                 var dup = ov;
+                var appended = false;
                 // `mangled` is module-lifetime — share it.
+                dup.receiver_ty = if (ov.receiver_ty) |receiver|
+                    try receiver.clone(self.allocator)
+                else
+                    null;
+                errdefer if (!appended) if (dup.receiver_ty) |receiver| {
+                    var cleanup = receiver;
+                    cleanup.deinit(self.allocator);
+                };
                 dup.param_tys = try self.allocator.dupe(?[]const u8, ov.param_tys);
+                errdefer if (!appended) self.allocator.free(dup.param_tys);
                 dup.param_names = try self.allocator.dupe([]const u8, ov.param_names);
+                errdefer if (!appended) self.allocator.free(dup.param_names);
+                dup.type_params = try self.allocator.dupe(
+                    ir.ModuleRegistry.TypeParamBound,
+                    ov.type_params,
+                );
+                errdefer if (!appended) self.allocator.free(dup.type_params);
                 try gop.value_ptr.append(self.allocator, dup);
+                appended = true;
             }
         }
     }
@@ -1648,6 +1818,29 @@ pub const FuncBuilder = struct {
     /// class). A cast to it is unchecked/erased.
     pub fn addTypeParamName(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.type_param_names.put(name, {});
+    }
+    pub fn addTypeParamBound(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: []const u8,
+    ) Allocator.Error!void {
+        try self.type_param_names.put(name, {});
+        try self.type_param_bounds.put(name, bound);
+    }
+    pub fn typeParamBoundsSlice(
+        self: *const FuncBuilder,
+    ) Allocator.Error!?[]const ir.ModuleRegistry.TypeParamBound {
+        if (self.type_param_bounds.count() == 0) return null;
+        const out = try self.allocator.alloc(
+            ir.ModuleRegistry.TypeParamBound,
+            self.type_param_bounds.count(),
+        );
+        var it = self.type_param_bounds.iterator();
+        var index: usize = 0;
+        while (it.next()) |entry| : (index += 1) {
+            out[index] = .{ .param = entry.key_ptr.*, .bound = entry.value_ptr.* };
+        }
+        return out;
     }
     /// Whether `name` is a non-reified type parameter in scope.
     pub fn isTypeParam(self: *const FuncBuilder, name: []const u8) bool {
@@ -2291,6 +2484,8 @@ test "captured local type metadata transfers to a lambda builder" {
     try outer.setLocalDeclNullable("scope");
     var snapshot = try outer.localDeclTypesSnapshot();
     defer {
+        var type_it = snapshot.types.valueIterator();
+        while (type_it.next()) |ty| ty.deinit(testing.allocator);
         snapshot.types.deinit();
         snapshot.nullable.deinit();
         snapshot.call_returns.deinit();

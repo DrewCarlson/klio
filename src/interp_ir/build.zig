@@ -2132,6 +2132,21 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
+        const type_params = try a.alloc([]const u8, ta.type_params.len);
+        for (ta.type_params, type_params) |*param, *out| out.* = param.name.name;
+        const alias_shape = ir.ModuleRegistry.TypeAliasShape{
+            .type_params = type_params,
+            .target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true),
+        };
+        try module.registry.type_alias_types.put(ta.name.name, alias_shape);
+        const alias_fqn = try resolveFqn(
+            a,
+            fqn_overrides,
+            ta.span,
+            package_prefix,
+            ta.name.name,
+        );
+        try module.registry.type_alias_types.put(alias_fqn, alias_shape);
         if (ta.target.function) |ft| {
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{ft.params.len});
             try module.registry.type_aliases.put(ta.name.name, tag);
@@ -2234,7 +2249,10 @@ fn buildModuleWithOverrides(
                 .fqn = fqn,
                 .package = decl_pkg.get(f.span) orelse packageOfFqn(fqn, f.name.name),
                 .params = stub_params,
-                .return_ty = ir.build.typeUnit(),
+                .return_ty = if (f.return_type) |*rt|
+                    try ir.lower.decl.loweredTypeRef(a, rt, true)
+                else
+                    ir.build.typeUnit(),
                 .n_locals = 0,
                 .blocks = &.{},
                 .entry = ir.BlockId.from(0),
@@ -2284,6 +2302,7 @@ fn buildModuleWithOverrides(
                 .arity = arity,
                 .sig = decl_sig,
                 .kind = if (f.receiver_type != null) .top_level_extension else .plain,
+                .visibility = f.visibility,
                 .is_inline = f.is_inline,
                 .is_suspend = f.is_suspend,
                 .has_body = f.body != null,
