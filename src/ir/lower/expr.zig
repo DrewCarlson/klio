@@ -10407,6 +10407,18 @@ fn lowerResolvedExtensionCall(
     return dst;
 }
 
+fn staticReceiverHasNoCompetingCallable(
+    b: *FuncBuilder,
+    receiver_ty: ?TypeRef,
+    name: []const u8,
+) bool {
+    const ty = receiver_ty orelse return false;
+    const head = typeHead(ty.name);
+    const hierarchy = b.module.registry.hierarchy_shadow_names.get(head) orelse return false;
+    if (!hierarchy.complete or hierarchy.names.contains(name)) return false;
+    return !b.module.extCouldApply(b.allocator, head, name);
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -10476,13 +10488,29 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
         const dst = b.allocReg();
-        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
         // A receiver whose static type is an unbounded type parameter declares
         // no members, so the runtime class must not be consulted at all: the
         // in-scope callable is the only candidate Kotlin ever had.
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
             b.isErasedRecvParam(receiver.Path.segments[0].name);
+        const callable_shape_known = b.isReceiverLambdaParam(name.name) or
+            b.isLocalExtFn(name.name);
+        if (recv_erased or
+            (callable_shape_known and staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
+        {
+            orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = local_reg,
+                .receiver = recv,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
         try b.push(.{ .CallMemberOrValue = .{
             .dst = dst,
             .receiver = recv,
@@ -11935,6 +11963,94 @@ test "shared member resolution selects overloads and dispatch forms" {
     const bodyless_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, bodyless_result.dispatch);
     try testing.expectEqual(final_pick, bodyless_result.target.?);
+}
+
+test "receiver callable emission respects members and lazy extensions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    var names = std.StringHashMap(void).init(a);
+    try names.put("member", {});
+    try m.registry.hierarchy_shadow_names.put("Target", .{
+        .names = names,
+        .complete = true,
+    });
+
+    const ext = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = ext,
+        .name = "extension",
+        .fqn = "sample.extension",
+        .package = "sample",
+        .params = &.{},
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "extension", .id = ext });
+    try m.decl_sigs.put(ext.int(), .{
+        .receiver_ty = .{ .name = "Target", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    const target_reg = b.allocReg();
+    try b.bind("target", target_reg);
+    try b.setLocalDeclType("target", "Target");
+    for ([_][]const u8{ "value", "member", "extension" }) |name| {
+        try b.bind(name, b.allocReg());
+        try b.markParam(name);
+        try b.markReceiverLambdaParam(name);
+        try b.markReceiverLambdaArity(name, 0);
+    }
+
+    var receiver_segments = [_]ast.Ident{.{
+        .name = "target",
+        .span = dummySpan(),
+    }};
+    var receiver = Expr{ .Path = .{
+        .segments = &receiver_segments,
+        .span = dummySpan(),
+    } };
+
+    const Expect = struct {
+        fn lower(
+            builder: *FuncBuilder,
+            recv: *Expr,
+            name: []const u8,
+            tag: std.meta.Tag(ir.Inst),
+        ) !void {
+            var callee = Expr{ .Member = .{
+                .receiver = recv,
+                .name = .{ .name = name, .span = dummySpan() },
+                .safe = false,
+                .span = dummySpan(),
+            } };
+            const call = Expr{ .Call = .{
+                .callee = &callee,
+                .args = &.{},
+                .arg_names = &.{},
+                .type_args = &.{},
+                .is_infix = false,
+                .span = dummySpan(),
+            } };
+            _ = try lowerExpr(builder, &call);
+            const insts = builder.blocks.items[builder.cur.int()].insts;
+            try testing.expectEqual(tag, std.meta.activeTag(insts[insts.len - 1]));
+        }
+    };
+
+    try Expect.lower(&b, &receiver, "value", .CallValueWithThis);
+    try Expect.lower(&b, &receiver, "member", .CallMemberOrValue);
+    try Expect.lower(&b, &receiver, "extension", .CallMemberOrValue);
 }
 
 test "lowers postfix not-null assert" {

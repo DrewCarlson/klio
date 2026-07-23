@@ -71,7 +71,7 @@ covers the heuristic's full decision context first. Queue state:
   heuristic. The hardening path is to thread declared receiver-shapes into
   `ClosureInfo` (an explicit `has_receiver` bit from the lambda's declared type)
   so the binding stops being an arity+capture guess; queued as an enhancement.
-- **`CallMemberOrValue` exact emission: metadata prerequisite landed.**
+- **`CallMemberOrValue` exact value emission: landed for proven calls.**
   First: the hierarchy sets cannot disprove EXTENSIONS (stdlib extensions on the
   receiver's type win over a local callable — the MinMax family measured it).
   Second: the extension-candidate index (`Module.extCouldApply` — landed, kept)
@@ -82,7 +82,14 @@ covers the heuristic's full decision context first. Queue state:
   the complete declaration index and image-preserved `DeclSig.receiver_ty`,
   including the lazy base-function range; it no longer reads materialized
   function parameters. Source and image tests pin the bodyless-header case.
-  Exact emission can now advance behind this index with eager/lazy audit parity.
+  The lowerer now emits `CallValueWithThis` when the in-scope value is known to
+  have a receiver-function shape and the receiver's complete hierarchy plus the
+  extension index prove no member or extension can compete. An unbounded
+  type-parameter receiver also takes this exact path. Known or incomplete member
+  and extension surfaces retain `CallMemberOrValue`; all generated MinMax
+  `min`/`max` sites remain deferred, while the audit shows exact production
+  sites for `block`, `contains`, `get`, and `iterator`. The full 117-file sweep
+  is unchanged and eager-identical at its one existing ULong range-sort failure.
 - **literal-coercion gap: NEUTRALIZED** — the only live path was eager primitive
   fills, which the channel excludes. The enhancement that would let primitives
   fill is a numeric-family-aware evidence comparison in applicability (Int
@@ -90,8 +97,8 @@ covers the heuristic's full decision context first. Queue state:
   canonical-gated, not urgent.
 
 With the seams live, the endgame per heuristic: `CallMemberOrValue`'s
-invocability guessing → exact emission per typeck (member, value-with-receiver,
-or ctor), guessing kept only for spans with no eager answer; the closure
+invocability guessing remains only where member or extension competition is
+real or declaration metadata is incomplete; the closure
 "+1 arity → receiver" rebind → explicit receiver-binding from declared types;
 the `hasOwnMember` implicit-this arm → typeck's member answer; the CMG
 unknown-receiver fallbacks and `class_member_names` → deleted once receiver
