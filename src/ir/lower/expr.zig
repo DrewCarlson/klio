@@ -8578,7 +8578,14 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| {
         if (std.mem.eql(u8, efw, name0)) std.debug.print("[efset] nlr={} nargs={d} last_lambda={} file={d}\n", .{ ctx.nonlocal_return_lambda, args.len, lastArgIsLambda(args), segments[0].span.file.int() });
     }
-    const res = try b.module.resolveCall(b.allocator, name0, b.self_package, segments[0].span.file, shapes, last_arg_lambda, ctx);
+    const res = try resolveCallWithComposerAbi(
+        b,
+        name0,
+        segments[0].span.file,
+        shapes,
+        last_arg_lambda,
+        ctx,
+    );
     // Eager audit: where typeck recorded a pick for this call site,
     // compare it against the engine's answer. Audit-only — behavior
     // flips seam by seam once disagreement is at zero.
@@ -8743,6 +8750,73 @@ fn resolveCtxFor(b: *FuncBuilder, name0: []const u8, ast_type_args: []const ast.
         .in_tailrec_body = b.tailrecSelf() != null,
         .owner_class = b.ownerClass(),
     };
+}
+
+/// Resolve a source-shaped call first, then retry with the hidden Compose ABI
+/// only when the current function has a real threaded composer and ordinary
+/// Kotlin resolution found no target. The retry must itself select a
+/// declaration whose lowered signature proves the synthetic pair; this keeps
+/// same-name non-composable overloads on the ordinary path.
+fn resolveCallWithComposerAbi(
+    b: *FuncBuilder,
+    name: []const u8,
+    caller_file: ir.FileId,
+    shapes: []const applicability.ArgShape,
+    last_arg_lambda: bool,
+    ctx: ir.Module.ResolveCtx,
+) Allocator.Error!ir.Module.Resolution {
+    const direct = try b.module.resolveCall(
+        b.allocator,
+        name,
+        b.self_package,
+        caller_file,
+        shapes,
+        last_arg_lambda,
+        ctx,
+    );
+    if (direct.target != null or b.resolve("$composer") == null or
+        argShapesHaveComposerPair(shapes))
+    {
+        return direct;
+    }
+
+    const augmented = try b.allocator.alloc(applicability.ArgShape, shapes.len + 2);
+    defer b.allocator.free(augmented);
+    @memcpy(augmented[0..shapes.len], shapes);
+    augmented[shapes.len] = .{ .named = "$composer" };
+    augmented[shapes.len + 1] = .{
+        .ty = build.typeInt(),
+        .named = "$changed",
+        .literal_kind = .numeric,
+    };
+
+    const threaded = try b.module.resolveCall(
+        b.allocator,
+        name,
+        b.self_package,
+        caller_file,
+        augmented,
+        false,
+        ctx,
+    );
+    if (threaded.target) |target| {
+        if (b.module.funcById(target)) |f| {
+            if (selectedCallHasComposerAbi(b.module, target, f)) {
+                b.allocator.free(direct.candidate_set);
+                return threaded;
+            }
+        }
+    }
+    b.allocator.free(threaded.candidate_set);
+    return direct;
+}
+
+fn argShapesHaveComposerPair(shapes: []const applicability.ArgShape) bool {
+    if (shapes.len < 2) return false;
+    const composer_name = shapes[shapes.len - 2].named orelse return false;
+    const changed_name = shapes[shapes.len - 1].named orelse return false;
+    return std.mem.eql(u8, composer_name, "$composer") and
+        std.mem.eql(u8, changed_name, "$changed");
 }
 
 fn indexDeferReason(res: ir.Module.BareCallResolution) ?ir.Module.ResolveDeferReason {
@@ -9409,6 +9483,137 @@ fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize
     return false;
 }
 
+const SelectedCallArgs = struct {
+    args: []const Expr,
+    names: []const ?[]const u8,
+    owned_args: ?[]Expr = null,
+    owned_names: ?[]?[]const u8 = null,
+    owned_composer_path: ?[]ast.Ident = null,
+
+    fn deinit(self: *SelectedCallArgs, allocator: Allocator) void {
+        if (self.owned_args) |items| allocator.free(items);
+        if (self.owned_names) |items| allocator.free(items);
+        if (self.owned_composer_path) |items| allocator.free(items);
+        self.* = .{ .args = &.{}, .names = &.{} };
+    }
+};
+
+fn hasThreadedComposerParams(f: *const Func) bool {
+    if (f.params.len < 2) return false;
+    return std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
+        std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed");
+}
+
+fn sameDeclSig(a: ir.Module.DeclSig, b: ir.Module.DeclSig) bool {
+    if (a.kind != b.kind or
+        a.arity.required != b.arity.required or
+        a.arity.total != b.arity.total or
+        a.arity.has_vararg != b.arity.has_vararg or
+        a.sig.len != b.sig.len)
+    {
+        return false;
+    }
+    if ((a.enclosing_class == null) != (b.enclosing_class == null)) return false;
+    if (a.enclosing_class) |ac| {
+        if (ac.int() != b.enclosing_class.?.int()) return false;
+    }
+    if ((a.receiver_ty == null) != (b.receiver_ty == null)) return false;
+    if (a.receiver_ty) |ar| {
+        if (!ar.eql(b.receiver_ty.?)) return false;
+    }
+    for (a.sig, b.sig) |ap, bp| {
+        if (!ap.eql(bp)) return false;
+    }
+    return true;
+}
+
+/// Whether the declaration selected during lowering has the transformed
+/// Compose call ABI. A reserved declaration header retains the source
+/// parameter list while its body-carrying sibling owns the synthetic tail, so
+/// match that sibling by the canonical declaration signature rather than by
+/// simple name.
+fn selectedCallHasComposerAbi(module: *const Module, func_id: FuncId, f: *const Func) bool {
+    if (hasThreadedComposerParams(f)) return true;
+    for (f.annotation_names) |ann| {
+        if (std.mem.eql(u8, ann, "Composable") or std.mem.endsWith(u8, ann, ".Composable")) return true;
+    }
+    const selected_sig = module.decl_sigs.get(func_id.int()) orelse return false;
+    for (module.funcsBySimpleName(f.name)) |candidate_id| {
+        if (candidate_id.int() == func_id.int()) continue;
+        const candidate = module.funcById(candidate_id) orelse continue;
+        if (!hasThreadedComposerParams(candidate)) continue;
+        if (!std.mem.eql(u8, candidate.fqn, f.fqn)) continue;
+        const candidate_sig = module.decl_sigs.get(candidate_id.int()) orelse continue;
+        if (sameDeclSig(selected_sig, candidate_sig)) return true;
+    }
+    return false;
+}
+
+fn selectedCallArgs(module: *const Module, func_id: FuncId, args: []const Expr, names: []const ?[]const u8) SelectedCallArgs {
+    if (args.len < 2 or names.len != args.len) return .{ .args = args, .names = names };
+    const composer_name = names[names.len - 2] orelse return .{ .args = args, .names = names };
+    const changed_name = names[names.len - 1] orelse return .{ .args = args, .names = names };
+    if (!std.mem.eql(u8, composer_name, "$composer") or
+        !std.mem.eql(u8, changed_name, "$changed"))
+    {
+        return .{ .args = args, .names = names };
+    }
+    const f = module.funcById(func_id) orelse return .{ .args = args, .names = names };
+    if (selectedCallHasComposerAbi(module, func_id, f)) return .{ .args = args, .names = names };
+    return .{
+        .args = args[0 .. args.len - 2],
+        .names = names[0 .. names.len - 2],
+    };
+}
+
+fn hasComposerArgPair(names: []const ?[]const u8) bool {
+    if (names.len < 2) return false;
+    const composer_name = names[names.len - 2] orelse return false;
+    const changed_name = names[names.len - 1] orelse return false;
+    return std.mem.eql(u8, composer_name, "$composer") and
+        std.mem.eql(u8, changed_name, "$changed");
+}
+
+/// Complete the exact selected Compose ABI from the current lowered scope.
+/// The AST pass normally supplies this pair, but a cross-pack caller may have
+/// been transformed before the callee joined its simple-name oracle. The
+/// selected declaration and the synthesized `$composer` binding are direct
+/// evidence, so emission can still produce the same static call.
+fn selectedCallArgsForBuilder(
+    b: *FuncBuilder,
+    func_id: FuncId,
+    args: []const Expr,
+    names: []const ?[]const u8,
+    call_span: ast.Span,
+) Allocator.Error!SelectedCallArgs {
+    var selected = selectedCallArgs(b.module, func_id, args, names);
+    if (hasComposerArgPair(selected.names)) return selected;
+    const f = b.module.funcById(func_id) orelse return selected;
+    if (!selectedCallHasComposerAbi(b.module, func_id, f) or b.resolve("$composer") == null) return selected;
+
+    const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
+    errdefer b.allocator.free(completed_args);
+    @memcpy(completed_args[0..selected.args.len], selected.args);
+    const composer_path = try b.allocator.alloc(ast.Ident, 1);
+    errdefer b.allocator.free(composer_path);
+    composer_path[0] = .{ .name = "$composer", .span = call_span };
+    completed_args[selected.args.len] = .{ .Path = .{ .segments = composer_path, .span = call_span } };
+    completed_args[selected.args.len + 1] = .{ .IntLit = .{ .value = 0, .kind = .Int, .span = call_span } };
+
+    const completed_names = try b.allocator.alloc(?[]const u8, selected.names.len + 2);
+    errdefer b.allocator.free(completed_names);
+    @memcpy(completed_names[0..selected.names.len], selected.names);
+    completed_names[selected.names.len] = "$composer";
+    completed_names[selected.names.len + 1] = "$changed";
+
+    selected.owned_args = completed_args;
+    selected.owned_names = completed_names;
+    selected.owned_composer_path = composer_path;
+    selected.args = completed_args;
+    selected.names = completed_names;
+    return selected;
+}
+
 /// The `Call` emit form: a resolved bare-name static call. A committed
 /// non-extension target lowers to a direct `Call` (or a `TailCallFunc` in a
 /// tailrec body); an extension target routes through `emitExtBareCall`, which
@@ -9425,8 +9630,10 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     }
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
     defer _ = b.setCallTrailingLambda(prev_trailing);
-    const args = call.args;
-    const ast_arg_names = call.arg_names;
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(call.callee));
+    defer selected_args.deinit(b.allocator);
+    const args = selected_args.args;
+    const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
 
     // The committed target is overload-precise, so its receiver-function
@@ -9807,8 +10014,10 @@ fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast:
 fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
-    const args = call.args;
-    const ast_arg_names = call.arg_names;
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee));
+    defer selected_args.deinit(b.allocator);
+    const args = selected_args.args;
+    const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
     const name0 = callee.Path.segments[0].name;
 
@@ -10006,6 +10215,13 @@ fn trailingLambdaArgNames(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error![]?ConstId {
+    if (b.module.funcById(func_id)) |f| {
+        if (threadedTrailingLambdaParam(f, args, ast_arg_names)) |hit| {
+            const tagged = try internArgNames(b.allocator, b.module, ast_arg_names);
+            tagged[hit.arg_index] = try b.module.internConst(b.allocator, .{ .String = hit.param_name });
+            return tagged;
+        }
+    }
     if (args.len != 0 and allNull(ast_arg_names) and lastArgIsLambda(args)) {
         if (b.module.funcById(func_id)) |f| {
             const last_is_fn = f.params.len != 0 and
@@ -10031,13 +10247,46 @@ fn trailingLambdaArgNames(
     return internArgNames(b.allocator, b.module, ast_arg_names);
 }
 
+const ThreadedTrailingLambda = struct {
+    arg_index: usize,
+    param_name: []const u8,
+};
+
+/// The source trailing lambda immediately before the Compose synthetic pair
+/// binds the selected declaration's last user parameter. The AST pass appends
+/// the pair and clears `has_trailing_lambda`, so carrying this exact parameter
+/// name into IR preserves Kotlin's across-default binding.
+fn threadedTrailingLambdaParam(
+    f: *const Func,
+    args: []const Expr,
+    names: []const ?[]const u8,
+) ?ThreadedTrailingLambda {
+    if (!hasThreadedComposerParams(f) or args.len < 3 or names.len != args.len) return null;
+    const composer_name = names[names.len - 2] orelse return null;
+    const changed_name = names[names.len - 1] orelse return null;
+    if (!std.mem.eql(u8, composer_name, "$composer") or
+        !std.mem.eql(u8, changed_name, "$changed"))
+    {
+        return null;
+    }
+    const arg_index = args.len - 3;
+    if (args[arg_index] != .Lambda or names[arg_index] != null) return null;
+    const user_param_end = f.params.len - 2;
+    if (user_param_end == 0) return null;
+    const param = &f.params[user_param_end - 1];
+    if (!std.mem.startsWith(u8, param.ty.name, "Function")) return null;
+    return .{ .arg_index = arg_index, .param_name = param.name };
+}
+
 /// The extension-fn bare-call path: prepend `this`, with trailing-lambda
 /// arg-name synthesis and the member-precedence routing.
 fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg: Reg, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
-    const args = call.args;
-    const ast_arg_names = call.arg_names;
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee));
+    defer selected_args.deinit(b.allocator);
+    const args = selected_args.args;
+    const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
 
     // Synthesise a Path("this") arg expr then lower the run.
@@ -11756,6 +12005,150 @@ test "buildArgShapes: literal, lambda, spread, and named argument shapes" {
     } };
     const call_shape = shapeOfAstArg(&b, &predicate_call, null);
     try testing.expectEqualStrings("Boolean", call_shape.ty.?.name);
+}
+
+test "selected call args discard a composer pair from a non-composable overload" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const plain_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = plain_id,
+        .name = "sameName",
+        .fqn = "sample.sameName",
+        .params = try a.dupe(ir.Param, &.{.{ .name = "value", .ty = build.typeInt(), .default = null }}),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    const composable_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = composable_id,
+        .name = "sameName",
+        .fqn = "sample.sameNameComposable",
+        .params = &.{},
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .annotation_names = &.{"Composable"},
+    });
+
+    const args = [_]Expr{
+        .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
+        .{ .NullLit = .{ .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } },
+    };
+    const names = [_]?[]const u8{ null, "$composer", "$changed" };
+    const plain = selectedCallArgs(&m, plain_id, &args, &names);
+    try testing.expectEqual(@as(usize, 1), plain.args.len);
+    try testing.expectEqual(@as(usize, 1), plain.names.len);
+    const composable = selectedCallArgs(&m, composable_id, &args, &names);
+    try testing.expectEqual(@as(usize, 3), composable.args.len);
+    try testing.expectEqual(@as(usize, 3), composable.names.len);
+
+    const header_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = header_id,
+        .name = "reserved",
+        .fqn = "sample.reserved",
+        .params = try a.dupe(ir.Param, &.{.{ .name = "value", .ty = build.typeInt(), .default = null }}),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    const body_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = body_id,
+        .name = "reserved",
+        .fqn = "sample.reserved",
+        .params = try a.dupe(ir.Param, &.{
+            .{ .name = "value", .ty = build.typeInt(), .default = null },
+            .{ .name = "$composer", .ty = build.typeUnit(), .default = null },
+            .{ .name = "$changed", .ty = build.typeInt(), .default = null },
+        }),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    const reserved_sig: ir.Module.DeclSig = .{
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &.{build.typeInt()},
+        .has_body = true,
+    };
+    try m.decl_sigs.put(header_id.int(), reserved_sig);
+    try m.decl_sigs.put(body_id.int(), reserved_sig);
+    try m.func_index.append(a, .{ .name = "reserved", .id = header_id });
+    try m.func_index.append(a, .{ .name = "reserved", .id = body_id });
+    try m.rebuildFuncNameIndex(a);
+    const reserved = selectedCallArgs(&m, header_id, &args, &names);
+    try testing.expectEqual(@as(usize, 3), reserved.args.len);
+    try testing.expectEqual(@as(usize, 3), reserved.names.len);
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    try b.bind("$composer", b.allocReg());
+    const source_names = [_]?[]const u8{null};
+    var completed = try selectedCallArgsForBuilder(
+        &b,
+        header_id,
+        args[0..1],
+        &source_names,
+        dummySpan(),
+    );
+    defer completed.deinit(a);
+    try testing.expectEqual(@as(usize, 3), completed.args.len);
+    try testing.expectEqualStrings("$composer", completed.names[1].?);
+    try testing.expectEqualStrings("$changed", completed.names[2].?);
+    try testing.expect(completed.args[1] == .Path);
+    try testing.expectEqualStrings("$composer", completed.args[1].Path.segments[0].name);
+}
+
+test "threaded trailing lambda binds before the composer pair" {
+    var params = [_]ir.Param{
+        .{ .name = "modifier$arg", .ty = .{ .name = "Modifier", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "measurePolicy", .ty = .{ .name = "Function1", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "$composer", .ty = .{ .name = "Composer", .nullable = false, .args = &.{} }, .default = null },
+        .{ .name = "$changed", .ty = build.typeInt(), .default = null },
+    };
+    const f = Func{
+        .id = FuncId.from(0),
+        .name = "SubcomposeLayout",
+        .fqn = "androidx.compose.ui.layout.SubcomposeLayout",
+        .params = &params,
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    };
+    var lambda_params: [0]ast.Ident = .{};
+    const args = [_]Expr{
+        .{ .Lambda = .{
+            .params = &lambda_params,
+            .body = .{ .stmts = &.{}, .span = dummySpan() },
+            .span = dummySpan(),
+        } },
+        .{ .NullLit = .{ .span = dummySpan() } },
+        .{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } },
+    };
+    const names = [_]?[]const u8{ null, "$composer", "$changed" };
+    const hit = threadedTrailingLambdaParam(&f, &args, &names).?;
+    try testing.expectEqual(@as(usize, 0), hit.arg_index);
+    try testing.expectEqualStrings("measurePolicy", hit.param_name);
+
+    const explicitly_named = [_]?[]const u8{ "measurePolicy", "$composer", "$changed" };
+    try testing.expect(threadedTrailingLambdaParam(&f, &args, &explicitly_named) == null);
 }
 
 test "lambda lowering records unknown, plain, and receiver callable shapes" {

@@ -5454,7 +5454,10 @@ pub const Module = struct {
     }
 
     fn phaseBLadder(self: *const Module, name: []const u8, args: []const applicability.ArgShape, caller_pkg: []const u8, caller_file: FileId, ctx_owner: ?[]const u8, receiver_known: bool) ?FuncId {
+        const named = !allShapeNamesNull(args);
         const scope = applicability.ApplicabilityScope{
+            .named = named,
+            .recv_external = named,
             .ctx = @ptrCast(@constCast(self)),
             .ext_is_subtype_name = evidenceSubtypeCb,
         };
@@ -5551,7 +5554,11 @@ pub const Module = struct {
     /// signature view, or no refuting evidence, keeps the candidate.
     pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
         const sv = self.sigViewForApplicability(fid) orelse return .{ .points = 0 };
-        return applicability.applicable(&sv, args, .{});
+        const named = !allShapeNamesNull(args);
+        return applicability.applicable(&sv, args, .{
+            .named = named,
+            .recv_external = named,
+        });
     }
 
     pub fn declSigCompatible(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) bool {
@@ -5754,10 +5761,32 @@ pub const Module = struct {
         const inf = self.funcById(idx);
         if (hf != null and inf != null and
             self.bareCallTier(hf.?, name, caller_pkg, caller_file) ==
-                self.bareCallTier(inf.?, name, caller_pkg, caller_file) and
-            !self.declSigCompatible(idx, args))
+                self.bareCallTier(inf.?, name, caller_pkg, caller_file))
         {
-            return heur;
+            const idx_score = self.declSigScore(idx, args) orelse return heur;
+            if (self.declSigScore(heur, args)) |heur_score| {
+                const heur_ext = funcHasImplicitThis(hf.?);
+                const idx_ext = funcHasImplicitThis(inf.?);
+                const heur_rung: u8 = if (heur_score.exact_arity)
+                    (if (heur_ext) 1 else 0)
+                else if (heur_score.binding.trailing_lambda_param != null)
+                    (if (heur_ext) 2 else 3)
+                else
+                    (if (heur_ext) 5 else 4);
+                const idx_rung: u8 = if (idx_score.exact_arity)
+                    (if (idx_ext) 1 else 0)
+                else if (idx_score.binding.trailing_lambda_param != null)
+                    (if (idx_ext) 2 else 3)
+                else
+                    (if (idx_ext) 5 else 4);
+                if (heur_rung < idx_rung) return heur;
+                if (heur_rung == idx_rung and
+                    !allShapeNamesNull(args) and
+                    heur_score.points > idx_score.points)
+                {
+                    return heur;
+                }
+            }
         }
         return idx;
     }
@@ -5992,7 +6021,11 @@ pub const Module = struct {
                             // type evidence excludes is not Kotlin's pick
                             // no matter how well its receiver matches.
                             if (self.sigViewForApplicability(cid)) |sv| {
-                                if (applicability.applicable(&sv, args, .{}) == null) continue;
+                                const named = !allShapeNamesNull(args);
+                                if (applicability.applicable(&sv, args, .{
+                                    .named = named,
+                                    .recv_external = named,
+                                }) == null) continue;
                             }
                             heur = cid;
                             heur_recv_matched = true;
@@ -6104,7 +6137,11 @@ pub const Module = struct {
             if (ds.host_symbol == null or ds.kind != .plain) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != tier) continue;
             const sv = self.sigViewForApplicability(id) orelse continue;
-            if (applicability.applicable(&sv, args, .{}) == null) continue;
+            const named = !allShapeNamesNull(args);
+            if (applicability.applicable(&sv, args, .{
+                .named = named,
+                .recv_external = named,
+            }) == null) continue;
             applicable_count += 1;
             if (applicable_count > 1) return false;
         }
@@ -9061,6 +9098,55 @@ test "resolveCall keeps an applicable trailing-lambda overload over the arity in
     const resolved = try m.resolveCall(a, "verify", "app", FileId.from(0), &args, true, .{});
     defer a.free(resolved.candidate_set);
     try testing.expectEqual(trailing.int(), resolved.target.?.int());
+}
+
+test "resolveCall preserves a trailing lambda before the Compose pair" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const short = try pushTestFunc(&m, a, "Box", "app.Box", "app", 3);
+    const content = try pushTestFunc(&m, a, "Box", "app.Box", "app", 6);
+
+    const short_params = m.funcs.items[short.int()].params;
+    short_params[0].name = "modifier";
+    short_params[0].ty.name = "Modifier";
+    short_params[1].name = "$composer";
+    short_params[1].ty.name = "Composer";
+    short_params[2].name = "$changed";
+
+    const content_params = m.funcs.items[content.int()].params;
+    content_params[0].name = "modifier";
+    content_params[0].ty.name = "Modifier";
+    content_params[0].has_default = true;
+    content_params[1].name = "alignment";
+    content_params[1].ty.name = "Alignment";
+    content_params[1].has_default = true;
+    content_params[2].name = "propagate";
+    content_params[2].ty.name = "Boolean";
+    content_params[2].has_default = true;
+    content_params[3].name = "content";
+    content_params[3].ty.name = "Function0";
+    content_params[4].name = "$composer";
+    content_params[4].ty.name = "Composer";
+    content_params[5].name = "$changed";
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .is_lambda = true },
+        .{ .ty = .{ .name = "Composer", .nullable = false, .args = &.{} }, .named = "$composer" },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .named = "$changed" },
+    };
+    const resolved = try m.resolveCall(
+        a,
+        "Box",
+        "app",
+        FileId.from(0),
+        &args,
+        false,
+        .{},
+    );
+    defer a.free(resolved.candidate_set);
+    try testing.expectEqual(content, resolved.target.?);
 }
 
 test "symbol index distinguishes overloads by generic arguments" {
