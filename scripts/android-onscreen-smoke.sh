@@ -25,7 +25,7 @@ BT="$(ls -d "$SDK"/build-tools/*/ 2>/dev/null | sort | tail -1)"; BT="${BT%/}"
 [ -x "$BT/aapt2" ] || skip "build-tools (aapt2) not found"
 PLAT="$(ls -d "$SDK"/platforms/*/ 2>/dev/null | sort | tail -1)"; PLAT="${PLAT%/}"
 [ -f "$PLAT/android.jar" ] || skip "android platform not found"
-SK="third_party/skia/android-arm64"; SKO="$SK/out/Release-android-arm64"
+SK="${ANDROID_SKIA_ROOT:-third_party/skia/android-arm64}"; SKO="$SK/out/Release-android-arm64"
 [ -f "$SKO/libskia.a" ] || skip "Android Skia not fetched (scripts/fetch-skia.sh android arm64)"
 command -v keytool >/dev/null 2>&1 || skip "keytool not found"
 

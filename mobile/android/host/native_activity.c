@@ -62,7 +62,7 @@ static void onFrame(long frameTimeNanos, void *data) {
     if (g_selftest) {
         if (g_frames == 120) { LOG("selftest scroll dy=300"); klio_dispatch_scroll(200, 400, 0, 300); }
         if (g_frames == 180) {
-            int ids[2] = {101, 202}, xs[2] = {110, 290}, ys[2] = {680, 680}, downs[2] = {1, 1};
+            int ids[2] = {101, 202}, xs[2] = {110, 290}, ys[2] = {130, 130}, downs[2] = {1, 1};
             LOG("selftest touch: 2 pointers");
             klio_dispatch_touches(2, ids, xs, ys, downs, 0);
         }
@@ -96,6 +96,13 @@ static char *extractAsset(struct android_app *app, const char *name) {
     return path;
 }
 
+static void captureStderr(struct android_app *app) {
+    const char *dir = app->activity->internalDataPath;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/klio_stderr.log", dir);
+    if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+}
+
 static void startUi(struct android_app *app) {
     if (g_started || !app->window) return;
     g_started = 1;
@@ -111,6 +118,7 @@ static void startUi(struct android_app *app) {
     int hp = (int)(hpx / g_density);
 
     setenv("HOME", app->activity->internalDataPath, 1);
+    captureStderr(app);
     char *base = extractAsset(app, "base.klio-image");
     char *scene = extractAsset(app, "window_scene.kt");
     if (!base || !scene) { LOG("missing assets; cannot start UI"); return; }
