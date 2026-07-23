@@ -1686,6 +1686,9 @@ fn intrinsicHostDeinit(h: *VmIntrinsicHost) void {
 /// control-flow signals back into the IR evaluator's `EvalError`.
 fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(self.allocator, "intrinsic_call_value", fqn, null, null, args);
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(args);
     var intrinsic = makeIntrinsicHost(self);
     defer intrinsicHostDeinit(&intrinsic);
     var ctx = CallCtx{

@@ -245,6 +245,25 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         if (testClassOf(a, io, p)) |cls| try classes.append(a, cls);
     }
 
+    // Copying an interpreted Map re-enters Kotlin while a native intrinsic
+    // owns its iterator and entry values. Collect at every safe point so this
+    // boundary remains a precise GC-root contract.
+    try env.put("KLIO_GC_STRESS", "1");
+    var stress_argv: std.ArrayList([]const u8) = .empty;
+    try stress_argv.append(a, klioBin(&env));
+    try stress_argv.append(a, "test");
+    try stress_argv.appendSlice(a, sources.items);
+    try stress_argv.append(a, "--filter=SnapshotStateMapTests.validateEntriesRemoveAll");
+    const stress = try runKlio(a, &env, stress_argv.items, 30_000);
+    _ = env.remove("KLIO_GC_STRESS");
+    if (stress.term != .exited or stress.term.exited != 0) {
+        std.debug.print(
+            "compose_plugin_commontest: GC-stress Map copy failed:\n{s}\n{s}\n",
+            .{ stress.stdout, stress.stderr },
+        );
+        return error.GcStressMapCopyFailed;
+    }
+
     var jobs: std.ArrayList([]const []const u8) = .empty;
     for (classes.items) |cls| {
         var argv: std.ArrayList([]const u8) = .empty;

@@ -2519,14 +2519,21 @@ fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutcome {
         .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
         else => {},
     }
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePush(value);
     const iter = (try ctx.host.invokeMethod(&value, "iterator", &.{}, ctx.out)) orelse
         return .{ .err = typeErr("value is not iterable") };
     const iter_v = switch (iter) {
         .ok => |v| v,
         .err => |e| return .{ .err = .{ .err = e } },
     };
+    runtime.keepalivePush(iter_v);
+    const loop_keepalive = runtime.keepaliveMark();
     var items: std.ArrayList(Value) = .empty;
     while (true) {
+        runtime.keepaliveRestore(loop_keepalive);
+        runtime.keepalivePushSlice(items.items);
         const has_r = (try ctx.host.invokeMethod(&iter_v, "hasNext", &.{}, ctx.out)) orelse
             return .{ .err = typeErr("iterator is missing hasNext()") };
         const has = switch (has_r) {
@@ -4705,18 +4712,27 @@ fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!un
 /// values, or `Pair`s). Returns an error EvalResult on a non-map instance.
 fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) { entries: []MapPair, err: EvalResult } {
     const a = ctx.allocator;
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePush(inst);
     const entries_r = (try ctx.host.getProperty(&inst, "entries", ctx.out)) orelse
         return .{ .err = typeErr(try fmt(a, "{s} requires a Map or a collection of Pairs", .{who})) };
     const entries_val = switch (entries_r) {
         .ok => |v| v,
         .err => |e| return .{ .err = .{ .err = e } },
     };
+    runtime.keepalivePush(entries_val);
     const items = switch (try materialiseIterableInstance(ctx, entries_val)) {
         .items => |x| x,
         .err => |e| return .{ .err = e },
     };
+    runtime.keepalivePushSlice(items);
+    const loop_keepalive = runtime.keepaliveMark();
     var out: std.ArrayList(MapPair) = .empty;
     for (items) |entry| {
+        runtime.keepaliveRestore(loop_keepalive);
+        runtime.keepalivePushPairs(out.items);
+        runtime.keepalivePush(entry);
         var key: Value = undefined;
         var val: Value = undefined;
         switch (entry) {
@@ -4736,6 +4752,7 @@ fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) {
                     .ok => |v| v,
                     .err => |e| return .{ .err = .{ .err = e } },
                 };
+                runtime.keepalivePush(key);
                 const vr = (try ctx.host.getProperty(&entry, "value", ctx.out)) orelse
                     return .{ .err = typeErr(try fmt(a, "{s} entry is missing value", .{who})) };
                 val = switch (vr) {
@@ -4744,6 +4761,8 @@ fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) {
                 };
             },
         }
+        runtime.keepalivePush(key);
+        runtime.keepalivePush(val);
         if (try findKeyIndexBoxedH(ctx.host, ctx.out, out.items, &key)) |i| {
             out.items[i].value = val;
         } else {

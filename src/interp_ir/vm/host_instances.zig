@@ -647,6 +647,9 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 
 fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(self.allocator, "intrinsic_instances", fqn, null, null, args);
+    const keepalive = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(keepalive);
+    runtime.keepalivePushSlice(args);
     var ih = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),
