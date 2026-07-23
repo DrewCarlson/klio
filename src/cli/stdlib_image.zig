@@ -108,9 +108,9 @@ fn threadedIo(allocator: Allocator) std.Io.Threaded {
 // Key ingredients
 // ---------------------------------------------------------------------
 
-/// `~/.klio/cache`, created if absent. Caller frees.
+/// `$KLIO_HOME/.klio/cache` (or `~/.klio/cache`), created if absent. Caller frees.
 fn cacheDir(gpa: Allocator) ?[]u8 {
-    const home = getEnvVar(gpa, "HOME") orelse return null;
+    const home = (runtime.procEnvKlioHome(gpa) catch null) orelse return null;
     defer gpa.free(home);
     const dir = std.fs.path.join(gpa, &.{ home, ".klio", "cache" }) catch return null;
     var threaded = threadedIo(gpa);

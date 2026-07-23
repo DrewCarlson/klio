@@ -162,6 +162,7 @@ pub const Env = env_mod.Env;
 
 // proc_env (portable process-environment access)
 pub const procEnvGetVar = proc_env_mod.getVar;
+pub const procEnvKlioHome = proc_env_mod.klioHome;
 pub const procEnvIsSet = proc_env_mod.isSet;
 pub const procEnvPutAllInto = proc_env_mod.putAllInto;
 

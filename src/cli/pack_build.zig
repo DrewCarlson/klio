@@ -409,7 +409,8 @@ fn registryDir(gpa: std.mem.Allocator, override_path: ?[]const u8) Outcome([]u8)
     if (override_path) |p| {
         return .{ .ok = gpa.dupe(u8, p) catch return .{ .err = fail(gpa, "out of memory", .{}) } };
     }
-    const home = getEnv(gpa, "HOME") orelse return .{ .err = fail(gpa, "HOME env var unset", .{}) };
+    const home = (runtime.procEnvKlioHome(gpa) catch null) orelse
+        return .{ .err = fail(gpa, "HOME (or KLIO_HOME) env var unset", .{}) };
     defer gpa.free(home);
     const path = std.fs.path.join(gpa, &.{ home, ".klio", "registry" }) catch
         return .{ .err = fail(gpa, "out of memory", .{}) };
