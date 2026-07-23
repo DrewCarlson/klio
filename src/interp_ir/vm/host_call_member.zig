@@ -8656,6 +8656,14 @@ pub fn invokeVirtualMember(
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
+        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const root = FuncId.from(slot.int());
+            const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
+            std.debug.print("[vcall-noinst] slot={d} method={s} recv_tag={s} recv_ty={s} nargs={d}\n", .{ slot.int(), mname, @tagName(std.meta.activeTag(receiver.*)), receiver.typeFqn(), args.len });
+        }
         return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
     }
     const runtime_def = blk: {
