@@ -90,6 +90,13 @@ covers the heuristic's full decision context first. Queue state:
   `min`/`max` sites remain deferred, while the audit shows exact production
   sites for `block`, `contains`, `get`, and `iterator`. The full 117-file sweep
   is unchanged and eager-identical at its one existing ULong range-sort failure.
+  A Compose exact-vs-deferred A/B reached the same stale field read after 18
+  `SnapshotStateMap` tests, proving the static call form was not its cause. The
+  failure was the native-intrinsic GC boundary: intrinsic args, iterator
+  results, and user `Map.Entry` values were invisible during Kotlin re-entry.
+  Those values are now rooted, and the former failing map-copy test passes
+  under collect-at-every-safe-point; the Compose gate runs that stress check
+  before its pass-count sweep.
 - **literal-coercion gap: NEUTRALIZED** — the only live path was eager primitive
   fills, which the channel excludes. The enhancement that would let primitives
   fill is a numeric-family-aware evidence comparison in applicability (Int
