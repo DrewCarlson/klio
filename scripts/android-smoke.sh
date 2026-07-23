@@ -27,7 +27,7 @@ CLANG="$TOOL/aarch64-linux-android${API}-clang"
 echo "==> cross-compile interpreter for aarch64-linux-android"
 zig build mobile-lib -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast -Dandroid-api="$API"
 LIB="$(pwd)/zig-out/lib/libklio-android.a"
-ZSTD="$(pwd)/zig-out/lib/libzstd.a"
+ZSTD="$(pwd)/zig-out/lib/libzstd-android.a"
 for f in "$LIB" "$ZSTD"; do [ -f "$f" ] || fail "expected $f"; done
 
 echo "==> link native host (NDK clang, bionic)"
