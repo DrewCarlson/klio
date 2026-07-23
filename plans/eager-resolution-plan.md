@@ -87,9 +87,11 @@ covers the heuristic's full decision context first. Queue state:
   function parameters. Source and image tests pin the bodyless-header case.
   The lowerer now emits `CallValueWithThis` when the in-scope value is known to
   have a receiver-function shape and the receiver's complete hierarchy plus the
-  extension index prove no member or extension can compete. An unbounded
-  type-parameter receiver also takes this exact path. Known or incomplete member
-  and extension surfaces retain `CallMemberOrValue`; all generated MinMax
+  extension index prove no member or extension can compete. Known or incomplete
+  member and extension surfaces retain `CallMemberOrValue`. An unbounded
+  type-parameter receiver removes the member leg but does not prove a same-named
+  local callable, so it takes the exact path only with declared
+  receiver-function shape. All generated MinMax
   `min`/`max` sites remain deferred, while the audit shows exact production
   sites for `block`, `contains`, `get`, and `iterator`. The full 117-file sweep
   is unchanged and eager-identical at its one existing ULong range-sort failure.

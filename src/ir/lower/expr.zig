@@ -10516,8 +10516,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             b.isErasedRecvParam(receiver.Path.segments[0].name);
         const callable_shape_known = b.isReceiverLambdaParam(name.name) or
             b.isLocalExtFn(name.name);
-        if (recv_erased or
-            (callable_shape_known and staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
+        if (callable_shape_known and
+            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
         {
             orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
             try b.push(.{ .CallValueWithThis = .{
@@ -12071,6 +12071,15 @@ test "receiver callable emission respects members and lazy extensions" {
     try Expect.lower(&b, &receiver, "value", .CallValueWithThis);
     try Expect.lower(&b, &receiver, "member", .CallMemberOrValue);
     try Expect.lower(&b, &receiver, "extension", .CallMemberOrValue);
+
+    // An erased receiver removes the member leg, but does not by itself prove
+    // that a same-named local is callable. Exact value dispatch still requires
+    // the local's declared receiver-function shape.
+    try b.bind("unknown", b.allocReg());
+    try b.markParam("unknown");
+    try b.markErasedRecvParam("target");
+    try Expect.lower(&b, &receiver, "value", .CallValueWithThis);
+    try Expect.lower(&b, &receiver, "unknown", .CallMemberOrValue);
 }
 
 test "lowers postfix not-null assert" {
