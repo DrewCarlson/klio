@@ -24,6 +24,30 @@ upstream stdlib lives under `kotlin/libraries/stdlib`, klio-authored actuals and
 kotlinx packs under `kotlin-klio/`, test fixtures under `tests/fixtures/`, and baked
 end-to-end expected output under `tests/corpus/expected/`.
 
+Local klio data home — USE IT for pack development:
+
+`klio run`/`bake-image` load the compose/kotlinx/etc. libraries from the
+**installed** pack in the klio data home (`packs/`, `cache/`, `registry/`,
+`stubs/`), which **shadows the `kotlin-klio/` source**. So editing pack Kotlin
+(e.g. `kotlin-klio/klio-compose-ui-core/…`) has NO effect until you rebuild and
+reinstall that pack — a stale installed pack silently hides your change (and made
+a whole perf investigation measure old code once). The data home defaults to the
+shared `~/.klio`, so a rebuild there also clobbers other clones/workstreams.
+
+`KLIO_HOME` overrides the data home. For all local pack work, point it at the
+repo-local gitignored `.klio-local/`:
+- `scripts/klio-local.sh <args>` — runs klio with `KLIO_HOME=$PWD/.klio-local`
+  (e.g. `scripts/klio-local.sh run app.kt`). Installed packs there shadow the
+  embedded copies; unbuilt packs fall back to embedded.
+- `scripts/install-local-packs.sh` — (re)builds every shipped pack from source
+  into `.klio-local`, so source edits take effect. Re-run after editing pack
+  Kotlin. A single pack: `scripts/klio-local.sh pack build <dir> && scripts/klio-local.sh pack install target/packs/<id>.klio-pack`.
+
+Pack sources come from sparse `update = none` submodules under
+`kotlin-klio/*/upstream` (+ `kotlin/`); if a checkout is empty a pack builds
+missing-source. Populate them with `scripts/bootstrap.sh --packs` or the
+per-lib `scripts/init-*-submodule.sh`.
+
 When changing behavior, match Kotlin semantics exactly and fix the real root
 cause. Verify per-module in isolation with `python3 scripts/zigcheck.py <module>`.
 
