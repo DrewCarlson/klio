@@ -2176,7 +2176,19 @@ fn buildModuleWithOverrides(
             const f = &d.Function;
             const id = module.nextFuncId();
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
-            const host_backed = f.receiver_type == null and stdlib.implementation(fqn) != null;
+            const receiver_ty: ?ir.TypeRef = if (f.receiver_type) |*rt|
+                try ir.lower.decl.loweredTypeRef(a, rt, true)
+            else
+                null;
+            const receiver_abi_name: ?[]const u8 = if (f.receiver_type) |*rt|
+                rt.qualified_path orelse rt.name.name
+            else
+                null;
+            const host_symbol = stdlib.declarationHostSymbol(
+                fqn,
+                receiver_abi_name,
+                f.name.name,
+            );
             // The header stub carries the full declared parameter list (the
             // same `loweredTypeRef` rendering the phase-2 body install uses),
             // not just a receiver placeholder: class methods lower between
@@ -2191,10 +2203,10 @@ fn buildModuleWithOverrides(
                 if (n != 0) {
                     const ps = try a.alloc(Param, n);
                     var pi: usize = 0;
-                    if (f.receiver_type) |*rt| {
+                    if (receiver_ty) |rt| {
                         ps[0] = .{
                             .name = "this",
-                            .ty = try ir.lower.decl.loweredTypeRef(a, rt, true),
+                            .ty = rt,
                             .default = null,
                             .is_property = false,
                             .is_vararg = false,
@@ -2268,14 +2280,14 @@ fn buildModuleWithOverrides(
                 decl_sig = sig;
             }
             try module.decl_sigs.put(id.int(), .{
-                .receiver_ty = if (f.receiver_type) |*rt| try ir.lower.decl.loweredTypeRef(a, rt, true) else null,
+                .receiver_ty = receiver_ty,
                 .arity = arity,
                 .sig = decl_sig,
                 .kind = if (f.receiver_type != null) .top_level_extension else .plain,
                 .is_inline = f.is_inline,
                 .is_suspend = f.is_suspend,
                 .has_body = f.body != null,
-                .host_backed = host_backed,
+                .host_symbol = host_symbol,
             });
             try module.decl_span.put(id.int(), f.span);
             if (f.body != null) try module.decl_ast_body.put(id.int(), {});
@@ -4247,12 +4259,13 @@ fn retainDecl(
             // construction): a same-named actual elsewhere implements a
             // different declaration.
             if (actual_func_names.contains(fqn)) return false;
-            // A receiverless declaration whose exact FQN is in the host
-            // registry has the ordinary FuncId ABI and survives. Receiver-
-            // formed expects stay deferred until their declaration identity
-            // carries the receiver-qualified host ABI; treating the package
-            // FQN as that ABI would collapse unrelated receiver overloads.
-            if (stdlib.implementation(fqn) != null) return f.receiver_type == null;
+            const receiver_name: ?[]const u8 = if (f.receiver_type) |*rt|
+                rt.qualified_path orelse rt.name.name
+            else
+                null;
+            // A declaration with an exact host ABI symbol survives with its
+            // ordinary FuncId identity, including receiver-formed expects.
+            if (stdlib.declarationHostSymbol(fqn, receiver_name, f.name.name) != null) return true;
             if (f.receiver_type == null) {
                 const kotlin_fqn = try std.fmt.allocPrint(a, "kotlin.{s}", .{f.name.name});
                 if (stdlib.implementation(kotlin_fqn) != null) return false;

@@ -557,6 +557,17 @@ pub fn implementation(fqn: []const u8) ?StdlibFn {
     return implementations.lookup(fqn);
 }
 
+/// Exact host ABI symbol for a Kotlin declaration, when this build provides
+/// one. The returned string is stable for the process lifetime and is suitable
+/// for declaration metadata and image serialization.
+pub fn declarationHostSymbol(
+    source_fqn: []const u8,
+    receiver_name: ?[]const u8,
+    name: []const u8,
+) ?[]const u8 {
+    return implementations.declarationHostSymbol(source_fqn, receiver_name, name);
+}
+
 /// Return whether a host-backed member accepts this argument run when the
 /// binding carries explicit applicability metadata. Null means the binding
 /// has no extra predicate and ordinary member precedence applies.
