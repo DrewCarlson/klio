@@ -955,6 +955,11 @@ pub const Func = struct {
     /// propagates as a non-local return through this frame instead
     /// of being caught locally.
     is_lambda: bool = false,
+    /// True when this callable's function type declares an extension
+    /// receiver. The receiver is supplied at invocation and is not counted
+    /// in `params`; keeping that shape explicitly prevents the VM from
+    /// inferring receiver binding from an extra argument or a `this` capture.
+    lambda_has_receiver: bool = false,
     /// Declared receiver head of a receiver-lambda body. Unlike a local
     /// extension function this receiver is supplied at invocation rather
     /// than occupying a parameter slot; the VM uses the head to select the

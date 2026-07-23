@@ -821,3 +821,15 @@ test "imported_specific_overload_after_generic" {
         \\
     );
 }
+
+test "receiver_lambda_invoke" {
+    try check("receiver_lambda_invoke",
+        \\n=5 tag=hi
+        \\n=9 tag=yo
+        \\n=3 tag=x
+        \\n=1 tag=k b=42
+        \\5
+        \\7
+        \\
+    );
+}

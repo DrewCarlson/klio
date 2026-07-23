@@ -1097,6 +1097,36 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         },
         .AnonFun => |af| {
             try narrowing.pushFrame(self);
+            var receiver_class: ?[]const u8 = null;
+            var pushed_receiver_class = false;
+            defer {
+                if (pushed_receiver_class) {
+                    _ = self.class_stack.pop();
+                    var popped = self.dsl_receiver_stack.pop().?;
+                    popped.markers.deinit();
+                }
+            }
+            if (af.receiver_ty) |*receiver_ty| {
+                const receiver_type = try convertTypeRefLossyH(a, receiver_ty);
+                receiver_class = classNameFromTyperef(receiver_ty);
+                try narrowing.currentFrame(self).bindings.put("this", .{
+                    .ty = receiver_type,
+                    .mutable = false,
+                    .decl_span = null,
+                    .class_name = receiver_class,
+                    .decl_type_name = receiver_class,
+                });
+                if (receiver_class) |cn| {
+                    var markers = std.StringHashMap(void).init(a);
+                    if (self.dsl_class_markers.get(cn)) |m| {
+                        var marker_it = m.keyIterator();
+                        while (marker_it.next()) |k| try markers.put(k.*, {});
+                    }
+                    try self.dsl_receiver_stack.append(a, .{ .name = cn, .markers = markers });
+                    try self.class_stack.append(a, cn);
+                    pushed_receiver_class = true;
+                }
+            }
             for (af.params) |*p| {
                 const pty = try convertTypeRefLossyH(a, &p.ty);
                 const decl_type_name: ?[]const u8 = if (builtinByName(p.ty.name.name) == null)
@@ -1137,6 +1167,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 .params = params_out,
                 .return_type = r,
                 .is_suspend = af.is_suspend,
+                .receiver_head = receiver_class,
             } };
         },
         .Spread => |sp_e| {

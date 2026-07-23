@@ -2417,6 +2417,21 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
 fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const lam = expr.Lambda;
+    const eager_shape = b.module.eagerParamShapeOf(lam.body.span);
+    const recorded_recv = b.lambdaArgRecv(expr.span());
+    const expected_recv: ?[]const u8 = blk: {
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| {
+                if (ft.receiver) |r| break :blk r.name.name;
+            }
+        }
+        break :blk null;
+    };
+    const receiver_head = expected_recv orelse
+        recorded_recv orelse
+        b.module.eagerRecvHeadOf(lam.body.span);
+    const lambda_has_receiver = receiver_head != null or
+        (eager_shape != null and eager_shape.?.has_receiver);
     // Consume the per-argument expected lambda arity set by the call
     // lowering for this argument slot before the body recurses (which
     // re-arms it for the body's own nested calls).
@@ -2457,7 +2472,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // type across packs, so it knows the value arity even when the lowering
     // cannot see the declaration.
     if (expected_arity == -1) {
-        if (b.module.eagerParamShapeOf(lam.body.span)) |shape| {
+        if (eager_shape) |shape| {
             expected_arity = @intCast(shape.arity);
         }
     }
@@ -2530,21 +2545,15 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A receiver-lambda ARGUMENT whose receiver type the resolved callee made
     // concrete (recorded by `recordLambdaArgReceivers`) — reached when the
     // call is deferred so no expected type carries the receiver to lowerLambda.
-    const recorded_recv: ?[]const u8 = b.lambdaArgRecv(expr.span());
     b.module.pending_lambda_enclosing_recv = blk: {
-        if (b.peekExpected()) |exp| {
-            if (exp.function) |ft| {
-                if (ft.receiver) |r| break :blk r.name.name;
-            }
-        }
-        if (recorded_recv) |rr| break :blk rr;
+        if (receiver_head) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
     };
     // The body owns that receiver as its extension receiver, so a bare call
     // there prefers an extension on it over a same-file plain namesake —
     // `validate { contact(c) }` binds `MockViewValidator.contact`, not the
     // same-file `@Composable contact`.
-    if (recorded_recv) |rr| b.module.pending_lambda_own_recv = rr;
+    if (receiver_head) |rr| b.module.pending_lambda_own_recv = rr;
     // Carry the enclosing non-reified type-parameter names so an `x as T`
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
@@ -2578,6 +2587,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     );
     const body_func = lowered.func;
     const captured_names = lowered.captures;
+    if (b.module.funcByIdMut(body_func)) |f| {
+        f.lambda_has_receiver = lambda_has_receiver;
+    }
 
     // Record the implicit label.
     if (b.pending_lambda_label) |label| {
@@ -2616,6 +2628,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
 fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const af = expr.AnonFun;
+    const receiver_head: ?[]const u8 = if (af.receiver_ty) |r| r.name.name else null;
     const body_block: ast.Block = blk: {
         if (af.body) |body| {
             switch (body.*) {
@@ -2648,6 +2661,10 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     const inherited_lef = try b.localExtFnNames();
     const inherited_erp = try b.erasedRecvParamNames();
+    if (receiver_head) |head| {
+        b.module.pending_lambda_enclosing_recv = head;
+        b.module.pending_lambda_own_recv = head;
+    }
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     const lowered = try lowerLambdaBodyCapturingKind(
@@ -2665,6 +2682,9 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         enclosing_owner,
     );
     const captured_names = lowered.captures;
+    if (b.module.funcByIdMut(lowered.func)) |f| {
+        f.lambda_has_receiver = receiver_head != null;
+    }
     const captures = try b.allocator.alloc(Reg, captured_names.len);
     for (captured_names, captures) |n, *c| c.* = try resolveCapture(b, n);
     const dst = b.allocReg();

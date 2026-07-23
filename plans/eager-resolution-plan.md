@@ -65,12 +65,15 @@ covers the heuristic's full decision context first. Queue state:
 - **implicit-this redirect: LANDED** — the member-shadow record gate walks
   declared AND inherited members (`classChainHasMember`), and a
   channel-committed `.plain` target skips the redirect.
-- **closure +1-arity rebind: MEASURED AND KEPT.** Under live HTTP traffic the
-  ktor pipeline fires it 174 times across a short request set — the arm IS the
-  runtime's receiver-binding for host-driven invocations, not a deletable
-  heuristic. The hardening path is to thread declared receiver-shapes into
-  `ClosureInfo` (an explicit `has_receiver` bit from the lambda's declared type)
-  so the binding stops being an arity+capture guess; queued as an enhancement.
+- **closure +1-arity rebind: LANDED AS DECLARED SHAPE.** Under live HTTP traffic
+  the ktor pipeline fired the binding 174 times across a short request set, so
+  the behavior is required for host-driven receiver-lambda invocations.
+  `Func.lambda_has_receiver` now records the typeck/lowering answer,
+  `ClosureInfo.has_receiver` carries it into invocation, and the VM splits the
+  leading receiver only when that bit is set. A `this` capture is no longer used
+  as receiver evidence. Receiver lambdas that never read their receiver are
+  covered explicitly, as are anonymous functions with a declared receiver; the
+  image format is version 29 so the bit is identical in baked and direct runs.
 - **`CallMemberOrValue` exact value emission: landed for proven calls.**
   First: the hierarchy sets cannot disprove EXTENSIONS (stdlib extensions on the
   receiver's type win over a local callable — the MinMax family measured it).
