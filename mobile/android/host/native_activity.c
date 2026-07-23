@@ -59,6 +59,7 @@ static long now_ns(void) {
 // Shim-recorded boundary timestamps (src/compose_ui/skia_shim.cpp), used to split
 // the frame into recompose+layout / draw / swap.
 extern long klio_perf_surface_ns, klio_perf_present_ns, klio_perf_swap_ns;
+extern long klio_perf_surface_calls;   // rendered-frame count (winSurface acquisitions)
 
 // Rolling per-60-frame timing: render = time inside klio_render_frame (VM
 // recompose + draw + eglSwapBuffers); gap = wall time between frame callbacks;
@@ -72,6 +73,7 @@ static void onFrame(long frameTimeNanos, void *data) {
     long t0 = now_ns();
     if (g_last_cb_ns) g_gap_ns += t0 - g_last_cb_ns;
     g_last_cb_ns = t0;
+    klio_perf_surface_ns = 0;                   // reset so a skipped frame reads 0
     klio_render_frame();
     g_render_ns += now_ns() - t0;
     if (klio_perf_surface_ns > t0) {           // a window drew this frame
@@ -80,11 +82,12 @@ static void onFrame(long frameTimeNanos, void *data) {
         g_swap_ns += klio_perf_swap_ns;
     }
     if (++g_frames % 60 == 0) {
-        LOG("frames=%lu render=%.1fms (compose=%.1f draw=%.1f swap=%.1f) gap=%.1fms (%.0ffps) input=%.1fms/%ldev",
+        LOG("frames=%lu render=%.1fms (compose=%.1f draw=%.1f swap=%.1f) gap=%.1fms (%.0ffps) input=%.1fms/%ldev rendered=%ld/60",
             g_frames, g_render_ns / 60.0 / 1e6,
             g_compose_ns / 60.0 / 1e6, g_draw_ns / 60.0 / 1e6, g_swap_ns / 60.0 / 1e6,
             g_gap_ns / 60.0 / 1e6, g_gap_ns > 0 ? 60.0 * 1e9 / (double)g_gap_ns : 0.0,
-            g_input_ns / 60.0 / 1e6, g_input_count);
+            g_input_ns / 60.0 / 1e6, g_input_count, klio_perf_surface_calls);
+        klio_perf_surface_calls = 0;
         g_render_ns = g_gap_ns = g_compose_ns = g_draw_ns = g_swap_ns = 0;
         g_input_ns = g_input_count = 0;
     }
@@ -135,7 +138,13 @@ static void captureStderr(struct android_app *app) {
     const char *dir = app->activity->internalDataPath;
     char path[1024];
     snprintf(path, sizeof(path), "%s/klio_stderr.log", dir);
-    if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+    if (freopen(path, "w", stderr)) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+        // Interpreter println() writes to stdout; fold it into the same capture
+        // file so Kotlin-side diagnostics survive too.
+        dup2(fileno(stderr), fileno(stdout));
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
 }
 
 static void startUi(struct android_app *app) {

@@ -566,6 +566,11 @@ internal class KlioRecomposerDriver {
     private var frameNanos = 0L
 
     fun frame(): Boolean {
+        // Idle fast path: with nothing invalidated and no frame-clock awaiter, a
+        // sendFrame only wakes the recomposer's coroutine to find no work — an
+        // expensive resume/suspend under the interpreter for zero benefit. Skip it
+        // so a static scene between changes costs nothing.
+        if (!recomposer.hasPendingWork) return false
         val before = recomposer.changeCount
         frameClock.sendFrame(frameNanos)
         frameNanos += 16_666_666L

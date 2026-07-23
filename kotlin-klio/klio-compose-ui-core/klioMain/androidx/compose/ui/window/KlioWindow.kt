@@ -368,12 +368,15 @@ private fun pumpWindow(holder: KlioWindowHolder, timeoutMs: Int): Boolean {
  * loop minus the blocking event poll (input arrives via a separate callback).
  */
 private fun frameHosted(recomposerDriver: KlioRecomposerDriver, scope: KlioApplicationScope): Boolean {
-    if (recomposerDriver.frame()) {
+    val changed = recomposerDriver.frame()
+    if (changed) {
         for (win in scope.windows) if (!win.closed) win.dirty = true
     }
     val live = scope.windows.filter { !it.closed }
     if (live.isEmpty()) return false
-    for (win in live) renderWindowFrame(win)
+    // Redraw only windows with pending work (a recomposition this vsync, or an
+    // input event marked them dirty), like the desktop loop.
+    for (win in live) if (win.dirty) renderWindowFrame(win)
     return true
 }
 

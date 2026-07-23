@@ -2448,6 +2448,7 @@ extern "C" {
 long klio_perf_surface_ns = 0;
 long klio_perf_present_ns = 0;
 long klio_perf_swap_ns = 0;
+long klio_perf_surface_calls = 0;   // ground-truth: winSurface acquisitions
 static long klio_now_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2511,6 +2512,7 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
     // (which frees it). Wrap the window's default framebuffer (FBO 0).
     if (kw->surface) return kw->surface;
     klio_perf_surface_ns = klio_now_ns();
+    klio_perf_surface_calls++;
     EGLint pw = 0, ph = 0;
     eglQuerySurface(kw->display, kw->eglSurface, EGL_WIDTH, &pw);
     eglQuerySurface(kw->display, kw->eglSurface, EGL_HEIGHT, &ph);
