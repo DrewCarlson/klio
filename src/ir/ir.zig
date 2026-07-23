@@ -1622,13 +1622,15 @@ pub const Module = struct {
     /// Materialise `func`'s deferred `blocks` from the lazy-IR section, clearing
     /// `deferred_offset` so it is a no-op afterwards. Decoded into the module's
     /// process-lifetime arena so the patch persists across per-program builds.
-    pub fn ensureFuncBody(self: *const Module, func: *Func) void {
-        if (func.deferred_offset == 0) return;
-        const decode = self.deferred_func_decode orelse return;
+    pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
+        if (func.blocks.len != 0) return true;
+        if (func.deferred_offset == 0) return false;
+        const decode = self.deferred_func_decode orelse return false;
         if (decode(self.deferred_func_arena, self.deferred_func_section, func.deferred_offset - 1)) |blocks| {
             func.blocks = blocks;
             func.deferred_offset = 0;
         }
+        return func.blocks.len != 0;
     }
 
     /// Look up a function by id. Eager path (fresh build): direct table index.
