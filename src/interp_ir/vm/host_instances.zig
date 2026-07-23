@@ -12,13 +12,12 @@ const ir = @import("ir");
 const runtime = @import("runtime");
 const ast = @import("ast");
 const stdlib = @import("stdlib");
-const applicability = @import("applicability");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
+const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
-const overload_match = @import("overload_match.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -706,119 +705,6 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
             else => .{ .err = try typeErr(self.allocator, "{s}", .{@tagName(e)}) },
         },
     };
-}
-
-/// Permissive name take after the final `.` of a (possibly qualified)
-/// type name.
-fn lastSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
-    return name;
-}
-
-/// Subset of `overload_score_arg` sufficient for the factory pickers in
-/// the construction flow. Returns `null` when the arg provably cannot
-/// satisfy the parameter type.
-fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) ?i32 {
-    const nm = param_ty.name;
-    var v_ty_buf: []const u8 = undefined;
-    var owned_name: ?[]const u8 = null;
-    if (arg.* == .Instance) {
-        const g = arg.Instance.borrow();
-        const cg = g.get().class.borrow();
-        owned_name = cg.get().name;
-        v_ty_buf = cg.get().name;
-        cg.deinit();
-        g.deinit();
-    } else {
-        const fqn = arg.typeFqn();
-        v_ty_buf = lastSegment(fqn);
-    }
-    const v_ty = v_ty_buf;
-    // A same-simple-name exact match is rejected when the parameter is written
-    // qualified to a specific class and the argument's runtime class provably
-    // denotes a different class in another package.
-    const nm_mangled = host_call_member.mangledClassKeyOf(self, nm);
-    if ((std.mem.eql(u8, nm, v_ty) or
-        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty))) and
-        !overload_match.crossPackageIdentityConflict(self, param_ty, arg)) return 100;
-    if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
-    if (arg.* == .Null and param_ty.nullable) return 50;
-    // Numeric widening.
-    if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
-    if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
-    if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
-    // Float values are stored Double-tagged (and vice versa after arithmetic):
-    // the two float widths are one value domain at runtime, so either width's
-    // parameter accepts either tag — `Density(density = 1f)` must bind the
-    // `density: Float` factory when the value arrives as a Double.
-    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
-        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
-    // Callable arg against a function-typed param.
-    var arg_arity: ?usize = null;
-    switch (arg.*) {
-        .IrClosure => |c| {
-            if (self.closures.get(c.id)) |ci| arg_arity = ci.n_params;
-        },
-        else => {},
-    }
-    const is_callable = arg_arity != null or std.mem.startsWith(u8, arg.typeFqn(), "kotlin.Function");
-    if (is_callable) {
-        if (std.mem.startsWith(u8, nm, "Function")) {
-            const want = std.fmt.parseInt(usize, nm["Function".len..], 10) catch {
-                return 20;
-            };
-            if (arg_arity) |got| {
-                return if (got == want or got == want + 1) 90 else 20;
-            }
-            return 20;
-        }
-        return 8;
-    }
-    // Subtype walk for instance args.
-    if (arg.* == .Instance) {
-        var queue: std.ArrayList(struct { name: []const u8, depth: i32 }) = .empty;
-        defer queue.deinit(self.allocator);
-        var seen: std.ArrayList([]const u8) = .empty;
-        defer seen.deinit(self.allocator);
-        queue.append(self.allocator, .{ .name = v_ty, .depth = 0 }) catch return null;
-        var head: usize = 0;
-        while (head < queue.items.len) : (head += 1) {
-            const cur = queue.items[head];
-            var already = false;
-            for (seen.items) |s| {
-                if (std.mem.eql(u8, s, cur.name)) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
-            seen.append(self.allocator, cur.name) catch return null;
-            const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
-            if (host_call_member.classHeadsMatch(self, cur.name, nm)) {
-                const d = @min(cur.depth, 50);
-                return 60 - d;
-            }
-            if (classDefByName(self, cur.name) orelse classDefByName(self, cur_key)) |def| {
-                const dg = def.borrow();
-                for (dg.get().supertype_names) |sup| {
-                    queue.append(self.allocator, .{ .name = sup, .depth = cur.depth + 1 }) catch {};
-                }
-                dg.deinit();
-                def.deinit();
-            }
-        }
-    }
-    // Builtin runtime types satisfy their nominal supertypes (a mutable
-    // builtin list offered to a `List<T>` parameter, a String to a
-    // `CharSequence` one). Mirrors the full scorer so the primary-ctor
-    // satisfiability gate cannot misroute such calls to a secondary ctor.
-    for (applicability.builtinSupersOf(v_ty), 0..) |s, pos| {
-        if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, lastSegment(nm))) {
-            const dist: i32 = if (pos > 20) 20 else @intCast(pos);
-            return 75 - dist;
-        }
-    }
-    return null;
 }
 
 fn isBuiltinThrowableName(name: []const u8) bool {
@@ -1923,63 +1809,20 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
         });
         return .{ .ok = .{ .Instance = inst } };
     }
-    // Same-named factory function (best type-fit, arity-applicable).
+    // Same-named factory function.
+    if (try pickFactory(self, allocator, class_name, args)) |fid| {
+        const module_ref = self.module.clone();
+        defer module_ref.deinit();
+        const mg = module_ref.borrow();
+        defer mg.deinit();
+        return self.callFunc(allocator, mg.get(), fid, args);
+    }
     {
         const module_ref = self.module.clone();
         defer module_ref.deinit();
         const mg = module_ref.borrow();
         defer mg.deinit();
         const m = mg.get();
-        const provided = args.len;
-        var best_fid: ?FuncId = null;
-        var best_score: i64 = std.math.minInt(i64);
-        for (m.funcsBySimpleName(class_name)) |fid| {
-            const f = m.funcById(fid) orelse continue;
-            if (!f.hasBody()) continue;
-            if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-            const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
-            var arity_ok = vararg;
-            if (!arity_ok and provided <= f.params.len) {
-                arity_ok = true;
-                var idx = provided;
-                while (idx < f.params.len) : (idx += 1) {
-                    if (!funcParamHasDefault(self, fid, idx)) {
-                        arity_ok = false;
-                        break;
-                    }
-                }
-            }
-            if (!arity_ok) continue;
-            var score: i64 = 0;
-            var viable = true;
-            for (args, 0..) |a, i| {
-                if (i < f.params.len) {
-                    const p = &f.params[i];
-                    if (overloadScoreArg(self, &p.ty, &a)) |s| {
-                        score += @as(i64, s);
-                    } else {
-                        const pn = lastSegment(p.ty.name);
-                        const generic = p.ty.nullable or
-                            std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit") or
-                            std.mem.startsWith(u8, pn, "Function") or
-                            (pn.len <= 2 and isAllUpper(pn));
-                        if (generic) {
-                            score -= 2;
-                        } else {
-                            viable = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (viable and (best_fid == null or score > best_score)) {
-                best_fid = fid;
-                best_score = score;
-            }
-        }
-        if (best_fid) |fid| {
-            return self.callFunc(allocator, m, fid, args);
-        }
         if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
             std.debug.print("[ifact] {s} nargs={d} cands={d} tags:", .{ class_name, args.len, m.funcsBySimpleName(class_name).len });
             for (args) |*av| std.debug.print(" {s}", .{@tagName(av.*)});
@@ -2300,7 +2143,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                 };
                 if (declared) |t| {
                     const ty = TypeRef{ .name = t, .nullable = true, .args = &.{} };
-                    if (overloadScoreArg(self, &ty, &a) == null) {
+                    if (host_call_func.runtimeParamPoints(self, &ty, &a) == null) {
                         ctor_unsatisfiable = true;
                         break;
                     }
@@ -2325,7 +2168,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                     if (try dispatchSecondaryCtor(self, allocator, c, class_def, effective.items, outer_hint)) |res| return res;
                 }
             }
-            if (try pickFactory(self, allocator, class_name, effective.items, true)) |fid| {
+            if (try pickFactory(self, allocator, class_name, effective.items)) |fid| {
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
                 const mg = module_ref.borrow();
@@ -2390,7 +2233,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
 
     if (effective.items.len != n_primary) {
         // Same-named factory with matching arity.
-        if (try pickFactory(self, allocator, class_name, effective.items, false)) |fid| {
+        if (try pickFactory(self, allocator, class_name, effective.items)) |fid| {
             const module_ref = self.module.clone();
             defer module_ref.deinit();
             const mg = module_ref.borrow();
@@ -2609,56 +2452,33 @@ fn padParentCtorDefaults(
     return .{ .ok = {} };
 }
 
-/// Among same-named factory overloads pick the best fit. `clean_only`
-/// requires every supplied arg to cleanly type-match (used by the
-/// ctor-unsatisfiable path); otherwise any arity-applicable factory.
-fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args: []const Value, clean_only: bool) Allocator.Error!?FuncId {
-    _ = allocator;
+/// Among same-named factory overloads pick the best applicable declaration.
+fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args: []const Value) Allocator.Error!?FuncId {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const mg = module_ref.borrow();
     defer mg.deinit();
     const m = mg.get();
-    const provided = args.len;
-    var best_fid: ?FuncId = null;
-    var best_score: i32 = std.math.minInt(i32);
+    var best_ord: ?FuncId = null;
+    var best_ord_score: i32 = std.math.minInt(i32);
+    var best_low: ?FuncId = null;
+    var best_low_score: i32 = std.math.minInt(i32);
     for (m.funcsBySimpleName(class_name)) |fid| {
         const f = m.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-        // Arity that honors default parameters: a call may omit trailing
-        // defaulted params (`CornerRadius(8f)` calls `fun CornerRadius(x, y = x)`),
-        // so require only `provided in [required, total]` — not an exact match.
-        const arity_ok = blk: {
-            if (m.decl_user_arity.get(fid.int())) |da| {
-                break :blk da.has_vararg or (provided >= da.required and provided <= da.total);
+        const score = (try host_call_func.runtimeFuncApplicability(self, allocator, m, fid, args)) orelse continue;
+        if (score.low_priority) {
+            if (best_low == null or score.points > best_low_score) {
+                best_low = fid;
+                best_low_score = score.points;
             }
-            const vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
-            break :blk vararg or f.params.len == provided;
-        };
-        if (!arity_ok) continue;
-        if (clean_only) {
-            var score: i32 = 0;
-            var clean = true;
-            for (args, 0..) |a, i| {
-                if (i < f.params.len) {
-                    if (overloadScoreArg(self, &f.params[i].ty, &a)) |s| {
-                        score += s;
-                    } else {
-                        clean = false;
-                        break;
-                    }
-                }
-            }
-            if (clean and (best_fid == null or score > best_score)) {
-                best_fid = fid;
-                best_score = score;
-            }
-        } else {
-            return fid;
+        } else if (best_ord == null or score.points > best_ord_score) {
+            best_ord = fid;
+            best_ord_score = score.points;
         }
     }
-    return best_fid;
+    return best_ord orelse best_low;
 }
 
 /// The lexically enclosing class name for an inner/nested class: the

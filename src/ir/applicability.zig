@@ -7,14 +7,12 @@
 //! scorer folds arity / default / vararg / trailing-lambda binding and the
 //! per-argument point values in one place.
 //!
-//! This first slice reproduces the runtime *global* scorer
-//! (`host_call_func.zig` `overloadScore` / `overloadScoreArg` /
-//! `builtinSupersFor`) verbatim, reading from `ArgShape` instead of a
-//! `*const Value`. The two runtime deltas that depend on the live value
-//! (declared-generic-argument / function-shape refinement, and instance
-//! subtype distance) are supplied by the caller through the `ApplicabilityScope`
-//! callbacks; when a callback is null (lowering / eager) the argument is treated
-//! as UNKNOWN — it contributes its base points and is never disproven.
+//! The scoring constants and special cases are the canonical rules consumed by
+//! lowering, eager type checking, and runtime binding. The runtime deltas that
+//! depend on a live value (declared-generic-argument / function-shape
+//! refinement and instance subtype distance) are supplied through
+//! `ApplicabilityScope`; when a callback is null, the evidence is UNKNOWN and
+//! never disproves a candidate.
 
 const std = @import("std");
 
@@ -251,6 +249,19 @@ pub const ApplicabilityScope = struct {
     /// (lowering / eager) keeps the static short-form-`T` rule only.
     type_var: ?*const fn (*anyopaque, FuncId, []const u8) bool = null,
 
+    /// Precise runtime equivalence for alternate spellings of the same class
+    /// head, such as a source `Modifier.Node` parameter and its lifted
+    /// `Modifier$Node` runtime class. This callback must not use a
+    /// simple-name fallback: distinct same-named classes remain distinct.
+    exact_head: ?*const fn (*anyopaque, []const u8, []const u8) bool = null,
+
+    /// Runtime member/global dispatch has erased the compile-time distinction
+    /// between a constant narrowed to Byte/Short and an Int value. Those paths
+    /// may retain the existing same-signedness width accommodation; factory
+    /// and constructor binding leave this false so an Int variable cannot bind
+    /// a Byte/Short parameter.
+    erased_integer_widths: bool = false,
+
     /// `extReceiverSpecificity(receiver, ty_name)`: the extension `recv_match`
     /// tier.
     ext_recv_match: ?*const fn (*anyopaque, *const anyopaque, []const u8) i32 = null,
@@ -366,11 +377,11 @@ fn isTopOrGenericType(ty_name: []const u8) bool {
 /// heads remain eligible for SAM conversion; scalars and containers do not.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
-        "String",         "CharSequence",     "Boolean",  "Char",        "Byte",  "Short",
-        "Int",            "Long",             "Float",    "Double",      "UByte", "UShort",
-        "UInt",           "ULong",            "Number",   "Collection",  "MutableCollection",
-        "Iterable",       "MutableIterable",  "List",     "MutableList", "Set",   "MutableSet",
-        "Map",            "MutableMap",       "Array",    "Sequence",
+        "String",          "CharSequence", "Boolean",     "Char",       "Byte",              "Short",
+        "Int",             "Long",         "Float",       "Double",     "UByte",             "UShort",
+        "UInt",            "ULong",        "Number",      "Collection", "MutableCollection", "Iterable",
+        "MutableIterable", "List",         "MutableList", "Set",        "MutableSet",        "Map",
+        "MutableMap",      "Array",        "Sequence",
     };
     for (names) |n| {
         if (std.mem.eql(u8, pn, n)) return true;
@@ -432,6 +443,13 @@ fn scopeIdentityConflict(scope: *const ApplicabilityScope, param_ty: *const Type
     const ctx = scope.ctx orelse return false;
     const v = arg.value orelse return false;
     return cb(ctx, param_ty, v);
+}
+
+fn scopeExactHeadMatch(scope: *const ApplicabilityScope, param_head: []const u8, arg_head: []const u8) bool {
+    if (std.mem.eql(u8, param_head, arg_head)) return true;
+    const cb = scope.exact_head orelse return false;
+    const ctx = scope.ctx orelse return false;
+    return cb(ctx, param_head, arg_head);
 }
 
 /// Value-independent fallback for a caller that could not prove a runtime head
@@ -564,12 +582,11 @@ pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scop
 }
 
 // -------------------------------------------------------------------------
-// Per-argument scoring (mirror of `overloadScoreArg`).
+// Per-argument scoring.
 // -------------------------------------------------------------------------
 
 /// Score one (param, arg) pair. Higher is better; null disqualifies the
-/// candidate. Reproduces `host_call_func.zig` `overloadScoreArg` reading from
-/// `ArgShape`, deferring value-dependent deltas to the scope callbacks.
+/// candidate. Value-dependent deltas are deferred to the scope callbacks.
 fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
     const nm = param_ty.name;
     const member = scope.member;
@@ -603,11 +620,9 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         return unknownArgScore(nm);
     };
 
-    if (std.mem.eql(u8, nm, v_ty)) {
-        // A same-simple-name exact match is rejected when the parameter is
-        // written qualified to a specific class and the argument's runtime
-        // class provably denotes a different class in another package — the
-        // sibling overload with the matching identity then wins on this tier.
+    if (scopeExactHeadMatch(scope, nm, v_ty)) {
+        // An exact or canonically-equivalent head match is rejected when the
+        // parameter and runtime value provably denote different classes.
         if (!scopeIdentityConflict(scope, param_ty, arg)) {
             const d = refineDelta(scope, param_ty, arg) orelse return null;
             return 100 + d;
@@ -628,7 +643,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     // signed `Int` does NOT match an unsigned `UByte` param (kotlinc forbids
     // that without `1u`). Below the exact head match (100) and the widen rules
     // above, so an exact numeric overload always wins.
-    if (sameSignednessInt(nm, v_ty)) return 20;
+    if (scope.erased_integer_widths and sameSignednessInt(nm, v_ty)) return 20;
 
     // A callable argument against a function-typed parameter. The member
     // scorer does not treat a `$bound_ref$` head as callable.
@@ -1063,8 +1078,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     const want = args.len + 1; // receiver + value args
     const recv = scope.receiver;
 
-    // Receiver score (`overloadScoreArg(params[0], receiver)`), saturating
-    // *1000 into the numeric `score` tier.
+    // Receiver score, saturating *1000 into the numeric `score` tier.
     const recv_score: i32 = if (params.len > 0 and recv != null)
         (scoreArg(sig, &params[0].ty, &recv.?, &scope) orelse -1)
     else
@@ -1237,7 +1251,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         const last_named = args[last].named != null;
         const last_param = params.len - 1;
         if (!last_named and !filled[last_param] and
-            isFunctionTypeRef(&params[last_param].ty) and args[last].is_lambda)
+            scopeIsFunctionType(&scope, &params[last_param].ty) and args[last].is_lambda)
         {
             total += scoreArg(sig, &params[last_param].ty, &args[last], &scope) orelse 0;
             if (argIsProven(&args[last])) proven += 1 else unknown += 1;
@@ -1263,7 +1277,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
                 args[lambda_index].named == null and
                 args[lambda_index].is_lambda and
                 !filled[user_param] and
-                isFunctionTypeRef(&params[user_param].ty))
+                scopeIsFunctionType(&scope, &params[user_param].ty))
             {
                 total += scoreArg(
                     sig,
@@ -1313,7 +1327,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         if (vararg_pos) |vp| {
             if (pidx == vp) {
                 var required_tail: usize = 0;
-                for (params[vp + 1 ..], vp + 1 ..) |p, pi| {
+                for (params[vp + 1 ..], vp + 1..) |p, pi| {
                     if (filled[pi] or p.is_vararg or paramHasDefault(sig, pi)) continue;
                     required_tail += 1;
                 }
@@ -1423,6 +1437,38 @@ test "applicable: exact head match scores 100" {
     const sc = applicable(&sig, &args, .{}).?;
     try testing.expectEqual(@as(i32, 100), sc.points);
     try testing.expect(sc.exact_arity);
+}
+
+test "applicable: a canonical nested-class head keeps exact-match refinement" {
+    var dummy: u8 = 0;
+    const p = oneParam("Modifier.Node");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Modifier$Node", .value = @ptrCast(&dummy) }};
+    const callbacks = struct {
+        fn exact(_: *anyopaque, param: []const u8, arg: []const u8) bool {
+            return std.mem.eql(u8, param, "Modifier.Node") and
+                std.mem.eql(u8, arg, "Modifier$Node");
+        }
+        fn refine(_: *anyopaque, _: *const TypeRef, _: *const anyopaque) ?i32 {
+            return 6;
+        }
+    };
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+    const sc = applicable(&sig, &args, .{
+        .ctx = @ptrCast(&dummy),
+        .exact_head = callbacks.exact,
+        .refine = callbacks.refine,
+    }).?;
+    try testing.expectEqual(@as(i32, 106), sc.points);
+}
+
+test "applicable: erased integer-width matching is explicit runtime evidence" {
+    const p = oneParam("Byte");
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+    try testing.expect(applicable(&sig, &args, .{}) == null);
+    const sc = applicable(&sig, &args, .{ .erased_integer_widths = true }).?;
+    try testing.expectEqual(@as(i32, 20), sc.points);
 }
 
 test "applicable: extra positional arg without vararg is inapplicable" {
@@ -1750,6 +1796,44 @@ test "applicable named: reordered named args bind by name and record the binding
     try testing.expectEqual(@as(i32, 200), sc.points);
     try testing.expectEqual(@as(u16, 1), sc.binding.arg_to_param[0]); // b -> param 1
     try testing.expectEqual(@as(u16, 0), sc.binding.arg_to_param[1]); // a -> param 0
+}
+
+test "applicable named: an external member receiver fills the this parameter" {
+    const p = [_]Param{
+        .{ .name = "this", .ty = tref("Canvas"), .default = null },
+        .{ .name = "color", .ty = tref("Color"), .default = null },
+    };
+    const sig = SigView{ .params = &p, .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Color", .named = "color" }};
+    try testing.expect(applicable(&sig, &args, .{ .named = true }) == null);
+    const sc = applicable(
+        &sig,
+        &args,
+        .{ .named = true, .member = true, .recv_external = true },
+    ).?;
+    try testing.expectEqual(@as(i32, 100), sc.points);
+}
+
+test "applicable named: a typealias function parameter accepts a trailing lambda" {
+    var dummy: u8 = 0;
+    const p = [_]Param{
+        .{ .name = "flags", .ty = tref("Int"), .default = null, .has_default = true },
+        .{ .name = "block", .ty = tref("HandlerAlias"), .default = null },
+    };
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{.{ .is_lambda = true, .lambda_arity = 0 }};
+    const callbacks = struct {
+        fn isFunc(_: *anyopaque, ty: *const TypeRef) bool {
+            return std.mem.eql(u8, ty.name, "HandlerAlias");
+        }
+    };
+    try testing.expect(applicable(&sig, &args, .{ .named = true }) == null);
+    const sc = applicable(&sig, &args, .{
+        .named = true,
+        .ctx = @ptrCast(&dummy),
+        .func_type = callbacks.isFunc,
+    }).?;
+    try testing.expectEqual(@as(?u16, 1), sc.binding.trailing_lambda_param);
 }
 
 test "applicable named: Compose pair preserves the source trailing lambda" {
