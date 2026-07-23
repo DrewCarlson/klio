@@ -426,6 +426,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 // Carry the declared name so `frameMatchesLabel` stops a
                 // nested lambda's non-local return at this frame.
                 bf.name = f.name.name;
+                bf.lambda_receiver_shape_known = true;
             }
         }
         const captured_names = lowered.captures;

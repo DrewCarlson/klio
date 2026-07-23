@@ -841,6 +841,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
         const id = self.closures.push(.{
             .body_func = fid,
             .n_params = func.params.len,
+            .receiver_shape_known = func.lambda_receiver_shape_known,
             .has_receiver = func.lambda_has_receiver,
             .capture_names = &.{},
             .captures = caps,

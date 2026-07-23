@@ -68,12 +68,21 @@ covers the heuristic's full decision context first. Queue state:
 - **closure +1-arity rebind: LANDED AS DECLARED SHAPE.** Under live HTTP traffic
   the ktor pipeline fired the binding 174 times across a short request set, so
   the behavior is required for host-driven receiver-lambda invocations.
-  `Func.lambda_has_receiver` now records the typeck/lowering answer,
-  `ClosureInfo.has_receiver` carries it into invocation, and the VM splits the
-  leading receiver only when that bit is set. A `this` capture is no longer used
-  as receiver evidence. Receiver lambdas that never read their receiver are
-  covered explicitly, as are anonymous functions with a declared receiver; the
-  image format is version 29 so the bit is identical in baked and direct runs.
+  `Func.lambda_receiver_shape_known` + `lambda_has_receiver` record a tri-state
+  typeck/lowering answer, and `ClosureInfo` carries both bits into invocation.
+  A known receiver shape binds the leading receiver; a known plain
+  `(R, P) -> T` adapted to `R.(P) -> T` prepends `R` positionally without
+  rebinding the ordinary closure's lexical `this`; an unclassified legacy or
+  cross-pack closure retains the compatibility route until its type seam lands.
+  Receiver lambdas that never read their receiver and anonymous functions with
+  a declared receiver are covered explicitly. `CallValueWithThis` and
+  `CallMemberOrValue` also carry whether lowering proved the call-site receiver
+  shape, plus the receiver/plain answer when known. The VM adapts a plain
+  underlying function only at a proven receiver-function site and retains the
+  compatibility route for incomplete cross-pack metadata. The image format is
+  version 31 so those answers are identical in baked and direct runs, and
+  parity coverage gives the lexical and adapted receivers a colliding member
+  to make the distinction observable.
 - **`CallMemberOrValue` exact value emission: landed for proven calls.**
   First: the hierarchy sets cannot disprove EXTENSIONS (stdlib extensions on the
   receiver's type win over a local callable — the MinMax family measured it).
@@ -110,8 +119,9 @@ covers the heuristic's full decision context first. Queue state:
 
 With the seams live, the endgame per heuristic: `CallMemberOrValue`'s
 invocability guessing remains only where member or extension competition is
-real or declaration metadata is incomplete; the closure
-"+1 arity → receiver" rebind → explicit receiver-binding from declared types;
+real or declaration metadata is incomplete; closure receiver binding is
+explicit from declared types and ordinary-function adaptation is a separate
+positional path;
 the `hasOwnMember` implicit-this arm → typeck's member answer; the CMG
 unknown-receiver fallbacks and `class_member_names` → deleted once receiver
 types cover the corpus.
