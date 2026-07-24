@@ -859,6 +859,40 @@ pub fn classPrimaryParams(a: Allocator, c: *const ast.Class) Allocator.Error![]P
     return primary_params.toOwnedSlice(a);
 }
 
+/// Resolve and install a class's nominal superclass edges after every class
+/// shell has been reserved. Method bodies then see the complete hierarchy
+/// regardless of declaration order.
+pub fn populateClassSupertypes(
+    module: *Module,
+    c: *const ast.Class,
+    class_fqn: []const u8,
+    class_pkg: []const u8,
+) Allocator.Error!void {
+    const a = module.registry.allocator;
+    var supertypes: std.ArrayList(ClassId) = .empty;
+    errdefer supertypes.deinit(a);
+    var supertype_refs: std.ArrayList(TypeRef) = .empty;
+    errdefer supertype_refs.deinit(a);
+    for (c.supertypes) |*t| {
+        if (t.qualified_path) |qp| {
+            if (module.classIdByQualifiedSuffix(qp)) |cid| {
+                try supertypes.append(a, cid);
+                try supertype_refs.append(a, try loweredTypeRef(a, t, false));
+                continue;
+            }
+        }
+        if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
+            try supertypes.append(a, cid);
+            try supertype_refs.append(a, try loweredTypeRef(a, t, false));
+        }
+    }
+    const class_id = module.classIdByFqn(class_fqn) orelse return;
+    if (class_id.int() >= module.classes.items.len) return;
+    const slot = &module.classes.items[class_id.int()];
+    slot.supertypes = try supertypes.toOwnedSlice(a);
+    slot.supertype_refs = try supertype_refs.toOwnedSlice(a);
+}
+
 pub fn lowerClassWithExtras(
     module: *Module,
     c: *const ast.Class,
@@ -901,6 +935,12 @@ pub fn lowerClassWithExtras(
             try module.registry.class_type_param_bounds.put(class_fqn, bounds);
         }
     }
+    try populateClassSupertypes(
+        module,
+        c,
+        class_fqn,
+        lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name),
+    );
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
     // (LoadGlobal). The lexically-enclosing class's members
@@ -1012,39 +1052,10 @@ pub fn lowerClassWithExtras(
             }
         }
     }
-    var supertypes: std.ArrayList(ClassId) = .empty;
-    errdefer supertypes.deinit(a);
-    var supertype_refs: std.ArrayList(TypeRef) = .empty;
-    errdefer supertype_refs.deinit(a);
-    // A supertype reference resolves from the declaring class's own
-    // scope (its package + its file's imports), so a cross-package
-    // simple-name collision binds the supertype this class can see.
-    const class_pkg = lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name);
-    for (c.supertypes) |*t| {
-        // A qualified supertype (`Outer.Inner`) disambiguates a nested base
-        // from a same-simple-name class in scope — including this class's own
-        // nested type. Resolve it through the nested-lift registry first so a
-        // subtype named like its base (`Engine.Configuration :
-        // ApplicationEngine.Configuration()`) binds the base, not itself.
-        if (t.qualified_path) |qp| {
-            if (module.classIdByQualifiedSuffix(qp)) |cid| {
-                try supertypes.append(a, cid);
-                try supertype_refs.append(a, try loweredTypeRef(a, t, false));
-                continue;
-            }
-        }
-        if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
-            try supertypes.append(a, cid);
-            try supertype_refs.append(a, try loweredTypeRef(a, t, false));
-        }
-    }
-    // Patch the registered class with its now-known method list and
-    // resolved supertypes.
+    // Patch the registered class with its now-known method list.
     if (class_id.int() < module.classes.items.len) {
         const slot = &module.classes.items[class_id.int()];
         slot.methods = try methods.toOwnedSlice(a);
-        slot.supertypes = try supertypes.toOwnedSlice(a);
-        slot.supertype_refs = try supertype_refs.toOwnedSlice(a);
     }
     return class_id;
 }
@@ -2447,6 +2458,43 @@ test "member body receiver keeps its reserved qualified generic owner" {
     const owner_param = ir.parseClassTypeParamIdentity(lowered.params[0].ty.args[0].name).?;
     try std.testing.expectEqual(right, owner_param.owner);
     try std.testing.expectEqualStrings("U", owner_param.param);
+}
+
+test "class superclass edges are available before method lowering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const base = try m.reserveClassFqn(a, "Base", "sample.Base", "sample", false);
+    const derived = try m.reserveClassFqn(a, "Derived", "sample.Derived", "sample", false);
+    const sp = ast.Span{ .file = ir.FileId.from(0), .start = 0, .end = 1 };
+    const supertype = ast.TypeRef{
+        .name = .{ .name = "Base", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var supertypes = [_]ast.TypeRef{supertype};
+    var class: ast.Class = undefined;
+    class.supertypes = &supertypes;
+
+    try populateClassSupertypes(&m, &class, "sample.Derived", "sample");
+
+    try std.testing.expectEqual(@as(usize, 1), m.classes.items[derived.int()].supertypes.len);
+    try std.testing.expectEqual(base, m.classes.items[derived.int()].supertypes[0]);
+    try std.testing.expectEqual(
+        ir.Module.StaticCompatibility.compatible,
+        m.staticTypeCompatibility(
+            .{ .name = "sample.Derived", .nullable = false, .args = &.{} },
+            .{ .name = "sample.Base", .nullable = false, .args = &.{} },
+        ),
+    );
 }
 
 fn expectContains(haystack: []const []const u8, needle: []const u8) !void {

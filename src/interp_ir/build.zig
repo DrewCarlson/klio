@@ -2150,6 +2150,16 @@ fn buildModuleWithOverrides(
         module.classes.items[cid.int()].is_object = module.classes.items[cid.int()].is_object or
             spanNamesObject(object_spans.items, c.span);
     }
+    // Link every reserved class shell to its exact superclass identities
+    // before any method body lowers. Static applicability can then prove
+    // subtype arguments for calls into forward top-level declarations.
+    for (decls) |*d| {
+        if (d.* != .Class) continue;
+        const c = &d.Class;
+        const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+        const cls_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
+        try ir.lower.decl.populateClassSupertypes(module, c, cfqn, cls_pkg);
+    }
     // Reserve complete member headers globally after every class shell exists
     // but before any method body lowers. Forward references, inherited calls,
     // and same-arity overloads then share stable declaration identities.
@@ -2304,6 +2314,9 @@ fn buildModuleWithOverrides(
             });
             try module.func_index.append(a, .{ .name = f.name.name, .id = id });
             try module.recordFuncDeclSpan(a, f.name.span, id);
+            if (f.visibility == .Private) {
+                try module.registry.private_fn_files.put(id, f.name.span.file);
+            }
             const gop = try module.func_name_index.getOrPut(f.name.name);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(a, id);

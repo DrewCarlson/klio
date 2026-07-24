@@ -163,6 +163,11 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   including trailing lambdas across omitted defaults. Receiver-formed
   extension candidates require a real implicit receiver context rather than
   consuming an ordinary argument as a synthetic receiver.
+  Reserved class shells now receive their exact numeric superclass edges before
+  any method body lowers, so subtype applicability is independent of class
+  declaration order. Private top-level headers likewise carry their declaring
+  file during initial registration, allowing earlier class bodies to bind a
+  later same-file declaration directly.
 - **P4 — DeclSig substrate**: hierarchy-precise member-shadow
   (`memberShadowPossible`/`anyReceiverClassDeclares`, own + lifted-outer
   chains), declared-nullability evidence, and the `declared_recv` channel that

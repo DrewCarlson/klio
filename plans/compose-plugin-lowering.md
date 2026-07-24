@@ -21,11 +21,16 @@ reimplementation.
   selected declaration before the synthetic pair, so `Surface {}` binds
   `content` without dropping the composer. The Material3 Surface repro now
   passes its former same-name `surfaceColorAtElevation`/`contentColorFor` and
-  `rememberedValue` failures and reaches the independent snapshot
-  `validateOpen` body-loading issue.
+  `rememberedValue` failures; full source, cold image bake, and image-cache-hit
+  runs all exit successfully.
 - Bare extension formation now requires an actual implicit receiver context.
   A same-named extension cannot consume an ordinary source argument as its
   receiver while competing with a non-extension composable overload.
+- Every reserved class shell receives its exact superclass edges before any
+  method body lowers. Snapshot subclasses therefore prove their nominal
+  relationship while resolving calls to a later private `validateOpen`
+  declaration. Private top-level headers also carry their declaring file from
+  initial registration rather than waiting for body placement.
 - Host-baked executable images carry the exact linked virtual dispatch table and
   owner-scoped member groups into Android rather than rebuilding them from lazy
   function headers. Qualified nested override types resolve by nominal class
