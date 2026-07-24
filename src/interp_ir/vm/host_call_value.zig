@@ -133,6 +133,15 @@ fn boundReferenceStaticReceiver(callee: *const Value) ?[]const u8 {
     return typeReferenceStaticReceiver(&recv);
 }
 
+fn boundReferenceFunc(callee: *const Value) ?FuncId {
+    if (callee.* != .Instance) return null;
+    const g = callee.Instance.borrow();
+    defer g.deinit();
+    const value = g.get().get("__bound_func__") orelse return null;
+    if (value != .Int or value.Int < 0) return null;
+    return FuncId.from(@intCast(value.Int));
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
@@ -180,6 +189,25 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
+            if (boundReferenceFunc(callee)) |func| {
+                var exact_args: std.ArrayList(Value) = .empty;
+                defer exact_args.deinit(allocator);
+                if (rv == .Class) {
+                    try exact_args.appendSlice(allocator, args);
+                } else {
+                    try exact_args.append(allocator, rv);
+                    try exact_args.appendSlice(allocator, args);
+                }
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                return host_call_func.callFunc(
+                    self,
+                    allocator,
+                    mg.get(),
+                    func,
+                    exact_args.items,
+                );
+            }
             // An unbound class-method reference (`Long::toByte`, `String::plus`)
             // consumes its first argument as the receiver. The reference's
             // captured receiver is the type itself: a `.Class` value, or — when
@@ -574,6 +602,17 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
                 return dispatchIntrinsic(self, func.fqn, intrinsic, args);
             }
+        }
+        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null and args.len < info.n_params) {
+            std.debug.print("[callvalue-short] id={d} fn={s} args={d} params={d} recv_shape={}/{} caller={s}\n", .{
+                id,
+                func.fqn,
+                args.len,
+                info.n_params,
+                info.receiver_shape_known,
+                info.has_receiver,
+                if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>",
+            });
         }
         // Value-style invocation of a receiver lambda
         // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
@@ -1219,6 +1258,43 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                     const takes_receiver = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
                     if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver) {
                         return callValue(self, allocator, callee, args);
+                    }
+                    // A pass-threaded composable lambda declaring one param
+                    // MORE than the call supplies, with no leading `this`
+                    // param, takes the bound receiver as that leading
+                    // positional slot regardless of its captures — the compose
+                    // pass flattens a composable `R.() -> T` literal's
+                    // receiver into exactly this shape
+                    // (`[it, $composer, $changed]`). Binding the receiver into
+                    // a `this` capture instead leaves the params one short and
+                    // shifts the composer pair left. The trailing pair is the
+                    // discriminator: a plain headerless lambda lowered with a
+                    // speculative `it` (an `apply { }` block) has no pair, and
+                    // its receiver must keep binding through the `this`
+                    // capture below. Keep the receiver reachable as the
+                    // innermost subject so the body's bare member calls still
+                    // dispatch against it.
+                    const pass_threaded = bf.params.len >= 3 and
+                        std.mem.eql(u8, bf.params[bf.params.len - 2].name, "$composer") and
+                        std.mem.eql(u8, bf.params[bf.params.len - 1].name, "$changed");
+                    if (std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
+                        pass_threaded and args.len + 1 == info.n_params)
+                    {
+                        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+                            std.debug.print("[recv-fill] id={d} params={d} args={d} caller={s}\n", .{
+                                id, info.n_params, args.len,
+                                if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>",
+                            });
+                        }
+                        const with_recv = try allocator.alloc(Value, args.len + 1);
+                        defer if (runtime.freeScratch()) allocator.free(with_recv);
+                        with_recv[0] = this_value.*;
+                        @memcpy(with_recv[1..], args);
+                        const pushed = this_value.* == .Instance or this_value.* == .Null;
+                        if (pushed) host_call_member.pushAccessEnclosingSubject(self, this_value);
+                        const r = try callValue(self, allocator, callee, with_recv);
+                        if (pushed) host_call_member.popAccessEnclosing(self);
+                        return r;
                     }
                 }
             }

@@ -215,6 +215,16 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
             try w.print("r{d} <- LoadFromThisOrGlobal this.'{s}'", .{ reg(c.dst), constStr(m, c.name) });
             if (c.func) |f| try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() }) else if (c.class) |cl| try w.print("        [bound -> class {s}]", .{className(m, cl)}) else try w.writeAll("        [unbound]");
         },
+        .MemberRef => |c| {
+            try w.print(
+                "r{d} <- MemberRef r{d}.'{s}'",
+                .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) },
+            );
+            if (c.func) |f|
+                try w.print("        [bound -> {s}#{d}]", .{ funcName(m, f), f.int() })
+            else
+                try w.writeAll("        [unbound]");
+        },
         .StoreToThisOrGlobal => |c| try w.print("StoreToThisOrGlobal this.'{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) }),
         .StoreGlobal => |c| try w.print("StoreGlobal '{s}' <- r{d}", .{ constStr(m, c.name), reg(c.value) }),
         .BinOp => |c| try w.print("r{d} <- BinOp {s} r{d}, r{d}", .{ reg(c.dst), @tagName(c.op), reg(c.lhs), reg(c.rhs) }),
@@ -256,10 +266,12 @@ fn dumpFunc(w: *std.Io.Writer, m: *const Module, f: *const Func, mod_tally: *Tal
         if (i != 0) try w.writeAll(", ");
         try w.print("{s}", .{p.name});
     }
-    try w.print(")   [kind={s}{s}{s}]\n", .{
+    try w.print(")   [kind={s}{s}{s} ret={s}{s}]\n", .{
         @tagName(f.kind),
         if (f.is_suspend) " suspend" else "",
         if (f.is_inline) " inline" else "",
+        if (f.return_ty.name.len != 0) f.return_ty.name else "-",
+        if (f.return_ty.nullable) "?" else "",
     });
 
     if (!f.hasBody()) {

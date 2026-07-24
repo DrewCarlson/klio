@@ -316,6 +316,7 @@ pub const VmHost = struct {
     pub const companionWithMember = host_call_member.companionWithMember;
     pub const declaringClassSimpleName = host_call_member.declaringClassSimpleName;
     pub const memberRef = host_call_member.memberRef;
+    pub const memberRefExact = host_call_member.memberRefExact;
     pub const callSuper = host_call_member.callSuper;
     pub const qualifiedThis = host_call_member.qualifiedThis;
     pub const newInstance = host_instances.newInstance;

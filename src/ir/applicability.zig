@@ -350,6 +350,14 @@ pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
         std.mem.endsWith(u8, param_name, composable_arg_suffix);
 }
 
+/// The compose lowering's generated call-site markers. They are appended by the
+/// AST pass rather than written in source, so a candidate that does not declare
+/// them is simply not a composable target — unlike a genuine source-level named
+/// argument, their absence from a signature must not disqualify the candidate.
+pub fn isGeneratedComposeArg(name: []const u8) bool {
+    return std.mem.eql(u8, name, "$composer") or std.mem.eql(u8, name, "$changed");
+}
+
 fn allAsciiUpper(s: []const u8) bool {
     for (s) |c| {
         if (!std.ascii.isUpper(c)) return false;
@@ -1224,12 +1232,18 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
 // parameter each supplied arg bound to is recorded through it.
 // -------------------------------------------------------------------------
 
+fn applicTraceReject(site: []const u8) void {
+    if (comptime !@import("builtin").link_libc) return;
+    if (std.c.getenv("KLIO_APPLIC_TRACE") == null) return;
+    std.debug.print("[applic-reject] {s}\n", .{site});
+}
+
 fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     const params = sig.params;
     // A bodyless declaration is only selectable when it backs a native
     // intrinsic; the caller folds that into `sig.has_body`.
-    if (!sig.has_body) return null;
-    if (params.len > 64) return null;
+    if (!sig.has_body) { applicTraceReject("named-1"); return null; }
+    if (params.len > 64) { applicTraceReject("named-2"); return null; }
 
     var filled = [_]bool{false} ** 64;
     var total: i32 = 0;
@@ -1252,8 +1266,28 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
                 break;
             }
         }
-        const p = pos orelse return null; // a named arg with no matching param
-        if (filled[p]) return null;
+        // A named argument no parameter accepts is a hard reject — except the
+        // compose lowering's generated `$composer`/`$changed` pair. That pass
+        // appends the pair from a program-wide name oracle that cannot see the
+        // receiver type, so it also lands on same-named NON-composable members
+        // (`CardColors.containerColor(enabled)` beside a composable
+        // `containerColor` on an unrelated colors type). The declaration is the
+        // authority: a candidate that does not declare the pair is not a
+        // composable target and the generated marker is not one of its
+        // arguments. Skip it here; the call-time named binding likewise leaves
+        // an unmatched name unbound, so the value is never passed.
+        const p = pos orelse {
+            if (isGeneratedComposeArg(n)) continue;
+            if (comptime @import("builtin").link_libc) {
+                if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
+                    std.debug.print("[applic-reject] named-3 arg={s} params:", .{n});
+                    for (params) |*pp| std.debug.print(" {s}", .{pp.name});
+                    std.debug.print("\n", .{});
+                }
+            }
+            { applicTraceReject("named-3"); return null; }
+        };
+        if (filled[p]) { applicTraceReject("named-4"); return null; }
         total += scoreArg(sig, &params[p].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         filled[p] = true;
@@ -1371,7 +1405,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
             }
         }
 
-        if (pidx >= params.len) return null;
+        if (pidx >= params.len) { applicTraceReject("named-5"); return null; }
         total += scoreArg(sig, &params[pidx].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         if (bind) |bb| {
@@ -1385,7 +1419,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     // Every unfilled non-vararg parameter must be defaultable.
     for (params, 0..) |p, pi| {
         if (filled[pi] or p.is_vararg) continue;
-        if (!paramHasDefault(sig, pi)) return null;
+        if (!paramHasDefault(sig, pi)) { applicTraceReject("named-6"); return null; }
         total -= 1;
     }
 
@@ -1952,6 +1986,45 @@ test "applicable named: Compose pair preserves the source trailing lambda" {
     try testing.expectEqualSlices(u16, &.{ 3, 4, 5 }, content_score.binding.arg_to_param);
 }
 
+test "applicable named: a non-composable candidate ignores the generated Compose pair" {
+    // The pass appends `$composer`/`$changed` from a program-wide name oracle
+    // that cannot see the receiver type, so the pair also lands on same-named
+    // NON-composable members (`CardColors.containerColor(enabled)` is `@Stable`
+    // while an unrelated colors type declares a `@Composable containerColor`).
+    const plain = [_]Param{
+        .{ .name = "enabled", .ty = tref("Boolean"), .default = null },
+    };
+    const composable = [_]Param{
+        .{ .name = "enabled", .ty = tref("Boolean"), .default = null },
+        .{ .name = "$composer", .ty = tref("Composer"), .default = null },
+        .{ .name = "$changed", .ty = tref("Int"), .default = null },
+    };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Boolean", .named = "enabled" },
+        .{ .runtime_class = "Composer", .named = "$composer" },
+        .{ .runtime_class = "Int", .named = "$changed" },
+    };
+
+    // The declaration is the authority: the generated pair is not one of the
+    // plain candidate's arguments, so it stays applicable instead of being
+    // rejected on an unknown argument name.
+    const plain_score = applicable(&.{ .params = &plain }, &args, .{ .named = true }).?;
+
+    // A candidate that does declare the pair still binds it, and still outranks
+    // the plain sibling — the fix must not let a non-composable namesake hijack
+    // a genuine composable call.
+    const comp_score = applicable(&.{ .params = &composable }, &args, .{ .named = true }).?;
+    try testing.expect(comp_score.points > plain_score.points);
+
+    // A source-level named argument that names no parameter is still a hard
+    // reject; only the generated markers are exempt.
+    const bogus = [_]ArgShape{
+        .{ .runtime_class = "Boolean", .named = "enabled" },
+        .{ .runtime_class = "Int", .named = "notAParameter" },
+    };
+    try testing.expect(applicable(&.{ .params = &plain }, &bogus, .{ .named = true }) == null);
+}
+
 test "applicable named: non-final vararg absorbs values before a named tail" {
     const p = [_]Param{
         .{ .name = "a", .ty = tref("T"), .default = null },
@@ -2028,4 +2101,21 @@ test "applicable named: unfilled non-default parameter is a reject; a default pa
     const sig_d = SigView{ .params = &p, .defaults = &defaults };
     const sc = applicable(&sig_d, &args, .{ .named = true }).?;
     try testing.expectEqual(@as(i32, 99), sc.points); // 100 - 1
+}
+
+test "applicable named: defaulted trailing param stays fillable for named Int args" {
+    // `Color(red = 0, green = 0, blue = 0)` against the Int factory
+    // `Color(red: Int, green: Int, blue: Int, alpha: Int = 0xFF)`.
+    const factory = [_]Param{
+        .{ .name = "red", .ty = tref("Int"), .default = null },
+        .{ .name = "green", .ty = tref("Int"), .default = null },
+        .{ .name = "blue", .ty = tref("Int"), .default = null },
+        .{ .name = "alpha", .ty = tref("Int"), .default = null, .has_default = true },
+    };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "red" },
+        .{ .runtime_class = "Int", .named = "green" },
+        .{ .runtime_class = "Int", .named = "blue" },
+    };
+    try testing.expect(applicable(&.{ .params = &factory }, &args, .{ .named = true }) != null);
 }
