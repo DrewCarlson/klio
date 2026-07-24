@@ -2779,19 +2779,7 @@ fn runFrameInner(
     // Lazy IR: materialise a deferred function's blocks before the dispatch
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
-    const deferred_offset = func.deferred_offset;
     if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
-        const sig = frame.module.decl_sigs.get(func.id.int());
-        std.debug.print(
-            "[empty-body] {s}#{d} has_body_sig={?} deferred_offset={d} section_len={d}\n",
-            .{
-                func.fqn,
-                func.id.int(),
-                if (sig) |s| s.has_body else null,
-                deferred_offset,
-                frame.module.deferred_func_section.len,
-            },
-        );
         return errResult(.{ .Type = "virtual method target is not executable" });
     }
     const jit_on = jit_loop.enabled();
