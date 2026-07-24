@@ -2083,7 +2083,7 @@ fn hasConstructibleClass(module: *const Module, name: []const u8) bool {
     return !module.classes.items[cid.int()].is_abstract;
 }
 
-pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, candidate_ids: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
+pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Module, candidate_ids: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_class: ?ir.ClassId, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
     // An anon-object/side-module frame carries no top-level func index;
     // the overload set lives in the main module, so collect there.
     const mg = self.module.borrow();
@@ -2236,7 +2236,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // factory that delegates `Foo(features, center)` back into the set — which
     // should reach the constructor — re-picks a sibling factory and self-recurses.
     if (best_ord != null) {
-        if (mg.get().classId(name)) |ccid| {
+        if (ctor_class orelse mg.get().classId(name)) |ccid| {
             if (ccid.int() < mg.get().classes.items.len) {
                 const class = &mg.get().classes.items[ccid.int()];
                 if (!class.is_abstract) {
