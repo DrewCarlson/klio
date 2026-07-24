@@ -297,6 +297,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         owned.call_returns.deinit();
         module.pending_lambda_local_decl_types = null;
     }
+    if (b.recvTypeRef()) |receiver| {
+        try b.setLocalDeclTypeOwned(
+            "this",
+            try receiver.clone(b.allocator),
+        );
+    }
     // A local `fun`'s BLOCK body returns Unit on fall-through, never the
     // tail statement's value (stashed by `lowerLocalFnDecl`; a lambda
     // literal keeps last-expression semantics). Consumed here, before any

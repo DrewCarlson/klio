@@ -3141,6 +3141,42 @@ pub const Module = struct {
         return self.memberDispatchOwnerInScope(owner, ctx);
     }
 
+    fn genericReceiverSuppliesLambdaReceiver(
+        self: *const Module,
+        fid: FuncId,
+        args: []const applicability.ArgShape,
+    ) bool {
+        const f = self.funcById(fid) orelse return false;
+        if (self.declarationKind(fid, f) != .top_level_extension or
+            f.params.len < 2 or
+            args.len != f.params.len - 1)
+        {
+            return false;
+        }
+        const receiver_param = staticTypeHead(f.params[0].ty.name);
+        if (self.funcTypeParamIndex(fid, receiver_param) == null) return false;
+        var supplied = false;
+        for (args, f.params[1..]) |arg, param| {
+            if (param.is_vararg) return false;
+            if (!arg.lambda_is_literal) {
+                if (arg.ty == null and arg.literal_kind == null) return false;
+                continue;
+            }
+            if (!std.mem.startsWith(u8, applicability.simpleName(param.ty.name), "Function") or
+                param.ty.args.len < 2 or
+                !std.mem.eql(
+                    u8,
+                    staticTypeHead(param.ty.args[0].name),
+                    receiver_param,
+                ))
+            {
+                return false;
+            }
+            supplied = true;
+        }
+        return supplied;
+    }
+
     /// Resolve an explicit-receiver top-level extension call from declaration
     /// metadata alone. Only a statically proven receiver and a unique overload
     /// at the innermost visible scope produce a target; runtime-value evidence
@@ -3454,7 +3490,13 @@ pub const Module = struct {
         // ordinary applicability selects one overload from that family, an
         // unknown argument type does not erase the identity; receiver/member
         // precedence is still decided by `emitFormFor`.
-        if (tied or (best_unknown and !renamed_best))
+        const receiver_supplies_lambda = if (best) |target|
+            ranked_sigs.items.len == 1 and
+                self.genericReceiverSuppliesLambdaReceiver(target, args)
+        else
+            false;
+        if (tied or
+            (best_unknown and !receiver_supplies_lambda and !renamed_best))
             return .{ .applicable = true };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
@@ -9420,6 +9462,43 @@ test "extension resolver does not erase incompatible generic receiver arguments"
         .caller_package = "app",
     });
     try testing.expectEqual(generic, generic_proven.target.?);
+}
+
+test "extension resolver retains a unique generic receiver lambda target" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const apply = try pushTestFuncOpts(&m, a, "apply", "kotlin.apply", "kotlin", 1, .{
+        .extension = true,
+        .param_ty = "Function0",
+    });
+    m.funcs.items[apply.int()].kind = .top_level_extension;
+    m.funcs.items[apply.int()].params[0].ty.name = "T";
+    const function_args = try a.alloc(TypeRef, 2);
+    defer a.free(function_args);
+    function_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
+    function_args[1] = .{ .name = "Unit", .nullable = false, .args = &.{} };
+    m.funcs.items[apply.int()].params[1].ty.args = function_args;
+    var type_params: std.ArrayList([]const u8) = .empty;
+    try type_params.append(a, "T");
+    try m.registry.func_type_params.put(apply, type_params);
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{.{
+        .is_lambda = true,
+        .lambda_arity = 0,
+        .lambda_is_literal = true,
+    }};
+    const resolved = m.resolveExtensionCall("apply", .{
+        .name = "LongArray",
+        .nullable = false,
+        .args = &.{},
+    }, &args, .{
+        .caller_file = FileId.from(0),
+        .caller_package = "app",
+    });
+    try testing.expectEqual(apply, resolved.target.?);
 }
 
 test "extension resolver ranks proven generic argument structure" {

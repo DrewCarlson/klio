@@ -3376,6 +3376,7 @@ fn callBoundLambdaReceiverType(
     args: []const Expr,
     arg_names: []const ?[]const u8,
     type_args: []const ast.TypeRef,
+    call_receiver: ?ir.TypeRef,
 ) Allocator.Error!ir.TypeRef {
     const head = declared_receiver.name;
     if (!funcDeclaresTypeParam(b, func, head)) {
@@ -3388,6 +3389,14 @@ fn callBoundLambdaReceiverType(
                 return loweredOwnedLocalTypeRef(b, &type_args[index]);
             }
             break;
+        }
+    }
+    if (call_receiver) |actual_receiver| {
+        if (func.params.len != 0 and
+            std.mem.eql(u8, func.params[0].name, "this") and
+            std.mem.eql(u8, func.params[0].ty.name, head))
+        {
+            return actual_receiver.clone(b.allocator);
         }
     }
 
@@ -3439,6 +3448,7 @@ fn recordCallBoundLambdaReceiver(
     args: []const Expr,
     arg_names: []const ?[]const u8,
     type_args: []const ast.TypeRef,
+    call_receiver: ?ir.TypeRef,
 ) Allocator.Error!void {
     const resolved = try callBoundLambdaReceiverType(
         b,
@@ -3448,6 +3458,7 @@ fn recordCallBoundLambdaReceiver(
         args,
         arg_names,
         type_args,
+        call_receiver,
     );
     if (resolved.eql(declared_receiver) and
         funcDeclaresTypeParam(b, func, declared_receiver.name) and
@@ -3471,6 +3482,26 @@ fn recordLambdaArgReceivers(
     type_args: []const ast.TypeRef,
     recv_offset: usize,
 ) Allocator.Error!void {
+    return recordLambdaArgReceiversForCallReceiver(
+        b,
+        func,
+        args,
+        arg_names,
+        type_args,
+        null,
+        recv_offset,
+    );
+}
+
+fn recordLambdaArgReceiversForCallReceiver(
+    b: *FuncBuilder,
+    func: *const Func,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const ast.TypeRef,
+    call_receiver: ?ir.TypeRef,
+    recv_offset: usize,
+) Allocator.Error!void {
     if (args.len == 0 or func.params.len < recv_offset) return;
     for (args) |*a| if (a.* == .Spread) return;
     const params = func.params[recv_offset..];
@@ -3481,7 +3512,7 @@ fn recordLambdaArgReceivers(
             if (a.* != .Lambda and a.* != .AnonFun) continue;
             if (m) |pi| if (pi < params.len) {
                 if (fnTypeReceiver(b, params[pi].ty)) |receiver| {
-                    try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args);
+                    try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
                 }
             };
         }
@@ -3493,7 +3524,7 @@ fn recordLambdaArgReceivers(
         while (i + 1 < args.len) : (i += 1) {
             if ((args[i] == .Lambda or args[i] == .AnonFun)) {
                 if (fnTypeReceiver(b, params[i].ty)) |receiver| {
-                    try recordCallBoundLambdaReceiver(b, func, args[i].span(), receiver, params, args, arg_names, type_args);
+                    try recordCallBoundLambdaReceiver(b, func, args[i].span(), receiver, params, args, arg_names, type_args, call_receiver);
                 }
             }
         }
@@ -3507,13 +3538,14 @@ fn recordLambdaArgReceivers(
                 args,
                 arg_names,
                 type_args,
+                call_receiver,
             );
         }
     } else if (args.len == params.len) {
         for (args, params) |*a, p| {
             if (a.* != .Lambda and a.* != .AnonFun) continue;
             if (fnTypeReceiver(b, p.ty)) |receiver| {
-                try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args);
+                try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
             }
         }
     }
@@ -4370,6 +4402,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         args,
                         ast_arg_names,
                         ast_type_args,
+                        null,
                     );
                     if (common) |c0| {
                         if (!c0.eql(bound_receiver)) {
@@ -11114,13 +11147,21 @@ fn lowerResolvedExtensionCall(
     }
     const func_id = resolution.target orelse return null;
     const target = b.module.funcById(func_id) orelse return null;
+    try recordLambdaArgReceiversForCallReceiver(
+        b,
+        target,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        recv_ty,
+        1,
+    );
     // Inline declarations require their own resolved-target lowering strategy:
     // an ordinary exact call executes InlineOnly wrapper bodies, while a splice
     // can change lexical lookup for body-local helpers. Keep the declaration
     // identity on the compatibility path until that strategy consumes FuncId.
     if (target.is_inline) return null;
 
-    try recordLambdaArgReceivers(b, target, args, ast_arg_names, ast_type_args, 1);
     const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
     defer if (broad_masks) |masks| b.allocator.free(masks);
     b.pending_arg_broad_masks = broad_masks;
@@ -12392,6 +12433,29 @@ test "receiver lambda substitutes a direct call type parameter" {
     };
     try recordLambdaArgReceivers(&b, &func, &args, &.{}, &.{explicit_any}, 0);
     try testing.expectEqualStrings("Any", b.lambdaArgRecv(sp).?.name);
+
+    var extension_params = [_]ir.Param{
+        .{ .name = "this", .ty = .{ .name = "T", .nullable = false, .args = &.{} }, .default = null },
+        .{
+            .name = "block",
+            .ty = .{ .name = "Function0", .nullable = false, .args = &receiver_fn_args },
+            .default = null,
+        },
+    };
+    var extension = func;
+    extension.name = "apply";
+    extension.fqn = "kotlin.apply";
+    extension.params = &extension_params;
+    try recordLambdaArgReceiversForCallReceiver(
+        &b,
+        &extension,
+        &.{lambda},
+        &.{},
+        &.{},
+        .{ .name = "LongArray", .nullable = false, .args = &.{} },
+        1,
+    );
+    try testing.expectEqualStrings("LongArray", b.lambdaArgRecv(sp).?.name);
 }
 
 test "local extension receiver applicability rejects nullable Nothing" {

@@ -122,7 +122,11 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   remain conservative. Generic receiver proofs preserve the structural owner
   and require complete, identity-safe bounds; dependent, cyclic, lossy, or
   ambiguously qualified evidence stays dynamic rather than becoming a false
-  negative. Exact operator selection likewise excludes lossy eager type heads
+  negative. A uniquely scoped generic extension such as
+  `T.apply(block: T.() -> R)` binds the explicit receiver into the receiver
+  lambda before its body lowers; the lambda's own `this` type then replaces,
+  rather than inherits, an outer class receiver. Exact operator selection
+  likewise excludes lossy eager type heads
   when a declaration-derived structural return type is available. Generic
   member headers preserve their owner arguments; class/function parameter
   scopes and inherited receiver projections are substituted before a return

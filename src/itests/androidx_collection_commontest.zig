@@ -22,6 +22,7 @@ const runtime = @import("runtime");
 const BASELINE: usize = 560;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
+const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_receiver.kt";
 const SCRATCH_HOME = "/tmp/klio_itest_androidx_home";
 
 const Pack = struct { dir: []const u8, artifact: []const u8 };
@@ -136,6 +137,21 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
     var env = try envWithHome(a, SCRATCH_HOME);
     try installPacks(a, &env);
+    const smoke = try runKlio(
+        a,
+        &env,
+        &.{ klioBin(&env), "run", INLINE_RECEIVER_FIXTURE, "--opt", "safe" },
+        120_000,
+    );
+    if (smoke.term != .exited or smoke.term.exited != 0 or
+        !std.mem.eql(u8, smoke.stdout, "0\n"))
+    {
+        std.debug.print(
+            "androidx_commontest: inline receiver smoke failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ smoke.stdout, smoke.stderr },
+        );
+        return error.InlineReceiverSmokeFailed;
+    }
 
     var all: std.ArrayList([]u8) = .empty;
     try collectKt(a, io, TEST_ROOT, &all);
