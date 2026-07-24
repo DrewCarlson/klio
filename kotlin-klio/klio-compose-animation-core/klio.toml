@@ -57,7 +57,9 @@ include = [
 [[source]]
 root = "../klio-compose-runtime/upstream/compose/animation/animation/src/commonMain/kotlin"
 include = [
+    "androidx/compose/animation/ColorVectorConverter.kt",
     "androidx/compose/animation/FlingCalculator.kt",
+    "androidx/compose/animation/SingleValueAnimation.kt",
     "androidx/compose/animation/SplineBasedDecay.kt",
     "androidx/compose/animation/SplineBasedFloatDecayAnimationSpec.kt",
 ]
