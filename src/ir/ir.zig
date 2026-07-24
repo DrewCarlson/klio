@@ -7085,6 +7085,78 @@ pub const Module = struct {
         return best_tier;
     }
 
+    /// Resolve a top-level callable extension property at an explicit
+    /// receiver call site. A member function has already been ruled out by
+    /// the caller; this query applies receiver, arity, visibility, and normal
+    /// Kotlin import/package tiers and commits only one declaration identity.
+    pub fn resolveCallableExtensionProperty(
+        self: *const Module,
+        name: []const u8,
+        receiver_head: []const u8,
+        receiver_is_class: bool,
+        value_arity: usize,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?ModuleRegistry.CallableExtensionProp {
+        const Helpers = struct {
+            fn outerCompanionHead(receiver: []const u8) ?[]const u8 {
+                const suffix = ".Companion";
+                if (!std.mem.endsWith(u8, receiver, suffix)) return null;
+                return staticTypeHead(receiver[0 .. receiver.len - suffix.len]);
+            }
+
+            fn receiverMatches(
+                module: *const Module,
+                declared: []const u8,
+                actual: []const u8,
+                is_class: bool,
+            ) bool {
+                if (outerCompanionHead(declared)) |outer| {
+                    return is_class and std.mem.eql(u8, outer, staticTypeHead(actual));
+                }
+                if (is_class) return false;
+                return module.classIsOrExtends(actual, declared);
+            }
+        };
+
+        var source_name = name;
+        var list = self.registry.callable_extension_props.get(source_name);
+        if (list == null) {
+            for (self.importAliasPathsIn(caller_file, name)) |path| {
+                source_name = staticTypeHead(path.fqn);
+                list = self.registry.callable_extension_props.get(source_name);
+                if (list != null) break;
+            }
+        }
+        const candidates = list orelse return null;
+        var best: ?ModuleRegistry.CallableExtensionProp = null;
+        var best_tier: u8 = 255;
+        var ambiguous = false;
+        for (candidates.items) |candidate| {
+            if (candidate.value_arity != value_arity) continue;
+            if (candidate.is_private and candidate.file != caller_file) continue;
+            if (!Helpers.receiverMatches(self, candidate.receiver, receiver_head, receiver_is_class)) continue;
+            const tier = self.scopeTier(
+                candidate.fqn,
+                candidate.package,
+                name,
+                caller_pkg,
+                caller_file,
+            );
+            if (tier > last_in_scope_tier) continue;
+            if (tier < best_tier) {
+                best = candidate;
+                best_tier = tier;
+                ambiguous = false;
+            } else if (tier == best_tier and best != null and
+                !std.mem.eql(u8, best.?.fqn, candidate.fqn))
+            {
+                ambiguous = true;
+            }
+        }
+        return if (ambiguous) null else best;
+    }
+
     /// The literal value of the top-level `const val` a bare reference to
     /// `name` resolves to at this site, or null when the best-scoped
     /// declaration is not a recorded compile-time constant (or the pick is
@@ -7748,6 +7820,10 @@ pub const ModuleRegistry = struct {
     /// ranks the read's tier the same way it ranks a bare call: a read
     /// whose only declaration is in an unimported package is unresolved.
     top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
+    /// Top-level extension properties whose values are directly callable.
+    /// Registered before body lowering so `receiver.property(args)` can be
+    /// classified as a property read followed by `invoke`.
+    callable_extension_props: std.StringHashMap(std.ArrayList(CallableExtensionProp)),
     /// Top-level property simple name → 0-arg getter `FuncId`, for a
     /// `val`/`var` declared with only a custom getter (no initializer,
     /// no backing field, no delegate). A `LoadGlobal` of such a name
@@ -7769,6 +7845,15 @@ pub const ModuleRegistry = struct {
     pub const PropDecl = struct {
         fqn: []const u8,
         package: []const u8,
+    };
+
+    pub const CallableExtensionProp = struct {
+        fqn: []const u8,
+        package: []const u8,
+        receiver: []const u8,
+        file: FileId,
+        value_arity: u16,
+        is_private: bool,
     };
 
     /// One non-wildcard import: its full dotted path (owned by the
@@ -7836,6 +7921,7 @@ pub const ModuleRegistry = struct {
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
+            .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
@@ -7948,6 +8034,11 @@ pub const ModuleRegistry = struct {
             var it = self.top_level_prop_pkgs.valueIterator();
             while (it.next()) |list| list.deinit(a);
             self.top_level_prop_pkgs.deinit();
+        }
+        {
+            var it = self.callable_extension_props.valueIterator();
+            while (it.next()) |list| list.deinit(a);
+            self.callable_extension_props.deinit();
         }
         self.top_level_prop_getters.deinit();
         self.top_level_prop_setters.deinit();
@@ -8105,6 +8196,14 @@ pub const ModuleRegistry = struct {
                 var list: std.ArrayList(PropDecl) = .empty;
                 try list.appendSlice(a, e.value_ptr.items);
                 try out.top_level_prop_pkgs.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.callable_extension_props.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(CallableExtensionProp) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.callable_extension_props.put(e.key_ptr.*, list);
             }
         }
         {
@@ -9581,6 +9680,70 @@ test "extension resolver retains a unique generic receiver lambda target" {
         .caller_package = "app",
     });
     try testing.expectEqual(apply, resolved.target.?);
+}
+
+test "callable extension properties resolve instance and companion receivers" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    var actions: std.ArrayList(ModuleRegistry.CallableExtensionProp) = .empty;
+    try actions.append(a, .{
+        .fqn = "app.action",
+        .package = "app",
+        .receiver = "Widget",
+        .file = FileId.from(1),
+        .value_arity = 1,
+        .is_private = false,
+    });
+    try m.registry.callable_extension_props.put("action", actions);
+
+    const action = m.resolveCallableExtensionProperty(
+        "action",
+        "Widget",
+        false,
+        1,
+        "app",
+        FileId.from(0),
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("app.action", action.fqn);
+    try testing.expect(m.resolveCallableExtensionProperty(
+        "action",
+        "Widget",
+        false,
+        0,
+        "app",
+        FileId.from(0),
+    ) == null);
+
+    var insets: std.ArrayList(ModuleRegistry.CallableExtensionProp) = .empty;
+    try insets.append(a, .{
+        .fqn = "app.systemBars",
+        .package = "app",
+        .receiver = "WindowInsets.Companion",
+        .file = FileId.from(1),
+        .value_arity = 0,
+        .is_private = false,
+    });
+    try m.registry.callable_extension_props.put("systemBars", insets);
+
+    const system_bars = m.resolveCallableExtensionProperty(
+        "systemBars",
+        "WindowInsets",
+        true,
+        0,
+        "app",
+        FileId.from(0),
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("app.systemBars", system_bars.fqn);
+    try testing.expect(m.resolveCallableExtensionProperty(
+        "systemBars",
+        "WindowInsets",
+        false,
+        0,
+        "app",
+        FileId.from(0),
+    ) == null);
 }
 
 test "extension resolver ranks proven generic argument structure" {

@@ -11581,6 +11581,40 @@ fn localExtensionReceiverCouldApply(
     return !saw_extension;
 }
 
+fn callableExtensionPropertyTarget(
+    b: *const FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    value_arity: usize,
+    declared_ty: ?TypeRef,
+) ?ir.ModuleRegistry.CallableExtensionProp {
+    var receiver_head: []const u8 = undefined;
+    var receiver_is_class = false;
+    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+        const ident = receiver.Path.segments[0];
+        if (b.resolve(ident.name) == null and !b.knowsOuter(ident.name)) {
+            if (b.module.classIdIndexed(ident.name, b.self_package, ident.span.file)) |cid| {
+                if (cid.int() < b.module.classes.items.len) {
+                    receiver_head = b.module.classes.items[cid.int()].name;
+                    receiver_is_class = true;
+                }
+            }
+        }
+    }
+    if (!receiver_is_class) {
+        const ty = declared_ty orelse return null;
+        receiver_head = ty.name;
+    }
+    return b.module.resolveCallableExtensionProperty(
+        name.name,
+        receiver_head,
+        receiver_is_class,
+        value_arity,
+        b.module.packageOfFile(name.span.file) orelse b.self_package,
+        name.span.file,
+    );
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -11728,6 +11762,81 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 return dst;
             }
         }
+    }
+
+    // The Compose syntax pass may conservatively thread a same-named call
+    // before overload resolution. Re-resolve the explicit receiver against
+    // its source argument list; a source-shaped member or extension proves
+    // that the selected declaration is not composable, so the compiler ABI
+    // pair does not belong to this call.
+    if (hasComposerArgPair(ast_arg_names) and args.len >= 2) {
+        const source_args = args[0 .. args.len - 2];
+        const source_names = ast_arg_names[0 .. ast_arg_names.len - 2];
+        const source_member = try lowerResolvedMemberCall(
+            b,
+            receiver,
+            name,
+            source_args,
+            source_names,
+            ast_type_args,
+            declared_ty,
+        );
+        switch (source_member) {
+            .lowered => |reg| return reg,
+            .deferred, .none => {},
+        }
+        if (declared_ty) |recv_ty| {
+            const source_extension = try resolveExtensionCallForArgs(
+                b,
+                recv_ty,
+                name,
+                source_args,
+                source_names,
+            );
+            if (source_extension.target) |target_id| {
+                if (b.module.funcById(target_id)) |target| {
+                    if (!selectedCallHasComposerAbi(b.module, target_id, target)) {
+                        var rewritten = expr.*;
+                        rewritten.Call.args = source_args;
+                        rewritten.Call.arg_names = source_names;
+                        return lowerMemberCallFallback(b, &rewritten);
+                    }
+                }
+            } else if (source_extension.applicable and
+                !source_extension.compiler_abi_applicable)
+            {
+                var rewritten = expr.*;
+                rewritten.Call.args = source_args;
+                rewritten.Call.arg_names = source_names;
+                return lowerMemberCallFallback(b, &rewritten);
+            }
+        }
+    }
+
+    if (!member_shadows_extensions and
+        callableExtensionPropertyTarget(b, receiver, name, args.len, declared_ty) != null)
+    {
+        const recv = try lowerReceiver(b, receiver);
+        const callee_reg = b.allocReg();
+        const marker_name = try std.fmt.allocPrint(b.allocator, "$extread${s}", .{name.name});
+        const marker = try b.module.internConst(b.allocator, .{ .String = marker_name });
+        try b.push(.{ .GetField = .{
+            .dst = callee_reg,
+            .receiver = recv,
+            .field = marker,
+        } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        orEmitAudit(b, "callable_extension_property", "CallValue", name.name);
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_reg,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
     }
 
     if (!member_shadows_extensions) {

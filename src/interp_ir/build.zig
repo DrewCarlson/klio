@@ -2459,6 +2459,47 @@ fn buildModuleWithOverrides(
         }
     }
 
+    // Register callable extension-property headers before any body lowers.
+    // Kotlin permits `receiver.property(args)` when the property's value is a
+    // function. Without this declaration shape, the call is indistinguishable
+    // from a member call until runtime and loses the extension getter.
+    for (decls) |*d| {
+        if (d.* != .Property) continue;
+        const p = d.Property;
+        const recv = p.receiver_type orelse continue;
+        const prop_ty = p.ty orelse continue;
+        const fn_ty = prop_ty.function orelse continue;
+        const recv_name: []const u8 = if (recv.qualified_path) |qp|
+            (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv.name.name)
+        else
+            recv.name.name;
+        const fqn = try resolveFqn(
+            a,
+            fqn_overrides,
+            p.span,
+            package_prefix,
+            p.name.name,
+        );
+        const pkg = try declPackage(
+            a,
+            decl_pkg,
+            fqn_overrides,
+            p.span,
+            package_prefix,
+            p.name.name,
+        );
+        const gop = try module.registry.callable_extension_props.getOrPut(p.name.name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, .{
+            .fqn = fqn,
+            .package = pkg,
+            .receiver = recv_name,
+            .file = p.name.span.file,
+            .value_arity = @intCast(fn_ty.params.len),
+            .is_private = p.visibility == .Private,
+        });
+    }
+
     // Lower each class after the top-level function headers are registered,
     // so a class method body's bare call to a sibling top-level function
     // resolves against the complete header set. The receiver-type member
