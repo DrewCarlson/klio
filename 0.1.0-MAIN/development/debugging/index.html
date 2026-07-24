@@ -1847,6 +1847,12 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[bare]</code></td>
 </tr>
 <tr>
+<td><code>KLIO_EXT_TRACE</code></td>
+<td><code>&lt;name&gt;</code></td>
+<td>How an explicit-receiver extension call resolved during lowering: receiver type, implicit dispatch owners, lexical owner, and exact target</td>
+<td><code>[ext-static]</code></td>
+</tr>
+<tr>
 <td><code>KLIO_MISS_TRACE</code></td>
 <td><code>&lt;name&gt;</code> (two field-miss sites fire on any set value)</td>
 <td>Runtime dispatch tails for <code>name</code> that miss or fall back, with frame-chain dumps at several sites</td>
