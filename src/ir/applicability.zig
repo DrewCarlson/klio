@@ -38,6 +38,11 @@ pub const ArgShape = struct {
     /// null and score off `runtime_class`.
     ty: ?TypeRef = null,
 
+    /// `ty` came from source syntax or declaration metadata rather than the
+    /// additive eager type-head channel. Static resolution may reject a
+    /// candidate only from authoritative evidence.
+    ty_authoritative: bool = true,
+
     /// The argument is callable per `valueIsCallable`
     /// (IrClosure/Function/Intrinsic/BoundMethod/PropertyRef) — drives the
     /// trailing-lambda binding gate.
@@ -123,7 +128,8 @@ pub const Score = struct {
     proven_args: u16 = 0,
     unknown_args: u16 = 0,
 
-    /// The call supplied exactly one arg per parameter (no defaults used).
+    /// The call supplied exactly one arg per fixed parameter, with neither
+    /// defaults nor vararg packing involved.
     exact_arity: bool = false,
 
     /// The candidate is `@LowPriorityInOverloadResolution` / HIDDEN. Carried,
@@ -762,7 +768,7 @@ fn argIsProven(arg: *const ArgShape) bool {
 /// The element `TypeRef` a vararg parameter's declared (materialized array)
 /// type carries: `ByteArray` -> `Byte`, `Array<T>` -> `T`, etc. A non-array
 /// declared type is returned unchanged (already an element).
-fn varargElementRef(param_ty: *const TypeRef) TypeRef {
+pub fn varargElementRef(param_ty: *const TypeRef) TypeRef {
     const n = param_ty.name;
     const eq = std.mem.eql;
     const elem: ?[]const u8 =
@@ -899,7 +905,11 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         if (!all_defaulted) return null;
     }
 
-    var total: i32 = if (params.len == args.len) 0 else -1;
+    // A vararg application is less specific than an otherwise equal fixed
+    // overload. Carry the same one-point applicability penalty used for
+    // defaulted under-application so every lowering/runtime scanner observes
+    // the Kotlin fixed-over-vararg tiebreak.
+    var total: i32 = if (params.len == args.len and !last_vararg) 0 else -1;
     var proven: u16 = 0;
     var unknown: u16 = 0;
     // A trailing vararg absorbs the args from its own position onward. Each
@@ -931,7 +941,7 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         .points = total,
         .proven_args = proven,
         .unknown_args = unknown,
-        .exact_arity = params.len == args.len,
+        .exact_arity = params.len == args.len and !last_vararg,
         .low_priority = sig.low_priority,
         .is_member = sig.is_member,
         .binding = .{},
@@ -1137,7 +1147,14 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
             }
         }
     }
-    if (params.len == want) score += 5;
+    var has_vararg = false;
+    for (params) |p| {
+        if (p.is_vararg) {
+            has_vararg = true;
+            break;
+        }
+    }
+    if (params.len == want and !has_vararg) score += 5;
 
     // Receiver specificity (`extReceiverSpecificity`).
     const recv_match: i32 = blk: {
@@ -1186,7 +1203,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
         .points = score,
         .proven_args = proven,
         .unknown_args = unknown,
-        .exact_arity = params.len == want,
+        .exact_arity = params.len == want and !has_vararg,
         .low_priority = sig.low_priority,
         .is_member = sig.is_member,
         .ext_key = key,
@@ -1283,6 +1300,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
                 args[lambda_index].named == null and
                 args[lambda_index].is_lambda and
                 !filled[user_param] and
+                !params[user_param].is_vararg and
                 scopeIsFunctionType(&scope, &params[user_param].ty))
             {
                 total += scoreArg(
@@ -1372,7 +1390,9 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     }
 
     return .{
-        .points = total,
+        // Kotlin prefers an otherwise equal fixed declaration for named calls
+        // just as it does for positional calls.
+        .points = total - @as(i32, @intFromBool(vararg_pos != null)),
         .proven_args = proven,
         .unknown_args = unknown,
         .exact_arity = false,
@@ -1524,6 +1544,29 @@ test "applicable: an empty trailing vararg is applicable" {
     const sc = applicable(&sig, &args, .{}).?;
     try testing.expectEqual(@as(i32, -1), sc.points);
     try testing.expect(!sc.exact_arity);
+}
+
+test "applicable: fixed arity outranks an equally typed vararg" {
+    var vararg_params = oneParam("Int");
+    vararg_params[0].is_vararg = true;
+    const fixed_params = oneParam("Int");
+    const args = [_]ArgShape{.{ .runtime_class = "Int" }};
+
+    const fixed = applicable(
+        &SigView{ .params = &fixed_params },
+        &args,
+        .{},
+    ).?;
+    const variadic = applicable(
+        &SigView{ .params = &vararg_params },
+        &args,
+        .{},
+    ).?;
+
+    try testing.expectEqual(@as(i32, 100), fixed.points);
+    try testing.expect(fixed.exact_arity);
+    try testing.expectEqual(@as(i32, 99), variadic.points);
+    try testing.expect(!variadic.exact_arity);
 }
 
 test "applicable: null defaults falls back to the param has_default flag" {

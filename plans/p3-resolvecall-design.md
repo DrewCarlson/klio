@@ -1,10 +1,11 @@
-# P3 — `Module.resolveCall`: the single index-primary, type-aware, 3-tier bare-call resolver
+# P3 — `Module.resolveCall`: the single applicability-primary, type-aware, 3-tier bare-call resolver
 
 ## Completed
 
-- `Module.resolveCall` is the live bare-call resolver (`src/ir/lower/expr.zig:5128`),
-  index-primary with the shared `applicability.applicable()` ranking the best non-empty
-  tier and returning a `Resolution{ target, confidence, emit_form, candidate_set }`.
+- `Module.resolveCall` is the live bare-call resolver, with the shared
+  `applicability.applicable()` ranking declarations before scope selects the
+  best non-empty tier and returning a
+  `Resolution{ target, confidence, emit_form, candidate_set }`.
 - `Confidence`/`EmitForm`/`Resolution`/`ResolveCtx`, the `sigViewForApplicability` adapter,
   and the `paramHasDefault` null-`defaults` fallback are in place; the three-tier boundary
   (exact `Call` / virtual `CallMember`+`CallMemberOrGlobal` / deferred `CallValue`) is
@@ -87,11 +88,32 @@
 
 ---
 
-## Remaining: make `Module.resolveCall` applicability-primary
+## Completed: applicability-primary resolution
 
-The lowerer now has one entry path, but the resolver internals still reconcile
-`phaseBLadder` with the index through `preferredBareTargetLike`, and can fall
-back through `phaseBFallback`. Replace that reconciliation with one
-scope-tiered candidate set ranked directly by `applicability.applicable`, then
-delete those remaining declaration-order paths. This is the next architectural
-target.
+- `resolveCall` ranks each complete declaration directly through the shared
+  applicability engine. Scope is selected from the applicable candidates, so
+  an inapplicable higher-priority import cannot hide an applicable declaration
+  in a lower scope.
+- `phaseBLadder`, `phaseBFallback`, `preferredBareTargetLike`, and their
+  declared-arity and receiver-name helpers are deleted. The symbol index
+  remains the declaration and diagnostic substrate, not a competing target
+  picker.
+- Authoritative source/declaration types pass through the identity-aware static
+  compatibility proof after shared applicability. Provably incompatible
+  overloads are removed; additive eager type heads may rank a candidate but
+  cannot reject one or make a target final.
+- A uniquely best, statically compatible declaration is final in the emitted
+  IR. A sole surviving declaration is also final; multi-candidate families
+  whose best match remains uncertain stay non-final instead of acquiring a
+  runtime-value-dependent source identity.
+- Fixed declarations outrank otherwise equal varargs for positional and named
+  calls. Bodyless `expect`/host declarations remain valid compile-time targets
+  and keep their declaration `FuncId`.
+- Final varargs of function values remain positional. Only a fixed
+  function-typed parameter after an earlier vararg receives a synthesized
+  trailing-lambda name, including across the Compose ABI pair.
+- Constructor and function candidates use the same classifier/callable scope
+  tiers. A nearer classifier emits `NewInstance`, a nearer function commits,
+  and an equal-tier family retains the deferred comparison. That comparison
+  consumes the lowering-bound `ClassId`; it never reopens the constructor by
+  simple name.

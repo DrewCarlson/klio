@@ -4525,6 +4525,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
             name,
             arg_values.items,
             effective_names.items,
+            null,
             false,
             frame.func.package,
             caller_file,
@@ -5819,7 +5820,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             (if (cmg.func) |bf| (if (frame.module.funcById(bf)) |bfd| bfd.package else "") else "")
         else
             "";
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
+        const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };
@@ -7625,11 +7626,11 @@ pub const NullHost = struct {
         return self.callFuncNamed(allocator, module, func, args, arg_names);
     }
 
-    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, candidates: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
+    pub fn callNamedOverload(self: *NullHost, allocator: Allocator, module: *const Module, candidates: ?[]const FuncId, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, ctor_class: ?ir.ClassId, ctor_name: bool, caller_pkg: []const u8, caller_file: ?ir.FileId, synth_anchor_pkg: []const u8) Allocator.Error!MaybeValueResult {
         _ = caller_pkg;
         _ = caller_file;
         _ = synth_anchor_pkg;
-        _ = .{ self, allocator, module, candidates, name, args, arg_names, ctor_name };
+        _ = .{ self, allocator, module, candidates, name, args, arg_names, ctor_class, ctor_name };
         return .{ .ok = null };
     }
 

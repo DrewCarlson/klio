@@ -638,6 +638,45 @@ test "member_factory_constructor_shadow" {
     );
 }
 
+test "constructor_scope_import" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/constructor_scope_import/lib.kt",
+        CORPUS_DIR ++ "/constructor_scope_import/app.kt",
+    },
+        \\ctor
+        \\
+    );
+}
+
+test "constructor_scope_import_alias" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/constructor_scope_import/lib.kt",
+        CORPUS_DIR ++ "/constructor_scope_import/app_alias.kt",
+    },
+        \\ctor
+        \\
+    );
+}
+
+test "constructor_identity_collision" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/constructor_identity_collision/wrong.kt",
+        CORPUS_DIR ++ "/constructor_identity_collision/app.kt",
+    },
+        \\ctor
+        \\
+    );
+}
+
+test "static_overload_evidence" {
+    try check("static_overload_evidence",
+        \\generic
+        \\generic
+        \\fixed
+        \\
+    );
+}
+
 test "unimported_object_member_extension" {
     try check("unimported_object_member_extension",
         \\true

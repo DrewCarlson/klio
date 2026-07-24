@@ -81,11 +81,24 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   `scoreExtCandidates`; the legacy scorers and the duplicate member
   builtin-supertype table are deleted.
 - **P3 — `Module.resolveCall`**: bare-call lowering is one path
-  (`buildArgShapes` → `resolveCall` Phase A index / Phase B applicability /
-  Phase C emit form → the four pure emitters `emitCall`/`emitCallMember`/
+  (`buildArgShapes` → applicability-ranked `resolveCall` / one emit-form
+  decision → the four pure emitters `emitCall`/`emitCallMember`/
   `emitMemberOrGlobal`/`emitValueCall`). The parallel captured-write lowerers
   and the lowering-side `preferredBareTarget`/heuristic audit ladder are
-  deleted; infix return inference uses explicit-receiver resolution. A known
+  deleted. `phaseBLadder`, `phaseBFallback`, `preferredBareTargetLike`, and
+  their declared-arity/name reconciliation helpers are also gone: complete
+  declarations pass through the shared applicability engine before the
+  winning scope tier is selected. Authoritative source types then remove
+  statically incompatible candidates through the identity-aware structural
+  proof; additive eager heads cannot reject or finalize a target. A uniquely
+  best proven declaration becomes an exact IR target, while uncertain
+  multi-candidate families remain non-final rather than acquiring a
+  declaration-order identity. Fixed overloads outrank equal varargs on both
+  positional and named calls. Constructor/classifier candidates share the same
+  scope tiers: a nearer classifier emits a static construction, and an
+  equal-tier runtime comparison consumes the already-bound `ClassId` instead of
+  reopening a simple name. Infix return inference uses
+  explicit-receiver resolution. A known
   complete static extension/dispatch receiver tower now defers only for an
   applicable member or extension, while outer, companion, and incomplete scopes
   remain conservative. Generic receiver proofs preserve the structural owner

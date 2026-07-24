@@ -5455,12 +5455,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Whether a single-segment class-name call resolves to the constructor.
     const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args);
-    // A constructible same-named class competing with the function
-    // candidates: a static commit to the function is only sound when the
-    // pick is type-proven; otherwise the deferred class-carrying form
-    // below lets the runtime decide ctor-vs-factory on the actual
-    // argument types (`Box(s.length)` constructs `Box(Int)`, not the
-    // `fun Box(s: String)` factory the arity-only view would pick).
+    var force_static_class = false;
+    // A constructible same-named class competes with the function candidates.
+    // Until constructors participate in the shared applicability set, the
+    // deferred class-carrying form below compares both declarations on the
+    // actual argument types (`Box(s.length)` constructs `Box(Int)`, not the
+    // `fun Box(s: String)` factory).
     const class_competes = callee.* == .Path and callee.Path.segments.len == 1 and
         !shadowed_by_class and !callee_is_object and blk: {
         const cid = callee_class_id orelse break :blk false;
@@ -5491,7 +5491,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Path-callee with a registered top-level fn → Call{func}.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (try lowerPathCall(b, expr, shadowed_by_class, class_competes)) |r| return r;
+        if (try lowerPathCall(
+            b,
+            expr,
+            shadowed_by_class,
+            class_competes,
+            &force_static_class,
+        )) |r| return r;
     }
 
     // A named object is a singleton value, not a constructible class.
@@ -5542,7 +5548,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const dst = b.allocReg();
             const cls = &b.module.classes.items[class_id.int()];
             const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
-            if (shadowed_by_class or static_sam) {
+            if (shadowed_by_class or force_static_class or static_sam) {
                 // A bare `Inner()` uses the enclosing `this` as the new
                 // instance's outer. Inside a lambda body that `this` is
                 // only reachable through the closure's capture set, so
@@ -7006,6 +7012,7 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
 /// the scorer: it can promote a head-matching candidate but never
 /// disqualify one.
 fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
+    const lazy_ty = argDeclTypeRefLazy(b, arg);
     const ty = argDeclTypeRef(b, arg);
     const declared_fn_arity = if (ty) |t| fnTypeArityAlias(b, t) else null;
     const literal_callable = arg.* == .Lambda or arg.* == .AnonFun;
@@ -7024,6 +7031,7 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
             .char => .char,
         } else null,
         .ty = ty,
+        .ty_authoritative = lazy_ty != null,
     };
 }
 
@@ -7620,7 +7628,10 @@ fn buildStaticReturnArgShapes(
     for (args, shapes, inferred) |*arg, *shape, *owned| {
         if (shape.ty != null) continue;
         owned.* = try staticCallReturnTypeRef(b, arg);
-        if (owned.*) |ty| shape.ty = ty;
+        if (owned.*) |ty| {
+            shape.ty = ty;
+            shape.ty_authoritative = true;
+        }
     }
     return .{ .shapes = shapes, .inferred = inferred };
 }
@@ -7648,6 +7659,7 @@ fn buildStaticArgShapes(
     const shapes = try buildArgShapes(b, args, arg_names);
     for (args, shapes) |*arg, *shape| {
         shape.ty = argDeclTypeRefLazy(b, arg);
+        shape.ty_authoritative = shape.ty != null;
     }
     return shapes;
 }
@@ -8023,7 +8035,13 @@ fn renamedImportDirectTarget(
     return if (tied) null else best;
 }
 
-fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, class_competes: bool) Allocator.Error!?Reg {
+fn lowerPathCall(
+    b: *FuncBuilder,
+    expr: *const Expr,
+    shadowed_by_class: bool,
+    class_competes: bool,
+    force_static_class: *bool,
+) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
@@ -8226,7 +8244,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     // an intrinsic), so `funcIdByFqn` above found no single FuncId to route to.
     // `import kotlin.math.max` names 4+ overloads: the import is a real in-scope
     // symbol, but a same-name unimported `other.max(Dp, Dp)` can still preempt it
-    // in the applicability/fallback ladder (body-bearing, while the intrinsic
+    // during unqualified applicability ranking (body-bearing, while the intrinsic
     // overloads are unrankable header stubs). Re-lower the call qualified to the
     // imported FQN so overload resolution reaches the imported symbol, bypassing
     // the invisible candidate. Order-independent (decided from this file's imports)
@@ -8295,9 +8313,8 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
     }
 
     // Bare-call resolution through the unified resolver. `resolveCall` folds
-    // the scope index, the applicability ladder and the member-vs-global emit
-    // decision into one query; the switch below routes its verdict to a single
-    // emitter.
+    // applicability, scope, and the member-vs-global emission decision into
+    // one query; the switch below routes its verdict to a single emitter.
     const want = args.len;
     const cands = b.module.funcsBySimpleName(name0);
     const last_arg_lambda = lastArgIsLambda(args);
@@ -8391,11 +8408,11 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         }
         // Consumption: the typeck-decided target is type-derived and
         // overload-precise where the lazy engine is shape-based; prefer
-        // it. `ty_proven` pins the pick against runtime value-typed
+        // it. `target_final` pins the pick against runtime value-typed
         // re-picks, matching a cast-disambiguated call.
         if (res.target == null or res.target.?.int() != eager_fid.int()) {
             res_final.target = eager_fid;
-            res_final.ty_proven = true;
+            res_final.target_final = true;
             if (res_final.emit_form != .Call) res_final.emit_form = .Call;
         }
         if (eagerAuditOn()) {
@@ -8428,7 +8445,7 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
         if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) break :static_import;
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) break :static_import;
         res_final.emit_form = .Call;
-        res_final.ty_proven = true;
+        res_final.target_final = true;
     }
     defer b.allocator.free(res_final.candidate_set);
     const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
@@ -8484,11 +8501,27 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             }
         }
         if (!shadowed_by_class) {
-            // A constructible same-named class competes with this pick and
-            // the pick is not type-proven: yield to the class arm's deferred
-            // class-carrying emission, where the runtime decides
-            // ctor-vs-factory on the actual argument types.
-            if (class_competes and !res_final.ty_proven and !was_cast) return null;
+            // Constructors do not yet occupy a `resolveCall` candidate slot,
+            // but their classifier scope tier is shared with callables. A
+            // nearer class constructs immediately; a nearer function commits;
+            // only an equal-tier constructor/factory family needs the
+            // class-carrying runtime comparison. An explicit argument cast
+            // already disambiguated the factory overload.
+            if (class_competes and !was_cast) {
+                const caller_pkg = b.module.packageOfFile(
+                    segments[0].span.file,
+                ) orelse b.self_package;
+                const class_tier = b.module.classRefTier(
+                    name0,
+                    caller_pkg,
+                    segments[0].span.file,
+                ) orelse ir.Module.other_package_tier;
+                if (class_tier < res_final.tier) {
+                    force_static_class.* = true;
+                    return null;
+                }
+                if (class_tier == res_final.tier) return null;
+            }
             if (indexDeferReason(index_res) == .ambiguous_tier) {
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
             }
@@ -8497,12 +8530,12 @@ fn lowerPathCall(b: *FuncBuilder, expr: *const Expr, shadowed_by_class: bool, cl
             // program before it runs.
             _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
             return switch (res_final.emit_form) {
-                // A fully type-proven pick is as final as a cast pick: the
+                // A finalized pick is as definitive as a cast pick: the
                 // runtime's value-typed overload re-pick must not override it.
-                .Call => try emitCall(b, expr, target, was_cast or res_final.ty_proven),
+                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
-                // Phase C never emits a value call with a committed target.
+                // The resolver never emits a value call with a committed target.
                 .CallValue => unreachable,
             };
         }
@@ -9847,18 +9880,20 @@ fn trailingLambdaArgNames(
     }
     if (args.len != 0 and allNull(ast_arg_names) and lastArgIsLambda(args)) {
         if (b.module.funcById(func_id)) |f| {
-            const last_is_fn = f.params.len != 0 and
+            const last_is_fixed_fn = f.params.len != 0 and
+                !f.params[f.params.len - 1].is_vararg and
                 std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
-            var has_vararg = false;
-            for (f.params) |p| {
-                if (p.is_vararg) has_vararg = true;
+            var has_earlier_vararg = false;
+            if (f.params.len > 1) {
+                for (f.params[0 .. f.params.len - 1]) |p| {
+                    if (p.is_vararg) has_earlier_vararg = true;
+                }
             }
             // Only the vararg-before-trailing-lambda shape needs the
             // synthesized name; a plain positional trailing lambda already
-            // lands on the last parameter. A vararg may absorb any number
-            // of leading positional args, so the count is not bounded by
-            // the parameter count here.
-            if (last_is_fn and has_vararg) {
+            // lands on the last parameter. A final vararg of function values
+            // absorbs every lambda positionally and must remain unnamed.
+            if (last_is_fixed_fn and has_earlier_vararg) {
                 const tagged = try b.allocator.alloc(?ConstId, args.len);
                 for (tagged) |*t| t.* = null;
                 const cid = try b.module.internConst(b.allocator, .{ .String = f.params[f.params.len - 1].name });
@@ -9897,7 +9932,7 @@ fn threadedTrailingLambdaParam(
     const user_param_end = f.params.len - 2;
     if (user_param_end == 0) return null;
     const param = &f.params[user_param_end - 1];
-    if (!std.mem.startsWith(u8, param.ty.name, "Function")) return null;
+    if (param.is_vararg or !std.mem.startsWith(u8, param.ty.name, "Function")) return null;
     return .{ .arg_index = arg_index, .param_name = param.name };
 }
 
@@ -12172,6 +12207,106 @@ test "threaded trailing lambda binds before the composer pair" {
 
     const explicitly_named = [_]?[]const u8{ "measurePolicy", "$composer", "$changed" };
     try testing.expect(threadedTrailingLambdaParam(&f, &args, &explicitly_named) == null);
+
+    params[1].is_vararg = true;
+    try testing.expect(threadedTrailingLambdaParam(&f, &args, &names) == null);
+}
+
+test "trailing lambda names only a fixed parameter after a vararg" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+
+    var final_vararg_params = [_]ir.Param{
+        .{ .name = "item", .ty = build.typeInt(), .default = null },
+        .{
+            .name = "selectors",
+            .ty = .{ .name = "Function1", .nullable = false, .args = &.{} },
+            .default = null,
+            .is_vararg = true,
+        },
+    };
+    const final_vararg = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = final_vararg,
+        .name = "inspect",
+        .fqn = "app.inspect",
+        .params = &final_vararg_params,
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+
+    var fixed_tail_params = [_]ir.Param{
+        .{
+            .name = "keys",
+            .ty = build.typeInt(),
+            .default = null,
+            .is_vararg = true,
+        },
+        .{
+            .name = "block",
+            .ty = .{ .name = "Function0", .nullable = false, .args = &.{} },
+            .default = null,
+        },
+    };
+    const fixed_tail = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = fixed_tail,
+        .name = "remember",
+        .fqn = "app.remember",
+        .params = &fixed_tail_params,
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+
+    var lambda_params = [_]ast.Ident{.{ .name = "it", .span = dummySpan() }};
+    const lambda = Expr{ .Lambda = .{
+        .params = &lambda_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const final_args = [_]Expr{
+        .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
+        lambda,
+        lambda,
+    };
+    const final_names = [_]?[]const u8{ null, null, null };
+    const positional = try trailingLambdaArgNames(
+        &b,
+        final_vararg,
+        &final_args,
+        &final_names,
+    );
+    try testing.expectEqual(@as(usize, 0), positional.len);
+
+    var no_lambda_params: [0]ast.Ident = .{};
+    const fixed_args = [_]Expr{
+        .{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } },
+        .{ .Lambda = .{
+            .params = &no_lambda_params,
+            .body = .{ .stmts = &.{}, .span = dummySpan() },
+            .span = dummySpan(),
+        } },
+    };
+    const fixed_names = [_]?[]const u8{ null, null };
+    const tagged = try trailingLambdaArgNames(
+        &b,
+        fixed_tail,
+        &fixed_args,
+        &fixed_names,
+    );
+    defer a.free(tagged);
+    try testing.expectEqual(@as(usize, 2), tagged.len);
+    try testing.expect(tagged[0] == null);
+    try testing.expect(tagged[1] != null);
 }
 
 test "lambda lowering records unknown, plain, and receiver callable shapes" {
