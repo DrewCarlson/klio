@@ -137,13 +137,15 @@ pub const CallSite = struct {
     /// native loop does not execute `.Trace`, so the frame's span is otherwise
     /// stale when a trampolined call throws.
     span: ?ir.Span = null,
-    /// Member-call fields. `is_member` selects `receiver.name(args)` dispatch (the
-    /// receiver stays boxed in the frame's registers and is read by the host);
+    /// Member-call fields. `is_member` selects `receiver.name(args)` dispatch;
+    /// scalar receivers are rebuilt from slots and object receivers stay boxed.
     /// `recv_class` is the receiver's class identity at compile time, re-checked at
     /// loop entry so a later activation with a different receiver class deopts.
     is_member: bool = false,
     recv_reg: u32 = 0,
     name: []const u8 = "",
+    resolved_member: ?FuncId = null,
+    dispatch_recv_reg: ?u32 = null,
     recv_class: usize = 0,
     /// Field-read fields. `is_field` selects a direct stored-field read from the
     /// boxed receiver at `field_idx` (the field's stable position in the instance,
@@ -680,11 +682,16 @@ fn isCallableValue(v: Value) bool {
     };
 }
 
-/// A `CallMember` the loop JIT can trampoline: an instance-method call whose
-/// receiver is a loop-invariant boxed object (read by the host from the frame's
-/// registers, never unboxed into a slot). v1 handles only the bare positional form
-/// (no named args, no static-receiver pin) with at most three scalar args.
-const TrampMember = struct { recv: Reg, name: []const u8, args_reg: u32, n_args: u32, dst: Reg };
+/// A positional `CallMember` the loop JIT can trampoline.
+const TrampMember = struct {
+    recv: Reg,
+    name: []const u8,
+    args_reg: u32,
+    n_args: u32,
+    dst: Reg,
+    resolved: ?FuncId,
+    dispatch_recv: ?Reg,
+};
 
 fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember {
     // Subscripts / numeric conversions / bitwise infix ops also lower to
@@ -699,7 +706,15 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
-            return .{ .recv = cm.receiver, .name = name.String, .args_reg = cm.args.int(), .n_args = cm.n_args, .dst = cm.dst };
+            return .{
+                .recv = cm.receiver,
+                .name = name.String,
+                .args_reg = cm.args.int(),
+                .n_args = cm.n_args,
+                .dst = cm.dst,
+                .resolved = cm.resolved,
+                .dispatch_recv = cm.dispatch_receiver,
+            };
         },
         else => return null,
     }
@@ -1305,7 +1320,7 @@ fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
     return (lt == .object and rt == .null_) or (lt == .null_ and rt == .object) or (lt == .object and rt == .object);
 }
 
-fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
+fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
     n_reads.* = 0;
     def.* = null;
     if (arrayOpOf(module, inst)) |op| {
@@ -1347,13 +1362,16 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[3]Reg, n_read
         if (isScalarRt(typeAt(types, tc.dst))) def.* = tc.dst;
         return;
     }
-    // A trampolined member call reads its scalar args (the receiver stays boxed in
-    // a register and is read directly by the host, so it is NOT a scalar read); its
-    // dst is a scalar def only when the resolved method returns a scalar.
+    // A trampolined member call reads scalar args and a scalar receiver. Object
+    // receivers remain in frame registers for the host callback.
     if (trampolinableMemberOf(module, inst)) |mc| {
+        const recv_scalar: usize = if (isScalarRt(typeAt(types, mc.recv))) 1 else 0;
+        if (recv_scalar != 0) reads[0] = mc.recv;
         var k: u8 = 0;
-        while (k < mc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(mc.args_reg + k);
-        n_reads.* = mc.n_args;
+        while (k < mc.n_args and k < 3) : (k += 1) {
+            reads[recv_scalar + k] = Reg.from(mc.args_reg + k);
+        }
+        n_reads.* = recv_scalar + @as(usize, mc.n_args);
         if (isScalarRt(typeAt(types, mc.dst))) def.* = mc.dst;
         return;
     }
@@ -1450,7 +1468,7 @@ fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []c
         @memset(u, false);
         @memset(d, false);
         const blk = &func.blocks[bid.int()];
-        var reads: [3]Reg = undefined;
+        var reads: [4]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (blk.insts) |*inst| {
@@ -2350,6 +2368,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 // Only for a loop-invariant receiver — inlining resolves one method
                 // body, so a varying (polymorphic) receiver must keep dynamic dispatch.
                 if (trampolinableMemberOf(module, inst)) |mc| {
+                    if (mc.resolved != null or mc.dispatch_recv != null) continue;
                     if (resolver == null or field_resolver == null) continue;
                     if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) continue;
                     if (regWrittenInBody(func, body, mc.recv)) continue;
@@ -2442,12 +2461,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
     }
 
-    // Resolve each trampolined member call's result type against its live receiver
-    // (the IR cannot name the dispatched method) and each trampolined field read's
-    // type + stable index. Both require Instance receivers and the matching
-    // resolver; a suspend method, or a loop that also indexes arrays (a method
-    // could resize the backing store), is rejected. `field_idx_of` records the
-    // stored-field index per field-read dst for the collection pass.
+    // Resolve each dynamic member call's result type against its live receiver;
+    // exact member calls carry the declaration identity in IR.
     const member_ret = try a.alloc(RegType, n_regs);
     defer a.free(member_ret);
     @memset(member_ret, .unknown);
@@ -2471,7 +2486,14 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (ar >= regs.len) return null;
                     av[k] = regs[ar];
                 }
-                if (regs[mc.recv.int()] == .Instance and resolver != null) {
+                if (mc.resolved) |fid| {
+                    if (module.funcById(fid)) |f| {
+                        if (f.is_suspend) return null;
+                        if (mc.dst.int() < n_regs) {
+                            member_ret[mc.dst.int()] = funcReturnRegType(module, f);
+                        }
+                    }
+                } else if (regs[mc.recv.int()] == .Instance and resolver != null) {
                     if (resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args])) |fid| {
                         if (module.funcById(fid)) |f| {
                             if (f.is_suspend) return null;
@@ -2577,7 +2599,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
     // if any other instruction (or a branch cond) touches a cell register.
     {
-        var reads: [3]Reg = undefined;
+        var reads: [4]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (body) |bid| {
@@ -2947,6 +2969,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (inlined_m) continue;
                 const mc = trampolinableMemberOf(module, inst).?;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
+                if (mc.dispatch_recv) |dispatch| {
+                    if (dispatch.int() >= n_regs or dispatch.int() >= regs.len) return null;
+                }
                 // A loop-invariant receiver is validated once by the entry guard; a
                 // boxed receiver that varies (a chain cursor) re-checks its class on
                 // every call. Either way the host reads it straight from the frame.
@@ -2966,6 +2991,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .is_member = true,
                     .recv_reg = mc.recv.int(),
                     .name = mc.name,
+                    .resolved_member = mc.resolved,
+                    .dispatch_recv_reg = if (mc.dispatch_recv) |reg| reg.int() else null,
                     .recv_class = if (regs[mc.recv.int()] == .Instance) instanceClassIdentity(regs[mc.recv.int()]) else 0,
                     .recv_varies = recv_varies or regs[mc.recv.int()] != .Instance,
                 }) catch return null;
@@ -3985,4 +4012,25 @@ test "loop JIT recognizes a boxed global read trampoline" {
     const global = trampolinableGlobalOf(&module, &inst).?;
     try testing.expectEqual(@as(u32, 3), global.dst.int());
     try testing.expectEqualStrings("pkg.SINGLETON", global.name);
+}
+
+test "loop JIT preserves exact member-extension operands" {
+    const testing = std.testing;
+    var module = Module.init(testing.allocator);
+    defer module.deinit(testing.allocator);
+    const name = try module.internConst(testing.allocator, .{ .String = "pick" });
+    const inst = Inst{ .CallMember = .{
+        .dst = Reg.from(8),
+        .receiver = Reg.from(3),
+        .name = name,
+        .args = Reg.from(4),
+        .n_args = 1,
+        .resolved = FuncId.from(17),
+        .dispatch_receiver = Reg.from(2),
+    } };
+    const member = trampolinableMemberOf(&module, &inst).?;
+    try testing.expectEqual(FuncId.from(17), member.resolved.?);
+    try testing.expectEqual(Reg.from(2), member.dispatch_recv.?);
+    try testing.expectEqual(Reg.from(3), member.recv);
+    try testing.expectEqual(@as(u32, 4), member.args_reg);
 }

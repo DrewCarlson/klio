@@ -1714,38 +1714,43 @@ fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
 /// key: Key, value: Value)` accepts any key even when an unrelated class
 /// named `Key` is registered. Bound enforcement is separate
 /// (`classTypeParamRefutes` at the member candidate walk).
-fn paramTypeIsTypeVar(self: *VmHost, f: *const Func, pn_raw: []const u8) bool {
-    return fidTypeVar(self, f.id, pn_raw);
+fn paramTypeIsTypeVar(self: *VmHost, f: *const Func, ty: *const TypeRef) bool {
+    return fidTypeVar(self, f.id, ty);
 }
 
 /// `paramTypeIsTypeVar` keyed by `FuncId` (the shared applicability engine's
 /// `type_var` callback shape).
-fn fidTypeVar(self: *VmHost, fid: FuncId, pn_raw: []const u8) bool {
-    const pn = std.mem.trimEnd(u8, simpleName(pn_raw), "?");
-    if (typeParamOf(self, fid, pn)) return true;
+fn fidTypeVar(self: *VmHost, fid: FuncId, ty: *const TypeRef) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
-    // Owning class by method-list scan (the lowered receiver param does not
-    // carry the owner's name). Only reached when a nominal adjudication is
-    // about to refute the candidate, so the scan is off the hot path.
-    for (mod.classes.items) |*c| {
-        for (c.methods) |m| {
-            if (m != fid) continue;
-            const bounds = mod.registry.class_type_param_bounds.get(c.name) orelse return false;
-            for (bounds) |b| {
-                if (std.mem.eql(u8, b.param, pn)) return true;
-            }
+    for (ty.args) |arg| {
+        if (std.mem.startsWith(u8, arg.name, "#qual:")) return false;
+    }
+    const raw = std.mem.trimEnd(u8, ty.name, "?");
+    if (ir.parseClassTypeParamIdentity(raw)) |identity| {
+        const sig = mod.decl_sigs.get(fid.int()) orelse return false;
+        if (sig.enclosing_class == null or
+            sig.enclosing_class.?.int() != identity.owner.int() or
+            identity.owner.int() >= mod.classes.items.len)
+        {
             return false;
         }
+        const owner = &mod.classes.items[identity.owner.int()];
+        const bounds = mod.registry.class_type_param_bounds.get(owner.fqn) orelse
+            return false;
+        for (bounds) |bound| {
+            if (std.mem.eql(u8, bound.param, identity.param)) return true;
+        }
+        return false;
     }
-    return false;
+    return typeParamOf(self, fid, raw);
 }
 
 /// `ApplicabilityScope.type_var`: wraps `fidTypeVar`.
-fn applicTypeVarCbM(ctx: *anyopaque, fid: FuncId, name: []const u8) bool {
+fn applicTypeVarCbM(ctx: *anyopaque, fid: FuncId, ty: *const TypeRef) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
-    return fidTypeVar(self, fid, name);
+    return fidTypeVar(self, fid, ty);
 }
 
 /// Generic-argument proof over the receiver's actual elements. Only
@@ -1919,6 +1924,35 @@ fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []cons
         },
         else => return receiver.isRuntimeType(pn),
     }
+}
+
+fn receiverImplementsOwnerIdentity(
+    self: *VmHost,
+    receiver: *const Value,
+    owner: []const u8,
+) bool {
+    if (std.mem.indexOfScalar(u8, owner, '.') == null) {
+        return receiverImplementsType(self, receiver, owner);
+    }
+    if (receiver.* != .Instance) return false;
+    var closure: std.ArrayList(*const ClassDef) = .empty;
+    defer closure.deinit(self.allocator);
+    var seen: std.ArrayList(*const ClassDef) = .empty;
+    defer seen.deinit(self.allocator);
+    {
+        const instance = receiver.Instance.borrow();
+        collectClassClosure(
+            instance.get().class.asPtr(),
+            &closure,
+            &seen,
+            self.allocator,
+        );
+        instance.deinit();
+    }
+    for (closure.items) |class| {
+        if (std.mem.eql(u8, class.fqn, owner)) return true;
+    }
+    return false;
 }
 
 // -------------------------------------------------------------------------
@@ -2313,28 +2347,28 @@ pub fn popOuterThis() void {
 // Overload scoring + method/extension selection.
 // -------------------------------------------------------------------------
 
-/// Direct dispatch of a lowering-resolved member-EXTENSION target: seed the
-/// declaring class's `this` as an enclosing receiver (the owner-find), then run
-/// the body. `null` when the owner is not reachable, so the caller falls back to
-/// the name walk. A statically-baked member-ext `resolved` target dispatches
-/// through here.
-fn invokeMemberExtFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+/// Direct dispatch of a lowering-resolved member extension. Both Kotlin
+/// receivers are explicit: `dispatch_receiver` is the declaring class/object
+/// instance and `receiver` is the extension receiver.
+fn invokeMemberExtFuncId(
+    self: *VmHost,
+    allocator: Allocator,
+    dispatch_receiver: *const Value,
+    receiver: *const Value,
+    fid: FuncId,
+    args: []const Value,
+) Allocator.Error!EvalResult {
     const all = try prependReceiver(allocator, receiver, args);
     defer if (runtime.freeScratch()) allocator.free(all);
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
-    if (funcAt(mod, fid) == null) return null;
-    var pushed = false;
-    if (mod.registry.member_ext_owner_class.get(fid)) |owner| {
-        const inst = (try memberExtOwnerInstance(self, allocator, receiver, owner)) orelse return null;
-        if (funcAt(mod, fid) != null and !funcAt(mod, fid).?.hasBody()) return null; // SAM: use the walk
-        ir.eval.pushEnclosing(&inst);
-        pushed = true;
+    if (funcAt(mod, fid) == null) {
+        return .{ .err = .{ .Type = "resolved member target is missing" } };
     }
-    const r = try callFuncRec(self, allocator, mod, fid, all);
-    if (pushed) ir.eval.popEnclosing();
-    return r;
+    ir.eval.pushEnclosing(dispatch_receiver);
+    defer ir.eval.popEnclosing();
+    return try callFuncRec(self, allocator, mod, fid, all);
 }
 
 /// Distance from an instance's runtime class to `target` along the
@@ -2499,7 +2533,11 @@ fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
     var chain = enclosingChainClassOrder(self, self.allocator) catch return 0;
     defer chain.deinit(self.allocator);
     for (chain.items, 0..) |co, pos| {
-        if (std.mem.eql(u8, co, owner)) {
+        const matches = if (std.mem.indexOfScalar(u8, owner, '.') != null)
+            std.mem.eql(u8, co, owner)
+        else
+            std.mem.eql(u8, simpleName(co), owner);
+        if (matches) {
             return @as(i32, @intCast(chain.items.len)) - @as(i32, @intCast(pos));
         }
     }
@@ -3089,12 +3127,12 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
             var i: usize = 0;
             while (i < args.len and i < vp) : (i += 1) {
                 if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
-                    !paramTypeIsTypeVar(self, &f, effective[i].ty.name)) return null;
+                    !paramTypeIsTypeVar(self, &f, &effective[i].ty)) return null;
             }
             var j: usize = vp;
             while (j < args.len) : (j += 1) {
                 if (argDefinitelyNotParamType(self, &effective[vp].ty, &args[j]) and
-                    !paramTypeIsTypeVar(self, &f, effective[vp].ty.name)) return null;
+                    !paramTypeIsTypeVar(self, &f, &effective[vp].ty)) return null;
             }
             return f;
         }
@@ -3150,7 +3188,7 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
                 }
             }
             if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
-                !paramTypeIsTypeVar(self, &f, effective[i].ty.name))
+                !paramTypeIsTypeVar(self, &f, &effective[i].ty))
             {
                 if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(args[i])) });
                 return null;
@@ -8305,7 +8343,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             // implementation (indexOf(nonEnum) on an
                             // EnumEntries answers -1 through AbstractList's
                             // scan, exactly as the generated bridge does).
-                            if (classTypeParamRefutes(self, mod, cur_name, &f, args)) continue;
+                            if (classTypeParamRefutes(self, mod, irc.fqn, &f, args)) continue;
                             // A static-receiver-directed call is resolved in the
                             // static type's member scope. A candidate declared on a
                             // proper descendant of that type (not in its ancestor
@@ -8382,13 +8420,18 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
 /// only — an unknown/incomplete relation never refutes.
 fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const u8, f: *const Func, args: []const Value) bool {
     const bounds = mod.registry.class_type_param_bounds.get(class_name) orelse return false;
+    const sig = mod.decl_sigs.get(f.id.int()) orelse return false;
+    const owner = sig.enclosing_class orelse return false;
     const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     if (f.params.len <= recv_off) return false;
     for (f.params[recv_off..], 0..) |*p, i| {
         if (i >= args.len) break;
-        const pn = std.mem.trimEnd(u8, simpleName(p.ty.name), "?");
+        const identity = ir.parseClassTypeParamIdentity(
+            std.mem.trimEnd(u8, p.ty.name, "?"),
+        ) orelse continue;
+        if (identity.owner.int() != owner.int()) continue;
         for (bounds) |b| {
-            if (!std.mem.eql(u8, b.param, pn)) continue;
+            if (!std.mem.eql(u8, b.param, identity.param)) continue;
             var bn = simpleName(b.bound);
             if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
             bn = std.mem.trimEnd(u8, bn, "?");
@@ -8410,7 +8453,11 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
                 }
                 continue;
             }
-            if (arg.* == .Instance and !receiverImplementsHead(self, arg, bn)) return true;
+            const decidable = switch (arg.*) {
+                .Null, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => false,
+                else => true,
+            };
+            if (decidable and !receiverImplementsHead(self, arg, bn)) return true;
         }
     }
     return false;
@@ -8419,26 +8466,42 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
 /// Invoke an already-resolved user method by `FuncId`: prepend the receiver,
 /// pad defaults, pack varargs, and run the body. Shared by the cold resolve
 /// path (`irMethodWalk`) and the inline-cache fast path.
-/// Direct dispatch to a lowering-resolved monomorphic member target
+/// Direct dispatch to a lowering-resolved member target
 /// (`Inst.CallMember.resolved`): invoke `fid` on `receiver` with no name
-/// resolution, applicability walk, or FQN scan. Returns `null` only if the
-/// target vanished (unresolvable fid); the caller then falls back to the
-/// name-based path, so a stale bake can never miscall — it degrades to the
-/// existing dispatch. Positional args only (the lowerer bakes `resolved`
-/// solely for name-arg-free calls).
-pub fn invokeResolvedMember(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+/// resolution, applicability walk, or FQN scan. Missing targets are image/link
+/// errors and remain errors rather than changing the declaration selected by
+/// lowering.
+pub fn invokeResolvedMember(
+    self: *VmHost,
+    allocator: Allocator,
+    dispatch_receiver: ?*const Value,
+    receiver: *const Value,
+    fid: FuncId,
+    args: []const Value,
+) Allocator.Error!EvalResult {
     // A member-extension needs its declaring class's `this` seeded as an
-    // enclosing receiver (the owner-find the walk performs) before the body
-    // runs; a plain member / top-level extension binds `[receiver] ++ args`
-    // directly. Route member-extensions through the owner-replay path, which
-    // returns null (fall back to the name walk) when the owner is unreachable.
+    // enclosing receiver before the body runs; a plain member binds
+    // `[receiver] ++ args` directly.
     const is_member_ext = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
         break :blk isMemberExt(mg.get(), fid);
     };
-    if (is_member_ext) return invokeMemberExtFuncId(self, allocator, receiver, fid, args);
-    return invokeMethodFuncId(self, allocator, receiver, fid, args);
+    if (is_member_ext) {
+        const dispatch = dispatch_receiver orelse return .{
+            .err = .{ .Type = "resolved member extension is missing its dispatch receiver" },
+        };
+        return invokeMemberExtFuncId(
+            self,
+            allocator,
+            dispatch,
+            receiver,
+            fid,
+            args,
+        );
+    }
+    return (try invokeMethodFuncId(self, allocator, receiver, fid, args)) orelse
+        .{ .err = .{ .Type = "resolved member target is not executable" } };
 }
 
 fn runtimeVirtualCacheGet(self: *VmHost, key: root_mod.ProgramImage.RuntimeVirtualKey) ?root_mod.ProgramImage.RuntimeVirtualTarget {
@@ -9749,10 +9812,14 @@ fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owne
 /// means anyway.
 fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []const u8, fid: FuncId) bool {
     const f = funcAt(mod, fid) orelse return false;
+    const runtime_owner = if (mod.classIdByFqn(owner)) |id|
+        mod.classes.items[id.int()].name
+    else
+        owner;
     const sups: []const []const u8 = blk: {
         const g = self.classes.borrow();
         defer g.deinit();
-        const d = g.get().get(owner) orelse break :blk &.{};
+        const d = g.get().get(runtime_owner) orelse break :blk &.{};
         const dg = d.borrow();
         defer dg.deinit();
         break :blk dg.get().supertype_names;
@@ -9770,9 +9837,19 @@ fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []cons
 /// Whether a member-extension owner class is a registered `object` /
 /// companion singleton.
 fn ownerIsObjectSingleton(self: *VmHost, owner: []const u8) bool {
-    const pg = self.prog.borrow();
-    defer pg.deinit();
-    return pg.get().object_names.contains(owner);
+    return memberExtOwnerObjectClass(self, owner) != null;
+}
+
+/// Exact class identity for an object/companion member-extension owner.
+fn memberExtOwnerObjectClass(self: *VmHost, owner: []const u8) ?ir.ClassId {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const id = mod.classIdByFqn(owner) orelse return null;
+    if (id.int() >= mod.classes.items.len or !mod.classes.items[id.int()].is_object) {
+        return null;
+    }
+    return id;
 }
 
 /// A visible member-extension on the receiver type declared in the
@@ -10839,7 +10916,7 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
             if (e.v == .Instance) {
                 const g = e.v.Instance.borrow();
                 const cg = g.get().class.borrow();
-                std.debug.print(" {s}={}", .{ cg.get().name, receiverImplementsType(self, &e.v, owner) });
+                std.debug.print(" {s}={}", .{ cg.get().name, receiverImplementsOwnerIdentity(self, &e.v, owner) });
                 cg.deinit();
                 g.deinit();
             } else std.debug.print(" {s}", .{@tagName(e.v)});
@@ -10848,18 +10925,19 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
     }
     for (entries) |e| {
         if (e.v != .Instance) continue;
-        if (receiverImplementsType(self, &e.v, owner)) return e.v;
+        if (receiverImplementsOwnerIdentity(self, &e.v, owner)) return e.v;
         // The owner may sit on the entry's class-nesting tower.
         if (!e.isSubject()) {
             var cur: ?Value = instanceOuterLink(&e.v);
             while (cur) |o| {
                 if (o != .Instance) break;
-                if (receiverImplementsType(self, &o, owner)) return o;
+                if (receiverImplementsOwnerIdentity(self, &o, owner)) return o;
                 cur = instanceOuterLink(&o);
             }
         }
     }
-    if (receiver.* == .Instance and receiverImplementsType(self, receiver, owner)) return receiver.*;
+    if (receiver.* == .Instance and
+        receiverImplementsOwnerIdentity(self, receiver, owner)) return receiver.*;
     // The lexical receiver tower of the executing call stack: a getter
     // reached through nested lambdas (`placeable.mainAxisSize` inside a
     // `with(scope) { repeat { … } }` body) has its owner bound as an
@@ -10869,13 +10947,19 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
         defer allocator.free(lex);
         for (lex) |v| {
             if (v != .Instance) continue;
-            if (receiverImplementsType(self, &v, owner)) return v;
+            if (receiverImplementsOwnerIdentity(self, &v, owner)) return v;
         }
     }
     // An `object`/companion owner is its own dispatch receiver: the
     // singleton is materializable from anywhere it can be imported.
-    if (ownerIsObjectSingleton(self, owner)) {
-        if (host_globals.objectSingletonQuiet(self, owner)) |sv| {
+    if (memberExtOwnerObjectClass(self, owner)) |owner_id| {
+        if (host_globals.lookupGlobalById(
+            self,
+            allocator,
+            null,
+            owner_id,
+            false,
+        )) |sv| {
             if (sv == .Instance) return sv;
         }
     }
@@ -11033,7 +11117,7 @@ fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.Error
                 const g = cv.Instance.borrow();
                 closure.clearRetainingCapacity();
                 collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
-                for (closure.items) |cd| try v.append(allocator, cd.name);
+                for (closure.items) |cd| try v.append(allocator, cd.fqn);
                 const outer = g.get().outer;
                 g.deinit();
                 cur = outer;
@@ -12425,6 +12509,37 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
 }
 
 pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
+    if (std.mem.indexOfScalar(u8, qualifier, '.') != null) {
+        var walk: ?Value = receiver.*;
+        var steps: usize = 0;
+        while (walk) |value| {
+            if (steps > 128 or value != .Instance) break;
+            steps += 1;
+            if (receiverImplementsOwnerIdentity(self, &value, qualifier)) {
+                return .{ .ok = value };
+            }
+            walk = instanceOuterLink(&value);
+        }
+        const exact_chain = try enclosingThisChain(self, allocator);
+        defer allocator.free(exact_chain);
+        for (exact_chain) |enclosing| {
+            walk = enclosing;
+            steps = 0;
+            while (walk) |value| {
+                if (steps > 128 or value != .Instance) break;
+                steps += 1;
+                if (receiverImplementsOwnerIdentity(self, &value, qualifier)) {
+                    return .{ .ok = value };
+                }
+                walk = instanceOuterLink(&value);
+            }
+        }
+        return .{ .err = try typeErr(
+            allocator,
+            "qualified this `{s}` is not in the implicit receiver scope",
+            .{qualifier},
+        ) };
+    }
     // Walk parent chain on the receiver's class for direct matches, then
     // traverse the `outer` chain for inner-class / local-class scenarios.
     // `this@Outer` from an Inner method walks to the captured outer.

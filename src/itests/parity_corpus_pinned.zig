@@ -87,6 +87,47 @@ test "inline_param_shadows_caller" {
     );
 }
 
+test "captured_write_shared_resolution" {
+    try check("captured_write_shared_resolution",
+        \\3
+        \\5
+        \\6
+        \\17
+        \\7
+        \\5
+        \\5
+        \\extension:1
+        \\
+    );
+}
+
+test "static_operator_resolution" {
+    try check("static_operator_resolution",
+        \\nullable:1
+        \\int:2
+        \\string:qualified
+        \\[1, 2, 3]
+        \\string:inherited
+        \\int:4
+        \\number:4
+        \\extension:shadow
+        \\inner:receiver
+        \\[3]
+        \\extension:constructor
+        \\21500
+        \\
+    );
+}
+
+test "qualified_type_parameter_collision" {
+    try check("qualified_type_parameter_collision",
+        \\extension:class
+        \\extension:function
+        \\derived
+        \\
+    );
+}
+
 test "lambda_it_receiver_enclosing" {
     try check("lambda_it_receiver_enclosing",
         \\0

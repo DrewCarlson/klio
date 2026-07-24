@@ -242,12 +242,11 @@ pub const ApplicabilityScope = struct {
     /// back to the static `isFunctionTypeRef`.
     func_type: ?*const fn (*anyopaque, *const TypeRef) bool = null,
 
-    /// Whether `name` is a TYPE VARIABLE in scope for candidate `fid` — one
-    /// of its own type parameters, or its owning class's. A type-variable
-    /// param accepts any argument instead of being read as a nominal class
-    /// (`put(key: Key)` on `ConcurrentMap<Key, Value>`). Null callback
-    /// (lowering / eager) keeps the static short-form-`T` rule only.
-    type_var: ?*const fn (*anyopaque, FuncId, []const u8) bool = null,
+    /// Whether a parameter type is a TYPE VARIABLE in scope for candidate
+    /// `fid` — one of its own type parameters, or its owning class's. The
+    /// complete `TypeRef` keeps a qualified nominal type from being
+    /// reinterpreted as a same-named type variable.
+    type_var: ?*const fn (*anyopaque, FuncId, *const TypeRef) bool = null,
 
     /// Precise runtime equivalence for alternate spellings of the same class
     /// head, such as a source `Modifier.Node` parameter and its lifted
@@ -725,7 +724,14 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
 
     // Generic single-letter type-parameter — accept any (member allows digits).
     const short_typaram = if (member) allUpperOrDigit(nm) else allAsciiUpper(nm);
-    if (nm.len <= 2 and short_typaram) return 5;
+    var qualified_nominal = false;
+    for (param_ty.args) |arg_ty| {
+        if (std.mem.startsWith(u8, arg_ty.name, "#qual:")) {
+            qualified_nominal = true;
+            break;
+        }
+    }
+    if (!qualified_nominal and nm.len <= 2 and short_typaram) return 5;
     // Unit param type — accept anything but rank lowest.
     if (std.mem.eql(u8, nm, "Unit")) return 1;
     // A param typed as one of the candidate's in-scope TYPE VARIABLES (its
@@ -735,7 +741,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     // variable's name.
     if (scope.type_var) |cb| {
         if (sig.fid) |fid| {
-            if (cb(scope.ctx.?, fid, simpleName(nm))) return 5;
+            if (cb(scope.ctx.?, fid, param_ty)) return 5;
         }
     }
     return null;
@@ -1679,14 +1685,44 @@ test "applicable member: a class-type-param-typed param accepts an unrelated ins
     const sig = SigView{ .params = &p, .fid = FuncId.from(3), .is_member = true };
     const args = [_]ArgShape{.{ .runtime_class = "Token", .value = @ptrCast(&dummy) }};
     const tv = struct {
-        fn cb(_: *anyopaque, fid: FuncId, name: []const u8) bool {
-            return fid.int() == 3 and std.mem.eql(u8, name, "Key");
+        fn cb(_: *anyopaque, fid: FuncId, ty: *const TypeRef) bool {
+            return fid.int() == 3 and std.mem.eql(u8, ty.name, "Key");
         }
     }.cb;
     const without = ApplicabilityScope{ .member = true, .ctx = @ptrCast(&dummy) };
     const with = ApplicabilityScope{ .member = true, .ctx = @ptrCast(&dummy), .type_var = tv };
     try testing.expect(applicable(&sig, &args, without) == null);
     try testing.expectEqual(@as(i32, 5), applicable(&sig, &args, with).?.points);
+}
+
+test "applicable member does not reinterpret a qualified nominal as a type variable" {
+    var dummy: u8 = 0;
+    var qualifier = [_]TypeRef{.{
+        .name = "#qual:app.Key",
+        .nullable = false,
+        .args = &.{},
+    }};
+    const p = [_]Param{.{
+        .name = "value",
+        .ty = .{ .name = "Key", .nullable = false, .args = qualifier[0..] },
+        .default = null,
+    }};
+    const sig = SigView{ .params = &p, .fid = FuncId.from(3), .is_member = true };
+    const args = [_]ArgShape{.{ .runtime_class = "Word", .value = @ptrCast(&dummy) }};
+    const tv = struct {
+        fn cb(_: *anyopaque, _: FuncId, ty: *const TypeRef) bool {
+            for (ty.args) |arg_ty| {
+                if (std.mem.startsWith(u8, arg_ty.name, "#qual:")) return false;
+            }
+            return std.mem.eql(u8, ty.name, "Key");
+        }
+    }.cb;
+    const scope = ApplicabilityScope{
+        .member = true,
+        .ctx = @ptrCast(&dummy),
+        .type_var = tv,
+    };
+    try testing.expect(applicable(&sig, &args, scope) == null);
 }
 
 test "applicable member vs global: instance subtype tier formula differs" {

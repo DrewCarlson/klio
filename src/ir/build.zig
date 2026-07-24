@@ -717,7 +717,8 @@ pub const FuncBuilder = struct {
     /// same-named concrete class. Reified type params are excluded — they are
     /// resolved by the reified splice, which substitutes the concrete type.
     type_param_names: StringSet,
-    type_param_bounds: std.StringHashMap([]const u8),
+    type_param_bounds: std.StringHashMap(ir.ModuleRegistry.TypeParamBound),
+    owned_type_param_names: std.ArrayList([]u8),
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
         var self = FuncBuilder{
@@ -737,7 +738,8 @@ pub const FuncBuilder = struct {
             .object_init_locals = StringSet.init(allocator),
             .own_members = StringSet.init(allocator),
             .type_param_names = StringSet.init(allocator),
-            .type_param_bounds = std.StringHashMap([]const u8).init(allocator),
+            .type_param_bounds = std.StringHashMap(ir.ModuleRegistry.TypeParamBound).init(allocator),
+            .owned_type_param_names = .empty,
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
             .lambda_arg_recv = std.AutoHashMap(span_mod.Span, TypeRef).init(allocator),
@@ -815,6 +817,8 @@ pub const FuncBuilder = struct {
         self.own_members.deinit();
         self.type_param_names.deinit();
         self.type_param_bounds.deinit();
+        for (self.owned_type_param_names.items) |name| a.free(name);
+        self.owned_type_param_names.deinit(a);
         self.own_member_arity.deinit();
         self.enclosing_members.deinit();
         self.param_names.deinit();
@@ -1824,8 +1828,41 @@ pub const FuncBuilder = struct {
         name: []const u8,
         bound: []const u8,
     ) Allocator.Error!void {
+        return self.addTypeParamBoundEvidence(name, bound, true);
+    }
+    pub fn addTypeParamBoundEvidence(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: []const u8,
+        complete: bool,
+    ) Allocator.Error!void {
         try self.type_param_names.put(name, {});
-        try self.type_param_bounds.put(name, bound);
+        try self.type_param_bounds.put(name, .{
+            .param = name,
+            .bound = bound,
+            .complete = complete,
+        });
+    }
+    pub fn addOwnedTypeParamBoundEvidence(
+        self: *FuncBuilder,
+        name: []u8,
+        bound: []const u8,
+        complete: bool,
+    ) Allocator.Error!void {
+        try self.owned_type_param_names.append(self.allocator, name);
+        errdefer {
+            _ = self.owned_type_param_names.pop();
+            self.allocator.free(name);
+        }
+        try self.addTypeParamBoundEvidence(name, bound, complete);
+    }
+    pub fn ownTypeParamText(
+        self: *FuncBuilder,
+        text: []u8,
+    ) Allocator.Error![]const u8 {
+        errdefer self.allocator.free(text);
+        try self.owned_type_param_names.append(self.allocator, text);
+        return text;
     }
     pub fn typeParamBoundsSlice(
         self: *const FuncBuilder,
@@ -1838,7 +1875,7 @@ pub const FuncBuilder = struct {
         var it = self.type_param_bounds.iterator();
         var index: usize = 0;
         while (it.next()) |entry| : (index += 1) {
-            out[index] = .{ .param = entry.key_ptr.*, .bound = entry.value_ptr.* };
+            out[index] = entry.value_ptr.*;
         }
         return out;
     }

@@ -139,6 +139,7 @@ const Match = enum { proven, disproven, unknown };
 /// short-all-uppercase convention used across dispatch, excluding names
 /// registered as runtime classes.
 fn looksLikeTypeParam(self: *VmHost, pn: []const u8) bool {
+    if (ir.parseClassTypeParamIdentity(pn) != null) return true;
     if (!(pn.len > 0 and pn.len <= 2 and allUppercase(pn))) return false;
     const cg = self.classes.borrow();
     defer cg.deinit();
@@ -239,9 +240,9 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
             std.mem.eql(u8, head, "ClosedRange") or std.mem.eql(u8, head, "OpenEndRange"))) return .proven;
         // Named a range-family type this value is not.
         for ([_][]const u8{
-            "IntRange",         "LongRange",        "CharRange",       "UIntRange",
-            "ULongRange",       "IntProgression",   "LongProgression", "CharProgression",
-            "UIntProgression",  "ULongProgression", "ClosedRange",     "OpenEndRange",
+            "IntRange",        "LongRange",        "CharRange",       "UIntRange",
+            "ULongRange",      "IntProgression",   "LongProgression", "CharProgression",
+            "UIntProgression", "ULongProgression", "ClosedRange",     "OpenEndRange",
         }) |fam| {
             if (std.mem.eql(u8, head, fam)) return .disproven;
         }
