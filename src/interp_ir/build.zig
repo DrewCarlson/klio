@@ -458,6 +458,48 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
 }
 
 fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
+    const ComposeMaps = struct {
+        names: std.StringHashMap(void),
+        receiver_names: std.StringHashMap(void),
+        sinks: std.StringHashMap(void),
+        factories: std.StringHashMap(void),
+        sink_arity: std.StringHashMap(u8),
+        comp_props: std.StringHashMap(void),
+        comp_getter_props: std.StringHashMap(void),
+        inline_fns: std.StringHashMap(void),
+        sink_last_param: std.StringHashMap([]const u8),
+        sink_content_reach: std.StringHashMap(u8),
+        stability: std.StringHashMap(compose_pass.Stability),
+
+        fn deinit(self: *@This()) void {
+            self.names.deinit();
+            self.receiver_names.deinit();
+            self.sinks.deinit();
+            self.factories.deinit();
+            self.sink_arity.deinit();
+            self.comp_props.deinit();
+            self.comp_getter_props.deinit();
+            self.inline_fns.deinit();
+            self.sink_last_param.deinit();
+            self.sink_content_reach.deinit();
+            self.stability.deinit();
+        }
+    };
+    var compose_maps: ?ComposeMaps = null;
+    defer {
+        compose_pass.active_composable_names = null;
+        compose_pass.active_composable_receiver_names = null;
+        compose_pass.active_composable_sinks = null;
+        compose_pass.active_factories = null;
+        compose_pass.active_sink_arity = null;
+        compose_pass.active_composable_props = null;
+        compose_pass.active_composable_getter_props = null;
+        compose_pass.active_inline_fns = null;
+        compose_pass.active_sink_last_param = null;
+        compose_pass.active_sink_content_reach = null;
+        compose_pass.active_stability = null;
+        if (compose_maps) |*maps| maps.deinit();
+    }
     var decls: std.ArrayList(Decl) = .empty;
     defer decls.deinit(allocator);
     var imports: std.ArrayList(ast.ImportDecl) = .empty;
@@ -477,7 +519,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try file_pkgs.put(f.span.file, prefix);
         }
         for (f.decls) |*d| {
-            try collectClassFqns(allocator, d, prefix, &fqn_overrides);
+            try collectClassifierFqns(allocator, d, prefix, &fqn_overrides);
             try collectDeclPkgs(allocator, d, prefix, &decl_pkg);
             if (d.* == .Function and prefix.len != 0) {
                 try func_fqn_overrides.put(d.Function.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, d.Function.name.name }));
@@ -566,6 +608,43 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_stability = &stability;
         defer compose_pass.active_stability = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
+        compose_maps = .{
+            .names = names,
+            .receiver_names = receiver_names,
+            .sinks = sinks,
+            .factories = factories,
+            .sink_arity = sink_arity,
+            .comp_props = comp_props,
+            .comp_getter_props = comp_getter_props,
+            .inline_fns = inline_fns,
+            .sink_last_param = sink_last_param,
+            .sink_content_reach = sink_content_reach,
+            .stability = stability,
+        };
+        names = std.StringHashMap(void).init(allocator);
+        receiver_names = std.StringHashMap(void).init(allocator);
+        sinks = std.StringHashMap(void).init(allocator);
+        factories = std.StringHashMap(void).init(allocator);
+        sink_arity = std.StringHashMap(u8).init(allocator);
+        comp_props = std.StringHashMap(void).init(allocator);
+        comp_getter_props = std.StringHashMap(void).init(allocator);
+        inline_fns = std.StringHashMap(void).init(allocator);
+        sink_last_param = std.StringHashMap([]const u8).init(allocator);
+        sink_content_reach = std.StringHashMap(u8).init(allocator);
+        stability = std.StringHashMap(compose_pass.Stability).init(allocator);
+    }
+    if (compose_maps) |*maps| {
+        compose_pass.active_composable_names = &maps.names;
+        compose_pass.active_composable_receiver_names = &maps.receiver_names;
+        compose_pass.active_composable_sinks = &maps.sinks;
+        compose_pass.active_factories = &maps.factories;
+        compose_pass.active_sink_arity = &maps.sink_arity;
+        compose_pass.active_composable_props = &maps.comp_props;
+        compose_pass.active_composable_getter_props = &maps.comp_getter_props;
+        compose_pass.active_inline_fns = &maps.inline_fns;
+        compose_pass.active_sink_last_param = &maps.sink_last_param;
+        compose_pass.active_sink_content_reach = &maps.sink_content_reach;
+        compose_pass.active_stability = &maps.stability;
     }
 
     // Kotlin gives same-named top-level properties distinct storage per
@@ -875,7 +954,17 @@ fn joinIdents(allocator: Allocator, idents: []const ast.Ident, sep: []const u8) 
     return buf.toOwnedSlice(allocator);
 }
 
-fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
+fn collectClassifierFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
+    if (d.* == .TypeAlias) {
+        const ta = &d.TypeAlias;
+        if (pkg.len != 0) {
+            try out.put(ta.span, try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ pkg, ta.name.name },
+            ));
+        }
+    }
     if (d.* == .Class) {
         const c = &d.Class;
         if (pkg.len != 0) {
@@ -885,7 +974,7 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             c.name.name
         else
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, c.name.name });
-        for (c.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
+        for (c.members) |*m| try collectClassifierFqns(allocator, m, inner_pkg, out);
     }
     if (d.* == .Object) {
         const o = &d.Object;
@@ -896,7 +985,7 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             o.name.name
         else
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name });
-        for (o.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
+        for (o.members) |*m| try collectClassifierFqns(allocator, m, inner_pkg, out);
     }
 }
 
@@ -920,7 +1009,7 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
         },
         .Function => |*f| try out.put(f.span, pkg),
         .Property => |p| try out.put(p.span, pkg),
-        else => {},
+        .TypeAlias => |*ta| try out.put(ta.span, pkg),
     }
 }
 
@@ -2281,6 +2370,7 @@ fn buildModuleWithOverrides(
                             .name = p.name.name,
                             .ty = try ir.lower.decl.loweredTypeRef(a, &p.ty, true),
                             .default = null,
+                            .composable_arity = compose_pass.composableFunctionArity(&p.ty),
                             .is_property = false,
                             .is_vararg = p.is_vararg,
                             .has_default = p.default != null,
@@ -2377,6 +2467,47 @@ fn buildModuleWithOverrides(
             }
             try stub_ids.append(a, id);
         }
+    }
+
+    // Register callable extension-property headers before any body lowers.
+    // Kotlin permits `receiver.property(args)` when the property's value is a
+    // function. Without this declaration shape, the call is indistinguishable
+    // from a member call until runtime and loses the extension getter.
+    for (decls) |*d| {
+        if (d.* != .Property) continue;
+        const p = d.Property;
+        const recv = p.receiver_type orelse continue;
+        const prop_ty = p.ty orelse continue;
+        const fn_ty = prop_ty.function orelse continue;
+        const recv_name: []const u8 = if (recv.qualified_path) |qp|
+            (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv.name.name)
+        else
+            recv.name.name;
+        const fqn = try resolveFqn(
+            a,
+            fqn_overrides,
+            p.span,
+            package_prefix,
+            p.name.name,
+        );
+        const pkg = try declPackage(
+            a,
+            decl_pkg,
+            fqn_overrides,
+            p.span,
+            package_prefix,
+            p.name.name,
+        );
+        const gop = try module.registry.callable_extension_props.getOrPut(p.name.name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, .{
+            .fqn = fqn,
+            .package = pkg,
+            .receiver = recv_name,
+            .file = p.name.span.file,
+            .value_arity = @intCast(fn_ty.params.len),
+            .is_private = p.visibility == .Private,
+        });
     }
 
     // Lower each class after the top-level function headers are registered,
@@ -4897,6 +5028,51 @@ test "build_module produces an owned empty module shell" {
     defer built.deinit();
     try testing.expect(built.main == null);
     try testing.expectEqual(@as(usize, 0), built.top_level_props.items.len);
+}
+
+test "multi-file assembly retains packaged typealias identities" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = span.Span.init(span.FileId.from(7), 0, 1);
+    var package_path = [_]ast.Ident{
+        .{ .name = "sample", .span = s },
+        .{ .name = "types", .span = s },
+    };
+    const target = ast.TypeRef{
+        .name = .{ .name = "Long", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var decls = [_]ast.Decl{.{ .TypeAlias = .{
+        .name = .{ .name = "Counter", .span = s },
+        .type_params = &.{},
+        .target = target,
+        .visibility = .Internal,
+        .annotations = &.{},
+        .span = s,
+    } }};
+    const file = ast.KotlinFile{
+        .package = .{ .path = &package_path, .span = s },
+        .imports = &.{},
+        .decls = &decls,
+        .span = s,
+    };
+
+    var built = try buildModuleFiles(a, &.{file});
+    defer built.deinit();
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const shape = mg.get().registry.type_alias_types.get(
+        "sample.types.Counter",
+    );
+    try testing.expect(shape != null);
+    try testing.expectEqualStrings("Long", shape.?.target.name);
 }
 
 test "class type-parameter metadata includes where bounds and unbounded identities" {

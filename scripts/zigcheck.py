@@ -35,7 +35,7 @@ GRAPH = {
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
     "jit": [],
-    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability"],
+    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability", "compose_pass"],
     "applicability": ["ir", "span"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
@@ -124,10 +124,12 @@ def build_cmd(root, root_override, build_only, mods):
     if build_only:
         cmd += ["-femit-bin=/dev/null"]
 
-    # Modules reaching `pack` need the vendored zstd library to satisfy the
-    # extern ZSTD_* symbols; modules that don't are linked exactly as before.
+    # The real build links libc everywhere (std.c.getenv gates, the CLI's
+    # c_allocator), so the isolated check must too. Modules reaching `pack`
+    # also need the vendored zstd library for the extern ZSTD_* symbols.
     if "pack" in mods:
-        cmd += [ZSTD_LIB, "-lc"]
+        cmd += [ZSTD_LIB]
+    cmd += ["-lc"]
     return cmd
 
 

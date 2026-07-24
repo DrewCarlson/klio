@@ -618,6 +618,25 @@ pub fn dumpFrameChainForDiagAlways() void {
     }
 }
 
+/// The innermost frame's declared params with the runtime shape each is
+/// bound to. Names an argument-misalignment (e.g. a generated `$composer`
+/// slot holding an `Int`) directly instead of leaving it to be inferred
+/// from a downstream receiver failure.
+pub fn dumpCurrentFrameParamsForDiag() void {
+    const fr = frame_chain orelse return;
+    const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
+    std.debug.print("[frame-params] {s} ({d} params, {d} bound):\n", .{
+        label, fr.func.params.len, fr.params.items.len,
+    });
+    for (fr.func.params, 0..) |p, i| {
+        if (i >= fr.params.items.len) break;
+        const v = &fr.params.items[i];
+        std.debug.print("  [{d}] {s} = {s} {s}\n", .{
+            i, p.name, @tagName(std.meta.activeTag(v.*)), v.typeFqn(),
+        });
+    }
+}
+
 fn spinDumpMaybe() void {
     if (!spin_interval_read) {
         spin_interval_read = true;

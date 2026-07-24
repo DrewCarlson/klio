@@ -1097,3 +1097,11 @@ test "overloaded_nullable_smartcast" {
         \\
     );
 }
+
+test "reified_inline_overload_delegation" {
+    try check("reified_inline_overload_delegation",
+        \\true
+        \\false
+        \\
+    );
+}

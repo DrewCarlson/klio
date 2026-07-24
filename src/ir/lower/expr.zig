@@ -10,6 +10,7 @@ const runtime = @import("runtime");
 const ir = @import("../ir.zig");
 const applicability = @import("applicability");
 const build = @import("../build.zig");
+const compose_pass = @import("compose_pass");
 
 const helpers = @import("helpers.zig");
 const literals = @import("literals.zig");
@@ -4624,7 +4625,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             break :blk false;
         };
-        if (reified_ext and !b.inlineInProgress(mname)) {
+        if (reified_ext) {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
@@ -5127,7 +5128,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     const nm = callee.Path.segments[0].name;
     if (b.inlineLambdaFor(nm)) |lam| {
         if (!plainFnParamRejectsTrailingLambda(b, nm, args)) {
-            return try spliceInlineLambda(b, lam, args);
+            return try spliceInlineLambda(b, nm, lam, args);
         }
     }
     // A local binding of a function-typed value (a plain fn param like
@@ -5164,6 +5165,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
                         args,
                         ast_arg_names,
                         exprSpan(callee),
+                        call.has_trailing_lambda,
                     )
                 else
                     SelectedCallArgs{ .args = args, .names = ast_arg_names };
@@ -5203,6 +5205,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
                     args,
                     ast_arg_names,
                     exprSpan(callee),
+                    call.has_trailing_lambda,
                 )
             else
                 SelectedCallArgs{ .args = args, .names = ast_arg_names };
@@ -7415,6 +7418,16 @@ fn typeheadAuditOn() bool {
 
 fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .This and arg.This.qualifier == null) {
+        // An extension body spliced into a member function binds a new `this`
+        // register while the builder's flat declaration metadata still names
+        // the enclosing member receiver. The splice receiver is the lexical
+        // `this` for this body and must win. A spliced lambda argument skips
+        // it because that lambda's receiver/free-name window is independent.
+        if (b.lambda_splice_resolve == null) {
+            if (b.spliceRecvTy()) |head| {
+                return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+        }
         if (b.localDeclTypeRef("this")) |narrowed| return narrowed;
         if (b.recvTypeRef()) |receiver| return receiver;
         if (b.enclosingRecvTy()) |head| {
@@ -7521,6 +7534,22 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 }
             }
         }
+        // Resolve each property segment from its receiver's declared type so
+        // the final member call can use the shared declaration resolver.
+        if (argDeclTypeRefLazy(b, recv)) |receiver_ty| {
+            const owner = typeHead(receiver_ty.name);
+            const heads = b.module.registry.class_prop_type_heads;
+            if (heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
+                return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+            const chain: []const []const u8 =
+                b.module.registry.class_super_names.get(owner) orelse &.{};
+            for (chain) |super_name| {
+                if (heads.get(.{ .a = super_name, .b = arg.Member.name.name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
         return null;
     }
     if (arg.* != .Path) return null;
@@ -7538,6 +7567,23 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return null;
     }
     if (p.segments.len != 1) return null;
+    // An inlined function's parameters live in the caller builder, but their
+    // declared types belong to the spliced declaration rather than the
+    // caller's local-declaration table. Keep that source type as static
+    // applicability evidence while lowering the inline body. A spliced
+    // lambda argument deliberately skips this channel: its free names resolve
+    // in the caller scopes and may shadow a same-named inline parameter.
+    if (b.lambda_splice_resolve == null) {
+        if (b.spliceParamTy(p.segments[0].name)) |declared| {
+            if (declared.function == null) {
+                return .{
+                    .name = declared.name.name,
+                    .nullable = declared.nullable,
+                    .args = &.{},
+                };
+            }
+        }
+    }
     if (b.localDeclTypeRef(p.segments[0].name)) |declared| {
         var result = declared;
         result.nullable = result.nullable or b.localDeclNullable(p.segments[0].name);
@@ -7547,6 +7593,9 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (init != arg) {
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
         }
+    }
+    if (staticBareReceiverType(b, p.segments[0].name)) |head| {
+        return .{ .name = head, .nullable = false, .args = &.{} };
     }
     // A bare class name used as a value is its companion object: carry the
     // owner class's head as type evidence so `install(RoutingRoot, ...)`
@@ -8605,6 +8654,7 @@ fn resolveCtxFor(
         },
         .receiver_known = receiverTypeKnown(b, name0),
         .has_type_args = ast_type_args.len != 0,
+        .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
         .recv_ty = b.recvTy(),
         .recv_type = b.recvTypeRef(),
@@ -9286,50 +9336,124 @@ fn selectedCallArgsForBuilder(
     args: []const Expr,
     names: []const ?[]const u8,
     call_span: ast.Span,
+    trailing_lambda: bool,
 ) Allocator.Error!SelectedCallArgs {
     var selected = selectedCallArgs(b.module, func_id, args, names);
-    if (hasComposerArgPair(selected.names)) return selected;
     const f = b.module.funcById(func_id) orelse return selected;
-    const has_abi = selectedCallHasComposerAbi(b.module, func_id, f);
-    const composer = b.resolve("$composer");
-    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, f.name)) {
-            std.debug.print(
-                "[compose-abi] {s}#{d} caller={s} has_abi={} composer={} args={d}\n",
-                .{
-                    f.fqn,
-                    func_id.int(),
-                    build.currentRealFn() orelse "-",
-                    has_abi,
-                    composer != null,
-                    args.len,
-                },
-            );
+    if (!hasComposerArgPair(selected.names)) {
+        const has_abi = selectedCallHasComposerAbi(b.module, func_id, f);
+        const composer = b.resolve("$composer");
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, f.name)) {
+                std.debug.print(
+                    "[compose-abi] {s}#{d} caller={s} has_abi={} composer={} args={d}\n",
+                    .{
+                        f.fqn,
+                        func_id.int(),
+                        build.currentRealFn() orelse "-",
+                        has_abi,
+                        composer != null,
+                        args.len,
+                    },
+                );
+            }
+        }
+        if (has_abi and composer != null) {
+            const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
+            errdefer b.allocator.free(completed_args);
+            @memcpy(completed_args[0..selected.args.len], selected.args);
+            const composer_path = try b.allocator.alloc(ast.Ident, 1);
+            errdefer b.allocator.free(composer_path);
+            composer_path[0] = .{ .name = "$composer", .span = call_span };
+            completed_args[selected.args.len] = .{ .Path = .{ .segments = composer_path, .span = call_span } };
+            completed_args[selected.args.len + 1] = .{ .IntLit = .{ .value = 0, .kind = .Int, .span = call_span } };
+
+            const completed_names = try b.allocator.alloc(?[]const u8, selected.names.len + 2);
+            errdefer b.allocator.free(completed_names);
+            @memcpy(completed_names[0..selected.names.len], selected.names);
+            completed_names[selected.names.len] = "$composer";
+            completed_names[selected.names.len + 1] = "$changed";
+
+            selected.owned_args = completed_args;
+            selected.owned_names = completed_names;
+            selected.owned_composer_path = composer_path;
+            selected.args = completed_args;
+            selected.names = completed_names;
         }
     }
-    if (!has_abi or composer == null) return selected;
-
-    const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
-    errdefer b.allocator.free(completed_args);
-    @memcpy(completed_args[0..selected.args.len], selected.args);
-    const composer_path = try b.allocator.alloc(ast.Ident, 1);
-    errdefer b.allocator.free(composer_path);
-    composer_path[0] = .{ .name = "$composer", .span = call_span };
-    completed_args[selected.args.len] = .{ .Path = .{ .segments = composer_path, .span = call_span } };
-    completed_args[selected.args.len + 1] = .{ .IntLit = .{ .value = 0, .kind = .Int, .span = call_span } };
-
-    const completed_names = try b.allocator.alloc(?[]const u8, selected.names.len + 2);
-    errdefer b.allocator.free(completed_names);
-    @memcpy(completed_names[0..selected.names.len], selected.names);
-    completed_names[selected.names.len] = "$composer";
-    completed_names[selected.names.len + 1] = "$changed";
-
-    selected.owned_args = completed_args;
-    selected.owned_names = completed_names;
-    selected.owned_composer_path = composer_path;
-    selected.args = completed_args;
-    selected.names = completed_names;
+    try transformSelectedComposableArgs(b, f, selected.args, selected.names, trailing_lambda);
     return selected;
+}
+
+fn transformSelectedComposableArgs(
+    b: *FuncBuilder,
+    f: *const Func,
+    args: []const Expr,
+    names: []const ?[]const u8,
+    trailing_lambda: bool,
+) Allocator.Error!void {
+    if (b.resolve("$composer") == null or args.len == 0) return;
+    const occupied = try b.allocator.alloc(bool, f.params.len);
+    defer b.allocator.free(occupied);
+    @memset(occupied, false);
+    var next_param: usize = 0;
+    if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) {
+        occupied[0] = true;
+        next_param = 1;
+    }
+    const user_arg_end = if (hasComposerArgPair(names)) args.len - 2 else args.len;
+    var user_param_end = f.params.len;
+    if (hasThreadedComposerParams(f)) user_param_end -= 2;
+    for (args, 0..) |_, arg_index| {
+        var param_index: ?usize = null;
+        if (trailing_lambda and arg_index + 1 == user_arg_end and user_param_end != 0) {
+            param_index = user_param_end - 1;
+        } else if (arg_index < names.len) {
+            if (names[arg_index]) |arg_name| {
+                for (f.params, 0..) |param, i| {
+                    if (applicability.paramNameMatchesArg(param.name, arg_name)) {
+                        param_index = i;
+                        break;
+                    }
+                }
+            }
+        }
+        if (param_index == null) {
+            while (next_param < f.params.len and occupied[next_param]) next_param += 1;
+            if (next_param < f.params.len) {
+                param_index = next_param;
+                next_param += 1;
+            }
+        }
+        const pi = param_index orelse continue;
+        occupied[pi] = true;
+        const expected = f.params[pi].composable_arity orelse {
+            if (runtime.getenvSlice("KLIO_BARE_TRACE")) |want| {
+                if (std.mem.eql(u8, want, f.name)) {
+                    std.debug.print(
+                        "[compose-param] {s}#{d} arg={d} param={s} composable=false\n",
+                        .{ f.fqn, f.id.int(), arg_index, f.params[pi].name },
+                    );
+                }
+            }
+            continue;
+        };
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |want| {
+            if (std.mem.eql(u8, want, f.name)) {
+                std.debug.print(
+                    "[compose-param] {s}#{d} arg={d} param={s} composable=true arity={d}\n",
+                    .{ f.fqn, f.id.int(), arg_index, f.params[pi].name, expected },
+                );
+            }
+        }
+        _ = try compose_pass.transformResolvedComposableLambda(
+            b.allocator,
+            @constCast(&args[arg_index]),
+            expected,
+            f.name,
+            f.is_inline,
+        );
+    }
 }
 
 /// The `Call` emit form: a resolved bare-name static call. A committed
@@ -9346,7 +9470,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
             runtime.trace.dumpCurrent(.{});
         }
     }
-    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(call.callee));
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(call.callee), call.has_trailing_lambda);
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
     const ast_arg_names = selected_args.names;
@@ -9734,7 +9858,7 @@ fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast:
 fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
-    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee));
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee), call.has_trailing_lambda);
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
     const ast_arg_names = selected_args.names;
@@ -10009,7 +10133,7 @@ fn threadedTrailingLambdaParam(
 fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg: Reg, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
-    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee));
+    var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee), call.has_trailing_lambda);
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
     const ast_arg_names = selected_args.names;
@@ -11211,69 +11335,65 @@ fn lowerResolvedExtensionCall(
     // path defers until it carries and proves that substitution.
     if (ast_type_args.len != 0) return null;
     const recv_ty = declared_ty orelse return null;
-    var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
-    defer shape_set.deinit(b.allocator);
-    const shapes = shape_set.shapes;
-    const caller_file = name.span.file;
-    const implicit_owners = try b.collectImplicitReceiverTower(b.allocator, eagerLambdaRecvHead(b));
-    defer b.allocator.free(implicit_owners);
-    const owned_type_param_bounds = try b.typeParamBoundsSlice();
-    defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
-    const resolution = b.module.resolveExtensionCall(name.name, recv_ty, shapes, .{
-        .caller_file = caller_file,
-        .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
-        .implicit_dispatch_owners = implicit_owners,
-        .lexical_owner = b.ownerClass(),
-        .call_name = name.name,
-        .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
-    });
-    if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
-        if (std.mem.eql(u8, wanted, name.name)) {
-            std.debug.print(
-                "[ext-static] {s} recv={s} owners=",
-                .{ name.name, recv_ty.name },
-            );
-            for (implicit_owners) |owner| std.debug.print("{s},", .{owner});
-            std.debug.print(
-                " lexical={s} target={?d} applicable={}\n",
-                .{
-                    b.ownerClass() orelse "-",
-                    if (resolution.target) |target| target.int() else null,
-                    resolution.applicable,
-                },
-            );
-        }
-    }
+    const resolution = try resolveExtensionCallForArgs(
+        b,
+        recv_ty,
+        name,
+        args,
+        ast_arg_names,
+    );
     const func_id = resolution.target orelse return null;
     const target = b.module.funcById(func_id) orelse return null;
+    var selected_args = try selectedCallArgsForBuilder(
+        b,
+        func_id,
+        args,
+        ast_arg_names,
+        name.span,
+        b.callTrailingLambda(),
+    );
+    defer selected_args.deinit(b.allocator);
+    const selected_values = selected_args.args;
+    const selected_names = selected_args.names;
     try recordLambdaArgReceiversForCallReceiver(
         b,
         target,
-        args,
-        ast_arg_names,
+        selected_values,
+        selected_names,
         ast_type_args,
         recv_ty,
         1,
     );
-    // Inline declarations require their own resolved-target lowering strategy:
-    // an ordinary exact call executes InlineOnly wrapper bodies, while a splice
-    // can change lexical lookup for body-local helpers. Keep the declaration
-    // identity on the compatibility path until that strategy consumes FuncId.
-    if (target.is_inline) return null;
+    if (target.is_inline) {
+        const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
+        inline_state.ensureInlineBody(inline_decl);
+        const expected = b.peekExpected();
+        const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
+        return try tryInlineCallWithTypeArgs(
+            b,
+            name.name,
+            inline_decl,
+            selected_values,
+            selected_names,
+            receiver,
+            ast_type_args,
+            expected_ptr,
+        );
+    }
 
-    const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
+    const broad_masks = try argLambdaBroadMasks(b, target, selected_values, selected_names, 1);
     defer if (broad_masks) |masks| b.allocator.free(masks);
     b.pending_arg_broad_masks = broad_masks;
-    const arg_arity = try argFnArities(b, target, args, ast_arg_names, 1);
+    const arg_arity = try argFnArities(b, target, selected_values, selected_names, 1);
     defer if (arg_arity) |arities| b.allocator.free(arities);
-    const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
+    const arg_generic = try argFnGenericFlags(b, target, selected_values, selected_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
     const lambda_param_types = try argLambdaParamTypes(
         b,
         target,
-        args,
-        ast_arg_names,
+        selected_values,
+        selected_names,
         ast_type_args,
         1,
     );
@@ -11290,12 +11410,12 @@ fn lowerResolvedExtensionCall(
         null;
     const recv_reg = try lowerReceiver(b, receiver);
     if (target.kind == .member_extension) {
-        const run = try lowerArgRunWithArity(b, args, arg_arity);
+        const run = try lowerArgRunWithArity(b, selected_values, arg_arity);
         const arg_names = try trailingLambdaArgNames(
             b,
             func_id,
-            args,
-            ast_arg_names,
+            selected_values,
+            selected_names,
         );
         const dst = b.allocReg();
         const method_name = try b.module.internConst(
@@ -11321,10 +11441,15 @@ fn lowerResolvedExtensionCall(
         return dst;
     }
     const args_start = b.allocReg();
-    const run = try lowerArgRunWithArity(b, args, arg_arity);
+    const run = try lowerArgRunWithArity(b, selected_values, arg_arity);
     try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
 
-    const user_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
+    const user_names = try trailingLambdaArgNames(
+        b,
+        func_id,
+        selected_values,
+        selected_names,
+    );
     const arg_names: []?ConstId = if (user_names.len == 0)
         &.{}
     else blk: {
@@ -11346,6 +11471,76 @@ fn lowerResolvedExtensionCall(
         .exact = true,
     } });
     return dst;
+}
+
+fn resolveExtensionCallForArgs(
+    b: *FuncBuilder,
+    recv_ty: TypeRef,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!ir.Module.ExtensionResolution {
+    var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+    defer shape_set.deinit(b.allocator);
+    const shapes = shape_set.shapes;
+    const caller_file = name.span.file;
+    const implicit_owners = try b.collectImplicitReceiverTower(b.allocator, eagerLambdaRecvHead(b));
+    defer b.allocator.free(implicit_owners);
+    const owned_type_param_bounds = try b.typeParamBoundsSlice();
+    defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
+    const resolve_ctx = ir.Module.ExtensionResolveCtx{
+        .caller_file = caller_file,
+        .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
+        .implicit_dispatch_owners = implicit_owners,
+        .lexical_owner = b.ownerClass(),
+        .call_name = name.name,
+        .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+    };
+    var resolution = b.module.resolveExtensionCall(
+        name.name,
+        recv_ty,
+        shapes,
+        resolve_ctx,
+    );
+    if (!argShapesHaveComposerPair(shapes)) {
+        const threaded = try b.allocator.alloc(
+            applicability.ArgShape,
+            shapes.len + 2,
+        );
+        defer b.allocator.free(threaded);
+        @memcpy(threaded[0..shapes.len], shapes);
+        threaded[shapes.len] = .{};
+        threaded[shapes.len + 1] = .{
+            .ty = build.typeInt(),
+            .literal_kind = .numeric,
+        };
+        resolution.compiler_abi_applicable = b.module.resolveExtensionCall(
+            name.name,
+            recv_ty,
+            threaded,
+            resolve_ctx,
+        ).applicable;
+    }
+    if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
+        if (std.mem.eql(u8, wanted, name.name)) {
+            std.debug.print(
+                "[ext-static] {s} recv={s} owners=",
+                .{ name.name, recv_ty.name },
+            );
+            for (implicit_owners) |owner| std.debug.print("{s},", .{owner});
+            std.debug.print(
+                " lexical={s} args={d} target={?d} applicable={} compiler_abi={}\n",
+                .{
+                    b.ownerClass() orelse "-",
+                    shapes.len,
+                    if (resolution.target) |target| target.int() else null,
+                    resolution.applicable,
+                    resolution.compiler_abi_applicable,
+                },
+            );
+        }
+    }
+    return resolution;
 }
 
 fn staticReceiverHasNoCompetingCallable(
@@ -11405,6 +11600,40 @@ fn localExtensionReceiverCouldApply(
     return !saw_extension;
 }
 
+fn callableExtensionPropertyTarget(
+    b: *const FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    value_arity: usize,
+    declared_ty: ?TypeRef,
+) ?ir.ModuleRegistry.CallableExtensionProp {
+    var receiver_head: []const u8 = undefined;
+    var receiver_is_class = false;
+    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+        const ident = receiver.Path.segments[0];
+        if (b.resolve(ident.name) == null and !b.knowsOuter(ident.name)) {
+            if (b.module.classIdIndexed(ident.name, b.self_package, ident.span.file)) |cid| {
+                if (cid.int() < b.module.classes.items.len) {
+                    receiver_head = b.module.classes.items[cid.int()].name;
+                    receiver_is_class = true;
+                }
+            }
+        }
+    }
+    if (!receiver_is_class) {
+        const ty = declared_ty orelse return null;
+        receiver_head = ty.name;
+    }
+    return b.module.resolveCallableExtensionProperty(
+        name.name,
+        receiver_head,
+        receiver_is_class,
+        value_arity,
+        b.module.packageOfFile(name.span.file) orelse b.self_package,
+        name.span.file,
+    );
+}
+
 fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -11413,13 +11642,13 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
-    const lazy_declared_ty = argDeclTypeRefLazy(b, receiver);
-    var inferred_declared_ty: ?ir.TypeRef = if (lazy_declared_ty == null)
+    const declared_from_expr = argDeclTypeRef(b, receiver);
+    var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
         try staticCallReturnTypeRef(b, receiver)
     else
         null;
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
-    const declared_ty = lazy_declared_ty orelse inferred_declared_ty;
+    const declared_ty = declared_from_expr orelse inferred_declared_ty;
 
     // Member declarations take precedence over local callables and extensions.
     // A unique static declaration commits here as either an exact function or
@@ -11554,6 +11783,81 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         }
     }
 
+    // The Compose syntax pass may conservatively thread a same-named call
+    // before overload resolution. Re-resolve the explicit receiver against
+    // its source argument list; a source-shaped member or extension proves
+    // that the selected declaration is not composable, so the compiler ABI
+    // pair does not belong to this call.
+    if (hasComposerArgPair(ast_arg_names) and args.len >= 2) {
+        const source_args = args[0 .. args.len - 2];
+        const source_names = ast_arg_names[0 .. ast_arg_names.len - 2];
+        const source_member = try lowerResolvedMemberCall(
+            b,
+            receiver,
+            name,
+            source_args,
+            source_names,
+            ast_type_args,
+            declared_ty,
+        );
+        switch (source_member) {
+            .lowered => |reg| return reg,
+            .deferred, .none => {},
+        }
+        if (declared_ty) |recv_ty| {
+            const source_extension = try resolveExtensionCallForArgs(
+                b,
+                recv_ty,
+                name,
+                source_args,
+                source_names,
+            );
+            if (source_extension.target) |target_id| {
+                if (b.module.funcById(target_id)) |target| {
+                    if (!selectedCallHasComposerAbi(b.module, target_id, target)) {
+                        var rewritten = expr.*;
+                        rewritten.Call.args = source_args;
+                        rewritten.Call.arg_names = source_names;
+                        return lowerMemberCallFallback(b, &rewritten);
+                    }
+                }
+            } else if (source_extension.applicable and
+                !source_extension.compiler_abi_applicable)
+            {
+                var rewritten = expr.*;
+                rewritten.Call.args = source_args;
+                rewritten.Call.arg_names = source_names;
+                return lowerMemberCallFallback(b, &rewritten);
+            }
+        }
+    }
+
+    if (!member_shadows_extensions and
+        callableExtensionPropertyTarget(b, receiver, name, args.len, declared_ty) != null)
+    {
+        const recv = try lowerReceiver(b, receiver);
+        const callee_reg = b.allocReg();
+        const marker_name = try std.fmt.allocPrint(b.allocator, "$extread${s}", .{name.name});
+        const marker = try b.module.internConst(b.allocator, .{ .String = marker_name });
+        try b.push(.{ .GetField = .{
+            .dst = callee_reg,
+            .receiver = recv,
+            .field = marker,
+        } });
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        orEmitAudit(b, "callable_extension_property", "CallValue", name.name);
+        try b.push(.{ .CallValue = .{
+            .dst = dst,
+            .callee = callee_reg,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
+    }
+
     if (!member_shadows_extensions) {
         if (try lowerResolvedExtensionCall(
             b,
@@ -11588,7 +11892,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // runtime receiver offers the filter nothing else to go on.
     const declared_recv: ?ConstId = blk: {
         const t = declared_ty orelse break :blk null;
-        const head = std.mem.trimEnd(u8, t.name, "?");
+        var alias_scratch = std.heap.ArenaAllocator.init(b.allocator);
+        defer alias_scratch.deinit();
+        const canonical = try b.module.resolveTypeAliasAt(
+            alias_scratch.allocator(),
+            t,
+            name.span.file,
+            b.module.packageOfFile(name.span.file) orelse b.self_package,
+        );
+        const head = std.mem.trimEnd(u8, canonical.name, "?");
         if (head.len == 0) break :blk null;
         break :blk try b.module.internConst(b.allocator, .{ .String = head });
     };
@@ -12215,6 +12527,7 @@ test "selected call args discard a composer pair from a non-composable overload"
         args[0..1],
         &source_names,
         dummySpan(),
+        false,
     );
     defer completed.deinit(a);
     try testing.expectEqual(@as(usize, 3), completed.args.len);
@@ -12262,6 +12575,117 @@ test "threaded trailing lambda binds before the composer pair" {
 
     params[1].is_vararg = true;
     try testing.expect(threadedTrailingLambdaParam(&f, &args, &names) == null);
+}
+
+test "selected composable parameters bind named and trailing lambdas exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const scaffold_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = scaffold_id,
+        .name = "Scaffold",
+        .fqn = "androidx.compose.material3.Scaffold",
+        .params = try a.dupe(ir.Param, &.{
+            .{
+                .name = "topBar",
+                .ty = .{ .name = "Function0", .nullable = false, .args = &.{} },
+                .default = null,
+                .composable_arity = 0,
+            },
+            .{
+                .name = "modifier",
+                .ty = .{ .name = "Modifier", .nullable = false, .args = &.{} },
+                .default = null,
+                .has_default = true,
+            },
+            .{
+                .name = "content",
+                .ty = .{ .name = "Function1", .nullable = false, .args = &.{} },
+                .default = null,
+                .composable_arity = 1,
+            },
+            .{ .name = "$composer", .ty = .{ .name = "Composer", .nullable = false, .args = &.{} }, .default = null },
+            .{ .name = "$changed", .ty = build.typeInt(), .default = null },
+        }),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .annotation_names = &.{"Composable"},
+    });
+
+    var composable_names = std.StringHashMap(void).init(a);
+    try composable_names.put("TopAppBar", {});
+    var sinks = std.StringHashMap(void).init(a);
+    compose_pass.active_composable_names = &composable_names;
+    defer compose_pass.active_composable_names = null;
+    compose_pass.active_composable_sinks = &sinks;
+    defer compose_pass.active_composable_sinks = null;
+    const old_memo = compose_pass.emit_lambda_memo;
+    compose_pass.emit_lambda_memo = true;
+    defer compose_pass.emit_lambda_memo = old_memo;
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    try b.bind("$composer", b.allocReg());
+
+    var top_segments = [_]ast.Ident{.{ .name = "TopAppBar", .span = dummySpan() }};
+    var top_callee = Expr{ .Path = .{ .segments = &top_segments, .span = dummySpan() } };
+    var top_args: [0]Expr = .{};
+    var top_names: [0]?[]const u8 = .{};
+    const top_call = Expr{ .Call = .{
+        .callee = &top_callee,
+        .args = &top_args,
+        .arg_names = &top_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = dummySpan(),
+    } };
+    var lambda_params: [0]ast.Ident = .{};
+    var lambda_stmts = [_]ast.Stmt{.{ .Expr = top_call }};
+    var content_params = [_]ast.Ident{.{ .name = "padding", .span = dummySpan() }};
+    var source_args = [_]Expr{
+        .{ .Lambda = .{
+            .params = &lambda_params,
+            .body = .{ .stmts = &lambda_stmts, .span = dummySpan() },
+            .span = dummySpan(),
+        } },
+        .{ .Lambda = .{
+            .params = &content_params,
+            .body = .{ .stmts = &.{}, .span = dummySpan() },
+            .span = dummySpan(),
+        } },
+    };
+    const source_names = [_]?[]const u8{ "topBar", null };
+    var selected = try selectedCallArgsForBuilder(
+        &b,
+        scaffold_id,
+        &source_args,
+        &source_names,
+        dummySpan(),
+        true,
+    );
+    defer selected.deinit(a);
+
+    try testing.expectEqual(@as(usize, 4), selected.args.len);
+    try testing.expect(selected.args[0] == .Call);
+    try testing.expectEqual(@as(usize, 5), selected.args[0].Call.args.len);
+    const wrapped_top_bar = selected.args[0].Call.args[2];
+    try testing.expect(wrapped_top_bar == .Lambda);
+    try testing.expectEqual(@as(usize, 2), wrapped_top_bar.Lambda.params.len);
+    try testing.expectEqualStrings("$composer", wrapped_top_bar.Lambda.params[0].name);
+    try testing.expectEqualStrings("$changed", wrapped_top_bar.Lambda.params[1].name);
+    try testing.expect(selected.args[1] == .Lambda);
+    try testing.expectEqual(@as(usize, 3), selected.args[1].Lambda.params.len);
+    try testing.expectEqualStrings("padding", selected.args[1].Lambda.params[0].name);
+    try testing.expectEqualStrings("$composer", selected.args[1].Lambda.params[1].name);
+    try testing.expectEqualStrings("$changed", selected.args[1].Lambda.params[2].name);
 }
 
 test "member-or-global emission binds a composable trailing lambda by parameter" {
@@ -13810,6 +14234,42 @@ test "shared member resolution selects overloads and dispatch forms" {
     const bodyless_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, bodyless_result.dispatch);
     try testing.expectEqual(final_pick, bodyless_result.target.?);
+    m.decl_sigs.getPtr(final_pick.int()).?.has_body = true;
+
+    const eager_recv_span = ast.Span.init(dummySpan().file, 50, 51);
+    var eager_types = std.AutoHashMap(ast.Span, ir.EagerTypeHead).init(a);
+    try eager_types.put(eager_recv_span, .{ .name = "Owner", .nullable = false });
+    m.eager_types = eager_types;
+    try b.bind("eagerTarget", b.allocReg());
+    var eager_recv_path = [_]ast.Ident{.{
+        .name = "eagerTarget",
+        .span = eager_recv_span,
+    }};
+    var eager_receiver = Expr{ .Path = .{
+        .segments = &eager_recv_path,
+        .span = eager_recv_span,
+    } };
+    var eager_member = Expr{ .Member = .{
+        .receiver = &eager_receiver,
+        .name = .{ .name = "finalPick", .span = eager_recv_span },
+        .safe = false,
+        .span = eager_recv_span,
+    } };
+    const eager_call = Expr{ .Call = .{
+        .callee = &eager_member,
+        .args = &int_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = eager_recv_span,
+    } };
+    _ = try lowerExpr(&b, &eager_call);
+    const eager_call_inst = b.blocks.items[b.cur.int()].insts[
+        b.blocks.items[b.cur.int()].insts.len - 1
+    ];
+    try testing.expect(eager_call_inst == .Call);
+    try testing.expectEqual(final_pick, eager_call_inst.Call.func);
+    try testing.expect(eager_call_inst.Call.exact);
 
     try b.setLocalDeclNullable("target");
     const nullable_binary = Expr{ .Binary = .{
@@ -14121,4 +14581,83 @@ test "trailing lambda's implicit label survives a call-shaped receiver" {
         }
     }
     try testing.expect(found);
+}
+
+test "inline extension receiver type remains available during body splicing" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    try b.setLocalDeclType("this", "Oklab");
+    b.setSpliceRecvTy("Float");
+    const this_expr = Expr{ .This = .{
+        .qualifier = null,
+        .span = dummySpan(),
+    } };
+    const ty = argDeclTypeRefLazy(&b, &this_expr) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("Float", ty.name);
+    try testing.expect(!ty.nullable);
+
+    const param_ty = ast.TypeRef{
+        .name = .{ .name = "Float", .span = dummySpan() },
+        .nullable = false,
+        .span = dummySpan(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    _ = try b.bindSpliceParamTy("minimumValue", param_ty);
+    var segments = [_]ast.Ident{.{
+        .name = "minimumValue",
+        .span = dummySpan(),
+    }};
+    const param_expr = Expr{ .Path = .{
+        .segments = &segments,
+        .span = dummySpan(),
+    } };
+    const param = argDeclTypeRefLazy(&b, &param_expr) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("Float", param.name);
+}
+
+test "declared member property chains retain static receiver types" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try m.registry.class_prop_type_heads.put(
+        .{ .a = "Coordinator", .b = "layoutNode" },
+        "LayoutNode",
+    );
+    try m.registry.class_prop_type_heads.put(
+        .{ .a = "LayoutNode", .b = "nodes" },
+        "NodeChain",
+    );
+
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Coordinator");
+
+    var layout_node_path = [_]ast.Ident{.{
+        .name = "layoutNode",
+        .span = dummySpan(),
+    }};
+    var layout_node = Expr{ .Path = .{
+        .segments = &layout_node_path,
+        .span = dummySpan(),
+    } };
+    const first = argDeclTypeRefLazy(&b, &layout_node) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("LayoutNode", first.name);
+
+    const nodes = Expr{ .Member = .{
+        .receiver = &layout_node,
+        .name = .{ .name = "nodes", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const chained = argDeclTypeRefLazy(&b, &nodes) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("NodeChain", chained.name);
 }

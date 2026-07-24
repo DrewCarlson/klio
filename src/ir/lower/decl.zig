@@ -498,6 +498,7 @@ pub fn reserveMemberHeaders(
                     &p.ty,
                 ),
                 .default = null,
+                .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
                 .is_property = false,
                 .is_vararg = p.is_vararg,
                 .has_default = p.default != null,
@@ -851,6 +852,7 @@ pub fn classPrimaryParams(a: Allocator, c: *const ast.Class) Allocator.Error![]P
             // its expected arity and drop a synthetic `it`.
             .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
             .default = null,
+            .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
             .is_property = p.property != null,
             .is_vararg = p.is_vararg,
             .has_default = p.default != null,
@@ -1981,6 +1983,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             .name = p.name.name,
             .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
             .default = null,
+            .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
             .is_property = false,
             .is_vararg = p.is_vararg,
             .has_default = p.default != null,

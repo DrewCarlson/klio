@@ -314,6 +314,8 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
 /// `ColorScheme` extension) is reached, via member syntax, by that
 /// non-composable extension, so threading it corrupts the call.
 pub var active_composable_receiver_names: ?*const std.StringHashMap(void) = null;
+pub var active_composable_names: ?*const std.StringHashMap(void) = null;
+pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
 
 pub fn collectComposableReceiverNames(
     a: std.mem.Allocator,
@@ -346,6 +348,11 @@ fn isComposableLambdaParam(p: *const Param) bool {
 /// (`@Composable () -> Unit`) — a lambda bound to it composes.
 fn isComposableFnType(t: *const ast.TypeRef) bool {
     return t.function != null and isComposable(t.annotations);
+}
+
+pub fn composableFunctionArity(t: *const ast.TypeRef) ?u8 {
+    if (!isComposableFnType(t)) return null;
+    return @intCast(@min(t.function.?.params.len, 255));
 }
 
 fn lambdaHasComposerParams(lam: anytype) bool {
@@ -507,18 +514,18 @@ pub fn collectInlineFnNamesInto(set: *std.StringHashMap(void), decls: []const as
 /// AST universe; these names splice their lambdas and keep the composable
 /// scope.
 const stdlib_inline_hofs = [_][]const u8{
-    "let",           "run",        "with",       "apply",     "also",
-    "takeIf",        "takeUnless", "repeat",     "use",       "synchronized",
-    "forEach",       "forEachIndexed", "onEach", "map",       "mapIndexed",
-    "mapNotNull",    "filter",     "filterNot",  "flatMap",   "fold",
-    "sumOf",         "count",      "any",        "all",       "none",
-    "first",         "firstOrNull", "last",      "lastOrNull", "find",
-    "indexOfFirst",  "indexOfLast", "groupBy",   "associateBy", "associateWith",
-    "getOrElse",     "getOrPut",   "buildString", "buildList", "buildSet",
-    "buildMap",      "maxOf",      "minOf",      "runCatching", "withLock",
-    "measureTime",   "fastForEach", "fastForEachIndexed", "fastMap", "fastAny",
-    "fastFilter",    "fastGroupBy", "fastFirstOrNull", "trace", "sortedBy",
-    "joinToString",  "removeIf",   "partition",  "single",    "singleOrNull",
+    "let",          "run",            "with",               "apply",       "also",
+    "takeIf",       "takeUnless",     "repeat",             "use",         "synchronized",
+    "forEach",      "forEachIndexed", "onEach",             "map",         "mapIndexed",
+    "mapNotNull",   "filter",         "filterNot",          "flatMap",     "fold",
+    "sumOf",        "count",          "any",                "all",         "none",
+    "first",        "firstOrNull",    "last",               "lastOrNull",  "find",
+    "indexOfFirst", "indexOfLast",    "groupBy",            "associateBy", "associateWith",
+    "getOrElse",    "getOrPut",       "buildString",        "buildList",   "buildSet",
+    "buildMap",     "maxOf",          "minOf",              "runCatching", "withLock",
+    "measureTime",  "fastForEach",    "fastForEachIndexed", "fastMap",     "fastAny",
+    "fastFilter",   "fastGroupBy",    "fastFirstOrNull",    "trace",       "sortedBy",
+    "joinToString", "removeIf",       "partition",          "single",      "singleOrNull",
 };
 
 /// Whether a lambda argument of a call to `name` keeps the composable
@@ -629,9 +636,25 @@ pub fn collectComposableSinkArity(
     return set;
 }
 
-fn compParamArity(t: *const ast.TypeRef) ?u8 {
+fn compParamArity(t: *const ast.TypeRef, receiver_is_a_slot: bool) ?u8 {
     if (t.function == null or !isComposable(t.annotations)) return null;
-    const n = t.function.?.params.len;
+    const ft = t.function.?;
+    // An extension receiver — and each `context(...)` type — flattens into a
+    // LEADING value slot when the lambda is INVOKED through the value protocol:
+    // a `Scope.() -> Unit` bound to a non-inline sink is memo-wrapped and called
+    // as `(receiver, $composer, $changed)`. Counting only `params` leaves a
+    // header-less `{ … }` there with no slot for the receiver, so the threaded
+    // `$composer` binds the receiver and every composable call in the body
+    // dispatches its composer methods on the scope object.
+    //
+    // An INLINE sink has no such protocol: its body is spliced into the caller
+    // with the receiver bound as `this`, so reserving a slot would instead shift
+    // the spliced parameters and hand `$composer` the Int dirty flag.
+    const recv_slots: usize = if (receiver_is_a_slot)
+        ft.context_params.len + @intFromBool(ft.receiver != null)
+    else
+        0;
+    const n = recv_slots + ft.params.len;
     if (n == 0) return null;
     return @intCast(@min(n, 255));
 }
@@ -639,13 +662,14 @@ fn compParamArity(t: *const ast.TypeRef) ?u8 {
 fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
-            for (f.params) |*p| if (compParamArity(&p.ty)) |n| {
+            for (f.params) |*p| if (compParamArity(&p.ty, !f.is_inline)) |n| {
                 try set.put(f.name.name, n);
                 break;
             };
         },
         .Class => |*c| {
-            for (c.primary_params) |*p| if (compParamArity(&p.ty)) |n| {
+            // A constructor never inlines its lambda argument.
+            for (c.primary_params) |*p| if (compParamArity(&p.ty, true)) |n| {
                 try set.put(c.name.name, n);
                 break;
             };
@@ -750,9 +774,9 @@ const stable_delegate_factories = [_][]const u8{
 };
 
 const stable_builtin_types = [_][]const u8{
-    "Int",    "Long",   "Short", "Byte",    "Char",  "Boolean",
-    "Float",  "Double", "String", "Unit",   "Nothing",
-    "UInt",   "ULong",  "UShort", "UByte",
+    "Int",   "Long",   "Short",  "Byte", "Char",    "Boolean",
+    "Float", "Double", "String", "Unit", "Nothing", "UInt",
+    "ULong", "UShort", "UByte",
 };
 
 fn isStableBuiltinType(name: []const u8) bool {
@@ -1166,7 +1190,7 @@ fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.me
             .mutable = false,
             .name = p.name,
             .receiver_type = null,
-            .ty = null,
+            .ty = p.ty,
             .init = pick,
             .delegate = null,
             .getter = null,
@@ -2577,6 +2601,40 @@ const Walker = struct {
     }
 };
 
+/// Transform a lambda argument after IR call resolution has selected its exact
+/// declaration and parameter. This is the overload-precise path for
+/// composable parameters that are not the source trailing lambda, such as
+/// `Scaffold(topBar = { ... })`.
+pub fn transformResolvedComposableLambda(
+    a: std.mem.Allocator,
+    arg: *Expr,
+    expected_params: u8,
+    implicit_label: ?[]const u8,
+    callee_inline: bool,
+) std.mem.Allocator.Error!bool {
+    const lam = trailingLambda(arg) orelse return false;
+    if (lambdaHasComposerParams(lam)) return false;
+    const names = active_composable_names orelse return false;
+    const label: ?[]const u8 = switch (arg.*) {
+        .Labeled => |labeled| labeled.label.name,
+        else => implicit_label,
+    };
+    var oracle = NameSetOracle{ .names = names };
+    var w = Walker{
+        .a = a,
+        .b = .{ .a = a, .gen_span = exprSpanOf(arg) },
+        .oracle = NameSetOracle.isComposableCall,
+        .oracle_ctx = &oracle,
+        .sinks = active_composable_sinks,
+        .thread = true,
+    };
+    try w.transformComposableLambda(lam, expected_params, label);
+    if (emit_lambda_memo and !callee_inline and w.branchHasComposable(arg)) {
+        w.wrapInComposableLambda(arg);
+    }
+    return true;
+}
+
 /// The span of an expression, for the memoization key. Falls back to a
 /// zero span when the node form carries none the pass knows about.
 fn exprSpanOf(e: *const Expr) Span {
@@ -3402,6 +3460,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(usize, 6), stmts.len);
     const prop = stmts[1].Decl.Property;
     try testing.expectEqualStrings("x", prop.name.name);
+    try testing.expectEqualStrings("Int", prop.ty.?.name.name);
     const pick = prop.init.?.If;
     try testing.expect(pick.cond.Binary.op == .IdentEq);
     try testing.expectEqualStrings("x$arg", pick.cond.Binary.lhs.Path.segments[0].name);

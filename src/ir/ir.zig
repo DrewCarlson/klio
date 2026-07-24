@@ -1104,6 +1104,10 @@ pub const Param = struct {
     name: []const u8,
     ty: TypeRef,
     default: ?BlockId,
+    /// Source function-type arity when this parameter is `@Composable`.
+    /// Null distinguishes an ordinary function parameter from a composable
+    /// zero-argument parameter.
+    composable_arity: ?u8 = null,
     /// True when the primary-ctor param doubles as a class property
     /// (`val name` / `var name` prefix on the param). The Vm uses
     /// this flag to decide which primary args become instance
@@ -1605,6 +1609,9 @@ pub const Module = struct {
         /// A tie or incomplete proof keeps `target` null without making the
         /// extension disappear from the candidate scope.
         applicable: bool = false,
+        /// The same source argument list can bind a visible extension after
+        /// appending the Compose compiler ABI pair.
+        compiler_abi_applicable: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -2347,6 +2354,112 @@ pub const Module = struct {
         return self.staticAliasType(allocator, expanded, depth + 1);
     }
 
+    fn scopedTypeAliasFqn(
+        self: *const Module,
+        allocator: Allocator,
+        ty: TypeRef,
+        file: ?FileId,
+        package: []const u8,
+    ) Allocator.Error!?[]const u8 {
+        if (overrideQualifiedPath(ty)) |path| {
+            return if (self.registry.type_alias_types.contains(path)) path else null;
+        }
+        const name = staticTypeHead(ty.name);
+        if (std.mem.indexOfScalar(u8, ty.name, '.') != null and
+            self.registry.type_alias_types.contains(ty.name))
+        {
+            return ty.name;
+        }
+        if (file) |source_file| {
+            var imported: ?[]const u8 = null;
+            for (self.importAliasPathsIn(source_file, name)) |path| {
+                if (!self.registry.type_alias_types.contains(path.fqn)) continue;
+                if (imported != null and !std.mem.eql(u8, imported.?, path.fqn)) {
+                    return null;
+                }
+                imported = path.fqn;
+            }
+            if (imported) |path| return path;
+        }
+        if (package.len != 0) {
+            const own = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ package, name },
+            );
+            defer allocator.free(own);
+            if (self.registry.type_alias_types.getKey(own)) |key| return key;
+        }
+        if (file) |source_file| {
+            var wildcard: ?[]const u8 = null;
+            if (self.registry.import_wildcards.get(source_file)) |packages| {
+                for (packages.items) |imported_package| {
+                    const candidate = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}.{s}",
+                        .{ imported_package, name },
+                    );
+                    defer allocator.free(candidate);
+                    const key = self.registry.type_alias_types.getKey(candidate) orelse
+                        continue;
+                    if (wildcard != null and !std.mem.eql(u8, wildcard.?, key)) {
+                        return null;
+                    }
+                    wildcard = key;
+                }
+            }
+            if (wildcard) |path| return path;
+        }
+        var default_import: ?[]const u8 = null;
+        for (default_import_packages) |imported_package| {
+            const candidate = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ imported_package, name },
+            );
+            defer allocator.free(candidate);
+            const key = self.registry.type_alias_types.getKey(candidate) orelse
+                continue;
+            if (default_import != null and
+                !std.mem.eql(u8, default_import.?, key))
+            {
+                return null;
+            }
+            default_import = key;
+        }
+        return default_import;
+    }
+
+    /// Expand a source typealias using the imports and package of its exact
+    /// reference site. The FQN-keyed alias registry keeps a same-simple-name
+    /// alias from another package out of the proof.
+    pub fn resolveTypeAliasAt(
+        self: *const Module,
+        allocator: Allocator,
+        ty: TypeRef,
+        file: ?FileId,
+        package: []const u8,
+    ) Allocator.Error!TypeRef {
+        const alias_fqn = (try self.scopedTypeAliasFqn(
+            allocator,
+            ty,
+            file,
+            package,
+        )) orelse
+            return ty;
+        const source_args = overrideArgs(ty);
+        const args = try allocator.alloc(TypeRef, source_args.len + 1);
+        @memcpy(args[0..source_args.len], source_args);
+        args[source_args.len] = .{
+            .name = try std.fmt.allocPrint(allocator, "#qual:{s}", .{alias_fqn}),
+            .nullable = false,
+            .args = &.{},
+        };
+        var qualified = ty;
+        qualified.args = args;
+        return self.staticAliasType(allocator, qualified, 0);
+    }
+
     fn projectionType(ty: TypeRef) struct { variance: ?ast.Variance, ty: TypeRef, star: bool } {
         if (std.mem.eql(u8, ty.name, "*")) {
             return .{ .variance = null, .ty = ty, .star = true };
@@ -2716,8 +2829,9 @@ pub const Module = struct {
             0,
         )) return false;
         for (declared_params) |param| {
+            const bound_actual = bindingType(bindings.items, param.param) orelse
+                continue;
             if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
-            const bound_actual = bindingType(bindings.items, param.param) orelse return false;
             const dependent_bound = rawBoundNamesDeclaredParam(
                 declared_params,
                 param.bound,
@@ -3189,17 +3303,23 @@ pub const Module = struct {
         ctx: ExtensionResolveCtx,
     ) ExtensionResolution {
         for (args) |arg| {
-            if (arg.named != null or arg.is_spread) return .{};
+            if (arg.is_spread) return .{};
         }
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
+        const scoped_receiver = self.resolveTypeAliasAt(
+            sa,
+            receiver,
+            ctx.caller_file,
+            ctx.caller_package,
+        ) catch return .{};
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
         var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
-        while (candidate_it.next()) |fid| {
+        candidate_loop: while (candidate_it.next()) |fid| {
             const f = self.funcById(fid) orelse continue;
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
@@ -3207,11 +3327,30 @@ pub const Module = struct {
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            // Ordered named arguments carry the same positional binding as
+            // their source order, but still constrain the declaration by
+            // parameter identity. Normalize them for the extension scorer
+            // only after proving every supplied name matches that position.
+            // Reordered named calls remain deferred until the shared binding
+            // result is threaded through extension ranking.
+            for (args, 0..) |arg, i| {
+                const arg_name = arg.named orelse continue;
+                const param_index = i + 1;
+                if (param_index >= f.params.len or
+                    !applicability.paramNameMatchesArg(
+                        f.params[param_index].name,
+                        arg_name,
+                    ))
+                {
+                    continue :candidate_loop;
+                }
+            }
             if (is_member_extension and
                 !self.memberExtensionInScope(fid, f, ds, ctx)) continue;
             const has_source_body = f.hasBody() or
                 (if (ds) |decl| decl.has_body else false) or
-                self.decl_ast_body.contains(fid.int());
+                self.decl_ast_body.contains(fid.int()) or
+                f.is_inline;
             const has_host_symbol = if (ds) |decl| decl.host_symbol != null else false;
             if (!has_source_body and !has_host_symbol) continue;
             const tier: u8 = if (is_member_extension)
@@ -3286,22 +3425,36 @@ pub const Module = struct {
                 if (!omitted_defaults) continue;
             }
             const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
-            var compatibility = self.staticReceiverCompatibility(fid, receiver, recv_param);
+            const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
+                decl_source.file
+            else
+                null;
+            const scoped_recv_param = self.resolveTypeAliasAt(
+                sa,
+                recv_param,
+                decl_file,
+                f.package,
+            ) catch return .{};
+            var compatibility = self.staticReceiverCompatibility(
+                fid,
+                scoped_receiver,
+                scoped_recv_param,
+            );
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
             if (declared_bounds.len != 0) {
                 const generic_applies = self.staticGenericReceiverApplicable(
                     sa,
-                    receiver,
-                    recv_param,
+                    scoped_receiver,
+                    scoped_recv_param,
                     declared_bounds,
                     ctx.actual_type_param_bounds,
                 ) catch return .{};
                 if (generic_applies) {
                     compatibility = .compatible;
                 } else {
-                    var erased_receiver = receiver;
+                    var erased_receiver = scoped_receiver;
                     erased_receiver.args = &.{};
-                    var erased_param = recv_param;
+                    var erased_param = scoped_recv_param;
                     erased_param.args = &.{};
                     compatibility = if (self.staticReceiverCompatibility(
                         null,
@@ -3313,30 +3466,30 @@ pub const Module = struct {
                         .unknown;
                 }
             } else if (compatibility == .unknown) {
-                const receiver_id = self.staticTypeClassId(receiver);
-                const param_id = self.staticTypeClassId(recv_param);
+                const receiver_id = self.staticTypeClassId(scoped_receiver);
+                const param_id = self.staticTypeClassId(scoped_recv_param);
                 const disjoint_known_classifiers = receiver_id != null and
                     param_id != null and
                     !self.classIdIsOrExtends(receiver_id.?, param_id.?);
                 const known_classifier_path = receiver_id != null and
                     param_id != null and
                     self.classIdIsOrExtends(receiver_id.?, param_id.?);
-                const same_known_classifier = receiver.args.len != 0 and
-                    recv_param.args.len != 0 and
+                const same_known_classifier = scoped_receiver.args.len != 0 and
+                    scoped_recv_param.args.len != 0 and
                     ((receiver_id != null and param_id != null and
                         receiver_id.? == param_id.?) or
                         (std.mem.eql(
                             u8,
-                            staticTypeHead(receiver.name),
-                            staticTypeHead(recv_param.name),
+                            staticTypeHead(scoped_receiver.name),
+                            staticTypeHead(scoped_recv_param.name),
                         ) and
                             self.staticBuiltinIdentity(
-                                receiver,
-                                staticTypeHead(receiver.name),
+                                scoped_receiver,
+                                staticTypeHead(scoped_receiver.name),
                             ) == .yes and
                             self.staticBuiltinIdentity(
-                                recv_param,
-                                staticTypeHead(recv_param.name),
+                                scoped_recv_param,
+                                staticTypeHead(scoped_recv_param.name),
                             ) == .yes));
                 if (disjoint_known_classifiers) {
                     compatibility = .incompatible;
@@ -3345,18 +3498,18 @@ pub const Module = struct {
                 {
                     const subtype = self.staticTypeIsSubtypeWithBounds(
                         sa,
-                        receiver,
-                        recv_param,
+                        scoped_receiver,
+                        scoped_recv_param,
                         ctx.actual_type_param_bounds,
                     ) catch return .{};
                     if (subtype) {
                         compatibility = .compatible;
                     } else if (self.staticTypeProofComplete(
-                        receiver,
+                        scoped_receiver,
                         ctx.actual_type_param_bounds,
                     ) and
                         self.staticTypeProofComplete(
-                            recv_param,
+                            scoped_recv_param,
                             ctx.actual_type_param_bounds,
                         ))
                     {
@@ -3394,13 +3547,14 @@ pub const Module = struct {
             return .{ .applicable = unknown_best_tier != 255 };
         }
 
-        var proof_receiver = receiver;
+        var proof_receiver = scoped_receiver;
         const receiver_alias = self.staticAliasHead(proof_receiver);
         if (receiver_alias.changed and !receiver_alias.structure_lost) {
             proof_receiver.name = receiver_alias.name;
         }
         const proof_args = sa.dupe(applicability.ArgShape, args) catch return .{};
         for (proof_args) |*arg| {
+            arg.named = null;
             if (arg.ty) |*ty| {
                 const alias = self.staticAliasHead(ty.*);
                 if (alias.changed and !alias.structure_lost) ty.name = alias.name;
@@ -3410,6 +3564,22 @@ pub const Module = struct {
         for (ids.items, 0..) |fid, i| {
             const f = self.funcById(fid).?;
             const params = sa.dupe(Param, f.params) catch return .{};
+            if (params.len != 0) {
+                const declared_receiver = if (self.decl_sigs.get(fid.int())) |decl|
+                    decl.receiver_ty orelse params[0].ty
+                else
+                    params[0].ty;
+                const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
+                    decl_source.file
+                else
+                    null;
+                params[0].ty = self.resolveTypeAliasAt(
+                    sa,
+                    declared_receiver,
+                    decl_file,
+                    f.package,
+                ) catch return .{};
+            }
             for (params) |*param| {
                 const alias = self.staticAliasHead(param.ty);
                 if (alias.changed and !alias.structure_lost) param.ty.name = alias.name;
@@ -5360,7 +5530,11 @@ pub const Module = struct {
     /// `func_defaults` lives on `ProgramImage`, not on `Module`, so the
     /// lowering adapter cannot read it; it carries defaults on the params
     /// (`paramHasDefault`'s null-`defaults` fallback).
-    fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
+    fn sigViewForApplicability(
+        self: *const Module,
+        id: FuncId,
+        include_compiler_abi: bool,
+    ) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
         const declared_callable = if (self.decl_sigs.get(id.int())) |ds|
             ds.has_body or ds.host_symbol != null or f.is_expect
@@ -5368,8 +5542,15 @@ pub const Module = struct {
             false;
         if (!f.hasBody() and !declared_callable) return null;
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        var end = f.params.len;
+        if (!include_compiler_abi and end >= off + 2 and
+            std.mem.eql(u8, f.params[end - 2].name, "$composer") and
+            std.mem.eql(u8, f.params[end - 1].name, "$changed"))
+        {
+            end -= 2;
+        }
         return .{
-            .params = f.params[off..],
+            .params = f.params[off..end],
             .defaults = null,
             .has_body = true,
             .low_priority = f.low_priority,
@@ -5899,6 +6080,10 @@ pub const Module = struct {
         /// widen it back through the program-wide member-name universe.
         receiver_known: bool = false,
         has_type_args: bool = false,
+        /// A `$composer` binding exists in the current lowering scope. Bare
+        /// composable calls can resolve against their source parameter list
+        /// before lowering appends the compiler ABI pair.
+        has_composer: bool = false,
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
         recv_type: ?TypeRef = null,
@@ -6064,7 +6249,7 @@ pub const Module = struct {
     /// Whether a candidate's declared signature can bind the call's argument
     /// shapes.
     pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
-        const sv = self.sigViewForApplicability(fid) orelse return .{ .points = 0 };
+        const sv = self.sigViewForApplicability(fid, callShapesHaveComposerPair(args)) orelse return .{ .points = 0 };
         const named = !allShapeNamesNull(args);
         return applicability.applicable(&sv, args, .{
             .named = named,
@@ -6172,6 +6357,7 @@ pub const Module = struct {
         receiver_formed: bool,
     ) ApplicableBarePick {
         const named = !allShapeNamesNull(args);
+        const include_compiler_abi = !ctx.has_composer or callShapesHaveComposerPair(args);
         var arg_to_param = [_]u16{0} ** 64;
         const scope = applicability.ApplicabilityScope{
             .named = named,
@@ -6192,7 +6378,7 @@ pub const Module = struct {
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
             }
-            const sig = self.sigViewForApplicability(id) orelse continue;
+            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse continue;
             const score = applicability.applicable(&sig, args, scope) orelse continue;
             const static_compatibility = if (receiver_formed)
                 StaticCompatibility.unknown
@@ -7041,6 +7227,78 @@ pub const Module = struct {
         return best_tier;
     }
 
+    /// Resolve a top-level callable extension property at an explicit
+    /// receiver call site. A member function has already been ruled out by
+    /// the caller; this query applies receiver, arity, visibility, and normal
+    /// Kotlin import/package tiers and commits only one declaration identity.
+    pub fn resolveCallableExtensionProperty(
+        self: *const Module,
+        name: []const u8,
+        receiver_head: []const u8,
+        receiver_is_class: bool,
+        value_arity: usize,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?ModuleRegistry.CallableExtensionProp {
+        const Helpers = struct {
+            fn outerCompanionHead(receiver: []const u8) ?[]const u8 {
+                const suffix = ".Companion";
+                if (!std.mem.endsWith(u8, receiver, suffix)) return null;
+                return staticTypeHead(receiver[0 .. receiver.len - suffix.len]);
+            }
+
+            fn receiverMatches(
+                module: *const Module,
+                declared: []const u8,
+                actual: []const u8,
+                is_class: bool,
+            ) bool {
+                if (outerCompanionHead(declared)) |outer| {
+                    return is_class and std.mem.eql(u8, outer, staticTypeHead(actual));
+                }
+                if (is_class) return false;
+                return module.classIsOrExtends(actual, declared);
+            }
+        };
+
+        var source_name = name;
+        var list = self.registry.callable_extension_props.get(source_name);
+        if (list == null) {
+            for (self.importAliasPathsIn(caller_file, name)) |path| {
+                source_name = staticTypeHead(path.fqn);
+                list = self.registry.callable_extension_props.get(source_name);
+                if (list != null) break;
+            }
+        }
+        const candidates = list orelse return null;
+        var best: ?ModuleRegistry.CallableExtensionProp = null;
+        var best_tier: u8 = 255;
+        var ambiguous = false;
+        for (candidates.items) |candidate| {
+            if (candidate.value_arity != value_arity) continue;
+            if (candidate.is_private and candidate.file != caller_file) continue;
+            if (!Helpers.receiverMatches(self, candidate.receiver, receiver_head, receiver_is_class)) continue;
+            const tier = self.scopeTier(
+                candidate.fqn,
+                candidate.package,
+                name,
+                caller_pkg,
+                caller_file,
+            );
+            if (tier > last_in_scope_tier) continue;
+            if (tier < best_tier) {
+                best = candidate;
+                best_tier = tier;
+                ambiguous = false;
+            } else if (tier == best_tier and best != null and
+                !std.mem.eql(u8, best.?.fqn, candidate.fqn))
+            {
+                ambiguous = true;
+            }
+        }
+        return if (ambiguous) null else best;
+    }
+
     /// The literal value of the top-level `const val` a bare reference to
     /// `name` resolves to at this site, or null when the best-scoped
     /// declaration is not a recorded compile-time constant (or the pick is
@@ -7422,6 +7680,14 @@ fn allShapeNamesNull(args: []const applicability.ArgShape) bool {
     return true;
 }
 
+fn callShapesHaveComposerPair(args: []const applicability.ArgShape) bool {
+    if (args.len < 2) return false;
+    const composer = args[args.len - 2].named orelse return false;
+    const changed = args[args.len - 1].named orelse return false;
+    return std.mem.eql(u8, composer, "$composer") and
+        std.mem.eql(u8, changed, "$changed");
+}
+
 /// True when `head` is the first dotted segment of `fqn` and `fqn` has
 /// at least one further segment — i.e. `fqn` is `head.<rest>`, so `head`
 /// is a package prefix of a real symbol rather than the symbol's own
@@ -7696,6 +7962,10 @@ pub const ModuleRegistry = struct {
     /// ranks the read's tier the same way it ranks a bare call: a read
     /// whose only declaration is in an unimported package is unresolved.
     top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
+    /// Top-level extension properties whose values are directly callable.
+    /// Registered before body lowering so `receiver.property(args)` can be
+    /// classified as a property read followed by `invoke`.
+    callable_extension_props: std.StringHashMap(std.ArrayList(CallableExtensionProp)),
     /// Top-level property simple name → 0-arg getter `FuncId`, for a
     /// `val`/`var` declared with only a custom getter (no initializer,
     /// no backing field, no delegate). A `LoadGlobal` of such a name
@@ -7717,6 +7987,15 @@ pub const ModuleRegistry = struct {
     pub const PropDecl = struct {
         fqn: []const u8,
         package: []const u8,
+    };
+
+    pub const CallableExtensionProp = struct {
+        fqn: []const u8,
+        package: []const u8,
+        receiver: []const u8,
+        file: FileId,
+        value_arity: u16,
+        is_private: bool,
     };
 
     /// One non-wildcard import: its full dotted path (owned by the
@@ -7784,6 +8063,7 @@ pub const ModuleRegistry = struct {
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
+            .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
             .allocator = allocator,
@@ -7896,6 +8176,11 @@ pub const ModuleRegistry = struct {
             var it = self.top_level_prop_pkgs.valueIterator();
             while (it.next()) |list| list.deinit(a);
             self.top_level_prop_pkgs.deinit();
+        }
+        {
+            var it = self.callable_extension_props.valueIterator();
+            while (it.next()) |list| list.deinit(a);
+            self.callable_extension_props.deinit();
         }
         self.top_level_prop_getters.deinit();
         self.top_level_prop_setters.deinit();
@@ -8053,6 +8338,14 @@ pub const ModuleRegistry = struct {
                 var list: std.ArrayList(PropDecl) = .empty;
                 try list.appendSlice(a, e.value_ptr.items);
                 try out.top_level_prop_pkgs.put(e.key_ptr.*, list);
+            }
+        }
+        {
+            var it = self.callable_extension_props.iterator();
+            while (it.next()) |e| {
+                var list: std.ArrayList(CallableExtensionProp) = .empty;
+                try list.appendSlice(a, e.value_ptr.items);
+                try out.callable_extension_props.put(e.key_ptr.*, list);
             }
         }
         {
@@ -9121,6 +9414,33 @@ test "extension resolver proves receiver, scope, and overload identity" {
     }, &string_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
     try testing.expectEqual(starts_with.int(), defaulted.target.?.int());
 
+    const ordered_named_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .named = "x",
+    }};
+    const ordered_named = m.resolveExtensionCall("startsWith", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &ordered_named_args, .{
+        .caller_file = FileId.from(0),
+        .caller_package = "app",
+    });
+    try testing.expectEqual(starts_with.int(), ordered_named.target.?.int());
+
+    const wrong_named_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .named = "other",
+    }};
+    try testing.expect(m.resolveExtensionCall("startsWith", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &wrong_named_args, .{
+        .caller_file = FileId.from(0),
+        .caller_package = "app",
+    }).target == null);
+
     const origin = m.resolveExtensionCall("origin", .{
         .name = "String",
         .nullable = false,
@@ -9158,6 +9478,70 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .caller_file = FileId.from(0),
         .caller_package = "app",
     }).target == null);
+}
+
+test "extension resolver expands receiver aliases in their file scope" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const compound = try pushTestFuncOpts(
+        &m,
+        a,
+        "compoundWith",
+        "app.compoundWith",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[compound.int()].kind = .top_level_extension;
+    m.funcs.items[compound.int()].params[0].ty.name = "Long";
+    try m.decl_sigs.put(compound.int(), .{
+        .receiver_ty = .{
+            .name = "CompositeKeyHashCode",
+            .nullable = false,
+            .args = &.{},
+        },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.decl_span.put(
+        compound.int(),
+        Span.init(FileId.from(1), 0, 1),
+    );
+    try m.registry.file_packages.put(FileId.from(1), "app");
+    try m.registry.file_packages.put(FileId.from(2), "app");
+    try m.registry.type_alias_types.put("app.CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "Long", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_alias_types.put("other.CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "String", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_alias_types.put("CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "String", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_aliases.put("CompositeKeyHashCode", "String");
+    try m.rebuildFuncNameIndex(a);
+
+    const resolved = m.resolveExtensionCall(
+        "compoundWith",
+        .{
+            .name = "CompositeKeyHashCode",
+            .nullable = false,
+            .args = &.{},
+        },
+        &.{},
+        .{
+            .caller_file = FileId.from(2),
+            .caller_package = "app",
+        },
+    );
+    try testing.expectEqual(compound, resolved.target.?);
 }
 
 test "extension resolver admits source bodies and defers possible member shadows" {
@@ -9484,6 +9868,7 @@ test "extension resolver retains a unique generic receiver lambda target" {
     m.funcs.items[apply.int()].params[1].ty.args = function_args;
     var type_params: std.ArrayList([]const u8) = .empty;
     try type_params.append(a, "T");
+    try type_params.append(a, "R");
     try m.registry.func_type_params.put(apply, type_params);
     try m.rebuildFuncNameIndex(a);
 
@@ -9501,6 +9886,70 @@ test "extension resolver retains a unique generic receiver lambda target" {
         .caller_package = "app",
     });
     try testing.expectEqual(apply, resolved.target.?);
+}
+
+test "callable extension properties resolve instance and companion receivers" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    var actions: std.ArrayList(ModuleRegistry.CallableExtensionProp) = .empty;
+    try actions.append(a, .{
+        .fqn = "app.action",
+        .package = "app",
+        .receiver = "Widget",
+        .file = FileId.from(1),
+        .value_arity = 1,
+        .is_private = false,
+    });
+    try m.registry.callable_extension_props.put("action", actions);
+
+    const action = m.resolveCallableExtensionProperty(
+        "action",
+        "Widget",
+        false,
+        1,
+        "app",
+        FileId.from(0),
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("app.action", action.fqn);
+    try testing.expect(m.resolveCallableExtensionProperty(
+        "action",
+        "Widget",
+        false,
+        0,
+        "app",
+        FileId.from(0),
+    ) == null);
+
+    var insets: std.ArrayList(ModuleRegistry.CallableExtensionProp) = .empty;
+    try insets.append(a, .{
+        .fqn = "app.systemBars",
+        .package = "app",
+        .receiver = "WindowInsets.Companion",
+        .file = FileId.from(1),
+        .value_arity = 0,
+        .is_private = false,
+    });
+    try m.registry.callable_extension_props.put("systemBars", insets);
+
+    const system_bars = m.resolveCallableExtensionProperty(
+        "systemBars",
+        "WindowInsets",
+        true,
+        0,
+        "app",
+        FileId.from(0),
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("app.systemBars", system_bars.fqn);
+    try testing.expect(m.resolveCallableExtensionProperty(
+        "systemBars",
+        "WindowInsets",
+        false,
+        0,
+        "app",
+        FileId.from(0),
+    ) == null);
 }
 
 test "extension resolver ranks proven generic argument structure" {
@@ -10987,6 +11436,9 @@ test "resolveCall: an extension requires an implicit receiver context" {
         "app",
         3,
     );
+    m.funcs.items[composable.int()].params[1].name = "$composer";
+    m.funcs.items[composable.int()].params[1].ty.name = "Composer";
+    m.funcs.items[composable.int()].params[2].name = "$changed";
     try m.rebuildFuncNameIndex(a);
 
     const source_args = [_]applicability.ArgShape{.{}};
@@ -11001,6 +11453,18 @@ test "resolveCall: an extension requires an implicit receiver context" {
     );
     defer a.free(source.candidate_set);
     try testing.expect(source.target == null);
+
+    const source_in_composition = try m.resolveCall(
+        a,
+        "contentColorFor",
+        "app",
+        FileId.from(0),
+        &source_args,
+        false,
+        .{ .has_composer = true },
+    );
+    defer a.free(source_in_composition.candidate_set);
+    try testing.expectEqual(composable, source_in_composition.target.?);
 
     const threaded_args = [_]applicability.ArgShape{ .{}, .{}, .{} };
     const threaded = try m.resolveCall(
