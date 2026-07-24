@@ -1984,12 +1984,62 @@ const Walker = struct {
         const blk = &branch.Block;
         const key = positionalKey(blk.span);
         if (dbg_groups) std.debug.print("[compose-pass] replace-group key={d} stmts={d}\n", .{ key, blk.stmts.len });
-        const stmts = w.a.alloc(ast.Stmt, blk.stmts.len + 2) catch @panic("oom");
         const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
         start_args[0] = w.b.intLit(key);
+        const preserve_tail = blk.stmts.len != 0 and blk.stmts[blk.stmts.len - 1] == .Expr and
+            blk.stmts[blk.stmts.len - 1].Expr != .Return and
+            blk.stmts[blk.stmts.len - 1].Expr != .Throw;
+        const stmts = w.a.alloc(
+            ast.Stmt,
+            blk.stmts.len + if (preserve_tail) @as(usize, 3) else 2,
+        ) catch @panic("oom");
         stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startReplaceGroup", start_args) };
-        @memcpy(stmts[1 .. blk.stmts.len + 1], blk.stmts);
-        stmts[blk.stmts.len + 1] = .{ .Expr = w.b.callMember(w.composerRef(), "endReplaceGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        if (preserve_tail) {
+            const tail_index = blk.stmts.len - 1;
+            @memcpy(stmts[1 .. tail_index + 1], blk.stmts[0..tail_index]);
+            const result_name = std.fmt.allocPrint(
+                w.a,
+                "$branch$v{x}",
+                .{@as(u64, @bitCast(key))},
+            ) catch @panic("oom");
+            const result_prop = w.a.create(ast.Property) catch @panic("oom");
+            result_prop.* = .{
+                .mutable = false,
+                .name = w.b.ident(result_name),
+                .receiver_type = null,
+                .ty = null,
+                .init = blk.stmts[tail_index].Expr,
+                .delegate = null,
+                .getter = null,
+                .setter = null,
+                .is_abstract = false,
+                .is_open = false,
+                .is_override = false,
+                .is_lateinit = false,
+                .is_const = false,
+                .is_inline = false,
+                .is_expect = false,
+                .is_actual = false,
+                .setter_visibility = null,
+                .visibility = .Public,
+                .annotations = &.{},
+                .span = w.b.gen_span,
+            };
+            stmts[tail_index + 1] = .{ .Decl = .{ .Property = result_prop } };
+            stmts[tail_index + 2] = .{ .Expr = w.b.callMember(
+                w.composerRef(),
+                "endReplaceGroup",
+                w.a.alloc(Expr, 0) catch @panic("oom"),
+            ) };
+            stmts[tail_index + 3] = .{ .Expr = w.b.pathExpr(result_name) };
+        } else {
+            @memcpy(stmts[1 .. blk.stmts.len + 1], blk.stmts);
+            stmts[blk.stmts.len + 1] = .{ .Expr = w.b.callMember(
+                w.composerRef(),
+                "endReplaceGroup",
+                w.a.alloc(Expr, 0) catch @panic("oom"),
+            ) };
+        }
         blk.stmts = stmts;
     }
 
@@ -2601,8 +2651,8 @@ const EpilogueInjector = struct {
     }
 
     fn block(self: *EpilogueInjector, blk: *ast.Block) std.mem.Allocator.Error!void {
-        // A branch block the walker wrapped opens a replace-group whose end
-        // call sits at the block's tail; a return inside must close it too.
+        // A branch block the walker wrapped opens a replace-group; a return
+        // inside must close it too.
         const wrapped = blk.stmts.len != 0 and isComposerCallStmt(&blk.stmts[0], "startReplaceGroup");
         if (wrapped) self.replace_depth += 1;
         defer if (wrapped) {
@@ -4138,7 +4188,17 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     plain.is_inline = true;
     const plain_out = try transformThreadedComposable(a, &plain, allComposable, &ctx, null, null);
     const plain_if = plain_out.body.?.Block.stmts[0].Expr.If;
-    try testing.expect(isComposerCallStmt(&plain_if.then_branch.Block.stmts[0], "startReplaceGroup"));
+    const plain_then = plain_if.then_branch.Block.stmts;
+    try testing.expectEqual(@as(usize, 4), plain_then.len);
+    try testing.expect(isComposerCallStmt(&plain_then[0], "startReplaceGroup"));
+    try testing.expect(plain_then[1] == .Decl);
+    const branch_result = plain_then[1].Decl.Property;
+    try testing.expect(branch_result.init.? == .Call);
+    try testing.expectEqualStrings("Foo", branch_result.init.?.Call.callee.Path.segments[0].name);
+    try testing.expect(isComposerCallStmt(&plain_then[2], "endReplaceGroup"));
+    try testing.expect(plain_then[3] == .Expr);
+    try testing.expect(plain_then[3].Expr == .Path);
+    try testing.expectEqualStrings(branch_result.name.name, plain_then[3].Expr.Path.segments[0].name);
     // A no-else composable `if` gains a synthesized empty else whose replace
     // group keeps the conditional position-stable across a branch flip.
     try testing.expect(plain_if.else_branch != null);
