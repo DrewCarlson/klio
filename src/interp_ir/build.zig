@@ -458,6 +458,48 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
 }
 
 fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
+    const ComposeMaps = struct {
+        names: std.StringHashMap(void),
+        receiver_names: std.StringHashMap(void),
+        sinks: std.StringHashMap(void),
+        factories: std.StringHashMap(void),
+        sink_arity: std.StringHashMap(u8),
+        comp_props: std.StringHashMap(void),
+        comp_getter_props: std.StringHashMap(void),
+        inline_fns: std.StringHashMap(void),
+        sink_last_param: std.StringHashMap([]const u8),
+        sink_content_reach: std.StringHashMap(u8),
+        stability: std.StringHashMap(compose_pass.Stability),
+
+        fn deinit(self: *@This()) void {
+            self.names.deinit();
+            self.receiver_names.deinit();
+            self.sinks.deinit();
+            self.factories.deinit();
+            self.sink_arity.deinit();
+            self.comp_props.deinit();
+            self.comp_getter_props.deinit();
+            self.inline_fns.deinit();
+            self.sink_last_param.deinit();
+            self.sink_content_reach.deinit();
+            self.stability.deinit();
+        }
+    };
+    var compose_maps: ?ComposeMaps = null;
+    defer {
+        compose_pass.active_composable_names = null;
+        compose_pass.active_composable_receiver_names = null;
+        compose_pass.active_composable_sinks = null;
+        compose_pass.active_factories = null;
+        compose_pass.active_sink_arity = null;
+        compose_pass.active_composable_props = null;
+        compose_pass.active_composable_getter_props = null;
+        compose_pass.active_inline_fns = null;
+        compose_pass.active_sink_last_param = null;
+        compose_pass.active_sink_content_reach = null;
+        compose_pass.active_stability = null;
+        if (compose_maps) |*maps| maps.deinit();
+    }
     var decls: std.ArrayList(Decl) = .empty;
     defer decls.deinit(allocator);
     var imports: std.ArrayList(ast.ImportDecl) = .empty;
@@ -566,6 +608,43 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_stability = &stability;
         defer compose_pass.active_stability = null;
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
+        compose_maps = .{
+            .names = names,
+            .receiver_names = receiver_names,
+            .sinks = sinks,
+            .factories = factories,
+            .sink_arity = sink_arity,
+            .comp_props = comp_props,
+            .comp_getter_props = comp_getter_props,
+            .inline_fns = inline_fns,
+            .sink_last_param = sink_last_param,
+            .sink_content_reach = sink_content_reach,
+            .stability = stability,
+        };
+        names = std.StringHashMap(void).init(allocator);
+        receiver_names = std.StringHashMap(void).init(allocator);
+        sinks = std.StringHashMap(void).init(allocator);
+        factories = std.StringHashMap(void).init(allocator);
+        sink_arity = std.StringHashMap(u8).init(allocator);
+        comp_props = std.StringHashMap(void).init(allocator);
+        comp_getter_props = std.StringHashMap(void).init(allocator);
+        inline_fns = std.StringHashMap(void).init(allocator);
+        sink_last_param = std.StringHashMap([]const u8).init(allocator);
+        sink_content_reach = std.StringHashMap(u8).init(allocator);
+        stability = std.StringHashMap(compose_pass.Stability).init(allocator);
+    }
+    if (compose_maps) |*maps| {
+        compose_pass.active_composable_names = &maps.names;
+        compose_pass.active_composable_receiver_names = &maps.receiver_names;
+        compose_pass.active_composable_sinks = &maps.sinks;
+        compose_pass.active_factories = &maps.factories;
+        compose_pass.active_sink_arity = &maps.sink_arity;
+        compose_pass.active_composable_props = &maps.comp_props;
+        compose_pass.active_composable_getter_props = &maps.comp_getter_props;
+        compose_pass.active_inline_fns = &maps.inline_fns;
+        compose_pass.active_sink_last_param = &maps.sink_last_param;
+        compose_pass.active_sink_content_reach = &maps.sink_content_reach;
+        compose_pass.active_stability = &maps.stability;
     }
 
     // Kotlin gives same-named top-level properties distinct storage per
@@ -2281,6 +2360,7 @@ fn buildModuleWithOverrides(
                             .name = p.name.name,
                             .ty = try ir.lower.decl.loweredTypeRef(a, &p.ty, true),
                             .default = null,
+                            .composable_arity = compose_pass.composableFunctionArity(&p.ty),
                             .is_property = false,
                             .is_vararg = p.is_vararg,
                             .has_default = p.default != null,

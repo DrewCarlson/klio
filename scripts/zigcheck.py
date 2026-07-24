@@ -35,7 +35,7 @@ GRAPH = {
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
     "jit": [],
-    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability"],
+    "ir": ["span", "ast", "types", "runtime", "diagnostics", "jit", "applicability", "compose_pass"],
     "applicability": ["ir", "span"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],

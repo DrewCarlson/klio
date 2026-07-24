@@ -30,7 +30,7 @@ const mod_list = [_]Mod{
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
     .{ .name = "jit", .tested = true },
-    .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit", "applicability" }, .tested = true },
+    .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit", "applicability", "compose_pass" }, .tested = true },
     // Shared overload-resolution applicability engine. Lives inside the ir
     // module's directory but is its own module (it depends on ir for TypeRef /
     // Param / FuncId) so the runtime scorers can import it. `ir` in turn

@@ -280,12 +280,21 @@ fn scanCatches(catches: []const ast.Catch) bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
-pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const Expr) Allocator.Error!Reg {
+pub fn spliceInlineLambda(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+) Allocator.Error!Reg {
     if (lam.* != .Lambda) {
         return lowerExpr(b, lam);
     }
     const params = lam.Lambda.params;
     const body = lam.Lambda.body;
+    const receiver = if (b.isReceiverLambdaParam(lambda_name))
+        b.resolve("this")
+    else
+        null;
 
     const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
     defer b.allocator.free(arg_regs);
@@ -301,6 +310,7 @@ pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const 
     const counted = inline_state.inlineExpandEnter();
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
+    if (receiver) |reg| try b.bind("this", reg);
     if (params.len == 0) {
         if (arg_regs.len > 0) {
             try b.bind("it", arg_regs[0]);
@@ -1048,6 +1058,14 @@ pub fn tryInlineCallWithTypeArgs(
     if (!inline_state.inlineExpandEnter()) {
         return null;
     }
+    errdefer inline_state.inlineExpandLeave();
+    const member_splice = f.receiver_type == null and this_arg != null and
+        inline_state.inlineMemberOwner(f) != null;
+    const explicit_receiver = if ((f.receiver_type != null or member_splice) and
+        this_arg != null)
+        try lowerExpr(b, this_arg.?)
+    else
+        null;
     try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside
@@ -1220,8 +1238,6 @@ pub fn tryInlineCallWithTypeArgs(
     // nested reified calls resolve against it. Without the binding the
     // call fell to runtime member dispatch with the reified parameter
     // dead (`E::class` reading the `kotlin.math.E` global).
-    const member_splice = f.receiver_type == null and this_arg != null and
-        inline_state.inlineMemberOwner(f) != null;
     const ext_splice = (f.receiver_type != null or member_splice) and this_arg != null;
     // The member body's bare sibling calls (`visitNodes(mask, include)`
     // inside `visitNodes(type, block)`, `headToTail(...)`) must lower as
@@ -1263,12 +1279,7 @@ pub fn tryInlineCallWithTypeArgs(
         }
     };
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
-    if (f.receiver_type != null or member_splice) {
-        if (this_arg) |recv| {
-            const rr = try lowerExpr(b, recv);
-            try b.bind("this", rr);
-        }
-    }
+    if (explicit_receiver) |receiver| try b.bind("this", receiver);
     if (ext_splice) {
         prev_splice_window = b.lambda_splice_resolve;
         b.lambda_splice_resolve = null;

@@ -1104,6 +1104,10 @@ pub const Param = struct {
     name: []const u8,
     ty: TypeRef,
     default: ?BlockId,
+    /// Source function-type arity when this parameter is `@Composable`.
+    /// Null distinguishes an ordinary function parameter from a composable
+    /// zero-argument parameter.
+    composable_arity: ?u8 = null,
     /// True when the primary-ctor param doubles as a class property
     /// (`val name` / `var name` prefix on the param). The Vm uses
     /// this flag to decide which primary args become instance
@@ -1605,6 +1609,9 @@ pub const Module = struct {
         /// A tie or incomplete proof keeps `target` null without making the
         /// extension disappear from the candidate scope.
         applicable: bool = false,
+        /// The same source argument list can bind a visible extension after
+        /// appending the Compose compiler ABI pair.
+        compiler_abi_applicable: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -2716,8 +2723,9 @@ pub const Module = struct {
             0,
         )) return false;
         for (declared_params) |param| {
+            const bound_actual = bindingType(bindings.items, param.param) orelse
+                continue;
             if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
-            const bound_actual = bindingType(bindings.items, param.param) orelse return false;
             const dependent_bound = rawBoundNamesDeclaredParam(
                 declared_params,
                 param.bound,
@@ -3189,7 +3197,7 @@ pub const Module = struct {
         ctx: ExtensionResolveCtx,
     ) ExtensionResolution {
         for (args) |arg| {
-            if (arg.named != null or arg.is_spread) return .{};
+            if (arg.is_spread) return .{};
         }
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
@@ -3199,7 +3207,7 @@ pub const Module = struct {
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
         var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
-        while (candidate_it.next()) |fid| {
+        candidate_loop: while (candidate_it.next()) |fid| {
             const f = self.funcById(fid) orelse continue;
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
@@ -3207,11 +3215,30 @@ pub const Module = struct {
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            // Ordered named arguments carry the same positional binding as
+            // their source order, but still constrain the declaration by
+            // parameter identity. Normalize them for the extension scorer
+            // only after proving every supplied name matches that position.
+            // Reordered named calls remain deferred until the shared binding
+            // result is threaded through extension ranking.
+            for (args, 0..) |arg, i| {
+                const arg_name = arg.named orelse continue;
+                const param_index = i + 1;
+                if (param_index >= f.params.len or
+                    !applicability.paramNameMatchesArg(
+                        f.params[param_index].name,
+                        arg_name,
+                    ))
+                {
+                    continue :candidate_loop;
+                }
+            }
             if (is_member_extension and
                 !self.memberExtensionInScope(fid, f, ds, ctx)) continue;
             const has_source_body = f.hasBody() or
                 (if (ds) |decl| decl.has_body else false) or
-                self.decl_ast_body.contains(fid.int());
+                self.decl_ast_body.contains(fid.int()) or
+                f.is_inline;
             const has_host_symbol = if (ds) |decl| decl.host_symbol != null else false;
             if (!has_source_body and !has_host_symbol) continue;
             const tier: u8 = if (is_member_extension)
@@ -3401,6 +3428,7 @@ pub const Module = struct {
         }
         const proof_args = sa.dupe(applicability.ArgShape, args) catch return .{};
         for (proof_args) |*arg| {
+            arg.named = null;
             if (arg.ty) |*ty| {
                 const alias = self.staticAliasHead(ty.*);
                 if (alias.changed and !alias.structure_lost) ty.name = alias.name;
@@ -5360,7 +5388,11 @@ pub const Module = struct {
     /// `func_defaults` lives on `ProgramImage`, not on `Module`, so the
     /// lowering adapter cannot read it; it carries defaults on the params
     /// (`paramHasDefault`'s null-`defaults` fallback).
-    fn sigViewForApplicability(self: *const Module, id: FuncId) ?applicability.SigView {
+    fn sigViewForApplicability(
+        self: *const Module,
+        id: FuncId,
+        include_compiler_abi: bool,
+    ) ?applicability.SigView {
         const f = self.funcById(id) orelse return null;
         const declared_callable = if (self.decl_sigs.get(id.int())) |ds|
             ds.has_body or ds.host_symbol != null or f.is_expect
@@ -5368,8 +5400,15 @@ pub const Module = struct {
             false;
         if (!f.hasBody() and !declared_callable) return null;
         const off: usize = if (funcHasImplicitThis(f)) 1 else 0;
+        var end = f.params.len;
+        if (!include_compiler_abi and end >= off + 2 and
+            std.mem.eql(u8, f.params[end - 2].name, "$composer") and
+            std.mem.eql(u8, f.params[end - 1].name, "$changed"))
+        {
+            end -= 2;
+        }
         return .{
-            .params = f.params[off..],
+            .params = f.params[off..end],
             .defaults = null,
             .has_body = true,
             .low_priority = f.low_priority,
@@ -5899,6 +5938,10 @@ pub const Module = struct {
         /// widen it back through the program-wide member-name universe.
         receiver_known: bool = false,
         has_type_args: bool = false,
+        /// A `$composer` binding exists in the current lowering scope. Bare
+        /// composable calls can resolve against their source parameter list
+        /// before lowering appends the compiler ABI pair.
+        has_composer: bool = false,
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
         recv_type: ?TypeRef = null,
@@ -6064,7 +6107,7 @@ pub const Module = struct {
     /// Whether a candidate's declared signature can bind the call's argument
     /// shapes.
     pub fn declSigScore(self: *const Module, fid: FuncId, args: []const applicability.ArgShape) ?applicability.Score {
-        const sv = self.sigViewForApplicability(fid) orelse return .{ .points = 0 };
+        const sv = self.sigViewForApplicability(fid, callShapesHaveComposerPair(args)) orelse return .{ .points = 0 };
         const named = !allShapeNamesNull(args);
         return applicability.applicable(&sv, args, .{
             .named = named,
@@ -6172,6 +6215,7 @@ pub const Module = struct {
         receiver_formed: bool,
     ) ApplicableBarePick {
         const named = !allShapeNamesNull(args);
+        const include_compiler_abi = !ctx.has_composer or callShapesHaveComposerPair(args);
         var arg_to_param = [_]u16{0} ** 64;
         const scope = applicability.ApplicabilityScope{
             .named = named,
@@ -6192,7 +6236,7 @@ pub const Module = struct {
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
             }
-            const sig = self.sigViewForApplicability(id) orelse continue;
+            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse continue;
             const score = applicability.applicable(&sig, args, scope) orelse continue;
             const static_compatibility = if (receiver_formed)
                 StaticCompatibility.unknown
@@ -7420,6 +7464,14 @@ fn allShapeNamesNull(args: []const applicability.ArgShape) bool {
         if (a.named != null) return false;
     }
     return true;
+}
+
+fn callShapesHaveComposerPair(args: []const applicability.ArgShape) bool {
+    if (args.len < 2) return false;
+    const composer = args[args.len - 2].named orelse return false;
+    const changed = args[args.len - 1].named orelse return false;
+    return std.mem.eql(u8, composer, "$composer") and
+        std.mem.eql(u8, changed, "$changed");
 }
 
 /// True when `head` is the first dotted segment of `fqn` and `fqn` has
@@ -9121,6 +9173,33 @@ test "extension resolver proves receiver, scope, and overload identity" {
     }, &string_args, .{ .caller_file = FileId.from(0), .caller_package = "app" });
     try testing.expectEqual(starts_with.int(), defaulted.target.?.int());
 
+    const ordered_named_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .named = "x",
+    }};
+    const ordered_named = m.resolveExtensionCall("startsWith", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &ordered_named_args, .{
+        .caller_file = FileId.from(0),
+        .caller_package = "app",
+    });
+    try testing.expectEqual(starts_with.int(), ordered_named.target.?.int());
+
+    const wrong_named_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .named = "other",
+    }};
+    try testing.expect(m.resolveExtensionCall("startsWith", .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    }, &wrong_named_args, .{
+        .caller_file = FileId.from(0),
+        .caller_package = "app",
+    }).target == null);
+
     const origin = m.resolveExtensionCall("origin", .{
         .name = "String",
         .nullable = false,
@@ -9484,6 +9563,7 @@ test "extension resolver retains a unique generic receiver lambda target" {
     m.funcs.items[apply.int()].params[1].ty.args = function_args;
     var type_params: std.ArrayList([]const u8) = .empty;
     try type_params.append(a, "T");
+    try type_params.append(a, "R");
     try m.registry.func_type_params.put(apply, type_params);
     try m.rebuildFuncNameIndex(a);
 
@@ -10987,6 +11067,9 @@ test "resolveCall: an extension requires an implicit receiver context" {
         "app",
         3,
     );
+    m.funcs.items[composable.int()].params[1].name = "$composer";
+    m.funcs.items[composable.int()].params[1].ty.name = "Composer";
+    m.funcs.items[composable.int()].params[2].name = "$changed";
     try m.rebuildFuncNameIndex(a);
 
     const source_args = [_]applicability.ArgShape{.{}};
@@ -11001,6 +11084,18 @@ test "resolveCall: an extension requires an implicit receiver context" {
     );
     defer a.free(source.candidate_set);
     try testing.expect(source.target == null);
+
+    const source_in_composition = try m.resolveCall(
+        a,
+        "contentColorFor",
+        "app",
+        FileId.from(0),
+        &source_args,
+        false,
+        .{ .has_composer = true },
+    );
+    defer a.free(source_in_composition.candidate_set);
+    try testing.expectEqual(composable, source_in_composition.target.?);
 
     const threaded_args = [_]applicability.ArgShape{ .{}, .{}, .{} };
     const threaded = try m.resolveCall(
