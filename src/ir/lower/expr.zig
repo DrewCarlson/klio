@@ -577,8 +577,18 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const member_shadows_ref = enclosingDeclaresMember(b, pr.name.name) and
                 (ref_arity < 0 or b.ownMemberApplicable(pr.name.name, @intCast(ref_arity)));
             const class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
+            var ref_shapes = try callableRefArgShapes(b, ref_arity);
+            defer if (ref_shapes) |*shapes| shapes.deinit(b.allocator);
             const ref_pick: ?FuncId = if (class_pick != null)
                 null
+            else if (ref_shapes) |shapes|
+                try b.module.resolveBareRefExpected(
+                    b.allocator,
+                    pr.name.name,
+                    b.self_package,
+                    pr.name.span.file,
+                    shapes.shapes,
+                )
             else
                 b.module.resolveBareRefIndexed(pr.name.name, b.self_package, pr.name.span.file);
             refAudit(b, pr.name.name, ref_pick);
@@ -601,7 +611,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (class_pick == null and ref_pick == null and b.pending_ref_fn_generic and
                 !member_shadows_ref and ref_arity >= 0)
             {
-                if (genericRefTarget(b, pr.name.name, @intCast(ref_arity))) |fid| {
+                if (try genericRefTarget(
+                    b,
+                    pr.name.name,
+                    pr.name.span.file,
+                    @intCast(ref_arity),
+                )) |fid| {
                     const fqn_n = if (b.module.funcById(fid)) |f|
                         try b.module.internConst(b.allocator, .{ .String = f.fqn })
                     else
@@ -708,6 +723,33 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     const dst = b.allocReg();
                     try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
                     return dst;
+                }
+            }
+            if (!std.mem.eql(u8, mr.name.name, "class")) {
+                var ref_shapes = try callableRefArgShapes(b, b.pending_lambda_arity);
+                defer if (ref_shapes) |*shapes| shapes.deinit(b.allocator);
+                if (ref_shapes) |*shapes| {
+                    if (try resolveExtensionRefTarget(
+                        b,
+                        mr.receiver,
+                        mr.name,
+                        shapes,
+                    )) |target_id| {
+                        const target = b.module.funcById(target_id).?;
+                        const recv = try lowerReceiver(b, mr.receiver);
+                        const dst = b.allocReg();
+                        const original_name = try b.module.internConst(
+                            b.allocator,
+                            .{ .String = target.name },
+                        );
+                        try b.push(.{ .MemberRef = .{
+                            .dst = dst,
+                            .receiver = recv,
+                            .name = original_name,
+                            .func = target_id,
+                        } });
+                        return dst;
+                    }
                 }
             }
             // `Outer::Nested` where `Nested` is a class is a constructor
@@ -915,8 +957,6 @@ fn lowerResolvedBinaryOperator(
         b,
         lhs,
         ident,
-        method,
-        null,
         args,
         &.{},
         &.{},
@@ -1739,7 +1779,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // that declaration, not `Enum.STATE_COMPLETED` for some unrelated
             // `import Enum.*` whose enum does not even declare it (which would
             // wrongly qualify it onto the enum and read a bogus field).
-            if (!b.hasEnclosingMember(name0) and !isTopLevelProp(name0) and b.module.funcId(name0) == null) {
+            if (!b.hasEnclosingMember(name0) and !isTopLevelProp(name0) and
+                !b.module.hasBareCallCandidate(name0, segments[0].span.file))
+            {
                 if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
                     const sp = segments[0].span;
                     var rsegs = [_]ast.Ident{
@@ -1811,7 +1853,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // plain extension receiver does not lexically see — the
             // runtime walk below resolves member-vs-global with the right
             // receiver scope.
-            const is_known_global = b.module.funcId(name0) != null or isTopLevelProp(name0);
+            const is_known_global =
+                b.module.hasBareCallCandidate(name0, segments[0].span.file) or
+                isTopLevelProp(name0);
             // A name declared only by an outer class must not become a plain
             // field read on the inner `this`. Defer it to the implicit-receiver
             // walk below, which carries the declaring class in the scoped
@@ -3601,9 +3645,10 @@ fn instantiatedLambdaValueParams(
     func: *const Func,
     fn_ty: ir.TypeRef,
     type_args: []const ast.TypeRef,
+    include_function_receiver: bool,
 ) Allocator.Error!?[]ir.TypeRef {
     const arity = fnTypeArityAlias(b, fn_ty) orelse return null;
-    if (arity <= 0) return null;
+    if (arity < 0) return null;
     const n: usize = @intCast(arity);
 
     const explicit = try b.allocator.alloc(ir.TypeRef, type_args.len);
@@ -3619,7 +3664,7 @@ fn instantiatedLambdaValueParams(
         func.id,
         fn_ty,
         explicit,
-    )) orelse return null;
+    )) orelse try fn_ty.clone(b.allocator);
     defer instantiated.deinit(b.allocator);
 
     var hi = instantiated.args.len;
@@ -3628,20 +3673,20 @@ fn instantiatedLambdaValueParams(
     var lo: usize = 0;
     if (lo < hi and std.mem.eql(u8, instantiated.args[lo].name, "#suspend")) lo += 1;
     const remaining = hi - lo;
-    const start = if (remaining == n + 2)
-        lo + 1
-    else if (remaining == n + 1)
-        lo
-    else
-        return null;
+    const has_receiver = remaining == n + 2;
+    if (!has_receiver and remaining != n + 1) return null;
+    const include_receiver = has_receiver and include_function_receiver;
+    const start = lo + @intFromBool(has_receiver and !include_receiver);
+    const count = n + @intFromBool(include_receiver);
+    if (count == 0 and !include_function_receiver) return null;
 
-    const out = try b.allocator.alloc(ir.TypeRef, n);
+    const out = try b.allocator.alloc(ir.TypeRef, count);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
         b.allocator.free(out);
     }
-    for (out, instantiated.args[start .. start + n]) |*dst, src| {
+    for (out, instantiated.args[start .. start + count]) |*dst, src| {
         dst.* = try src.clone(b.allocator);
         initialized += 1;
     }
@@ -3686,16 +3731,24 @@ fn argLambdaParamTypes(
         };
         defer b.allocator.free(mapping);
         for (args, mapping, out) |*arg, mapped, *slot| {
-            if (arg.* != .Lambda and arg.* != .AnonFun) continue;
+            const callable_ref = arg.* == .PropertyRef or arg.* == .MemberRef;
+            if (arg.* != .Lambda and arg.* != .AnonFun and !callable_ref) continue;
             const pi = mapped orelse continue;
-            slot.* = try instantiatedLambdaValueParams(b, func, params[pi].ty, type_args);
+            slot.* = try instantiatedLambdaValueParams(
+                b,
+                func,
+                params[pi].ty,
+                type_args,
+                callable_ref,
+            );
             any = any or slot.* != null;
         }
     } else {
         const trailing_lambda = args[args.len - 1] == .Lambda or
             args[args.len - 1] == .AnonFun;
         for (args, out, 0..) |*arg, *slot, i| {
-            if (arg.* != .Lambda and arg.* != .AnonFun) continue;
+            const callable_ref = arg.* == .PropertyRef or arg.* == .MemberRef;
+            if (arg.* != .Lambda and arg.* != .AnonFun and !callable_ref) continue;
             const pi: ?usize = if (trailing_lambda and i + 1 == args.len and
                 args.len <= params.len)
                 params.len - 1
@@ -3709,6 +3762,7 @@ fn argLambdaParamTypes(
                     func,
                     params[param_index].ty,
                     type_args,
+                    callable_ref,
                 );
                 any = any or slot.* != null;
             }
@@ -3729,9 +3783,20 @@ fn argLambdaParamTypes(
 /// phase-1 header metadata (`decl_user_sig` + `decl_ast_body`) — the
 /// in-memory two-phase build lowers user files while the stdlib funcs are
 /// still header stubs, and the answer must not depend on that state.
-fn genericRefTarget(b: *FuncBuilder, name: []const u8, arity: usize) ?FuncId {
+fn genericRefTarget(
+    b: *FuncBuilder,
+    name: []const u8,
+    caller_file: ir.FileId,
+    arity: usize,
+) Allocator.Error!?FuncId {
+    const candidates = try b.module.bareCallCandidates(
+        b.allocator,
+        name,
+        caller_file,
+    );
+    defer b.allocator.free(candidates);
     var found: ?FuncId = null;
-    cands: for (b.module.funcsBySimpleName(name)) |id| {
+    cands: for (candidates) |id| {
         const f = b.module.funcById(id) orelse continue;
         // An extension (a placed leading `this`, or a header stub's
         // synthesized receiver param) never binds a bare `::name`.
@@ -3761,6 +3826,135 @@ fn genericRefTarget(b: *FuncBuilder, name: []const u8, arity: usize) ?FuncId {
         found = id;
     }
     return found;
+}
+
+const CallableRefArgShapes = struct {
+    shapes: []applicability.ArgShape,
+    owned_types: []TypeRef = &.{},
+
+    fn deinit(self: *@This(), allocator: Allocator) void {
+        for (self.owned_types) |*ty| ty.deinit(allocator);
+        if (self.owned_types.len != 0) allocator.free(self.owned_types);
+        allocator.free(self.shapes);
+    }
+};
+
+/// Expected argument types for a callable reference. A typed local initializer
+/// contributes its source function type; an argument position contributes the
+/// callee-instantiated lambda parameter types, falling back to arity alone.
+fn callableRefArgShapes(
+    b: *FuncBuilder,
+    ref_arity: i16,
+) Allocator.Error!?CallableRefArgShapes {
+    if (b.pending_ref_lambda_param_types) |types| {
+        const shapes = try b.allocator.alloc(applicability.ArgShape, types.len);
+        for (types, shapes) |ty, *shape| {
+            shape.* = .{ .ty = ty, .ty_authoritative = true };
+        }
+        return .{ .shapes = shapes };
+    }
+    if (b.peekExpected()) |expected| {
+        if (expected.function) |ft| {
+            const types = try b.allocator.alloc(TypeRef, ft.params.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (types[0..initialized]) |*ty| ty.deinit(b.allocator);
+                b.allocator.free(types);
+            }
+            for (ft.params, types) |*param, *ty| {
+                ty.* = try loweredOwnedLocalTypeRef(b, param);
+                initialized += 1;
+            }
+            const shapes = try b.allocator.alloc(applicability.ArgShape, types.len);
+            for (types, shapes) |ty, *shape| {
+                shape.* = .{ .ty = ty, .ty_authoritative = true };
+            }
+            return .{ .shapes = shapes, .owned_types = types };
+        }
+    }
+    if (ref_arity < 0) return null;
+    const shapes = try b.allocator.alloc(applicability.ArgShape, @intCast(ref_arity));
+    @memset(shapes, .{});
+    return .{ .shapes = shapes };
+}
+
+fn resolveExtensionRefTarget(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    ref_shapes: *const CallableRefArgShapes,
+) Allocator.Error!?FuncId {
+    const receiver_ty = argDeclTypeRefLazy(b, receiver) orelse return null;
+    const unbound = receiver.* == .Path and
+        receiver.Path.segments.len == 1 and
+        b.resolve(receiver.Path.segments[0].name) == null and
+        !b.knowsOuter(receiver.Path.segments[0].name) and
+        b.module.classIdIndexed(
+            receiver.Path.segments[0].name,
+            b.self_package,
+            name.span.file,
+        ) != null;
+    const args = if (unbound) blk: {
+        if (ref_shapes.shapes.len == 0) return null;
+        break :blk ref_shapes.shapes[1..];
+    } else ref_shapes.shapes;
+    const trace_ref = if (runtime.getenvSlice("KLIO_BARE_TRACE")) |wanted|
+        std.mem.eql(u8, wanted, name.name)
+    else
+        false;
+    if (trace_ref) {
+        std.debug.print("[refext] {s} unbound={} expected={d} args={d}", .{
+            name.name,
+            unbound,
+            ref_shapes.shapes.len,
+            args.len,
+        });
+        for (ref_shapes.shapes) |shape| {
+            std.debug.print(" {s}", .{if (shape.ty) |ty| ty.name else "?"});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    if (staticTypeClassId(b, receiver_ty)) |owner| {
+        if (b.module.resolveMemberCall(owner, name.name, args, .{
+            .lexical_owner = if (b.ownerClass()) |owner_name|
+                b.module.classId(owner_name)
+            else
+                null,
+            .receiver_type = receiver_ty,
+        }).applicable) return null;
+    }
+
+    const implicit_owners = try b.collectImplicitReceiverTower(
+        b.allocator,
+        eagerLambdaRecvHead(b),
+    );
+    defer b.allocator.free(implicit_owners);
+    const resolution = b.module.resolveExtensionCall(
+        name.name,
+        receiver_ty,
+        args,
+        .{
+            .caller_file = name.span.file,
+            .caller_package = b.module.packageOfFile(name.span.file) orelse
+                b.self_package,
+            .implicit_dispatch_owners = implicit_owners,
+            .lexical_owner = b.ownerClass(),
+            .call_name = name.name,
+        },
+    );
+    const target = resolution.target orelse return null;
+    if (trace_ref) std.debug.print("[refext] {s} -> #{d}\n", .{
+        name.name,
+        target.int(),
+    });
+    const func = b.module.funcById(target) orelse return null;
+    const kind = if (b.module.decl_sigs.get(target.int())) |decl|
+        decl.kind
+    else
+        func.kind;
+    if (kind != .top_level_extension) return null;
+    return target;
 }
 
 fn nameInList(name: []const u8, list: []const []const u8) bool {
@@ -4743,6 +4937,7 @@ fn lowerCallSpread(
     var member_id: ?ConstId = null;
     var spread_name: ?ConstId = null;
     var spread_candidates: ?[]const FuncId = null;
+    var spread_anchor_pkg: ?ConstId = null;
     const callee_reg = blk: {
         if (callee.* == .Member) {
             const m = callee.Member;
@@ -4760,7 +4955,7 @@ fn lowerCallSpread(
         if (callee.* == .Path and callee.Path.segments.len == 1) {
             const name = callee.Path.segments[0].name;
             if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
-                b.module.funcId(name) == null)
+                !b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
                 if (try resolveThisForBareCall(b)) |this_reg| {
                     member_id = try b.module.internConst(b.allocator, .{ .String = name });
@@ -4773,7 +4968,8 @@ fn lowerCallSpread(
             // arg-blind and can hand back a zero-arg overload, silently
             // dropping the spread's elements.
             if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
-                !b.hasOwnMember(name) and b.module.funcsBySimpleName(name).len > 1)
+                !b.hasOwnMember(name) and
+                b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
                 const nm = try b.module.internConst(b.allocator, .{ .String = name });
                 if (try b.module.boundedSpreadCandidates(
@@ -4785,6 +4981,12 @@ fn lowerCallSpread(
                     spread_name = nm;
                     spread_candidates = ids;
                     if (ids.len != 0) {
+                        if (b.module.funcById(ids[0])) |f| {
+                            spread_anchor_pkg = try b.module.internConst(
+                                b.allocator,
+                                .{ .String = f.package },
+                            );
+                        }
                         const dst = b.allocReg();
                         try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = ids[0] } });
                         break :blk dst;
@@ -4810,6 +5012,7 @@ fn lowerCallSpread(
         .member = member_id,
         .name = spread_name,
         .candidates = spread_candidates,
+        .anchor_pkg = spread_anchor_pkg,
     } });
     return dst;
 }
@@ -4846,6 +5049,28 @@ fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
     return false;
 }
 
+/// A plain function parameter is inapplicable to a trailing-lambda call when
+/// its own final value parameter is not function-typed. Inline splices retain
+/// this declaration shape through `currentInlineDecl`; the substituted lambda
+/// value alone does not carry it.
+fn plainFnParamRejectsTrailingLambda(
+    b: *const FuncBuilder,
+    name: []const u8,
+    args: []const Expr,
+) bool {
+    if (!lastArgIsLambda(args)) return false;
+    if (b.isPlainFnParam(name)) return !b.fnParamTakesTrailingLambda(name);
+    const decl = b.currentInlineDecl() orelse return false;
+    for (decl.params) |*param| {
+        if (!std.mem.eql(u8, param.name.name, name)) continue;
+        const ft = param.ty.function orelse return false;
+        if (ft.receiver != null) return false;
+        return ft.params.len == 0 or
+            ft.params[ft.params.len - 1].function == null;
+    }
+    return false;
+}
+
 /// Bare-path inline expansion: splice an inline-lambda parameter's body,
 /// the reified overload an explicit `<T>` argument binds, or the resolved
 /// inline target of a bare call. Returns null when the callee is not a
@@ -4860,7 +5085,9 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     if (call.is_infix or callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
     if (b.inlineLambdaFor(nm)) |lam| {
-        return try spliceInlineLambda(b, lam, args);
+        if (!plainFnParamRejectsTrailingLambda(b, nm, args)) {
+            return try spliceInlineLambda(b, lam, args);
+        }
     }
     // A local binding of a function-typed value (a plain fn param like
     // `body: () -> T`, a local val) shadows every top-level namesake for a
@@ -4880,26 +5107,6 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
         .trailing_lambda_arity = trailingLambdaArity(args),
     };
-    // A renamed import is indexed under its declaration's original leaf, not
-    // the source alias. Resolve the exact imported overload first, then hand
-    // its registered AST to the ordinary splice path. This keeps reified
-    // vararg/iterable adapters static without widening the alias into a
-    // simple-name lookup.
-    if (try renamedImportDirectTarget(b, callee.Path.segments[0], args, ast_arg_names)) |fid| {
-        if (b.module.funcById(fid)) |target_func| {
-            if (target_func.is_inline) {
-                if (inline_state.inlineAstById(fid.int())) |target_ast| {
-                    if (bareInlineNeedsSplice(b, nm, target_ast, args)) {
-                        const expected = b.peekExpected();
-                        const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                        if (try tryInlineCallWithTypeArgs(b, nm, target_ast, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
-                            return r;
-                        }
-                    }
-                }
-            }
-        }
-    }
     // An explicit `<T>` argument binds a reified parameter, so a reified
     // inline overload of this shape outranks a non-reified `KClass<T>`
     // namesake (which would lower `<T>` as a constructor value instead of
@@ -6832,7 +7039,9 @@ fn lowerValueInvocation(
         // `fun Flow<T>.combine(flow: Flow<T2>, …)` resolves to the `flow {}`
         // builder, not the `flow: Flow<T2>` parameter (a `Flow` is not
         // invokable). Defer to the bare-function path so the builder binds.
-        if (b.isNonFnParam(name0) and b.module.funcId(name0) != null) {
+        if (b.isNonFnParam(name0) and
+            b.module.hasBareCallCandidate(name0, callee.Path.segments[0].span.file))
+        {
             return null;
         }
         // Nor does a LOCAL whose initializer is a definite non-callable
@@ -6840,7 +7049,9 @@ fn lowerValueInvocation(
         // resolves the call `nodeIndex(slots, startingGroup)` to the
         // function (an Int is not invokable) — the composer's
         // movable-content insert is the shape.
-        if (b.module.funcId(name0) != null and !b.isLocalFn(name0)) {
+        if (b.module.hasBareCallCandidate(name0, callee.Path.segments[0].span.file) and
+            !b.isLocalFn(name0))
+        {
             if (b.localInitExpr(name0)) |init_e| {
                 if (argLitKind(init_e) != null) return null;
             }
@@ -6854,8 +7065,7 @@ fn lowerValueInvocation(
         // the inner `transform(value)` is the parameter. Binding the parameter
         // there passed the operator's own lambda in as the emitted value, so
         // `map`'s caller saw a closure where its element belonged.
-        if (b.isPlainFnParam(name0) and !b.fnParamTakesTrailingLambda(name0) and
-            lastArgIsLambda(args) and b.module.funcId(name0) != null)
+        if (plainFnParamRejectsTrailingLambda(b, name0, args))
         {
             return null;
         }
@@ -7945,96 +8155,6 @@ fn simpleTypeHead(name: []const u8) []const u8 {
     return n;
 }
 
-/// Resolve a renamed import against the exact FQN the import denotes while
-/// retaining the implicit receiver of a bare extension call.  Qualifying the
-/// callee path is not equivalent: `import p.f as g; recv.g(x)` can be written
-/// as bare `g(x)` inside an extension body, and `p.f(x)` would drop `recv`.
-/// Null means the imported overload set is not statically unique from the
-/// evidence available at lowering time.
-fn renamedImportDirectTarget(
-    b: *FuncBuilder,
-    ident: ast.Ident,
-    args: []const Expr,
-    ast_arg_names: []const ?[]const u8,
-) Allocator.Error!?FuncId {
-    const paths = b.module.importAliasPathsIn(ident.span.file, ident.name);
-    if (paths.len != 1 or paths[0].segs.len < 2) return null;
-    const target_leaf = paths[0].segs[paths[0].segs.len - 1];
-    if (std.mem.eql(u8, target_leaf, ident.name)) return null;
-
-    // A real member named by the alias remains in the implicit-receiver
-    // candidate group ahead of the imported extension.
-    if (inReceiverContext(b) and anyReceiverClassDeclares(b, ident.name)) return null;
-
-    const shapes = try buildArgShapes(b, args, ast_arg_names);
-    defer b.allocator.free(shapes);
-    const recv = b.enclosingRecvTy() orelse b.recvTy() orelse b.ownerClass();
-    const can_supply_this = b.resolve("this") != null or b.knowsOuter("this") or
-        b.capturesThisSlot();
-
-    var best: ?FuncId = null;
-    var best_recv_rank: i16 = -1;
-    var best_sig_rank: i32 = std.math.minInt(i32);
-    var best_shape_rank: i16 = -1;
-    var tied = false;
-    const trace = if (runtime.getenvSlice("KLIO_BARE_TRACE")) |wanted|
-        std.mem.eql(u8, wanted, ident.name)
-    else
-        false;
-    for (b.module.funcsBySimpleName(target_leaf)) |fid| {
-        const f = b.module.funcById(fid) orelse continue;
-        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) continue;
-        if (f.low_priority) continue;
-        if (!fqnCallArityFits(b, fid, args.len)) continue;
-        const sig_score = b.module.declSigScore(fid, shapes) orelse continue;
-
-        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-        var recv_match = false;
-        if (is_ext) {
-            if (!can_supply_this) continue;
-            if (recv) |r| {
-                const actual = simpleTypeHead(r);
-                const declared = simpleTypeHead(f.params[0].ty.name);
-                recv_match = std.mem.eql(u8, actual, declared) or
-                    b.module.classIsOrExtends(actual, declared);
-                if (!recv_match) continue;
-            }
-        }
-
-        const arity = b.module.decl_user_arity.get(fid.int()) orelse continue;
-        const shape_rank: i16 = if (arity.has_vararg)
-            1
-        else if (arity.total == args.len)
-            4
-        else
-            2;
-        // Static argument compatibility selects the overload first. An
-        // implicit receiver breaks a score tie, but cannot make
-        // `Flow.combine(Flow, ...)` outrank `combine(Iterable<Flow>, ...)`
-        // when the first supplied argument is statically a List.
-        const recv_rank: i16 = if (recv_match) 1 else 0;
-        if (trace) std.debug.print("[alias-pick] {s} fid={d} inline={} recv={d} score={d} shape={d}\n", .{
-            f.fqn, fid.int(), f.is_inline, recv_rank, sig_score.points, shape_rank,
-        });
-
-        if (sig_score.points > best_sig_rank or
-            (sig_score.points == best_sig_rank and recv_rank > best_recv_rank) or
-            (sig_score.points == best_sig_rank and recv_rank == best_recv_rank and shape_rank > best_shape_rank))
-        {
-            best = fid;
-            best_recv_rank = recv_rank;
-            best_sig_rank = sig_score.points;
-            best_shape_rank = shape_rank;
-            tied = false;
-        } else if (recv_rank == best_recv_rank and
-            sig_score.points == best_sig_rank and shape_rank == best_shape_rank)
-        {
-            tied = true;
-        }
-    }
-    return if (tied) null else best;
-}
-
 fn lowerPathCall(
     b: *FuncBuilder,
     expr: *const Expr,
@@ -8095,7 +8215,8 @@ fn lowerPathCall(
     else
         true;
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
-        b.module.funcId(name0) != null and local_fn_takes_call and
+        b.module.hasBareCallCandidate(name0, segments[0].span.file) and
+        local_fn_takes_call and
         // A captured local with definite NON-callable evidence (`var key = 0`
         // beside the `key(...) {}` composable) never serves a CALL — the
         // function wins, as in Kotlin.
@@ -8140,183 +8261,16 @@ fn lowerPathCall(
         return dst;
     }
 
-    // A renamed import whose exact overload is an ordinary function binds
-    // directly.  This preserves an implicit extension receiver and is also
-    // immune to unrelated same-simple-name globals. Inline targets stay with
-    // the splice path because reification, suspension, and non-local returns
-    // may require the source body at this call site.
-    if (!shadowed_by_class and segments.len == 1 and
-        !b.callableMemberApplicable(name0, args.len))
-    {
-        if (try renamedImportDirectTarget(b, segments[0], args, ast_arg_names)) |target| {
-            const f = b.module.funcById(target) orelse return null;
-            if (!f.is_inline) return try emitCall(b, expr, target, true);
-        }
-    }
-
-    // FQN-precedence: a UNIQUE explicit import routes a collision call.
-    // Two same-leaf imports are no shadow — Kotlin keeps both in scope —
-    // so a collision among the imports themselves falls through to the
-    // symbol index, which classifies the tie (ambiguous when the
-    // signatures are identical, type-dispatched otherwise).
-    const collision = b.module.funcsBySimpleName(name0).len > 1;
-    var imported_func_id: ?FuncId = null;
-    if (collision) {
-        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
-        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
-            imported_func_id = b.module.funcIdByFqn(alias_paths[0].fqn);
-        }
-    }
-    // The import may name a whole OVERLOAD SET (five `remember`s share one
-    // FQN): `funcIdByFqn` returns the first by declaration order, which can
-    // be arity-incompatible with this call — a 4-key `remember(a,b,c,d){..}`
-    // blind-bound the zero-key overload. A multi-overload FQN skips BOTH
-    // import-routing arms and falls to the full resolver, whose overload
-    // scoring ranks every sibling (vararg included) — and whose implicit-
-    // receiver dispatch keeps a bare `launch {}` on the scope extension
-    // instead of the qualified rewrite's non-extension guidance stub.
-    var imported_fqn_multi = false;
-    if (imported_func_id != null) {
-        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
-        if (alias_paths.len == 1) {
-            var fqn_overloads: usize = 0;
-            for (b.module.funcsBySimpleName(name0)) |cid| {
-                if (b.module.funcById(cid)) |cf| {
-                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) fqn_overloads += 1;
-                }
-            }
-            imported_fqn_multi = fqn_overloads > 1;
-        }
-    }
-    if (imported_func_id != null and imported_fqn_multi) {
-        // fall through to the generic resolution below (skip both arms)
-    } else if (imported_func_id) |func_id| {
-        // An applicable extension on an in-scope implicit receiver outranks the
-        // imported plain namesake: inside `validate { contact(c) }`
-        // (`MockViewValidator.() -> Unit`), the imported `contact` FQN resolves
-        // to the `@Composable contact`, but the receiver's
-        // `MockViewValidator.contact` extension must win (Kotlin resolves the
-        // implicit-receiver candidate group first). Defer to the member/
-        // extension dispatch below when such an extension applies.
-        if (!shadowed_by_class and !extOnEnclosingReceiverApplies(b, name0, args.len)) {
-            const needs_this = blk: {
-                if (b.module.funcById(func_id)) |f| {
-                    break :blk f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
-                }
-                break :blk false;
-            };
-            if (!needs_this) {
-                // Import-routed binds run the index + audit too, so the
-                // detector keeps one line per bare call and a unique
-                // index pick (the exact-arity overload behind the
-                // imported FQN) is preferred over the first FQN match.
-                const ires = b.module.resolveBareCallIndexed(
-                    name0,
-                    b.self_package,
-                    segments[0].span.file,
-                    args.len,
-                    lastArgIsLambda(args),
-                );
-                if (indexDeferReason(ires) == .ambiguous_tier) {
-                    try recordAmbiguousCall(b, name0, segments[0].span, ires);
-                }
-                const bind_id = ires.pick() orelse func_id;
-                const run = try lowerArgRun(b, args);
-                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
-                const dst = b.allocReg();
-                try b.push(.{ .Call = .{
-                    .dst = dst,
-                    .func = bind_id,
-                    .trailing_lambda = b.callTrailingLambda(),
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                    .type_args = type_args,
-                    .exact = false,
-                } });
-                return dst;
-            }
-        }
-    }
-
-    // FQN-precedence for a UNIQUE import whose leaf has MULTIPLE overloads (or is
-    // an intrinsic), so `funcIdByFqn` above found no single FuncId to route to.
-    // `import kotlin.math.max` names 4+ overloads: the import is a real in-scope
-    // symbol, but a same-name unimported `other.max(Dp, Dp)` can still preempt it
-    // during unqualified applicability ranking (body-bearing, while the intrinsic
-    // overloads are unrankable header stubs). Re-lower the call qualified to the
-    // imported FQN so overload resolution reaches the imported symbol, bypassing
-    // the invisible candidate. Order-independent (decided from this file's imports)
-    // and gated on the import actually naming in-scope funcs, so it never invents
-    // a target.
-    // An applicable function in the enclosing class hierarchy shadows a
-    // top-level import. A same-named non-callable property does not participate
-    // in call resolution, so it must not block the imported function.
-    if (imported_func_id == null and !shadowed_by_class and segments.len == 1 and
-        !b.callableMemberApplicable(name0, args.len))
-    {
-        const alias_paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
-        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
-            // A RENAMING import (`import a.b.f as g`) binds `g` with no
-            // function of that simple name in the module: the qualified
-            // rewrite is the only route to the target, and candidates are
-            // enumerated under the TARGET leaf.
-            const target_leaf = alias_paths[0].segs[alias_paths[0].segs.len - 1];
-            const renamed = !std.mem.eql(u8, target_leaf, name0);
-            const cand_name = if (renamed) target_leaf else name0;
-            if (renamed or b.module.funcsBySimpleName(name0).len >= 1) {
-                // The import resolves to real funcs of that FQN (a multi-overload
-                // symbol), OR to a stdlib intrinsic the func index does not enumerate
-                // (`isAliasName`, e.g. kotlin.math.max). Either way the qualified call
-                // reaches it.
-                var import_resolves = ir.isAliasName(cand_name);
-                // An imported EXTENSION function (`RoundedPolygon.Companion.circle`)
-                // called with no explicit receiver has no `this` to carry: the
-                // qualified FQN rewrite would load it as a receiverless global and
-                // miss. Only a plain top-level function (the `kotlin.math.max`
-                // shape this rewrite exists for) qualifies; an FQN with several
-                // overloads stays eligible while any non-extension one exists.
-                var any_nonext = false;
-                var any_fqn_match = false;
-                var any_inline = false;
-                for (b.module.funcsBySimpleName(cand_name)) |cid| {
-                    const cf = b.module.funcById(cid) orelse continue;
-                    if (std.mem.eql(u8, cf.fqn, alias_paths[0].fqn)) {
-                        import_resolves = true;
-                        any_fqn_match = true;
-                        if (cf.is_inline) any_inline = true;
-                        if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) {
-                            any_nonext = true;
-                        }
-                    }
-                }
-                const imp_is_extension = any_fqn_match and !any_nonext;
-                // An INLINE target stays with the splice machinery (which
-                // resolves aliases itself): rewriting `flow { ... }`
-                // (`unsafeFlow as flow` in every kotlinx flow operator) to a
-                // qualified CALL skips the splice, and the crossinline
-                // block's bare `collect` then lowers in a plain-lambda
-                // context and binds the wrong receiver.
-                if (import_resolves and !imp_is_extension and !any_inline) {
-                    const new_segs = try b.allocator.alloc(ast.Ident, alias_paths[0].segs.len);
-                    for (alias_paths[0].segs, 0..) |s, i| new_segs[i] = .{ .name = s, .span = segments[0].span };
-                    const new_callee = try b.allocator.create(Expr);
-                    new_callee.* = Expr{ .Path = .{ .segments = new_segs, .span = callee.Path.span } };
-                    var new_call = call;
-                    new_call.callee = new_callee;
-                    const rewritten = Expr{ .Call = new_call };
-                    return try lowerCall(b, &rewritten);
-                }
-            }
-        }
-    }
-
     // Bare-call resolution through the unified resolver. `resolveCall` folds
     // applicability, scope, and the member-vs-global emission decision into
     // one query; the switch below routes its verdict to a single emitter.
     const want = args.len;
-    const cands = b.module.funcsBySimpleName(name0);
+    const cands = try b.module.bareCallCandidates(
+        b.allocator,
+        name0,
+        segments[0].span.file,
+    );
+    defer b.allocator.free(cands);
     const last_arg_lambda = lastArgIsLambda(args);
 
     // An own member applicable to this call outranks a same-named top-level
@@ -8380,6 +8334,7 @@ fn lowerPathCall(
         b,
         name0,
         segments[0].span.file,
+        cands,
         shapes,
         last_arg_lambda,
         ctx,
@@ -8429,24 +8384,6 @@ fn lowerPathCall(
         }
     }
 
-    // An exact explicit import remains a static call after overload
-    // resolution, even inside a captured receiver context, when that receiver
-    // has no applicable member or extension of the imported name. The earlier
-    // import fast path intentionally defers an overloaded FQN so the shared
-    // resolver can choose its sibling; once that choice is made there is no
-    // runtime member-vs-global decision left to perform.
-    if (res_final.target) |target| static_import: {
-        if (res_final.emit_form != .CallMemberOrGlobal or shadowed_by_class or
-            segments.len != 1 or b.callableMemberApplicable(name0, args.len) or
-            extOnEnclosingReceiverApplies(b, name0, args.len)) break :static_import;
-        const paths = b.module.importAliasPathsIn(segments[0].span.file, name0);
-        if (paths.len != 1) break :static_import;
-        const f = b.module.funcById(target) orelse break :static_import;
-        if (!std.mem.eql(u8, f.fqn, paths[0].fqn)) break :static_import;
-        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) break :static_import;
-        res_final.emit_form = .Call;
-        res_final.target_final = true;
-    }
     defer b.allocator.free(res_final.candidate_set);
     const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
 
@@ -8616,15 +8553,17 @@ fn resolveCallWithComposerAbi(
     b: *FuncBuilder,
     name: []const u8,
     caller_file: ir.FileId,
+    candidates: []const FuncId,
     shapes: []const applicability.ArgShape,
     last_arg_lambda: bool,
     ctx: ir.Module.ResolveCtx,
 ) Allocator.Error!ir.Module.Resolution {
-    const direct = try b.module.resolveCall(
+    const direct = try b.module.resolveCallCandidates(
         b.allocator,
         name,
         b.self_package,
         caller_file,
+        candidates,
         shapes,
         last_arg_lambda,
         ctx,
@@ -8645,11 +8584,12 @@ fn resolveCallWithComposerAbi(
         .literal_kind = .numeric,
     };
 
-    const threaded = try b.module.resolveCall(
+    const threaded = try b.module.resolveCallCandidates(
         b.allocator,
         name,
         b.self_package,
         caller_file,
+        candidates,
         augmented,
         false,
         ctx,
@@ -10284,7 +10224,9 @@ fn lowerImplicitThisCall(
     // known top-level stdlib function (a host intrinsic, absent from
     // `funcsBySimpleName`): a `@Test fun listOfNotNull()` method calling the
     // top-level `listOfNotNull(...)` must fall through on the arity miss.
-    if (b.module.funcsBySimpleName(name0).len != 0 or ir.isAliasName(name0)) {
+    if (b.module.hasBareCallCandidate(name0, segments[0].span.file) or
+        ir.isAliasName(name0))
+    {
         const this_idx = try b.recordCapture("this");
         orEmitAudit(b, "implicit_this_call_global_fallback", "CallMemberOrGlobal", name0);
         try b.push(.{ .CallMemberOrGlobal = .{
@@ -10486,6 +10428,7 @@ fn lowerUnresolvedBareCall(
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .func = static_ext,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -11126,8 +11069,6 @@ fn lowerResolvedExtensionCall(
     b: *FuncBuilder,
     receiver: *const Expr,
     name: ast.Ident,
-    resolution_name: []const u8,
-    target_fqn: ?[]const u8,
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
@@ -11146,20 +11087,19 @@ fn lowerResolvedExtensionCall(
     defer b.allocator.free(implicit_owners);
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
-    const resolution = b.module.resolveExtensionCall(resolution_name, recv_ty, shapes, .{
+    const resolution = b.module.resolveExtensionCall(name.name, recv_ty, shapes, .{
         .caller_file = caller_file,
         .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
         .implicit_dispatch_owners = implicit_owners,
         .lexical_owner = b.ownerClass(),
-        .target_fqn = target_fqn,
         .call_name = name.name,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
     });
     if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
-        if (std.mem.eql(u8, wanted, resolution_name)) {
+        if (std.mem.eql(u8, wanted, name.name)) {
             std.debug.print(
                 "[ext-static] {s} recv={s} owners=",
-                .{ resolution_name, recv_ty.name },
+                .{ name.name, recv_ty.name },
             );
             for (implicit_owners) |owner| std.debug.print("{s},", .{owner});
             std.debug.print(
@@ -11474,39 +11414,11 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         }
     }
 
-    // A RENAMING import (`import a.b.f as g`) used with an explicit
-    // receiver (`recv.g(args)`): no member or extension bears the alias
-    // name, so bind the aliased extension overload directly by FQN. The
-    // direct bind keeps a same-receiver namesake under the target's
-    // ORIGINAL name (e.g. a wrapper `TestScope.runTest` delegating to the
-    // aliased `kotlinx...runTest`) from capturing the call and recursing.
-    if (!member_shadows_extensions) {
-        const alias_paths = b.module.importAliasPathsIn(name.span.file, name.name);
-        if (alias_paths.len == 1 and alias_paths[0].segs.len >= 2) {
-            const target_leaf = alias_paths[0].segs[alias_paths[0].segs.len - 1];
-            if (!std.mem.eql(u8, target_leaf, name.name)) {
-                if (try lowerResolvedExtensionCall(
-                    b,
-                    receiver,
-                    name,
-                    target_leaf,
-                    alias_paths[0].fqn,
-                    args,
-                    ast_arg_names,
-                    ast_type_args,
-                    declared_ty,
-                )) |reg| return reg;
-            }
-        }
-    }
-
     if (!member_shadows_extensions) {
         if (try lowerResolvedExtensionCall(
             b,
             receiver,
             name,
-            name.name,
-            null,
             args,
             ast_arg_names,
             ast_type_args,
@@ -12739,9 +12651,9 @@ test "renamed overloaded import binds exact extension and plain identities" {
     };
 
     const ext_params = try a.alloc(ir.Param, 3);
-    ext_params[0] = .{ .name = "this", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
-    ext_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
-    ext_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[0] = .{ .name = "this", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[1] = .{ .name = "other", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    ext_params[2] = .{ .name = "transform", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
     const ext_id = try Add.func(&m, a, ext_params, .top_level_extension, false, .{
         .required = 2,
         .total = 2,
@@ -12749,22 +12661,24 @@ test "renamed overloaded import binds exact extension and plain identities" {
     });
 
     const plain_params = try a.alloc(ir.Param, 3);
-    plain_params[0] = .{ .name = "flow", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
-    plain_params[1] = .{ .name = "other", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null };
-    plain_params[2] = .{ .name = "transform", .ty = .{ .name = "Function2", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[0] = .{ .name = "flow", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[1] = .{ .name = "other", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    plain_params[2] = .{ .name = "transform", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
     const plain_id = try Add.func(&m, a, plain_params, .plain, false, .{
         .required = 3,
         .total = 3,
         .has_vararg = false,
     });
 
-    const inline_params = try a.alloc(ir.Param, 2);
-    inline_params[0] = .{ .name = "flows", .ty = .{ .name = "Flow", .nullable = false, .args = &.{} }, .default = null, .is_vararg = true };
-    inline_params[1] = .{ .name = "transform", .ty = .{ .name = "Function1", .nullable = false, .args = &.{} }, .default = null };
+    const inline_params = try a.alloc(ir.Param, 4);
+    inline_params[0] = .{ .name = "first", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    inline_params[1] = .{ .name = "second", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    inline_params[2] = .{ .name = "third", .ty = .{ .name = "String", .nullable = false, .args = &.{} }, .default = null };
+    inline_params[3] = .{ .name = "transform", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null };
     const inline_id = try Add.func(&m, a, inline_params, .plain, true, .{
-        .required = 1,
-        .total = 2,
-        .has_vararg = true,
+        .required = 4,
+        .total = 4,
+        .has_vararg = false,
     });
     try m.rebuildFuncNameIndex(a);
 
@@ -12775,18 +12689,48 @@ test "renamed overloaded import binds exact extension and plain identities" {
     try imports.put("combineOriginal", paths);
     try m.registry.import_aliases.put(sp.file, imports);
 
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "String",
+        .fqn = "kotlin.String",
+        .package = "kotlin",
+        .type_params = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const string_names = std.StringHashMap(void).init(a);
+    try m.registry.hierarchy_shadow_names.put("String", .{
+        .names = string_names,
+        .complete = true,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Int",
+        .fqn = "kotlin.Int",
+        .package = "kotlin",
+        .type_params = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
-    b.setRecvTy("Flow");
+    b.setRecvTy("String");
     try b.bind("this", b.allocReg());
     try b.bind("first", b.allocReg());
     try b.bind("other", b.allocReg());
     try b.bind("transform", b.allocReg());
     try b.bind("arrayTransform", b.allocReg());
-    try b.setLocalDeclType("first", "Flow");
-    try b.setLocalDeclType("other", "Flow");
-    try b.setLocalDeclType("transform", "Function2");
-    try b.setLocalDeclType("arrayTransform", "Function1");
+    try b.setLocalDeclType("first", "String");
+    try b.setLocalDeclType("other", "String");
+    try b.setLocalDeclType("transform", "String");
+    try b.setLocalDeclType("arrayTransform", "Int");
 
     var callee_segs = [_]ast.Ident{.{ .name = "combineOriginal", .span = sp }};
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = sp } };
@@ -12804,6 +12748,19 @@ test "renamed overloaded import binds exact extension and plain identities" {
         .is_infix = false,
         .span = sp,
     } };
+    const ext_shapes = try buildArgShapes(&b, &ext_args, &.{});
+    defer a.free(ext_shapes);
+    const ext_resolution = m.resolveExtensionCall(
+        callee_segs[0].name,
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        ext_shapes,
+        .{
+            .caller_file = sp.file,
+            .caller_package = b.self_package,
+            .call_name = callee_segs[0].name,
+        },
+    );
+    try testing.expectEqual(ext_id, ext_resolution.target.?);
     _ = try lowerExpr(&b, &ext_call);
     const ext_insts = b.blocks.items[b.cur.int()].insts;
     const ext_inst = ext_insts[ext_insts.len - 1];
@@ -12836,11 +12793,76 @@ test "renamed overloaded import binds exact extension and plain identities" {
     var inline_args = [_]Expr{
         .{ .Path = .{ .segments = &first_segs, .span = sp } },
         .{ .Path = .{ .segments = &other_segs, .span = sp } },
+        .{ .Path = .{ .segments = &other_segs, .span = sp } },
         .{ .Path = .{ .segments = &array_transform_segs, .span = sp } },
     };
-    const inline_pick = try renamedImportDirectTarget(&b, callee_segs[0], &inline_args, &.{});
-    try testing.expect(inline_pick != null);
-    try testing.expectEqual(inline_id, inline_pick.?);
+    const inline_shapes = try buildArgShapes(&b, &inline_args, &.{});
+    defer a.free(inline_shapes);
+    const inline_res = try m.resolveCall(
+        a,
+        callee_segs[0].name,
+        b.self_package,
+        callee_segs[0].span.file,
+        inline_shapes,
+        false,
+        resolveCtxFor(&b, callee_segs[0].name, &.{}, null, &.{}),
+    );
+    defer a.free(inline_res.candidate_set);
+    try testing.expectEqual(inline_id, inline_res.target.?);
+    try testing.expect(inline_res.target_final);
+
+    const string_ref = ir.TypeRef{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    };
+    const plain_ref_types = [_]ir.TypeRef{
+        string_ref,
+        string_ref,
+        string_ref,
+    };
+    b.pending_ref_lambda_param_types = &plain_ref_types;
+    const plain_ref = Expr{ .PropertyRef = .{
+        .name = .{ .name = "combineOriginal", .span = sp },
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &plain_ref);
+    b.pending_ref_lambda_param_types = null;
+    const plain_ref_insts = b.blocks.items[b.cur.int()].insts;
+    const plain_ref_inst = plain_ref_insts[plain_ref_insts.len - 1];
+    try testing.expect(plain_ref_inst == .LoadGlobal);
+    try testing.expectEqual(plain_id, plain_ref_inst.LoadGlobal.func.?);
+
+    var string_type_segs = [_]ast.Ident{.{ .name = "String", .span = sp }};
+    var string_type = Expr{ .Path = .{ .segments = &string_type_segs, .span = sp } };
+    b.pending_ref_lambda_param_types = &plain_ref_types;
+    const unbound_ref = Expr{ .MemberRef = .{
+        .receiver = &string_type,
+        .name = .{ .name = "combineOriginal", .span = sp },
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &unbound_ref);
+    b.pending_ref_lambda_param_types = null;
+    const unbound_insts = b.blocks.items[b.cur.int()].insts;
+    const unbound_inst = unbound_insts[unbound_insts.len - 1];
+    try testing.expect(unbound_inst == .MemberRef);
+    try testing.expectEqual(ext_id, unbound_inst.MemberRef.func.?);
+
+    const bound_ref_types = [_]ir.TypeRef{ string_ref, string_ref };
+    b.pending_ref_lambda_param_types = &bound_ref_types;
+    var first_receiver_segs = [_]ast.Ident{.{ .name = "first", .span = sp }};
+    var first_receiver = Expr{ .Path = .{ .segments = &first_receiver_segs, .span = sp } };
+    const bound_ref = Expr{ .MemberRef = .{
+        .receiver = &first_receiver,
+        .name = .{ .name = "combineOriginal", .span = sp },
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &bound_ref);
+    b.pending_ref_lambda_param_types = null;
+    const bound_insts = b.blocks.items[b.cur.int()].insts;
+    const bound_inst = bound_insts[bound_insts.len - 1];
+    try testing.expect(bound_inst == .MemberRef);
+    try testing.expectEqual(ext_id, bound_inst.MemberRef.func.?);
 }
 
 test "scope getter owner follows the class contributing an enclosing property" {

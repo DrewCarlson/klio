@@ -346,6 +346,10 @@ pub const Inst = union(enum) {
         /// the arg-blind function value in `callee`.
         name: ?ConstId = null,
         candidates: ?[]const FuncId = null,
+        /// Declaring package of the lowering-selected candidate set. A
+        /// synthesized lambda frame may have no package of its own; this keeps
+        /// runtime applicability inside the already-resolved source scope.
+        anchor_pkg: ?ConstId = null,
     },
     /// `super.method(args)` — dispatch the named method on the
     /// receiver's value, but resolved against the parent of
@@ -492,6 +496,9 @@ pub const Inst = union(enum) {
         dst: Reg,
         receiver: Reg,
         name: ConstId,
+        /// Exact top-level extension declaration selected at lowering. Null
+        /// keeps ordinary member/property reference dispatch by name.
+        func: ?FuncId = null,
     },
     /// Binary primitive operation. Operands are guaranteed to be
     /// the right type by typeck.
@@ -1583,8 +1590,6 @@ pub const Module = struct {
         /// Lexically enclosing class or object, retained separately from an
         /// inner receiver-lambda head.
         lexical_owner: ?[]const u8 = null,
-        /// Exact imported declaration path for a renamed-import query.
-        target_fqn: ?[]const u8 = null,
         /// Source-visible alias used for member-extension shadow checks.
         call_name: ?[]const u8 = null,
         /// Bounds of type parameters owned by the enclosing declaration. They
@@ -3157,7 +3162,8 @@ pub const Module = struct {
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
-        for (self.funcsBySimpleName(name)) |fid| {
+        var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
+        while (candidate_it.next()) |fid| {
             const f = self.funcById(fid) orelse continue;
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
@@ -3167,17 +3173,12 @@ pub const Module = struct {
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
             if (is_member_extension and
                 !self.memberExtensionInScope(fid, f, ds, ctx)) continue;
-            if (ctx.target_fqn) |target_fqn| {
-                if (!std.mem.eql(u8, f.fqn, target_fqn)) continue;
-            }
             const has_source_body = f.hasBody() or
                 (if (ds) |decl| decl.has_body else false) or
                 self.decl_ast_body.contains(fid.int());
             const has_host_symbol = if (ds) |decl| decl.host_symbol != null else false;
             if (!has_source_body and !has_host_symbol) continue;
-            const tier: u8 = if (ctx.target_fqn != null)
-                0
-            else if (is_member_extension)
+            const tier: u8 = if (is_member_extension)
                 self.memberExtensionScopeTier(
                     self.registry.member_ext_owner_class.get(fid) orelse continue,
                     ctx,
@@ -3193,7 +3194,7 @@ pub const Module = struct {
                     ) + 1,
                     191,
                 );
-            if (!is_member_extension and ctx.target_fqn == null and
+            if (!is_member_extension and
                 tier > 64 + last_in_scope_tier + 1) continue;
             if (ds) |decl| {
                 switch (decl.visibility) {
@@ -3441,7 +3442,20 @@ pub const Module = struct {
                 tied = true;
             }
         }
-        if (tied or best_unknown) return .{ .applicable = true };
+        const renamed_best = if (best) |target|
+            self.renamedImportDenotesFunc(
+                ctx.call_name orelse name,
+                ctx.caller_file,
+                target,
+            )
+        else
+            false;
+        // A renamed import fixes the declaration family by exact FQN. Once
+        // ordinary applicability selects one overload from that family, an
+        // unknown argument type does not erase the identity; receiver/member
+        // precedence is still decided by `emitFormFor`.
+        if (tied or (best_unknown and !renamed_best))
+            return .{ .applicable = true };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)
@@ -5075,6 +5089,109 @@ pub const Module = struct {
         return &.{};
     }
 
+    const BareCallCandidateIterator = struct {
+        module: *const Module,
+        name: []const u8,
+        simple: []const FuncId,
+        simple_index: usize = 0,
+        aliases: []const ModuleRegistry.ImportPath,
+        alias_index: usize = 0,
+        alias_candidates: []const FuncId = &.{},
+        alias_candidate_index: usize = 0,
+        alias_fqn: []const u8 = "",
+
+        fn next(it: *BareCallCandidateIterator) ?FuncId {
+            if (it.simple_index < it.simple.len) {
+                defer it.simple_index += 1;
+                return it.simple[it.simple_index];
+            }
+            while (true) {
+                while (it.alias_candidate_index < it.alias_candidates.len) {
+                    const id = it.alias_candidates[it.alias_candidate_index];
+                    it.alias_candidate_index += 1;
+                    const f = it.module.funcById(id) orelse continue;
+                    if (std.mem.eql(u8, f.fqn, it.alias_fqn)) return id;
+                }
+                if (it.alias_index >= it.aliases.len) return null;
+
+                const path_index = it.alias_index;
+                const path = it.aliases[path_index];
+                it.alias_index += 1;
+                if (path.segs.len == 0) continue;
+                const leaf = path.segs[path.segs.len - 1];
+                if (std.mem.eql(u8, leaf, it.name)) continue;
+
+                var duplicate = false;
+                for (it.aliases[0..path_index]) |previous| {
+                    if (std.mem.eql(u8, previous.fqn, path.fqn)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+
+                it.alias_candidates = it.module.funcsBySimpleName(leaf);
+                it.alias_candidate_index = 0;
+                it.alias_fqn = path.fqn;
+            }
+        }
+    };
+
+    fn bareCallCandidateIterator(
+        self: *const Module,
+        name: []const u8,
+        caller_file: FileId,
+    ) BareCallCandidateIterator {
+        return .{
+            .module = self,
+            .name = name,
+            .simple = self.funcsBySimpleName(name),
+            .aliases = self.importAliasPathsIn(caller_file, name),
+        };
+    }
+
+    fn renamedImportDenotesFunc(
+        self: *const Module,
+        name: []const u8,
+        caller_file: FileId,
+        target: FuncId,
+    ) bool {
+        const f = self.funcById(target) orelse return false;
+        for (self.importAliasPathsIn(caller_file, name)) |path| {
+            if (path.segs.len == 0) continue;
+            const leaf = path.segs[path.segs.len - 1];
+            if (std.mem.eql(u8, leaf, name)) continue;
+            if (std.mem.eql(u8, path.fqn, f.fqn)) return true;
+        }
+        return false;
+    }
+
+    /// Every declaration denoted by a bare source name in this file. This is
+    /// the canonical candidate enumeration for calls and function references:
+    /// ordinary declarations enter by simple name, renamed imports by exact
+    /// FQN, and each declaration identity appears once.
+    pub fn bareCallCandidates(
+        self: *const Module,
+        allocator: Allocator,
+        name: []const u8,
+        caller_file: FileId,
+    ) Allocator.Error![]FuncId {
+        var out: std.ArrayList(FuncId) = .empty;
+        errdefer out.deinit(allocator);
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| try out.append(allocator, id);
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn hasBareCallCandidate(
+        self: *const Module,
+        name: []const u8,
+        caller_file: FileId,
+    ) bool {
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        return candidate_it.next() != null;
+    }
+
     /// Whether source file `file` declares `import <pkg>.*`. A wildcard
     /// import is file-scoped like a named one.
     pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool {
@@ -5479,8 +5596,9 @@ pub const Module = struct {
         // package (`withFrameNanos` inside `withFrameMillis`'s body is a
         // same-package call wherever the splice lands).
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-        const cands = self.funcsBySimpleName(name);
-        if (cands.len == 0) return BareCallResolution.deferred(.no_candidates);
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        if (candidate_it.next() == null)
+            return BareCallResolution.deferred(.no_candidates);
 
         // Highest-priority tier among the non-extension candidates:
         // body-bearing funcs, plus header stubs with a declared-arity
@@ -5488,7 +5606,8 @@ pub const Module = struct {
         var best_tier: u8 = 255;
         var all_ext = true;
         var ext_in_scope = false;
-        for (cands) |id| {
+        candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) {
                 if (self.bareCallTier(f, name, caller_pkg, caller_file) < other_package_tier) {
@@ -5534,7 +5653,8 @@ pub const Module = struct {
         var saw_vararg = false;
         var saw_low = false;
         var saw_bodyless = false;
-        for (cands) |id| {
+        candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
@@ -6002,6 +6122,7 @@ pub const Module = struct {
     fn applicableBarePick(
         self: *const Module,
         name: []const u8,
+        candidates: []const FuncId,
         args: []const applicability.ArgShape,
         caller_pkg: []const u8,
         caller_file: FileId,
@@ -6019,7 +6140,7 @@ pub const Module = struct {
             .type_var = staticTypeVar,
         };
         var best = ApplicableBarePick{};
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             const kind = self.declarationKind(id, f);
             const is_receiver_formed = kind != .plain;
@@ -6078,13 +6199,14 @@ pub const Module = struct {
         self: *const Module,
         alloc: std.mem.Allocator,
         name: []const u8,
+        candidates: []const FuncId,
         caller_pkg: []const u8,
         caller_file: FileId,
         tier: u8,
     ) std.mem.Allocator.Error![]const FuncId {
         if (tier == 255) return &.{};
         var list: std.ArrayList(FuncId) = .empty;
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) <= tier)
                 try list.append(alloc, id);
@@ -6105,16 +6227,23 @@ pub const Module = struct {
         caller_file: FileId,
         user_arg_count: usize,
     ) std.mem.Allocator.Error!?[]const FuncId {
-        if (self.funcsBySimpleName(name).len == 0) return null;
+        const candidates = try self.bareCallCandidates(alloc, name, caller_file);
+        defer alloc.free(candidates);
+        if (candidates.len == 0) return null;
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-        const first_tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
+        const first_tier = self.lowestVisibleGlobalTier(
+            name,
+            candidates,
+            caller_pkg,
+            caller_file,
+        );
         if (first_tier == 255) return null;
         if (first_tier >= other_package_tier) {
             return try alloc.alloc(FuncId, 0);
         }
         var list: std.ArrayList(FuncId) = .empty;
         var any_arity_match = false;
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             if (self.declarationKind(id, f) != .plain) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) >= other_package_tier) continue;
@@ -6141,14 +6270,21 @@ pub const Module = struct {
         caller_pkg_in: []const u8,
         caller_file: FileId,
     ) std.mem.Allocator.Error!?[]const FuncId {
-        if (self.funcsBySimpleName(name).len == 0) return null;
+        const candidates = try self.bareCallCandidates(alloc, name, caller_file);
+        defer alloc.free(candidates);
+        if (candidates.len == 0) return null;
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
-        const tier = self.lowestVisibleGlobalTier(name, caller_pkg, caller_file);
+        const tier = self.lowestVisibleGlobalTier(
+            name,
+            candidates,
+            caller_pkg,
+            caller_file,
+        );
         if (tier == 255) return null;
         if (tier >= other_package_tier) return try alloc.alloc(FuncId, 0);
 
         var list: std.ArrayList(FuncId) = .empty;
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             if (self.declarationKind(id, f) != .plain) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) > tier) continue;
@@ -6202,9 +6338,15 @@ pub const Module = struct {
     /// `CallMemberOrGlobal`; allowing them to establish this tier would let an
     /// own-class test method hide an imported top-level function from the
     /// terminal global leg.
-    fn lowestVisibleGlobalTier(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+    fn lowestVisibleGlobalTier(
+        self: *const Module,
+        name: []const u8,
+        candidates: []const FuncId,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) u8 {
         var best: u8 = 255;
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             if (self.declarationKind(id, f) != .plain) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
@@ -6216,9 +6358,15 @@ pub const Module = struct {
 
     /// The lowest scope tier among the rankable (body, or stub with a declared
     /// arity record) candidates named `name`, or 255 when none exists.
-    fn lowestVisibleTier(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) u8 {
+    fn lowestVisibleTier(
+        self: *const Module,
+        name: []const u8,
+        candidates: []const FuncId,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) u8 {
         var best: u8 = 255;
-        for (self.funcsBySimpleName(name)) |id| {
+        for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
@@ -6240,6 +6388,34 @@ pub const Module = struct {
         name: []const u8,
         caller_pkg_in: []const u8,
         caller_file: FileId,
+        args: []const applicability.ArgShape,
+        last_arg_lambda: bool,
+        ctx: ResolveCtx,
+    ) std.mem.Allocator.Error!Resolution {
+        const candidates = try self.bareCallCandidates(alloc, name, caller_file);
+        defer alloc.free(candidates);
+        return self.resolveCallCandidates(
+            alloc,
+            name,
+            caller_pkg_in,
+            caller_file,
+            candidates,
+            args,
+            last_arg_lambda,
+            ctx,
+        );
+    }
+
+    /// Resolve from a candidate set already enumerated for this source name.
+    /// Lowering uses this form when the same set also participates in cast
+    /// selection and hidden-ABI retries.
+    pub fn resolveCallCandidates(
+        self: *const Module,
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        caller_pkg_in: []const u8,
+        caller_file: FileId,
+        candidates: []const FuncId,
         args: []const applicability.ArgShape,
         last_arg_lambda: bool,
         ctx: ResolveCtx,
@@ -6314,6 +6490,7 @@ pub const Module = struct {
         if (target == null) {
             const global = self.applicableBarePick(
                 name,
+                candidates,
                 args,
                 caller_pkg,
                 caller_file,
@@ -6328,6 +6505,7 @@ pub const Module = struct {
         if (target == null and !receiver_extension_applicable) {
             const receiver_formed = self.applicableBarePick(
                 name,
+                candidates,
                 args,
                 caller_pkg,
                 caller_file,
@@ -6344,7 +6522,7 @@ pub const Module = struct {
             tier = if (ires.tier != 255)
                 ires.tier
             else
-                self.lowestVisibleTier(name, caller_pkg, caller_file);
+                self.lowestVisibleTier(name, candidates, caller_pkg, caller_file);
         }
         if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| {
             if (std.mem.eql(u8, w, name)) std.debug.print(
@@ -6367,9 +6545,11 @@ pub const Module = struct {
             caller_pkg,
             caller_file,
             target,
+            receiver_matched,
             tier,
             reason,
             ires.tier_count,
+            candidates,
             args,
             ctx,
         );
@@ -6397,13 +6577,14 @@ pub const Module = struct {
     /// lowerer proved that the extension/dispatch receivers form the complete
     /// receiver scope; receiver lambdas, thunks, outers, and companions keep
     /// the conservative runtime walk.
-    fn knownReceiverCallableApplicable(
+    fn knownReceiverApplicability(
         self: *const Module,
         name: []const u8,
         caller_pkg: []const u8,
         caller_file: FileId,
         args: []const applicability.ArgShape,
         ctx: ResolveCtx,
+        include_extensions: bool,
     ) ?bool {
         if (!ctx.receiver_scope_complete) return null;
         var receivers: [2]TypeRef = undefined;
@@ -6491,6 +6672,10 @@ pub const Module = struct {
                 .receiver_type = receiver,
             }).applicable) return true;
         }
+        if (!include_extensions) {
+            if (has_incomplete_receiver) return null;
+            return false;
+        }
         // The static extension resolver deliberately declines named and spread
         // argument shapes. They therefore cannot prove a negative: preserve
         // the receiver walk unless a member already proved applicability.
@@ -6515,6 +6700,42 @@ pub const Module = struct {
         return false;
     }
 
+    fn knownReceiverCallableApplicable(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+        ctx: ResolveCtx,
+    ) ?bool {
+        return self.knownReceiverApplicability(
+            name,
+            caller_pkg,
+            caller_file,
+            args,
+            ctx,
+            true,
+        );
+    }
+
+    fn knownReceiverMemberApplicable(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+        ctx: ResolveCtx,
+    ) ?bool {
+        return self.knownReceiverApplicability(
+            name,
+            caller_pkg,
+            caller_file,
+            args,
+            ctx,
+            false,
+        );
+    }
+
     /// The single member-vs-global decision, folding the receiver
     /// gates once. `Call → exact`, `CallMember`/`CallMemberOrGlobal → virtual`
     /// (target non-null) or `deferred` (target null), `CallValue → deferred`.
@@ -6525,9 +6746,11 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
         target: ?FuncId,
+        receiver_matched: bool,
         tier: u8,
         reason: ?ResolveDeferReason,
         tier_count: usize,
+        candidates: []const FuncId,
         args: []const applicability.ArgShape,
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
@@ -6547,17 +6770,40 @@ pub const Module = struct {
         if (target) |t| {
             const is_ext = if (self.funcById(t)) |f| funcHasImplicitThis(f) else false;
             if (is_ext) {
+                const renamed_target = receiver_matched and
+                    self.renamedImportDenotesFunc(name, caller_file, t);
+                const extension_receiver_shadowable = if (renamed_target) blk: {
+                    const known_member_applicable = self.knownReceiverMemberApplicable(
+                        name,
+                        caller_pkg,
+                        caller_file,
+                        args,
+                        ctx,
+                    );
+                    break :blk (known_member_applicable orelse
+                        (ctx.in_receiver_context or ctx.unknown_receiver)) or
+                        ctx.enclosing_has_member or
+                        (known_member_applicable == null and !ctx.receiver_known and
+                            self.registry.class_member_names.contains(name));
+                } else member_shadowable;
                 // Extension member-first defer: in a receiver context a member of
                 // the implicit receiver could shadow the extension, so it
                 // dispatches member-first. Unlike the non-extension gate, a cast
                 // or explicit type arguments do NOT suppress this.
-                if (ctx.in_receiver_context and member_shadowable) {
-                    const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+                if (ctx.in_receiver_context and extension_receiver_shadowable) {
+                    const cs = try self.candidateSet(
+                        alloc,
+                        name,
+                        candidates,
+                        caller_pkg,
+                        caller_file,
+                        tier,
+                    );
                     return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
                 }
-                // Static-receiver extension bind: a cast keeps the static Call,
-                // otherwise the member-precedence CallMember on `this`.
-                if (cast_static) {
+                // A renamed import records an exact declaration identity that
+                // cannot be recovered from runtime dispatch by the alias.
+                if (cast_static or renamed_target) {
                     return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
                 }
                 return .{ .target = t, .confidence = .virtual, .emit_form = .CallMember, .reason = reason, .tier = tier, .tier_count = tier_count };
@@ -6579,14 +6825,28 @@ pub const Module = struct {
             if (!shadow) {
                 return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
-            const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+            const cs = try self.candidateSet(
+                alloc,
+                name,
+                candidates,
+                caller_pkg,
+                caller_file,
+                tier,
+            );
             return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
         }
         if (ctx.is_value_capture) {
             return .{ .target = null, .confidence = .deferred, .emit_form = .CallValue, .reason = reason, .tier = tier, .tier_count = tier_count };
         }
         if (ctx.in_receiver_context) {
-            const cs = try self.candidateSet(alloc, name, caller_pkg, caller_file, tier);
+            const cs = try self.candidateSet(
+                alloc,
+                name,
+                candidates,
+                caller_pkg,
+                caller_file,
+                tier,
+            );
             return .{ .target = null, .confidence = .deferred, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
         }
         return .{ .target = null, .confidence = .deferred, .emit_form = .CallValue, .reason = reason, .tier = tier, .tier_count = tier_count };
@@ -6608,10 +6868,9 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?FuncId {
-        const cands = self.funcsBySimpleName(name);
-        if (cands.len == 0) return null;
         var best_tier: u8 = 255;
-        for (cands) |id| {
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
@@ -6621,7 +6880,8 @@ pub const Module = struct {
         if (best_tier == 255) return null;
         var chosen: ?FuncId = null;
         var count: usize = 0;
-        for (cands) |id| {
+        candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
@@ -6631,6 +6891,34 @@ pub const Module = struct {
         }
         if (count == 1) return chosen;
         return null;
+    }
+
+    /// Resolve an overloaded bare callable reference from its expected
+    /// function-parameter types. Candidate enumeration, scope, and static
+    /// applicability are identical to a source call; no receiver is supplied,
+    /// so extension declarations remain outside this unbound bare form.
+    pub fn resolveBareRefExpected(
+        self: *const Module,
+        allocator: Allocator,
+        name: []const u8,
+        caller_pkg_in: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+    ) Allocator.Error!?FuncId {
+        const candidates = try self.bareCallCandidates(allocator, name, caller_file);
+        defer allocator.free(candidates);
+        if (candidates.len == 0) return null;
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
+        const pick = self.applicableBarePick(
+            name,
+            candidates,
+            args,
+            caller_pkg,
+            caller_file,
+            .{},
+            false,
+        );
+        return if (pick.unique) pick.target else null;
     }
 
     /// The best (lowest) scope tier among the value-referenceable
@@ -6649,10 +6937,9 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?u8 {
-        const cands = self.funcsBySimpleName(name);
-        if (cands.len == 0) return null;
         var best_tier: u8 = 255;
-        for (cands) |id| {
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
             if (funcHasImplicitThis(f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
@@ -9850,6 +10137,73 @@ test "symbol index ranks a named import above the caller's own package" {
     try testing.expectEqual(@as(u8, 1), got2.tier);
 }
 
+test "renamed imports enter the canonical candidate set by exact identity" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const own = try pushTestFunc(&m, a, "hello", "app.hello", "app", 0);
+    const imported = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
+    const imported_int = try pushTestFuncOpts(
+        &m,
+        a,
+        "greet",
+        "lib.greet",
+        "lib",
+        1,
+        .{ .param_ty = "Int" },
+    );
+    _ = try pushTestFunc(&m, a, "greet", "other.greet", "other", 0);
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "lib";
+    segs[1] = "greet";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.greet"), .segs = segs });
+    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try imports.put("hello", paths);
+    try m.registry.import_aliases.put(FileId.from(0), imports);
+    try m.rebuildFuncNameIndex(a);
+
+    const candidates = try m.bareCallCandidates(a, "hello", FileId.from(0));
+    defer a.free(candidates);
+    try testing.expectEqual(@as(usize, 3), candidates.len);
+    try testing.expectEqual(own, candidates[0]);
+    try testing.expectEqual(imported, candidates[1]);
+    try testing.expectEqual(imported_int, candidates[2]);
+
+    const call = m.resolveBareCallIndexed("hello", "app", FileId.from(0), 0, false);
+    try testing.expectEqual(imported, call.pick().?);
+    try testing.expectEqual(@as(u8, 0), call.tier);
+    try testing.expect(m.resolveBareRefIndexed(
+        "hello",
+        "app",
+        FileId.from(0),
+    ) == null);
+    const zero_ref = try m.resolveBareRefExpected(
+        a,
+        "hello",
+        "app",
+        FileId.from(0),
+        &.{},
+    );
+    try testing.expectEqual(imported, zero_ref.?);
+    const int_ref_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
+        .ty_authoritative = true,
+    }};
+    const int_ref = try m.resolveBareRefExpected(
+        a,
+        "hello",
+        "app",
+        FileId.from(0),
+        &int_ref_args,
+    );
+    try testing.expectEqual(imported_int, int_ref.?);
+
+    const other_file = m.resolveBareCallIndexed("hello", "app", FileId.from(1), 0, false);
+    try testing.expectEqual(own, other_file.pick().?);
+}
+
 test "symbol index defers an out-of-scope pick when an in-scope extension exists" {
     const a = testing.allocator;
     var m = Module.default(a);
@@ -10052,6 +10406,48 @@ test "bounded spread candidates keep only varargs in the winning scope" {
     try testing.expectEqual(@as(usize, 2), scoped.len);
     try testing.expectEqual(app_ints.int(), scoped[0].int());
     try testing.expectEqual(app_strings.int(), scoped[1].int());
+}
+
+test "bounded spread candidates retain renamed import identity" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    const imported = try pushTestFuncOpts(
+        &m,
+        a,
+        "merge",
+        "lib.merge",
+        "lib",
+        1,
+        .{ .last_vararg = true },
+    );
+    _ = try pushTestFuncOpts(
+        &m,
+        a,
+        "merge",
+        "other.merge",
+        "other",
+        1,
+        .{ .last_vararg = true },
+    );
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "lib";
+    segs[1] = "merge";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "lib.merge"), .segs = segs });
+    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try imports.put("originalMerge", paths);
+    try m.registry.import_aliases.put(FileId.from(0), imports);
+    try m.rebuildFuncNameIndex(a);
+
+    const scoped = (try m.boundedSpreadCandidates(
+        a,
+        "originalMerge",
+        "app",
+        FileId.from(0),
+    )).?;
+    defer a.free(scoped);
+    try testing.expectEqualSlices(FuncId, &.{imported}, scoped);
 }
 
 test "bounded spread candidates do not widen past a fixed-only tier" {

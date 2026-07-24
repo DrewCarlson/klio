@@ -4517,6 +4517,10 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
             return raiseStep(frame, .{ .Type = "CallSpread: bounded call has no name" });
         const name = constStr(frame.module, name_id) orelse
             return raiseStep(frame, .{ .Type = "CallSpread: name not a string const" });
+        const anchor_pkg = if (cs.anchor_pkg) |pkg_id|
+            constStr(frame.module, pkg_id) orelse ""
+        else
+            "";
         const caller_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
         const overload = switch (try host.callNamedOverload(
             allocator,
@@ -4529,7 +4533,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
             false,
             frame.func.package,
             caller_file,
-            "",
+            anchor_pkg,
         )) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
@@ -5369,7 +5373,14 @@ noinline fn execArmMemberRef(comptime H: type, allocator: Allocator, frame: *Fra
     const recv = frame.read(mr.receiver);
     const name_str = constStr(frame.module, mr.name) orelse
         return raiseStep(frame, .{ .Type = "MemberRef: name not a string const" });
-    switch (try host.memberRef(allocator, &recv, name_str)) {
+    const result = if (mr.func) |func|
+        if (comptime @hasDecl(H, "memberRefExact"))
+            try host.memberRefExact(allocator, &recv, name_str, func)
+        else
+            try host.memberRef(allocator, &recv, name_str)
+    else
+        try host.memberRef(allocator, &recv, name_str);
+    switch (result) {
         .ok => |v| try frame.write(mr.dst, v),
         .err => |e| return raiseStep(frame, e),
     }
@@ -7583,6 +7594,11 @@ pub const NullHost = struct {
     pub fn memberRef(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
         _ = .{ self, allocator, receiver, name };
         return errResult(.{ .Unsupported = "Host.member_ref" });
+    }
+
+    pub fn memberRefExact(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8, func: FuncId) Allocator.Error!EvalResult {
+        _ = func;
+        return self.memberRef(allocator, receiver, name);
     }
 
     pub fn buildClosure(self: *NullHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {

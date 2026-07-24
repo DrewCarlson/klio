@@ -93,9 +93,27 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   proof; additive eager heads cannot reject or finalize a target. A uniquely
   best proven declaration becomes an exact IR target, while uncertain
   multi-candidate families remain non-final rather than acquiring a
-  declaration-order identity. Fixed overloads outrank equal varargs on both
-  positional and named calls. Constructor/classifier candidates share the same
-  scope tiers: a nearer classifier emits a static construction, and an
+  declaration-order identity. Ordinary names and renamed imports now enter the
+  same candidate enumeration; an alias contributes every declaration at its
+  exact imported FQN, and calls, spreads, references, extensions, inline
+  targets, captured-value precedence, and candidate-existence gates all
+  consume that set. The alias-specific overload picker, direct import binding,
+  qualified-call rewrite, and post-resolution override are deleted.
+  A proven renamed-import extension becomes exact only after the complete
+  receiver tower excludes applicable ordinary members; the imported extension
+  itself is not treated as a member-precedence conflict. An incomplete tower
+  retains member-first dispatch with the exact imported `FuncId` as fallback.
+  Bound and unbound references retain the selected declaration identity
+  through invocation; unbound extension references retain their type receiver,
+  and expected receiver-function shapes survive unresolved generic returns.
+  Bounded spread calls retain their source-scope package across synthesized
+  frames. Inline substitution checks the source parameter shape before
+  replacing a same-named function parameter, including inside nested lambdas.
+  Ordinary extension calls stay member-first until builtin member
+  surfaces join the canonical declaration index. Fixed overloads outrank equal
+  varargs on both positional and named calls. Constructor/classifier candidates
+  share the same scope tiers: a nearer classifier emits a static construction,
+  and an
   equal-tier runtime comparison consumes the already-bound `ClassId` instead of
   reopening a simple name. Infix return inference uses
   explicit-receiver resolution. A known

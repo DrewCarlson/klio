@@ -658,6 +658,23 @@ test "constructor_scope_import_alias" {
     );
 }
 
+test "renamed_function_import" {
+    try checkFiles(&.{
+        CORPUS_DIR ++ "/renamed_function_import/lib.kt",
+        CORPUS_DIR ++ "/renamed_function_import/app.kt",
+    },
+        \\extension:a:b
+        \\plain:a:b:c
+        \\inline:a:b:c:d
+        \\x+y
+        \\plain:r:s:t
+        \\extension:u:v
+        \\extension:w:x
+        \\30
+        \\
+    );
+}
+
 test "constructor_identity_collision" {
     try checkFiles(&.{
         CORPUS_DIR ++ "/constructor_identity_collision/wrong.kt",

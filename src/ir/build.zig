@@ -905,6 +905,10 @@ pub const FuncBuilder = struct {
         if (self.inline_stack.items.len == 0) return null;
         return self.inline_stack.items[self.inline_stack.items.len - 1].name;
     }
+    pub fn currentInlineDecl(self: *const FuncBuilder) ?*const ast.Function {
+        if (self.inline_stack.items.len == 0) return null;
+        return self.inline_stack.items[self.inline_stack.items.len - 1].decl;
+    }
     pub fn pushInlineLambdaRet(self: *FuncBuilder, label: []const u8, r: Reg, end: BlockId) Allocator.Error!void {
         try self.inline_lambda_ret.append(self.allocator, .{ .label = label, .reg = r, .end = end });
     }

@@ -112,6 +112,31 @@
 - Final varargs of function values remain positional. Only a fixed
   function-typed parameter after an earlier vararg receives a synthesized
   trailing-lambda name, including across the Compose ABI pair.
+- Ordinary names and renamed imports enter one canonical candidate set.
+  Renamed imports contribute every declaration at the imported FQN, preserving
+  overload identity for calls, spreads, references, extensions, and inline
+  targets. Candidate existence checks for captured-value precedence and
+  star-import/member routing use the same file-scoped enumeration.
+  The lowerer's alias-specific overload picker, direct-import bind, qualified
+  FQN rewrite, and post-resolution import override are deleted.
+- A selected renamed-import extension becomes an exact static call only when
+  its receiver was proven and the complete receiver tower has no applicable
+  ordinary member. Extension applicability no longer counts as evidence that
+  the imported alias shadows itself. When the tower is incomplete, the
+  deferred member-first form retains the exact extension `FuncId` as its
+  fallback. Ordinary extension calls retain member-first runtime dispatch
+  while builtin member surfaces remain outside the canonical declaration
+  index.
+- Bound and unbound callable references carry the selected `FuncId`; invoking a
+  bound reference prepends its captured receiver, while a `Type::extension`
+  reference consumes its first invocation argument as that receiver. Expected
+  callable-reference shapes retain receiver-function receivers even when a
+  generic return type cannot yet be instantiated.
+- A bounded spread call carries the selected declaration package into
+  synthesized lambda frames, so runtime applicability does not reopen source
+  scope from an empty synthetic package. Inline splices test the original
+  parameter signature before substituting a same-named lambda, and nested
+  captured parameters continue to shadow imported aliases when applicable.
 - Constructor and function candidates use the same classifier/callable scope
   tiers. A nearer classifier emits `NewInstance`, a nearer function commits,
   and an equal-tier family retains the deferred comparison. That comparison

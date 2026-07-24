@@ -646,7 +646,7 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
 
 fn isCallable(v: *const Value) bool {
     return switch (v.*) {
-        .IrClosure, .Function, .BoundMethod => true,
+        .IrClosure, .Function, .Intrinsic, .BoundMethod => true,
         else => false,
     };
 }
@@ -5884,6 +5884,7 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     const inst = receiver.Instance;
     var rc: ?Value = null;
     var n_str: ?[]const u8 = null;
+    var exact_func: ?FuncId = null;
     {
         const g = inst.borrow();
         rc = g.get().get("__bound_receiver__");
@@ -5893,6 +5894,9 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 n_str = sg.get().bytes;
                 sg.deinit();
             }
+        }
+        if (g.get().get("__bound_func__")) |fv| {
+            if (fv == .Int and fv.Int >= 0) exact_func = FuncId.from(@intCast(fv.Int));
         }
         g.deinit();
     }
@@ -5911,6 +5915,27 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
         ref_pushed = true;
     }
     defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
+    if (exact_func) |func| {
+        if (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) {
+            var exact_args: std.ArrayList(Value) = .empty;
+            defer exact_args.deinit(allocator);
+            if (recv_capt == .Class) {
+                try exact_args.appendSlice(allocator, args);
+            } else {
+                try exact_args.append(allocator, recv_capt);
+                try exact_args.appendSlice(allocator, args);
+            }
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            return try host_call_func.callFunc(
+                self,
+                allocator,
+                mg.get(),
+                func,
+                exact_args.items,
+            );
+        }
+    }
     // Property-delegation protocol on a bound property reference
     // (`var x by data::prop` / `by Data::prop`): read/write the
     // referenced property. A Class-bound ref takes the instance from
@@ -12120,6 +12145,26 @@ fn isUnsignedArrayName(simple: []const u8) bool {
 }
 
 pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    return memberRefResolved(self, allocator, receiver, name, null);
+}
+
+pub fn memberRefExact(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    func: FuncId,
+) Allocator.Error!EvalResult {
+    return memberRefResolved(self, allocator, receiver, name, func);
+}
+
+fn memberRefResolved(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    func: ?FuncId,
+) Allocator.Error!EvalResult {
     // `X::class` is a class reference — return the class itself. For an
     // instance receiver, reach into the runtime ClassDef.
     if (std.mem.eql(u8, name, "class")) {
@@ -12203,6 +12248,9 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     try fields.append(allocator, .{ .name = "__bound_receiver__", .value = receiver.* });
     const name_dup = try allocator.dupe(u8, name);
     try fields.append(allocator, .{ .name = "__bound_name__", .value = .{ .String = try runtime.strInitOwned(allocator, name_dup) } });
+    if (func) |fid| {
+        try fields.append(allocator, .{ .name = "__bound_func__", .value = .{ .Int = @intCast(fid.int()) } });
+    }
     // The reference's creation-site file: visibility of a file-private
     // target is decided where the reference is written, so the invoke
     // path re-installs this file while it dispatches by name.

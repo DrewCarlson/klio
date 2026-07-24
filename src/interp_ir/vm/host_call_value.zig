@@ -133,6 +133,15 @@ fn boundReferenceStaticReceiver(callee: *const Value) ?[]const u8 {
     return typeReferenceStaticReceiver(&recv);
 }
 
+fn boundReferenceFunc(callee: *const Value) ?FuncId {
+    if (callee.* != .Instance) return null;
+    const g = callee.Instance.borrow();
+    defer g.deinit();
+    const value = g.get().get("__bound_func__") orelse return null;
+    if (value != .Int or value.Int < 0) return null;
+    return FuncId.from(@intCast(value.Int));
+}
+
 /// Single callable-value dispatch over the value variants.
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
@@ -180,6 +189,25 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
+            if (boundReferenceFunc(callee)) |func| {
+                var exact_args: std.ArrayList(Value) = .empty;
+                defer exact_args.deinit(allocator);
+                if (rv == .Class) {
+                    try exact_args.appendSlice(allocator, args);
+                } else {
+                    try exact_args.append(allocator, rv);
+                    try exact_args.appendSlice(allocator, args);
+                }
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                return host_call_func.callFunc(
+                    self,
+                    allocator,
+                    mg.get(),
+                    func,
+                    exact_args.items,
+                );
+            }
             // An unbound class-method reference (`Long::toByte`, `String::plus`)
             // consumes its first argument as the receiver. The reference's
             // captured receiver is the type itself: a `.Class` value, or — when
