@@ -1,5 +1,5 @@
 //! Human-readable IR dump (`klio dump-ir`). Prints a built `Module`'s functions
-//! as registers + instructions, classifying every call site as DIRECT (a baked
+//! as registers + instructions, classifying every call site as DIRECT (an exact
 //! `FuncId`/`ClassId` target), VIRTUAL (a numeric method slot), or DYNAMIC
 //! (resolved by name at runtime), and
 //! distinguishing a dynamic call the lowerer *did* resolve to a unique target
@@ -54,7 +54,7 @@ fn classify(inst: *const Inst) ?Kind {
         .CallMemberOrGlobal => |c| if (c.func != null or c.class != null or c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallSpread => |c| if (c.virtual_slot != null) .virtual else if (c.candidates != null) .dyn_bound else .dyn_unbound,
         .CallVirtual => .virtual,
-        .CallMember,
+        .CallMember => |c| if (c.resolved != null) .direct else .dyn_unbound,
         .CallValue,
         .CallValueWithThis,
         .CallSuper,
@@ -133,7 +133,21 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .CallMember => |c| {
             try w.print("r{d} <- CallMember r{d}.'{s}' ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name) });
             try argRun(w, c.args, c.n_args);
-            try w.print("        [DYN member '{s}']", .{constStr(m, c.name)});
+            if (c.resolved) |target| {
+                if (c.dispatch_receiver) |dispatch| {
+                    try w.print(
+                        "        [DIRECT member-ext dispatch=r{d} -> {s}#{d}]",
+                        .{ reg(dispatch), funcName(m, target), target.int() },
+                    );
+                } else {
+                    try w.print(
+                        "        [DIRECT -> {s}#{d}]",
+                        .{ funcName(m, target), target.int() },
+                    );
+                }
+            } else {
+                try w.print("        [DYN member '{s}']", .{constStr(m, c.name)});
+            }
         },
         .CallVirtual => |c| {
             try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });

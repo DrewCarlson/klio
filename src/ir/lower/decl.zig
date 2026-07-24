@@ -256,6 +256,168 @@ fn memberDeclKey(a: Allocator, owner: []const u8, f: *const ast.Function) Alloca
     });
 }
 
+fn memberOwnerTypeRef(
+    module: *const Module,
+    allocator: Allocator,
+    owner_id: ?ir.ClassId,
+    fallback_name: []const u8,
+) Allocator.Error!TypeRef {
+    const id = owner_id orelse return .{
+        .name = fallback_name,
+        .nullable = false,
+        .args = &.{},
+    };
+    if (id.int() >= module.classes.items.len) return .{
+        .name = fallback_name,
+        .nullable = false,
+        .args = &.{},
+    };
+    const class = &module.classes.items[id.int()];
+    const args = try allocator.alloc(TypeRef, class.type_params.len);
+    for (class.type_params, args) |param, *arg| {
+        arg.* = .{
+            .name = try ir.classTypeParamIdentity(allocator, id, param),
+            .nullable = false,
+            .args = &.{},
+        };
+    }
+    return .{
+        .name = class.fqn,
+        .nullable = false,
+        .args = args,
+    };
+}
+
+fn functionTypeParamShadows(f: *const ast.Function, name: []const u8) bool {
+    for (f.type_params) |*param| {
+        if (std.mem.eql(u8, param.name.name, name)) return true;
+    }
+    return false;
+}
+
+fn typeRefHasQualifier(ty: TypeRef) bool {
+    for (ty.args) |arg| {
+        if (std.mem.startsWith(u8, arg.name, "#qual:")) return true;
+    }
+    return false;
+}
+
+fn rewriteClassOwnedTypeRef(
+    allocator: Allocator,
+    owner: ir.ClassId,
+    class_params: []const []const u8,
+    f: *const ast.Function,
+    own_names: bool,
+    ty: *TypeRef,
+) Allocator.Error!void {
+    for (ty.args) |*arg| {
+        try rewriteClassOwnedTypeRef(
+            allocator,
+            owner,
+            class_params,
+            f,
+            own_names,
+            arg,
+        );
+    }
+    if (typeRefHasQualifier(ty.*)) return;
+    const prefix: ?[]const u8 = if (std.mem.startsWith(u8, ty.name, "out#"))
+        "out#"
+    else if (std.mem.startsWith(u8, ty.name, "in#"))
+        "in#"
+    else
+        null;
+    const source_name = if (prefix) |p| ty.name[p.len..] else ty.name;
+    if (std.mem.indexOfScalar(u8, source_name, '.') != null) return;
+    for (class_params) |param| {
+        if (!std.mem.eql(u8, source_name, param) or
+            functionTypeParamShadows(f, param)) continue;
+        const identity = try ir.classTypeParamIdentity(allocator, owner, param);
+        const rewritten = if (prefix) |p| blk: {
+            const projected = try std.fmt.allocPrint(
+                allocator,
+                "{s}{s}",
+                .{ p, identity },
+            );
+            allocator.free(identity);
+            break :blk projected;
+        } else identity;
+        if (own_names) allocator.free(ty.name);
+        ty.name = rewritten;
+        return;
+    }
+}
+
+fn rewriteMemberFuncTypes(
+    module: *const Module,
+    allocator: Allocator,
+    owner: ?ir.ClassId,
+    f: *const ast.Function,
+    func: *Func,
+) Allocator.Error!void {
+    const owner_id = owner orelse return;
+    if (owner_id.int() >= module.classes.items.len) return;
+    const class_params = module.classes.items[owner_id.int()].type_params;
+    for (func.params) |*param| {
+        try rewriteClassOwnedTypeRef(
+            allocator,
+            owner_id,
+            class_params,
+            f,
+            false,
+            &param.ty,
+        );
+    }
+    try rewriteClassOwnedTypeRef(
+        allocator,
+        owner_id,
+        class_params,
+        f,
+        false,
+        &func.return_ty,
+    );
+}
+
+fn loweredMemberTypeRef(
+    module: *const Module,
+    allocator: Allocator,
+    owner: ?ir.ClassId,
+    f: *const ast.Function,
+    source: *const ast.TypeRef,
+    own_names: bool,
+) Allocator.Error!TypeRef {
+    var ty = try loweredTypeRef(allocator, source, own_names);
+    if (owner) |owner_id| {
+        if (owner_id.int() < module.classes.items.len) {
+            try rewriteClassOwnedTypeRef(
+                allocator,
+                owner_id,
+                module.classes.items[owner_id.int()].type_params,
+                f,
+                own_names,
+                &ty,
+            );
+        }
+    }
+    return ty;
+}
+
+fn memberOwnerIdForFunction(
+    module: *const Module,
+    owner_name: []const u8,
+    f: *const ast.Function,
+) ?ir.ClassId {
+    if (module.funcByDeclSpan(f.name.span)) |reserved| {
+        if (module.decl_sigs.get(reserved.int())) |sig| {
+            if (sig.enclosing_class) |owner| return owner;
+        }
+    }
+    if (std.mem.indexOfScalar(u8, owner_name, '.') != null) {
+        return module.classIdByFqn(owner_name);
+    }
+    return module.uniqueClassIdBySimpleName(owner_name);
+}
+
 /// Reserve every member-function signature before any class body lowers.
 /// The declaration-span identity remains stable when the body replaces the
 /// stub, and the owner-scoped index retains the full overload set instead of
@@ -268,6 +430,21 @@ pub fn reserveMemberHeaders(
 ) Allocator.Error!void {
     const a = module.registry.allocator;
     const owner_id = module.classIdByFqn(class_fqn) orelse module.classId(c.name.name);
+    if (owner_id) |owner| {
+        if (owner.int() < module.classes.items.len and
+            module.classes.items[owner.int()].type_params.len == 0 and
+            c.type_params.len != 0)
+        {
+            const names = try a.alloc([]const u8, c.type_params.len);
+            const variances = try a.alloc(ast.Variance, c.type_params.len);
+            for (c.type_params, names, variances) |*param, *name, *variance| {
+                name.* = param.name.name;
+                variance.* = param.variance;
+            }
+            module.classes.items[owner.int()].type_params = names;
+            module.classes.items[owner.int()].type_param_variance = variances;
+        }
+    }
     for (c.members) |*member| {
         if (member.* != .Function) continue;
         const f = &member.Function;
@@ -282,9 +459,25 @@ pub fn reserveMemberHeaders(
         params[0] = .{
             .name = "this",
             .ty = if (f.receiver_type) |*rt|
-                try loweredTypeRef(a, rt, false)
-            else
-                .{ .name = c.name.name, .nullable = false, .args = &.{} },
+                try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
+            else blk: {
+                const owner_args = try a.alloc(TypeRef, c.type_params.len);
+                for (c.type_params, owner_args) |*param, *arg| {
+                    arg.* = .{
+                        .name = if (owner_id) |owner|
+                            try ir.classTypeParamIdentity(a, owner, param.name.name)
+                        else
+                            param.name.name,
+                        .nullable = false,
+                        .args = &.{},
+                    };
+                }
+                break :blk .{
+                    .name = class_fqn,
+                    .nullable = false,
+                    .args = owner_args,
+                };
+            },
             .default = null,
             .is_property = false,
             .is_vararg = false,
@@ -293,7 +486,17 @@ pub fn reserveMemberHeaders(
         for (f.params, 0..) |*p, i| {
             params[i + 1] = .{
                 .name = p.name.name,
-                .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
+                .ty = renameParamHead(
+                    try loweredMemberTypeRef(
+                        module,
+                        a,
+                        owner_id,
+                        f,
+                        &p.ty,
+                        false,
+                    ),
+                    &p.ty,
+                ),
                 .default = null,
                 .is_property = false,
                 .is_vararg = p.is_vararg,
@@ -302,7 +505,7 @@ pub fn reserveMemberHeaders(
         }
         const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ class_fqn, f.name.name });
         const return_ty = if (f.return_type) |*rt|
-            try loweredTypeRef(a, rt, false)
+            try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
         else
             build.typeUnit();
         try module.funcs.append(a, .{
@@ -331,7 +534,9 @@ pub fn reserveMemberHeaders(
             try funcNameIndexPush(module, f.name.name, id);
         }
         try module.recordFuncDeclSpan(a, f.name.span, id);
-        if (f.receiver_type != null) try module.registry.member_ext_owner_class.put(id, c.name.name);
+        if (f.receiver_type != null) {
+            try module.registry.member_ext_owner_class.put(id, class_fqn);
+        }
         try registerFuncTypeParams(module, f, id);
 
         var has_vararg = false;
@@ -346,13 +551,25 @@ pub fn reserveMemberHeaders(
             .has_vararg = has_vararg,
         };
         const sig = try a.alloc(TypeRef, f.params.len);
-        for (f.params, 0..) |*p, i| sig[i] = try loweredTypeRef(a, &p.ty, true);
+        for (f.params, 0..) |*p, i| {
+            sig[i] = try loweredMemberTypeRef(
+                module,
+                a,
+                owner_id,
+                f,
+                &p.ty,
+                true,
+            );
+        }
         try module.decl_user_params.put(id.int(), @intCast(f.params.len));
         try module.decl_user_arity.put(id.int(), arity);
         try module.decl_user_sig.put(id.int(), sig);
         try module.decl_sigs.put(id.int(), .{
             .enclosing_class = owner_id,
-            .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
+            .receiver_ty = if (f.receiver_type) |*rt|
+                try loweredMemberTypeRef(module, a, owner_id, f, rt, true)
+            else
+                null,
             .arity = arity,
             .sig = sig,
             .kind = if (f.receiver_type != null) .member_extension else .instance_method,
@@ -679,6 +896,11 @@ pub fn lowerClassWithExtras(
         .is_value = c.is_value,
         .receiver_abi = runtime.classifierReceiverAbi(class_fqn),
     });
+    if (!module.registry.class_type_param_bounds.contains(class_fqn)) {
+        if (try loweredClassTypeParamBounds(a, c)) |bounds| {
+            try module.registry.class_type_param_bounds.put(class_fqn, bounds);
+        }
+    }
     // Collect this class's own member names so method-body lowering can
     // tell `someMember()` (this.someMember) apart from `topLevelFn()`
     // (LoadGlobal). The lexically-enclosing class's members
@@ -777,7 +999,7 @@ pub fn lowerClassWithExtras(
                     msig[i] = try loweredTypeRef(a, &p.ty, true);
                 }
                 try module.decl_sigs.put(placed.id.int(), .{
-                    .enclosing_class = module.classId(c.name.name),
+                    .enclosing_class = class_id,
                     .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
                     .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
                     .sig = msig,
@@ -1166,6 +1388,13 @@ pub fn lowerMethodWithMemberContext(
         const reserved_id = module.funcByDeclSpan(f.name.span);
         const id = reserved_id orelse module.nextFuncId();
         var placed = func;
+        try rewriteMemberFuncTypes(
+            module,
+            a,
+            memberOwnerIdForFunction(module, owner_class, f),
+            f,
+            &placed,
+        );
         placed.id = id;
         placed.kind = .member_extension;
         if (reserved_id != null) {
@@ -1185,7 +1414,17 @@ pub fn lowerMethodWithMemberContext(
         // runtime extension-fallback dispatch can filter it out at call
         // sites whose enclosing class chain doesn't include the
         // declaring class.
-        try module.registry.member_ext_owner_class.put(id, owner_class);
+        const owner_identity = blk: {
+            if (module.decl_sigs.get(id.int())) |sig| {
+                if (sig.enclosing_class) |owner_id| {
+                    if (owner_id.int() < module.classes.items.len) {
+                        break :blk module.classes.items[owner_id.int()].fqn;
+                    }
+                }
+            }
+            break :blk owner_class;
+        };
+        try module.registry.member_ext_owner_class.put(id, owner_identity);
         // Extension member: no enclosing-class own-members in scope (the
         // receiver is `this`, not the declaring class), so the thunk
         // runs with no owner_class context.
@@ -1204,6 +1443,13 @@ pub fn lowerMethodWithMemberContext(
     const reserved_id = module.funcByDeclSpan(f.name.span);
     const id = reserved_id orelse module.nextFuncId();
     var placed = func;
+    try rewriteMemberFuncTypes(
+        module,
+        a,
+        memberOwnerIdForFunction(module, owner_class, f),
+        f,
+        &placed,
+    );
     placed.id = id;
     placed.kind = .instance_method;
     if (reserved_id) |_| {
@@ -1230,6 +1476,147 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
     var tp_names: std.ArrayList([]const u8) = .empty;
     for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
     try module.registry.func_type_params.put(id, tp_names);
+}
+
+fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
+    return !bound.nullable and bound.type_args.len == 0 and
+        bound.function == null and !bound.definitely_non_null and
+        bound.qualified_path == null;
+}
+
+fn loweredClassTypeParamBounds(
+    allocator: Allocator,
+    class: *const ast.Class,
+) Allocator.Error!?[]const ir.ModuleRegistry.TypeParamBound {
+    if (class.type_params.len == 0) return null;
+    var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+    errdefer bounds.deinit(allocator);
+    for (class.type_params) |*param| {
+        const first = bounds.items.len;
+        if (param.upper_bound) |*upper| {
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = upper.name.name,
+                .complete = boundTypeRecordComplete(upper),
+            });
+        }
+        for (class.where_bounds) |*where_bound| {
+            if (!std.mem.eql(u8, where_bound.name.name, param.name.name)) continue;
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = where_bound.bound.name.name,
+                .complete = boundTypeRecordComplete(&where_bound.bound),
+            });
+        }
+        if (bounds.items.len == first) {
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = "kotlin.Any",
+            });
+        } else if (bounds.items.len - first > 1) {
+            for (bounds.items[first..]) |*bound| bound.complete = false;
+        }
+    }
+    return try bounds.toOwnedSlice(allocator);
+}
+
+fn addScopedTypeParamBounds(
+    b: *FuncBuilder,
+    module: *Module,
+    owner_class: ?[]const u8,
+    f: *const ast.Function,
+) Allocator.Error!void {
+    if (owner_class) |owner| {
+        const owner_id = blk: {
+            if (module.funcByDeclSpan(f.name.span)) |reserved| {
+                if (module.decl_sigs.get(reserved.int())) |sig| {
+                    if (sig.enclosing_class) |exact| break :blk exact;
+                }
+            }
+            if (std.mem.indexOfScalar(u8, owner, '.') != null) {
+                break :blk module.classIdByFqn(owner);
+            }
+            break :blk module.classIdIndexed(owner, b.self_package, f.span.file) orelse
+                module.uniqueClassIdBySimpleName(owner);
+        };
+        const exact_owner = if (owner_id) |id|
+            (if (id.int() < module.classes.items.len)
+                module.classes.items[id.int()].fqn
+            else
+                owner)
+        else
+            owner;
+        if (module.registry.class_type_param_bounds.get(exact_owner) orelse
+            module.registry.class_type_param_bounds.get(owner)) |bounds|
+        {
+            for (bounds) |bound| {
+                if (owner_id) |id| {
+                    const identity = try ir.classTypeParamIdentity(
+                        b.allocator,
+                        id,
+                        bound.param,
+                    );
+                    var owned_bound: []const u8 = bound.bound;
+                    if (id.int() < module.classes.items.len and
+                        std.mem.indexOfScalar(u8, bound.bound, '.') == null)
+                    {
+                        for (module.classes.items[id.int()].type_params) |param| {
+                            if (!std.mem.eql(u8, param, bound.bound)) continue;
+                            owned_bound = try b.ownTypeParamText(
+                                try ir.classTypeParamIdentity(
+                                    b.allocator,
+                                    id,
+                                    param,
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                    try b.addOwnedTypeParamBoundEvidence(
+                        identity,
+                        owned_bound,
+                        bound.complete,
+                    );
+                }
+                var shadowed = false;
+                for (f.type_params) |*param| {
+                    if (std.mem.eql(u8, param.name.name, bound.param)) {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (!shadowed) {
+                    try b.addTypeParamBoundEvidence(
+                        bound.param,
+                        bound.bound,
+                        bound.complete,
+                    );
+                }
+            }
+        }
+    }
+    for (f.type_params) |*param| {
+        if (param.is_reified) continue;
+        var bound: []const u8 = "kotlin.Any";
+        var complete = true;
+        var count: usize = 0;
+        if (param.upper_bound) |*upper| {
+            bound = upper.name.name;
+            complete = boundTypeRecordComplete(upper);
+            count += 1;
+        }
+        for (f.where_bounds) |*where_bound| {
+            if (std.mem.eql(u8, where_bound.name.name, param.name.name)) {
+                if (count == 0) {
+                    bound = where_bound.bound.name.name;
+                    complete = boundTypeRecordComplete(&where_bound.bound);
+                }
+                count += 1;
+            }
+        }
+        if (count > 1) complete = false;
+        try b.addTypeParamBoundEvidence(param.name.name, bound, complete);
+    }
 }
 
 pub fn lowerFunctionBodyWithImplicitOwner(
@@ -1296,6 +1683,27 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // A normal member's synthesized `this` is not present in the source
+    // parameter list below. Seed it from the reserved declaration header so
+    // explicit `this.member(...)` resolution sees the same qualified generic
+    // owner type as implicit-this and virtual-slot resolution.
+    if (implicit_params.len != 0 and
+        std.mem.eql(u8, implicit_params[0], "this") and
+        f.receiver_type == null)
+    {
+        if (module.funcByDeclSpan(f.name.span)) |reserved| {
+            if (module.funcById(reserved)) |header| {
+                if (header.params.len != 0 and
+                    std.mem.eql(u8, header.params[0].name, "this"))
+                {
+                    try b.setLocalDeclTypeOwned(
+                        "this",
+                        try header.params[0].ty.clone(b.allocator),
+                    );
+                }
+            }
+        }
+    }
     // A user parameter literally named `this` (backtick-quoted in source) on
     // a receiver-less function is an ordinary value binding, not a dispatch
     // receiver: bare calls in the body must not member-dispatch through it.
@@ -1436,23 +1844,9 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         // Non-reified type parameters in scope: this function's own (a reified
         // one is resolved by the reified splice) plus the enclosing class's
         // (never reified in Kotlin). A cast to such a name is unchecked/erased.
-        for (f.type_params) |*tp| {
-            if (!tp.is_reified) {
-                var bound = if (tp.upper_bound) |upper| upper.name.name else "Any";
-                for (f.where_bounds) |where_bound| {
-                    if (std.mem.eql(u8, where_bound.name.name, tp.name.name)) {
-                        bound = where_bound.bound.name.name;
-                        break;
-                    }
-                }
-                try b.addTypeParamBound(tp.name.name, bound);
-            }
-        }
-        if (owner_class) |owner| {
-            if (module.registry.class_type_param_bounds.get(owner)) |bounds| {
-                for (bounds) |bnd| try b.addTypeParamBound(bnd.param, bnd.bound);
-            }
-        }
+        // Install the outer class first so a same-named function parameter
+        // retains the lexically nearer bound.
+        try addScopedTypeParamBounds(&b, module, owner_class, f);
         for (f.params) |*p| {
             if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
                 try b.markGenericTypedParam(p.name.name);
@@ -1595,6 +1989,23 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // proving on the bare head.
             func.params[0].ty = try loweredTypeRef(a, rt, false);
         }
+    } else if (owner_class != null and func.params.len != 0 and
+        std.mem.eql(u8, func.params[0].name, "this"))
+    {
+        const owner = owner_class.?;
+        const owner_id = blk: {
+            if (module.funcByDeclSpan(f.name.span)) |reserved| {
+                if (module.decl_sigs.get(reserved.int())) |sig| {
+                    if (sig.enclosing_class) |exact| break :blk exact;
+                }
+            }
+            if (std.mem.indexOfScalar(u8, owner, '.') != null) {
+                break :blk module.classIdByFqn(owner);
+            }
+            break :blk module.classIdIndexed(owner, b.self_package, f.span.file) orelse
+                module.uniqueClassIdBySimpleName(owner);
+        };
+        func.params[0].ty = try memberOwnerTypeRef(module, a, owner_id, owner);
     }
     func.is_suspend = f.is_suspend;
     func.low_priority = isLowPriorityOverload(f);
@@ -1842,14 +2253,42 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     string_overload.receiver_type = null;
     string_overload.params = &string_params;
     string_overload.span = sp_string;
+    const sp_t = ast.Span{ .file = ir.FileId.from(0), .start = 70, .end = 80 };
+    var t_ty = scope_ty;
+    t_ty.name = .{ .name = "T", .span = sp_t };
+    t_ty.span = sp_t;
+    var t_params = [_]ast.Param{.{
+        .name = .{ .name = "value", .span = sp_t },
+        .ty = t_ty,
+        .default = null,
+        .is_vararg = false,
+        .is_crossinline = false,
+        .is_noinline = false,
+        .annotations = &.{},
+        .span = sp_t,
+    }};
+    var takes_t = helper;
+    takes_t.name = .{ .name = "takesT", .span = sp_t };
+    takes_t.receiver_type = null;
+    takes_t.params = &t_params;
+    takes_t.span = sp_t;
     var members = [_]ast.Decl{
         .{ .Function = helper },
         .{ .Function = int_overload },
         .{ .Function = string_overload },
+        .{ .Function = takes_t },
     };
+    const host_type_params = [_]ast.TypeParam{.{
+        .name = .{ .name = "T", .span = sp },
+        .variance = .Invariant,
+        .upper_bound = null,
+        .is_reified = false,
+        .annotations = &.{},
+        .span = sp,
+    }};
     const cls: ast.Class = .{
         .name = .{ .name = "Host", .span = sp },
-        .type_params = &.{},
+        .type_params = @constCast(&host_type_params),
         .where_bounds = &.{},
         .primary_params = &.{},
         .init_blocks = &.{},
@@ -1888,18 +2327,126 @@ test "member headers reserve stable ids and preserve same-arity overloads" {
     try std.testing.expectEqualStrings("sample.Host.helper", f.fqn);
     try std.testing.expectEqualStrings("Scope", f.params[0].ty.name);
     try std.testing.expectEqual(owner, m.decl_sigs.get(id.int()).?.enclosing_class.?);
-    try std.testing.expectEqualStrings("Host", m.registry.member_ext_owner_class.get(id).?);
+    try std.testing.expectEqualStrings("sample.Host", m.registry.member_ext_owner_class.get(id).?);
     try std.testing.expectEqual(@as(usize, 1), m.funcsBySimpleName("helper").len);
     const overloads = m.memberDecls("sample.Host", "helper");
     try std.testing.expectEqual(@as(usize, 3), overloads.len);
     try std.testing.expectEqual(ir.FuncKind.instance_method, m.funcById(overloads[1]).?.kind);
     try std.testing.expectEqual(ir.FuncKind.instance_method, m.funcById(overloads[2]).?.kind);
+    try std.testing.expectEqualStrings("sample.Host", m.funcById(overloads[1]).?.params[0].ty.name);
+    try std.testing.expectEqual(@as(usize, 1), m.funcById(overloads[1]).?.params[0].ty.args.len);
+    const owner_param = ir.parseClassTypeParamIdentity(
+        m.funcById(overloads[1]).?.params[0].ty.args[0].name,
+    ).?;
+    try std.testing.expectEqual(owner, owner_param.owner);
+    try std.testing.expectEqualStrings("T", owner_param.param);
     try std.testing.expectEqualStrings("Int", m.funcById(overloads[1]).?.params[1].ty.name);
     try std.testing.expectEqualStrings("String", m.funcById(overloads[2]).?.params[1].ty.name);
+    const takes_t_id = m.memberDecls("sample.Host", "takesT")[0];
+    const takes_t_param = ir.parseClassTypeParamIdentity(
+        m.funcById(takes_t_id).?.params[1].ty.name,
+    ).?;
+    try std.testing.expectEqual(owner, takes_t_param.owner);
+    try std.testing.expectEqualStrings("T", takes_t_param.param);
     const exact_defaults = m.registry.local_fn_defaults.get(overloads[1]).?;
     try std.testing.expectEqual(@as(usize, 2), exact_defaults.items.len);
     try std.testing.expect(exact_defaults.items[1] != null);
     try std.testing.expect(m.registry.local_fn_defaults.get(overloads[2]) == null);
+}
+
+test "member body receiver keeps its reserved qualified generic owner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const left = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Box",
+        .fqn = "left.Box",
+        .package = "left",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const right = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Box",
+        .fqn = "right.Box",
+        .package = "right",
+        .type_params = &.{"U"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try std.testing.expect(left != right);
+
+    const sp = ast.Span{ .file = ir.FileId.from(7), .start = 1, .end = 2 };
+    const f: ast.Function = .{
+        .name = .{ .name = "value", .span = sp },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = null,
+        .body = .{ .Expr = .{ .IntLit = .{ .value = 1, .kind = .Int, .span = sp } } },
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = sp,
+    };
+    const reserved = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = reserved,
+        .name = "value",
+        .fqn = "right.Box.value",
+        .package = "right",
+        .params = &.{},
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .kind = .instance_method,
+    });
+    try m.recordFuncDeclSpan(a, sp, reserved);
+    try m.decl_sigs.put(reserved.int(), .{
+        .enclosing_class = right,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    const previous_package = build.setLowerSelfPackage("right");
+    defer _ = build.setLowerSelfPackage(previous_package);
+    const lowered = try lowerFunctionBodyWithImplicitOwnerEnclosing(
+        &m,
+        &f,
+        &.{"this"},
+        "Box",
+        null,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("right.Box", lowered.params[0].ty.name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.params[0].ty.args.len);
+    const owner_param = ir.parseClassTypeParamIdentity(lowered.params[0].ty.args[0].name).?;
+    try std.testing.expectEqual(right, owner_param.owner);
+    try std.testing.expectEqualStrings("U", owner_param.param);
 }
 
 fn expectContains(haystack: []const []const u8, needle: []const u8) !void {
@@ -1907,6 +2454,116 @@ fn expectContains(haystack: []const []const u8, needle: []const u8) !void {
         if (std.mem.eql(u8, s, needle)) return;
     }
     return error.TestExpectedEqual;
+}
+
+test "function bounds shadow class bounds and mark intersections incomplete" {
+    const a = std.testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const owner_id = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Owner",
+        .fqn = "sample.Owner",
+        .package = "sample",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put(
+        "sample.Owner",
+        try a.dupe(ir.ModuleRegistry.TypeParamBound, &.{
+            .{ .param = "T", .bound = "kotlin.Any" },
+        }),
+    );
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+
+    const sp = ast.Span{ .file = ir.FileId.from(0), .start = 0, .end = 1 };
+    const reserved = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = reserved,
+        .name = "value",
+        .fqn = "sample.Owner.value",
+        .package = "sample",
+        .params = &.{},
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .kind = .instance_method,
+    });
+    try m.recordFuncDeclSpan(a, sp, reserved);
+    try m.decl_sigs.put(reserved.int(), .{
+        .enclosing_class = owner_id,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    const number_ty = ast.TypeRef{
+        .name = .{ .name = "Number", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const params = [_]ast.TypeParam{.{
+        .name = .{ .name = "T", .span = sp },
+        .variance = .Invariant,
+        .upper_bound = number_ty,
+        .is_reified = false,
+        .annotations = &.{},
+        .span = sp,
+    }};
+    const comparable_ty = ast.TypeRef{
+        .name = .{ .name = "Comparable", .span = sp },
+        .nullable = false,
+        .span = sp,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const where_bounds = [_]ast.WhereBound{.{
+        .name = .{ .name = "T", .span = sp },
+        .bound = comparable_ty,
+        .span = sp,
+    }};
+    var f: ast.Function = undefined;
+    f.name = .{ .name = "value", .span = sp };
+    f.span = sp;
+    f.type_params = @constCast(&params);
+    f.where_bounds = @constCast(&where_bounds);
+
+    try addScopedTypeParamBounds(&b, &m, "Owner", &f);
+    const bounds = (try b.typeParamBoundsSlice()).?;
+    defer a.free(bounds);
+    try std.testing.expectEqual(@as(usize, 2), bounds.len);
+    var saw_class = false;
+    var saw_function = false;
+    for (bounds) |bound| {
+        if (std.mem.startsWith(u8, bound.param, "$class$")) {
+            saw_class = true;
+            try std.testing.expectEqualStrings("kotlin.Any", bound.bound);
+            try std.testing.expect(bound.complete);
+        } else if (std.mem.eql(u8, bound.param, "T")) {
+            saw_function = true;
+            try std.testing.expectEqualStrings("Number", bound.bound);
+            try std.testing.expect(!bound.complete);
+        }
+    }
+    try std.testing.expect(saw_class);
+    try std.testing.expect(saw_function);
 }
 
 test "bind params loads each param and marks it" {

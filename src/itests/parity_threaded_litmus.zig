@@ -385,28 +385,62 @@ test "eager pipeline output parity" {
         "fun pick(x: Int): String = \"int:\" + x\n" ++
         "fun pick(x: String): String = \"string:\" + x\n" ++
         "fun <T> pick(x: List<T>): String = \"list:\" + x.size\n" ++
+        "class EagerAccumulator {\n" ++
+        "    operator fun plus(value: Number): String = \"number:\" + value\n" ++
+        "    operator fun plus(value: CharSequence): String = \"chars:\" + value\n" ++
+        "}\n" ++
+        "class EagerScope<T : Number>(private val value: T) {\n" ++
+        "    fun kotlin.String.scopedIdentityValue(): T = value\n" ++
+        "    fun <T : CharSequence> shadowedIdentityPick(value: T): String =\n" ++
+        "        EagerAccumulator() + \"$value\".scopedIdentityValue()\n" ++
+        "}\n" ++
         "fun main() {\n" ++
         "    println(pick(42))\n" ++
         "    println(pick(\"y\"))\n" ++
         "    println(pick(listOf(1, 2)))\n" ++
+        "    println(listOf(1) + sequenceOf(2, 3))\n" ++
+        "    println(EagerScope(4).shadowedIdentityPick(\"shadow\"))\n" ++
         "}\n";
     std.Io.Dir.cwd().createDirPath(io, "/tmp/klio_eager_itest") catch {};
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/klio_eager_itest/e1.kt", .data = src }) catch return error.WriteFailed;
 
     var env = std.process.Environ.Map.init(al);
     runtime.procEnvPutAllInto(al, &env);
+    _ = env.remove("KLIO_EAGER");
     const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
     const lazy = std.process.run(al, io, .{
         .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
         .environ_map = &env,
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch return error.SpawnFailed;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, lazy.term);
     try env.put("KLIO_EAGER", "1");
     const eager = std.process.run(al, io, .{
         .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
         .environ_map = &env,
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch return error.SpawnFailed;
-    try std.testing.expectEqualStrings("int:42\nstring:y\nlist:2\n", lazy.stdout);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager.term);
+    try std.testing.expectEqualStrings("int:42\nstring:y\nlist:2\n[1, 2, 3]\nnumber:4\n", lazy.stdout);
     try std.testing.expectEqualStrings(lazy.stdout, eager.stdout);
+
+    const eager_ir = std.process.run(al, io, .{
+        .argv = &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" },
+        .environ_map = &env,
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
+    }) catch return error.SpawnFailed;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager_ir.term);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        eager_ir.stdout,
+        "[DIRECT member-ext dispatch=r",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        eager_ir.stdout,
+        " -> scopedIdentityValue#",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "Call plus#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "[DYN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "0 dynamic") != null);
 }

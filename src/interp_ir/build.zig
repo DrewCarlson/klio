@@ -42,6 +42,52 @@ const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
 const StringSet = std.StringHashMap(void);
 
+fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
+    return !bound.nullable and bound.type_args.len == 0 and
+        bound.function == null and !bound.definitely_non_null and
+        bound.qualified_path == null;
+}
+
+fn collectClassTypeParamBounds(
+    allocator: Allocator,
+    class: *const ast.Class,
+) Allocator.Error!?[]const ir.ModuleRegistry.TypeParamBound {
+    if (class.type_params.len == 0) return null;
+    var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+    errdefer bounds.deinit(allocator);
+    for (class.type_params) |*param| {
+        const first = bounds.items.len;
+        var any_bound = false;
+        if (param.upper_bound) |*upper| {
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = upper.name.name,
+                .complete = boundTypeRecordComplete(upper),
+            });
+            any_bound = true;
+        }
+        for (class.where_bounds) |*where_bound| {
+            if (!std.mem.eql(u8, where_bound.name.name, param.name.name)) continue;
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = where_bound.bound.name.name,
+                .complete = boundTypeRecordComplete(&where_bound.bound),
+            });
+            any_bound = true;
+        }
+        if (!any_bound) {
+            try bounds.append(allocator, .{
+                .param = param.name.name,
+                .bound = "kotlin.Any",
+            });
+        }
+        if (bounds.items.len - first > 1) {
+            for (bounds.items[first..]) |*bound| bound.complete = false;
+        }
+    }
+    return @as(?[]const ir.ModuleRegistry.TypeParamBound, try bounds.toOwnedSlice(allocator));
+}
+
 // -------------------------------------------------------------------------
 // Shared key/value table types (used by both BuiltModule and the Vm's
 // ProgramImage so they agree on shape).
@@ -1805,18 +1851,9 @@ fn buildModuleWithOverrides(
             // on `ConcurrentMap<Key, Value>`) from a nominal reference to
             // an unrelated same-named class.
             if (!module.registry.class_type_param_bounds.contains(e.key_ptr.*)) {
-                var cbounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
-                for (e.value_ptr.get().type_params) |*tp| {
-                    if (tp.upper_bound) |*ub| {
-                        try cbounds.append(a, .{ .param = tp.name.name, .bound = ub.name.name });
-                    } else {
-                        try cbounds.append(a, .{ .param = tp.name.name, .bound = "Any" });
-                    }
-                }
-                if (cbounds.items.len != 0) {
-                    try module.registry.class_type_param_bounds.put(e.key_ptr.*, try cbounds.toOwnedSlice(a));
-                } else {
-                    cbounds.deinit(a);
+                const class = e.value_ptr.get();
+                if (try collectClassTypeParamBounds(a, class)) |bounds| {
+                    try module.registry.class_type_param_bounds.put(e.key_ptr.*, bounds);
                 }
             }
         }
@@ -2429,12 +2466,25 @@ fn buildModuleWithOverrides(
                 // for the strict extension-receiver prover.
                 var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
                 for (f.type_params) |*tp| {
+                    const first = bounds.items.len;
                     if (tp.upper_bound) |*ub| {
-                        try bounds.append(a, .{ .param = tp.name.name, .bound = ub.name.name });
+                        try bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = ub.name.name,
+                            .complete = boundTypeRecordComplete(ub),
+                        });
                     }
-                }
-                for (f.where_bounds) |*wb| {
-                    try bounds.append(a, .{ .param = wb.name.name, .bound = wb.bound.name.name });
+                    for (f.where_bounds) |*where_bound| {
+                        if (!std.mem.eql(u8, where_bound.name.name, tp.name.name)) continue;
+                        try bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = where_bound.bound.name.name,
+                            .complete = boundTypeRecordComplete(&where_bound.bound),
+                        });
+                    }
+                    if (bounds.items.len - first > 1) {
+                        for (bounds.items[first..]) |*bound| bound.complete = false;
+                    }
                 }
                 if (bounds.items.len != 0) {
                     try module.registry.func_type_param_bounds.put(id, try bounds.toOwnedSlice(a));
@@ -3212,13 +3262,38 @@ fn buildModuleWithOverrides(
         switch (d.*) {
             .Property => |p| if (p.receiver_type != null) try ext_prop_decls.append(a, .{ .p = p, .owner = null }),
             .Class => |*c| {
+                const owner_fqn = try resolveFqn(
+                    a,
+                    fqn_overrides,
+                    c.span,
+                    package_prefix,
+                    c.name.name,
+                );
                 for (c.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = c.name.name, .owner_type_params = c.type_params });
+                    if (m.* == .Property and m.Property.receiver_type != null) {
+                        try ext_prop_decls.append(a, .{
+                            .p = m.Property,
+                            .owner = owner_fqn,
+                            .owner_type_params = c.type_params,
+                        });
+                    }
                 }
             },
             .Object => |*o| {
+                const owner_fqn = try resolveFqn(
+                    a,
+                    fqn_overrides,
+                    o.span,
+                    package_prefix,
+                    o.name.name,
+                );
                 for (o.members) |*m| {
-                    if (m.* == .Property and m.Property.receiver_type != null) try ext_prop_decls.append(a, .{ .p = m.Property, .owner = o.name.name });
+                    if (m.* == .Property and m.Property.receiver_type != null) {
+                        try ext_prop_decls.append(a, .{
+                            .p = m.Property,
+                            .owner = owner_fqn,
+                        });
+                    }
                 }
             },
             else => {},
@@ -3485,10 +3560,6 @@ fn buildModuleWithOverrides(
     // complete. Runtime member dispatch can then use only class + slot ids.
     try module.linkMethodSlots(a);
 
-    // Static dispatch bake: resolve provably-monomorphic explicit-receiver
-    // member calls to their target at lower time (see `bakeStaticMemberCalls`).
-    bakeStaticMemberCalls(module, a);
-
     return .{
         .module = module_ref,
         .classes = classes,
@@ -3522,227 +3593,6 @@ fn buildModuleWithOverrides(
         .delegated_body_props = delegated_body_props,
         .allocator = allocator,
     };
-}
-
-// -------------------------------------------------------------------------
-// Static dispatch bake (lowering-time).
-// -------------------------------------------------------------------------
-
-/// Resolve provably-monomorphic explicit-receiver member calls to their target
-/// at lower time. For each `recv.name(args)` in this module's own funcs, when
-/// `name` denotes exactly ONE body-bearing top-level extension / member-extension
-/// and NO class in this module declares a member of that name (Kotlin binds a
-/// member over an extension), the call cannot resolve to anything else at run
-/// time — so its target is settled here, in `Inst.CallMember.resolved`, and the
-/// VM dispatches straight through it, skipping the name-based member-dispatch
-/// ladder + candidate walk. This is the static-dispatch step a bytecode VM
-/// needs: the target is resolved once, at build time, not per call.
-///
-/// Soundness is checked, not assumed: `KLIO_BAKE_ASSERT` runs the full name
-/// walk and flags any callsite whose walk winner differs from the baked target
-/// (a builtin-member or cross-module shadow this static gate did not model). The
-/// runtime fast-path additionally falls back to the walk when a member-extension
-/// owner is unreachable, so a conservative bake degrades rather than miscalls.
-fn bakeStaticMemberCalls(module: *ir.Module, a: Allocator) void {
-    var member_names = std.StringHashMap(void).init(a);
-    defer member_names.deinit();
-    for (module.classes.items) |*c| {
-        for (c.methods) |mfid| {
-            const mf = module.funcById(mfid) orelse continue;
-            member_names.put(mf.name, {}) catch {};
-        }
-    }
-
-    var baked: usize = 0;
-    var seen: usize = 0;
-    for (module.funcs.items) |*f| {
-        for (f.blocks) |*blk| {
-            for (blk.insts) |*inst| {
-                switch (inst.*) {
-                    .CallMember => |*cm| {
-                        seen += 1;
-                        if (cm.resolved != null) continue;
-                        // The `resolved` fast-path dispatches positionally (it
-                        // does not forward `arg_names`), so a named-argument call
-                        // must keep the name-based path that binds by label.
-                        if (hasNamedArg(cm.arg_names)) continue;
-                        const name = switch (module.consts.items[cm.name.int()]) {
-                            .String => |s| s,
-                            else => continue,
-                        };
-                        // A member declared with this name binds ahead of any
-                        // extension (Kotlin's member-over-extension rule). A member
-                        // method is virtual, so it is baked only when the receiver's
-                        // static type is a FINAL class — one that can never be
-                        // subclassed, so the method cannot be overridden anywhere,
-                        // even open-world (a serialized bake stays correct for every
-                        // consumer). Otherwise the name is an extension surface.
-                        if (member_names.contains(name)) {
-                            if (finalReceiverMethod(module, cm.declared_recv, name, cm.n_args)) |mfid| {
-                                cm.resolved = mfid;
-                                baked += 1;
-                            }
-                            continue;
-                        }
-                        cm.resolved = uniqueMemberTarget(module, name, cm.n_args) orelse continue;
-                        baked += 1;
-                    },
-                    else => {},
-                }
-            }
-        }
-    }
-    if (runtime.getenvSlice("KLIO_BAKE_STATS") != null and seen != 0) {
-        std.debug.print("[bake-stats] module funcs={d} callmembers={d} baked={d}\n", .{ module.funcs.items.len, seen, baked });
-    }
-}
-
-/// The single body-bearing top-level extension / member-extension named `name`,
-/// or null when zero or more than one exists. A CallMember's target must take an
-/// explicit receiver (`params[0].name == "this"`); uniqueness among those makes
-/// `recv.name(...)` unambiguous independent of the runtime receiver.
-fn hasNamedArg(arg_names: []const ?ir.ConstId) bool {
-    for (arg_names) |n| if (n != null) return true;
-    return false;
-}
-
-/// The FuncId a `recv.name(<n_args>)` MEMBER call resolves to when the receiver's
-/// static type (`declared_recv`) is a FINAL user class, or null. A final class
-/// can never be subclassed, so the method cannot be overridden anywhere — the
-/// dispatch is monomorphic even open-world, which makes it safe to bake (unlike a
-/// method on an open/abstract class, where a subtype override would diverge from a
-/// serialized target). The receiver being a resolvable user class also guarantees
-/// the runtime value is an instance of that class, never a builtin with a
-/// same-named member.
-fn finalReceiverMethod(module: *ir.Module, declared_recv: ?ir.ConstId, name: []const u8, n_args: u32) ?ir.FuncId {
-    const did = declared_recv orelse return null;
-    var h = switch (module.consts.items[did.int()]) {
-        .String => |s| s,
-        else => return null,
-    };
-    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| h = h[i + 1 ..];
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
-    h = std.mem.trimEnd(u8, h, "?");
-    if (h.len == 0) return null;
-    const cid = module.classId(h) orelse return null;
-    if (cid.int() >= module.classes.items.len) return null;
-    const c = &module.classes.items[cid.int()];
-    const found = resolveMethodInHierarchy(module, cid, name, n_args, 0) orelse return null;
-    // A method DECLARED on an interface is always overridable in Kotlin — an
-    // interface member is implicitly `open`, whether it is abstract or carries a
-    // default body, and its `is_open` flag does not record that. Any implementer
-    // (open-world) may override it, so `recv.name()` is not monomorphic even when
-    // the flag looks final. Never bake such a target.
-    const decl_class = &module.classes.items[found.cls.int()];
-    if (decl_class.is_interface) return null;
-    // Condition 1 — the RECEIVER class is final (not `open`, not
-    // abstract/interface/sealed): it can never be subclassed, so `recv` is
-    // exactly `C` and the resolved method is the unique target regardless of its
-    // own modifiers.
-    if (!c.is_open and !c.is_abstract) return found.fid;
-    // Condition 2 — the receiver class is open/abstract, but the resolved METHOD
-    // is a class member that is itself un-overridable, so `recv.name()` is
-    // monomorphic whatever `recv`'s runtime type. The final-ness flags are
-    // serialized with the func header, so this holds for an image-decoded base
-    // method as well as a freshly-lowered one.
-    const mf = module.funcById(found.fid) orelse return null;
-    if (methodCannotBeOverridden(mf)) return found.fid;
-    return null;
-}
-
-/// A class member that Kotlin forbids any subclass from overriding: not `open`,
-/// and either not an `override` at all or an explicit `final override` (a bare
-/// `override` is open by default and may be overridden further down). A plain
-/// member with no `open`/`override` is final; a redundant `final` on it is
-/// honored. Such a method is the unique target of `recv.name()` regardless of
-/// the receiver's runtime type, so the call may be statically dispatched.
-/// Caller must have already excluded interface-declared methods (implicitly
-/// open, which this flag-only check cannot see).
-fn methodCannotBeOverridden(mf: *const ir.Func) bool {
-    if (mf.is_open) return false;
-    if (mf.is_override and !mf.is_final) return false;
-    return true;
-}
-
-const ResolvedMethod = struct { fid: ir.FuncId, cls: ir.ClassId };
-
-/// First body-bearing, arity-compatible method named `name` in class `cid`'s
-/// resolution order (own methods, then supertypes), paired with the class that
-/// declares it — the target `recv.name()` binds for a receiver of exactly `cid`.
-/// `null` when unresolved. The declaring class lets the caller tell an
-/// interface member (always overridable) from a class member.
-fn resolveMethodInHierarchy(module: *ir.Module, cid: ir.ClassId, name: []const u8, n_args: u32, depth: u8) ?ResolvedMethod {
-    if (depth > 32) return null;
-    if (cid.int() >= module.classes.items.len) return null;
-    const c = &module.classes.items[cid.int()];
-    for (c.methods) |mfid| {
-        const mf = module.funcById(mfid) orelse continue;
-        if (!std.mem.eql(u8, mf.name, name)) continue;
-        // A member method carries the receiver as a synthesized leading `this`
-        // param (like an extension), so `extAcceptsArity` scores the value params.
-        if (!(mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this"))) continue;
-        if (!mf.hasBody()) continue;
-        if (!extAcceptsArity(mf, n_args)) continue;
-        return .{ .fid = mfid, .cls = cid };
-    }
-    for (c.supertypes) |sid| {
-        if (resolveMethodInHierarchy(module, sid, name, n_args, depth + 1)) |m| return m;
-    }
-    return null;
-}
-
-/// Whether an extension / member-extension `f` (whose `params[0]` is the
-/// receiver) could bind a positional call of `n_args` value arguments: at least
-/// its required (non-default, non-vararg) value params are supplied, and no more
-/// than its declared value params unless it ends in a vararg. Deliberately
-/// permissive at the boundary — used only to decide whether ONE candidate is
-/// uniquely selected by arity, so over-counting a rival merely declines the bake.
-fn extAcceptsArity(f: *const ir.Func, n_args: u32) bool {
-    if (f.params.len == 0) return false;
-    const vps = f.params[1..]; // skip the receiver `this`
-    var required: u32 = 0;
-    var has_vararg = false;
-    for (vps) |*p| {
-        if (p.is_vararg) {
-            has_vararg = true;
-        } else if (!p.has_default) {
-            required += 1;
-        }
-    }
-    if (n_args < required) return false;
-    if (!has_vararg and n_args > vps.len) return false;
-    return true;
-}
-
-/// The single body-bearing top-level extension / member-extension named `name`
-/// that a `recv.name(<n_args args>)` call must dispatch to, or null when zero or
-/// more than one qualify. A CallMember's target takes an explicit receiver
-/// (`params[0].name == "this"`); when several such candidates share the name,
-/// the callsite's fixed arity selects among them (Kotlin overloads that differ
-/// in arity) — a unique arity-compatible candidate is still statically
-/// determined. If two remain arity-compatible (same arity, distinguished only by
-/// receiver/argument type) the pick needs runtime types, so the call is left to
-/// the name path.
-fn uniqueMemberTarget(module: *ir.Module, name: []const u8, n_args: u32) ?ir.FuncId {
-    var only: ?ir.FuncId = null; // sole candidate regardless of arity
-    var candidates: u32 = 0;
-    var arity_hit: ?ir.FuncId = null; // sole arity-compatible candidate
-    var arity_hits: u32 = 0;
-    for (module.funcsBySimpleName(name)) |fid| {
-        const f = module.funcById(fid) orelse continue;
-        if (!(f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"))) continue;
-        if (!f.hasBody()) continue;
-        candidates += 1;
-        only = fid;
-        if (extAcceptsArity(f, n_args)) {
-            arity_hits += 1;
-            arity_hit = fid;
-        }
-    }
-    if (candidates == 0) return null;
-    if (candidates == 1) return only; // unique by name — arity irrelevant
-    if (arity_hits == 1) return arity_hit; // unique by arity among the overloads
-    return null;
 }
 
 // -------------------------------------------------------------------------
@@ -5034,6 +4884,106 @@ test "build_module produces an owned empty module shell" {
     defer built.deinit();
     try testing.expect(built.main == null);
     try testing.expectEqual(@as(usize, 0), built.top_level_props.items.len);
+}
+
+test "class type-parameter metadata includes where bounds and unbounded identities" {
+    const s = span.Span.init(span.FileId.from(0), 0, 1);
+    const number_ty = ast.TypeRef{
+        .name = .{ .name = "Number", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const comparable_ty = ast.TypeRef{
+        .name = .{ .name = "Comparable", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const string_ty = ast.TypeRef{
+        .name = .{ .name = "String", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const comparable_args = [_]ast.TypeArg{.{
+        .variance = .Invariant,
+        .is_star = false,
+        .ty = string_ty,
+        .span = s,
+    }};
+    const comparable_string_ty = ast.TypeRef{
+        .name = .{ .name = "Comparable", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = @constCast(&comparable_args),
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const params = [_]ast.TypeParam{
+        .{
+            .name = .{ .name = "T", .span = s },
+            .variance = .Out,
+            .upper_bound = number_ty,
+            .is_reified = false,
+            .annotations = &.{},
+            .span = s,
+        },
+        .{
+            .name = .{ .name = "V", .span = s },
+            .variance = .Invariant,
+            .upper_bound = comparable_string_ty,
+            .is_reified = false,
+            .annotations = &.{},
+            .span = s,
+        },
+        .{
+            .name = .{ .name = "U", .span = s },
+            .variance = .Invariant,
+            .upper_bound = null,
+            .is_reified = false,
+            .annotations = &.{},
+            .span = s,
+        },
+    };
+    const where_bounds = [_]ast.WhereBound{.{
+        .name = .{ .name = "T", .span = s },
+        .bound = comparable_ty,
+        .span = s,
+    }};
+    var class: ast.Class = undefined;
+    class.type_params = @constCast(&params);
+    class.where_bounds = @constCast(&where_bounds);
+
+    const bounds = (try collectClassTypeParamBounds(testing.allocator, &class)).?;
+    defer testing.allocator.free(bounds);
+    try testing.expectEqual(@as(usize, 4), bounds.len);
+    try testing.expectEqualStrings("T", bounds[0].param);
+    try testing.expectEqualStrings("Number", bounds[0].bound);
+    try testing.expect(!bounds[0].complete);
+    try testing.expectEqualStrings("T", bounds[1].param);
+    try testing.expectEqualStrings("Comparable", bounds[1].bound);
+    try testing.expect(!bounds[1].complete);
+    try testing.expectEqualStrings("V", bounds[2].param);
+    try testing.expectEqualStrings("Comparable", bounds[2].bound);
+    try testing.expect(!bounds[2].complete);
+    try testing.expectEqualStrings("U", bounds[3].param);
+    try testing.expectEqualStrings("kotlin.Any", bounds[3].bound);
+    try testing.expect(bounds[3].complete);
 }
 
 test "expect class member defaults transplant to the matching actual signature" {

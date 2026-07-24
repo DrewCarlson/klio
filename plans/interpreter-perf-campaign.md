@@ -250,16 +250,13 @@ NOT merged (left in worktree `agent-a98a7b41b750ea981`, revertable).
 CONCLUSION (runtime cache): a *runtime* cache cannot safely capture member-extension
 resolution in the coroutine core — a dead end.
 
-### THEN TRIED — lowering-time static extension bake (correct, validated, but FLAT)
+### Historical experiment — post-lowering static extension bake
 
-Built the correct approach with a SAFE two-phase methodology (worktree agent): a
-post-lowering `bakeMemberExtCallSites()` pass resolves a `recv.name()` call to a UNIQUE
-member-extension (name maps to exactly one function module-wide, owned by the callsite's
-lexical enclosing-class chain, receiver-type conformant or unambiguous) and stores it in
-`Inst.CallMember.resolved`. Phase 1 kept the walk driving dispatch while asserting
-`baked_fid == walk_fid` (`KLIO_BAKE_ASSERT`); Phase 2 (`invokeResolvedMember`) dispatches
-the baked fid, replaying the member-ext owner-find + `pushEnclosing`, falling back to the
-walk if the owner is unreachable (verify-on-hit).
+The experiment used a post-lowering `bakeMemberExtCallSites()` pass to resolve a
+`recv.name()` call to a unique member extension and store it in
+`Inst.CallMember.resolved`. It first compared the selected identity with the
+runtime walk, then dispatched that identity while replaying the member-extension
+owner search.
 
 RESULT: **correctness is a clean GO** — 33 callsites bake, **0 mismatches** across 1803
 matches (coro bench + channel/async/flow/stdlib programs), checksums and outputs
@@ -317,26 +314,15 @@ keep the deliverable focused on static dispatch.)
 > first deferred-call correction now preserves an authoritative scoped `FuncId` set
 > in IR and forbids runtime widening to the program-wide simple-name index. Bare
 > spread calls preserve the winning tier's vararg-only set as well, then select and
-> invoke one exact `FuncId` after flattening. The bake remains useful for coverage
-> measurement until direct exact/virtual emission subsumes it.
+> invoke one exact `FuncId` after flattening.
 
-`bakeStaticMemberCalls` (`interp_ir/build.zig`, run at each module's lowering finalize, so
-it serializes into packs) sets `Inst.CallMember.resolved` for every explicit-receiver call
-`recv.name(args)` where `name` denotes exactly ONE body-bearing top-level extension /
-member-extension and no class declares a member of that name (Kotlin's member-over-extension
-rule). The VM dispatches such a call straight through `invokeResolvedMember` (extended to
-replay a member-extension's owner-find, falling back to the walk when the owner is
-unreachable), skipping the whole `callMemberInnerStatic` ladder + `extensionFnFallback`
-walk. `KLIO_BAKE_OFF=1` is the kill-switch; `KLIO_BAKE_STATS=1` reports coverage.
+The post-lowering bake is now deleted. Exact member extensions are selected in
+expression lowering and carry their `FuncId`, extension receiver, and dispatch
+receiver in IR. Missing targets are image/link errors; they do not fall back to
+runtime name dispatch. The former bake environment switches no longer exist.
 
-This demonstrated that a build-time target can bypass the name walk and supplied a
-coverage oracle for the migration. It is not the bytecode contract because a baked
-target can still fall back to runtime name dispatch. Coverage: ~787 callsites of ~14k
-in a coro program.
-
-Measured (ReleaseFast, coro bench, median of N; `klio run`/itests re-lower from source so the
-bake applies everywhere):
-- Correctness: 279/279 examples byte-identical bake on vs `KLIO_BAKE_OFF`. Behavior-preserving.
+Historical measurements (ReleaseFast, coro bench, median of N):
+- Correctness: 279/279 examples were byte-identical.
 - Wall: **within noise (~0.4-1.6%).**
 
 The empirical ceiling (an unverified per-callsite cache that skipped the ladder for ALL

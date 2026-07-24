@@ -2613,8 +2613,14 @@ fn LoopTramp(comptime H: type) type {
                 }
             }
             const res = if (site.is_member) member: {
-                if (comptime !@hasDecl(H, "callMemberNamed")) break :member EvalResult{ .err = .{ .Type = "host cannot dispatch member calls" } };
-                const recv = lc.frame.regs.items[site.recv_reg];
+                var recv = switch (cl.reg_types[site.recv_reg]) {
+                    .object, .unknown => lc.frame.regs.items[site.recv_reg],
+                    .null_ => Value.Null,
+                    else => jit_loop.valueFromSlot(
+                        cl.reg_types[site.recv_reg],
+                        tctx.slots[site.recv_reg],
+                    ),
+                };
                 // A varying boxed receiver may be a different class this iteration;
                 // deopt unless it matches the class the return type was resolved for.
                 if (site.recv_class != 0 and site.recv_varies and (recv != .Instance or jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
@@ -2623,6 +2629,45 @@ fn LoopTramp(comptime H: type) type {
                 }
                 recv.retain();
                 defer recv.release(lc.allocator);
+                if (site.resolved_member) |fid| {
+                    if (comptime !@hasDecl(H, "invokeResolvedMember")) {
+                        break :member EvalResult{ .err = .{
+                            .Type = "host cannot invoke resolved member calls",
+                        } };
+                    }
+                    var dispatch: ?Value = if (site.dispatch_recv_reg) |reg|
+                        switch (cl.reg_types[reg]) {
+                            .object, .unknown => lc.frame.regs.items[reg],
+                            .null_ => Value.Null,
+                            else => jit_loop.valueFromSlot(
+                                cl.reg_types[reg],
+                                tctx.slots[reg],
+                            ),
+                        }
+                    else
+                        null;
+                    if (dispatch) |value| value.retain();
+                    defer if (dispatch) |value| value.release(lc.allocator);
+                    const dispatch_ptr: ?*const Value = if (dispatch) |*value|
+                        value
+                    else
+                        null;
+                    break :member lc.host.invokeResolvedMember(
+                        lc.allocator,
+                        dispatch_ptr,
+                        &recv,
+                        fid,
+                        argbuf[0..site.n_args],
+                    ) catch {
+                        lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                        return jit_loop.throwCode(site.block);
+                    };
+                }
+                if (comptime !@hasDecl(H, "callMemberNamed")) {
+                    break :member EvalResult{ .err = .{
+                        .Type = "host cannot dispatch member calls",
+                    } };
+                }
                 // Keep the caller's instance `this` reachable for member-extension
                 // visibility, exactly as the interpreted CallMember path does.
                 var pushed = false;
@@ -4524,18 +4569,6 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
-/// Kill-switch for the lowering-time static dispatch bake (`KLIO_BAKE_OFF=1`
-/// routes every `resolved` CallMember back through the name-based walk). Resolved
-/// once; a benign first-use race computes the same value. For A/B measurement and
-/// as a safety escape hatch.
-var bake_disabled: ?bool = null;
-fn bakeDisabled() bool {
-    if (bake_disabled) |v| return v;
-    const v = if (runtime.getenvSlice("KLIO_BAKE_OFF")) |s| std.mem.eql(u8, s, "1") else false;
-    bake_disabled = v;
-    return v;
-}
-
 /// Execute a statically selected virtual slot. Unlike `CallMember`, this arm
 /// has no name-based fallback: a missing slot is a link error in the program
 /// image and is reported by the host.
@@ -4567,34 +4600,46 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
+    const recv = frame.read(cm.receiver);
+    // Complete lowering evidence selected this declaration. Execute that
+    // identity before representation-specific member fast paths; an invalid
+    // identity is an image/link error, never permission to reinterpret the
+    // call through name-based dispatch.
+    if (cm.resolved) |fid| {
+        if (comptime @hasDecl(H, "invokeResolvedMember")) {
+            recv.retain();
+            defer recv.release(allocator);
+            var dispatch_recv: ?Value = if (cm.dispatch_receiver) |reg|
+                frame.read(reg)
+            else
+                null;
+            if (dispatch_recv) |value| value.retain();
+            defer if (dispatch_recv) |value| value.release(allocator);
+            const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
+            defer allocator.free(ra);
+            const dispatch_ptr: ?*const Value = if (dispatch_recv) |*value|
+                value
+            else
+                null;
+            switch (try host.invokeResolvedMember(
+                allocator,
+                dispatch_ptr,
+                &recv,
+                fid,
+                ra,
+            )) {
+                .ok => |rv| {
+                    try frame.write(cm.dst, rv);
+                    return .cont;
+                },
+                .err => |e| return raiseStep(frame, e),
+            }
+        }
+        return raiseStep(frame, .{ .Type = "resolved member calls are unsupported by this host" });
+    }
     if (fastSubscript(allocator, frame, cm)) |rv| {
         try frame.write(cm.dst, rv);
         return .cont;
-    }
-    const recv = frame.read(cm.receiver);
-    // Statically-resolved dispatch: the lowerer proved this call
-    // monomorphic and baked its target, so go straight to it — no
-    // name lookup, applicability walk, or FQN scan. A `null` return
-    // (target vanished) falls through to the name-based path, so a
-    // stale bake degrades rather than miscalls.
-    if (cm.resolved) |fid| {
-        if (comptime @hasDecl(H, "invokeResolvedMember")) {
-            if (!bakeDisabled()) {
-                recv.retain();
-                defer recv.release(allocator);
-                const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
-                defer allocator.free(ra);
-                if (try host.invokeResolvedMember(allocator, &recv, fid, ra)) |res| {
-                    switch (res) {
-                        .ok => |rv| {
-                            try frame.write(cm.dst, rv);
-                            return .cont;
-                        },
-                        .err => |e| return raiseStep(frame, e),
-                    }
-                }
-            }
-        }
     }
     // Fast path: a range iterator's `hasNext()`/`next()`. The universal
     // `for (x in range)` desugaring calls these once per element; the
@@ -4758,8 +4803,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
         else if (cmv.fallback_receiver_shape_known)
             try host.callValueNamed(allocator, &fb, user_args, names)
         else
-            try host.callValueWithThis(allocator, &fb, &recv, user_args, names))
-        {
+            try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
             .ok => |rv| try frame.write(cmv.dst, rv),
             .err => |e| return raiseStep(frame, e),
         }
@@ -4795,8 +4839,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
             else if (cmv.fallback_receiver_shape_known)
                 try host.callValueNamed(allocator, &fb, user_args, names)
             else
-                try host.callValueWithThis(allocator, &fb, &recv, user_args, names))
-            {
+                try host.callValueWithThis(allocator, &fb, &recv, user_args, names)) {
                 .ok => |rv| try frame.write(cmv.dst, rv),
                 .err => |e| return raiseStep(frame, e),
             }

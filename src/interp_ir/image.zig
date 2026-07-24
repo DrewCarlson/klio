@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 33;
+pub const FORMAT_VERSION: u32 = 34;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -2496,6 +2496,26 @@ test "codec preserves explicit receiver-lambda shape" {
     try testing.expect(got.lambda_receiver_shape_known);
     try testing.expect(got.lambda_has_receiver);
     try testing.expectEqualStrings("String", got.lambda_receiver_ty.?);
+}
+
+test "codec preserves both receivers of an exact member extension call" {
+    const a = testing.allocator;
+    const inst = ir.Inst{ .CallMember = .{
+        .dst = ir.Reg.from(1),
+        .receiver = ir.Reg.from(2),
+        .name = ir.ConstId.from(3),
+        .args = ir.Reg.from(4),
+        .n_args = 0,
+        .resolved = ir.FuncId.from(5),
+        .dispatch_receiver = ir.Reg.from(6),
+    } };
+    const bytes = try encodeOne(ir.Inst, a, &inst);
+    defer a.free(bytes);
+    const got = try decodeOne(ir.Inst, a, bytes);
+    try testing.expect(got == .CallMember);
+    try testing.expectEqual(ir.Reg.from(2), got.CallMember.receiver);
+    try testing.expectEqual(ir.FuncId.from(5), got.CallMember.resolved.?);
+    try testing.expectEqual(ir.Reg.from(6), got.CallMember.dispatch_receiver.?);
 }
 
 test "module image preserves linked identities with lazy function headers" {

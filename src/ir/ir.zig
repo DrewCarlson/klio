@@ -132,6 +132,44 @@ pub const ClassId = enum(u32) {
     }
 };
 
+pub fn classTypeParamIdentity(
+    allocator: Allocator,
+    owner: ClassId,
+    param: []const u8,
+) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "$class$\x00{d}\x00{d}:{s}",
+        .{ owner.int(), param.len, param },
+    );
+}
+
+pub const ClassTypeParamIdentity = struct {
+    owner: ClassId,
+    param: []const u8,
+};
+
+pub fn parseClassTypeParamIdentity(raw_name: []const u8) ?ClassTypeParamIdentity {
+    var name = raw_name;
+    if (std.mem.startsWith(u8, name, "out#")) {
+        name = name["out#".len..];
+    } else if (std.mem.startsWith(u8, name, "in#")) {
+        name = name["in#".len..];
+    }
+    const prefix = "$class$\x00";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const owner_end = std.mem.indexOfScalar(u8, name[prefix.len..], 0) orelse return null;
+    const owner_text = name[prefix.len .. prefix.len + owner_end];
+    const owner_int = std.fmt.parseInt(u32, owner_text, 10) catch return null;
+    const length_start = prefix.len + owner_end + 1;
+    const colon = std.mem.indexOfScalar(u8, name[length_start..], ':') orelse return null;
+    const length_text = name[length_start .. length_start + colon];
+    const param_len = std.fmt.parseInt(usize, length_text, 10) catch return null;
+    const param = name[length_start + colon + 1 ..];
+    if (param.len != param_len) return null;
+    return .{ .owner = ClassId.from(owner_int), .param = param };
+}
+
 /// Constant pool index for literals too large to fit in a `u32`.
 pub const ConstId = enum(u32) {
     _,
@@ -402,6 +440,11 @@ pub const Inst = union(enum) {
         /// member — so direct dispatch stays sound. Null keeps the virtual
         /// name-based path.
         resolved: ?FuncId = null,
+        /// Declaring instance for a resolved member-extension target. The
+        /// extension receiver remains in `receiver`; this second operand is
+        /// the lexical/object dispatch receiver selected by Kotlin's implicit
+        /// receiver tower. Null for ordinary members and top-level extensions.
+        dispatch_receiver: ?Reg = null,
     },
     /// Virtual member call whose overload was resolved statically. `slot`
     /// names the selected declaration's override family; runtime work is one
@@ -1027,14 +1070,12 @@ pub const Func = struct {
     /// Carries the source `open` modifier. A method that is neither `open` nor
     /// `override` (an `override` is open-by-default) cannot be overridden, so a
     /// `recv.name()` call resolving to it is monomorphic even when the receiver
-    /// CLASS is `open` — the static dispatch bake reads this. Serialized with the
-    /// func header (like every field), so the bake trusts it on an image-decoded
-    /// base method as well as a freshly-lowered one.
+    /// class is `open`. Serialized with the function header.
     is_open: bool = false,
     /// Carries the source `final` modifier. Meaningful on an `override` member:
     /// `final override fun` seals the method against any further override, so it
     /// is monomorphic despite `is_override`. Redundant (but honored) on a plain
-    /// member. The static dispatch bake reads this alongside `is_open`.
+    /// member.
     is_final: bool = false,
     /// Resolved fully-qualified candidate names for each source-level
     /// annotation on this function (e.g. `kotlin.test.Test`), so a test
@@ -1115,9 +1156,7 @@ pub const Class = struct {
     is_fun_interface: bool = false,
     /// `open` modifier — the class can be subclassed. A class that is neither
     /// `open` nor `is_abstract` (which folds in `abstract`/`interface`/`sealed`)
-    /// is FINAL: it can never be subclassed, so its members cannot be overridden
-    /// anywhere, and a `recv.method()` call on it is monomorphic even open-world
-    /// (used by the static dispatch bake).
+    /// is final: it can never be subclassed, so its members cannot be overridden.
     is_open: bool = false,
     /// A named Kotlin `object`. Calling its classifier name resolves the
     /// singleton value and dispatches `operator fun invoke`; it is never a
@@ -1517,6 +1556,11 @@ pub const Module = struct {
         /// for arguments while withholding a static dispatch commitment.
         target: ?FuncId = null,
         dispatch: MemberDispatch = .deferred,
+        /// At least one visible member accepts the supplied call shape.
+        /// This remains true for an ambiguity or incomplete static type proof,
+        /// where `target` must stay null but the member still shadows a
+        /// same-named package function.
+        applicable: bool = false,
     };
 
     pub const MemberResolveCtx = struct {
@@ -1526,6 +1570,8 @@ pub const Module = struct {
         /// Restrict the query to private declarations. Used by bare own-member
         /// calls, which can commit directly without considering virtual peers.
         private_only: bool = false,
+        actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
+        receiver_type: ?TypeRef = null,
     };
 
     pub const ExtensionResolveCtx = struct {
@@ -1549,6 +1595,11 @@ pub const Module = struct {
 
     pub const ExtensionResolution = struct {
         target: ?FuncId = null,
+        dispatch_owner: ?ClassId = null,
+        /// At least one visible extension accepts the receiver and arguments.
+        /// A tie or incomplete proof keeps `target` null without making the
+        /// extension disappear from the candidate scope.
+        applicable: bool = false,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -1886,9 +1937,12 @@ pub const Module = struct {
         return std.mem.trimEnd(u8, head, "?");
     }
 
-    fn staticTypeVar(raw: *anyopaque, fid: FuncId, name: []const u8) bool {
+    fn staticTypeVar(raw: *anyopaque, fid: FuncId, ty: *const TypeRef) bool {
         const self: *const Module = @ptrCast(@alignCast(raw));
-        return self.funcTypeParamIndex(fid, staticTypeHead(name)) != null;
+        for (ty.args) |arg| {
+            if (std.mem.startsWith(u8, arg.name, "#qual:")) return false;
+        }
+        return self.funcTypeParamIndex(fid, staticTypeHead(ty.name)) != null;
     }
 
     fn staticTypeArgsEqual(actual: []const TypeRef, declared: []const TypeRef) bool {
@@ -1906,13 +1960,19 @@ pub const Module = struct {
         compatible,
     };
 
-    fn staticDeclTypeParam(self: *const Module, fid: FuncId, name: []const u8) bool {
+    fn staticDeclTypeParam(self: *const Module, fid: FuncId, ty: TypeRef) bool {
+        if (overrideQualifiedPath(ty) != null) return false;
+        const name = staticTypeHead(ty.name);
         if (self.funcTypeParamIndex(fid, name) != null) return true;
         const owner = (self.decl_sigs.get(fid.int()) orelse return false).enclosing_class orelse
             return false;
         if (owner.int() >= self.classes.items.len) return false;
-        for (self.classes.items[owner.int()].type_params) |param| {
-            if (std.mem.eql(u8, param, name)) return true;
+        if (parseClassTypeParamIdentity(name)) |identity| {
+            if (identity.owner != owner) return false;
+            for (self.classes.items[owner.int()].type_params) |param| {
+                if (std.mem.eql(u8, param, identity.param)) return true;
+            }
+            return false;
         }
         return false;
     }
@@ -1928,7 +1988,7 @@ pub const Module = struct {
                 if (std.mem.eql(u8, entry.param, name)) return entry.bound;
             }
         }
-        return "Any";
+        return "kotlin.Any";
     }
 
     fn staticTypeContainsFuncParam(
@@ -1936,6 +1996,7 @@ pub const Module = struct {
         fid: FuncId,
         ty: TypeRef,
     ) bool {
+        if (overrideQualifiedPath(ty) != null) return false;
         if (self.funcTypeParamIndex(fid, staticTypeHead(ty.name)) != null) return true;
         for (overrideArgs(ty)) |arg| {
             if (self.staticTypeContainsFuncParam(fid, arg)) return true;
@@ -1955,13 +2016,15 @@ pub const Module = struct {
     ) StaticCompatibility {
         if (depth >= 32) return .unknown;
         const param_head = staticTypeHead(param.name);
-        if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
-            if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
-            return self.staticReceiverCompatibility(
-                null,
-                actual,
-                .{ .name = bound, .nullable = false, .args = &.{} },
-            );
+        if (overrideQualifiedPath(param) == null) {
+            if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
+                if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
+                return self.staticReceiverCompatibility(
+                    null,
+                    actual,
+                    .{ .name = bound, .nullable = false, .args = &.{} },
+                );
+            }
         }
         if (actual.nullable and !param.nullable) return .incompatible;
 
@@ -2107,6 +2170,52 @@ pub const Module = struct {
         return self.uniqueClassIdBySimpleName(staticTypeHead(ty.name));
     }
 
+    fn staticTypesShareClassifier(
+        self: *const Module,
+        actual: TypeRef,
+        declared: TypeRef,
+    ) bool {
+        const actual_id = self.staticTypeClassId(actual);
+        const declared_id = self.staticTypeClassId(declared);
+        if (actual_id != null or declared_id != null) {
+            return actual_id != null and declared_id != null and
+                actual_id.? == declared_id.?;
+        }
+        const actual_head = staticTypeHead(actual.name);
+        const declared_head = staticTypeHead(declared.name);
+        if (!std.mem.eql(u8, actual_head, declared_head)) return false;
+        return self.staticBuiltinIdentity(actual, actual_head) == .yes and
+            self.staticBuiltinIdentity(declared, declared_head) == .yes;
+    }
+
+    fn staticBoundProofComplete(
+        self: *const Module,
+        bound: ModuleRegistry.TypeParamBound,
+        bounds: []const ModuleRegistry.TypeParamBound,
+        depth: u8,
+    ) bool {
+        if (!bound.complete or depth >= 64) return false;
+        const head = staticTypeHead(bound.bound);
+        if (rawBoundNamesDeclaredParam(bounds, bound.bound)) {
+            var matched = false;
+            for (bounds) |dependent| {
+                if (!std.mem.eql(u8, dependent.param, head)) continue;
+                matched = true;
+                if (!self.staticBoundProofComplete(
+                    dependent,
+                    bounds,
+                    depth + 1,
+                )) return false;
+            }
+            return matched;
+        }
+        const ty = TypeRef{ .name = bound.bound, .nullable = false, .args = &.{} };
+        const alias = self.staticAliasHead(ty);
+        if (alias.structure_lost) return false;
+        return self.staticBuiltinIdentity(ty, alias.name) == .yes or
+            self.staticTypeClassId(ty) != null;
+    }
+
     fn staticReceiverCompatibility(
         self: *const Module,
         fid: ?FuncId,
@@ -2123,7 +2232,7 @@ pub const Module = struct {
         // by the receiver and every value argument. Until that environment is
         // part of this proof, a declaration type parameter stays unresolved.
         if (fid) |decl_id| {
-            if (self.staticDeclTypeParam(decl_id, declared)) return .unknown;
+            if (self.staticDeclTypeParam(decl_id, param)) return .unknown;
         }
         if (receiver.nullable and !param.nullable) return .incompatible;
         if (std.mem.eql(u8, actual, "Nothing") and receiver.nullable) {
@@ -2264,20 +2373,28 @@ pub const Module = struct {
         const actual_head = staticTypeHead(actual.name);
         const declared_head = staticTypeHead(declared.name);
         if (actual_head.len == 0 or declared_head.len == 0) return false;
-        if (actual.eql(declared)) return true;
+        if (actual.eql(declared)) {
+            if (typeRefIsDeclaredParam(actual_bounds, actual) and
+                typeRefIsDeclaredParam(actual_bounds, declared) or
+                self.staticTypesShareClassifier(actual, declared)) return true;
+        }
         var saw_actual_bound = false;
-        for (actual_bounds) |bound| {
-            if (!std.mem.eql(u8, bound.param, actual_head)) continue;
-            saw_actual_bound = true;
-            if (try self.staticTypeIsSubtypeInner(
-                allocator,
-                .{ .name = bound.bound, .nullable = false, .args = &.{} },
-                declared,
-                actual_bounds,
-                depth + 1,
-            )) return true;
+        if (typeRefIsDeclaredParam(actual_bounds, actual)) {
+            for (actual_bounds) |bound| {
+                if (!std.mem.eql(u8, bound.param, actual_head)) continue;
+                saw_actual_bound = true;
+                if (!self.staticBoundProofComplete(bound, actual_bounds, 0)) continue;
+                if (try self.staticTypeIsSubtypeInner(
+                    allocator,
+                    .{ .name = bound.bound, .nullable = false, .args = &.{} },
+                    declared,
+                    actual_bounds,
+                    depth + 1,
+                )) return true;
+            }
         }
         if (saw_actual_bound) return false;
+        if (typeRefIsDeclaredParam(actual_bounds, declared)) return false;
         if (std.mem.eql(u8, actual_head, "Nothing")) return !actual.nullable or declared.nullable;
         if (std.mem.eql(u8, declared_head, "Any")) {
             return self.staticBuiltinIdentity(declared, declared_head) == .yes;
@@ -2285,10 +2402,7 @@ pub const Module = struct {
 
         const actual_id = self.staticTypeClassId(actual);
         const declared_id = self.staticTypeClassId(declared);
-        const same_classifier = if (actual_id != null and declared_id != null)
-            actual_id.? == declared_id.?
-        else
-            std.mem.eql(u8, actual_head, declared_head);
+        const same_classifier = self.staticTypesShareClassifier(actual, declared);
         if (same_classifier) {
             if (actual.nullable and !declared.nullable) return false;
             const actual_args = overrideArgs(actual);
@@ -2348,15 +2462,19 @@ pub const Module = struct {
                 if (sub_id.int() >= self.classes.items.len or
                     super_id.int() >= self.classes.items.len) return false;
                 const sub = &self.classes.items[sub_id.int()];
-                const identity = try allocator.alloc(TypeBinding, sub.type_params.len);
+                const identity = try allocator.alloc(TypeBinding, sub.type_params.len * 2);
                 for (sub.type_params, 0..) |param, index| {
-                    identity[index] = .{
-                        .name = param,
-                        .ty = if (index < actual.args.len)
-                            actual.args[index]
-                        else
-                            .{ .name = param, .nullable = false, .args = &.{} },
-                    };
+                    const identity_name = try classTypeParamIdentity(
+                        allocator,
+                        sub_id,
+                        param,
+                    );
+                    const actual_ty = if (index < actual.args.len)
+                        actual.args[index]
+                    else
+                        TypeRef{ .name = identity_name, .nullable = false, .args = &.{} };
+                    identity[index * 2] = .{ .name = param, .ty = actual_ty };
+                    identity[index * 2 + 1] = .{ .name = identity_name, .ty = actual_ty };
                 }
                 const inherited = (try self.ancestorBindings(
                     allocator,
@@ -2368,8 +2486,13 @@ pub const Module = struct {
                 const super_class = &self.classes.items[super_id.int()];
                 const args = try allocator.alloc(TypeRef, super_class.type_params.len);
                 for (super_class.type_params, 0..) |param, index| {
-                    args[index] = bindingType(inherited, param) orelse
-                        .{ .name = param, .nullable = false, .args = &.{} };
+                    const identity_name = try classTypeParamIdentity(
+                        allocator,
+                        super_id,
+                        param,
+                    );
+                    args[index] = bindingType(inherited, identity_name) orelse
+                        .{ .name = identity_name, .nullable = false, .args = &.{} };
                 }
                 return self.staticTypeIsSubtypeInner(
                     allocator,
@@ -2424,6 +2547,24 @@ pub const Module = struct {
         return false;
     }
 
+    fn rawBoundNamesDeclaredParam(
+        params: []const ModuleRegistry.TypeParamBound,
+        bound: []const u8,
+    ) bool {
+        if (std.mem.indexOfScalar(u8, bound, '.') != null or
+            std.mem.startsWith(u8, bound, "#qual:")) return false;
+        return isDeclaredTypeParam(params, staticTypeHead(bound));
+    }
+
+    fn typeRefIsDeclaredParam(
+        params: []const ModuleRegistry.TypeParamBound,
+        ty: TypeRef,
+    ) bool {
+        if (overrideQualifiedPath(ty) != null or
+            std.mem.indexOfScalar(u8, ty.name, '.') != null) return false;
+        return isDeclaredTypeParam(params, staticTypeHead(ty.name));
+    }
+
     fn staticTypeProofComplete(
         self: *const Module,
         raw_ty: TypeRef,
@@ -2434,7 +2575,13 @@ pub const Module = struct {
         const ty = projected.ty;
         const head = staticTypeHead(ty.name);
         if (head.len == 0 or ty.name[0] == '#') return false;
-        if (isDeclaredTypeParam(bounds, head)) return true;
+        if (typeRefIsDeclaredParam(bounds, ty)) {
+            for (bounds) |bound| {
+                if (std.mem.eql(u8, bound.param, head) and
+                    !self.staticBoundProofComplete(bound, bounds, 0)) return false;
+            }
+            return true;
+        }
         const alias = self.staticAliasHead(ty);
         if (alias.structure_lost) return false;
         const identity = self.staticBuiltinIdentity(ty, alias.name);
@@ -2460,7 +2607,7 @@ pub const Module = struct {
         if (actual_projection.star or pattern_projection.star) return pattern_projection.star;
         const actual = actual_projection.ty;
         const pattern = pattern_projection.ty;
-        if (isDeclaredTypeParam(params, staticTypeHead(pattern.name))) {
+        if (typeRefIsDeclaredParam(params, pattern)) {
             if (bindingType(bindings.items, staticTypeHead(pattern.name))) |bound| {
                 return bound.eql(actual);
             }
@@ -2472,23 +2619,24 @@ pub const Module = struct {
         }
         const actual_id = self.staticTypeClassId(actual);
         const pattern_id = self.staticTypeClassId(pattern);
-        const same_classifier = if (actual_id != null and pattern_id != null)
-            actual_id.? == pattern_id.?
-        else
-            std.mem.eql(u8, staticTypeHead(actual.name), staticTypeHead(pattern.name));
+        const same_classifier = self.staticTypesShareClassifier(actual, pattern);
         if (!same_classifier and actual_id != null and pattern_id != null and
             self.classIdIsOrExtends(actual_id.?, pattern_id.?))
         {
             const actual_class = &self.classes.items[actual_id.?.int()];
-            const identity = try allocator.alloc(TypeBinding, actual_class.type_params.len);
+            const identity = try allocator.alloc(TypeBinding, actual_class.type_params.len * 2);
             for (actual_class.type_params, 0..) |param, i| {
-                identity[i] = .{
-                    .name = param,
-                    .ty = if (i < overrideArgs(actual).len)
-                        overrideArgs(actual)[i]
-                    else
-                        .{ .name = param, .nullable = false, .args = &.{} },
-                };
+                const identity_name = try classTypeParamIdentity(
+                    allocator,
+                    actual_id.?,
+                    param,
+                );
+                const actual_ty = if (i < overrideArgs(actual).len)
+                    overrideArgs(actual)[i]
+                else
+                    TypeRef{ .name = identity_name, .nullable = false, .args = &.{} };
+                identity[i * 2] = .{ .name = param, .ty = actual_ty };
+                identity[i * 2 + 1] = .{ .name = identity_name, .ty = actual_ty };
             }
             const inherited = (try self.ancestorBindings(
                 allocator,
@@ -2500,8 +2648,13 @@ pub const Module = struct {
             const pattern_class = &self.classes.items[pattern_id.?.int()];
             const projected_args = try allocator.alloc(TypeRef, pattern_class.type_params.len);
             for (pattern_class.type_params, 0..) |param, i| {
-                projected_args[i] = bindingType(inherited, param) orelse
-                    .{ .name = param, .nullable = false, .args = &.{} };
+                const identity_name = try classTypeParamIdentity(
+                    allocator,
+                    pattern_id.?,
+                    param,
+                );
+                projected_args[i] = bindingType(inherited, identity_name) orelse
+                    .{ .name = identity_name, .nullable = false, .args = &.{} };
             }
             return self.bindReceiverTypeParams(
                 allocator,
@@ -2558,12 +2711,30 @@ pub const Module = struct {
             0,
         )) return false;
         for (declared_params) |param| {
-            if (std.mem.eql(u8, param.bound, "Any")) continue;
+            if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
             const bound_actual = bindingType(bindings.items, param.param) orelse return false;
+            const dependent_bound = rawBoundNamesDeclaredParam(
+                declared_params,
+                param.bound,
+            );
+            if (!dependent_bound and
+                std.mem.eql(u8, staticTypeHead(param.bound), "Any") and
+                self.staticBuiltinIdentity(
+                    .{ .name = param.bound, .nullable = false, .args = &.{} },
+                    "Any",
+                ) == .yes)
+            {
+                continue;
+            }
+            const required_bound = if (dependent_bound)
+                bindingType(bindings.items, staticTypeHead(param.bound)) orelse
+                    return false
+            else
+                TypeRef{ .name = param.bound, .nullable = false, .args = &.{} };
             if (!try self.staticTypeIsSubtypeInner(
                 a,
                 bound_actual,
-                .{ .name = param.bound, .nullable = false, .args = &.{} },
+                required_bound,
                 actual_bounds,
                 0,
             )) return false;
@@ -2577,9 +2748,12 @@ pub const Module = struct {
         fid: FuncId,
         arg: applicability.ArgShape,
         param: TypeRef,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
     ) StaticCompatibility {
         const declared = staticTypeHead(param.name);
-        if (self.funcTypeParamIndex(fid, declared) != null) {
+        if (overrideQualifiedPath(param) == null and
+            self.funcTypeParamIndex(fid, declared) != null)
+        {
             if (arg.ty) |ty| return self.staticGenericArgCompatibility(
                 fid,
                 ty,
@@ -2593,7 +2767,41 @@ pub const Module = struct {
         // A class-owned type parameter needs the receiver's class
         // substitution environment, which this per-argument probe does not
         // yet carry.
-        if (self.staticDeclTypeParam(fid, declared)) return .unknown;
+        if (self.staticDeclTypeParam(fid, param)) {
+            if (parseClassTypeParamIdentity(declared)) |identity| {
+                const owner = if (identity.owner.int() < self.classes.items.len)
+                    &self.classes.items[identity.owner.int()]
+                else
+                    return .unknown;
+                const bounds = self.registry.class_type_param_bounds.get(owner.fqn) orelse
+                    return .unknown;
+                var required: ?TypeRef = null;
+                for (bounds) |bound| {
+                    if (std.mem.eql(u8, bound.param, identity.param)) {
+                        required = .{
+                            .name = bound.bound,
+                            .nullable = param.nullable,
+                            .args = &.{},
+                        };
+                        break;
+                    }
+                }
+                if (required != null and arg.ty != null) {
+                    if (self.staticTypeIsSubtypeWithBounds(
+                        self.registry.allocator,
+                        arg.ty.?,
+                        required.?,
+                        actual_bounds,
+                    ) catch false) return .compatible;
+                    if (self.staticTypeProofComplete(arg.ty.?, actual_bounds) and
+                        self.staticTypeProofComplete(required.?, actual_bounds))
+                    {
+                        return .incompatible;
+                    }
+                }
+            }
+            return .unknown;
+        }
         if (arg.is_null) return if (param.nullable) .compatible else .incompatible;
         if (arg.literal_kind) |kind| {
             const builtin_identity = self.staticBuiltinIdentity(param, declared);
@@ -2638,6 +2846,20 @@ pub const Module = struct {
             if (self.staticTypeContainsFuncParam(fid, param)) {
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
+            if (typeContainsBoundParam(ty, actual_bounds)) {
+                if (self.staticTypeIsSubtypeWithBounds(
+                    self.registry.allocator,
+                    ty,
+                    param,
+                    actual_bounds,
+                ) catch false) return .compatible;
+                if (self.staticTypeProofComplete(ty, actual_bounds) and
+                    self.staticTypeProofComplete(param, actual_bounds))
+                {
+                    return .incompatible;
+                }
+                return .unknown;
+            }
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
@@ -2650,9 +2872,12 @@ pub const Module = struct {
 
     fn staticMemberArgsCompatibility(
         self: *const Module,
+        allocator: Allocator,
         fid: FuncId,
         f: *const Func,
         args: []const applicability.ArgShape,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
+        receiver: ?TypeRef,
     ) StaticCompatibility {
         const skip: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
@@ -2664,9 +2889,51 @@ pub const Module = struct {
             if (param.is_vararg) return .unknown;
         }
         if (args.len > params.len) return .incompatible;
+        var bindings: std.ArrayList(TypeBinding) = .empty;
+        if (receiver) |actual_receiver| {
+            if (self.decl_sigs.get(fid.int())) |sig| {
+                if (sig.enclosing_class) |owner| {
+                    if (owner.int() < self.classes.items.len) {
+                        const projected = (self.projectTypeToClass(
+                            allocator,
+                            actual_receiver,
+                            owner,
+                        ) catch null) orelse return .unknown;
+                        const owner_class = &self.classes.items[owner.int()];
+                        const projected_args = overrideArgs(projected);
+                        if (projected_args.len < owner_class.type_params.len) {
+                            return .unknown;
+                        }
+                        for (owner_class.type_params, 0..) |param, i| {
+                            bindings.append(allocator, .{
+                                .name = classTypeParamIdentity(
+                                    allocator,
+                                    owner,
+                                    param,
+                                ) catch return .unknown,
+                                .ty = projected_args[i],
+                            }) catch return .unknown;
+                        }
+                    }
+                }
+            }
+        }
         var result: StaticCompatibility = .compatible;
         for (args, params[0..args.len]) |arg, param| {
-            const arg_result = self.staticArgCompatibility(fid, arg, param.ty);
+            const instantiated_param = if (bindings.items.len == 0)
+                param.ty
+            else
+                substituteType(
+                    allocator,
+                    param.ty,
+                    bindings.items,
+                ) catch return .unknown;
+            const arg_result = self.staticArgCompatibility(
+                fid,
+                arg,
+                instantiated_param,
+                actual_bounds,
+            );
             if (arg_result == .incompatible) return .incompatible;
             if (arg_result == .unknown) result = .unknown;
         }
@@ -2690,40 +2957,79 @@ pub const Module = struct {
 
     fn memberExtensionOwnerIsObject(self: *const Module, fid: FuncId) ?[]const u8 {
         const owner = self.registry.member_ext_owner_class.get(fid) orelse return null;
+        if (self.classIdByFqn(owner)) |id| {
+            if (id.int() < self.classes.items.len and self.classes.items[id.int()].is_object) {
+                return owner;
+            }
+        }
         for (self.registry.object_names.items) |object_name| {
             if (std.mem.eql(u8, object_name, owner)) return owner;
         }
         return null;
     }
 
-    fn dispatchOwnerInChain(self: *const Module, start: []const u8, owner: []const u8) bool {
+    fn scopedClassId(
+        self: *const Module,
+        name: []const u8,
+        ctx: ExtensionResolveCtx,
+    ) ?ClassId {
+        return if (std.mem.indexOfScalar(u8, name, '.') != null)
+            self.classIdByFqn(name)
+        else
+            self.classIdIndexed(name, ctx.caller_package, ctx.caller_file);
+    }
+
+    fn dispatchOwnerInChain(
+        self: *const Module,
+        start: []const u8,
+        owner: []const u8,
+        ctx: ExtensionResolveCtx,
+    ) bool {
+        const owner_id = self.scopedClassId(owner, ctx);
         var current: ?[]const u8 = start;
         var hops: u8 = 0;
         while (current) |candidate| : (hops += 1) {
             if (hops > 16) break;
+            if (owner_id) |target| {
+                if (self.scopedClassId(candidate, ctx)) |candidate_id| {
+                    if (self.classIdIsOrExtends(candidate_id, target)) return true;
+                }
+            } else if (std.mem.eql(u8, candidate, owner) or
+                (std.mem.indexOfScalar(u8, owner, '.') == null and
+                    std.mem.eql(u8, staticTypeHead(candidate), staticTypeHead(owner))))
+            {
+                return true;
+            }
             const candidate_head = staticTypeHead(candidate);
-            const owner_head = staticTypeHead(owner);
-            if (std.mem.eql(u8, candidate_head, owner_head) or
-                self.classIsOrExtends(candidate_head, owner_head)) return true;
             current = self.registry.enclosing_class.get(candidate) orelse
                 self.registry.enclosing_class.get(candidate_head);
         }
         return false;
     }
 
-    fn lexicalOwnerChainContains(self: *const Module, start: []const u8, owner: []const u8) bool {
+    fn lexicalOwnerChainContains(
+        self: *const Module,
+        start: []const u8,
+        owner: []const u8,
+        ctx: ExtensionResolveCtx,
+    ) bool {
         var current: ?[]const u8 = start;
         var hops: u8 = 0;
         while (current) |candidate| : (hops += 1) {
             if (hops > 16) break;
-            if (std.mem.eql(u8, staticTypeHead(candidate), staticTypeHead(owner))) return true;
+            if (self.dispatchOwnerInChain(candidate, owner, ctx)) return true;
             current = self.registry.enclosing_class.get(candidate) orelse
                 self.registry.enclosing_class.get(staticTypeHead(candidate));
         }
         return false;
     }
 
-    fn lexicalOwnerCompanionMatches(self: *const Module, start: []const u8, owner: []const u8) bool {
+    fn lexicalOwnerCompanionMatches(
+        self: *const Module,
+        start: []const u8,
+        owner: []const u8,
+        ctx: ExtensionResolveCtx,
+    ) bool {
         var current: ?[]const u8 = start;
         var hops: u8 = 0;
         while (current) |candidate| : (hops += 1) {
@@ -2732,7 +3038,7 @@ pub const Module = struct {
             const companion = self.registry.companion_singletons.get(candidate) orelse
                 self.registry.companion_singletons.get(head);
             if (companion) |name| {
-                if (std.mem.eql(u8, staticTypeHead(name), staticTypeHead(owner))) return true;
+                if (self.dispatchOwnerInChain(name, owner, ctx)) return true;
             }
             current = self.registry.enclosing_class.get(candidate) orelse
                 self.registry.enclosing_class.get(head);
@@ -2742,13 +3048,33 @@ pub const Module = struct {
 
     fn memberDispatchOwnerInScope(self: *const Module, owner: []const u8, ctx: ExtensionResolveCtx) bool {
         for (ctx.implicit_dispatch_owners) |implicit| {
-            if (self.dispatchOwnerInChain(implicit, owner)) return true;
+            if (self.dispatchOwnerInChain(implicit, owner, ctx)) return true;
         }
         if (ctx.lexical_owner) |lexical| {
-            if (self.dispatchOwnerInChain(lexical, owner) or
-                self.lexicalOwnerCompanionMatches(lexical, owner)) return true;
+            if (self.dispatchOwnerInChain(lexical, owner, ctx) or
+                self.lexicalOwnerCompanionMatches(lexical, owner, ctx)) return true;
         }
         return false;
+    }
+
+    fn memberExtensionScopeTier(
+        self: *const Module,
+        owner: []const u8,
+        ctx: ExtensionResolveCtx,
+    ) u8 {
+        for (ctx.implicit_dispatch_owners, 0..) |implicit, index| {
+            if (self.dispatchOwnerInChain(implicit, owner, ctx)) {
+                return @intCast(@min(index, 31));
+            }
+        }
+        if (ctx.lexical_owner) |lexical| {
+            if (self.dispatchOwnerInChain(lexical, owner, ctx) or
+                self.lexicalOwnerCompanionMatches(lexical, owner, ctx))
+            {
+                return @intCast(@min(ctx.implicit_dispatch_owners.len, 31));
+            }
+        }
+        return 32;
     }
 
     fn objectMemberExtensionInScope(
@@ -2777,69 +3103,37 @@ pub const Module = struct {
         return self.importWildcardIn(ctx.caller_file, owner_fqn);
     }
 
-    /// A member extension occupies an inner candidate scope and needs a
-    /// separate dispatch receiver in addition to the explicit extension
-    /// receiver. Until that receiver is part of the static call ABI, any
-    /// same-name member extension that can accept this call keeps the call on
-    /// the member-resolution path.
-    fn memberExtensionCouldShadow(
+    fn memberExtensionInScope(
         self: *const Module,
-        name: []const u8,
-        receiver: TypeRef,
-        arg_count: usize,
+        fid: FuncId,
+        f: *const Func,
+        decl: ?DeclSig,
         ctx: ExtensionResolveCtx,
     ) bool {
-        for (self.funcsBySimpleName(name)) |fid| {
-            const f = self.funcById(fid) orelse continue;
-            const ds = self.decl_sigs.get(fid.int());
-            const kind = if (ds) |decl| decl.kind else f.kind;
-            if (kind != .member_extension or f.params.len == 0 or
-                !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
-            if (!self.staticReceiverCouldAccept(fid, receiver, recv_param)) continue;
-            if (ds) |decl| {
-                if (arg_count < decl.arity.required) continue;
-                if (!decl.arity.has_vararg and arg_count > decl.arity.total) continue;
-            } else {
-                var required: usize = 0;
-                var has_vararg = false;
-                for (f.params[1..]) |param| {
-                    if (param.is_vararg) {
-                        has_vararg = true;
-                    } else if (!param.has_default and param.default == null) {
-                        required += 1;
-                    }
-                }
-                if (arg_count < required) continue;
-                if (!has_vararg and arg_count > f.params.len - 1) continue;
-            }
-            const owner = self.registry.member_ext_owner_class.get(fid);
-            if (ds) |decl| {
-                switch (decl.visibility) {
-                    .Private => {
-                        const declared_owner = owner orelse continue;
-                        const lexical = ctx.lexical_owner orelse continue;
-                        if (!self.lexicalOwnerChainContains(lexical, declared_owner) and
-                            !self.lexicalOwnerCompanionMatches(lexical, declared_owner)) continue;
-                    },
-                    .Protected => {
-                        const declared_owner = owner orelse continue;
-                        const lexical = ctx.lexical_owner orelse continue;
-                        if (!self.dispatchOwnerInChain(lexical, declared_owner) and
-                            !self.lexicalOwnerCompanionMatches(lexical, declared_owner)) continue;
-                    },
-                    .Public, .Internal => {},
-                }
-            }
-            if (self.memberExtensionOwnerIsObject(fid)) |object_owner| {
-                if (!self.objectMemberExtensionInScope(fid, f, name, object_owner, ctx)) continue;
-            } else {
-                const declared_owner = owner orelse return true;
-                if (!self.memberDispatchOwnerInScope(declared_owner, ctx)) continue;
-            }
-            return true;
+        const owner = self.registry.member_ext_owner_class.get(fid) orelse return false;
+        if (decl) |sig| switch (sig.visibility) {
+            .Private => {
+                const lexical = ctx.lexical_owner orelse return false;
+                if (!self.lexicalOwnerChainContains(lexical, owner, ctx) and
+                    !self.lexicalOwnerCompanionMatches(lexical, owner, ctx)) return false;
+            },
+            .Protected => {
+                const lexical = ctx.lexical_owner orelse return false;
+                if (!self.dispatchOwnerInChain(lexical, owner, ctx) and
+                    !self.lexicalOwnerCompanionMatches(lexical, owner, ctx)) return false;
+            },
+            .Public, .Internal => {},
+        };
+        if (self.memberExtensionOwnerIsObject(fid)) |object_owner| {
+            return self.objectMemberExtensionInScope(
+                fid,
+                f,
+                ctx.call_name orelse f.name,
+                object_owner,
+                ctx,
+            );
         }
-        return false;
+        return self.memberDispatchOwnerInScope(owner, ctx);
     }
 
     /// Resolve an explicit-receiver top-level extension call from declaration
@@ -2856,13 +3150,6 @@ pub const Module = struct {
         for (args) |arg| {
             if (arg.named != null or arg.is_spread) return .{};
         }
-        if (self.memberExtensionCouldShadow(
-            ctx.call_name orelse name,
-            receiver,
-            args.len,
-            ctx,
-        )) return .{};
-
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
@@ -2874,8 +3161,12 @@ pub const Module = struct {
             const f = self.funcById(fid) orelse continue;
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
-            if (kind != .top_level_extension or f.params.len == 0 or
+            const is_member_extension = kind == .member_extension;
+            if ((kind != .top_level_extension and !is_member_extension) or
+                f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (is_member_extension and
+                !self.memberExtensionInScope(fid, f, ds, ctx)) continue;
             if (ctx.target_fqn) |target_fqn| {
                 if (!std.mem.eql(u8, f.fqn, target_fqn)) continue;
             }
@@ -2886,17 +3177,34 @@ pub const Module = struct {
             if (!has_source_body and !has_host_symbol) continue;
             const tier: u8 = if (ctx.target_fqn != null)
                 0
+            else if (is_member_extension)
+                self.memberExtensionScopeTier(
+                    self.registry.member_ext_owner_class.get(fid) orelse continue,
+                    ctx,
+                )
             else
-                self.scopeTier(f.fqn, f.package, name, ctx.caller_package, ctx.caller_file);
-            if (tier > last_in_scope_tier) continue;
+                64 + @min(
+                    self.scopeTier(
+                        f.fqn,
+                        f.package,
+                        name,
+                        ctx.caller_package,
+                        ctx.caller_file,
+                    ) + 1,
+                    191,
+                );
+            if (!is_member_extension and ctx.target_fqn == null and
+                tier > 64 + last_in_scope_tier + 1) continue;
             if (ds) |decl| {
                 switch (decl.visibility) {
                     .Private => {
-                        const decl_file = self.registry.private_fn_files.get(fid) orelse {
-                            unknown_best_tier = @min(unknown_best_tier, tier);
-                            continue;
-                        };
-                        if (decl_file.int() != ctx.caller_file.int()) continue;
+                        if (!is_member_extension) {
+                            const decl_file = self.registry.private_fn_files.get(fid) orelse {
+                                unknown_best_tier = @min(unknown_best_tier, tier);
+                                continue;
+                            };
+                            if (decl_file.int() != ctx.caller_file.int()) continue;
+                        }
                     },
                     .Internal => {
                         // Module identity is not yet carried by the call-site
@@ -2905,13 +3213,12 @@ pub const Module = struct {
                         unknown_best_tier = @min(unknown_best_tier, tier);
                         continue;
                     },
-                    .Protected => continue,
+                    .Protected => if (!is_member_extension) continue,
                     .Public => {},
                 }
             } else if (self.registry.private_fn_files.get(fid)) |decl_file| {
                 if (decl_file.int() != ctx.caller_file.int()) continue;
             }
-            if (args.len > f.params.len - 1) continue;
             var has_vararg = false;
             for (f.params[1..]) |param| {
                 if (param.is_vararg) {
@@ -2919,15 +3226,28 @@ pub const Module = struct {
                     break;
                 }
             }
-            if (has_vararg) continue;
-            var omitted_defaults = true;
-            for (f.params[1 + args.len ..]) |param| {
-                if (!param.has_default and param.default == null) {
-                    omitted_defaults = false;
-                    break;
+            if (has_vararg) {
+                const required = if (ds) |decl| decl.arity.required else blk: {
+                    var count: usize = 0;
+                    for (f.params[1..]) |param| {
+                        if (!param.is_vararg and !param.has_default and param.default == null) {
+                            count += 1;
+                        }
+                    }
+                    break :blk count;
+                };
+                if (args.len < required) continue;
+            } else {
+                if (args.len > f.params.len - 1) continue;
+                var omitted_defaults = true;
+                for (f.params[1 + args.len ..]) |param| {
+                    if (!param.has_default and param.default == null) {
+                        omitted_defaults = false;
+                        break;
+                    }
                 }
+                if (!omitted_defaults) continue;
             }
-            if (!omitted_defaults) continue;
             const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
             var compatibility = self.staticReceiverCompatibility(fid, receiver, recv_param);
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
@@ -2994,38 +3314,48 @@ pub const Module = struct {
                     ) catch return .{};
                     if (subtype) {
                         compatibility = .compatible;
-                    } else if (typeContainsBoundParam(
+                    } else if (self.staticTypeProofComplete(
                         receiver,
                         ctx.actual_type_param_bounds,
-                    ) or
+                    ) and
                         self.staticTypeProofComplete(
-                            receiver,
+                            recv_param,
                             ctx.actual_type_param_bounds,
-                        ) and
-                            self.staticTypeProofComplete(
-                                recv_param,
-                                ctx.actual_type_param_bounds,
-                            ))
+                        ))
                     {
                         compatibility = .incompatible;
                     }
                 }
             }
             if (compatibility == .incompatible) continue;
-            for (args, f.params[1 .. 1 + args.len]) |arg, param| {
-                const arg_compatibility = self.staticArgCompatibility(fid, arg, param.ty);
-                if (arg_compatibility == .incompatible) {
-                    compatibility = .incompatible;
-                    break;
+            if (has_vararg) {
+                // `applicability.applicable` maps fixed/default/vararg
+                // positions below. Keep the extra static compatibility proof
+                // conservative until it models repeated vararg element slots.
+                compatibility = .unknown;
+            } else {
+                for (args, f.params[1 .. 1 + args.len]) |arg, param| {
+                    const arg_compatibility = self.staticArgCompatibility(
+                        fid,
+                        arg,
+                        param.ty,
+                        ctx.actual_type_param_bounds,
+                    );
+                    if (arg_compatibility == .incompatible) {
+                        compatibility = .incompatible;
+                        break;
+                    }
+                    if (arg_compatibility == .unknown) compatibility = .unknown;
                 }
-                if (arg_compatibility == .unknown) compatibility = .unknown;
             }
             if (compatibility == .incompatible) continue;
             ids.append(sa, fid) catch return .{};
             tiers.append(sa, tier) catch return .{};
             unknowns.append(sa, compatibility == .unknown) catch return .{};
         }
-        if (ids.items.len == 0) return .{};
+        if (ids.items.len == 0) {
+            return .{ .applicable = unknown_best_tier != 255 };
+        }
 
         var proof_receiver = receiver;
         const receiver_alias = self.staticAliasHead(proof_receiver);
@@ -3075,7 +3405,7 @@ pub const Module = struct {
         if (best_tier == 255) return .{};
         // A same-or-inner-tier declaration whose visibility metadata is not
         // complete cannot be compared safely with the ranked set.
-        if (unknown_best_tier <= best_tier) return .{};
+        if (unknown_best_tier <= best_tier) return .{ .applicable = true };
 
         var ranked_sigs: std.ArrayList(applicability.SigView) = .empty;
         var ranked_ids: std.ArrayList(FuncId) = .empty;
@@ -3111,8 +3441,19 @@ pub const Module = struct {
                 tied = true;
             }
         }
-        if (tied or best_unknown) return .{};
-        return .{ .target = best };
+        if (tied or best_unknown) return .{ .applicable = true };
+        const dispatch_owner = if (best) |target|
+            (if (self.registry.member_ext_owner_class.get(target)) |owner|
+                self.classIdByFqn(owner)
+            else
+                null)
+        else
+            null;
+        return .{
+            .target = best,
+            .dispatch_owner = dispatch_owner,
+            .applicable = best != null,
+        };
     }
 
     /// Resolve one member name against the declarations owned by the static
@@ -3155,6 +3496,7 @@ pub const Module = struct {
         var unknown: ?FuncId = null;
         var unknown_count: usize = 0;
         var visibility_unknown = false;
+        var any_applicable = false;
         for (candidates.items) |candidate| {
             const fid = candidate.fid;
             const ds = self.decl_sigs.get(fid.int()) orelse continue;
@@ -3189,18 +3531,28 @@ pub const Module = struct {
             };
             const score = applicability.applicable(&sig, args, scope) orelse continue;
             if (ds.visibility == .Internal) {
+                any_applicable = true;
                 visibility_unknown = true;
                 continue;
             }
-            switch (self.staticMemberArgsCompatibility(fid, f, args)) {
+            switch (self.staticMemberArgsCompatibility(
+                sa,
+                fid,
+                f,
+                args,
+                ctx.actual_type_param_bounds,
+                ctx.receiver_type,
+            )) {
                 .incompatible => continue,
                 .unknown => {
+                    any_applicable = true;
                     unknown = fid;
                     unknown_count += 1;
                     continue;
                 },
                 .compatible => {},
             }
+            any_applicable = true;
             var applied = score.points + if (!named and f.params.len != 0)
                 applicability.tyEvidenceBonus(f.params[1..], args)
             else
@@ -3215,34 +3567,36 @@ pub const Module = struct {
                 tied = true;
             }
         }
-        if (visibility_unknown or tied or unknown_count != 0 and best != null) return .{};
+        if (visibility_unknown or tied or unknown_count != 0 and best != null) {
+            return .{ .applicable = any_applicable };
+        }
         if (best == null) {
             if (unknown_count == 1) {
-                return .{ .target = unknown, .dispatch = .deferred };
+                return .{ .target = unknown, .dispatch = .deferred, .applicable = true };
             }
-            return .{};
+            return .{ .applicable = any_applicable };
         }
         const target = best.?;
         const ds = self.decl_sigs.get(target.int()).?;
         // Native/expect/abstract headers identify an overload but do not carry
         // the ordinary IR-function ABI required by a direct FuncId call.
-        if (!ds.has_body) return .{ .target = target, .dispatch = .virtual };
-        if (ds.visibility == .Private) return .{ .target = target, .dispatch = .direct };
+        if (!ds.has_body) return .{ .target = target, .dispatch = .virtual, .applicable = true };
+        if (ds.visibility == .Private) return .{ .target = target, .dispatch = .direct, .applicable = true };
         const f = self.funcById(target) orelse return .{};
         // An unclaimed classifier header carries no trustworthy final/open/
         // interface modifiers. Its declaration identity can still resolve the
         // overload, but dispatch must remain virtual until the class is filled.
-        if (class.is_stub) return .{ .target = target, .dispatch = .virtual };
-        if (class.is_value) return .{ .target = target, .dispatch = .virtual };
+        if (class.is_stub) return .{ .target = target, .dispatch = .virtual, .applicable = true };
+        if (class.is_value) return .{ .target = target, .dispatch = .virtual, .applicable = true };
         const declaring_class = if (ds.enclosing_class) |decl_owner|
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else
             null;
         const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
         if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
-            return .{ .target = target, .dispatch = .direct };
+            return .{ .target = target, .dispatch = .direct, .applicable = true };
         }
-        return .{ .target = target, .dispatch = .virtual };
+        return .{ .target = target, .dispatch = .virtual, .applicable = true };
     }
 
     fn methodIsFinal(f: *const Func) bool {
@@ -3328,13 +3682,17 @@ pub const Module = struct {
         else
             null;
         const binding_name = if (projection_prefix) |prefix| ty.name[prefix.len..] else ty.name;
-        if (bindingType(bindings, binding_name)) |replacement| {
-            var out = replacement;
-            if (projection_prefix) |prefix| {
-                out.name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, replacement.name });
+        if (overrideQualifiedPath(ty) == null and
+            std.mem.indexOfScalar(u8, ty.name, '.') == null)
+        {
+            if (bindingType(bindings, binding_name)) |replacement| {
+                var out = replacement;
+                if (projection_prefix) |prefix| {
+                    out.name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, replacement.name });
+                }
+                out.nullable = out.nullable or ty.nullable;
+                return out;
             }
-            out.nullable = out.nullable or ty.nullable;
-            return out;
         }
         const args = try allocator.alloc(TypeRef, ty.args.len);
         for (ty.args, args) |arg, *out| out.* = try substituteType(allocator, arg, bindings);
@@ -3350,6 +3708,59 @@ pub const Module = struct {
             if (std.mem.eql(u8, param, head)) return true;
         }
         return false;
+    }
+
+    fn callTypeRefParam(
+        params: []const []const u8,
+        ty: TypeRef,
+    ) bool {
+        if (overrideQualifiedPath(ty) != null or
+            std.mem.indexOfScalar(u8, ty.name, '.') != null) return false;
+        return callTypeParam(params, ty.name);
+    }
+
+    fn projectTypeToClass(
+        self: *const Module,
+        allocator: Allocator,
+        actual: TypeRef,
+        target: ClassId,
+    ) Allocator.Error!?TypeRef {
+        const actual_id = self.staticTypeClassId(actual) orelse return null;
+        if (!self.classIdIsOrExtends(actual_id, target)) return null;
+        if (actual_id.int() >= self.classes.items.len or
+            target.int() >= self.classes.items.len) return null;
+
+        const actual_class = &self.classes.items[actual_id.int()];
+        const actual_args = overrideArgs(actual);
+        if (actual_args.len < actual_class.type_params.len) return null;
+        if (actual_id.int() == target.int()) return actual;
+
+        const identity = try allocator.alloc(TypeBinding, actual_class.type_params.len * 2);
+        for (actual_class.type_params, 0..) |param, i| {
+            const identity_name = try classTypeParamIdentity(allocator, actual_id, param);
+            identity[i * 2] = .{ .name = param, .ty = actual_args[i] };
+            identity[i * 2 + 1] = .{ .name = identity_name, .ty = actual_args[i] };
+        }
+        const inherited = (try self.ancestorBindings(
+            allocator,
+            actual_id,
+            target,
+            identity,
+            0,
+        )) orelse return null;
+        const target_class = &self.classes.items[target.int()];
+        const projected_args = try allocator.alloc(TypeRef, target_class.type_params.len);
+        for (target_class.type_params, 0..) |param, i| {
+            projected_args[i] = bindingType(
+                inherited,
+                try classTypeParamIdentity(allocator, target, param),
+            ) orelse return null;
+        }
+        return .{
+            .name = target_class.fqn,
+            .nullable = actual.nullable,
+            .args = projected_args,
+        };
     }
 
     fn bindCallType(
@@ -3368,7 +3779,7 @@ pub const Module = struct {
         const pattern = pattern_projection.ty;
         const actual = actual_projection.ty;
         const pattern_head = staticTypeHead(pattern.name);
-        if (callTypeParam(params, pattern_head)) {
+        if (callTypeRefParam(params, pattern)) {
             if (bindingType(bindings.items, pattern_head)) |bound| {
                 return bound.eql(actual);
             }
@@ -3378,14 +3789,18 @@ pub const Module = struct {
 
         const pattern_args = overrideArgs(pattern);
         if (pattern_args.len == 0) return true;
-        const actual_args = overrideArgs(actual);
-        const pattern_id = self.staticTypeClassId(pattern);
-        const actual_id = self.staticTypeClassId(actual);
-        const same_classifier = if (pattern_id != null and actual_id != null)
-            pattern_id.? == actual_id.?
-        else
-            std.mem.eql(u8, staticTypeHead(pattern.name), staticTypeHead(actual.name));
-        if (!same_classifier or pattern_args.len != actual_args.len) return false;
+        var projected_actual = actual;
+        if (!self.staticTypesShareClassifier(pattern, actual)) {
+            const pattern_id = self.staticTypeClassId(pattern) orelse return false;
+            projected_actual = (try self.projectTypeToClass(
+                allocator,
+                actual,
+                pattern_id,
+            )) orelse return false;
+        }
+        if (projected_actual.nullable and !pattern.nullable) return false;
+        const actual_args = overrideArgs(projected_actual);
+        if (pattern_args.len != actual_args.len) return false;
         for (pattern_args, actual_args) |pattern_arg, actual_arg| {
             if (!try self.bindCallType(
                 allocator,
@@ -3405,7 +3820,7 @@ pub const Module = struct {
         bindings: []const TypeBinding,
     ) bool {
         const head = staticTypeHead(ty.name);
-        if (callTypeParam(params, head) and bindingType(bindings, head) == null) return false;
+        if (callTypeRefParam(params, ty) and bindingType(bindings, head) == null) return false;
         for (overrideArgs(ty)) |arg| {
             if (!returnTypeBindingsComplete(arg, params, bindings)) return false;
         }
@@ -3416,7 +3831,7 @@ pub const Module = struct {
         ty: TypeRef,
         bounds: []const ModuleRegistry.TypeParamBound,
     ) bool {
-        if (isDeclaredTypeParam(bounds, staticTypeHead(ty.name))) return true;
+        if (typeRefIsDeclaredParam(bounds, ty)) return true;
         for (overrideArgs(ty)) |arg| {
             if (typeContainsBoundParam(arg, bounds)) return true;
         }
@@ -3432,10 +3847,11 @@ pub const Module = struct {
         const bounds = try allocator.alloc(ModuleRegistry.TypeParamBound, params.items.len);
         const explicit = self.registry.func_type_param_bounds.get(fid) orelse &.{};
         for (params.items, bounds) |param, *out| {
-            out.* = .{ .param = param, .bound = "Any" };
+            out.* = .{ .param = param, .bound = "kotlin.Any" };
             for (explicit) |bound| {
                 if (std.mem.eql(u8, bound.param, param)) {
                     out.bound = bound.bound;
+                    out.complete = bound.complete;
                     break;
                 }
             }
@@ -3452,6 +3868,7 @@ pub const Module = struct {
         allocator: Allocator,
         fid: FuncId,
         receiver: ?TypeRef,
+        dispatch_receiver: ?TypeRef,
         args: []const applicability.ArgShape,
         explicit_type_args: []const TypeRef,
     ) Allocator.Error!?TypeRef {
@@ -3466,25 +3883,71 @@ pub const Module = struct {
         const a = scratch.allocator();
 
         const type_params_list = self.registry.func_type_params.get(fid);
-        const type_params: []const []const u8 = if (type_params_list) |list|
+        const function_type_params: []const []const u8 = if (type_params_list) |list|
             list.items
         else
             &.{};
-        if (explicit_type_args.len > type_params.len) return null;
+        if (explicit_type_args.len > function_type_params.len) return null;
 
         var bindings: std.ArrayList(TypeBinding) = .empty;
         for (explicit_type_args, 0..) |ty, i| {
-            try bindings.append(a, .{ .name = type_params[i], .ty = ty });
+            try bindings.append(a, .{ .name = function_type_params[i], .ty = ty });
         }
 
+        var all_type_params: std.ArrayList([]const u8) = .empty;
+        try all_type_params.appendSlice(a, function_type_params);
+        const decl_sig = self.decl_sigs.get(fid.int());
+        const owner_id = if (decl_sig) |sig| sig.enclosing_class else null;
+        if (owner_id) |owner| {
+            if (owner.int() >= self.classes.items.len) return null;
+            const owner_class = &self.classes.items[owner.int()];
+            for (owner_class.type_params) |param| {
+                try all_type_params.append(
+                    a,
+                    try classTypeParamIdentity(a, owner, param),
+                );
+            }
+            const actual_dispatch_receiver: ?TypeRef = switch (decl_sig.?.kind) {
+                .instance_method => dispatch_receiver orelse receiver,
+                .member_extension => dispatch_receiver,
+                else => null,
+            };
+            if (owner_class.type_params.len != 0 and
+                actual_dispatch_receiver != null)
+            {
+                const actual_receiver = actual_dispatch_receiver.?;
+                const projected = (try self.projectTypeToClass(
+                    a,
+                    actual_receiver,
+                    owner,
+                )) orelse return null;
+                const projected_args = overrideArgs(projected);
+                if (projected_args.len < owner_class.type_params.len) return null;
+                for (owner_class.type_params, 0..) |param, i| {
+                    try bindings.append(a, .{
+                        .name = try classTypeParamIdentity(a, owner, param),
+                        .ty = projected_args[i],
+                    });
+                }
+            }
+        }
+        const type_params = all_type_params.items;
+        const inference_type_params = if (decl_sig != null and
+            decl_sig.?.kind == .member_extension)
+            function_type_params
+        else
+            type_params;
+
         const first_param: usize = @intFromBool(funcHasImplicitThis(f));
-        if (first_param != 0) {
+        if (first_param != 0 and
+            (decl_sig == null or decl_sig.?.kind != .instance_method))
+        {
             if (receiver) |actual_receiver| {
                 if (!try self.bindCallType(
                     a,
                     f.params[0].ty,
                     actual_receiver,
-                    type_params,
+                    function_type_params,
                     &bindings,
                     0,
                 )) return null;
@@ -3506,7 +3969,7 @@ pub const Module = struct {
                     a,
                     param.ty,
                     actual,
-                    type_params,
+                    inference_type_params,
                     &bindings,
                     0,
                 )) return null;
@@ -3558,7 +4021,7 @@ pub const Module = struct {
                 a,
                 params[pi].ty,
                 actual_ty,
-                type_params,
+                inference_type_params,
                 &bindings,
                 0,
             )) return null;
@@ -3612,20 +4075,44 @@ pub const Module = struct {
         current_bindings: []const TypeBinding,
         depth: u8,
     ) Allocator.Error!?[]const TypeBinding {
-        if (current.int() == target.int()) return try allocator.dupe(TypeBinding, current_bindings);
+        if (current.int() == target.int()) {
+            var exact_count: usize = 0;
+            for (current_bindings) |binding| {
+                if (parseClassTypeParamIdentity(binding.name) != null) exact_count += 1;
+            }
+            const exact = try allocator.alloc(TypeBinding, exact_count);
+            var exact_index: usize = 0;
+            for (current_bindings) |binding| {
+                if (parseClassTypeParamIdentity(binding.name) == null) continue;
+                exact[exact_index] = binding;
+                exact_index += 1;
+            }
+            return exact;
+        }
         if (depth > 64 or current.int() >= self.classes.items.len) return null;
         const class = &self.classes.items[current.int()];
         for (class.supertypes, 0..) |super_id, edge| {
             if (super_id.int() >= self.classes.items.len) continue;
             const super = &self.classes.items[super_id.int()];
             const super_ref: ?TypeRef = if (edge < class.supertype_refs.len) class.supertype_refs[edge] else null;
-            const next = try allocator.alloc(TypeBinding, super.type_params.len);
+            const next = try allocator.alloc(TypeBinding, super.type_params.len * 2);
             for (super.type_params, 0..) |param, i| {
+                const identity_name = try classTypeParamIdentity(
+                    allocator,
+                    super_id,
+                    param,
+                );
                 const supplied: TypeRef = if (super_ref) |ref|
-                    (if (i < ref.args.len) ref.args[i] else .{ .name = param, .nullable = false, .args = &.{} })
+                    (if (i < ref.args.len) ref.args[i] else .{ .name = identity_name, .nullable = false, .args = &.{} })
                 else
-                    .{ .name = param, .nullable = false, .args = &.{} };
-                next[i] = .{ .name = param, .ty = try substituteType(allocator, supplied, current_bindings) };
+                    .{ .name = identity_name, .nullable = false, .args = &.{} };
+                const supplied_ty = try substituteType(
+                    allocator,
+                    supplied,
+                    current_bindings,
+                );
+                next[i * 2] = .{ .name = param, .ty = supplied_ty };
+                next[i * 2 + 1] = .{ .name = identity_name, .ty = supplied_ty };
             }
             if (try self.ancestorBindings(allocator, super_id, target, next, depth + 1)) |found| return found;
         }
@@ -3723,9 +4210,20 @@ pub const Module = struct {
         const base_owner = base_sig.enclosing_class orelse return false;
 
         const owner_class = &self.classes.items[owner.int()];
-        const identity = try allocator.alloc(TypeBinding, owner_class.type_params.len);
+        const identity = try allocator.alloc(TypeBinding, owner_class.type_params.len * 2);
         for (owner_class.type_params, 0..) |param, i| {
-            identity[i] = .{ .name = param, .ty = .{ .name = param, .nullable = false, .args = &.{} } };
+            const identity_name = try classTypeParamIdentity(
+                allocator,
+                owner,
+                param,
+            );
+            const identity_ty = TypeRef{
+                .name = identity_name,
+                .nullable = false,
+                .args = &.{},
+            };
+            identity[i * 2] = .{ .name = param, .ty = identity_ty };
+            identity[i * 2 + 1] = .{ .name = identity_name, .ty = identity_ty };
         }
         const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse return false;
         for (candidate_sig.sig, base_sig.sig) |candidate_ty, raw_base_ty| {
@@ -5247,6 +5745,8 @@ pub const Module = struct {
         cast_pick: ?FuncId = null,
         recv_ty: ?[]const u8 = null,
         recv_type: ?TypeRef = null,
+        /// Bounds for type parameters appearing in `recv_type`.
+        actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
         is_value_capture: bool = false,
         /// The caller sits in a tailrec function body (`tailrecSelf() != null`).
         /// A positional call to a tailrec target from such a body emits a static
@@ -5265,6 +5765,11 @@ pub const Module = struct {
         /// the declaring class (or a subclass) has that class as an implicit
         /// dispatch receiver, so only there is one bindable by a bare call.
         owner_class: ?[]const u8 = null,
+        /// Every implicit callable receiver is represented by `recv_type`
+        /// and/or `owner_class`, and each hierarchy is complete. Lambda/thunk
+        /// bodies and declarations with outer or companion receivers leave
+        /// this false.
+        receiver_scope_complete: bool = false,
     };
 
     fn funcIsInline(self: *const Module, id: FuncId) bool {
@@ -6177,6 +6682,129 @@ pub const Module = struct {
         return false;
     }
 
+    /// Whether any statically known implicit receiver has an applicable member
+    /// or extension named `name`. A definite false is available only when the
+    /// lowerer proved that the extension/dispatch receivers form the complete
+    /// receiver scope; receiver lambdas, thunks, outers, and companions keep
+    /// the conservative runtime walk.
+    fn knownReceiverCallableApplicable(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+        args: []const applicability.ArgShape,
+        ctx: ResolveCtx,
+    ) ?bool {
+        if (!ctx.receiver_scope_complete) return null;
+        var receivers: [2]TypeRef = undefined;
+        var receiver_complete: [2]bool = undefined;
+        var receiver_bounds: [2][]const ModuleRegistry.TypeParamBound = undefined;
+        var owner_args: [32]TypeRef = undefined;
+        var receiver_count: usize = 0;
+        if (ctx.recv_type orelse if (ctx.recv_ty) |head|
+            TypeRef{ .name = head, .nullable = false, .args = &.{} }
+        else
+            null) |receiver|
+        {
+            receivers[receiver_count] = receiver;
+            receiver_bounds[receiver_count] = ctx.actual_type_param_bounds;
+            receiver_complete[receiver_count] = self.staticTypeClassId(receiver) != null and
+                self.staticTypeProofComplete(receiver, ctx.actual_type_param_bounds);
+            receiver_count += 1;
+        }
+        if (ctx.owner_class) |owner_name| {
+            var owner_receiver = TypeRef{ .name = owner_name, .nullable = false, .args = &.{} };
+            const owner_id = self.staticTypeClassId(owner_receiver);
+            var owner_complete = false;
+            var owner_has_type_params = false;
+            var owner_bounds: []const ModuleRegistry.TypeParamBound = &.{};
+            if (owner_id) |id| {
+                if (id.int() < self.classes.items.len) {
+                    const class = &self.classes.items[id.int()];
+                    owner_has_type_params = class.type_params.len != 0;
+                    if (class.type_params.len <= owner_args.len) {
+                        for (class.type_params, 0..) |param, i| {
+                            owner_args[i] = .{ .name = param, .nullable = false, .args = &.{} };
+                        }
+                        owner_receiver = .{
+                            .name = class.fqn,
+                            .nullable = false,
+                            .args = owner_args[0..class.type_params.len],
+                        };
+                        owner_bounds = self.registry.class_type_param_bounds.get(class.fqn) orelse &.{};
+                        owner_complete = self.staticTypeProofComplete(owner_receiver, owner_bounds);
+                    }
+                }
+            }
+            const duplicate = owner_complete and !owner_has_type_params and
+                receiver_count != 0 and blk: {
+                const receiver = receivers[0];
+                if (!receiver_complete[0] or receiver.nullable or
+                    self.staticTypeClassId(receiver).? != owner_id.?)
+                {
+                    break :blk false;
+                }
+                const receiver_args = overrideArgs(receiver);
+                const dispatch_args = overrideArgs(owner_receiver);
+                if (receiver_args.len != dispatch_args.len) break :blk false;
+                for (receiver_args, dispatch_args) |receiver_arg, dispatch_arg| {
+                    if (!receiver_arg.eql(dispatch_arg)) break :blk false;
+                }
+                break :blk true;
+            };
+            if (!duplicate) {
+                receivers[receiver_count] = owner_receiver;
+                receiver_complete[receiver_count] = owner_complete;
+                receiver_bounds[receiver_count] = owner_bounds;
+                receiver_count += 1;
+            }
+        }
+        if (receiver_count == 0) return null;
+        var has_incomplete_receiver = false;
+        const lexical_owner: ?ClassId = if (ctx.owner_class) |lexical|
+            self.staticTypeClassId(.{ .name = lexical, .nullable = false, .args = &.{} })
+        else
+            null;
+        for (
+            receivers[0..receiver_count],
+            receiver_complete[0..receiver_count],
+            receiver_bounds[0..receiver_count],
+        ) |receiver, complete, bounds| {
+            if (!complete) {
+                has_incomplete_receiver = true;
+                continue;
+            }
+            const owner = self.staticTypeClassId(receiver).?;
+            if (self.resolveMemberCall(owner, name, args, .{
+                .lexical_owner = lexical_owner,
+                .actual_type_param_bounds = bounds,
+                .receiver_type = receiver,
+            }).applicable) return true;
+        }
+        // The static extension resolver deliberately declines named and spread
+        // argument shapes. They therefore cannot prove a negative: preserve
+        // the receiver walk unless a member already proved applicability.
+        for (args) |arg| {
+            if (arg.named != null or arg.is_spread) return null;
+        }
+        for (
+            receivers[0..receiver_count],
+            receiver_complete[0..receiver_count],
+            receiver_bounds[0..receiver_count],
+        ) |receiver, complete, bounds| {
+            if (!complete) continue;
+            if (self.resolveExtensionCall(name, receiver, args, .{
+                .caller_file = caller_file,
+                .caller_package = caller_pkg,
+                .lexical_owner = ctx.owner_class,
+                .call_name = name,
+                .actual_type_param_bounds = bounds,
+            }).applicable) return true;
+        }
+        if (has_incomplete_receiver) return null;
+        return false;
+    }
+
     /// Phase C — the single member-vs-global decision, folding the receiver
     /// gates once. `Call → exact`, `CallMember`/`CallMemberOrGlobal → virtual`
     /// (target non-null) or `deferred` (target null), `CallValue → deferred`.
@@ -6193,8 +6821,18 @@ pub const Module = struct {
         args: []const applicability.ArgShape,
         ctx: ResolveCtx,
     ) std.mem.Allocator.Error!Resolution {
-        const member_shadowable = ctx.unknown_receiver or ctx.enclosing_has_member or
-            (!ctx.receiver_known and self.registry.class_member_names.contains(name));
+        const known_receiver_applicable = self.knownReceiverCallableApplicable(
+            name,
+            caller_pkg,
+            caller_file,
+            args,
+            ctx,
+        );
+        const receiver_shadowable = known_receiver_applicable orelse
+            (ctx.in_receiver_context or ctx.unknown_receiver);
+        const member_shadowable = receiver_shadowable or ctx.enclosing_has_member or
+            (known_receiver_applicable == null and !ctx.receiver_known and
+                self.registry.class_member_names.contains(name));
         const cast_static = if (ctx.cast_pick) |cp| (if (target) |t| cp.int() == t.int() else false) else false;
         if (target) |t| {
             const is_ext = if (self.funcById(t)) |f| funcHasImplicitThis(f) else false;
@@ -6562,6 +7200,20 @@ pub const Module = struct {
     /// a base class accepts a subclass receiver.
     pub fn classIsOrExtends(self: *const Module, sub: []const u8, super_name: []const u8) bool {
         if (std.mem.eql(u8, sub, super_name)) return true;
+        const sub_id = if (std.mem.indexOfScalar(u8, sub, '.') != null)
+            self.classIdByFqn(sub)
+        else
+            self.uniqueClassIdBySimpleName(staticTypeHead(sub));
+        const super_id = if (std.mem.indexOfScalar(u8, super_name, '.') != null)
+            self.classIdByFqn(super_name)
+        else
+            self.uniqueClassIdBySimpleName(staticTypeHead(super_name));
+        if (sub_id != null or super_id != null) {
+            return sub_id != null and super_id != null and
+                self.classIdIsOrExtends(sub_id.?, super_id.?);
+        }
+        if (std.mem.indexOfScalar(u8, sub, '.') != null or
+            std.mem.indexOfScalar(u8, super_name, '.') != null) return false;
         const supers = self.registry.class_super_names.get(sub) orelse return false;
         for (supers) |s| {
             if (std.mem.eql(u8, s, super_name)) return true;
@@ -7034,6 +7686,9 @@ pub const ModuleRegistry = struct {
     pub const TypeParamBound = struct {
         param: []const u8,
         bound: []const u8,
+        /// False when the string-only record dropped intersection or
+        /// structural type information and cannot support a negative proof.
+        complete: bool = true,
     };
 
     /// One class's transitive shadow-name set + chain completeness.
@@ -7492,6 +8147,29 @@ test "packageOfFqn strips the trailing simple name" {
     try testing.expectEqualStrings("pkg", packageOfFqn("pkg.Outer$Name", "Name"));
 }
 
+test "class type parameter identities are exact and unambiguous" {
+    const first = try classTypeParamIdentity(
+        testing.allocator,
+        ClassId.from(1),
+        "23X",
+    );
+    defer testing.allocator.free(first);
+    const second = try classTypeParamIdentity(
+        testing.allocator,
+        ClassId.from(12),
+        "3X",
+    );
+    defer testing.allocator.free(second);
+    try testing.expect(!std.mem.eql(u8, first, second));
+
+    const projected = try std.fmt.allocPrint(testing.allocator, "out#{s}", .{first});
+    defer testing.allocator.free(projected);
+    const parsed = parseClassTypeParamIdentity(projected).?;
+    try testing.expectEqual(ClassId.from(1), parsed.owner);
+    try testing.expectEqualStrings("23X", parsed.param);
+    try testing.expect(parseClassTypeParamIdentity("$class$123X") == null);
+}
+
 test "extension candidate index uses declaration metadata for bodyless headers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -7745,6 +8423,83 @@ test "member resolution uses declaration-owner visibility" {
     );
 }
 
+test "member resolution separates class and caller function bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const scope = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "sample.Scope",
+        .package = "sample",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put(
+        "sample.Scope",
+        try a.dupe(ModuleRegistry.TypeParamBound, &.{
+            .{ .param = "T", .bound = "Number" },
+        }),
+    );
+    const class_t = try classTypeParamIdentity(a, scope, "T");
+    const owner_args = try a.dupe(TypeRef, &.{
+        .{ .name = class_t, .nullable = false, .args = &.{} },
+    });
+    const choose = try pushTestFuncOpts(
+        &m,
+        a,
+        "choose",
+        "sample.Scope.choose",
+        "sample",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[choose.int()].kind = .instance_method;
+    m.funcs.items[choose.int()].params[0].ty = .{
+        .name = "sample.Scope",
+        .nullable = false,
+        .args = owner_args,
+    };
+    m.funcs.items[choose.int()].params[1].ty = .{
+        .name = class_t,
+        .nullable = false,
+        .args = &.{},
+    };
+    try m.decl_sigs.put(choose.int(), .{
+        .enclosing_class = scope,
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = try a.dupe(TypeRef, &.{m.funcs.items[choose.int()].params[1].ty}),
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    try m.registerMemberDecl(a, "sample.Scope", "choose", choose);
+
+    const args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "T", .nullable = false, .args = &.{} },
+    }};
+    const actual_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = class_t, .bound = "Number" },
+        .{ .param = "T", .bound = "CharSequence" },
+    };
+    const resolved = m.resolveMemberCall(scope, "choose", &args, .{
+        .receiver_type = .{
+            .name = "sample.Scope",
+            .nullable = false,
+            .args = owner_args,
+        },
+        .actual_type_param_bounds = &actual_bounds,
+    });
+    try testing.expect(resolved.target == null);
+    try testing.expect(!resolved.applicable);
+}
+
 test "method slots link generic overrides and multiple interface roots" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -7851,11 +8606,14 @@ test "method slots link generic overrides and multiple interface roots" {
     const owners = [_]ClassId{ base, child, left, right, both };
     const funcs = [_]FuncId{ base_put, child_put, left_run, right_run, both_run };
     const types = [_][]const u8{ "T", "String", "Int", "Int", "Int" };
+    const base_t = try classTypeParamIdentity(a, base, "T");
     for (funcs, owners, types) |fid, owner, ty| {
+        const declared_ty = if (fid == base_put) base_t else ty;
+        m.funcs.items[fid.int()].params[0].ty.name = declared_ty;
         try m.decl_sigs.put(fid.int(), .{
             .enclosing_class = owner,
             .arity = .{ .required = 1, .total = 1, .has_vararg = false },
-            .sig = &.{.{ .name = ty, .nullable = false, .args = &.{} }},
+            .sig = &.{.{ .name = declared_ty, .nullable = false, .args = &.{} }},
             .kind = .instance_method,
             .has_body = m.funcs.items[fid.int()].hasBody(),
         });
@@ -7956,6 +8714,89 @@ test "method slots link generic overrides and multiple interface roots" {
     try testing.expectEqual(
         combined_all,
         m.methodSlotTarget(combined, MethodSlotId.fromFunc(root_all)).?,
+    );
+
+    const shadow_base = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "ShadowBase",
+        .fqn = "sample.ShadowBase",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .type_params = &.{"T"},
+        .is_open = true,
+    });
+    const shadow_child_arg = try a.dupe(TypeRef, &.{.{
+        .name = "X",
+        .nullable = false,
+        .args = &.{},
+    }});
+    const shadow_child = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "ShadowChild",
+        .fqn = "sample.ShadowChild",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{shadow_base}),
+        .supertype_refs = try a.dupe(TypeRef, &.{.{
+            .name = "ShadowBase",
+            .nullable = false,
+            .args = shadow_child_arg,
+        }}),
+        .type_params = &.{"X"},
+    });
+    const base_pick = try pushTestFuncOpts(
+        &m,
+        a,
+        "pick",
+        "sample.ShadowBase.pick",
+        "sample",
+        1,
+        .{ .stub = true, .param_ty = "T" },
+    );
+    const child_pick = try pushTestFuncOpts(
+        &m,
+        a,
+        "pick",
+        "sample.ShadowChild.pick",
+        "sample",
+        1,
+        .{ .param_ty = "T" },
+    );
+    for ([_]FuncId{ base_pick, child_pick }) |fid| {
+        m.funcs.items[fid.int()].kind = .instance_method;
+        var method_type_params: std.ArrayList([]const u8) = .empty;
+        try method_type_params.append(a, "T");
+        try m.registry.func_type_params.put(fid, method_type_params);
+    }
+    m.funcs.items[child_pick.int()].is_override = true;
+    m.classes.items[shadow_base.int()].methods = try a.dupe(FuncId, &.{base_pick});
+    m.classes.items[shadow_child.int()].methods = try a.dupe(FuncId, &.{child_pick});
+    for (
+        [_]FuncId{ base_pick, child_pick },
+        [_]ClassId{ shadow_base, shadow_child },
+    ) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+            .sig = try a.dupe(TypeRef, &.{.{
+                .name = "T",
+                .nullable = false,
+                .args = &.{},
+            }}),
+            .kind = .instance_method,
+            .has_body = m.funcs.items[fid.int()].hasBody(),
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "pick", fid);
+    }
+    try m.linkMethodSlots(a);
+    try testing.expectEqual(
+        child_pick,
+        m.methodSlotTarget(shadow_child, MethodSlotId.fromFunc(base_pick)).?,
     );
 }
 
@@ -8340,7 +9181,7 @@ test "extension resolver admits source bodies and defers possible member shadows
         .caller_package = "app",
         .lexical_owner = "Scope",
     });
-    try testing.expect(shadowed.target == null);
+    try testing.expectEqual(member, shadowed.target.?);
 
     const unresolved = m.resolveExtensionCall("headerOnly", receiver, &.{}, .{
         .caller_file = FileId.from(0),
@@ -8383,7 +9224,114 @@ test "extension resolver admits source bodies and defers possible member shadows
         .implicit_dispatch_owners = &.{"StringBuilder"},
         .lexical_owner = "HiddenExtensions",
     });
-    try testing.expect(visible_object.target == null);
+    try testing.expectEqual(hidden_starts_with, visible_object.target.?);
+}
+
+test "member extension resolution keeps qualified declaring owners distinct" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const left_owner = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "left.Scope",
+        .package = "left",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const right_owner = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "right.Scope",
+        .package = "right",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const left = try pushTestFuncOpts(
+        &m,
+        a,
+        "tag",
+        "left.Scope.tag",
+        "left",
+        0,
+        .{ .extension = true },
+    );
+    const right = try pushTestFuncOpts(
+        &m,
+        a,
+        "tag",
+        "right.Scope.tag",
+        "right",
+        0,
+        .{ .extension = true },
+    );
+    for ([_]struct { fid: FuncId, owner: ClassId, fqn: []const u8 }{
+        .{ .fid = left, .owner = left_owner, .fqn = "left.Scope" },
+        .{ .fid = right, .owner = right_owner, .fqn = "right.Scope" },
+    }) |entry| {
+        m.funcs.items[entry.fid.int()].kind = .member_extension;
+        m.funcs.items[entry.fid.int()].params[0].ty = .{
+            .name = "String",
+            .nullable = false,
+            .args = &.{},
+        };
+        try m.registry.member_ext_owner_class.put(entry.fid, entry.fqn);
+        try m.decl_sigs.put(entry.fid.int(), .{
+            .enclosing_class = entry.owner,
+            .receiver_ty = m.funcs.items[entry.fid.int()].params[0].ty,
+            .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+            .sig = &.{},
+            .kind = .member_extension,
+            .has_body = true,
+        });
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    const resolved = m.resolveExtensionCall(
+        "tag",
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        &.{},
+        .{
+            .caller_file = FileId.from(0),
+            .caller_package = "left",
+            .lexical_owner = "Scope",
+        },
+    );
+    try testing.expectEqual(left, resolved.target.?);
+    try testing.expectEqual(left_owner, resolved.dispatch_owner.?);
+
+    const right_innermost = m.resolveExtensionCall(
+        "tag",
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        &.{},
+        .{
+            .caller_file = FileId.from(0),
+            .caller_package = "left",
+            .implicit_dispatch_owners = &.{ "right.Scope", "left.Scope" },
+        },
+    );
+    try testing.expectEqual(right, right_innermost.target.?);
+    try testing.expectEqual(right_owner, right_innermost.dispatch_owner.?);
+
+    const left_innermost = m.resolveExtensionCall(
+        "tag",
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        &.{},
+        .{
+            .caller_file = FileId.from(0),
+            .caller_package = "right",
+            .implicit_dispatch_owners = &.{ "left.Scope", "right.Scope" },
+        },
+    );
+    try testing.expectEqual(left, left_innermost.target.?);
+    try testing.expectEqual(left_owner, left_innermost.dispatch_owner.?);
 }
 
 test "extension resolver does not erase incompatible generic receiver arguments" {
@@ -8510,6 +9458,7 @@ test "extension resolver ranks proven generic argument structure" {
         a,
         sequence,
         receiver,
+        null,
         &args,
         &.{},
     )).?;
@@ -8517,6 +9466,352 @@ test "extension resolver ranks proven generic argument structure" {
     try testing.expectEqualStrings("Sequence", return_ty.name);
     try testing.expectEqual(@as(usize, 1), return_ty.args.len);
     try testing.expectEqualStrings("Int", return_ty.args[0].name);
+}
+
+test "member return instantiation separates class and function type parameters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const box = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Box",
+        .fqn = "app.Box",
+        .package = "app",
+        .type_params = &.{"String"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const class_identity = try classTypeParamIdentity(a, box, "String");
+    const class_arg = try a.dupe(TypeRef, &.{
+        .{ .name = class_identity, .nullable = false, .args = &.{} },
+    });
+    const actual_arg = try a.dupe(TypeRef, &.{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    });
+    const box_pattern = TypeRef{
+        .name = "app.Box",
+        .nullable = false,
+        .args = class_arg,
+    };
+    const box_int = TypeRef{
+        .name = "app.Box",
+        .nullable = false,
+        .args = actual_arg,
+    };
+
+    const get = try pushTestFuncOpts(&m, a, "get", "app.Box.get", "app", 0, .{
+        .extension = true,
+    });
+    m.funcs.items[get.int()].kind = .instance_method;
+    m.funcs.items[get.int()].params[0].ty = box_pattern;
+    m.funcs.items[get.int()].return_ty = class_arg[0];
+    try m.decl_sigs.put(get.int(), .{
+        .enclosing_class = box,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .instance_method,
+        .has_body = true,
+    });
+
+    var class_result = (try m.instantiatedCallReturnType(
+        a,
+        get,
+        box_int,
+        box_int,
+        &.{},
+        &.{},
+    )).?;
+    defer class_result.deinit(a);
+    try testing.expectEqualStrings("Int", class_result.name);
+
+    const shadow = try pushTestFuncOpts(
+        &m,
+        a,
+        "shadow",
+        "app.Box.shadow",
+        "app",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[shadow.int()].kind = .instance_method;
+    m.funcs.items[shadow.int()].params[0].ty = box_pattern;
+    const function_param_ty = TypeRef{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    };
+    m.funcs.items[shadow.int()].params[1].ty = function_param_ty;
+    m.funcs.items[shadow.int()].return_ty = function_param_ty;
+    var function_params: std.ArrayList([]const u8) = .empty;
+    try function_params.append(a, "String");
+    try m.registry.func_type_params.put(shadow, function_params);
+    const shadow_sig = try a.dupe(TypeRef, &.{function_param_ty});
+    try m.decl_sigs.put(shadow.int(), .{
+        .enclosing_class = box,
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = shadow_sig,
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    const bool_args = [_]applicability.ArgShape{.{
+        .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} },
+    }};
+    var function_result = (try m.instantiatedCallReturnType(
+        a,
+        shadow,
+        box_int,
+        box_int,
+        &bool_args,
+        &.{},
+    )).?;
+    defer function_result.deinit(a);
+    try testing.expectEqualStrings("Boolean", function_result.name);
+
+    const qualified_args = try a.dupe(TypeRef, &.{
+        .{ .name = "#qual:kotlin.String", .nullable = false, .args = &.{} },
+    });
+    const qualified_string = TypeRef{
+        .name = "String",
+        .nullable = false,
+        .args = qualified_args,
+    };
+    const literal = try pushTestFuncOpts(
+        &m,
+        a,
+        "literal",
+        "app.Box.literal",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[literal.int()].kind = .instance_method;
+    m.funcs.items[literal.int()].params[0].ty = box_pattern;
+    m.funcs.items[literal.int()].return_ty = qualified_string;
+    try m.decl_sigs.put(literal.int(), .{
+        .enclosing_class = box,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    var literal_result = (try m.instantiatedCallReturnType(
+        a,
+        literal,
+        box_int,
+        box_int,
+        &.{},
+        &.{},
+    )).?;
+    defer literal_result.deinit(a);
+    try testing.expectEqualStrings("String", literal_result.name);
+    try testing.expectEqualStrings(
+        "#qual:kotlin.String",
+        literal_result.args[literal_result.args.len - 1].name,
+    );
+}
+
+test "extension return instantiation projects a subtype receiver" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const parent = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Parent",
+        .fqn = "app.Parent",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const t_args = try a.dupe(TypeRef, &.{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+    });
+    const supers = try a.dupe(ClassId, &.{parent});
+    const super_refs = try a.dupe(TypeRef, &.{
+        .{ .name = "app.Parent", .nullable = false, .args = t_args },
+    });
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Child",
+        .fqn = "app.Child",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = supers,
+        .supertype_refs = super_refs,
+    });
+
+    const wrap = try pushTestFuncOpts(&m, a, "wrap", "app.wrap", "app", 0, .{
+        .extension = true,
+    });
+    m.funcs.items[wrap.int()].kind = .top_level_extension;
+    m.funcs.items[wrap.int()].params[0].ty = .{
+        .name = "app.Parent",
+        .nullable = false,
+        .args = t_args,
+    };
+    m.funcs.items[wrap.int()].return_ty = .{
+        .name = "app.Child",
+        .nullable = false,
+        .args = t_args,
+    };
+    var type_params: std.ArrayList([]const u8) = .empty;
+    try type_params.append(a, "T");
+    try m.registry.func_type_params.put(wrap, type_params);
+
+    const int_args = try a.dupe(TypeRef, &.{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    });
+    var result = (try m.instantiatedCallReturnType(
+        a,
+        wrap,
+        .{ .name = "app.Child", .nullable = false, .args = int_args },
+        null,
+        &.{},
+        &.{},
+    )).?;
+    defer result.deinit(a);
+    try testing.expectEqualStrings("app.Child", result.name);
+    try testing.expectEqual(@as(usize, 1), result.args.len);
+    try testing.expectEqualStrings("Int", result.args[0].name);
+
+    const shadow_parent = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "ShadowParent",
+        .fqn = "app.ShadowParent",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const qualified_string_args = try a.dupe(TypeRef, &.{
+        .{ .name = "#qual:kotlin.String", .nullable = false, .args = &.{} },
+    });
+    const shadow_supers = try a.dupe(ClassId, &.{shadow_parent});
+    const shadow_super_refs = try a.dupe(TypeRef, &.{
+        .{
+            .name = "app.ShadowParent",
+            .nullable = false,
+            .args = try a.dupe(TypeRef, &.{
+                .{ .name = "String", .nullable = false, .args = qualified_string_args },
+            }),
+        },
+    });
+    const shadow_child = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "ShadowChild",
+        .fqn = "app.ShadowChild",
+        .package = "app",
+        .type_params = &.{"String"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = shadow_supers,
+        .supertype_refs = shadow_super_refs,
+    });
+    const shadow_actual_args = try a.dupe(TypeRef, &.{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    });
+    const projected = (try m.projectTypeToClass(
+        a,
+        .{
+            .name = m.classes.items[shadow_child.int()].fqn,
+            .nullable = false,
+            .args = shadow_actual_args,
+        },
+        shadow_parent,
+    )).?;
+    try testing.expectEqualStrings("app.ShadowParent", projected.name);
+    try testing.expectEqual(@as(usize, 1), projected.args.len);
+    try testing.expectEqualStrings("String", projected.args[0].name);
+    try testing.expectEqualStrings(
+        "#qual:kotlin.String",
+        projected.args[0].args[projected.args[0].args.len - 1].name,
+    );
+}
+
+test "member extension return instantiation uses the dispatch receiver" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const scope = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "app.Scope",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const value = try pushTestFuncOpts(&m, a, "value", "app.Scope.value", "app", 0, .{
+        .extension = true,
+    });
+    const class_identity = try classTypeParamIdentity(a, scope, "T");
+    m.funcs.items[value.int()].kind = .member_extension;
+    m.funcs.items[value.int()].params[0].ty = .{
+        .name = "String",
+        .nullable = false,
+        .args = &.{},
+    };
+    m.funcs.items[value.int()].return_ty = .{
+        .name = class_identity,
+        .nullable = false,
+        .args = &.{},
+    };
+    try m.decl_sigs.put(value.int(), .{
+        .enclosing_class = scope,
+        .receiver_ty = m.funcs.items[value.int()].params[0].ty,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .member_extension,
+        .has_body = true,
+    });
+    const scope_args = try a.dupe(TypeRef, &.{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    });
+    try testing.expect((try m.instantiatedCallReturnType(
+        a,
+        value,
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        null,
+        &.{},
+        &.{},
+    )) == null);
+    var result = (try m.instantiatedCallReturnType(
+        a,
+        value,
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        .{ .name = "app.Scope", .nullable = false, .args = scope_args },
+        &.{},
+        &.{},
+    )).?;
+    defer result.deinit(a);
+    try testing.expectEqualStrings("Int", result.name);
 }
 
 test "extension resolver substitutes bounded caller type parameters" {
@@ -8559,16 +9854,37 @@ test "extension resolver substitutes bounded caller type parameters" {
 
     const actual_args = try a.alloc(TypeRef, 1);
     actual_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
-    const resolved = m.resolveExtensionCall("minOrNull", .{
+    const actual_receiver = TypeRef{
         .name = "Array",
         .nullable = false,
         .args = actual_args,
-    }, &.{}, .{
+    };
+    const actual_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "Comparable" },
+    };
+    const declared_bounds = try m.declaredTypeParamBounds(a, generic);
+    try testing.expect(m.staticBoundProofComplete(
+        declared_bounds[0],
+        declared_bounds,
+        0,
+    ));
+    try testing.expect(try m.staticTypeIsSubtypeWithBounds(
+        a,
+        .{ .name = "T", .nullable = false, .args = &.{} },
+        .{ .name = "Comparable", .nullable = false, .args = &.{} },
+        &actual_bounds,
+    ));
+    try testing.expect(try m.staticGenericReceiverApplicable(
+        a,
+        actual_receiver,
+        m.funcs.items[generic.int()].params[0].ty,
+        declared_bounds,
+        &actual_bounds,
+    ));
+    const resolved = m.resolveExtensionCall("minOrNull", actual_receiver, &.{}, .{
         .caller_file = FileId.from(0),
         .caller_package = "app",
-        .actual_type_param_bounds = &.{
-            .{ .param = "T", .bound = "Comparable" },
-        },
+        .actual_type_param_bounds = &actual_bounds,
     });
     try testing.expectEqual(generic, resolved.target.?);
 
@@ -9225,6 +10541,683 @@ test "resolveCall: an exact non-extension resolves to a static Call" {
     try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
     try testing.expectEqual(Module.Confidence.exact, res.confidence);
     try testing.expectEqual(g.int(), res.target.?.int());
+}
+
+test "resolveCall ignores inapplicable callables on a known receiver tower" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try pushTestClass(&m, a, "String", "kotlin.String", "kotlin");
+    _ = try pushTestClass(&m, a, "FractionalParser", "kotlin.time.FractionalParser", "kotlin.time");
+    const global = try pushTestFuncOpts(&m, a, "repeat", "kotlin.repeat", "kotlin", 2, .{});
+    m.funcs.items[global.int()].params[1].ty.name = "Function1";
+
+    const string_repeat = try pushTestFuncOpts(
+        &m,
+        a,
+        "repeat",
+        "kotlin.text.repeat",
+        "kotlin.text",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[string_repeat.int()].kind = .top_level_extension;
+    const string_repeat_sig = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    };
+    try m.decl_sigs.put(string_repeat.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &string_repeat_sig,
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+        .{
+            .ty = .{ .name = "Function1", .nullable = false, .args = &.{} },
+            .is_lambda = true,
+            .lambda_arity = 1,
+        },
+    };
+    const res = try m.resolveCall(a, "repeat", "app", FileId.from(0), &args, true, .{
+        .in_receiver_context = true,
+        .unknown_receiver = true,
+        .recv_ty = "String",
+        .recv_type = .{ .name = "String", .nullable = false, .args = &.{} },
+        .owner_class = "FractionalParser",
+        .receiver_scope_complete = true,
+    });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(global, res.target.?);
+    try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
+    try testing.expectEqual(Module.Confidence.exact, res.confidence);
+}
+
+test "resolveCall retains a vararg extension on a known receiver" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try pushTestClass(&m, a, "String", "kotlin.String", "kotlin");
+    const global = try pushTestFunc(&m, a, "pick", "app.pick", "app", 1);
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "pick",
+        "app.stringPick",
+        "app",
+        1,
+        .{ .extension = true, .last_vararg = true },
+    );
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(extension.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 1, .has_vararg = true },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    const res = try m.resolveCall(a, "pick", "app", FileId.from(0), &args, false, .{
+        .in_receiver_context = true,
+        .unknown_receiver = true,
+        .recv_ty = "String",
+        .recv_type = .{ .name = "String", .nullable = false, .args = &.{} },
+        .receiver_scope_complete = true,
+    });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(global, res.target.?);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, res.emit_form);
+    try testing.expectEqual(Module.Confidence.virtual, res.confidence);
+}
+
+test "known receiver applicability keeps same-name classes distinct" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try pushTestClass(&m, a, "Scope", "left.Scope", "left");
+    const owner = try pushTestClass(&m, a, "Scope", "right.Scope", "right");
+    const choose = try pushTestFunc(&m, a, "choose", "right.Scope.choose", "right", 1);
+    m.funcs.items[choose.int()].kind = .instance_method;
+    const choose_sig = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    };
+    try m.decl_sigs.put(choose.int(), .{
+        .enclosing_class = owner,
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &choose_sig,
+        .kind = .instance_method,
+        .has_body = true,
+    });
+    try m.registerMemberDecl(a, "right.Scope", "choose", choose);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    try testing.expectEqual(true, m.knownReceiverCallableApplicable(
+        "choose",
+        "app",
+        FileId.from(0),
+        &args,
+        .{
+            .recv_ty = "left.Scope",
+            .recv_type = .{ .name = "left.Scope", .nullable = false, .args = &.{} },
+            .owner_class = "right.Scope",
+            .receiver_scope_complete = true,
+        },
+    ).?);
+
+    const left_qualifier = [_]TypeRef{
+        .{ .name = "#qual:left.Scope", .nullable = false, .args = &.{} },
+    };
+    try testing.expect(m.knownReceiverCallableApplicable(
+        "choose",
+        "app",
+        FileId.from(0),
+        &args,
+        .{
+            .recv_ty = "Scope",
+            .recv_type = .{ .name = "Scope", .nullable = false, .args = @constCast(&left_qualifier) },
+            .owner_class = "Scope",
+            .receiver_scope_complete = true,
+        },
+    ) == null);
+}
+
+test "known receiver applicability keeps nullable extension and dispatch receivers" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try pushTestClass(&m, a, "Scope", "app.Scope", "app");
+    const choose = try pushTestFuncOpts(
+        &m,
+        a,
+        "choose",
+        "app.choose",
+        "app",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[choose.int()].params[0].ty.name = "app.Scope";
+    m.funcs.items[choose.int()].kind = .top_level_extension;
+    const choose_sig = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    };
+    try m.decl_sigs.put(choose.int(), .{
+        .receiver_ty = .{ .name = "app.Scope", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &choose_sig,
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    try testing.expectEqual(true, m.knownReceiverCallableApplicable(
+        "choose",
+        "app",
+        FileId.from(0),
+        &args,
+        .{
+            .recv_ty = "app.Scope",
+            .recv_type = .{ .name = "app.Scope", .nullable = true, .args = &.{} },
+            .owner_class = "app.Scope",
+            .receiver_scope_complete = true,
+        },
+    ).?);
+}
+
+test "known receiver applicability checks exact receivers before erased generic owners" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try pushTestClass(&m, a, "String", "kotlin.String", "kotlin");
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Box",
+        .fqn = "app.Box",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put("app.Box", try a.dupe(ModuleRegistry.TypeParamBound, &.{
+        .{ .param = "T", .bound = "kotlin.Any" },
+    }));
+    const choose = try pushTestFuncOpts(
+        &m,
+        a,
+        "choose",
+        "app.stringChoose",
+        "app",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[choose.int()].kind = .top_level_extension;
+    const choose_sig = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+    };
+    try m.decl_sigs.put(choose.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &choose_sig,
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const args = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} } },
+    };
+    const ctx = Module.ResolveCtx{
+        .recv_ty = "String",
+        .recv_type = .{ .name = "String", .nullable = false, .args = &.{} },
+        .owner_class = "Box",
+        .receiver_scope_complete = true,
+    };
+    try testing.expectEqual(true, m.knownReceiverCallableApplicable(
+        "choose",
+        "app",
+        FileId.from(0),
+        &args,
+        ctx,
+    ).?);
+    try testing.expectEqual(false, m.knownReceiverCallableApplicable(
+        "missing",
+        "app",
+        FileId.from(0),
+        &args,
+        ctx,
+    ).?);
+}
+
+test "an imported same-name upper bound cannot complete raw bound evidence" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const left = try pushTestClass(&m, a, "Bound", "left.Bound", "left");
+    _ = try pushTestClass(&m, a, "Bound", "right.Bound", "right");
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Box",
+        .fqn = "app.Box",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put("app.Box", try a.dupe(ModuleRegistry.TypeParamBound, &.{
+        .{ .param = "T", .bound = "Bound", .complete = true },
+    }));
+
+    var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
+    const segs = try a.alloc([]const u8, 2);
+    segs[0] = "left";
+    segs[1] = "Bound";
+    try paths.append(a, .{ .fqn = try a.dupe(u8, "left.Bound"), .segs = segs });
+    var imports = std.StringHashMap(std.ArrayList(ModuleRegistry.ImportPath)).init(a);
+    try imports.put("Bound", paths);
+    try m.registry.import_aliases.put(FileId.from(0), imports);
+    try testing.expectEqual(left, m.classIdIndexed("Bound", "app", FileId.from(0)).?);
+
+    try testing.expect(m.knownReceiverCallableApplicable(
+        "missing",
+        "app",
+        FileId.from(0),
+        &.{},
+        .{
+            .in_receiver_context = true,
+            .receiver_known = true,
+            .owner_class = "Box",
+            .receiver_scope_complete = true,
+        },
+    ) == null);
+
+    _ = try pushTestClass(&m, a, "U", "app.U", "app");
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Wrapper",
+        .fqn = "app.Wrapper",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const dependent_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "U", .complete = true },
+        .{ .param = "U", .bound = "Comparable", .complete = false },
+    };
+    const wrapper_args = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+    };
+    try testing.expect(!m.staticTypeProofComplete(.{
+        .name = "Wrapper",
+        .nullable = false,
+        .args = @constCast(&wrapper_args),
+    }, &dependent_bounds));
+}
+
+test "dependent candidate bounds use declaration bindings not caller names" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Pair",
+        .fqn = "app.Pair",
+        .package = "app",
+        .type_params = &.{ "First", "Second" },
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const declared_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "U" },
+        .{ .param = "U", .bound = "Number" },
+    };
+    const caller_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "A", .bound = "U" },
+        .{ .param = "U", .bound = "Number" },
+        .{ .param = "V", .bound = "Number" },
+    };
+    const pattern_args = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+        .{ .name = "U", .nullable = false, .args = &.{} },
+    };
+    const pattern = TypeRef{
+        .name = "Pair",
+        .nullable = false,
+        .args = @constCast(&pattern_args),
+    };
+    const invalid_args = [_]TypeRef{
+        .{ .name = "A", .nullable = false, .args = &.{} },
+        .{ .name = "V", .nullable = false, .args = &.{} },
+    };
+    try testing.expect(!(try m.staticGenericReceiverApplicable(
+        a,
+        .{ .name = "Pair", .nullable = false, .args = @constCast(&invalid_args) },
+        pattern,
+        &declared_bounds,
+        &caller_bounds,
+    )));
+    const valid_args = [_]TypeRef{
+        .{ .name = "A", .nullable = false, .args = &.{} },
+        .{ .name = "U", .nullable = false, .args = &.{} },
+    };
+    try testing.expect(try m.staticGenericReceiverApplicable(
+        a,
+        .{ .name = "Pair", .nullable = false, .args = @constCast(&valid_args) },
+        pattern,
+        &declared_bounds,
+        &caller_bounds,
+    ));
+
+    const any_declared_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "Any" },
+        .{ .param = "Any", .bound = "Number" },
+    };
+    const any_caller_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "A", .bound = "Any" },
+        .{ .param = "Any", .bound = "Number" },
+        .{ .param = "V", .bound = "Number" },
+    };
+    const any_pattern_args = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+        .{ .name = "Any", .nullable = false, .args = &.{} },
+    };
+    const any_pattern = TypeRef{
+        .name = "Pair",
+        .nullable = false,
+        .args = @constCast(&any_pattern_args),
+    };
+    try testing.expect(!(try m.staticGenericReceiverApplicable(
+        a,
+        .{ .name = "Pair", .nullable = false, .args = @constCast(&invalid_args) },
+        any_pattern,
+        &any_declared_bounds,
+        &any_caller_bounds,
+    )));
+    const synthetic_any_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "kotlin.Any" },
+        .{ .param = "Any", .bound = "Number" },
+    };
+    try testing.expect(try m.staticGenericReceiverApplicable(
+        a,
+        .{ .name = "Pair", .nullable = false, .args = @constCast(&invalid_args) },
+        any_pattern,
+        &synthetic_any_bounds,
+        &any_caller_bounds,
+    ));
+
+    const base = try pushTestClass(&m, a, "Base", "app.Base", "app");
+    const supers = [_]ClassId{base};
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Sub",
+        .fqn = "app.Sub",
+        .package = "app",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = @constCast(&supers),
+    });
+    const nominal_declared_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "U" },
+        .{ .param = "U", .bound = "kotlin.Any" },
+    };
+    const nominal_caller_bounds = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "A", .bound = "Sub" },
+        .{ .param = "Base", .bound = "kotlin.Any" },
+    };
+    const nominal_args = [_]TypeRef{
+        .{ .name = "A", .nullable = false, .args = &.{} },
+        .{ .name = "Base", .nullable = false, .args = &.{} },
+    };
+    try testing.expect(!(try m.staticGenericReceiverApplicable(
+        a,
+        .{ .name = "Pair", .nullable = false, .args = @constCast(&nominal_args) },
+        pattern,
+        &nominal_declared_bounds,
+        &nominal_caller_bounds,
+    )));
+}
+
+test "resolveCall retains a generic dispatch-owner extension" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Box",
+        .fqn = "app.Box",
+        .package = "app",
+        .type_params = &.{"T"},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put("app.Box", try a.dupe(ModuleRegistry.TypeParamBound, &.{
+        .{ .param = "T", .bound = "kotlin.Any" },
+    }));
+    const global = try pushTestFunc(&m, a, "pick", "app.pick", "app", 0);
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "pick",
+        "app.boxPick",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    const box_args = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+    };
+    const box_t = TypeRef{
+        .name = "Box",
+        .nullable = false,
+        .args = @constCast(&box_args),
+    };
+    m.funcs.items[extension.int()].params[0].ty = box_t;
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(extension.int(), .{
+        .receiver_ty = box_t,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const res = try m.resolveCall(a, "pick", "app", FileId.from(0), &.{}, false, .{
+        .in_receiver_context = true,
+        .receiver_known = true,
+        .owner_class = "Box",
+        .receiver_scope_complete = true,
+    });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(global, res.target.?);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, res.emit_form);
+    try testing.expectEqual(Module.Confidence.virtual, res.confidence);
+
+    const global_wrong = try pushTestFunc(&m, a, "wrong", "app.wrong", "app", 0);
+    const concrete_extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "wrong",
+        "app.stringBoxWrong",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    const string_args = [_]TypeRef{
+        .{ .name = "String", .nullable = false, .args = &.{} },
+    };
+    const box_string = TypeRef{
+        .name = "Box",
+        .nullable = false,
+        .args = @constCast(&string_args),
+    };
+    m.funcs.items[concrete_extension.int()].params[0].ty = box_string;
+    m.funcs.items[concrete_extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(concrete_extension.int(), .{
+        .receiver_ty = box_string,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const wrong = try m.resolveCall(a, "wrong", "app", FileId.from(0), &.{}, false, .{
+        .in_receiver_context = true,
+        .receiver_known = true,
+        .owner_class = "Box",
+        .receiver_scope_complete = true,
+    });
+    defer a.free(wrong.candidate_set);
+    try testing.expectEqual(global_wrong, wrong.target.?);
+    try testing.expectEqual(Module.EmitForm.Call, wrong.emit_form);
+    try testing.expectEqual(Module.Confidence.exact, wrong.confidence);
+}
+
+test "resolveCall applies a generic dispatch-owner upper bound" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    _ = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Box",
+        .fqn = "app.Box",
+        .package = "app",
+        .type_params = &.{"T"},
+        .type_param_variance = &.{.Out},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    try m.registry.class_type_param_bounds.put("app.Box", try a.dupe(ModuleRegistry.TypeParamBound, &.{
+        .{ .param = "T", .bound = "Number" },
+    }));
+    const global = try pushTestFunc(&m, a, "bounded", "app.bounded", "app", 0);
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "bounded",
+        "app.boundedBox",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    const number_args = [_]TypeRef{
+        .{ .name = "Number", .nullable = false, .args = &.{} },
+    };
+    const box_number = TypeRef{
+        .name = "Box",
+        .nullable = false,
+        .args = @constCast(&number_args),
+    };
+    m.funcs.items[extension.int()].params[0].ty = box_number;
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(extension.int(), .{
+        .receiver_ty = box_number,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const res = try m.resolveCall(a, "bounded", "app", FileId.from(0), &.{}, false, .{
+        .in_receiver_context = true,
+        .receiver_known = true,
+        .owner_class = "Box",
+        .receiver_scope_complete = true,
+    });
+    defer a.free(res.candidate_set);
+    try testing.expectEqual(global, res.target.?);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, res.emit_form);
+    try testing.expectEqual(Module.Confidence.virtual, res.confidence);
+
+    @constCast(m.registry.class_type_param_bounds.get("app.Box").?)[0].complete = false;
+    const uncertain_global = try pushTestFunc(&m, a, "uncertain", "app.uncertain", "app", 0);
+    const uncertain_extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "uncertain",
+        "app.uncertainStringBox",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    const string_args = [_]TypeRef{
+        .{ .name = "String", .nullable = false, .args = &.{} },
+    };
+    const box_string = TypeRef{
+        .name = "Box",
+        .nullable = false,
+        .args = @constCast(&string_args),
+    };
+    m.funcs.items[uncertain_extension.int()].params[0].ty = box_string;
+    m.funcs.items[uncertain_extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(uncertain_extension.int(), .{
+        .receiver_ty = box_string,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+    const uncertain = try m.resolveCall(
+        a,
+        "uncertain",
+        "app",
+        FileId.from(0),
+        &.{},
+        false,
+        .{
+            .in_receiver_context = true,
+            .receiver_known = true,
+            .owner_class = "Box",
+            .receiver_scope_complete = true,
+        },
+    );
+    defer a.free(uncertain.candidate_set);
+    try testing.expectEqual(uncertain_global, uncertain.target.?);
+    try testing.expectEqual(Module.EmitForm.CallMemberOrGlobal, uncertain.emit_form);
+    try testing.expectEqual(Module.Confidence.virtual, uncertain.confidence);
 }
 
 test "resolveCall binds bodyless host declarations by FuncId" {

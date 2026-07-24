@@ -313,7 +313,9 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     if (module.pending_lambda_type_param_bounds) |bounds| {
         module.pending_lambda_type_param_bounds = null;
         defer moduleAllocator(module).free(bounds);
-        for (bounds) |bound| try b.addTypeParamBound(bound.param, bound.bound);
+        for (bounds) |bound| {
+            try b.addTypeParamBoundEvidence(bound.param, bound.bound, bound.complete);
+        }
     }
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that

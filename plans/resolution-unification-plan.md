@@ -83,7 +83,41 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
 - **P3 — `Module.resolveCall`**: bare-call lowering is one path
   (`buildArgShapes` → `resolveCall` Phase A index / Phase B applicability /
   Phase C emit form → the four pure emitters `emitCall`/`emitCallMember`/
-  `emitMemberOrGlobal`/`emitValueCall`).
+  `emitMemberOrGlobal`/`emitValueCall`). The parallel captured-write lowerers
+  and the lowering-side `preferredBareTarget`/heuristic audit ladder are
+  deleted; infix return inference uses explicit-receiver resolution. A known
+  complete static extension/dispatch receiver tower now defers only for an
+  applicable member or extension, while outer, companion, and incomplete scopes
+  remain conservative. Generic receiver proofs preserve the structural owner
+  and require complete, identity-safe bounds; dependent, cyclic, lossy, or
+  ambiguously qualified evidence stays dynamic rather than becoming a false
+  negative. Exact operator selection likewise excludes lossy eager type heads
+  when a declaration-derived structural return type is available. Generic
+  member headers preserve their owner arguments; class/function parameter
+  scopes and inherited receiver projections are substituted before a return
+  type becomes static evidence. Generic class shells expose those parameters
+  before member headers reserve stable IDs, and ancestor projection carries
+  source plus owner-qualified binding keys so generic overrides link to their
+  executable bodies. Qualified classifiers remain distinct from same-named
+  type parameters, and member-extension class parameters bind from the
+  dispatch receiver rather than the extension receiver. Exact
+  member-extension calls carry their declaration identity and an explicit
+  dispatch-receiver register in `CallMember`; the ordinary receiver remains the
+  extension receiver. The loop JIT carries the same exact identity and both
+  operands through its host-call trampoline. Declaring-owner metadata uses class
+  FQNs, and object or companion dispatch receivers load by exact `ClassId`.
+  Runtime invocation consumes both operands without reconstructing the owner
+  from a simple name or scanning the enclosing-receiver chain. An applicable
+  ordinary member that lacks a complete exact or virtual ABI remains deferred
+  and still shadows extensions. Class-owned type parameters use unambiguous
+  owner-qualified identities in member parameters, returns, owner receiver
+  arguments, and bound evidence, so method parameters can shadow their source
+  name without corrupting receiver substitution or overload selection. Runtime
+  applicability parses the same identities and receives complete `TypeRef`
+  evidence, so qualified nominal types never collapse into same-named class or
+  function parameters. Explicit generic constructor arguments remain attached
+  to receiver evidence. Nullable receivers cannot bind non-null member
+  operators ahead of nullable extensions.
 - **P4 — DeclSig substrate**: hierarchy-precise member-shadow
   (`memberShadowPossible`/`anyReceiverClassDeclares`, own + lifted-outer
   chains), declared-nullability evidence, and the `declared_recv` channel that
@@ -181,9 +215,10 @@ The next implementation order is:
 3. Give each override family a stable method slot. Runtime virtual dispatch becomes
    `(receiver class, slot) -> FuncId`, with no method-name or program-wide function
    search.
-4. Move explicit-receiver resolution into expression lowering. Keep the current
-   post-lowering bake only as a measured migration aid, then delete it once every
-   baked site is produced directly as exact or virtual IR.
+4. Move explicit-receiver resolution into expression lowering. This is now the
+   only source of exact member and member-extension targets. The post-lowering
+   simple-name/arity bake is deleted; an unresolved call remains explicitly
+   deferred rather than acquiring a declaration identity after lowering.
 5. Finish P10's host declaration manifest, after which
    `CallMemberOrGlobal.candidates == null` and runtime global lookup by simple name
    are invalid states for Kotlin calls.
@@ -253,7 +288,7 @@ receiver-formed declarations. `DeclSig.host_symbol` records the exact
 fully-qualified host ABI symbol selected for each source declaration; an absent
 value means the declaration has no proven host form. The mapping is computed
 once while headers register, is restricted to the Kotlin host surface, and is
-serialized in image format 33. The same declaration record now preserves all
+serialized in image format 34. The same declaration record now preserves all
 four Kotlin visibility levels instead of collapsing member visibility to a
 private bit. A proven non-inline Kotlin extension therefore
 resolves through `Module.resolveExtensionCall` and emits `Call(FuncId)` without

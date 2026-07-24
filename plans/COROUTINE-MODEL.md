@@ -85,10 +85,10 @@ are the implementation notes behind these verdicts.
 
 - **Channel-backed flow operators (#5, partial).** FIXED: `drop`/`dropWhile`/`onCompletion`
   (a bare extension call whose trailing lambda mutated an outer var pinned the nearest `this`
-  instead of walking implicit receivers — `lowerCallWithWritebackPath`/`lowerUnresolvedBareCall`
-  in `src/ir/lower/expr.zig`) and `produceIn`/`buffer`/`flowOn` (overload resolution bound the
-  wrong `produce` overload: a named arg that re-targets a positionally-filled parameter must
-  make the overload inapplicable — `memberApplicableForWalkNamed`/`resolveExtOverloadLocal` in
+  instead of walking implicit receivers; captured-write calls now use the ordinary shared
+  call resolver) and `produceIn`/`buffer`/`flowOn` (overload resolution bound the wrong
+  `produce` overload: a named arg that re-targets a positionally-filled parameter must make
+  the overload inapplicable — `memberApplicableForWalkNamed`/`resolveExtOverloadLocal` in
   `src/interp_ir/vm/host_call_member.zig`). The decisive divergence was
   `scope.produce(ctx, cap, onBufferOverflow, start=…, block=…)` binding the 5-arg deprecated
   overload, dropping `onBufferOverflow` into `start` and `block` into `onCompletion`, so

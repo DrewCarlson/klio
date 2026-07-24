@@ -68,14 +68,30 @@ fn localTypeParamBounds(
         function.type_params.len,
     );
     for (function.type_params, bounds) |*param, *out| {
-        var bound = if (param.upper_bound) |upper| upper.name.name else "Any";
-        for (function.where_bounds) |where_bound| {
+        var bound: []const u8 = "kotlin.Any";
+        var complete = true;
+        var count: usize = 0;
+        if (param.upper_bound) |*upper| {
+            bound = upper.name.name;
+            complete = !upper.nullable and upper.type_args.len == 0 and
+                upper.function == null and !upper.definitely_non_null and
+                upper.qualified_path == null;
+            count += 1;
+        }
+        for (function.where_bounds) |*where_bound| {
             if (std.mem.eql(u8, where_bound.name.name, param.name.name)) {
-                bound = where_bound.bound.name.name;
-                break;
+                if (count == 0) {
+                    const where_type = &where_bound.bound;
+                    bound = where_type.name.name;
+                    complete = !where_type.nullable and where_type.type_args.len == 0 and
+                        where_type.function == null and !where_type.definitely_non_null and
+                        where_type.qualified_path == null;
+                }
+                count += 1;
             }
         }
-        out.* = .{ .param = param.name.name, .bound = bound };
+        if (count > 1) complete = false;
+        out.* = .{ .param = param.name.name, .bound = bound, .complete = complete };
     }
     return bounds;
 }

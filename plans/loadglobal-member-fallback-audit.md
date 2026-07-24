@@ -20,31 +20,11 @@ the member-resolution logic.**
 
 ## Completed
 
-The main bare-call path is unified: `lowerImplicitThisCall` and the general
-bare-call route now go through the shared `Module.resolveCall` engine
-(`src/ir/lower/expr.zig`), so member-vs-global for the common path is decided in
-one place. The confirmed writeback-path instance is fixed:
-`lowerCallWithWritebackPath` (the path taken when a trailing lambda mutates a
-captured local) carries the `hasOwnMember` + `this`-in-scope → `CallMember` guard
-before its `LoadGlobal` fallback (`src/ir/lower/expr.zig`, ~`:3216`), so an
-inherited inline member whose lambda mutates a captured `var` (e.g.
-`forEachSlotLocked` in kotlinx.coroutines `SharedFlow`) no longer falls to an
-unresolved global.
-
-## Open
-
-`lowerCallWithWritebackPath` is still a **separate parallel path that does not
-route through `resolveCall`** — it hand-rolls its own member guard. The structural
-risk the audit named (duplicate call-lowering paths that do not share the
-member-resolution logic) therefore still exists for the writeback path, and its
-other callee-as-global fallback sites have not been re-audited since the file was
-refactored.
-
-To close:
-
-- Route `lowerCallWithWritebackPath` through the shared `resolveCall` engine (the
-  single `local → member → inline → top-level` classifier), or confirm every
-  `LoadGlobal` fallback it still reaches for a bare member/inline name is guarded
-  by `hasOwnMember` (own + inherited, receiver in scope) first.
-- Add a regression test per remaining fallback site: an inherited member fn called
-  bare under the shape that selects that path.
+The separate writeback member/path lowerers are deleted. Lambda arguments that
+mutate captured variables use the ordinary call pipeline and boxed capture cells,
+so local, inherited member, extension, and top-level classification has one path.
+`captured_write_shared_resolution.kt` covers an inherited member call, a top-level
+call, an implicit receiver extension, a receiver-function property, and
+receiver-sensitive infix chaining while each lambda mutates a captured variable.
+It also keeps an implicit-receiver vararg extension ahead of a same-name exact
+global, so unsupported static shapes cannot become false inapplicability proofs.
