@@ -1598,6 +1598,24 @@ pub const FuncBuilder = struct {
         return saved;
     }
 
+    pub fn narrowLocalNotNull(self: *FuncBuilder, name: []const u8) Allocator.Error!?NarrowedLocal {
+        const current = self.local_decl_types.get(name) orelse return null;
+        const prev_nullable = self.local_decl_nullable.contains(name);
+        var replacement = try current.clone(self.allocator);
+        replacement.nullable = false;
+        const old = self.local_decl_types.fetchPut(name, replacement) catch |err| {
+            replacement.deinit(self.allocator);
+            return err;
+        };
+        std.debug.assert(old != null);
+        _ = self.local_decl_nullable.remove(name);
+        return .{
+            .name = name,
+            .prev_ty = old.?.value,
+            .prev_nullable = prev_nullable,
+        };
+    }
+
     pub fn restoreLocal(self: *FuncBuilder, saved: NarrowedLocal) void {
         if (self.local_decl_types.fetchRemove(saved.name)) |current| {
             var cleanup = current.value;
@@ -2537,6 +2555,29 @@ test "captured local type metadata transfers to a lambda builder" {
     try inner.inheritLocalDeclTypes(&snapshot);
     try testing.expectEqualStrings("CoroutineScope", inner.localDeclType("scope").?);
     try testing.expect(inner.localDeclNullable("scope"));
+}
+
+test "not-null narrowing preserves and restores the declared type" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var args = [_]TypeRef{.{ .name = "String", .nullable = false, .args = &.{} }};
+    try b.setLocalDeclTypeOwned(
+        "record",
+        try (TypeRef{ .name = "Box", .nullable = true, .args = &args }).clone(testing.allocator),
+    );
+    try b.setLocalDeclNullable("record");
+
+    const saved = (try b.narrowLocalNotNull("record")).?;
+    try testing.expect(!b.localDeclTypeRef("record").?.nullable);
+    try testing.expectEqualStrings("String", b.localDeclTypeRef("record").?.args[0].name);
+    try testing.expect(!b.localDeclNullable("record"));
+
+    b.restoreLocal(saved);
+    try testing.expect(b.localDeclTypeRef("record").?.nullable);
+    try testing.expectEqualStrings("String", b.localDeclTypeRef("record").?.args[0].name);
+    try testing.expect(b.localDeclNullable("record"));
 }
 
 test "loop frame lookup by label and innermost" {

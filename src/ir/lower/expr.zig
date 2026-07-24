@@ -325,13 +325,17 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // arm, and extension resolution is static — see `narrowIsCheck`.
             b.switchTo(t_block);
             const narrowed = try narrowIsCheck(b, f.cond);
+            const narrowed_not_null = try narrowNullCheck(b, f.cond, true);
             const t_val = try lowerExpr(b, f.then_branch);
+            if (narrowed_not_null) |n| b.restoreLocal(n);
             if (narrowed) |n| b.restoreLocal(n);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
             b.switchTo(f_block);
+            const narrowed_else_not_null = try narrowNullCheck(b, f.cond, false);
             const f_val = if (f.else_branch) |e| try lowerExpr(b, e) else try b.emitConst(.Unit);
+            if (narrowed_else_not_null) |n| b.restoreLocal(n);
             try b.push(.{ .Move = .{ .dst = dst, .src = f_val } });
             b.terminate(.{ .Goto = join });
             b.switchTo(join);
@@ -352,7 +356,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
             b.switchTo(body_blk);
             try b.pushLoop(null, header, exit);
+            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
             _ = try lowerExpr(b, w.body);
+            if (narrowed_not_null) |n| b.restoreLocal(n);
             b.popLoop();
             b.terminate(.{ .Goto = header });
 
@@ -4177,7 +4183,9 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, header, exit);
+            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
             _ = try lowerExpr(b, w.body);
+            if (narrowed_not_null) |n| b.restoreLocal(n);
             b.popLoop();
             b.terminate(.{ .Goto = header });
             b.switchTo(exit);
@@ -7098,8 +7106,7 @@ fn lowerValueInvocation(
         // the inner `transform(value)` is the parameter. Binding the parameter
         // there passed the operator's own lambda in as the emitted value, so
         // `map`'s caller saw a closure where its element belonged.
-        if (plainFnParamRejectsTrailingLambda(b, name0, args))
-        {
+        if (plainFnParamRejectsTrailingLambda(b, name0, args)) {
             return null;
         }
         var callee_reg = reg;
@@ -7313,6 +7320,26 @@ pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.
         return try b.narrowLocal("this", head);
     }
     return null;
+}
+
+fn narrowNullCheck(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    truthy: bool,
+) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
+    if (cond.* != .Binary) return null;
+    const binary = cond.Binary;
+    const unequal = binary.op == .Neq or binary.op == .IdentNeq;
+    const equal = binary.op == .Eq or binary.op == .IdentEq;
+    if (!(if (truthy) unequal else equal)) return null;
+    const value = if (binary.lhs.* == .NullLit)
+        binary.rhs
+    else if (binary.rhs.* == .NullLit)
+        binary.lhs
+    else
+        return null;
+    if (value.* != .Path or value.Path.segments.len != 1) return null;
+    return b.narrowLocalNotNull(value.Path.segments[0].name);
 }
 
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {

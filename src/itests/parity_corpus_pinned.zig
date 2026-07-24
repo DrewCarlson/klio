@@ -1088,3 +1088,12 @@ test "receiver_lambda_invoke" {
         \\
     );
 }
+
+test "overloaded_nullable_smartcast" {
+    try check("overloaded_nullable_smartcast",
+        \\true
+        \\true
+        \\true
+        \\
+    );
+}

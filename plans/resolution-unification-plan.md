@@ -152,7 +152,10 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   evidence, so qualified nominal types never collapse into same-named class or
   function parameters. Explicit generic constructor arguments remain attached
   to receiver evidence. Nullable receivers cannot bind non-null member
-  operators ahead of nullable extensions.
+  operators ahead of nullable extensions. Control-flow non-null facts from
+  `x != null` and the false branch of `x == null` preserve the local's complete
+  declared type while removing nullability in `if` and `while` bodies, so
+  overload resolution remains static after Kotlin smart casts.
 - **P4 — DeclSig substrate**: hierarchy-precise member-shadow
   (`memberShadowPossible`/`anyReceiverClassDeclares`, own + lifted-outer
   chains), declared-nullability evidence, and the `declared_recv` channel that
