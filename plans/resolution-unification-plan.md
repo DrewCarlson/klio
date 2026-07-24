@@ -156,6 +156,13 @@ is committed to `main`; the stdlib commonTest canonical passes 100% per-file
   `x != null` and the false branch of `x == null` preserve the local's complete
   declared type while removing nullability in `if` and `while` bodies, so
   overload resolution remains static after Kotlin smart casts.
+  Compose bare declaration calls also stay source-shaped until this resolver
+  selects their exact `FuncId`; lowering then completes only the selected
+  declaration's synthetic composer ABI. Direct calls, inline splices, and
+  deferred implicit-receiver probes share the same selected-parameter binding,
+  including trailing lambdas across omitted defaults. Receiver-formed
+  extension candidates require a real implicit receiver context rather than
+  consuming an ordinary argument as a synthetic receiver.
 - **P4 — DeclSig substrate**: hierarchy-precise member-shadow
   (`memberShadowPossible`/`anyReceiverClassDeclares`, own + lifted-outer
   chains), declared-nullability evidence, and the `declared_recv` channel that

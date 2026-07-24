@@ -12,8 +12,20 @@ the internal-invariant `Check failed` tests become reachable).
 Directed by the user (2026-07-15): the faithful path over the pragmatic
 reimplementation.
 
-## Status (2026-07-23)
+## Status (2026-07-24)
 
+- Bare declaration calls now remain source-shaped through the Compose AST pass.
+  The canonical IR resolver selects the exact overload before completing its
+  `$composer`/`$changed` ABI, including inline calls and calls that retain a
+  runtime implicit-receiver probe. Trailing content lambdas are named from the
+  selected declaration before the synthetic pair, so `Surface {}` binds
+  `content` without dropping the composer. The Material3 Surface repro now
+  passes its former same-name `surfaceColorAtElevation`/`contentColorFor` and
+  `rememberedValue` failures and reaches the independent snapshot
+  `validateOpen` body-loading issue.
+- Bare extension formation now requires an actual implicit receiver context.
+  A same-named extension cannot consume an ordinary source argument as its
+  receiver while competing with a non-extension composable overload.
 - Host-baked executable images carry the exact linked virtual dispatch table and
   owner-scoped member groups into Android rather than rebuilding them from lazy
   function headers. Qualified nested override types resolve by nominal class

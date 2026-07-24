@@ -6544,7 +6544,9 @@ pub const Module = struct {
             target_final = global.target != null and global.unique and
                 (global.static_complete or global.tier_candidates == 1);
         }
-        if (target == null and !receiver_extension_applicable) {
+        if (target == null and ctx.in_receiver_context and
+            !receiver_extension_applicable)
+        {
             const receiver_formed = self.applicableBarePick(
                 name,
                 candidates,
@@ -10960,6 +10962,59 @@ test "resolveCall: an exact non-extension resolves to a static Call" {
     try testing.expectEqual(Module.EmitForm.Call, res.emit_form);
     try testing.expectEqual(Module.Confidence.exact, res.confidence);
     try testing.expectEqual(g.int(), res.target.?.int());
+}
+
+test "resolveCall: an extension requires an implicit receiver context" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "contentColorFor",
+        "app.contentColorFor",
+        "app",
+        1,
+        .{ .extension = true },
+    );
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    const composable = try pushTestFunc(
+        &m,
+        a,
+        "contentColorFor",
+        "app.contentColorFor",
+        "app",
+        3,
+    );
+    try m.rebuildFuncNameIndex(a);
+
+    const source_args = [_]applicability.ArgShape{.{}};
+    const source = try m.resolveCall(
+        a,
+        "contentColorFor",
+        "app",
+        FileId.from(0),
+        &source_args,
+        false,
+        .{},
+    );
+    defer a.free(source.candidate_set);
+    try testing.expect(source.target == null);
+
+    const threaded_args = [_]applicability.ArgShape{ .{}, .{}, .{} };
+    const threaded = try m.resolveCall(
+        a,
+        "contentColorFor",
+        "app",
+        FileId.from(0),
+        &threaded_args,
+        false,
+        .{},
+    );
+    defer a.free(threaded.candidate_set);
+    try testing.expectEqual(composable, threaded.target.?);
+    try testing.expectEqual(Module.EmitForm.Call, threaded.emit_form);
 }
 
 test "resolveCall ignores inapplicable callables on a known receiver tower" {

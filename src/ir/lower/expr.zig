@@ -5157,7 +5157,18 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
             if (bareInlineNeedsSplice(b, nm, rf, args)) {
                 const expected = b.peekExpected();
                 const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-                if (try tryInlineCallWithTypeArgs(b, nm, rf, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+                var selected = if (inline_state.inlineIdByAst(rf)) |id|
+                    try selectedCallArgsForBuilder(
+                        b,
+                        FuncId.from(id),
+                        args,
+                        ast_arg_names,
+                        exprSpan(callee),
+                    )
+                else
+                    SelectedCallArgs{ .args = args, .names = ast_arg_names };
+                defer selected.deinit(b.allocator);
+                if (try tryInlineCallWithTypeArgs(b, nm, rf, selected.args, selected.names, null, ast_type_args, exp_ptr)) |r| {
                     return r;
                 }
             }
@@ -5185,7 +5196,18 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            if (try tryInlineCallWithTypeArgs(b, nm, f, args, ast_arg_names, null, ast_type_args, exp_ptr)) |r| {
+            var selected = if (inline_state.inlineIdByAst(f)) |id|
+                try selectedCallArgsForBuilder(
+                    b,
+                    FuncId.from(id),
+                    args,
+                    ast_arg_names,
+                    exprSpan(callee),
+                )
+            else
+                SelectedCallArgs{ .args = args, .names = ast_arg_names };
+            defer selected.deinit(b.allocator);
+            if (try tryInlineCallWithTypeArgs(b, nm, f, selected.args, selected.names, null, ast_type_args, exp_ptr)) |r| {
                 return r;
             }
             if (nlr_dbg) std.debug.print("[tbie] synchronized in_fn={s} SPLICE-DECLINED\n", .{build.currentRealFn() orelse "-"});
@@ -8331,6 +8353,29 @@ fn lowerPathCall(
         segments[0].span.file,
     );
     defer b.allocator.free(cands);
+    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0)) {
+            std.debug.print("[bare-candidates] {s} file={d} count={d}\n", .{
+                name0,
+                segments[0].span.file.int(),
+                cands.len,
+            });
+            for (cands) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                std.debug.print(
+                    "[bare-candidate] {s}#{d} pkg={s} file={?d} params={d} body={}\n",
+                    .{
+                        f.fqn,
+                        fid.int(),
+                        f.package,
+                        if (b.module.registry.private_fn_files.get(fid)) |file| file.int() else null,
+                        f.params.len,
+                        f.hasBody(),
+                    },
+                );
+            }
+        }
+    }
     const last_arg_lambda = lastArgIsLambda(args);
 
     // An own member applicable to this call outranks a same-named top-level
@@ -9245,7 +9290,24 @@ fn selectedCallArgsForBuilder(
     var selected = selectedCallArgs(b.module, func_id, args, names);
     if (hasComposerArgPair(selected.names)) return selected;
     const f = b.module.funcById(func_id) orelse return selected;
-    if (!selectedCallHasComposerAbi(b.module, func_id, f) or b.resolve("$composer") == null) return selected;
+    const has_abi = selectedCallHasComposerAbi(b.module, func_id, f);
+    const composer = b.resolve("$composer");
+    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, f.name)) {
+            std.debug.print(
+                "[compose-abi] {s}#{d} caller={s} has_abi={} composer={} args={d}\n",
+                .{
+                    f.fqn,
+                    func_id.int(),
+                    build.currentRealFn() orelse "-",
+                    has_abi,
+                    composer != null,
+                    args.len,
+                },
+            );
+        }
+    }
+    if (!has_abi or composer == null) return selected;
 
     const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
     errdefer b.allocator.free(completed_args);
@@ -9284,13 +9346,15 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
             runtime.trace.dumpCurrent(.{});
         }
     }
-    const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
-    defer _ = b.setCallTrailingLambda(prev_trailing);
     var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(call.callee));
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
     const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
+    const prev_trailing = b.setCallTrailingLambda(
+        call.has_trailing_lambda and !hasComposerArgPair(ast_arg_names),
+    );
+    defer _ = b.setCallTrailingLambda(prev_trailing);
 
     // The committed target is overload-precise, so its receiver-function
     // parameter types are authoritative even when the source callee is an
@@ -9676,6 +9740,10 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
     const name0 = callee.Path.segments[0].name;
+    const prev_trailing = b.setCallTrailingLambda(
+        call.has_trailing_lambda and !hasComposerArgPair(ast_arg_names),
+    );
+    defer _ = b.setCallTrailingLambda(prev_trailing);
 
     if (!isNonExt(b, func_id)) {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
@@ -9703,7 +9771,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         break :blk null;
     };
     const run = try lowerArgRunWithArity(b, args, arg_arity);
-    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
@@ -9946,6 +10014,10 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
     const args = selected_args.args;
     const ast_arg_names = selected_args.names;
     const ast_type_args = call.type_args;
+    const prev_trailing = b.setCallTrailingLambda(
+        call.has_trailing_lambda and !hasComposerArgPair(ast_arg_names),
+    );
+    defer _ = b.setCallTrailingLambda(prev_trailing);
 
     // Synthesise a Path("this") arg expr then lower the run.
     const sp = exprSpan(callee);
@@ -12190,6 +12262,77 @@ test "threaded trailing lambda binds before the composer pair" {
 
     params[1].is_vararg = true;
     try testing.expect(threadedTrailingLambdaParam(&f, &args, &names) == null);
+}
+
+test "member-or-global emission binds a composable trailing lambda by parameter" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const surface_id = m.nextFuncId();
+    try m.funcs.append(a, .{
+        .id = surface_id,
+        .name = "Surface",
+        .fqn = "androidx.compose.material3.Surface",
+        .params = try a.dupe(ir.Param, &.{
+            .{ .name = "modifier", .ty = .{ .name = "Modifier", .nullable = false, .args = &.{} }, .default = null },
+            .{ .name = "content", .ty = .{ .name = "Function0", .nullable = false, .args = &.{} }, .default = null },
+            .{ .name = "$composer", .ty = .{ .name = "Composer", .nullable = false, .args = &.{} }, .default = null },
+            .{ .name = "$changed", .ty = build.typeInt(), .default = null },
+        }),
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    });
+    try m.func_index.append(a, .{ .name = "Surface", .id = surface_id });
+    try m.rebuildFuncNameIndex(a);
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    try b.bind("$composer", b.allocReg());
+
+    var callee_segments = [_]ast.Ident{.{ .name = "Surface", .span = dummySpan() }};
+    var callee = Expr{ .Path = .{ .segments = &callee_segments, .span = dummySpan() } };
+    var lambda_params: [0]ast.Ident = .{};
+    var args = [_]Expr{.{ .Lambda = .{
+        .params = &lambda_params,
+        .body = .{ .stmts = &.{}, .span = dummySpan() },
+        .span = dummySpan(),
+    } }};
+    var names = [_]?[]const u8{null};
+    const call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = true,
+        .span = dummySpan(),
+    } };
+    const result = try emitMemberOrGlobal(&b, &call, surface_id, false);
+    b.terminate(.{ .Return = result });
+    const lowered = try b.finish("caller", "sample.caller", build.typeUnit());
+
+    var found = false;
+    for (lowered.blocks[0].insts) |inst| switch (inst) {
+        .CallMemberOrGlobal => |cmg| {
+            try testing.expectEqual(@as(usize, 3), cmg.arg_names.len);
+            const content = m.consts.items[cmg.arg_names[0].?.int()];
+            const composer = m.consts.items[cmg.arg_names[1].?.int()];
+            const changed = m.consts.items[cmg.arg_names[2].?.int()];
+            try testing.expectEqualStrings("content", content.String);
+            try testing.expectEqualStrings("$composer", composer.String);
+            try testing.expectEqualStrings("$changed", changed.String);
+            try testing.expect(!cmg.trailing_lambda);
+            found = true;
+        },
+        else => {},
+    };
+    try testing.expect(found);
 }
 
 test "trailing lambda names only a fixed parameter after a vararg" {

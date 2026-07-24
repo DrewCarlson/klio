@@ -2250,10 +2250,15 @@ const Walker = struct {
                         // receiver-taking overload — a name whose only composable
                         // overload is a top-level non-extension is reached here by
                         // a non-composable extension, which must NOT be threaded.
-                        // Bare / qualified names (`Text`, `pkg.Text`) keep the
-                        // general oracle.
+                        // Bare declaration calls keep their source argument
+                        // shape. IR resolution selects the exact declaration
+                        // first and only then completes a proven Compose ABI.
+                        // Qualified paths still need the pre-resolution
+                        // oracle; local/value calls are handled above.
                         const oracle_hit = if (c.callee.* == .Member)
                             (active_composable_receiver_names != null and active_composable_receiver_names.?.contains(nm))
+                        else if (c.callee.* == .Path and c.callee.Path.segments.len == 1)
+                            false
                         else
                             w.oracle(w.oracle_ctx, nm);
                         if (positional or is_composable_val or is_local_composable or oracle_hit) try w.threadCall(c, positional);
@@ -3047,10 +3052,9 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
     try testing.expect(!lam.implicit_it);
-    // Its body's Text call was threaded ($composer, 0).
+    // Bare declaration calls stay source-shaped for the IR resolver.
     const inner = lam.body.stmts[0].Expr.Call;
-    try testing.expectEqual(@as(usize, 3), inner.args.len);
-    try testing.expectEqualStrings(composer_param, inner.args[1].Path.segments[0].name);
+    try testing.expectEqual(@as(usize, 1), inner.args.len);
 }
 
 fn noneComposable(_: *anyopaque, _: []const u8) bool {
@@ -3275,12 +3279,10 @@ test "walker replaces currentComposer with the threaded composer inside a nested
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, null, false, null, null);
     // The Emit call sits inside the skip-if's then-block.
     const emit = wrappedBodyStmts(&out)[0].Expr.Call;
-    // Emit gained ($composer, 0); its first arg — originally currentComposer —
-    // is now the threaded $composer.
-    try testing.expectEqual(@as(usize, 3), emit.args.len);
+    // The bare declaration call stays source-shaped; its first arg, originally
+    // currentComposer, is still rewritten to the threaded $composer.
+    try testing.expectEqual(@as(usize, 1), emit.args.len);
     try testing.expectEqualStrings(composer_param, emit.args[0].Path.segments[0].name);
-    try testing.expectEqualStrings(composer_param, emit.args[1].Path.segments[0].name);
-    try testing.expectEqual(@as(i64, 0), emit.args[2].IntLit.value);
 }
 
 test "positionalKey is stable per span and fits Int" {
@@ -3354,11 +3356,9 @@ test "transform injects composer/changed params and brackets the body" {
         "skipToGroupEnd",
         skip_if.else_branch.?.Block.stmts[0].Expr.Call.callee.Member.name.name,
     );
-    // The Text call gained 2 trailing args (composer + changed).
+    // The bare Text declaration stays source-shaped until IR resolution.
     const text_call = wrappedBodyStmts(&out)[0].Expr.Call;
-    try testing.expectEqual(@as(usize, 3), text_call.args.len);
-    try testing.expectEqualStrings(composer_param, text_call.args[1].Path.segments[0].name);
-    try testing.expectEqual(@as(i64, 0), text_call.args[2].IntLit.value);
+    try testing.expectEqual(@as(usize, 1), text_call.args.len);
     // Last stmt: endRestartGroup()?.updateScope { ... }
     const upd = stmts[4].Expr.Call;
     try testing.expect(upd.callee.Member.safe);
@@ -3443,7 +3443,7 @@ test "threadCall appends the composer pair as named args" {
     } };
     var ctx: u8 = 0;
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx };
-    try w.walkExpr(&call);
+    try w.threadCall(&call.Call, false);
     const c = call.Call;
     try testing.expectEqual(@as(usize, 2), c.args.len);
     try testing.expectEqualStrings(composer_param, c.arg_names[0].?);
@@ -3492,9 +3492,7 @@ test "a conditional initializer propagates its composable function type to lambd
     try testing.expectEqualStrings(composer_param, transformed.params[0].name);
     try testing.expectEqualStrings(changed_param, transformed.params[1].name);
     const call = transformed.body.stmts[0].Expr.Call;
-    try testing.expectEqual(@as(usize, 2), call.args.len);
-    try testing.expectEqualStrings(composer_param, call.arg_names[0].?);
-    try testing.expectEqualStrings(changed_param, call.arg_names[1].?);
+    try testing.expectEqual(@as(usize, 0), call.args.len);
 }
 
 test "remember propagates a composable result type into its calculation result" {
@@ -3548,10 +3546,8 @@ test "remember propagates a composable result type into its calculation result" 
     try testing.expectEqualStrings(composer_param, transformed.params[0].name);
     try testing.expectEqualStrings(changed_param, transformed.params[1].name);
     const box_call = transformed.body.stmts[0].Expr.Call;
-    try testing.expectEqual(@as(usize, 2), box_call.args.len);
-    try testing.expectEqualStrings(composer_param, box_call.arg_names[0].?);
-    try testing.expectEqualStrings(changed_param, box_call.arg_names[1].?);
-    try testing.expectEqual(@as(usize, 3), value.Call.args.len);
+    try testing.expectEqual(@as(usize, 0), box_call.args.len);
+    try testing.expectEqual(@as(usize, 1), value.Call.args.len);
 }
 
 test "threadCall re-names a trailing lambda across a defaulted gap" {
@@ -3985,8 +3981,8 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     try testing.expectEqualStrings("k", start.args[1].Path.segments[0].name);
     const kcall = blk.stmts[1].Decl.Property.init.?.Call;
     try testing.expectEqualStrings("key", kcall.callee.Path.segments[0].name);
-    // Threaded: keys + lambda + $composer + $changed.
-    try testing.expectEqual(@as(usize, 4), kcall.args.len);
+    // The bare key declaration stays source-shaped for IR resolution.
+    try testing.expectEqual(@as(usize, 2), kcall.args.len);
     try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
     try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
 }
