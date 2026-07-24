@@ -995,10 +995,11 @@ fix is the complete owner-scoped overload index, not another arity/name exceptio
    at zero divergence over the full sweep, flipped onto
    `positionalPoints`/`applicable()`, legacy `overloadScore` deleted (the historical
    `assertContentEquals` divergence no longer reproduces after the trailing-lambda
-   engine fixes). REMAINING: the per-arg `overloadScoreArg` still backs the
-   host_instances binders (3 sites) and the `extensionFnFallback` pre-filter
-   (host_call_member ~6526) — audit and fold those into `ArgShape` scoring the same
-   way. The `overload_match.zig` tri-state helpers stay (legitimate backing).
+   engine fixes). COMPLETE: construction factories, primary-constructor
+   compatibility, extension fallback, and named-member ranking now consume
+   `applicable()` as well; all three legacy per-argument scorer implementations
+   and their call sites are deleted. The `overload_match.zig` tri-state helpers
+   stay as the shared engine's legitimate runtime-evidence backing.
 3. **P4 completion — first slice LANDED (`5d5d4ebb`)**: the central member-shadow gate
    (`memberShadowPossible` + Phase C, via `ResolveCtx.receiver_known`) now keys on the
    owner class AND its lifted-outer chain through the new `HierarchyShadowSet` registry

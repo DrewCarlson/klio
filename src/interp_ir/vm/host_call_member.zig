@@ -2313,94 +2313,6 @@ pub fn popOuterThis() void {
 // Overload scoring + method/extension selection.
 // -------------------------------------------------------------------------
 
-/// Score an arg/param compatibility for overload resolution. Higher is
-/// better. `null` disqualifies the candidate.
-fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) ?i32 {
-    const nm = param_ty.name;
-    var v_ty: []const u8 = undefined;
-    switch (arg.*) {
-        .Instance => |i| {
-            const g = i.borrow();
-            const cg = g.get().class.borrow();
-            v_ty = cg.get().name;
-            cg.deinit();
-            g.deinit();
-        },
-        else => v_ty = simpleName(arg.typeFqn()),
-    }
-    const nm_mangled = mangledClassKeyOf(self, nm);
-    if (std.mem.eql(u8, nm, v_ty) or
-        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty)))
-    {
-        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-        return 100 + d;
-    }
-    if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
-    if (arg.* == .Null and param_ty.nullable) return 50;
-    if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
-    if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
-    if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
-    // Float values are stored Double-tagged (and vice versa after arithmetic):
-    // the two float widths are one value domain at runtime, so either width's
-    // parameter accepts either tag — `Density(density = 1f)` must bind the
-    // `density: Float` factory when the value arrives as a Double.
-    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
-        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
-
-    const arg_arity: ?usize = switch (arg.*) {
-        .IrClosure => |c| blk: {
-            if (self.closures.get(@intCast(c.id))) |info| break :blk info.n_params;
-            break :blk null;
-        },
-        else => null,
-    };
-    const callable = arg_arity != null or std.mem.startsWith(u8, arg.typeFqn(), "kotlin.Function");
-    if (callable) {
-        if (std.mem.startsWith(u8, nm, "Function")) {
-            const want = std.fmt.parseInt(usize, nm["Function".len..], 10) catch return 20;
-            if (arg_arity) |got| {
-                if (got == want or got == want + 1) {
-                    const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-                    return 90 + d;
-                }
-                return 20;
-            }
-            return 20;
-        }
-        // A callable can never bind a concrete non-function parameter type
-        // (`Iterable`/`Collection`/`Array`/`String`/`Int`…): disqualify the
-        // candidate so a sibling function-typed overload wins. Without this a
-        // lambda scores a weak-but-positive 8 against `removeAll(Iterable)`,
-        // and the receiver-specificity tier (ranked above arg fit) then elects
-        // that Iterable form over `removeAll(predicate)` → infinite recursion.
-        if (isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
-        return 8;
-    }
-    // Subtype distance scoring for an instance argument.
-    if (arg.* == .Instance) {
-        if (instanceSubtypeDistance(self, arg, nm)) |dist| {
-            const d: i32 = @intCast(@min(dist, @as(usize, 20)));
-            return 75 - d;
-        }
-    }
-    // Builtin runtime types satisfy their nominal supertypes (a `String`
-    // arg matches a `CharSequence` param, a `List` matches `Iterable`,
-    // etc.). Key the supertype list on the *argument's* value type and
-    // check whether the *parameter* name is among them.
-    const builtin_supers = applicability.builtinSupersOf(v_ty);
-    const nm_simple = simpleName(nm);
-    for (builtin_supers, 0..) |s, pos| {
-        if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
-            const dist: i32 = @intCast(@min(pos, @as(usize, 20)));
-            const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-            return 75 - dist + d;
-        }
-    }
-    if (nm.len <= 2 and allUppercase(nm)) return 5;
-    if (std.mem.eql(u8, nm, "Unit")) return 1;
-    return null;
-}
-
 /// Direct dispatch of a lowering-resolved member-EXTENSION target: seed the
 /// declaring class's `this` as an enclosing receiver (the owner-find), then run
 /// the body. `null` when the owner is not reachable, so the caller falls back to
@@ -2480,9 +2392,9 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
 // -------------------------------------------------------------------------
 
 /// `ArgShape` for one runtime value, in the MEMBER scorer's conventions:
-/// `lambda_arity` from an `IrClosure` only (never `Function`/`Class`, mirroring
-/// `overloadScoreArg`), and `is_lambda` from `isCallable` (the trailing-lambda
-/// gate), not the broader `valueIsCallable`.
+/// `lambda_arity` from an `IrClosure` only (never `Function`/`Class`), and
+/// `is_lambda` from `isCallable` (the trailing-lambda gate), not the broader
+/// `valueIsCallable`.
 fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
     var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
@@ -2537,6 +2449,12 @@ fn applicIdentityConflictCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const v: *const Value = @ptrCast(@alignCast(value));
     return overload_match.crossPackageIdentityConflict(self, param_ty, v);
+}
+
+fn applicExactHeadCbM(ctx: *anyopaque, param_head: []const u8, arg_head: []const u8) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const key = mangledClassKeyOf(self, param_head) orelse return false;
+    return std.mem.eql(u8, key, arg_head);
 }
 
 /// `ApplicabilityScope.subtype`: the member instance-subtype BFS
@@ -2606,6 +2524,46 @@ fn funcDefaults(self: *VmHost, f: *const Func) ?[]const ?FuncId {
     const pg = self.prog.borrow();
     defer pg.deinit();
     return pg.get().func_defaults.get(@intFromEnum(f.id));
+}
+
+fn runtimeMemberApplicability(
+    self: *VmHost,
+    allocator: Allocator,
+    f: *const Func,
+    args: []const Value,
+    arg_names: ?[]const ?[]const u8,
+    named: bool,
+) Allocator.Error!?applicability.Score {
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    const shapes = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else
+        try allocator.alloc(applicability.ArgShape, args.len);
+    defer if (args.len > shapes_buf.len) allocator.free(shapes);
+    for (args, 0..) |*arg, i| {
+        shapes[i] = shapeOfValueMember(self, arg);
+        if (named) {
+            shapes[i].named = if (arg_names) |names|
+                if (i < names.len) names[i] else null
+            else
+                null;
+        }
+    }
+    const sig = sigViewOfMember(self, f, false);
+    const scope = applicability.ApplicabilityScope{
+        .member = true,
+        .named = named,
+        .recv_external = named and f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this"),
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCbM,
+        .subtype = applicSubtypeCbM,
+        .func_type = applicFuncTypeCbM,
+        .identity_conflict = applicIdentityConflictCbM,
+        .type_var = applicTypeVarCbM,
+        .exact_head = applicExactHeadCbM,
+        .erased_integer_widths = true,
+    };
+    return applicability.applicable(&sig, shapes, scope);
 }
 
 /// Whether the parameter at lowered position `idx` (with the implicit
@@ -3219,6 +3177,8 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         .func_type = applicFuncTypeCbM,
         .identity_conflict = applicIdentityConflictCbM,
         .type_var = applicTypeVarCbM,
+        .exact_head = applicExactHeadCbM,
+        .erased_integer_widths = true,
     };
 
     var best: ?Func = null;
@@ -10720,14 +10680,8 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
         if (count != 1) unique_exact = null;
         if (unique_exact) |c| {
-            for (args, 0..) |*a, i| {
-                if (c.func.params.len > i + 1 and
-                    overloadScoreArg(self, &c.func.params[i + 1].ty, a) == null)
-                {
-                    unique_exact = null;
-                    break;
-                }
-            }
+            if (try runtimeMemberApplicability(self, allocator, &c.func, args, null, false) == null)
+                unique_exact = null;
         }
     }
 
@@ -10997,6 +10951,8 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         .refine = applicRefineCbM,
         .subtype = applicSubtypeCbM,
         .identity_conflict = applicIdentityConflictCbM,
+        .exact_head = applicExactHeadCbM,
+        .erased_integer_widths = true,
         .ext_recv_match = applicExtRecvMatchCb,
         .ext_is_subtype_name = applicExtSubtypeNameCb,
         .ext_owner_rank = applicExtOwnerRankCb,
@@ -11789,42 +11745,15 @@ fn unboundParamCount(f: *const Func, args: []const Value, arg_names: ?[]const ?[
     return n;
 }
 
-fn scoreNamedMemberCandidate(self: *VmHost, f: *const Func, args: []const Value, arg_names: ?[]const ?[]const u8) i32 {
-    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-    const effective = f.params[skip..];
-    var bound = [_]bool{false} ** 64;
-    if (effective.len > bound.len) return 0;
-    var positional: usize = 0;
-    var total: i32 = 0;
-    for (args, 0..) |*a, i| {
-        const supplied_name: ?[]const u8 = if (arg_names) |ns| (if (i < ns.len) ns[i] else null) else null;
-        var param: ?*const ir.Param = null;
-        if (supplied_name) |nm| {
-            for (effective, 0..) |*p, k| {
-                if (!bound[k] and std.mem.eql(u8, p.name, nm)) {
-                    param = p;
-                    bound[k] = true;
-                    break;
-                }
-            }
-        } else {
-            while (positional < effective.len and bound[positional]) positional += 1;
-            if (positional < effective.len) {
-                param = &effective[positional];
-                bound[positional] = true;
-                positional += 1;
-            }
-        }
-        if (param) |p| {
-            if (p.is_vararg) continue;
-            if (overloadScoreArg(self, &p.ty, a)) |s| {
-                total += s;
-            } else {
-                total -= 1000;
-            }
-        }
-    }
-    return total;
+fn scoreNamedMemberCandidate(
+    self: *VmHost,
+    allocator: Allocator,
+    f: *const Func,
+    args: []const Value,
+    arg_names: ?[]const ?[]const u8,
+) Allocator.Error!?i32 {
+    const score = try runtimeMemberApplicability(self, allocator, f, args, arg_names, true);
+    return if (score) |s| s.points else null;
 }
 
 /// Mirrors `memberApplicableForWalk`'s last-param shape test: a declared
@@ -11979,7 +11908,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                             // ladder reaches the class-delegate forward.
                             if (walkActive(fid, receiverIdent(receiver))) continue;
                             if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
-                                const sc = scoreNamedMemberCandidate(self, &f, args, arg_names);
+                                const sc = (try scoreNamedMemberCandidate(self, allocator, &f, args, arg_names)) orelse continue;
                                 // Argument types decide first; a tie goes to the
                                 // MORE SPECIFIC signature — the one leaving fewer
                                 // parameters for defaults to fill.

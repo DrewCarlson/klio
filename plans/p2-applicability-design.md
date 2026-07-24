@@ -15,24 +15,6 @@
   table, replacing the three divergent per-caller tables (`builtinSupersFor`,
   `builtinSupers`, `builtinHeadAccepts`) and restoring the previously-missing
   `Collection` / `StringBuilder` / range-and-progression rows.
-
----
-
-## Remaining: delete `overloadScoreArg`
-
-The legacy per-arg `overloadScoreArg` was meant to be removed once the flip landed, but
-it is still live at the binder sites. Fold each remaining call into the shared `ArgShape`
-scoring in `applicable()` and delete the function.
-
-Live sites:
-
-- `src/interp_ir/vm/host_instances.zig:504` — `overloadScoreArg` definition.
-- `src/interp_ir/vm/host_instances.zig:1441`, `:1736`, `:1914` — the three binder call
-  sites that still score per-arg through it.
-- `src/interp_ir/vm/host_call_member.zig:1793` (definition) and `:7565` (call) — the
-  `extensionFnFallback` pre-filter copy.
-
-Dead site to remove with the same change:
-
-- `src/interp_ir/vm/host_call_func.zig:488` — stray leftover `overloadScoreArg`
-  definition, unreferenced after the global scorer was flipped.
+- Construction factories, primary-constructor compatibility, extension fallback,
+  and named-member ranking also consume `applicable()`. The three legacy
+  per-argument scorer implementations and every call site have been removed.

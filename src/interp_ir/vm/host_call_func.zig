@@ -536,158 +536,7 @@ fn linkAuditOn() bool {
 // Overload scoring + selection.
 // -------------------------------------------------------------------------
 
-fn simpleName(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
-    return name;
-}
-
-fn allAsciiUpper(s: []const u8) bool {
-    for (s) |c| {
-        if (!std.ascii.isUpper(c)) return false;
-    }
-    return true;
-}
-
-/// Score an arg/param compatibility for overload resolution. Higher is
-/// better; `null` disqualifies the candidate.
-fn overloadScoreArg(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) ?i32 {
-    const nm = param_ty.name;
-    // Runtime type-simple-name of the argument.
-    var inst_name_buf: ?[]const u8 = null;
-    const v_ty: []const u8 = switch (arg.*) {
-        .Instance => |i| blk: {
-            const g = i.borrow();
-            defer g.deinit();
-            const cg = g.get().class.borrow();
-            defer cg.deinit();
-            inst_name_buf = cg.get().name;
-            break :blk cg.get().name;
-        },
-        else => blk: {
-            const fqn = arg.typeFqn();
-            break :blk simpleName(fqn);
-        },
-    };
-
-    // A dotted nested param type whose class lifted under a mangled key
-    // (`Modifier.Node` when several `Node`s exist) compares by that key, so
-    // it matches the argument's registered class name exactly.
-    const nm_mangled = host_call_member.mangledClassKeyOf(self, nm);
-    if (std.mem.eql(u8, nm, v_ty) or
-        (nm_mangled != null and std.mem.eql(u8, nm_mangled.?, v_ty)))
-    {
-        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-        return 100 + d;
-    }
-    if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
-    if (arg.* == .Null and param_ty.nullable) return 50;
-
-    // Numeric widening: Int → Long, Int → Double, Long → Double.
-    if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
-    if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
-    if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
-    // Float values are stored Double-tagged (and vice versa after arithmetic):
-    // the two float widths are one value domain at runtime, so either width's
-    // parameter accepts either tag — `Density(density = 1f)` must bind the
-    // `density: Float` factory when the value arrives as a Double.
-    if ((std.mem.eql(u8, nm, "Float") and std.mem.eql(u8, v_ty, "Double")) or
-        (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Float"))) return 60;
-
-    // A callable argument against a function-typed parameter. A `::name`
-    // member reference loads as a `.Function`; a constructor reference loads
-    // as a `.Class`. Both must score by arity against a `FunctionN` param.
-    const arg_arity: ?usize = switch (arg.*) {
-        .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
-        .Function => |f| f.decl.params.len,
-        .Class => 0,
-        else => null,
-    };
-    // A bound callable reference (`recv::method`, `Enum::values`) is a
-    // synth `Instance` whose class name is `$bound_ref$<name>`; it is
-    // callable, so it satisfies a function-typed parameter even though its
-    // typeFqn is a plain `<instance>`.
-    const is_bound_ref = arg.* == .Instance and std.mem.startsWith(u8, v_ty, "$bound_ref$");
-    const is_callable = arg_arity != null or is_bound_ref or std.mem.startsWith(u8, arg.typeFqn(), "kotlin.Function");
-    if (is_callable) {
-        // `FunctionN` carries the expected lambda arity.
-        if (std.mem.startsWith(u8, nm, "Function")) {
-            const expected = nm["Function".len..];
-            if (std.fmt.parseInt(usize, expected, 10)) |want| {
-                if (arg_arity) |got| {
-                    if (got == want or got == want + 1) {
-                        const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-                        return 90 + d;
-                    }
-                    return 20;
-                }
-                return 20;
-            } else |_| {}
-        }
-        // SAM conversion / receiver-style function types: low, but scored.
-        return 8;
-    }
-
-    // Subtype: an instance argument whose class transitively extends /
-    // implements the parameter's nominal type matches (distance-weighted).
-    if (arg.* == .Instance) {
-        var queue: std.ArrayList(QItem) = .empty;
-        defer queue.deinit(self.allocator);
-        var seen: std.ArrayList([]const u8) = .empty;
-        defer seen.deinit(self.allocator);
-        queue.append(self.allocator, .{ .name = v_ty, .depth = 0 }) catch return null;
-        var head: usize = 0;
-        while (head < queue.items.len) : (head += 1) {
-            const cur = queue.items[head];
-            var already = false;
-            for (seen.items) |s| {
-                if (std.mem.eql(u8, s, cur.name)) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
-            seen.append(self.allocator, cur.name) catch return null;
-            const cur_key = host_call_member.mangledClassKeyOf(self, cur.name) orelse cur.name;
-            if (host_call_member.classHeadsMatch(self, cur.name, nm)) {
-                const d: i32 = if (cur.depth > 50) 50 else cur.depth;
-                return 60 - d;
-            }
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            // A dotted supertype ascends through its mangled entry.
-            const def_hit = cg.get().get(cur.name) orelse cg.get().get(cur_key);
-            if (def_hit) |def_ref| {
-                const dg = def_ref.borrow();
-                defer dg.deinit();
-                for (dg.get().supertype_names) |sup| {
-                    queue.append(self.allocator, .{ .name = sup, .depth = cur.depth + 1 }) catch return null;
-                }
-            }
-        }
-    }
-
-    // Builtin runtime types satisfy their nominal supertypes.
-    const builtin_supers: []const []const u8 = applicability.builtinSupersOf(v_ty);
-    const nm_simple = simpleName(nm);
-    for (builtin_supers, 0..) |s, pos| {
-        if (std.mem.eql(u8, s, nm) or std.mem.eql(u8, s, nm_simple)) {
-            const dist: i32 = if (pos > 20) 20 else @intCast(pos);
-            const d = overload_match.refineByDeclaredArgs(self, param_ty, arg) orelse return null;
-            return 75 - dist + d;
-        }
-    }
-
-    // Generic single-letter type-parameter — accept any.
-    if (nm.len <= 2 and allAsciiUpper(nm)) return 5;
-    // Unit param type (no info preserved at lower time) — accept anything
-    // but rank lowest.
-    if (std.mem.eql(u8, nm, "Unit")) return 1;
-    return null;
-}
-
 const QItem = struct { name: []const u8, depth: i32 };
-
-
 
 /// When the target function shares its name with siblings, pick the best
 /// match for the runtime arg types. `null` when there is nothing better.
@@ -851,9 +700,15 @@ fn applicIdentityConflictCb(ctx: *anyopaque, param_ty: *const TypeRef, value: *c
     return overload_match.crossPackageIdentityConflict(self, param_ty, v);
 }
 
-/// `applicability.ApplicabilityScope.subtype`: the instance-supertype BFS from
-/// `overloadScoreArg`, returning the match depth (or null when the value is not
-/// an instance or `target` is never reached).
+fn applicExactHeadCb(ctx: *anyopaque, param_head: []const u8, arg_head: []const u8) bool {
+    const self: *VmHost = @ptrCast(@alignCast(ctx));
+    const key = host_call_member.mangledClassKeyOf(self, param_head) orelse return false;
+    return std.mem.eql(u8, key, arg_head);
+}
+
+/// `applicability.ApplicabilityScope.subtype`: the instance-supertype BFS,
+/// returning the match depth (or null when the value is not an instance or
+/// `target` is never reached).
 fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
@@ -917,6 +772,51 @@ fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: 
     const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
     const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
     return sc.points;
+}
+
+fn runtimeApplicabilityScope(self: *VmHost) applicability.ApplicabilityScope {
+    return .{
+        .ctx = @ptrCast(self),
+        .refine = applicRefineCb,
+        .subtype = applicSubtypeCb,
+        .identity_conflict = applicIdentityConflictCb,
+        .exact_head = applicExactHeadCb,
+    };
+}
+
+/// Score one runtime value against a declared parameter through the shared
+/// applicability engine. Construction paths use this when their parameter
+/// metadata is not represented by an IR `Func`.
+pub fn runtimeParamPoints(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) ?i32 {
+    const params = [_]ir.Param{.{
+        .name = "value",
+        .ty = param_ty.*,
+        .default = null,
+    }};
+    const shapes = [_]applicability.ArgShape{shapeOfValue(self, arg)};
+    const sig = applicability.SigView{ .params = &params };
+    const score = applicability.applicable(&sig, &shapes, runtimeApplicabilityScope(self)) orelse return null;
+    return score.points;
+}
+
+/// Score a complete runtime call against one function declaration through the
+/// same positional applicability engine used by ordinary overload dispatch.
+pub fn runtimeFuncApplicability(
+    self: *VmHost,
+    allocator: Allocator,
+    module: *const Module,
+    cand: FuncId,
+    args: []const Value,
+) Allocator.Error!?applicability.Score {
+    var shapes_buf: [24]applicability.ArgShape = undefined;
+    const shapes = if (args.len <= shapes_buf.len)
+        shapes_buf[0..args.len]
+    else
+        try allocator.alloc(applicability.ArgShape, args.len);
+    defer if (args.len > shapes_buf.len) allocator.free(shapes);
+    for (args, 0..) |*arg, i| shapes[i] = shapeOfValue(self, arg);
+    const sig = sigViewOfFunc(self, module, cand, args.len) orelse return null;
+    return applicability.applicable(&sig, shapes, runtimeApplicabilityScope(self));
 }
 
 /// Declared arity of a function-TYPE reference: `Function2` -> 2, an
@@ -995,6 +895,8 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
         .identity_conflict = applicIdentityConflictCb,
+        .exact_head = applicExactHeadCb,
+        .erased_integer_widths = true,
     };
 
     // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
@@ -1378,10 +1280,10 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             // second lambda to the second param, never the third.
             const positional_fits = lead < f.params.len and
                 isFunctionType(&f.params[lead].ty) and blk: {
-                    const pa = fnTypeArity(&f.params[lead].ty) orelse break :blk true;
-                    const ca = callableDeclaredArity(self, &args.items[args.items.len - 1]) orelse break :blk true;
-                    break :blk pa == ca;
-                };
+                const pa = fnTypeArity(&f.params[lead].ty) orelse break :blk true;
+                const ca = callableDeclaredArity(self, &args.items[args.items.len - 1]) orelse break :blk true;
+                break :blk pa == ca;
+            };
             if (lead < last_param and (trailing_syntax or !positional_fits)) {
                 if (funcDefaults(self, func)) |defaults| {
                     const trailing = args.items[args.items.len - 1];
@@ -1604,6 +1506,8 @@ pub fn pickNamedOverloadIdRecv(
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
         .identity_conflict = applicIdentityConflictCb,
+        .exact_head = applicExactHeadCb,
+        .erased_integer_widths = true,
     };
 
     // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
@@ -1851,7 +1755,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     // by name, and absorbing through them is the pre-existing
                     // behaviour.
                     var required_tail: usize = 0;
-                    for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1 ..) |_, j| {
+                    for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1..) |_, j| {
                         if (slots[j] != null) continue;
                         const has_default = walk_defaults != null and j < walk_defaults.?.len and walk_defaults.?[j] != null;
                         if (!has_default) required_tail += 1;
@@ -2245,6 +2149,9 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         .ctx = @ptrCast(self),
         .refine = applicRefineCb,
         .subtype = applicSubtypeCb,
+        .identity_conflict = applicIdentityConflictCb,
+        .exact_head = applicExactHeadCb,
+        .erased_integer_widths = true,
     };
     // `@LowPriorityInOverloadResolution` / deprecated-ERROR|HIDDEN overloads are
     // only chosen when nothing ordinary applies, and a same-named class
