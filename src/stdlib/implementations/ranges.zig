@@ -156,6 +156,32 @@ pub const RangeView = struct {
     progression: bool = false,
 };
 
+const InstanceRangeType = struct {
+    kind: RangeKind,
+    progression: bool,
+};
+
+fn instanceRangeType(fqn: []const u8) ?InstanceRangeType {
+    const entries = [_]struct { []const u8, RangeKind, bool }{
+        .{ "kotlin.ranges.IntRange", .Int, false },
+        .{ "kotlin.ranges.LongRange", .Long, false },
+        .{ "kotlin.ranges.CharRange", .Char, false },
+        .{ "kotlin.ranges.UIntRange", .UInt, false },
+        .{ "kotlin.ranges.ULongRange", .ULong, false },
+        .{ "kotlin.ranges.IntProgression", .Int, true },
+        .{ "kotlin.ranges.LongProgression", .Long, true },
+        .{ "kotlin.ranges.CharProgression", .Char, true },
+        .{ "kotlin.ranges.UIntProgression", .UInt, true },
+        .{ "kotlin.ranges.ULongProgression", .ULong, true },
+    };
+    for (entries) |entry| {
+        if (std.mem.eql(u8, fqn, entry[0])) {
+            return .{ .kind = entry[1], .progression = entry[2] };
+        }
+    }
+    return null;
+}
+
 pub fn asRangeView(v: *const Value) ?RangeView {
     switch (v.*) {
         .Range => |r| return .{ .start = r.start, .end = r.end, .step = r.step, .kind = r.kind, .progression = r.progression },
@@ -166,31 +192,19 @@ pub fn asRangeView(v: *const Value) ?RangeView {
             const cg = data.class.borrow();
             defer cg.deinit();
             const fqn = cg.get().fqn;
-            if (!std.mem.startsWith(u8, fqn, "kotlin.ranges.")) {
-                return null;
-            }
-            // Test ULong/UInt before Long/Int: "ULongRange" contains "Long",
-            // "UIntRange" contains "Int", and a wrong kind makes the unsigned
-            // range iterate signed (`ULongRange.EMPTY` would not read as empty).
-            const kind: RangeKind = if (std.mem.indexOf(u8, fqn, "ULong") != null)
-                .ULong
-            else if (std.mem.indexOf(u8, fqn, "UInt") != null)
-                .UInt
-            else if (std.mem.indexOf(u8, fqn, "Long") != null)
-                .Long
-            else if (std.mem.indexOf(u8, fqn, "Char") != null)
-                .Char
-            else if (std.mem.indexOf(u8, fqn, "Int") != null)
-                .Int
-            else
-                return null;
+            const range_type = instanceRangeType(fqn) orelse return null;
             // IntProgression stores first/last/step; IntRange also exposes
             // start/endInclusive -- accept whichever the lowered fields carry.
             const start = num(data, &.{ "first", "start" }) orelse return null;
             const end = num(data, &.{ "last", "endInclusive" }) orelse return null;
             const step = num(data, &.{"step"}) orelse 1;
-            const progression = std.mem.indexOf(u8, fqn, "Progression") != null;
-            return .{ .start = start, .end = end, .step = step, .kind = kind, .progression = progression };
+            return .{
+                .start = start,
+                .end = end,
+                .step = step,
+                .kind = range_type.kind,
+                .progression = range_type.progression,
+            };
         },
         else => return null,
     }
@@ -680,6 +694,12 @@ test "to string renders the range form" {
 test "range view rejects a non-range receiver" {
     const v = Value{ .Int = 3 };
     try testing.expect(asRangeView(&v) == null);
+}
+
+test "instance range types exclude iterator implementation classes" {
+    try testing.expectEqual(RangeKind.UInt, instanceRangeType("kotlin.ranges.UIntRange").?.kind);
+    try testing.expect(instanceRangeType("kotlin.ranges.UIntProgression").?.progression);
+    try testing.expect(instanceRangeType("kotlin.ranges.UIntProgressionIterator") == null);
 }
 
 test "range iter is empty when bounds cross" {
