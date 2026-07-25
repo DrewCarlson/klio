@@ -2220,6 +2220,7 @@ fn ownerKeyedExtProp(self: *VmHost, allocator: Allocator, map: anytype, recv_key
             defer g.deinit();
             const cg = g.get().class.borrow();
             defer cg.deinit();
+            names.append(allocator, cg.get().fqn) catch return null;
             names.append(allocator, cg.get().name) catch return null;
             for (cg.get().supertype_names) |sn| names.append(allocator, sn) catch return null;
         }
