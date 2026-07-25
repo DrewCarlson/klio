@@ -770,8 +770,16 @@ fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId, argc: usize
 /// `points` by `applicable()`, so the caller keys directly on the result.
 fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
     const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
-    const sc = applicability.applicable(&sig, shapes, scope) orelse return null;
-    return sc.points;
+    const sc = applicability.applicable(&sig, shapes, scope);
+    if (sc == null and runtime.getenvSlice("KLIO_APPLIC_TRACE") != null) {
+        std.debug.print("[pp-null] cand={d} named={} nshapes={d} shape0named={s}\n", .{
+            cand.int(),
+            scope.named,
+            shapes.len,
+            if (shapes.len != 0) (shapes[0].named orelse "<pos>") else "-",
+        });
+    }
+    return (sc orelse return null).points;
 }
 
 fn runtimeApplicabilityScope(self: *VmHost) applicability.ApplicabilityScope {
@@ -2112,13 +2120,17 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // hottest frame in the interpreter profile.
     const candidates = candidate_ids orelse eff.funcsBySimpleName(name);
     const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
-    if (ntrace) std.debug.print("[cno] {s} bounded={} cands={d} eff_funcs={d} frame_funcs={d}\n", .{
-        name,
-        bounded,
-        candidates.len,
-        eff.func_index.items.len,
-        module.func_index.items.len,
-    });
+    if (ntrace) {
+        std.debug.print("[cno] {s} bounded={} cands={d} eff_funcs={d} frame_funcs={d} names:", .{
+            name,
+            bounded,
+            candidates.len,
+            eff.func_index.items.len,
+            module.func_index.items.len,
+        });
+        for (arg_names) |an| std.debug.print(" {s}", .{an orelse "<pos>"});
+        std.debug.print("\n", .{});
+    }
     if (!bounded and candidates.len < 2) {
         if (ntrace) std.debug.print("[cno] {s} cands={d} -> decline\n", .{ name, candidates.len });
         return .{ .ok = null };
@@ -2203,7 +2215,26 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             }
         }
         const pts = positionalPoints(self, eff, cand, shapes, scope);
-        if (ntrace) std.debug.print("[cno] {s} cand={d} pts={?}\n", .{ name, cand.int(), pts });
+        if (ntrace) {
+            const dbg_sig = sigViewOfFunc(self, eff, cand, shapes.len);
+            std.debug.print("[cno] {s} cand={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
+                name,
+                cand.int(),
+                pts,
+                if (dbg_sig) |s| s.params.len else null,
+                if (dbg_sig) |s| s.has_body else null,
+                if (dbg_sig) |s| (if (s.params.len != 0) s.params[0].name else "-") else "-",
+                if (dbg_sig) |s| (if (s.params.len != 0) s.params[s.params.len - 1].has_default else false) else null,
+                if (dbg_sig) |s| (if (s.defaults) |d| d.len else null) else null,
+            });
+            if (dbg_sig) |s| {
+                if (s.defaults) |d| {
+                    std.debug.print("[cno]   def-entries:", .{});
+                    for (d) |e| std.debug.print(" {}", .{e != null});
+                    std.debug.print("\n", .{});
+                }
+            }
+        }
         if (pts) |total| {
             if (candidate_tier > best_scope_tier) continue;
             if (candidate_tier < best_scope_tier) {

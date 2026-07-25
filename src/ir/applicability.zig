@@ -1232,12 +1232,18 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
 // parameter each supplied arg bound to is recorded through it.
 // -------------------------------------------------------------------------
 
+fn applicTraceReject(site: []const u8) void {
+    if (comptime !@import("builtin").link_libc) return;
+    if (std.c.getenv("KLIO_APPLIC_TRACE") == null) return;
+    std.debug.print("[applic-reject] {s}\n", .{site});
+}
+
 fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     const params = sig.params;
     // A bodyless declaration is only selectable when it backs a native
     // intrinsic; the caller folds that into `sig.has_body`.
-    if (!sig.has_body) return null;
-    if (params.len > 64) return null;
+    if (!sig.has_body) { applicTraceReject("named-1"); return null; }
+    if (params.len > 64) { applicTraceReject("named-2"); return null; }
 
     var filled = [_]bool{false} ** 64;
     var total: i32 = 0;
@@ -1272,9 +1278,16 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         // an unmatched name unbound, so the value is never passed.
         const p = pos orelse {
             if (isGeneratedComposeArg(n)) continue;
-            return null;
+            if (comptime @import("builtin").link_libc) {
+                if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
+                    std.debug.print("[applic-reject] named-3 arg={s} params:", .{n});
+                    for (params) |*pp| std.debug.print(" {s}", .{pp.name});
+                    std.debug.print("\n", .{});
+                }
+            }
+            { applicTraceReject("named-3"); return null; }
         };
-        if (filled[p]) return null;
+        if (filled[p]) { applicTraceReject("named-4"); return null; }
         total += scoreArg(sig, &params[p].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         filled[p] = true;
@@ -1392,7 +1405,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
             }
         }
 
-        if (pidx >= params.len) return null;
+        if (pidx >= params.len) { applicTraceReject("named-5"); return null; }
         total += scoreArg(sig, &params[pidx].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         if (bind) |bb| {
@@ -1406,7 +1419,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     // Every unfilled non-vararg parameter must be defaultable.
     for (params, 0..) |p, pi| {
         if (filled[pi] or p.is_vararg) continue;
-        if (!paramHasDefault(sig, pi)) return null;
+        if (!paramHasDefault(sig, pi)) { applicTraceReject("named-6"); return null; }
         total -= 1;
     }
 
@@ -2088,4 +2101,21 @@ test "applicable named: unfilled non-default parameter is a reject; a default pa
     const sig_d = SigView{ .params = &p, .defaults = &defaults };
     const sc = applicable(&sig_d, &args, .{ .named = true }).?;
     try testing.expectEqual(@as(i32, 99), sc.points); // 100 - 1
+}
+
+test "applicable named: defaulted trailing param stays fillable for named Int args" {
+    // `Color(red = 0, green = 0, blue = 0)` against the Int factory
+    // `Color(red: Int, green: Int, blue: Int, alpha: Int = 0xFF)`.
+    const factory = [_]Param{
+        .{ .name = "red", .ty = tref("Int"), .default = null },
+        .{ .name = "green", .ty = tref("Int"), .default = null },
+        .{ .name = "blue", .ty = tref("Int"), .default = null },
+        .{ .name = "alpha", .ty = tref("Int"), .default = null, .has_default = true },
+    };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Int", .named = "red" },
+        .{ .runtime_class = "Int", .named = "green" },
+        .{ .runtime_class = "Int", .named = "blue" },
+    };
+    try testing.expect(applicable(&.{ .params = &factory }, &args, .{ .named = true }) != null);
 }
