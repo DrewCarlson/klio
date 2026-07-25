@@ -2354,6 +2354,112 @@ pub const Module = struct {
         return self.staticAliasType(allocator, expanded, depth + 1);
     }
 
+    fn scopedTypeAliasFqn(
+        self: *const Module,
+        allocator: Allocator,
+        ty: TypeRef,
+        file: ?FileId,
+        package: []const u8,
+    ) Allocator.Error!?[]const u8 {
+        if (overrideQualifiedPath(ty)) |path| {
+            return if (self.registry.type_alias_types.contains(path)) path else null;
+        }
+        const name = staticTypeHead(ty.name);
+        if (std.mem.indexOfScalar(u8, ty.name, '.') != null and
+            self.registry.type_alias_types.contains(ty.name))
+        {
+            return ty.name;
+        }
+        if (file) |source_file| {
+            var imported: ?[]const u8 = null;
+            for (self.importAliasPathsIn(source_file, name)) |path| {
+                if (!self.registry.type_alias_types.contains(path.fqn)) continue;
+                if (imported != null and !std.mem.eql(u8, imported.?, path.fqn)) {
+                    return null;
+                }
+                imported = path.fqn;
+            }
+            if (imported) |path| return path;
+        }
+        if (package.len != 0) {
+            const own = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ package, name },
+            );
+            defer allocator.free(own);
+            if (self.registry.type_alias_types.getKey(own)) |key| return key;
+        }
+        if (file) |source_file| {
+            var wildcard: ?[]const u8 = null;
+            if (self.registry.import_wildcards.get(source_file)) |packages| {
+                for (packages.items) |imported_package| {
+                    const candidate = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}.{s}",
+                        .{ imported_package, name },
+                    );
+                    defer allocator.free(candidate);
+                    const key = self.registry.type_alias_types.getKey(candidate) orelse
+                        continue;
+                    if (wildcard != null and !std.mem.eql(u8, wildcard.?, key)) {
+                        return null;
+                    }
+                    wildcard = key;
+                }
+            }
+            if (wildcard) |path| return path;
+        }
+        var default_import: ?[]const u8 = null;
+        for (default_import_packages) |imported_package| {
+            const candidate = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ imported_package, name },
+            );
+            defer allocator.free(candidate);
+            const key = self.registry.type_alias_types.getKey(candidate) orelse
+                continue;
+            if (default_import != null and
+                !std.mem.eql(u8, default_import.?, key))
+            {
+                return null;
+            }
+            default_import = key;
+        }
+        return default_import;
+    }
+
+    /// Expand a source typealias using the imports and package of its exact
+    /// reference site. The FQN-keyed alias registry keeps a same-simple-name
+    /// alias from another package out of the proof.
+    pub fn resolveTypeAliasAt(
+        self: *const Module,
+        allocator: Allocator,
+        ty: TypeRef,
+        file: ?FileId,
+        package: []const u8,
+    ) Allocator.Error!TypeRef {
+        const alias_fqn = (try self.scopedTypeAliasFqn(
+            allocator,
+            ty,
+            file,
+            package,
+        )) orelse
+            return ty;
+        const source_args = overrideArgs(ty);
+        const args = try allocator.alloc(TypeRef, source_args.len + 1);
+        @memcpy(args[0..source_args.len], source_args);
+        args[source_args.len] = .{
+            .name = try std.fmt.allocPrint(allocator, "#qual:{s}", .{alias_fqn}),
+            .nullable = false,
+            .args = &.{},
+        };
+        var qualified = ty;
+        qualified.args = args;
+        return self.staticAliasType(allocator, qualified, 0);
+    }
+
     fn projectionType(ty: TypeRef) struct { variance: ?ast.Variance, ty: TypeRef, star: bool } {
         if (std.mem.eql(u8, ty.name, "*")) {
             return .{ .variance = null, .ty = ty, .star = true };
@@ -3202,6 +3308,12 @@ pub const Module = struct {
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
+        const scoped_receiver = self.resolveTypeAliasAt(
+            sa,
+            receiver,
+            ctx.caller_file,
+            ctx.caller_package,
+        ) catch return .{};
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
@@ -3313,22 +3425,36 @@ pub const Module = struct {
                 if (!omitted_defaults) continue;
             }
             const recv_param = if (ds) |decl| decl.receiver_ty orelse f.params[0].ty else f.params[0].ty;
-            var compatibility = self.staticReceiverCompatibility(fid, receiver, recv_param);
+            const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
+                decl_source.file
+            else
+                null;
+            const scoped_recv_param = self.resolveTypeAliasAt(
+                sa,
+                recv_param,
+                decl_file,
+                f.package,
+            ) catch return .{};
+            var compatibility = self.staticReceiverCompatibility(
+                fid,
+                scoped_receiver,
+                scoped_recv_param,
+            );
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
             if (declared_bounds.len != 0) {
                 const generic_applies = self.staticGenericReceiverApplicable(
                     sa,
-                    receiver,
-                    recv_param,
+                    scoped_receiver,
+                    scoped_recv_param,
                     declared_bounds,
                     ctx.actual_type_param_bounds,
                 ) catch return .{};
                 if (generic_applies) {
                     compatibility = .compatible;
                 } else {
-                    var erased_receiver = receiver;
+                    var erased_receiver = scoped_receiver;
                     erased_receiver.args = &.{};
-                    var erased_param = recv_param;
+                    var erased_param = scoped_recv_param;
                     erased_param.args = &.{};
                     compatibility = if (self.staticReceiverCompatibility(
                         null,
@@ -3340,30 +3466,30 @@ pub const Module = struct {
                         .unknown;
                 }
             } else if (compatibility == .unknown) {
-                const receiver_id = self.staticTypeClassId(receiver);
-                const param_id = self.staticTypeClassId(recv_param);
+                const receiver_id = self.staticTypeClassId(scoped_receiver);
+                const param_id = self.staticTypeClassId(scoped_recv_param);
                 const disjoint_known_classifiers = receiver_id != null and
                     param_id != null and
                     !self.classIdIsOrExtends(receiver_id.?, param_id.?);
                 const known_classifier_path = receiver_id != null and
                     param_id != null and
                     self.classIdIsOrExtends(receiver_id.?, param_id.?);
-                const same_known_classifier = receiver.args.len != 0 and
-                    recv_param.args.len != 0 and
+                const same_known_classifier = scoped_receiver.args.len != 0 and
+                    scoped_recv_param.args.len != 0 and
                     ((receiver_id != null and param_id != null and
                         receiver_id.? == param_id.?) or
                         (std.mem.eql(
                             u8,
-                            staticTypeHead(receiver.name),
-                            staticTypeHead(recv_param.name),
+                            staticTypeHead(scoped_receiver.name),
+                            staticTypeHead(scoped_recv_param.name),
                         ) and
                             self.staticBuiltinIdentity(
-                                receiver,
-                                staticTypeHead(receiver.name),
+                                scoped_receiver,
+                                staticTypeHead(scoped_receiver.name),
                             ) == .yes and
                             self.staticBuiltinIdentity(
-                                recv_param,
-                                staticTypeHead(recv_param.name),
+                                scoped_recv_param,
+                                staticTypeHead(scoped_recv_param.name),
                             ) == .yes));
                 if (disjoint_known_classifiers) {
                     compatibility = .incompatible;
@@ -3372,18 +3498,18 @@ pub const Module = struct {
                 {
                     const subtype = self.staticTypeIsSubtypeWithBounds(
                         sa,
-                        receiver,
-                        recv_param,
+                        scoped_receiver,
+                        scoped_recv_param,
                         ctx.actual_type_param_bounds,
                     ) catch return .{};
                     if (subtype) {
                         compatibility = .compatible;
                     } else if (self.staticTypeProofComplete(
-                        receiver,
+                        scoped_receiver,
                         ctx.actual_type_param_bounds,
                     ) and
                         self.staticTypeProofComplete(
-                            recv_param,
+                            scoped_recv_param,
                             ctx.actual_type_param_bounds,
                         ))
                     {
@@ -3421,7 +3547,7 @@ pub const Module = struct {
             return .{ .applicable = unknown_best_tier != 255 };
         }
 
-        var proof_receiver = receiver;
+        var proof_receiver = scoped_receiver;
         const receiver_alias = self.staticAliasHead(proof_receiver);
         if (receiver_alias.changed and !receiver_alias.structure_lost) {
             proof_receiver.name = receiver_alias.name;
@@ -3438,6 +3564,22 @@ pub const Module = struct {
         for (ids.items, 0..) |fid, i| {
             const f = self.funcById(fid).?;
             const params = sa.dupe(Param, f.params) catch return .{};
+            if (params.len != 0) {
+                const declared_receiver = if (self.decl_sigs.get(fid.int())) |decl|
+                    decl.receiver_ty orelse params[0].ty
+                else
+                    params[0].ty;
+                const decl_file = if (self.decl_span.get(fid.int())) |decl_source|
+                    decl_source.file
+                else
+                    null;
+                params[0].ty = self.resolveTypeAliasAt(
+                    sa,
+                    declared_receiver,
+                    decl_file,
+                    f.package,
+                ) catch return .{};
+            }
             for (params) |*param| {
                 const alias = self.staticAliasHead(param.ty);
                 if (alias.changed and !alias.structure_lost) param.ty.name = alias.name;
@@ -9336,6 +9478,70 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .caller_file = FileId.from(0),
         .caller_package = "app",
     }).target == null);
+}
+
+test "extension resolver expands receiver aliases in their file scope" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+
+    const compound = try pushTestFuncOpts(
+        &m,
+        a,
+        "compoundWith",
+        "app.compoundWith",
+        "app",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[compound.int()].kind = .top_level_extension;
+    m.funcs.items[compound.int()].params[0].ty.name = "Long";
+    try m.decl_sigs.put(compound.int(), .{
+        .receiver_ty = .{
+            .name = "CompositeKeyHashCode",
+            .nullable = false,
+            .args = &.{},
+        },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .sig = &.{},
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.decl_span.put(
+        compound.int(),
+        Span.init(FileId.from(1), 0, 1),
+    );
+    try m.registry.file_packages.put(FileId.from(1), "app");
+    try m.registry.file_packages.put(FileId.from(2), "app");
+    try m.registry.type_alias_types.put("app.CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "Long", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_alias_types.put("other.CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "String", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_alias_types.put("CompositeKeyHashCode", .{
+        .type_params = &.{},
+        .target = .{ .name = "String", .nullable = false, .args = &.{} },
+    });
+    try m.registry.type_aliases.put("CompositeKeyHashCode", "String");
+    try m.rebuildFuncNameIndex(a);
+
+    const resolved = m.resolveExtensionCall(
+        "compoundWith",
+        .{
+            .name = "CompositeKeyHashCode",
+            .nullable = false,
+            .args = &.{},
+        },
+        &.{},
+        .{
+            .caller_file = FileId.from(2),
+            .caller_package = "app",
+        },
+    );
+    try testing.expectEqual(compound, resolved.target.?);
 }
 
 test "extension resolver admits source bodies and defers possible member shadows" {

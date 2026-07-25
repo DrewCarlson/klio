@@ -11873,7 +11873,15 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // runtime receiver offers the filter nothing else to go on.
     const declared_recv: ?ConstId = blk: {
         const t = declared_ty orelse break :blk null;
-        const head = std.mem.trimEnd(u8, t.name, "?");
+        var alias_scratch = std.heap.ArenaAllocator.init(b.allocator);
+        defer alias_scratch.deinit();
+        const canonical = try b.module.resolveTypeAliasAt(
+            alias_scratch.allocator(),
+            t,
+            name.span.file,
+            b.module.packageOfFile(name.span.file) orelse b.self_package,
+        );
+        const head = std.mem.trimEnd(u8, canonical.name, "?");
         if (head.len == 0) break :blk null;
         break :blk try b.module.internConst(b.allocator, .{ .String = head });
     };

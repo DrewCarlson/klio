@@ -519,7 +519,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try file_pkgs.put(f.span.file, prefix);
         }
         for (f.decls) |*d| {
-            try collectClassFqns(allocator, d, prefix, &fqn_overrides);
+            try collectClassifierFqns(allocator, d, prefix, &fqn_overrides);
             try collectDeclPkgs(allocator, d, prefix, &decl_pkg);
             if (d.* == .Function and prefix.len != 0) {
                 try func_fqn_overrides.put(d.Function.span, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, d.Function.name.name }));
@@ -954,7 +954,17 @@ fn joinIdents(allocator: Allocator, idents: []const ast.Ident, sep: []const u8) 
     return buf.toOwnedSlice(allocator);
 }
 
-fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
+fn collectClassifierFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
+    if (d.* == .TypeAlias) {
+        const ta = &d.TypeAlias;
+        if (pkg.len != 0) {
+            try out.put(ta.span, try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ pkg, ta.name.name },
+            ));
+        }
+    }
     if (d.* == .Class) {
         const c = &d.Class;
         if (pkg.len != 0) {
@@ -964,7 +974,7 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             c.name.name
         else
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, c.name.name });
-        for (c.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
+        for (c.members) |*m| try collectClassifierFqns(allocator, m, inner_pkg, out);
     }
     if (d.* == .Object) {
         const o = &d.Object;
@@ -975,7 +985,7 @@ fn collectClassFqns(allocator: Allocator, d: *const Decl, pkg: []const u8, out: 
             o.name.name
         else
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, o.name.name });
-        for (o.members) |*m| try collectClassFqns(allocator, m, inner_pkg, out);
+        for (o.members) |*m| try collectClassifierFqns(allocator, m, inner_pkg, out);
     }
 }
 
@@ -999,7 +1009,7 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
         },
         .Function => |*f| try out.put(f.span, pkg),
         .Property => |p| try out.put(p.span, pkg),
-        else => {},
+        .TypeAlias => |*ta| try out.put(ta.span, pkg),
     }
 }
 
@@ -5018,6 +5028,51 @@ test "build_module produces an owned empty module shell" {
     defer built.deinit();
     try testing.expect(built.main == null);
     try testing.expectEqual(@as(usize, 0), built.top_level_props.items.len);
+}
+
+test "multi-file assembly retains packaged typealias identities" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = span.Span.init(span.FileId.from(7), 0, 1);
+    var package_path = [_]ast.Ident{
+        .{ .name = "sample", .span = s },
+        .{ .name = "types", .span = s },
+    };
+    const target = ast.TypeRef{
+        .name = .{ .name = "Long", .span = s },
+        .nullable = false,
+        .span = s,
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    var decls = [_]ast.Decl{.{ .TypeAlias = .{
+        .name = .{ .name = "Counter", .span = s },
+        .type_params = &.{},
+        .target = target,
+        .visibility = .Internal,
+        .annotations = &.{},
+        .span = s,
+    } }};
+    const file = ast.KotlinFile{
+        .package = .{ .path = &package_path, .span = s },
+        .imports = &.{},
+        .decls = &decls,
+        .span = s,
+    };
+
+    var built = try buildModuleFiles(a, &.{file});
+    defer built.deinit();
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const shape = mg.get().registry.type_alias_types.get(
+        "sample.types.Counter",
+    );
+    try testing.expect(shape != null);
+    try testing.expectEqualStrings("Long", shape.?.target.name);
 }
 
 test "class type-parameter metadata includes where bounds and unbounded identities" {
