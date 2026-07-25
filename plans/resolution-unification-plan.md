@@ -1553,13 +1553,22 @@ IR lowering that runs after frontend resolution; klio's runs before.
   only for a non-inline sink per the DECLARATION's own is_inline). The repair
   unwraps the pass's memo shell to reach wrapped arguments. DELETED with their
   collectors, baked-base walks, and plumbing: `active_sink_arity` and
-  `active_sink_param_arity` (196 lines). Remaining P12 surface:
-  `active_sink_last_param`, `active_sink_content_reach`,
-  `active_composable_props`, `active_composable_getter_props`,
-  `active_factories` — each still serving the memo-wrap naming, content-reach
-  gating, and value-invocation decisions the same flip-measure-close-delete
-  method applies to. P13 (inline-ness) still requires moving the non-sink
-  lambda scope-keeping decision to lowering.
+  `active_sink_param_arity` (196 lines). Remaining P12 surface after
+  `active_composable_props` also landed (member-syntax property invocations
+  complete at the value; 72 lines deleted):
+  - `active_sink_last_param` + `active_sink_content_reach`: the memo-wrap
+    re-naming pair. Retiring them means the LOWERING names a wrapped trailing
+    argument from the RESOLVED trailing parameter (selectedCallArgsForBuilder
+    can set the name when the last arg is a memoWrappedLambda and unnamed) —
+    then both maps and the AST-side rename fall together.
+  - `active_composable_getter_props`: bare reads of composable property
+    getters; value-side threading, likely servable by the getter-invocation
+    completion.
+  - `active_factories`: composable-val factory tracking feeding the
+    val-invocation walk; value-side by design, needs a value-typed signal at
+    lowering (the factory's resolved return type) to retire.
+  P13 (inline-ness) still requires moving the non-sink lambda scope-keeping
+  decision to lowering.
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
