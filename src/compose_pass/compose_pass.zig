@@ -319,6 +319,15 @@ fn isComposableFnType(t: *const ast.TypeRef) bool {
     return t.function != null and isComposable(t.annotations);
 }
 
+/// Extension-receiver + context slot count of a composable function type
+/// (0 when not a composable function type).
+pub fn composableFunctionRecvSlots(t: *const ast.TypeRef) u8 {
+    if (!isComposableFnType(t)) return 0;
+    const ft = t.function.?;
+    const n = ft.context_params.len + @intFromBool(ft.receiver != null);
+    return @intCast(@min(n, 255));
+}
+
 pub fn composableFunctionArity(t: *const ast.TypeRef) ?u8 {
     if (!isComposableFnType(t)) return null;
     return @intCast(@min(t.function.?.params.len, 255));
@@ -2205,43 +2214,18 @@ const Walker = struct {
                             .Labeled => |lb| lb.label.name,
                             else => name,
                         };
-                        var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
-                        // A named lambda argument binds one declared parameter;
-                        // read that parameter's own slot arity instead of the
-                        // function-conflated guess (which reports a sibling
-                        // parameter's receiver slot for a slotless `title = {}`).
-                        const last_arg_name: ?[]const u8 =
-                            if (c.arg_names.len == c.args.len) c.arg_names[c.args.len - 1] else null;
-                        if (last_arg_name) |pn| {
-                            if (active_sink_param_arity) |pa| {
-                                if (pa.getPtr(name.?)) |inner| exp = inner.get(pn);
-                            }
-                        }
-                        // `movableContentOf` / `movableContentWithReceiverOf`
-                        // are OVERLOADED on the lambda's parameter count
-                        // (`() -> Unit` vs `(P) -> Unit` … `R.(P1..P3)`); the
-                        // name-keyed sink-arity map conflates them, and a
-                        // spurious synthetic `it` shifts the invoke protocol
-                        // (the 3-param block is invoked 2-arg and `$composer`
-                        // receives the Int dirty flag). Explicit call-site
-                        // type args name the overload exactly (the receiver
-                        // form spends its first type arg on R, not a lambda
-                        // param); otherwise a headerless lambda IS the
-                        // 0-param overload — kotlinc cannot infer `P` from a
-                        // headerless literal, so a bare `it` inside belongs
-                        // to an ENCLOSING implicit-`it` lambda
-                        // (`Array(4) { movableContentOf { level[it * 2]() } }`),
-                        // never to this one.
+                        // P12: the pass no longer guesses a headerless sink
+                        // lambda's synthetic slot count from the name-keyed
+                        // arity maps. It shapes the lambda with the bare
+                        // composer pair; the LOWERING repairs the shape
+                        // against the resolved parameter's declared arity
+                        // (transformResolvedComposableLambda inserts the
+                        // implicit `it` when the selected parameter takes
+                        // one), and the runtime's flattened-receiver dispatch
+                        // supplies a receiver slot the declared arity omits.
+                        const exp: ?u8 = null;
                         const is_mco = std.mem.eql(u8, name.?, "movableContentOf");
                         const is_mcwro = std.mem.eql(u8, name.?, "movableContentWithReceiverOf");
-                        if ((is_mco or is_mcwro) and sink_lam.implicit_it) {
-                            if (c.type_args.len != 0) {
-                                const ta: u8 = @intCast(@min(c.type_args.len, 255));
-                                exp = if (is_mcwro) ta - 1 else ta;
-                            } else {
-                                exp = 0;
-                            }
-                        }
                         // A movable-content type arg that is ITSELF a
                         // `@Composable` function type makes the lambda param
                         // at that position a composable value: a bare
@@ -2705,13 +2689,27 @@ pub fn transformResolvedComposableLambda(
     implicit_label: ?[]const u8,
     callee_inline: bool,
 ) std.mem.Allocator.Error!bool {
-    const lam = trailingLambda(arg) orelse return false;
+    const lam = trailingLambda(arg) orelse memoWrappedLambda(arg) orelse return false;
     if (lambdaHasComposerParams(lam)) {
-        // The pass already shaped this lambda; audit its guess against the
-        // declared arity of the parameter resolution just selected. One
-        // param over is the flattened receiver slot the declared arity
-        // does not count.
+        // The pass already shaped this lambda. P12: REPAIR it against the
+        // declared arity of the parameter resolution just selected — the
+        // pass shapes headerless lambdas with the bare pair only, and the
+        // resolved declaration is the authority on the synthetic slot
+        // count. A one-short lambda gains the implicit `it` here; one over
+        // is the flattened receiver slot the declared arity omits, left
+        // alone. Anything else is audited.
         const user_n = lam.params.len - 2;
+        if (user_n + 1 == expected_params) {
+            const np = a.alloc(ast.Ident, lam.params.len + 1) catch return false;
+            np[0] = .{ .name = "it", .span = lam.params[0].span };
+            @memcpy(np[1..], lam.params);
+            const nt = a.alloc(?ast.TypeRef, lam.param_tys.len + 1) catch return false;
+            nt[0] = null;
+            @memcpy(nt[1..], lam.param_tys);
+            lam.params = np;
+            lam.param_tys = nt;
+            return true;
+        }
         if (user_n < expected_params or user_n > @as(usize, expected_params) + 1) {
             compose_audit.lambda_arity_mismatch += 1;
             if (composeAuditOn()) {
@@ -3117,6 +3115,20 @@ fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
 /// A lambda literal argument, or a lambda wrapped in a `Labeled` node from an
 /// explicit `lbl@{ … }` trailing lambda. Returns the lambda payload pointer so
 /// the labeled form threads exactly like the bare one; null for a non-lambda arg.
+/// The lambda inside a memo wrap the pass emitted around a sink argument
+/// (`rememberComposableLambda(key, tracked, block, $composer, 0)` /
+/// `composableLambdaInstance(key, tracked, block)`), for the lowering-side
+/// shape repair — the wrap runs before resolution selects the parameter.
+fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
+    if (e.* != .Call) return null;
+    const c = &e.Call;
+    const nm = calleeSimpleName(c.callee) orelse return null;
+    if (!std.mem.eql(u8, nm, "rememberComposableLambda") and
+        !std.mem.eql(u8, nm, "composableLambdaInstance")) return null;
+    if (c.args.len < 3) return null;
+    return trailingLambda(&c.args[2]);
+}
+
 fn trailingLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
     return switch (e.*) {
         .Lambda => &e.Lambda,

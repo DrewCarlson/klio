@@ -9508,10 +9508,18 @@ fn transformSelectedComposableArgs(
                 );
             }
         }
+        // The synthetic slot count comes from the RESOLVED parameter: its
+        // declared arity plus, for a non-inline sink, the receiver/context
+        // slots the value protocol flattens in front (an inline sink
+        // splices with the receiver bound as `this`, no slot).
+        const expected_slots: u8 = if (f.is_inline)
+            expected
+        else
+            expected +| f.params[pi].composable_recv_slots;
         _ = try compose_pass.transformResolvedComposableLambda(
             b.allocator,
             @constCast(&args[arg_index]),
-            expected,
+            expected_slots,
             f.name,
             f.is_inline,
         );

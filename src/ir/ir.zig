@@ -1108,6 +1108,10 @@ pub const Param = struct {
     /// Null distinguishes an ordinary function parameter from a composable
     /// zero-argument parameter.
     composable_arity: ?u8 = null,
+    /// Extension-receiver + context slots of a `@Composable` function-typed
+    /// parameter — the leading value slots a NON-inline sink's lambda takes
+    /// beyond `composable_arity` when invoked through the value protocol.
+    composable_recv_slots: u8 = 0,
     /// True when the primary-ctor param doubles as a class property
     /// (`val name` / `var name` prefix on the param). The Vm uses
     /// this flag to decide which primary args become instance
