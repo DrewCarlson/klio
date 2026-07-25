@@ -7316,7 +7316,19 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
             break :blk @intCast(n);
         },
         .AnonFun => |af| @intCast(af.params.len),
-        else => null,
+        else => blk: {
+            // A memo-wrapped sink lambda ranks by the inner literal's
+            // declared header, exactly like the bare literal above.
+            const lam = compose_pass.memoWrappedLambda(@constCast(arg)) orelse break :blk null;
+            if (lam.implicit_it) break :blk @as(u8, 0);
+            var n = lam.params.len;
+            if (n >= 2 and std.mem.eql(u8, lam.params[n - 1].name, "$changed") and
+                std.mem.eql(u8, lam.params[n - 2].name, "$composer"))
+            {
+                n -= 2;
+            }
+            break :blk @intCast(n);
+        },
     };
 }
 
@@ -7333,7 +7345,10 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
     const lazy_ty = argDeclTypeRefLazy(b, arg);
     const ty = argDeclTypeRef(b, arg);
     const declared_fn_arity = if (ty) |t| fnTypeArityAlias(b, t) else null;
-    const literal_callable = arg.* == .Lambda or arg.* == .AnonFun;
+    // A memo-wrapped sink lambda is the trailing functional argument for
+    // overload selection — the wrap is transparent to the shape.
+    const literal_callable = arg.* == .Lambda or arg.* == .AnonFun or
+        compose_pass.memoWrappedLambda(@constCast(arg)) != null;
     return .{
         .named = name,
         .is_spread = arg.* == .Spread,

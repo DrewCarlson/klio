@@ -2971,7 +2971,7 @@ fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
 /// (`rememberComposableLambda(key, tracked, block, $composer, 0)` /
 /// `composableLambdaInstance(key, tracked, block)`), for the lowering-side
 /// shape repair — the wrap runs before resolution selects the parameter.
-fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
+pub fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
     if (e.* != .Call) return null;
     const c = &e.Call;
     const nm = calleeSimpleName(c.callee) orelse return null;
