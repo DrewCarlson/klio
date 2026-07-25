@@ -470,7 +470,6 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
 fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
-        receiver_names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
         factories: std.StringHashMap(void),
         sink_arity: std.StringHashMap(u8),
@@ -484,7 +483,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
 
         fn deinit(self: *@This()) void {
             self.names.deinit();
-            self.receiver_names.deinit();
             self.sinks.deinit();
             self.factories.deinit();
             self.sink_arity.deinit();
@@ -500,7 +498,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     var compose_maps: ?ComposeMaps = null;
     defer {
         compose_pass.active_composable_names = null;
-        compose_pass.active_composable_receiver_names = null;
         compose_pass.active_composable_sinks = null;
         compose_pass.active_factories = null;
         compose_pass.active_sink_arity = null;
@@ -573,8 +570,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
-        var receiver_names = try compose_pass.collectComposableReceiverNames(allocator, decls.items);
-        defer receiver_names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
         var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
@@ -598,7 +593,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             // every collector below must read the decoded section instead.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
-            try composeBaseReceiverNames(&receiver_names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
             try composeBaseFactories(&factories, base_decls);
             try composeBaseSinkArity(&sink_arity, base_decls);
@@ -629,8 +623,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_last_param = null;
         compose_pass.active_sink_content_reach = &sink_content_reach;
         defer compose_pass.active_sink_content_reach = null;
-        compose_pass.active_composable_receiver_names = &receiver_names;
-        defer compose_pass.active_composable_receiver_names = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -642,7 +634,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
         compose_maps = .{
             .names = names,
-            .receiver_names = receiver_names,
             .sinks = sinks,
             .factories = factories,
             .sink_arity = sink_arity,
@@ -655,7 +646,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             .stability = stability,
         };
         names = std.StringHashMap(void).init(allocator);
-        receiver_names = std.StringHashMap(void).init(allocator);
         sinks = std.StringHashMap(void).init(allocator);
         factories = std.StringHashMap(void).init(allocator);
         sink_arity = std.StringHashMap(u8).init(allocator);
@@ -669,7 +659,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     }
     if (compose_maps) |*maps| {
         compose_pass.active_composable_names = &maps.names;
-        compose_pass.active_composable_receiver_names = &maps.receiver_names;
         compose_pass.active_composable_sinks = &maps.sinks;
         compose_pass.active_factories = &maps.factories;
         compose_pass.active_sink_arity = &maps.sink_arity;
@@ -4617,13 +4606,6 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
         .Object => |*o| for (o.members) |*m| try composeBaseNameDecl(names, m),
         else => {},
     }
-}
-
-/// Baked-base equivalent of `collectComposableReceiverNames`: names of
-/// `@Composable` functions reachable via member syntax (extensions or
-/// class/object members).
-fn composeBaseReceiverNames(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try compose_pass.collectReceiverInto(set, @as([*]const Decl, @ptrCast(d))[0..1], false);
 }
 
 /// Add the names of baked-base functions with a `@Composable`-typed lambda

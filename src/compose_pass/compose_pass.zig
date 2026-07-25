@@ -306,37 +306,6 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
     };
 }
 
-/// Simple names of `@Composable` functions reachable through MEMBER syntax
-/// (`receiver.name(...)`): extensions (a declared receiver type) and class /
-/// object member functions. A member-syntax call threads the composer only when
-/// the name is here — a name whose only `@Composable` overload is a top-level
-/// non-extension (`contentColorFor`, which ALSO has a non-composable
-/// `ColorScheme` extension) is reached, via member syntax, by that
-/// non-composable extension, so threading it corrupts the call.
-pub var active_composable_receiver_names: ?*const std.StringHashMap(void) = null;
-pub var active_composable_names: ?*const std.StringHashMap(void) = null;
-pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
-
-pub fn collectComposableReceiverNames(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
-    try collectReceiverInto(&set, decls, false);
-    return set;
-}
-
-pub fn collectReceiverInto(set: *std.StringHashMap(void), decls: []const ast.Decl, in_type: bool) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            if (isComposable(f.annotations) and (in_type or f.receiver_type != null))
-                try set.put(f.name.name, {});
-        },
-        .Class => |*c| try collectReceiverInto(set, c.members, true),
-        .Object => |*o| try collectReceiverInto(set, o.members, true),
-        else => {},
-    };
-}
 
 /// Whether a parameter's type is a `@Composable`-annotated function type — a
 /// sink a lambda argument is transformed for.
@@ -402,25 +371,6 @@ pub var compose_audit: ComposeAudit = .{};
 
 var compose_audit_env: ?bool = null;
 
-/// P11 experiment gate: `KLIO_P11_MEMBER=1` disables the member-form
-/// oracle arm so member calls keep their source argument shape and the
-/// resolution-side completions must serve them. Temporary — becomes the
-/// default (and the receiver-names map is deleted) once the completion
-/// gaps recorded in the plan are closed.
-var p11_env: ?bool = null;
-
-fn runtime_env_p11() bool {
-    if (p11_env) |v| return v;
-    const v = blk: {
-        if (comptime !@import("builtin").link_libc) break :blk false;
-        const raw = std.c.getenv("KLIO_P11_MEMBER") orelse break :blk false;
-        const s = std.mem.span(raw);
-        break :blk s.len != 0 and !std.mem.eql(u8, s, "0");
-    };
-    p11_env = v;
-    return v;
-}
-
 pub fn composeAuditOn() bool {
     if (compose_audit_env) |v| return v;
     const v = blk: {
@@ -432,6 +382,9 @@ pub fn composeAuditOn() bool {
     compose_audit_env = v;
     return v;
 }
+
+pub var active_composable_names: ?*const std.StringHashMap(void) = null;
+pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
 
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
@@ -2412,9 +2365,14 @@ const Walker = struct {
                         // first and only then completes a proven Compose ABI.
                         // Qualified paths still need the pre-resolution
                         // oracle; local/value calls are handled above.
-                        const p11_member_flip = if (runtime_env_p11()) true else false;
+                        // P11: a MEMBER-form call keeps its source argument
+                        // shape, exactly like a bare call. The lowering
+                        // completes the pair after static selection, and a
+                        // runtime-dispatched member or member-syntax extension
+                        // completes at the member-miss tail — both against the
+                        // RESOLVED declaration, never a simple name.
                         const oracle_hit = if (c.callee.* == .Member)
-                            (!p11_member_flip and active_composable_receiver_names != null and active_composable_receiver_names.?.contains(nm))
+                            false
                         else if (c.callee.* == .Path and c.callee.Path.segments.len == 1)
                             false
                         else
