@@ -8736,6 +8736,14 @@ fn virtualSlotUnlinkedDiag(
         "[vslot-unlinked] {s} slot={d} method={s} recv={s} nargs={d}\n",
         .{ which, slot.int(), mname, recv_fqn, nargs },
     );
+    // Name the executing overload: same-named siblings (the FunctionN `invoke`
+    // family) are indistinguishable in the frame chain, and which one is running
+    // is exactly what identifies a misbound receiver.
+    if (ir.eval.currentFrameFunc()) |cf| {
+        std.debug.print("[vslot-unlinked]   in {s} params=[", .{cf.fqn});
+        for (cf.params) |p| std.debug.print("{s} ", .{p.name});
+        std.debug.print("]\n", .{});
+    }
     ir.eval.dumpFrameChainForDiagAlways();
 }
 

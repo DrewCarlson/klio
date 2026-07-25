@@ -638,7 +638,14 @@ pub fn collectComposableSinkArity(
 
 fn compParamArity(t: *const ast.TypeRef) ?u8 {
     if (t.function == null or !isComposable(t.annotations)) return null;
-    const n = t.function.?.params.len;
+    const ft = t.function.?;
+    // An extension receiver — and each `context(...)` type — flattens into a
+    // LEADING value slot at the invocation: `MyScope.() -> Unit` is invoked as
+    // `(receiver, $composer, $changed)`. Counting only `params` leaves a
+    // header-less `{ … }` bound to such a sink with no slot for the receiver, so
+    // the threaded `$composer` binds the receiver and every composable call in
+    // the body dispatches its composer methods on the scope object.
+    const n = ft.context_params.len + @as(usize, @intFromBool(ft.receiver != null)) + ft.params.len;
     if (n == 0) return null;
     return @intCast(@min(n, 255));
 }
