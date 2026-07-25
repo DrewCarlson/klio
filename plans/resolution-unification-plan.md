@@ -1605,10 +1605,18 @@ IR lowering that runs after frontend resolution; klio's runs before.
     byte-identical, unit tests, sweep). The wrap's trailing-callable
     unification now holds at every tier: member/func/lowering arg shapes,
     the positional callFunc gate, and the named binder. P12's naming pair
-    is retired; five of six P12 maps are deleted. Remaining:
-    `active_composable_getter_props` and `active_factories` (the
-    branch-composability classifiers) and P13 — the classifier/scope move
-    to lowering.
+    is retired. `active_factories` retired next (the runtime closure
+    completion serves an unclassified val's bare calls; the walker-local
+    delegate/known-value arms stay). SIX of the seven name-keyed maps the
+    phase touched are deleted. The LAST one, `active_composable_getter_props`,
+    is measurably different in kind: a probe flip fails the unit contract 'a
+    @Composable getter property is detected as composable content' — it
+    decides WRAP COVERAGE (emission structure), for which no runtime
+    completion can compensate; a lambda whose only compose content is a
+    getter read must still be wrapped. It retires only with the
+    classifier-to-lowering move (shared with P13's scope-keeping), where the
+    RESOLVED getter classifies the branch. That move is the single remaining
+    structural item of the consolidation.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
