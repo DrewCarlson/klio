@@ -892,6 +892,19 @@ fn inlineVarargArrayExpr(
 /// resolve to the call site's type. `expected` carries the call's
 /// tail-position type so a reified parameter with no explicit `<…>`
 /// argument can be inferred from context.
+/// The source file a call-site expression was written in, from its span:
+/// visibility of a file-private inline candidate is judged against this.
+fn callSiteFileOf(e: *const Expr) ?span.FileId {
+    return switch (e.*) {
+        .Path => |p| if (p.segments.len != 0) p.segments[0].span.file else null,
+        .Member => |m| m.name.span.file,
+        .Call => |c| callSiteFileOf(c.callee),
+        .Lambda => |l| l.span.file,
+        .This => |t| t.span.file,
+        else => null,
+    };
+}
+
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
@@ -921,7 +934,12 @@ pub fn tryInlineCallWithTypeArgs(
             .AnonFun => |af| af.params.len,
             else => null,
         };
-        const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda, .trailing_lambda_arity = trailing_arity };
+        const call_shape = CallShape{
+            .want = args.len,
+            .last_is_lambda = last_is_lambda,
+            .trailing_lambda_arity = trailing_arity,
+            .call_file = if (this_arg) |ta| callSiteFileOf(ta) else null,
+        };
         var recv_ty = try inferReceiverType(b, this_arg);
         // A BARE call inside an extension body has the enclosing
         // extension's declared receiver as its implicit receiver — that

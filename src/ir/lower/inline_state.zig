@@ -66,7 +66,38 @@ pub const CallShape = struct {
     /// the `T.() -> R` (0-param) overload over a reified `T.(X) -> R` one
     /// whose type argument a bare lambda cannot supply.
     trailing_lambda_arity: ?usize = null,
+    /// The call site's file. A `private` inline declaration is scoped to
+    /// its own file; the simple-name candidate table spans the whole
+    /// program, so without this a file-private `List.fastForEach` in one
+    /// pack file spliced into an unrelated caller. Null keeps every
+    /// candidate (callers that predate the field).
+    call_file: ?span.FileId = null,
 };
+
+/// Whether `f` is visible to a call in `call_file`: a `private`
+/// declaration only from its own file. Unknown call file keeps the
+/// candidate (conservative — the old behavior).
+fn candVisibleFrom(f: *const ast.Function, call_file: ?span.FileId) bool {
+    if (f.visibility != .Private) return true;
+    const cf = call_file orelse return true;
+    return f.name.span.file.int() == cf.int();
+}
+
+/// `cands` minus the file-private declarations the call site cannot see.
+/// Returns a slice into `buf`; falls back to the unfiltered slice when
+/// there are more candidates than `buf` holds.
+fn visibleCands(cands: []const *const ast.Function, call_file: ?span.FileId, buf: []*const ast.Function) []const *const ast.Function {
+    if (call_file == null) return cands;
+    if (cands.len > buf.len) return cands;
+    var n: usize = 0;
+    for (cands) |f| {
+        if (candVisibleFrom(f, call_file)) {
+            buf[n] = f;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
 
 /// `suspend inline fun` ASTs by simple name, set by the build driver
 /// before body lowering. A `suspend inline` builder's
@@ -403,7 +434,10 @@ pub fn inlineFnAstForRecvExt(
 ) ?*const ast.Function {
     if (isShadowed(name)) return null;
     const ptrace = if (runtime.getenvSlice("KLIO_INLINE_PICK")) |w| std.mem.eql(u8, w, name) else false;
-    const cands = candidatesFor(name) orelse return inlineFnAstFor(name, call);
+    const all = candidatesFor(name) orelse return inlineFnAstFor(name, call);
+    var vis_buf: [24]*const ast.Function = undefined;
+    const cands = visibleCands(all, if (call) |c| c.call_file else null, &vis_buf);
+    if (cands.len == 0) return null;
     if (ptrace) {
         std.debug.print("[ipick] {s} n={d} chain0={s}:", .{ name, cands.len, if (recv_chain) |ch| (if (ch.len > 0) ch[0] else "<empty>") else "<null>" });
         for (cands) |c| std.debug.print(" recv={s}/owner={s}/file={d}", .{ if (c.receiver_type) |rt| rt.name.name else "-", inlineMemberOwner(c) orelse "-", c.name.span.file.int() });
@@ -671,7 +705,9 @@ fn pickUniqueArityFit(cands: []const *const ast.Function, want: usize) ?*const a
 /// overload wins.
 pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     if (isShadowed(name)) return null;
-    const cands = candidatesFor(name) orelse return null;
+    const all = candidatesFor(name) orelse return null;
+    var vis_buf: [24]*const ast.Function = undefined;
+    const cands = visibleCands(all, if (call) |c| c.call_file else null, &vis_buf);
     const first: ?*const ast.Function = if (cands.len > 0) cands[0] else null;
     const shape = call orelse return first;
     if (cands.len < 2) return first;

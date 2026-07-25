@@ -5173,6 +5173,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         .want = args.len,
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
         .trailing_lambda_arity = trailingLambdaArity(args),
+        .call_file = callee.Path.segments[0].span.file,
     };
     // An explicit `<T>` argument binds a reified parameter, so a reified
     // inline overload of this shape outranks a non-reified `KClass<T>`
