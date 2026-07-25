@@ -1522,6 +1522,18 @@ IR lowering that runs after frontend resolution; klio's runs before.
   the three gaps in the runtime member completion (or add lowering-side completion
   for statically-selected member calls), re-flip the arm, and gate on this exact
   fixture battery plus the sweep.
+
+  LANDED (2026-07-25, same session): the three gaps were closed — the completion's
+  recursion guard became the completed-pair shape instead of an execution-spanning
+  flag; the ownership proof accepts a defaulted middle and the retry appends the
+  pair BY NAME so the named walk reorders and default-fills; the proof covers
+  pair-tailed extensions reached by member syntax. With every gate green both ways,
+  the member-form oracle arm was retired unconditionally and
+  `active_composable_receiver_names` plus its collectors DELETED — P11's first
+  named deletion, gated on the full battery, the M3 scene render, and a
+  byte-identical sweep. Remaining P11 surface: the val/lambda-param positional
+  pair appends and `isGeneratedComposeArg`'s absorption; then P12 (lambda shaping)
+  and P13 (inline-ness).
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
