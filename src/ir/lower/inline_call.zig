@@ -98,6 +98,9 @@ pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocato
             const name = p.segments[0].name;
             if (b.localDeclType(name)) |t| return t;
             if (b.localInitExpr(name)) |e| return inferReceiverType(b, e);
+            // Typeck fills the receiver head only when lexical declaration and
+            // initializer evidence could not carry it into the nested body.
+            if (b.module.eagerTypeOf(arg.span())) |t| return t.name;
             // A bare name that is not a local is a member of the enclosing
             // class, whose declared type is receiver evidence just as a
             // local's is. Without it a reified inline extension called on a

@@ -7534,6 +7534,22 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 }
             }
         }
+        // Resolve each property segment from its receiver's declared type so
+        // the final member call can use the shared declaration resolver.
+        if (argDeclTypeRefLazy(b, recv)) |receiver_ty| {
+            const owner = typeHead(receiver_ty.name);
+            const heads = b.module.registry.class_prop_type_heads;
+            if (heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
+                return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+            const chain: []const []const u8 =
+                b.module.registry.class_super_names.get(owner) orelse &.{};
+            for (chain) |super_name| {
+                if (heads.get(.{ .a = super_name, .b = arg.Member.name.name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
         return null;
     }
     if (arg.* != .Path) return null;
@@ -7577,6 +7593,9 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (init != arg) {
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
         }
+    }
+    if (staticBareReceiverType(b, p.segments[0].name)) |head| {
+        return .{ .name = head, .nullable = false, .args = &.{} };
     }
     // A bare class name used as a value is its companion object: carry the
     // owner class's head as type evidence so `install(RoutingRoot, ...)`
@@ -11623,13 +11642,13 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
-    const lazy_declared_ty = argDeclTypeRefLazy(b, receiver);
-    var inferred_declared_ty: ?ir.TypeRef = if (lazy_declared_ty == null)
+    const declared_from_expr = argDeclTypeRef(b, receiver);
+    var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
         try staticCallReturnTypeRef(b, receiver)
     else
         null;
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
-    const declared_ty = lazy_declared_ty orelse inferred_declared_ty;
+    const declared_ty = declared_from_expr orelse inferred_declared_ty;
 
     // Member declarations take precedence over local callables and extensions.
     // A unique static declaration commits here as either an exact function or
@@ -14215,6 +14234,42 @@ test "shared member resolution selects overloads and dispatch forms" {
     const bodyless_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, bodyless_result.dispatch);
     try testing.expectEqual(final_pick, bodyless_result.target.?);
+    m.decl_sigs.getPtr(final_pick.int()).?.has_body = true;
+
+    const eager_recv_span = ast.Span.init(dummySpan().file, 50, 51);
+    var eager_types = std.AutoHashMap(ast.Span, ir.EagerTypeHead).init(a);
+    try eager_types.put(eager_recv_span, .{ .name = "Owner", .nullable = false });
+    m.eager_types = eager_types;
+    try b.bind("eagerTarget", b.allocReg());
+    var eager_recv_path = [_]ast.Ident{.{
+        .name = "eagerTarget",
+        .span = eager_recv_span,
+    }};
+    var eager_receiver = Expr{ .Path = .{
+        .segments = &eager_recv_path,
+        .span = eager_recv_span,
+    } };
+    var eager_member = Expr{ .Member = .{
+        .receiver = &eager_receiver,
+        .name = .{ .name = "finalPick", .span = eager_recv_span },
+        .safe = false,
+        .span = eager_recv_span,
+    } };
+    const eager_call = Expr{ .Call = .{
+        .callee = &eager_member,
+        .args = &int_args,
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = eager_recv_span,
+    } };
+    _ = try lowerExpr(&b, &eager_call);
+    const eager_call_inst = b.blocks.items[b.cur.int()].insts[
+        b.blocks.items[b.cur.int()].insts.len - 1
+    ];
+    try testing.expect(eager_call_inst == .Call);
+    try testing.expectEqual(final_pick, eager_call_inst.Call.func);
+    try testing.expect(eager_call_inst.Call.exact);
 
     try b.setLocalDeclNullable("target");
     const nullable_binary = Expr{ .Binary = .{
@@ -14566,4 +14621,43 @@ test "inline extension receiver type remains available during body splicing" {
     const param = argDeclTypeRefLazy(&b, &param_expr) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Float", param.name);
+}
+
+test "declared member property chains retain static receiver types" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try m.registry.class_prop_type_heads.put(
+        .{ .a = "Coordinator", .b = "layoutNode" },
+        "LayoutNode",
+    );
+    try m.registry.class_prop_type_heads.put(
+        .{ .a = "LayoutNode", .b = "nodes" },
+        "NodeChain",
+    );
+
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Coordinator");
+
+    var layout_node_path = [_]ast.Ident{.{
+        .name = "layoutNode",
+        .span = dummySpan(),
+    }};
+    var layout_node = Expr{ .Path = .{
+        .segments = &layout_node_path,
+        .span = dummySpan(),
+    } };
+    const first = argDeclTypeRefLazy(&b, &layout_node) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("LayoutNode", first.name);
+
+    const nodes = Expr{ .Member = .{
+        .receiver = &layout_node,
+        .name = .{ .name = "nodes", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const chained = argDeclTypeRefLazy(&b, &nodes) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("NodeChain", chained.name);
 }
