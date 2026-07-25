@@ -8791,6 +8791,7 @@ pub fn invokeVirtualMember(
                 args.len,
                 if (ir.eval.currentFrameFunc()) |f| f.fqn else "<none>",
             });
+            ir.eval.dumpCurrentFrameParamsForDiag();
             ir.eval.dumpFrameChainForDiagAlways();
         }
         return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
