@@ -1597,12 +1597,18 @@ IR lowering that runs after frontend resolution; klio's runs before.
     NAMED binding path still maps a wrap-trailing call positionally — the
     frame shows content=Null with the composer shifted
     (`MaterialTheme(colorScheme=…, WRAP, $composer=, $changed=)` binds
-    colorScheme by name, defaults the middles, and drops the wrap). ONE
-    duplicated binding site remains (the named-args reorder used by
-    callFuncTyped's named dispatch); teach it the trailing-callable rule and
-    the renames retire. Five measured probes on record — each layer's fix
-    landed as it was found (three shape tiers + the positional gate); the
-    maps stay until the named binder learns the rule.
+    colorScheme by name, defaults the middles, and drops the wrap). The SIXTH
+    probe taught the named binder (callFuncNamed) the lambda-before-pair
+    rule — an unnamed callable before the named generated pair binds the
+    last user parameter — and the retirement LANDED: both maps deleted with
+    their collectors and plumbing, all gates green (battery, M3 render
+    byte-identical, unit tests, sweep). The wrap's trailing-callable
+    unification now holds at every tier: member/func/lowering arg shapes,
+    the positional callFunc gate, and the named binder. P12's naming pair
+    is retired; five of six P12 maps are deleted. Remaining:
+    `active_composable_getter_props` and `active_factories` (the
+    branch-composability classifiers) and P13 — the classifier/scope move
+    to lowering.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
