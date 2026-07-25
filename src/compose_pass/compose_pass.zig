@@ -570,41 +570,6 @@ fn callPropagatesExpectedValue(name: []const u8) bool {
         std.mem.eql(u8, name, "rememberRetained");
 }
 
-/// Names of class PROPERTIES declared with a `@Composable` function type
-/// (`MovableContent.content`). An explicit-receiver invoke of one
-/// (`content.content(parameter)` in the composer's movable-content path) is
-/// a composable call and threads the pair. Consulted only for `.Member`
-/// callees, so a same-named bare call cannot be captured.
-pub var active_composable_props: ?*const std.StringHashMap(void) = null;
-
-/// Collect `@Composable`-fn-typed property names (constructor vals and body
-/// properties) across the decls. Caller owns the map.
-pub fn collectComposableProps(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
-    try collectComposablePropsInto(&set, decls);
-    return set;
-}
-
-fn collectComposablePropsInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Property => |p| {
-            if (p.ty != null and isComposableFnType(&p.ty.?)) try set.put(p.name.name, {});
-        },
-        .Class => |*c| {
-            for (c.primary_params) |*p| {
-                if (p.property != null and p.ty.function != null and isComposable(p.ty.annotations)) {
-                    try set.put(p.name.name, {});
-                }
-            }
-            try collectComposablePropsInto(set, c.members);
-        },
-        .Object => |*o| try collectComposablePropsInto(set, o.members),
-        else => {},
-    };
-}
 
 /// Names of PROPERTIES whose read invokes a `@Composable` getter — the property
 /// carries `@Composable` on its declaration or on its `get()` accessor
@@ -2206,8 +2171,13 @@ const Walker = struct {
                         const is_composable_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
                         // An explicit-receiver invoke of a `@Composable`-typed
                         // property (`content.content(parameter)`).
-                        const is_composable_prop = c.callee.* == .Member and
-                            active_composable_props != null and active_composable_props.?.contains(nm);
+                        // P12: a member-syntax invocation of a composable-typed
+                        // PROPERTY value is served by the runtime closure
+                        // completion (a typeless composable value call gains
+                        // the pair from the ambient composer when the closure's
+                        // protocol wants it) — the name-keyed property set is
+                        // retired.
+                        const is_composable_prop = false;
                         // VALUE invocations take the pair positionally —
                         // only under the memoization emission (a wrapped
                         // ComposableLambdaImpl cannot bind the named pair);
