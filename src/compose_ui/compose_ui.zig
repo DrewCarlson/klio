@@ -1521,6 +1521,12 @@ fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
 
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
+        std.debug.print("[draw] rect surf={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} color={x:0>8}\n", .{
+            argInt(ctx.args[0]), argFloat(ctx.args[1]), argFloat(ctx.args[2]),
+            argFloat(ctx.args[3]), argFloat(ctx.args[4]), argU32(ctx.args[5]),
+        });
+    }
     const skia = loadSkia() orelse return ok(Value.newLong(0));
     if (ctx.args.len < 11) return ok(Value.newLong(0));
     const surf = surfArg(ctx.args[0]) orelse return ok(Value.newLong(0));
