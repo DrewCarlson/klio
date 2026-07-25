@@ -25,7 +25,24 @@ concludes "at ~12 s that is part of the loop, not a hazard". It is now **302 s**
 
 ## Root causes, in impact order
 
-### 1. Lowering has regressed ~25x on the material3 set
+### 1. Lowering has regressed ~25x on the material3 set — FIXED (2026-07-25)
+
+Profiled with macOS `sample` (note: the built-in `KLIO_PROF` sampler is
+Linux-only — `prof.zig` returns early on other OSes, so `KLIO_PROF_ALL=1` on a
+Mac collects nothing; attach `sample <pid>` externally instead). ~70% of all
+lowering samples landed in two per-reference linear scans over every class in
+the module universe, each recomputing `simpleName(fqn)` per class per call:
+
+- `Module.uniqueClassIdBySimpleName` — the simple-classifier-head resolver
+- `Module.staticBuiltinIdentity` — the "is this head shadowed outside kotlin.*"
+  check
+
+Both now answer from one lazy simple-name cache (`unique_simple_cache`,
+growth-counter top-up like the FQN cache; reset on a stub-claim FQN rewrite).
+Result: `lower` 290.7 s -> **25.8 s**, cold material3 bake ~31 s — back to the
+target order of magnitude. The commontest sweep failure list is byte-identical
+before/after. Seven more `for (self.classes.items)` scans remain in `ir.zig`;
+none profiled hot on this corpus.
 
 `lower` is 284.5 s of the 302 s bake — 94%. Parse and serialize are unchanged and
 negligible, so this is not I/O, pack size, or the image format; it is the lowering pass
@@ -118,8 +135,8 @@ Small, cheap, and immediately useful:
 
 ## Order of work
 
-1. Profile and fix the lowering regression (item 1). Target: material3 cold bake back
-   under ~30 s. Everything below is worth far less until this lands.
+1. ~~Profile and fix the lowering regression (item 1).~~ Done — lower 290.7 s ->
+   25.8 s, cold bake ~31 s (see item 1).
 2. Pack staleness stamp + skip-unchanged rebuild (item 3) — removes a silent-corruption
    class, not just time.
 3. Pass-level unit harness (item 4) — unblocks RC-I P11..P13 without bakes.
