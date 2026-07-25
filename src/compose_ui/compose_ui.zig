@@ -505,7 +505,41 @@ fn openSkiaLib() ?std.DynLib {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
     if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
+    // The install layout puts the shim in `lib/` next to the binary's `bin/`;
+    // resolve it relative to the executable so a plain `zig-out/bin/klio`
+    // renders without loader-path setup.
+    const exe_dir = selfExeDir() orelse return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "../lib", "." }) |rel| {
+        const p = std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ exe_dir, rel, skia_lib_name }) catch continue;
+        if (std.DynLib.open(p)) |l| return l else |_| {}
+    }
     return null;
+}
+
+var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+/// The directory holding the running executable (no trailing slash), or null
+/// where the platform offers no way to ask.
+fn selfExeDir() ?[]const u8 {
+    const os = @import("builtin").os.tag;
+    var len: usize = 0;
+    switch (os) {
+        .linux => {
+            const n = std.os.linux.readlink("/proc/self/exe", &self_exe_buf, self_exe_buf.len - 1);
+            if (@as(isize, @bitCast(n)) <= 0) return null;
+            len = n;
+        },
+        .macos => {
+            var l: u32 = self_exe_buf.len;
+            if (std.c._NSGetExecutablePath(&self_exe_buf, &l) != 0) return null;
+            len = std.mem.len(@as([*:0]const u8, @ptrCast(&self_exe_buf)));
+        },
+        else => return null,
+    }
+    const path = self_exe_buf[0..len];
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+    return path[0..slash];
 }
 
 fn parseU32Hex(s: []const u8) u32 {

@@ -8,9 +8,10 @@ import androidx.compose.ui.klio.renderComposeToPng
 
 @OptIn(ExperimentalMaterial3Api::class)
 fun main() {
-    renderComposeToPng(390, 844, 1f, "/tmp/klio_m3_scaffold.png") {
+    val ok = renderComposeToPng(390, 844, 1f, "/tmp/klio_m3_scaffold.png") {
         MaterialTheme(colorScheme = darkColorScheme()) {
             Scaffold(topBar = { TopAppBar(title = { Text("x") }) }) { _ -> }
         }
     }
+    println(if (ok) "scaffold ok" else "scaffold draw failed")
 }
