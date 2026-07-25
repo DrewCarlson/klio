@@ -772,11 +772,12 @@ fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: 
     const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
     const sc = applicability.applicable(&sig, shapes, scope);
     if (sc == null and runtime.getenvSlice("KLIO_APPLIC_TRACE") != null) {
-        std.debug.print("[pp-null] cand={d} named={} nshapes={d} shape0named={s}\n", .{
+        std.debug.print("[pp-null] cand={d} named={} nshapes={d} shape0named={s} shape0class={s}\n", .{
             cand.int(),
             scope.named,
             shapes.len,
             if (shapes.len != 0) (shapes[0].named orelse "<pos>") else "-",
+            if (shapes.len != 0) (shapes[0].runtime_class orelse "<none>") else "-",
         });
     }
     return (sc orelse return null).points;
@@ -2121,12 +2122,12 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     const candidates = candidate_ids orelse eff.funcsBySimpleName(name);
     const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     if (ntrace) {
-        std.debug.print("[cno] {s} bounded={} cands={d} eff_funcs={d} frame_funcs={d} names:", .{
+        std.debug.print("[cno] {s} bounded={} cands={d} in_fn={s} nargs={d} names:", .{
             name,
             bounded,
             candidates.len,
-            eff.func_index.items.len,
-            module.func_index.items.len,
+            if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>",
+            args.len,
         });
         for (arg_names) |an| std.debug.print(" {s}", .{an orelse "<pos>"});
         std.debug.print("\n", .{});
