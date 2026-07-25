@@ -350,6 +350,14 @@ pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
         std.mem.endsWith(u8, param_name, composable_arg_suffix);
 }
 
+/// The compose lowering's generated call-site markers. They are appended by the
+/// AST pass rather than written in source, so a candidate that does not declare
+/// them is simply not a composable target — unlike a genuine source-level named
+/// argument, their absence from a signature must not disqualify the candidate.
+pub fn isGeneratedComposeArg(name: []const u8) bool {
+    return std.mem.eql(u8, name, "$composer") or std.mem.eql(u8, name, "$changed");
+}
+
 fn allAsciiUpper(s: []const u8) bool {
     for (s) |c| {
         if (!std.ascii.isUpper(c)) return false;
@@ -1252,7 +1260,20 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
                 break;
             }
         }
-        const p = pos orelse return null; // a named arg with no matching param
+        // A named argument no parameter accepts is a hard reject — except the
+        // compose lowering's generated `$composer`/`$changed` pair. That pass
+        // appends the pair from a program-wide name oracle that cannot see the
+        // receiver type, so it also lands on same-named NON-composable members
+        // (`CardColors.containerColor(enabled)` beside a composable
+        // `containerColor` on an unrelated colors type). The declaration is the
+        // authority: a candidate that does not declare the pair is not a
+        // composable target and the generated marker is not one of its
+        // arguments. Skip it here; the call-time named binding likewise leaves
+        // an unmatched name unbound, so the value is never passed.
+        const p = pos orelse {
+            if (isGeneratedComposeArg(n)) continue;
+            return null;
+        };
         if (filled[p]) return null;
         total += scoreArg(sig, &params[p].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
@@ -1950,6 +1971,45 @@ test "applicable named: Compose pair preserves the source trailing lambda" {
     try testing.expect(content_score.points > short_score.points);
     try testing.expectEqual(@as(?u16, 3), content_score.binding.trailing_lambda_param);
     try testing.expectEqualSlices(u16, &.{ 3, 4, 5 }, content_score.binding.arg_to_param);
+}
+
+test "applicable named: a non-composable candidate ignores the generated Compose pair" {
+    // The pass appends `$composer`/`$changed` from a program-wide name oracle
+    // that cannot see the receiver type, so the pair also lands on same-named
+    // NON-composable members (`CardColors.containerColor(enabled)` is `@Stable`
+    // while an unrelated colors type declares a `@Composable containerColor`).
+    const plain = [_]Param{
+        .{ .name = "enabled", .ty = tref("Boolean"), .default = null },
+    };
+    const composable = [_]Param{
+        .{ .name = "enabled", .ty = tref("Boolean"), .default = null },
+        .{ .name = "$composer", .ty = tref("Composer"), .default = null },
+        .{ .name = "$changed", .ty = tref("Int"), .default = null },
+    };
+    const args = [_]ArgShape{
+        .{ .runtime_class = "Boolean", .named = "enabled" },
+        .{ .runtime_class = "Composer", .named = "$composer" },
+        .{ .runtime_class = "Int", .named = "$changed" },
+    };
+
+    // The declaration is the authority: the generated pair is not one of the
+    // plain candidate's arguments, so it stays applicable instead of being
+    // rejected on an unknown argument name.
+    const plain_score = applicable(&.{ .params = &plain }, &args, .{ .named = true }).?;
+
+    // A candidate that does declare the pair still binds it, and still outranks
+    // the plain sibling — the fix must not let a non-composable namesake hijack
+    // a genuine composable call.
+    const comp_score = applicable(&.{ .params = &composable }, &args, .{ .named = true }).?;
+    try testing.expect(comp_score.points > plain_score.points);
+
+    // A source-level named argument that names no parameter is still a hard
+    // reject; only the generated markers are exempt.
+    const bogus = [_]ArgShape{
+        .{ .runtime_class = "Boolean", .named = "enabled" },
+        .{ .runtime_class = "Int", .named = "notAParameter" },
+    };
+    try testing.expect(applicable(&.{ .params = &plain }, &bogus, .{ .named = true }) == null);
 }
 
 test "applicable named: non-final vararg absorbs values before a named tail" {

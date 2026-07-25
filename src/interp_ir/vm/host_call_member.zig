@@ -11773,7 +11773,19 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
                     break;
                 }
             }
-            if (param == null) return false;
+            if (param == null) {
+                // The compose lowering appends its generated `$composer`/
+                // `$changed` markers from a program-wide name oracle that cannot
+                // see the receiver type, so they also land on same-named
+                // NON-composable members (`CardColors.containerColor(enabled)`
+                // beside a composable `containerColor` on an unrelated colors
+                // type). The declaration is the authority: a candidate that does
+                // not declare the pair is not a composable target and the marker
+                // is not one of its arguments. A source-level named argument that
+                // names no parameter is still inapplicable.
+                if (applicability.isGeneratedComposeArg(nm)) continue;
+                return false;
+            }
         } else if (i == args.len - 1 and isCallable(a) and effective.len > 0 and
             !bound[effective.len - 1] and
             lastParamIsFunctionShaped(self, &effective[effective.len - 1]))
