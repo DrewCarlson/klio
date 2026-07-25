@@ -8718,6 +8718,27 @@ fn invokeRuntimeVirtualSide(
     return invokeAnonMethod(self, allocator, receiver, hit, args, receiver.Instance);
 }
 
+/// Name the slot family, receiver, and live frame chain when a virtual call
+/// finds no target for its receiver class. Gated on `KLIO_ERR_TRACE`, like the
+/// non-instance receiver diagnostic above: the bare error says a slot is
+/// unlinked but not which method or on what, which is the whole question.
+fn virtualSlotUnlinkedDiag(
+    module: *const Module,
+    slot: MethodSlotId,
+    recv_fqn: []const u8,
+    nargs: usize,
+    which: []const u8,
+) void {
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    const root = FuncId.from(slot.int());
+    const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
+    std.debug.print(
+        "[vslot-unlinked] {s} slot={d} method={s} recv={s} nargs={d}\n",
+        .{ which, slot.int(), mname, recv_fqn, nargs },
+    );
+    ir.eval.dumpFrameChainForDiagAlways();
+}
+
 /// Invoke a statically resolved virtual family by numeric slot. The runtime
 /// receiver contributes its exact class identity; named and runtime-defined
 /// classes both resolve to an O(1) `(class, slot)` target.
@@ -8781,11 +8802,15 @@ pub fn invokeVirtualMember(
     defer mg.deinit();
     const module = mg.get();
     var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
-        .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse
-            return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } }).int() }
+        .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse {
+            virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "receiver class");
+            return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
+        }).int() }
     else
-        (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse
+        (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse {
+            virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "runtime class");
             return .{ .err = .{ .Type = "virtual method slot is not linked for runtime class" } };
+        };
     // A runtime-defined or anonymous class can share the source interface's
     // nominal FQN. The main-module table then identifies the correct slot
     // family but lands on its bodyless declaration header; use the runtime
