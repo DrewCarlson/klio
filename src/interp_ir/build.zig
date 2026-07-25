@@ -471,7 +471,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
-        factories: std.StringHashMap(void),
         comp_getter_props: std.StringHashMap(void),
         inline_fns: std.StringHashMap(void),
         stability: std.StringHashMap(compose_pass.Stability),
@@ -479,7 +478,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         fn deinit(self: *@This()) void {
             self.names.deinit();
             self.sinks.deinit();
-            self.factories.deinit();
             self.comp_getter_props.deinit();
             self.inline_fns.deinit();
             self.stability.deinit();
@@ -489,7 +487,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     defer {
         compose_pass.active_composable_names = null;
         compose_pass.active_composable_sinks = null;
-        compose_pass.active_factories = null;
         compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = null;
         compose_pass.active_stability = null;
@@ -557,8 +554,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
-        var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
-        defer factories.deinit();
         var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
         defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
@@ -569,16 +564,13 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
-            try composeBaseFactories(&factories, base_decls);
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
-            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} factories, {d} decls\n", .{ names.count(), sinks.count(), factories.count(), decls.items.len });
+            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
         }
-        compose_pass.active_factories = &factories;
-        defer compose_pass.active_factories = null;
         compose_pass.active_composable_getter_props = &comp_getter_props;
         defer compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = &inline_fns;
@@ -595,14 +587,12 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_maps = .{
             .names = names,
             .sinks = sinks,
-            .factories = factories,
             .comp_getter_props = comp_getter_props,
             .inline_fns = inline_fns,
             .stability = stability,
         };
         names = std.StringHashMap(void).init(allocator);
         sinks = std.StringHashMap(void).init(allocator);
-        factories = std.StringHashMap(void).init(allocator);
         comp_getter_props = std.StringHashMap(void).init(allocator);
         inline_fns = std.StringHashMap(void).init(allocator);
         stability = std.StringHashMap(compose_pass.Stability).init(allocator);
@@ -610,7 +600,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     if (compose_maps) |*maps| {
         compose_pass.active_composable_names = &maps.names;
         compose_pass.active_composable_sinks = &maps.sinks;
-        compose_pass.active_factories = &maps.factories;
         compose_pass.active_composable_getter_props = &maps.comp_getter_props;
         compose_pass.active_inline_fns = &maps.inline_fns;
         compose_pass.active_stability = &maps.stability;
@@ -4557,10 +4546,6 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
 /// parameter (composable-lambda sinks the user's composable calls pass into).
 fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| try composeBaseSinkDecl(sinks, d);
-}
-
-fn composeBaseFactories(factories: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try composeBaseFactoryDecl(factories, d);
 }
 
 fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {

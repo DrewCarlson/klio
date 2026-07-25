@@ -339,11 +339,6 @@ fn lambdaHasComposerParams(lam: anytype) bool {
         std.mem.eql(u8, lam.params[lam.params.len - 1].name, changed_param);
 }
 
-/// Names of functions returning a `@Composable` function type, installed by
-/// the build driver around `transformDecls` (module decls + baked base). A
-/// val initialized from one holds a composable lambda; the walker records
-/// the val's name in its scoped `locals` set so bare calls thread.
-pub var active_factories: ?*const std.StringHashMap(void) = null;
 
 /// Declared parameter count of a sink's `@Composable` lambda parameter,
 /// recorded only when NON-ZERO (module decls + baked base, installed around
@@ -552,31 +547,6 @@ pub fn collectComposableGetterPropsInto(set: *std.StringHashMap(void), decls: []
     };
 }
 
-
-/// Collect the simple names of functions RETURNING a `@Composable` function
-/// type (`movableContentOf`): a val initialized from one holds a composable
-/// lambda, so a bare call through the val is threaded. Caller owns the map.
-pub fn collectComposableValFactories(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(void) {
-    var set = std.StringHashMap(void).init(a);
-    try collectFactoriesInto(&set, decls);
-    return set;
-}
-
-fn collectFactoriesInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            if (f.return_type != null and isComposableFnType(&f.return_type.?)) {
-                try set.put(f.name.name, {});
-            }
-        },
-        .Class => |*c| try collectFactoriesInto(set, c.members),
-        .Object => |*o| try collectFactoriesInto(set, o.members),
-        else => {},
-    };
-}
 
 /// Collect the simple names of functions (and constructors) that declare a
 /// `@Composable`-typed lambda parameter, so a lambda bound to one is itself
@@ -1511,12 +1481,12 @@ const Walker = struct {
                             }
                         }
                     }
-                    const ini = p.init orelse break :blk false;
-                    if (ini != .Call or ini.Call.callee.* != .Path) break :blk false;
-                    const segs = ini.Call.callee.Path.segments;
-                    if (segs.len == 0) break :blk false;
-                    const af = active_factories orelse break :blk false;
-                    break :blk af.contains(segs[segs.len - 1].name);
+                    // P12: the name-keyed factory classification is
+                    // retired — an unclassified val's bare calls go
+                    // unthreaded and the runtime closure completion supplies
+                    // the pair from the ambient composer when the invoked
+                    // value's protocol wants it.
+                    break :blk false;
                 };
                 if (holds_composable) {
                     // The name joins BOTH sets: `locals` feeds every
