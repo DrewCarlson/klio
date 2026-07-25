@@ -1568,14 +1568,26 @@ IR lowering that runs after frontend resolution; klio's runs before.
     forms carry no provisional name — the runtime named-overload pick can
     bind the wrap to ITS choice's trailing parameter instead. The maps stay
     until that split is plumbed through the emit forms.
-  - `active_composable_getter_props`: bare reads of composable property
-    getters; value-side threading, likely servable by the getter-invocation
-    completion.
-  - `active_factories`: composable-val factory tracking feeding the
-    val-invocation walk; value-side by design, needs a value-typed signal at
-    lowering (the factory's resolved return type) to retire.
-  P13 (inline-ness) still requires moving the non-sink lambda scope-keeping
-  decision to lowering.
+  - `active_composable_getter_props`: NOT call-side threading — it feeds
+    `branchHasComposable`, the does-this-branch-compose classifier driving
+    memo wraps and branch brackets. Retiring it means the wrap decision moves
+    post-resolution.
+  - `active_factories`: composable-val classification feeding the same family
+    of decisions.
+
+  CONVERGENCE (the session's closing structural finding): every remaining
+  P12/P13 item — the naming pair, getter-props, factories, and P13's
+  scope-keeping — is blocked on the SAME prerequisite: the wrap/branch/scope
+  decisions the AST pass makes from name sets must move to post-resolution
+  lowering, alongside the static/dynamic emission split the naming attempt
+  measured. This is one coherent refactor with four beneficiaries, not four
+  independent items: introduce a lowering-phase "compose emission" step that
+  (a) knows whether the emission is fully static, (b) wraps and names sink
+  arguments from the SELECTED declaration, and (c) classifies branch
+  composability from resolved callees/getters instead of simple names. The
+  threading inversions already landed (P11 complete, P12 core + three
+  deletions) are its foundation; the audit and the fixture battery are its
+  gates.
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
