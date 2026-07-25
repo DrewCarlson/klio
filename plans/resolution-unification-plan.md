@@ -1557,10 +1557,17 @@ IR lowering that runs after frontend resolution; klio's runs before.
   `active_composable_props` also landed (member-syntax property invocations
   complete at the value; 72 lines deleted):
   - `active_sink_last_param` + `active_sink_content_reach`: the memo-wrap
-    re-naming pair. Retiring them means the LOWERING names a wrapped trailing
-    argument from the RESOLVED trailing parameter (selectedCallArgsForBuilder
-    can set the name when the last arg is a memoWrappedLambda and unnamed) —
-    then both maps and the AST-side rename fall together.
+    re-naming pair. ATTEMPTED (2026-07-25), reverted with a measured finding:
+    naming the wrapped argument in `selectedCallArgsForBuilder` from the
+    STATIC selection poisons dynamically re-dispatched emissions — the runtime
+    re-pick may choose a different overload, and with the pair absorber
+    correctly gone, a provisional `content=` name is a hard reject there
+    (`MaterialTheme` fell through to an object-invoke miss). The retirement
+    needs the static/dynamic emission split: name only on fully-static Call
+    emissions (where the selected f IS the executed target), and let dynamic
+    forms carry no provisional name — the runtime named-overload pick can
+    bind the wrap to ITS choice's trailing parameter instead. The maps stay
+    until that split is plumbed through the emit forms.
   - `active_composable_getter_props`: bare reads of composable property
     getters; value-side threading, likely servable by the getter-invocation
     completion.
