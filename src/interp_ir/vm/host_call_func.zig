@@ -2205,11 +2205,17 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // receiver chain. The terminal global leg may execute only plain
             // package-scope functions; never reinterpret a receiver-taking
             // declaration as a receiverless global call.
-            if (bounded and cf.kind != .plain) continue;
+            if (bounded and cf.kind != .plain) {
+                if (ntrace) std.debug.print("[cno] {s} cand={d} kind-skip {s}\n", .{ name, cand.int(), @tagName(cf.kind) });
+                continue;
+            }
             if (bounded) {
                 const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
                 candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
-                if (candidate_tier >= ir.Module.other_package_tier) continue;
+                if (candidate_tier >= ir.Module.other_package_tier) {
+                    if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={?}\n", .{ name, cand.int(), candidate_tier, scope_pkg, if (caller_file) |cfl| cfl.int() else null });
+                    continue;
+                }
             }
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
@@ -2232,9 +2238,10 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         const pts = positionalPoints(self, eff, cand, shapes, scope);
         if (ntrace) {
             const dbg_sig = sigViewOfFunc(self, eff, cand, shapes.len);
-            std.debug.print("[cno] {s} cand={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
+            std.debug.print("[cno] {s} cand={d} nargs={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
                 name,
                 cand.int(),
+                shapes.len,
                 pts,
                 if (dbg_sig) |s| s.params.len else null,
                 if (dbg_sig) |s| s.has_body else null,

@@ -5867,10 +5867,23 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // re-pick can exclude the out-of-scope twin. Only consulted when the
         // frame package is empty, so the ordinary packaged-caller path is
         // untouched.
-        const cno_anchor: []const u8 = if (frame.func.package.len == 0)
-            (if (cmg.func) |bf| (if (frame.module.funcById(bf)) |bfd| bfd.package else "") else "")
-        else
-            "";
+        const cno_anchor: []const u8 = if (frame.func.package.len == 0) blk: {
+            if (cmg.func) |bf| {
+                if (frame.module.funcById(bf)) |bfd| {
+                    if (bfd.package.len != 0) break :blk bfd.package;
+                }
+            }
+            // A ctor-name call resolved to a class carries no func hint; the
+            // class's package anchors the scope the same way (a property-init
+            // thunk calling `Color(red = …)` must see the ui.graphics
+            // factories as import-tier candidates, not other-package noise).
+            if (cmg.class) |cid| {
+                if (cid.int() < frame.module.classes.items.len) {
+                    break :blk frame.module.classes.items[cid.int()].package;
+                }
+            }
+            break :blk "";
+        } else "";
         const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
