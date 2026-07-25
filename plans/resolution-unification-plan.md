@@ -1503,6 +1503,25 @@ IR lowering that runs after frontend resolution; klio's runs before.
   lambda shaping.
 - **P11 — Call-side threading becomes resolution-driven.** Deletions:
   `active_composable_receiver_names`, `isGeneratedComposeArg`.
+
+  ATTEMPTED (2026-07-25), reverted with a measured worklist. Retiring the
+  member-form oracle arm (the map's only consumer) regressed exactly three
+  fixtures, naming the completion gaps that must widen first:
+  1. `CardDefaults.cardElevation(...)` — a composable member of an OBJECT with an
+     explicit receiver: the member-miss completion retry did not fire (verify
+     `receiverHasThreadedMember`'s class walk against object singletons).
+  2. `ColorScheme.applyTonalElevation(...)` — an explicit-receiver composable
+     member; likely the same gap or the strict-probe path (the retry skips
+     `strict_ext` probes by design — an explicit-receiver member call may only
+     probe strictly).
+  3. `Host().outer(x = 1)` (the private-member fixture) — the outer member call
+     itself lost its pair; the retry that already serves BARE sibling calls did
+     not serve the explicit-receiver form.
+  The bare-call side is already resolution-driven (hardcoded no-thread + the
+  lowering completion; P10 measures 2335 completions vs 8 pass-agreements). Close
+  the three gaps in the runtime member completion (or add lowering-side completion
+  for statically-selected member calls), re-flip the arm, and gate on this exact
+  fixture battery plus the sweep.
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
