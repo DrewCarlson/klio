@@ -1577,10 +1577,19 @@ IR lowering that runs after frontend resolution; klio's runs before.
     the object-vs-function arbitration tries the OBJECT's invoke first, or
     the lowering-time static applicability (AST shapes, where the wrap is a
     .Call and never lambda-shaped) commits a rejecting form. The func-side
-    shape unification (member-side already treats callable instances as
-    lambdas) is probably correct on its own merits and can land separately.
-    The maps stay until this dispatch path is mapped with the tracing
-    already in place.
+    shape unification LANDED separately (gated, sweep-identical). A THIRD
+    probe then mapped the failing arm exactly: without the rename, the
+    fixture's `MaterialTheme(colorScheme = …) { }` lowers via
+    `object_operator_call` — the function tier (`lowerPathCall`) declines
+    because lowering-side applicability cannot see the memo-wrap `.Call`
+    argument as the trailing functional argument, and the object-invoke
+    fallback wins. Extending the three AST trailing-lambda helpers to unwrap
+    `memoWrappedLambda` was NOT sufficient — the tier declines through
+    another gate (and the compose_pass unit binary crashed with the pub'd
+    helper, unexamined). Next: instrument `lowerPathCall`'s exit points for
+    this exact call, make the function tier accept a wrap-trailing shape,
+    then retire the renames and delete the maps. Three measured probes are
+    on record; the maps stay until then.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
