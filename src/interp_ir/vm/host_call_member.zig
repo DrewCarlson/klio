@@ -11969,16 +11969,10 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
                 }
             }
             if (param == null) {
-                // The compose lowering appends its generated `$composer`/
-                // `$changed` markers from a program-wide name oracle that cannot
-                // see the receiver type, so they also land on same-named
-                // NON-composable members (`CardColors.containerColor(enabled)`
-                // beside a composable `containerColor` on an unrelated colors
-                // type). The declaration is the authority: a candidate that does
-                // not declare the pair is not a composable target and the marker
-                // is not one of its arguments. A source-level named argument that
-                // names no parameter is still inapplicable.
-                if (applicability.isGeneratedComposeArg(nm)) continue;
+                // A named argument that names no parameter is inapplicable —
+                // the generated pair included, now that the pre-resolution
+                // threading oracle is retired and a pair only reaches calls
+                // whose resolved target (or completion probe) declares it.
                 return false;
             }
         } else if (i == args.len - 1 and isCallable(a) and effective.len > 0 and
