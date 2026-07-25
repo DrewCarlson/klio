@@ -1523,3 +1523,29 @@ being blamed for plugin-ABI mismatches.
   signature) — never of a simple name.
 - (f) zero name-keyed maps remain in the Compose decision path; each deletion is the
   acceptance test for its phase.
+
+## Session record (2026-07-25): eleven runtime-resolution fixes, M3 rendering end to end
+
+The material3 campaign fixed eleven root causes in one session, each an instance of
+the plan's RC families, each gated on a byte-identical commontest sweep:
+
+1. Class-scan caches (`uniqueClassIdBySimpleName`/`staticBuiltinIdentity`) — lower 290.7s → 25.8s.
+2. Named-arg sink arity per (function, parameter) — the RC-I named-lambda poisoning.
+3. Pass-flattened receiver lambdas bind their receiver positionally (pair-guarded).
+4. Spliced inline extension bodies resolve bare names receiver-first (RC-B).
+5. Composer-pair completion for bare calls to threaded composable members.
+6. File-private inline declarations invisible to other files' splices (Kotlin file scope).
+7. The same-file scope tier no longer orders member extensions (owner rank decides).
+8. A ctor-name call's class anchors the overload scope in a packageless thunk frame —
+   the empty-scope tier gate was silently discarding every imported candidate and the
+   fallback ran the Float overload for Int args (all material3 colors white).
+
+Plus the Skia exe-relative lookup and the P10 audit. The instrumentation family that
+made each fix a minutes-long loop (frame-params dumps, cmg/ltg tails, rim/extfb/cno
+candidate traces, applic reject sites, fn-entry arg dumps, KLIO_DRAW_TRACE) is all
+committed and env-gated — it is the observability P11–P13 should be driven with.
+
+State: the full Material 3 scene (MaterialTheme/Scaffold/TopAppBar/Card/Button through
+the real windowing path) composes, lays out, and renders pixel-correct dark-theme
+output. P11–P13 remain the structural consolidation; the P10 baseline (agree=8,
+pair-completed=2335) says P11 is mostly deletion of the pass's call-side append.
