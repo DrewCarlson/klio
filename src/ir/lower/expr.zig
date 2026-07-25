@@ -10743,8 +10743,23 @@ fn lowerUnresolvedBareCall(
                     // receiverless and its bare `this` captures the
                     // ENCLOSING instance — `SnapshotStateMap.mutate`'s
                     // `withCurrent { this }` returned the outer map instead
-                    // of the bound record.
-                    try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
+                    // of the bound record. Record ONLY when the pick came
+                    // from the owner-scoped member walk (it is absent from
+                    // the top-level name index): a member's signature is
+                    // scope-proven, while a top-level namesake pick is
+                    // declaration-order heuristic and a wrong receiver
+                    // stamp OVERRIDES the correct shape other sources
+                    // supply (a same-name `g`/`group` twin re-shaped the
+                    // SlotTable builder blocks and shifted every binding).
+                    const member_pick = blk2: {
+                        const tl = b.module.func_name_index.get(name0) orelse break :blk2 true;
+                        for (tl.items) |tfid| {
+                            if (tfid == fid) break :blk2 false;
+                        }
+                        break :blk2 true;
+                    };
+                    if (member_pick)
+                        try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
                     break :blk try argFnArities(b, f, args, ast_arg_names, off);
                 }
             }
