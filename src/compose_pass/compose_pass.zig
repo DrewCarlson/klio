@@ -375,6 +375,67 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// parameter first.
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
+/// Sink name -> per-parameter slot arity for every `@Composable`
+/// function-typed parameter, 0 included for a slotless `() -> Unit`. A NAMED
+/// lambda argument binds a declared parameter directly, so its synthetic-param
+/// decision reads that parameter's own type; the function-keyed map above
+/// conflates sibling parameters (`TopAppBar`'s `actions: RowScope.() -> Unit`
+/// must not hand `title` a slot).
+pub var active_sink_param_arity: ?*const std.StringHashMap(std.StringHashMap(u8)) = null;
+
+pub fn collectComposableSinkParamArity(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(std.StringHashMap(u8)) {
+    var map = std.StringHashMap(std.StringHashMap(u8)).init(a);
+    try collectSinkParamArityInto(&map, a, decls);
+    return map;
+}
+
+pub fn collectSinkParamArityInto(
+    map: *std.StringHashMap(std.StringHashMap(u8)),
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            for (f.params[0..sinkParamCount(f.params)]) |*p| {
+                if (compParamArity(&p.ty, !f.is_inline)) |n| {
+                    try sinkParamArityPut(map, a, f.name.name, p.name.name, n);
+                }
+            }
+        },
+        .Class => |*c| {
+            for (c.primary_params[0..sinkParamCount(c.primary_params)]) |*p| {
+                if (compParamArity(&p.ty, true)) |n| {
+                    try sinkParamArityPut(map, a, c.name.name, p.name.name, n);
+                }
+            }
+            try collectSinkParamArityInto(map, a, c.members);
+        },
+        .Object => |*o| try collectSinkParamArityInto(map, a, o.members),
+        else => {},
+    };
+}
+
+fn sinkParamArityPut(
+    map: *std.StringHashMap(std.StringHashMap(u8)),
+    a: std.mem.Allocator,
+    fn_name: []const u8,
+    param_name: []const u8,
+    n: u8,
+) std.mem.Allocator.Error!void {
+    const gop = try map.getOrPut(fn_name);
+    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(u8).init(a);
+    try gop.value_ptr.put(param_name, n);
+}
+
+pub fn deinitSinkParamArity(map: *std.StringHashMap(std.StringHashMap(u8))) void {
+    var it = map.valueIterator();
+    while (it.next()) |inner| inner.deinit();
+    map.deinit();
+}
+
 /// Sink name -> the NAME of its last parameter when that parameter is the
 /// composable lambda. The memo wrap turns the trailing lambda into a plain
 /// call expression, which no longer binds as a trailing lambda: with
@@ -655,7 +716,6 @@ fn compParamArity(t: *const ast.TypeRef, receiver_is_a_slot: bool) ?u8 {
     else
         0;
     const n = recv_slots + ft.params.len;
-    if (n == 0) return null;
     return @intCast(@min(n, 255));
 }
 
@@ -663,6 +723,7 @@ pub fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             for (f.params) |*p| if (compParamArity(&p.ty, !f.is_inline)) |n| {
+                if (n == 0) continue;
                 try set.put(f.name.name, n);
                 break;
             };
@@ -670,6 +731,7 @@ pub fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl
         .Class => |*c| {
             // A constructor never inlines its lambda argument.
             for (c.primary_params) |*p| if (compParamArity(&p.ty, true)) |n| {
+                if (n == 0) continue;
                 try set.put(c.name.name, n);
                 break;
             };
@@ -2131,6 +2193,17 @@ const Walker = struct {
                             else => name,
                         };
                         var exp: ?u8 = if (active_sink_arity) |sa| sa.get(name.?) else null;
+                        // A named lambda argument binds one declared parameter;
+                        // read that parameter's own slot arity instead of the
+                        // function-conflated guess (which reports a sibling
+                        // parameter's receiver slot for a slotless `title = {}`).
+                        const last_arg_name: ?[]const u8 =
+                            if (c.arg_names.len == c.args.len) c.arg_names[c.args.len - 1] else null;
+                        if (last_arg_name) |pn| {
+                            if (active_sink_param_arity) |pa| {
+                                if (pa.getPtr(name.?)) |inner| exp = inner.get(pn);
+                            }
+                        }
                         // `movableContentOf` / `movableContentWithReceiverOf`
                         // are OVERLOADED on the lambda's parameter count
                         // (`() -> Unit` vs `(P) -> Unit` … `R.(P1..P3)`); the
@@ -3750,6 +3823,76 @@ test "collectComposableSinkContentReach counts non-defaulted params before conte
     var reach = try collectComposableSinkContentReach(a, &decls);
     defer reach.deinit();
     try testing.expectEqual(@as(u8, 2), reach.get("Foo").?);
+}
+
+test "a named lambda argument reads its own parameter's slot arity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
+    const b = B{ .a = a, .gen_span = gsp };
+
+    var comp_path = [_]Ident{dummyIdent("Composable")};
+    var comp_ann = [_]ast.Annotation{.{ .use_site = null, .path = &comp_path, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = gsp }};
+
+    // Bar(title: @Composable () -> Unit, actions: @Composable RowScope.() -> Unit)
+    var title_fn = ast.FunctionTypeRef{ .receiver = null, .params = &.{}, .ret = b.typeRef("Unit"), .is_suspend = false, .span = gsp };
+    var title_ty = b.typeRef("Function0");
+    title_ty.function = &title_fn;
+    title_ty.annotations = &comp_ann;
+    var actions_fn = ast.FunctionTypeRef{ .receiver = b.typeRef("RowScope"), .params = &.{}, .ret = b.typeRef("Unit"), .is_suspend = false, .span = gsp };
+    var actions_ty = b.typeRef("Function1");
+    actions_ty.function = &actions_fn;
+    actions_ty.annotations = &comp_ann;
+    var bar_params = [_]Param{ b.param("title", title_ty), b.param("actions", actions_ty) };
+    const bar = emptyFn("Bar", &bar_params, .{ .Block = .{ .stmts = &.{}, .span = gsp } }, true);
+    var decls = [_]ast.Decl{.{ .Function = bar }};
+
+    // The function-conflated map records the actions slot for the whole name...
+    var arity = try collectComposableSinkArity(a, &decls);
+    defer arity.deinit();
+    try testing.expectEqual(@as(u8, 1), arity.get("Bar").?);
+    // ...while the per-parameter map keeps title slotless.
+    var param_arity = try collectComposableSinkParamArity(a, &decls);
+    defer deinitSinkParamArity(&param_arity);
+    try testing.expectEqual(@as(u8, 0), param_arity.get("Bar").?.get("title").?);
+    try testing.expectEqual(@as(u8, 1), param_arity.get("Bar").?.get("actions").?);
+
+    // Bar(title = { }) — a headerless lambda bound by name must gain only the
+    // composer pair, not a synthetic `it` for the sibling's receiver slot.
+    var segs = [_]Ident{dummyIdent("Bar")};
+    var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
+    var args = [_]Expr{.{ .Lambda = .{
+        .params = &.{},
+        .param_tys = &.{},
+        .body = .{ .stmts = &.{}, .span = gsp },
+        .implicit_it = true,
+        .span = gsp,
+    } }};
+    var arg_names = [_]?[]const u8{"title"};
+    var call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &args,
+        .arg_names = &arg_names,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = gsp,
+    } };
+    var sinks = std.StringHashMap(void).init(a);
+    defer sinks.deinit();
+    try sinks.put("Bar", {});
+    active_sink_arity = &arity;
+    defer active_sink_arity = null;
+    active_sink_param_arity = &param_arity;
+    defer active_sink_param_arity = null;
+    var ctx: u8 = 0;
+    var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx, .sinks = &sinks, .thread = true };
+    try w.walkExpr(&call);
+    const lam = call.Call.args[0].Lambda;
+    try testing.expectEqual(@as(usize, 2), lam.params.len);
+    try testing.expectEqualStrings(composer_param, lam.params[0].name);
+    try testing.expectEqualStrings(changed_param, lam.params[1].name);
 }
 
 test "non-composable callees are not threaded" {
