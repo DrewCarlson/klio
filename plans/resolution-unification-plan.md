@@ -1707,3 +1707,34 @@ is (value arity, receiver, composability) as a UNIT read from one resolved candi
 any emit path that threads part of the shape from one candidate and lets another half
 default is a latent misbinding. P12's resolved-parameter shaping already made this
 true for the resolved paths; the deferred bare-call arm is now consistent with it.
+
+## The compose gate deficit is the Link-composer arm, bisected to the withTimeout pump commit
+
+The compose-plugin itest ratchet (baseline 1210, verified 2026-07-19 at 1252)
+reads ~1071 because the gate aborted at its GC-stress arm for the whole
+material3 session — the arm's failure hid ~180 accumulated test failures that
+PRE-DATE the session (origin/main measures the same). An era-matched bisect
+(each step rebuilds the harness AND its five packs from that commit, runs
+`EffectsTests.testCommit3` in the itest env) lands on deb89aae (2026-07-20,
+"interp: withTimeout gate must run on the timed block's pump").
+
+Mechanism, fully localized with pack-source instrumentation: compositionTest
+runs every test body twice — Gap composer then Link composer
+(`ComposerToUse.Both`). The Gap arm is healthy. In the Link arm the
+recomposer's frame processes the invalidation correctly all the way to
+`RecomposeScopeImpl.compose` → `block.invoke(composer, 1)` — and the restart
+lambda ENTERS, re-reads its state, then NEVER RETURNS: no Kotlin throw, no
+interpreter errtrace, the frame parks and the resume is lost. The frame body's
+callers silently continue; `changeCount` never increments; the test reports
+"Expected changes but none were found" (43 tests), and the SlotTable*/link
+classes fail or time out on the same subsystem. The `hashCode()` instability
+seen while instrumenting (same object, different values per call site) is a
+separate interpreter bug worth its own probe.
+
+Open question for the fix: what inside the interpreted restart lambda under a
+LINK composer receiver classifies as a suspension (or otherwise abandons the
+frame), and why deb89aae's gate re-homing (later reworked to the
+`timeout_launched` promote-at-loop-top form, with the claim/commit logic since
+removed — `drainTimeouts` has no callers) turned it from pass to fail. Probe
+next with `KLIO_CALLVALUE_TRACE`/`KLIO_RESUME_TRACE` on the
+`block.invoke(composer, 1)` dispatch, comparing Gap-arm vs Link-arm.
