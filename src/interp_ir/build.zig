@@ -439,7 +439,17 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
     defer func_fqn.deinit();
     var decl_pkg = SpanStrMap.init(allocator);
     defer decl_pkg.deinit();
-    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn, &decl_pkg, null, null);
+    return buildModuleWithOverrides(
+        allocator,
+        file,
+        &fqn,
+        &func_fqn,
+        &decl_pkg,
+        null,
+        null,
+        null,
+        null,
+    );
 }
 
 /// Drive `buildModule` against multiple parsed files. All declarations
@@ -513,7 +523,21 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     defer decl_pkg.deinit();
 
     var file_pkgs = std.AutoHashMap(ir.FileId, []const u8).init(allocator);
+    defer file_pkgs.deinit();
+    var file_modules = std.AutoHashMap(ir.FileId, u32).init(allocator);
+    defer file_modules.deinit();
+    const compilation_module: u32 = if (base) |bs| blk: {
+        const module_guard = bs.built.module.borrow();
+        defer module_guard.deinit();
+        var next: u32 = 0;
+        var module_it = module_guard.get().registry.file_modules.valueIterator();
+        while (module_it.next()) |module_id| {
+            next = @max(next, module_id.* +| 1);
+        }
+        break :blk next;
+    } else 0;
     for (files) |*f| {
+        try file_modules.put(f.span.file, compilation_module);
         const prefix = try packagePrefix(allocator, f.package);
         if (prefix.len != 0) {
             try file_pkgs.put(f.span.file, prefix);
@@ -934,8 +958,17 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
-    ir.pending_file_packages = file_pkgs;
-    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg, base, out_lifted);
+    return buildModuleWithOverrides(
+        allocator,
+        &combined,
+        &fqn_overrides,
+        &func_fqn_overrides,
+        &decl_pkg,
+        &file_pkgs,
+        &file_modules,
+        base,
+        out_lifted,
+    );
 }
 
 fn packagePrefix(allocator: Allocator, pkg: ?ast.PackageHeader) Allocator.Error![]const u8 {
@@ -1397,6 +1430,8 @@ fn buildModuleWithOverrides(
     fqn_overrides: *const SpanStrMap,
     func_fqn_overrides: *const SpanStrMap,
     decl_pkg: *const SpanStrMap,
+    file_packages: ?*const std.AutoHashMap(ir.FileId, []const u8),
+    file_modules: ?*const std.AutoHashMap(ir.FileId, u32),
     base: ?*const StdlibBase,
     out_lifted: ?*[]Decl,
 ) Allocator.Error!BuiltModule {
@@ -1411,6 +1446,18 @@ fn buildModuleWithOverrides(
     const module: *Module = &module_ref.cell.data;
     const a = module.registry.allocator;
     const base_funcs_len = module.funcs.items.len;
+    if (file_packages) |packages| {
+        var package_it = packages.iterator();
+        while (package_it.next()) |entry| {
+            try module.registry.file_packages.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    if (file_modules) |modules| {
+        var module_it = modules.iterator();
+        while (module_it.next()) |entry| {
+            try module.registry.file_modules.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
 
     const package_prefix = try packagePrefix(a, file.package);
 
@@ -5073,6 +5120,44 @@ test "multi-file assembly retains packaged typealias identities" {
     );
     try testing.expect(shape != null);
     try testing.expectEqualStrings("Long", shape.?.target.name);
+    try testing.expectEqual(
+        @as(u32, 0),
+        mg.get().registry.file_modules.get(s.file).?,
+    );
+}
+
+test "dependency extension assigns a distinct compilation module" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dep_span = span.Span.init(span.FileId.from(20), 0, 0);
+    const user_span = span.Span.init(span.FileId.from(21), 0, 0);
+    const dep_file = KotlinFile{
+        .package = null,
+        .imports = &.{},
+        .decls = &.{},
+        .span = dep_span,
+    };
+    const user_file = KotlinFile{
+        .package = null,
+        .imports = &.{},
+        .decls = &.{},
+        .span = user_span,
+    };
+    const base = (try buildStdlibBase(a, &.{dep_file})).?;
+    var extended = try buildModuleFilesExtend(a, base, &.{user_file});
+    defer extended.deinit();
+
+    const mg = extended.module.borrow();
+    defer mg.deinit();
+    try testing.expectEqual(
+        @as(u32, 0),
+        mg.get().registry.file_modules.get(dep_span.file).?,
+    );
+    try testing.expectEqual(
+        @as(u32, 1),
+        mg.get().registry.file_modules.get(user_span.file).?,
+    );
 }
 
 test "class type-parameter metadata includes where bounds and unbounded identities" {

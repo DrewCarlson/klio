@@ -3956,6 +3956,7 @@ fn resolveExtensionRefTarget(
 
     if (staticTypeClassId(b, receiver_ty)) |owner| {
         if (b.module.resolveMemberCall(owner, name.name, args, .{
+            .caller_file = name.span.file,
             .lexical_owner = if (b.ownerClass()) |owner_name|
                 b.module.classId(owner_name)
             else
@@ -7729,6 +7730,7 @@ fn staticCallReturnTypeRef(
                 method,
                 shape_set.shapes,
                 .{
+                    .caller_file = bin.span.file,
                     .lexical_owner = lexical_owner,
                     .actual_type_param_bounds = owned_bounds orelse &.{},
                     .receiver_type = receiver,
@@ -7869,6 +7871,7 @@ fn staticCallReturnTypeRef(
                     member.name.name,
                     shape_set.shapes,
                     .{
+                        .caller_file = member.name.span.file,
                         .lexical_owner = lexical_owner,
                         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
                         .receiver_type = recv_ty,
@@ -10294,6 +10297,7 @@ fn resolvePrivateMemberCall(
     );
     defer owner_type.deinit(b.allocator);
     return b.module.resolveMemberCall(owner_id, name, shapes, .{
+        .caller_file = file,
         .lexical_owner = owner_id,
         .private_only = true,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
@@ -11139,6 +11143,7 @@ fn lowerResolvedMemberCall(
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
     const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
+        .caller_file = name.span.file,
         .lexical_owner = lexical_owner,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
         .receiver_type = ty,

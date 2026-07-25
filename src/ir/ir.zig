@@ -1224,7 +1224,6 @@ const FuncIdMap = std.AutoHashMap;
 /// resolution BEFORE the module exists (lowering starts inside the build),
 /// parks it here, and the next module created on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
-pub threadlocal var pending_file_packages: ?std.AutoHashMap(FileId, []const u8) = null;
 /// Companion channel: per-expression static TYPE HEADS from typeck
 /// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
 /// applicability engine otherwise reconstructs from AST string probes.
@@ -1575,6 +1574,9 @@ pub const Module = struct {
     };
 
     pub const MemberResolveCtx = struct {
+        /// Source file containing the call. Together with the declaration
+        /// span this identifies Kotlin `internal` visibility.
+        caller_file: ?FileId = null,
         /// Innermost lexical class whose body contains the call. Visibility
         /// walks its enclosing-class chain.
         lexical_owner: ?ClassId = null,
@@ -1718,11 +1720,6 @@ pub const Module = struct {
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
             pending_eager_calls = null;
-        }
-        if (pending_file_packages) |pfp| {
-            out__.registry.file_packages.deinit();
-            out__.registry.file_packages = pfp;
-            pending_file_packages = null;
         }
         if (pending_eager_types) |pet| {
             out__.eager_types = pet;
@@ -3383,11 +3380,12 @@ pub const Module = struct {
                         }
                     },
                     .Internal => {
-                        // Module identity is not yet carried by the call-site
-                        // context, so internal visibility cannot prove either
-                        // accessibility or inaccessibility.
-                        unknown_best_tier = @min(unknown_best_tier, tier);
-                        continue;
+                        if (self.internalVisibleFrom(fid, ctx.caller_file)) |visible| {
+                            if (!visible) continue;
+                        } else {
+                            unknown_best_tier = @min(unknown_best_tier, tier);
+                            continue;
+                        }
                     },
                     .Protected => if (!is_member_extension) continue,
                     .Public => {},
@@ -3757,9 +3755,18 @@ pub const Module = struct {
             };
             const score = applicability.applicable(&sig, args, scope) orelse continue;
             if (ds.visibility == .Internal) {
-                any_applicable = true;
-                visibility_unknown = true;
-                continue;
+                const caller_file = ctx.caller_file orelse {
+                    any_applicable = true;
+                    visibility_unknown = true;
+                    continue;
+                };
+                if (self.internalVisibleFrom(fid, caller_file)) |visible| {
+                    if (!visible) continue;
+                } else {
+                    any_applicable = true;
+                    visibility_unknown = true;
+                    continue;
+                }
             }
             switch (self.staticMemberArgsCompatibility(
                 sa,
@@ -3829,6 +3836,21 @@ pub const Module = struct {
         if (f.is_open) return false;
         if (f.is_override and !f.is_final) return false;
         return true;
+    }
+
+    fn internalVisibleFrom(
+        self: *const Module,
+        fid: FuncId,
+        caller_file: FileId,
+    ) ?bool {
+        const caller_module = self.registry.file_modules.get(caller_file);
+        const decl_file = if (self.decl_span.get(fid.int())) |decl|
+            decl.file
+        else
+            self.registry.private_fn_files.get(fid) orelse return null;
+        const declaration_module = self.registry.file_modules.get(decl_file);
+        if (caller_module == null or declaration_module == null) return null;
+        return caller_module.? == declaration_module.?;
     }
 
     /// Reconstruct the owner-scoped index from serialized declaration records.
@@ -6897,6 +6919,7 @@ pub const Module = struct {
             }
             const owner = self.staticTypeClassId(receiver).?;
             if (self.resolveMemberCall(owner, name, args, .{
+                .caller_file = caller_file,
                 .lexical_owner = lexical_owner,
                 .actual_type_param_bounds = bounds,
                 .receiver_type = receiver,
@@ -7944,6 +7967,10 @@ pub const ModuleRegistry = struct {
     /// follow the span's file — its package and imports — not the
     /// recipient function's package.
     file_packages: std.AutoHashMap(FileId, []const u8),
+    /// Kotlin compilation-module identity for each source file. `internal`
+    /// declarations are visible across files carrying the same identity and
+    /// inaccessible across dependency/program boundaries.
+    file_modules: std.AutoHashMap(FileId, u32),
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
@@ -8059,6 +8086,7 @@ pub const ModuleRegistry = struct {
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
+            .file_modules = std.AutoHashMap(FileId, u32).init(allocator),
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
@@ -8165,6 +8193,7 @@ pub const ModuleRegistry = struct {
             self.import_wildcards.deinit();
         }
         self.file_packages.deinit();
+        self.file_modules.deinit();
         {
             var it = self.nested_object_aliases.valueIterator();
             while (it.next()) |inner| inner.deinit();
@@ -8319,6 +8348,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.file_packages.iterator();
             while (it.next()) |e| try out.file_packages.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.file_modules.iterator();
+            while (it.next()) |e| try out.file_modules.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.nested_object_aliases.iterator();
@@ -8758,6 +8791,99 @@ test "member resolution uses declaration-owner visibility" {
         any_pick,
         m.resolveMemberCall(base, "identityPick", &kotlin_string, .{}).target.?,
     );
+}
+
+test "internal member and extension visibility follows compilation modules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const declaration_file = FileId.from(10);
+    const same_module_file = FileId.from(11);
+    const other_module_file = FileId.from(12);
+    try m.registry.file_modules.put(declaration_file, 4);
+    try m.registry.file_modules.put(same_module_file, 4);
+    try m.registry.file_modules.put(other_module_file, 5);
+    try m.registry.file_packages.put(declaration_file, "sample");
+    try m.registry.file_packages.put(same_module_file, "sample");
+    try m.registry.file_packages.put(other_module_file, "sample");
+
+    const owner = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "sample.Scope",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const member = try pushTestFuncOpts(
+        &m,
+        a,
+        "walk",
+        "sample.Scope.walk",
+        "sample",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[member.int()].kind = .instance_method;
+    try m.decl_sigs.put(member.int(), .{
+        .enclosing_class = owner,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .instance_method,
+        .visibility = .Internal,
+        .has_body = true,
+    });
+    try m.decl_span.put(member.int(), Span.init(declaration_file, 0, 1));
+    try m.registerMemberDecl(a, "sample.Scope", "walk", member);
+
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "tag",
+        "sample.tag",
+        "sample",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(extension.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .visibility = .Internal,
+        .has_body = true,
+    });
+    try m.decl_span.put(extension.int(), Span.init(declaration_file, 2, 3));
+    try m.rebuildFuncNameIndex(a);
+
+    try testing.expectEqual(
+        member,
+        m.resolveMemberCall(owner, "walk", &.{}, .{
+            .caller_file = same_module_file,
+        }).target.?,
+    );
+    try testing.expect(!m.resolveMemberCall(owner, "walk", &.{}, .{
+        .caller_file = other_module_file,
+    }).applicable);
+    try testing.expect(m.resolveMemberCall(owner, "walk", &.{}, .{}).target == null);
+
+    const receiver = TypeRef{ .name = "String", .nullable = false, .args = &.{} };
+    try testing.expectEqual(
+        extension,
+        m.resolveExtensionCall("tag", receiver, &.{}, .{
+            .caller_file = same_module_file,
+            .caller_package = "sample",
+        }).target.?,
+    );
+    try testing.expect(!m.resolveExtensionCall("tag", receiver, &.{}, .{
+        .caller_file = other_module_file,
+        .caller_package = "sample",
+    }).applicable);
 }
 
 test "member resolution separates class and caller function bounds" {

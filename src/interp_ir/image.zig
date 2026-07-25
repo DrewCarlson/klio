@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 34;
+pub const FORMAT_VERSION: u32 = 35;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -618,6 +618,7 @@ const RegistryImage = struct {
     iface_member_ext_recv: []PairStrEntry,
     private_fn_files: []KV(FuncId, FileId),
     file_packages: []KV(FileId, []const u8),
+    file_modules: []KV(FileId, u32),
     top_level_const_vals: []KV([]const u8, ir.Const),
     member_method_fids: []KV([]const u8, FuncId),
     recv_fn_props: []PairStrEntry,
@@ -1404,6 +1405,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
         .private_fn_files = try autoMapToSlice(FuncId, FileId, a, &r.private_fn_files),
         .file_packages = try autoMapToSlice(FileId, []const u8, a, &r.file_packages),
+        .file_modules = try autoMapToSlice(FileId, u32, a, &r.file_modules),
         .top_level_const_vals = try strMapToSlice(ir.Const, a, &r.top_level_const_vals),
         .member_method_fids = try strMapToSlice(FuncId, a, &r.member_method_fids),
         .recv_fn_props = try pairMapToSlice(a, &r.recv_fn_props),
@@ -2132,6 +2134,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
     for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);
+    for (ri.file_modules) |kv| try r.file_modules.put(kv.k, kv.v);
     for (ri.top_level_const_vals) |kv| try r.top_level_const_vals.put(kv.k, kv.v);
     for (ri.member_method_fids) |kv| try r.member_method_fids.put(kv.k, kv.v);
     for (ri.recv_fn_props) |pk| try r.recv_fn_props.put(.{ .a = pk.a, .b = pk.b }, pk.v);
@@ -2567,6 +2570,7 @@ test "module image preserves linked identities with lazy function headers" {
             }}),
         },
     });
+    try source.registry.file_modules.put(FileId.from(7), 3);
 
     var image: ModuleImage = undefined;
     try testing.expect(try moduleToImage(a, &source, &image));
@@ -2598,6 +2602,10 @@ test "module image preserves linked identities with lazy function headers" {
     const alias = loaded.registry.type_alias_types.get("Names").?;
     try testing.expectEqualStrings("List", alias.target.name);
     try testing.expectEqualStrings("String", alias.target.args[0].name);
+    try testing.expectEqual(
+        @as(u32, 3),
+        loaded.registry.file_modules.get(FileId.from(7)).?,
+    );
 }
 
 test "codec resolves watched AST pointers to the decoded tree" {
