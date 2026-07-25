@@ -395,69 +395,6 @@ pub fn composeAuditOn() bool {
 pub var active_composable_names: ?*const std.StringHashMap(void) = null;
 pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
 
-pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
-
-/// Sink name -> per-parameter slot arity for every `@Composable`
-/// function-typed parameter, 0 included for a slotless `() -> Unit`. A NAMED
-/// lambda argument binds a declared parameter directly, so its synthetic-param
-/// decision reads that parameter's own type; the function-keyed map above
-/// conflates sibling parameters (`TopAppBar`'s `actions: RowScope.() -> Unit`
-/// must not hand `title` a slot).
-pub var active_sink_param_arity: ?*const std.StringHashMap(std.StringHashMap(u8)) = null;
-
-pub fn collectComposableSinkParamArity(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(std.StringHashMap(u8)) {
-    var map = std.StringHashMap(std.StringHashMap(u8)).init(a);
-    try collectSinkParamArityInto(&map, a, decls);
-    return map;
-}
-
-pub fn collectSinkParamArityInto(
-    map: *std.StringHashMap(std.StringHashMap(u8)),
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            for (f.params[0..sinkParamCount(f.params)]) |*p| {
-                if (compParamArity(&p.ty, !f.is_inline)) |n| {
-                    try sinkParamArityPut(map, a, f.name.name, p.name.name, n);
-                }
-            }
-        },
-        .Class => |*c| {
-            for (c.primary_params[0..sinkParamCount(c.primary_params)]) |*p| {
-                if (compParamArity(&p.ty, true)) |n| {
-                    try sinkParamArityPut(map, a, c.name.name, p.name.name, n);
-                }
-            }
-            try collectSinkParamArityInto(map, a, c.members);
-        },
-        .Object => |*o| try collectSinkParamArityInto(map, a, o.members),
-        else => {},
-    };
-}
-
-fn sinkParamArityPut(
-    map: *std.StringHashMap(std.StringHashMap(u8)),
-    a: std.mem.Allocator,
-    fn_name: []const u8,
-    param_name: []const u8,
-    n: u8,
-) std.mem.Allocator.Error!void {
-    const gop = try map.getOrPut(fn_name);
-    if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(u8).init(a);
-    try gop.value_ptr.put(param_name, n);
-}
-
-pub fn deinitSinkParamArity(map: *std.StringHashMap(std.StringHashMap(u8))) void {
-    var it = map.valueIterator();
-    while (it.next()) |inner| inner.deinit();
-    map.deinit();
-}
-
 /// Sink name -> the NAME of its last parameter when that parameter is the
 /// composable lambda. The memo wrap turns the trailing lambda into a plain
 /// call expression, which no longer binds as a trailing lambda: with
@@ -708,61 +645,6 @@ pub fn collectComposableGetterPropsInto(set: *std.StringHashMap(void), decls: []
     };
 }
 
-/// Collect `sink name -> composable-lambda param count` for sinks whose
-/// composable parameter declares at least one value parameter. Caller owns.
-pub fn collectComposableSinkArity(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(u8) {
-    var set = std.StringHashMap(u8).init(a);
-    try collectSinkArityInto(&set, decls);
-    return set;
-}
-
-fn compParamArity(t: *const ast.TypeRef, receiver_is_a_slot: bool) ?u8 {
-    if (t.function == null or !isComposable(t.annotations)) return null;
-    const ft = t.function.?;
-    // An extension receiver — and each `context(...)` type — flattens into a
-    // LEADING value slot when the lambda is INVOKED through the value protocol:
-    // a `Scope.() -> Unit` bound to a non-inline sink is memo-wrapped and called
-    // as `(receiver, $composer, $changed)`. Counting only `params` leaves a
-    // header-less `{ … }` there with no slot for the receiver, so the threaded
-    // `$composer` binds the receiver and every composable call in the body
-    // dispatches its composer methods on the scope object.
-    //
-    // An INLINE sink has no such protocol: its body is spliced into the caller
-    // with the receiver bound as `this`, so reserving a slot would instead shift
-    // the spliced parameters and hand `$composer` the Int dirty flag.
-    const recv_slots: usize = if (receiver_is_a_slot)
-        ft.context_params.len + @intFromBool(ft.receiver != null)
-    else
-        0;
-    const n = recv_slots + ft.params.len;
-    return @intCast(@min(n, 255));
-}
-
-pub fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            for (f.params) |*p| if (compParamArity(&p.ty, !f.is_inline)) |n| {
-                if (n == 0) continue;
-                try set.put(f.name.name, n);
-                break;
-            };
-        },
-        .Class => |*c| {
-            // A constructor never inlines its lambda argument.
-            for (c.primary_params) |*p| if (compParamArity(&p.ty, true)) |n| {
-                if (n == 0) continue;
-                try set.put(c.name.name, n);
-                break;
-            };
-            try collectSinkArityInto(set, c.members);
-        },
-        .Object => |*o| try collectSinkArityInto(set, o.members),
-        else => {},
-    };
-}
 
 /// Collect the simple names of functions RETURNING a `@Composable` function
 /// type (`movableContentOf`): a val initialized from one holds a composable
@@ -3873,41 +3755,15 @@ test "collectComposableSinkContentReach counts non-defaulted params before conte
     try testing.expectEqual(@as(u8, 2), reach.get("Foo").?);
 }
 
-test "a named lambda argument reads its own parameter's slot arity" {
+test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
-    const b = B{ .a = a, .gen_span = gsp };
 
-    var comp_path = [_]Ident{dummyIdent("Composable")};
-    var comp_ann = [_]ast.Annotation{.{ .use_site = null, .path = &comp_path, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = gsp }};
-
-    // Bar(title: @Composable () -> Unit, actions: @Composable RowScope.() -> Unit)
-    var title_fn = ast.FunctionTypeRef{ .receiver = null, .params = &.{}, .ret = b.typeRef("Unit"), .is_suspend = false, .span = gsp };
-    var title_ty = b.typeRef("Function0");
-    title_ty.function = &title_fn;
-    title_ty.annotations = &comp_ann;
-    var actions_fn = ast.FunctionTypeRef{ .receiver = b.typeRef("RowScope"), .params = &.{}, .ret = b.typeRef("Unit"), .is_suspend = false, .span = gsp };
-    var actions_ty = b.typeRef("Function1");
-    actions_ty.function = &actions_fn;
-    actions_ty.annotations = &comp_ann;
-    var bar_params = [_]Param{ b.param("title", title_ty), b.param("actions", actions_ty) };
-    const bar = emptyFn("Bar", &bar_params, .{ .Block = .{ .stmts = &.{}, .span = gsp } }, true);
-    var decls = [_]ast.Decl{.{ .Function = bar }};
-
-    // The function-conflated map records the actions slot for the whole name...
-    var arity = try collectComposableSinkArity(a, &decls);
-    defer arity.deinit();
-    try testing.expectEqual(@as(u8, 1), arity.get("Bar").?);
-    // ...while the per-parameter map keeps title slotless.
-    var param_arity = try collectComposableSinkParamArity(a, &decls);
-    defer deinitSinkParamArity(&param_arity);
-    try testing.expectEqual(@as(u8, 0), param_arity.get("Bar").?.get("title").?);
-    try testing.expectEqual(@as(u8, 1), param_arity.get("Bar").?.get("actions").?);
-
-    // Bar(title = { }) — a headerless lambda bound by name must gain only the
-    // composer pair, not a synthetic `it` for the sibling's receiver slot.
+    // Bar(title = { }) — the pass appends only the composer pair, no
+    // synthetic `it`: the slot count is the LOWERING's decision, made
+    // against the parameter the resolution selects.
     var segs = [_]Ident{dummyIdent("Bar")};
     var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
     var args = [_]Expr{.{ .Lambda = .{
@@ -3930,10 +3786,6 @@ test "a named lambda argument reads its own parameter's slot arity" {
     var sinks = std.StringHashMap(void).init(a);
     defer sinks.deinit();
     try sinks.put("Bar", {});
-    active_sink_arity = &arity;
-    defer active_sink_arity = null;
-    active_sink_param_arity = &param_arity;
-    defer active_sink_param_arity = null;
     var ctx: u8 = 0;
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx, .sinks = &sinks, .thread = true };
     try w.walkExpr(&call);
@@ -4011,12 +3863,6 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     const host = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     var sinks = std.StringHashMap(void).init(a);
     try sinks.put("movableContentWithReceiverOf", {});
-    // Conflated name-keyed arity says 3 (the R.(P1..P3) overload) — the
-    // call-site type args must override it down to 0.
-    var arity = std.StringHashMap(u8).init(a);
-    try arity.put("movableContentWithReceiverOf", 3);
-    active_sink_arity = &arity;
-    defer active_sink_arity = null;
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null, null);
     const call = wrappedBodyStmts(&out)[0].Expr.Call;

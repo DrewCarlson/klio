@@ -472,8 +472,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
         factories: std.StringHashMap(void),
-        sink_arity: std.StringHashMap(u8),
-        sink_param_arity: std.StringHashMap(std.StringHashMap(u8)),
         comp_props: std.StringHashMap(void),
         comp_getter_props: std.StringHashMap(void),
         inline_fns: std.StringHashMap(void),
@@ -485,8 +483,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             self.names.deinit();
             self.sinks.deinit();
             self.factories.deinit();
-            self.sink_arity.deinit();
-            compose_pass.deinitSinkParamArity(&self.sink_param_arity);
             self.comp_props.deinit();
             self.comp_getter_props.deinit();
             self.inline_fns.deinit();
@@ -500,8 +496,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_composable_names = null;
         compose_pass.active_composable_sinks = null;
         compose_pass.active_factories = null;
-        compose_pass.active_sink_arity = null;
-        compose_pass.active_sink_param_arity = null;
         compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = null;
@@ -574,10 +568,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer sinks.deinit();
         var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
         defer factories.deinit();
-        var sink_arity = try compose_pass.collectComposableSinkArity(allocator, decls.items);
-        defer sink_arity.deinit();
-        var sink_param_arity = try compose_pass.collectComposableSinkParamArity(allocator, decls.items);
-        defer compose_pass.deinitSinkParamArity(&sink_param_arity);
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
         var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
@@ -595,8 +585,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseNames(&names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
             try composeBaseFactories(&factories, base_decls);
-            try composeBaseSinkArity(&sink_arity, base_decls);
-            try composeBaseSinkParamArity(&sink_param_arity, allocator, base_decls);
             try composeBaseComposableProps(&comp_props, base_decls);
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
@@ -609,10 +597,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         compose_pass.active_factories = &factories;
         defer compose_pass.active_factories = null;
-        compose_pass.active_sink_arity = &sink_arity;
-        defer compose_pass.active_sink_arity = null;
-        compose_pass.active_sink_param_arity = &sink_param_arity;
-        defer compose_pass.active_sink_param_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = &comp_getter_props;
@@ -636,8 +620,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             .names = names,
             .sinks = sinks,
             .factories = factories,
-            .sink_arity = sink_arity,
-            .sink_param_arity = sink_param_arity,
             .comp_props = comp_props,
             .comp_getter_props = comp_getter_props,
             .inline_fns = inline_fns,
@@ -648,8 +630,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         names = std.StringHashMap(void).init(allocator);
         sinks = std.StringHashMap(void).init(allocator);
         factories = std.StringHashMap(void).init(allocator);
-        sink_arity = std.StringHashMap(u8).init(allocator);
-        sink_param_arity = std.StringHashMap(std.StringHashMap(u8)).init(allocator);
         comp_props = std.StringHashMap(void).init(allocator);
         comp_getter_props = std.StringHashMap(void).init(allocator);
         inline_fns = std.StringHashMap(void).init(allocator);
@@ -661,8 +641,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_composable_names = &maps.names;
         compose_pass.active_composable_sinks = &maps.sinks;
         compose_pass.active_factories = &maps.factories;
-        compose_pass.active_sink_arity = &maps.sink_arity;
-        compose_pass.active_sink_param_arity = &maps.sink_param_arity;
         compose_pass.active_composable_props = &maps.comp_props;
         compose_pass.active_composable_getter_props = &maps.comp_getter_props;
         compose_pass.active_inline_fns = &maps.inline_fns;
@@ -4633,22 +4611,6 @@ fn composeBaseSinkContentReach(set: *std.StringHashMap(u8), base_decls: []const 
 fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectInlineFnNamesInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkArityInto(arity, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseSinkParamArity(
-    map: *std.StringHashMap(std.StringHashMap(u8)),
-    a: Allocator,
-    base_decls: []const Decl,
-) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkParamArityInto(map, a, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
