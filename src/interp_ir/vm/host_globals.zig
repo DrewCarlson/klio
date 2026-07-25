@@ -232,6 +232,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
     // companion is materialized once per scope and identity comparisons
     // against it (e.g. `slot === Composer.Empty`) break.
     if (singletonFromSharedRegistry(self, name)) |v| return .{ .ok = v };
+    var wait_rounds: u32 = 0;
     while (true) {
         {
             const g = self.globals.borrow();
@@ -244,9 +245,17 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
             .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
+            // Another thread is running the singleton's interpreted
+            // constructor — an unbounded wait, so escalate from yield to
+            // a millisecond park instead of burning a core until it
+            // finishes (the sleep is GC blocking-safe).
             .wait => {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
+                wait_rounds +|= 1;
+                if (wait_rounds <= 64) {
+                    std.Thread.yield() catch {};
+                } else {
+                    runtime.clockSleepMillis(1);
+                }
                 continue;
             },
         }
@@ -399,6 +408,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             if (v == .Instance) return .{ .ok = v };
         }
     }
+    var wait_rounds: u32 = 0;
     while (true) {
         {
             const g = self.globals.borrow();
@@ -411,9 +421,15 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
             .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
+            // Same escalation as the simple-name arm: the constructing
+            // thread runs interpreted init, so park instead of spinning.
             .wait => {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
+                wait_rounds +|= 1;
+                if (wait_rounds <= 64) {
+                    std.Thread.yield() catch {};
+                } else {
+                    runtime.clockSleepMillis(1);
+                }
                 continue;
             },
         }
