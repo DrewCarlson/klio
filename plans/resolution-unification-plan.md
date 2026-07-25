@@ -1531,9 +1531,23 @@ IR lowering that runs after frontend resolution; klio's runs before.
   the member-form oracle arm was retired unconditionally and
   `active_composable_receiver_names` plus its collectors DELETED — P11's first
   named deletion, gated on the full battery, the M3 scene render, and a
-  byte-identical sweep. Remaining P11 surface: the val/lambda-param positional
-  pair appends and `isGeneratedComposeArg`'s absorption; then P12 (lambda shaping)
-  and P13 (inline-ness).
+  byte-identical sweep.
+
+  P11 COMPLETE (2026-07-25, same session). The qualified-path oracle arm was
+  retired next (oracle_hit is constant-false: EVERY declaration call keeps its
+  source shape and gets its pair from the resolved declaration), and with the
+  stray-pair source gone, `isGeneratedComposeArg`'s absorption was deleted from
+  both applicability paths — the containerColor fixture that originally required
+  the absorber passes without it, and the unit test now pins the inverted
+  contract (a candidate not declaring the pair is inapplicable to a
+  pair-carrying call). Both of P11's named deletions are landed. Value
+  invocations (lambda params, composable vals/locals/props) still transform at
+  the call site by design — their callee is a value the resolver never sees.
+  Invariant (e) now holds for all declaration calls. Next: P12 (lambda shaping
+  from the resolved parameter type) and P13 (inline-ness from the declaration —
+  the AST-side scope-keeping decision for non-sink lambdas still needs the
+  name-keyed inline set pre-resolution, so P13 requires moving that decision to
+  lowering, not just deleting the map).
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
