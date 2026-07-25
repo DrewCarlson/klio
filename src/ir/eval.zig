@@ -1689,6 +1689,18 @@ const Frame = struct {
         captures: std.ArrayList(Value),
     ) Allocator.Error!Frame {
         const params = params_in;
+        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+            if (std.mem.eql(u8, w, func.name) and params.items.len == 4 and func.params.len == 4) {
+                std.debug.print("[frame-entry] {s}:", .{func.fqn});
+                for (func.params, 0..) |p, i| {
+                    const v = &params.items[i];
+                    std.debug.print(" {s}={s}", .{ p.name, @tagName(std.meta.activeTag(v.*)) });
+                    if (v.* == .Int) std.debug.print(":{d}", .{v.Int});
+                    if (v.* == .Long) std.debug.print(":{d}", .{v.Long});
+                }
+                std.debug.print("\n", .{});
+            }
+        }
         if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null and
             params.items.len < func.params.len)
         {
@@ -5943,7 +5955,25 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         .err => |e| return raiseStep(frame, e),
                     }
                 } else switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
-                    .ok => |v| result = v,
+                    .ok => |v| {
+                        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                            if (std.mem.eql(u8, w, name_str)) {
+                                std.debug.print("[gid-result] {s} in_fn={s} callee={s} nargs={d} -> {s}", .{
+                                    name_str,
+                                    frame.func.name,
+                                    @tagName(std.meta.activeTag(callee)),
+                                    arg_values.len,
+                                    @tagName(std.meta.activeTag(v)),
+                                });
+                                if (arg_values.len == 1 and arg_values[0] == .ULong)
+                                    std.debug.print(" arg={x}", .{arg_values[0].ULong});
+                                if (v == .ULong) std.debug.print(" {x}", .{v.ULong});
+                                if (v == .Long) std.debug.print(" {x}", .{v.Long});
+                                std.debug.print("\n", .{});
+                            }
+                        }
+                        result = v;
+                    },
                     .err => |e| return raiseStep(frame, e),
                 }
             } else {

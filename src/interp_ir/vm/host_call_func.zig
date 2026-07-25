@@ -1388,6 +1388,20 @@ fn composableEval(
     f: *const Func,
     packed_args: std.ArrayList(Value),
 ) Allocator.Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (std.mem.eql(u8, w, f.name)) {
+            std.debug.print("[fn-entry] {s}#{d}:", .{ f.fqn, f.id.int() });
+            for (f.params, 0..) |p, i| {
+                if (i >= packed_args.items.len) break;
+                const v = &packed_args.items[i];
+                std.debug.print(" {s}={s}", .{ p.name, @tagName(std.meta.activeTag(v.*)) });
+                if (v.* == .Int) std.debug.print(":{d}", .{v.Int});
+                if (v.* == .Long) std.debug.print(":{d}", .{v.Long});
+                if (v.* == .ULong) std.debug.print(":{x}", .{v.ULong});
+            }
+            std.debug.print("\n", .{});
+        }
+    }
     // Plugin path: the pass already lowered composition into the body; run it
     // directly with no implicit-composer bracketing — but publish the threaded
     // `$composer` argument as the ambient composer for the call. A
