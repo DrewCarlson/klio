@@ -1583,13 +1583,19 @@ IR lowering that runs after frontend resolution; klio's runs before.
     `object_operator_call` — the function tier (`lowerPathCall`) declines
     because lowering-side applicability cannot see the memo-wrap `.Call`
     argument as the trailing functional argument, and the object-invoke
-    fallback wins. Extending the three AST trailing-lambda helpers to unwrap
-    `memoWrappedLambda` was NOT sufficient — the tier declines through
-    another gate (and the compose_pass unit binary crashed with the pub'd
-    helper, unexamined). Next: instrument `lowerPathCall`'s exit points for
-    this exact call, make the function tier accept a wrap-trailing shape,
-    then retire the renames and delete the maps. Three measured probes are
-    on record; the maps stay until then.
+    fallback wins. The fourth probe fixed the tier decline at its
+    choke point — `shapeOfAstArg`/`astArgLambdaArity` now see through the
+    memo shell (LANDED, gated, sweep-identical: the shape unification now
+    holds across the member-side, func-side, and lowering-side tiers) — and
+    the MaterialTheme call moved onto the FUNCTION tier, exposing the final
+    layer: with the pick trailing-binding the wrap, the EMISSION still maps
+    it positionally ('virtual call receiver is not an instance' — the wrap
+    lands on a defaulted middle at binding). The retirement's last
+    requirement: the emission must honor the pick's binding record
+    (Score.binding.arg_to_param / trailing_lambda_param) for a wrap-trailing
+    call, the pick-vs-binding alignment that IS the post-resolution emission
+    step's first concrete deliverable. Four measured probes on record; the
+    maps stay until the emission consumes the binding.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
