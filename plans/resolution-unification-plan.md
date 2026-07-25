@@ -1543,11 +1543,23 @@ IR lowering that runs after frontend resolution; klio's runs before.
   pair-carrying call). Both of P11's named deletions are landed. Value
   invocations (lambda params, composable vals/locals/props) still transform at
   the call site by design — their callee is a value the resolver never sees.
-  Invariant (e) now holds for all declaration calls. Next: P12 (lambda shaping
-  from the resolved parameter type) and P13 (inline-ness from the declaration —
-  the AST-side scope-keeping decision for non-sink lambdas still needs the
-  name-keyed inline set pre-resolution, so P13 requires moving that decision to
-  lowering, not just deleting the map).
+  Invariant (e) now holds for all declaration calls.
+
+  P12 CORE LANDED (2026-07-25, same session). Sink-lambda shaping is
+  resolution-driven: the pass emits the bare composer pair; the lowering repairs
+  the shape against the resolved parameter — its declared arity
+  (`composable_arity`, inserting the implicit `it` when the parameter takes one)
+  plus the new `composable_recv_slots` field (receiver/context slots, applied
+  only for a non-inline sink per the DECLARATION's own is_inline). The repair
+  unwraps the pass's memo shell to reach wrapped arguments. DELETED with their
+  collectors, baked-base walks, and plumbing: `active_sink_arity` and
+  `active_sink_param_arity` (196 lines). Remaining P12 surface:
+  `active_sink_last_param`, `active_sink_content_reach`,
+  `active_composable_props`, `active_composable_getter_props`,
+  `active_factories` — each still serving the memo-wrap naming, content-reach
+  gating, and value-invocation decisions the same flip-measure-close-delete
+  method applies to. P13 (inline-ness) still requires moving the non-sink
+  lambda scope-keeping decision to lowering.
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
   `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
   `active_composable_props`, `active_composable_getter_props`, `active_factories`.
