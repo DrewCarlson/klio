@@ -1408,6 +1408,16 @@ pub const Module = struct {
     class_fqn_cache: std.StringHashMapUnmanaged(ClassId) = .empty,
     class_fqn_cache_n: usize = 0,
     class_fqn_cache_dead: bool = false,
+    /// Lowering-phase simple name → what the per-name class scans would
+    /// find: the `ClassId` `uniqueClassIdBySimpleName` returns (or
+    /// `class_id_ambiguous`), plus whether any class under the name lives
+    /// outside the `kotlin` packages (`staticBuiltinIdentity`'s scan).
+    /// Each class contributes under both its `name` and its FQN's last
+    /// segment. Entries fold many classes, so the stub-claim FQN rewrite
+    /// cannot patch one contribution out; a claim that touches the cached
+    /// range resets the cache for a lazy rebuild.
+    unique_simple_cache: std.StringHashMapUnmanaged(SimpleNameInfo) = .empty,
+    unique_simple_cache_n: usize = 0,
     /// `internConst` dedup: const hash → first `ConstId` with that hash.
     /// A hash collision falls back to the linear scan for that value.
     const_dedup: std.AutoHashMapUnmanaged(u64, ConstId) = .empty,
@@ -2159,6 +2169,13 @@ pub const Module = struct {
             if (std.mem.startsWith(u8, path, "kotlin.") and
                 std.mem.eql(u8, applicability.simpleName(path), head)) return .yes;
             return .no;
+        }
+        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+            const mut: *Module = @constCast(self);
+            if (mut.topUpUniqueSimpleCache()) {
+                const info = mut.unique_simple_cache.get(head) orelse return .yes;
+                return if (info.non_kotlin) .ambiguous else .yes;
+            } else |_| {}
         }
         for (self.classes.items) |class| {
             if (!std.mem.eql(u8, applicability.simpleName(class.fqn), head) and
@@ -4666,6 +4683,7 @@ pub const Module = struct {
             while (cn_it.next()) |list| list.deinit(cg);
             self.class_name_cache.deinit(cg);
             self.class_fqn_cache.deinit(cg);
+            self.unique_simple_cache.deinit(cg);
             self.const_dedup.deinit(cg);
         }
         var it = self.func_name_index.valueIterator();
@@ -4809,6 +4827,13 @@ pub const Module = struct {
     /// Resolve a simple classifier head only when it denotes one class
     /// identity across the whole module universe.
     pub fn uniqueClassIdBySimpleName(self: *const Module, name: []const u8) ?ClassId {
+        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+            const mut: *Module = @constCast(self);
+            if (mut.topUpUniqueSimpleCache()) {
+                const info = mut.unique_simple_cache.get(name) orelse return null;
+                return if (info.id == class_id_ambiguous) null else info.id;
+            } else |_| {}
+        }
         var found: ?ClassId = null;
         for (self.classes.items) |class| {
             if (!std.mem.eql(u8, class.name, name) and
@@ -4821,6 +4846,39 @@ pub const Module = struct {
             }
         }
         return found;
+    }
+
+    fn topUpUniqueSimpleCache(self: *Module) Allocator.Error!void {
+        const gpa = self.lookup_cache_gpa.?;
+        while (self.unique_simple_cache_n < self.classes.items.len) : (self.unique_simple_cache_n += 1) {
+            const c = self.classes.items[self.unique_simple_cache_n];
+            const non_kotlin = !std.mem.eql(u8, c.package, "kotlin") and
+                !std.mem.startsWith(u8, c.package, "kotlin.");
+            try self.uniqueSimpleInsert(gpa, c.name, c.id, c.fqn, non_kotlin);
+            const seg = applicability.simpleName(c.fqn);
+            if (!std.mem.eql(u8, seg, c.name)) {
+                try self.uniqueSimpleInsert(gpa, seg, c.id, c.fqn, non_kotlin);
+            }
+        }
+    }
+
+    /// Fold one class into the simple-name cache under `key`, replicating
+    /// the scans exactly: the first class wins the unique id; a later class
+    /// conflicts only when both its id and its FQN differ from the winner's;
+    /// one class outside the `kotlin` packages taints the name for
+    /// `staticBuiltinIdentity`.
+    fn uniqueSimpleInsert(self: *Module, gpa: Allocator, key: []const u8, id: ClassId, fqn: []const u8, non_kotlin: bool) Allocator.Error!void {
+        const gop = try self.unique_simple_cache.getOrPut(gpa, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .id = id, .non_kotlin = non_kotlin };
+            return;
+        }
+        gop.value_ptr.non_kotlin = gop.value_ptr.non_kotlin or non_kotlin;
+        const cur = gop.value_ptr.id;
+        if (cur == class_id_ambiguous or cur == id) return;
+        if (!std.mem.eql(u8, self.classes.items[cur.int()].fqn, fqn)) {
+            gop.value_ptr.id = class_id_ambiguous;
+        }
     }
 
     /// The `ClassId`s registered under simple `name`, in `class_index`
@@ -7449,6 +7507,8 @@ pub const Module = struct {
     /// returns null so an ambiguous FQN never silently binds the wrong class.
     const class_id_ambiguous: ClassId = @enumFromInt(std.math.maxInt(u32));
 
+    const SimpleNameInfo = struct { id: ClassId, non_kotlin: bool };
+
     /// The fully-qualified name of the class with id `id`, or null if out of range.
     pub fn classFqnById(self: *const Module, id: ClassId) ?[]const u8 {
         const c = idGet(Class, self.classes.items, id.int()) orelse return null;
@@ -7529,6 +7589,10 @@ pub const Module = struct {
             insertFqnPrefixes(&self.pkg_head_cache, gpa, new_fqn) catch {
                 self.pkg_head_cache_dead = true;
             };
+        }
+        if (id.int() < self.unique_simple_cache_n) {
+            self.unique_simple_cache.clearRetainingCapacity();
+            self.unique_simple_cache_n = 0;
         }
     }
 
@@ -12703,6 +12767,24 @@ fn pushTestClass(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, pa
         .companion = null,
         .supertypes = &.{},
     });
+}
+
+test "uniqueClassIdBySimpleName caches without changing scan semantics" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const solo = try pushTestClass(&m, a, "Solo", "lib.Solo", "lib");
+    const inner = try pushTestClass(&m, a, "Outer$Inner", "lib.Outer.Inner", "lib");
+    // Unique names resolve, via both the class name and the FQN's last segment.
+    try testing.expectEqual(solo.int(), m.uniqueClassIdBySimpleName("Solo").?.int());
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Outer$Inner").?.int());
+    try testing.expect(m.uniqueClassIdBySimpleName("Missing") == null);
+    // A class appended after the first lookup is visible to the next one,
+    // and a second identity under the same simple name makes it ambiguous.
+    _ = try pushTestClass(&m, a, "Solo", "app.Solo", "app");
+    try testing.expect(m.uniqueClassIdBySimpleName("Solo") == null);
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
 }
 
 test "classIdIndexed prefers the caller's own package on a collision" {
