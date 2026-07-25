@@ -402,6 +402,25 @@ pub var compose_audit: ComposeAudit = .{};
 
 var compose_audit_env: ?bool = null;
 
+/// P11 experiment gate: `KLIO_P11_MEMBER=1` disables the member-form
+/// oracle arm so member calls keep their source argument shape and the
+/// resolution-side completions must serve them. Temporary — becomes the
+/// default (and the receiver-names map is deleted) once the completion
+/// gaps recorded in the plan are closed.
+var p11_env: ?bool = null;
+
+fn runtime_env_p11() bool {
+    if (p11_env) |v| return v;
+    const v = blk: {
+        if (comptime !@import("builtin").link_libc) break :blk false;
+        const raw = std.c.getenv("KLIO_P11_MEMBER") orelse break :blk false;
+        const s = std.mem.span(raw);
+        break :blk s.len != 0 and !std.mem.eql(u8, s, "0");
+    };
+    p11_env = v;
+    return v;
+}
+
 pub fn composeAuditOn() bool {
     if (compose_audit_env) |v| return v;
     const v = blk: {
@@ -2393,8 +2412,9 @@ const Walker = struct {
                         // first and only then completes a proven Compose ABI.
                         // Qualified paths still need the pre-resolution
                         // oracle; local/value calls are handled above.
+                        const p11_member_flip = if (runtime_env_p11()) true else false;
                         const oracle_hit = if (c.callee.* == .Member)
-                            (active_composable_receiver_names != null and active_composable_receiver_names.?.contains(nm))
+                            (!p11_member_flip and active_composable_receiver_names != null and active_composable_receiver_names.?.contains(nm))
                         else if (c.callee.* == .Path and c.callee.Path.segments.len == 1)
                             false
                         else

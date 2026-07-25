@@ -4879,10 +4879,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
 }
 
-/// Recursion guard for the compose member-miss completion: the retried
-/// dispatch must not complete a second pair onto its own miss.
-threadlocal var compose_member_retry: bool = false;
-
 /// Compose ABI completion at the member-miss tails. A bare sibling call to
 /// a `@Composable` METHOD keeps its source argument shape (the pass defers
 /// bare calls to resolution), and a runtime-dispatched member has no
@@ -4926,27 +4922,64 @@ fn receiverHasThreadedMember(self: *VmHost, receiver: *const Value, name: []cons
             if (!std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) continue;
             if (!std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed")) continue;
             const skip: usize = if (std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-            if (f.params.len - skip != nargs + 2) continue;
+            // At least the pair beyond the supplied args; a LARGER gap is a
+            // defaulted middle (CardDefaults.cardElevation's five Dp
+            // defaults) — the retried dispatch's own applicability check
+            // still validates that every unfilled param defaults.
+            if (f.params.len - skip < nargs + 2) continue;
             return true;
         }
         const supers = m.registry.class_super_names.get(cn) orelse break;
         cur = if (supers.len != 0) supers[0] else null;
     }
+    // A threaded composable EXTENSION reached by member syntax
+    // (`colorScheme.applyTonalElevation(...)`): same proof over the
+    // top-level index, with the declared receiver checked against the
+    // receiver's hierarchy.
+    for (m.funcsBySimpleName(name)) |fid| {
+        const f = m.funcById(fid) orelse continue;
+        if (f.params.len < 3) continue;
+        if (!std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) continue;
+        if (!std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed")) continue;
+        if (f.params.len - 1 < nargs + 2) continue;
+        const recv_head = applicability.simpleName(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
+        if (m.classIsOrExtends(recv_name, recv_head)) return true;
+    }
     return false;
 }
 
 fn composeMemberPairRetry(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
-    if (compose_member_retry or strict_ext or !host_call_func.composePluginEnabled()) return null;
-    if (!receiverHasThreadedMember(self, receiver, name, args.len)) return null;
+    _ = static_recv;
+    _ = no_ext;
+    _ = declared_recv;
+    if (strict_ext or !host_call_func.composePluginEnabled()) return null;
     const comp = compose.currentComposer() orelse return null;
+    // A retried dispatch already carries the pair this completion appended;
+    // recognize it by the ambient composer's identity in the second-to-last
+    // slot rather than a flag — a flag's lifetime would span the retried
+    // callee's whole EXECUTION and suppress the completion for every nested
+    // call in its body (the private-member fixture's `inner` inside the
+    // completed `outer`).
+    if (args.len >= 2 and args[args.len - 1] == .Int and
+        args[args.len - 2] == .Instance and comp == .Instance and
+        ObjRef(InstanceData).ptrEq(args[args.len - 2].Instance, comp.Instance)) return null;
+    if (!receiverHasThreadedMember(self, receiver, name, args.len)) return null;
     const buf = try allocator.alloc(Value, args.len + 2);
     defer if (runtime.freeScratch()) allocator.free(buf);
     @memcpy(buf[0..args.len], args);
     buf[args.len] = comp;
     buf[args.len + 1] = .{ .Int = 0 };
-    compose_member_retry = true;
-    defer compose_member_retry = false;
-    const r = try callMemberInnerStatic(self, allocator, receiver, name, buf, strict_ext, static_recv, no_ext, declared_recv);
+    // The pair binds BY NAME: a threaded member may declare defaulted
+    // params between the user args and the pair (CardDefaults.cardElevation's
+    // five Dp defaults) — appended positionally the composer would land in
+    // the first defaulted slot. The named walk reorders and default-fills.
+    const names_buf = try allocator.alloc(?[]const u8, args.len + 2);
+    defer if (runtime.freeScratch()) allocator.free(names_buf);
+    for (names_buf[0..args.len]) |*nn| nn.* = null;
+    names_buf[args.len] = "$composer";
+    names_buf[args.len + 1] = "$changed";
+    const r = try callMemberNamed(self, allocator, receiver, name, buf, names_buf);
     if (r == .ok) return r;
     if (r == .err and r.err != .Unimplemented) return r;
     return null;
