@@ -10874,12 +10874,28 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             const smg = self.module.borrow();
             defer smg.deinit();
             const smod = smg.get();
+            // The file tier orders TOP-LEVEL declarations only. A MEMBER
+            // extension's scope level is its owner's position in the
+            // implicit-receiver chain (the scorer's owner rank), not its
+            // declaring file: `with(focusableNode) { applySemantics() }`
+            // written in Clickable.kt must reach FocusableNode's override
+            // in Focusable.kt over the enclosing node's own same-file
+            // member — filtering by file inverted that into infinite
+            // recursion. Skip the tier when every surviving candidate is
+            // a member extension.
+            var all_member_ext = true;
+            for (candidates.items) |c| {
+                if (!isMemberExt(smod, c.fid)) {
+                    all_member_ext = false;
+                    break;
+                }
+            }
             var same_file: usize = 0;
             for (candidates.items) |c| {
                 const ds = smod.decl_span.get(c.fid.int()) orelse continue;
                 if (ds.file.int() == sf.int()) same_file += 1;
             }
-            if (same_file != 0 and same_file != candidates.items.len) {
+            if (!all_member_ext and same_file != 0 and same_file != candidates.items.len) {
                 var filtered: std.ArrayList(Candidate) = .empty;
                 for (candidates.items) |c| {
                     const ds = smod.decl_span.get(c.fid.int()) orelse continue;
@@ -11214,7 +11230,18 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver
         // specificity, the numeric score, owner rank, parameter specificity,
         // and the stable lowest-FuncId discriminator.
-        const key = (applicability.applicable(&all_sigs[idx], shapes, scope) orelse continue).ext_key.?;
+        const applied = applicability.applicable(&all_sigs[idx], shapes, scope);
+        if (candidates.len > 0 and missTraceWant(candidates[0].func.name)) {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const owner = mg.get().registry.member_ext_owner_class.get(c.fid) orelse "-";
+            if (applied) |ap| {
+                std.debug.print("[extscore] fid={d} owner={s} key={any}\n", .{ c.fid.int(), owner, ap.ext_key.? });
+            } else {
+                std.debug.print("[extscore] fid={d} owner={s} INAPPLICABLE\n", .{ c.fid.int(), owner });
+            }
+        }
+        const key = (applied orelse continue).ext_key.?;
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, c.func) catch {};
         }
