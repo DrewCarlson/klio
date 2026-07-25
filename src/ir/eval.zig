@@ -5979,12 +5979,15 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                     if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
                         if (std.mem.eql(u8, w, name_str)) {
-                            std.debug.print("[cmg-tail] name={s} func={?} class={?} this_tag={s} n_seen_err={} in_fn={s} recvp={} np={d} p0={s} nparams_vals={d} this_idx={d} ncaps={d}\n", .{
+                            std.debug.print("[cmg-tail] name={s} func={?} class={?} this_tag={s} n_seen_err={} span={d}:{d} cands={d} in_fn={s} recvp={} np={d} p0={s} nparams_vals={d} this_idx={d} ncaps={d}\n", .{
                                 name_str,
                                 if (cmg.func) |f| f.int() else null,
                                 if (cmg.class) |c| c.int() else null,
                                 @tagName(std.meta.activeTag(this_val)),
                                 first_real_err != null,
+                                if (frame.cur_span) |sp| sp.file.int() else 0,
+                                if (frame.cur_span) |sp| sp.start else 0,
+                                if (cmg.candidates) |c| c.len else 0,
                                 frame.func.name,
                                 frame.func.has_receiver_param,
                                 frame.func.params.len,
