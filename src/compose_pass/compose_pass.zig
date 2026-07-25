@@ -395,21 +395,6 @@ pub fn composeAuditOn() bool {
 pub var active_composable_names: ?*const std.StringHashMap(void) = null;
 pub var active_composable_sinks: ?*const std.StringHashMap(void) = null;
 
-/// Sink name -> the NAME of its last parameter when that parameter is the
-/// composable lambda. The memo wrap turns the trailing lambda into a plain
-/// call expression, which no longer binds as a trailing lambda: with
-/// defaulted middle parameters it would slide into the FIRST open slot
-/// positionally. Emitting the wrapped argument by name keeps the binding.
-pub var active_sink_last_param: ?*const std.StringHashMap([]const u8) = null;
-
-pub fn collectComposableSinkLastParam(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap([]const u8) {
-    var set = std.StringHashMap([]const u8).init(a);
-    try collectSinkLastParamInto(&set, decls);
-    return set;
-}
 
 /// Trailing parameter count with a compose-plugin `$composer, $changed` pair
 /// stripped. A baked-base decl was already threaded when its pack was built, so
@@ -423,49 +408,6 @@ fn sinkParamCount(params: anytype) usize {
     return n;
 }
 
-pub fn collectSinkLastParamInto(set: *std.StringHashMap([]const u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
-    for (decls) |*d| switch (d.*) {
-        .Function => |*f| {
-            const n = sinkParamCount(f.params);
-            if (n != 0) {
-                const lp = &f.params[n - 1];
-                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
-                    try set.put(f.name.name, lp.name.name);
-                }
-            }
-        },
-        .Class => |*c| {
-            if (c.primary_params.len != 0) {
-                const lp = &c.primary_params[c.primary_params.len - 1];
-                if (lp.ty.function != null and isComposable(lp.ty.annotations)) {
-                    try set.put(c.name.name, lp.name.name);
-                }
-            }
-            try collectSinkLastParamInto(set, c.members);
-        },
-        .Object => |*o| try collectSinkLastParamInto(set, o.members),
-        else => {},
-    };
-}
-
-/// Fewest value arguments a sink call needs for its trailing lambda to bind the
-/// callee's last (composable-content) parameter: the count of non-defaulted
-/// params before it, plus one for the lambda. Keyed by bare name and minimised
-/// across overloads (installed by the build driver, module decls + baked base).
-/// `threadCall` consults it so a call that provides FEWER args than this binds a
-/// smaller, non-content overload of the same name (`ComposeNode(::Factory) {
-/// update }`) and its trailing lambda is left positional rather than re-named to
-/// a sibling overload's `content` parameter.
-pub var active_sink_content_reach: ?*const std.StringHashMap(u8) = null;
-
-pub fn collectComposableSinkContentReach(
-    a: std.mem.Allocator,
-    decls: []const ast.Decl,
-) std.mem.Allocator.Error!std.StringHashMap(u8) {
-    var set = std.StringHashMap(u8).init(a);
-    try collectSinkContentReachInto(&set, decls);
-    return set;
-}
 
 /// `params` is `[]const Param` (a function) or `[]const ClassParam` (a primary
 /// constructor); both carry `.ty`, `.default`, `.is_vararg`.
@@ -2134,16 +2076,6 @@ const Walker = struct {
                             // bind it by the sink's last-parameter name so a
                             // defaulted middle parameter cannot absorb it
                             // positionally.
-                            if (active_sink_last_param) |lp| {
-                                if (lp.get(name.?)) |pname| {
-                                    const names = w.a.alloc(?[]const u8, c.args.len) catch @panic("oom");
-                                    for (0..c.args.len) |k| {
-                                        names[k] = if (k < c.arg_names.len) c.arg_names[k] else null;
-                                    }
-                                    names[c.args.len - 1] = pname;
-                                    c.arg_names = names;
-                                }
-                            }
                         }
                     } else if (arg.* == .Lambda and w.thread and name != null and
                         !calleeInlinesLambda(name.?))
@@ -2505,18 +2437,7 @@ const Walker = struct {
         // the trailing lambda to bind `content` (non-defaulted params before it,
         // plus the lambda). A call with fewer args than that binds a smaller,
         // non-content overload, so leave its trailing lambda positional.
-        const reach: u8 = if (active_sink_content_reach) |m|
-            (if (calleeSimpleName(c.callee)) |nm| (m.get(nm) orelse 0) else 0)
-        else
-            0;
-        const reaches_content = reach == 0 or c.args.len >= reach;
-        if (had_trailing and reaches_content and c.args.len != 0 and new_names[c.args.len - 1] == null) {
-            if (calleeSimpleName(c.callee)) |nm| {
-                if (active_sink_last_param) |lp| {
-                    if (lp.get(nm)) |pname| new_names[c.args.len - 1] = pname;
-                }
-            }
-        }
+        _ = had_trailing;
         if (!positional) {
             new_names[c.args.len] = composer_param;
             new_names[c.args.len + 1] = changed_param;
@@ -3593,11 +3514,6 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
 
-    var last_param = std.StringHashMap([]const u8).init(a);
-    try last_param.put("ExplicitStartReplaceGroup", "content");
-    active_sink_last_param = &last_param;
-    defer active_sink_last_param = null;
-
     var callee_segs = [_]Ident{dummyIdent("ExplicitStartReplaceGroup")};
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
     var lam_params: [0]Ident = .{};
@@ -3628,7 +3544,11 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
     const c = call.Call;
     try testing.expectEqual(@as(usize, 4), c.args.len);
     try testing.expect(c.arg_names[0] == null); // key stays positional
-    try testing.expectEqualStrings("content", c.arg_names[1].?); // lambda re-named
+    // P12: the pass leaves the trailing argument POSITIONAL — the runtime
+    // binders' trailing-callable rules (positional gate and the named
+    // lambda-before-pair binder) place it on the resolved declaration's
+    // trailing parameter.
+    try testing.expect(c.arg_names[1] == null);
     try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
     try testing.expect(!c.has_trailing_lambda);
@@ -3645,15 +3565,6 @@ test "threadCall leaves a non-content overload's trailing lambda positional" {
     defer arena.deinit();
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
-
-    var last_param = std.StringHashMap([]const u8).init(a);
-    try last_param.put("ComposeNode", "content");
-    active_sink_last_param = &last_param;
-    defer active_sink_last_param = null;
-    var reach = std.StringHashMap(u8).init(a);
-    try reach.put("ComposeNode", 3);
-    active_sink_content_reach = &reach;
-    defer active_sink_content_reach = null;
 
     var callee_segs = [_]Ident{dummyIdent("ComposeNode")};
     var callee = Expr{ .Path = .{ .segments = &callee_segs, .span = gsp } };
@@ -3691,39 +3602,6 @@ test "threadCall leaves a non-content overload's trailing lambda positional" {
     try testing.expect(!c.has_trailing_lambda);
 }
 
-test "collectComposableSinkContentReach counts non-defaulted params before content" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
-    const b = B{ .a = a, .gen_span = gsp };
-
-    // `content: @Composable () -> Unit` — a composable-lambda type.
-    var fn_ty_ref = ast.FunctionTypeRef{
-        .receiver = null,
-        .params = &.{},
-        .ret = b.typeRef("Unit"),
-        .is_suspend = false,
-        .span = gsp,
-    };
-    var comp_path = [_]Ident{dummyIdent("Composable")};
-    var comp_ann = [_]ast.Annotation{.{ .use_site = null, .path = &comp_path, .type_args = &.{}, .args = &.{}, .arg_names = &.{}, .span = gsp }};
-    var comp_fn_ty = b.typeRef("Function0");
-    comp_fn_ty.function = &fn_ty_ref;
-    comp_fn_ty.annotations = &comp_ann;
-
-    // Foo(a, b = default, content): reach = 2 (a non-defaulted, b defaulted) + 1.
-    const p_a = b.param("a", b.typeRef("Int"));
-    var p_b = b.param("b", b.typeRef("Int"));
-    p_b.default = b.box(b.intLit(0));
-    const p_content = b.param("content", comp_fn_ty);
-    var foo_params = [_]Param{ p_a, p_b, p_content };
-    const foo = emptyFn("Foo", &foo_params, .{ .Block = .{ .stmts = &.{}, .span = gsp } }, false);
-    var decls = [_]ast.Decl{.{ .Function = foo }};
-    var reach = try collectComposableSinkContentReach(a, &decls);
-    defer reach.deinit();
-    try testing.expectEqual(@as(u8, 2), reach.get("Foo").?);
-}
 
 test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

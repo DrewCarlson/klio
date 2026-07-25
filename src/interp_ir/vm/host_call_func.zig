@@ -1690,6 +1690,13 @@ pub fn callFuncIndexed(
     }
 }
 
+/// A value the trailing-callable rule may bind: a closure/function, or a
+/// memo-wrapped composable lambda (an Instance with a block arity).
+fn callableForTrailing(self: *VmHost, v: *const Value) bool {
+    if (valueIsCallable(v)) return true;
+    return v.* == .Instance and composableLambdaBlockArity(self, v) != null;
+}
+
 pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module, func_in: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     var any_named = false;
     for (arg_names) |n| {
@@ -1733,10 +1740,35 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                 const last_named = last < arg_names.len and arg_names[last] != null;
                 const last_param = params.len - 1;
                 if (!last_named and slots[last_param] == null and
-                    isFunctionType(&params[last_param].ty) and valueIsCallable(&args[last]))
+                    isFunctionType(&params[last_param].ty) and callableForTrailing(self, &args[last]))
                 {
                     slots[last_param] = args[last];
                     trailing_lambda = last;
+                }
+                // Compose shape: `(…, BLOCK, $composer = c, $changed = n)` —
+                // the unnamed callable BEFORE the named generated pair binds
+                // the last user parameter (declared just before the pair),
+                // mirroring the scorer's lambda-before-pair rule; without
+                // this the block walks positionally into a defaulted middle.
+                if (trailing_lambda == null and args.len >= 3 and params.len >= 3) {
+                    const ci = args.len - 2;
+                    const bi = args.len - 3;
+                    const cn = if (ci < arg_names.len) arg_names[ci] else null;
+                    const gn = if (last < arg_names.len) arg_names[last] else null;
+                    const bn = if (bi < arg_names.len) arg_names[bi] else null;
+                    const up = params.len - 3;
+                    if (cn != null and gn != null and bn == null and
+                        std.mem.eql(u8, cn.?, "$composer") and
+                        std.mem.eql(u8, gn.?, "$changed") and
+                        std.mem.eql(u8, params[params.len - 2].name, "$composer") and
+                        std.mem.eql(u8, params[params.len - 1].name, "$changed") and
+                        slots[up] == null and
+                        isFunctionType(&params[up].ty) and
+                        callableForTrailing(self, &args[bi]))
+                    {
+                        slots[up] = args[bi];
+                        trailing_lambda = bi;
+                    }
                 }
             }
 

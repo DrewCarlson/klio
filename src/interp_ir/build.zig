@@ -474,8 +474,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         factories: std.StringHashMap(void),
         comp_getter_props: std.StringHashMap(void),
         inline_fns: std.StringHashMap(void),
-        sink_last_param: std.StringHashMap([]const u8),
-        sink_content_reach: std.StringHashMap(u8),
         stability: std.StringHashMap(compose_pass.Stability),
 
         fn deinit(self: *@This()) void {
@@ -484,8 +482,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             self.factories.deinit();
             self.comp_getter_props.deinit();
             self.inline_fns.deinit();
-            self.sink_last_param.deinit();
-            self.sink_content_reach.deinit();
             self.stability.deinit();
         }
     };
@@ -496,8 +492,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_factories = null;
         compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = null;
-        compose_pass.active_sink_last_param = null;
-        compose_pass.active_sink_content_reach = null;
         compose_pass.active_stability = null;
         if (compose_maps) |*maps| maps.deinit();
     }
@@ -569,10 +563,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
-        var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
-        defer sink_last_param.deinit();
-        var sink_content_reach = try compose_pass.collectComposableSinkContentReach(allocator, decls.items);
-        defer sink_content_reach.deinit();
         if (base) |bsp| {
             // Decode once: an image-loaded base leaves `lifted_decls` empty, so
             // every collector below must read the decoded section instead.
@@ -582,8 +572,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseFactories(&factories, base_decls);
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
-            try composeBaseSinkLastParam(&sink_last_param, base_decls);
-            try composeBaseSinkContentReach(&sink_content_reach, base_decls);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
@@ -595,10 +583,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = &inline_fns;
         defer compose_pass.active_inline_fns = null;
-        compose_pass.active_sink_last_param = &sink_last_param;
-        defer compose_pass.active_sink_last_param = null;
-        compose_pass.active_sink_content_reach = &sink_content_reach;
-        defer compose_pass.active_sink_content_reach = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -614,8 +598,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             .factories = factories,
             .comp_getter_props = comp_getter_props,
             .inline_fns = inline_fns,
-            .sink_last_param = sink_last_param,
-            .sink_content_reach = sink_content_reach,
             .stability = stability,
         };
         names = std.StringHashMap(void).init(allocator);
@@ -623,8 +605,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         factories = std.StringHashMap(void).init(allocator);
         comp_getter_props = std.StringHashMap(void).init(allocator);
         inline_fns = std.StringHashMap(void).init(allocator);
-        sink_last_param = std.StringHashMap([]const u8).init(allocator);
-        sink_content_reach = std.StringHashMap(u8).init(allocator);
         stability = std.StringHashMap(compose_pass.Stability).init(allocator);
     }
     if (compose_maps) |*maps| {
@@ -633,8 +613,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_pass.active_factories = &maps.factories;
         compose_pass.active_composable_getter_props = &maps.comp_getter_props;
         compose_pass.active_inline_fns = &maps.inline_fns;
-        compose_pass.active_sink_last_param = &maps.sink_last_param;
-        compose_pass.active_sink_content_reach = &maps.sink_content_reach;
         compose_pass.active_stability = &maps.stability;
     }
 
@@ -4583,18 +4561,6 @@ fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) A
 
 fn composeBaseFactories(factories: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| try composeBaseFactoryDecl(factories, d);
-}
-
-fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkLastParamInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseSinkContentReach(set: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkContentReachInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
 }
 
 fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
