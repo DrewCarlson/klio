@@ -969,7 +969,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
-    return buildModuleWithOverrides(
+    const built = try buildModuleWithOverrides(
         allocator,
         &combined,
         &fqn_overrides,
@@ -980,6 +980,14 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         base,
         out_lifted,
     );
+    if (composePluginEnabled() and compose_pass.composeAuditOn()) {
+        const ca = &compose_pass.compose_audit;
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] compose summary (cumulative): agree={d} pair-stripped={d} pair-completed={d} lambda-arity={d} disagreements={d}\n",
+            .{ ca.threaded_agree, ca.pair_stripped, ca.pair_completed, ca.lambda_arity_mismatch, ca.disagreements() },
+        );
+    }
+    return built;
 }
 
 fn packagePrefix(allocator: Allocator, pkg: ?ast.PackageHeader) Allocator.Error![]const u8 {

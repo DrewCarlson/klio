@@ -9330,7 +9330,17 @@ fn selectedCallArgs(module: *const Module, func_id: FuncId, args: []const Expr, 
         return .{ .args = args, .names = names };
     }
     const f = module.funcById(func_id) orelse return .{ .args = args, .names = names };
-    if (selectedCallHasComposerAbi(module, func_id, f)) return .{ .args = args, .names = names };
+    if (selectedCallHasComposerAbi(module, func_id, f)) {
+        compose_pass.compose_audit.threaded_agree += 1;
+        return .{ .args = args, .names = names };
+    }
+    compose_pass.compose_audit.pair_stripped += 1;
+    if (compose_pass.composeAuditOn()) {
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] compose pair-stripped target={s}#{d}\n",
+            .{ f.fqn, func_id.int() },
+        );
+    }
     return .{
         .args = args[0 .. args.len - 2],
         .names = names[0 .. names.len - 2],
@@ -9379,6 +9389,13 @@ fn selectedCallArgsForBuilder(
             }
         }
         if (has_abi and composer != null) {
+            compose_pass.compose_audit.pair_completed += 1;
+            if (compose_pass.composeAuditOn()) {
+                std.debug.print(
+                    "[KLIO_RESOLVE_AUDIT] compose pair-completed target={s}#{d} caller={s}\n",
+                    .{ f.fqn, func_id.int(), build.currentRealFn() orelse "-" },
+                );
+            }
             const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
             errdefer b.allocator.free(completed_args);
             @memcpy(completed_args[0..selected.args.len], selected.args);

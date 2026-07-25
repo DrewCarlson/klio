@@ -373,6 +373,47 @@ pub var active_factories: ?*const std.StringHashMap(void) = null;
 /// Unit` sink keeps its implicit `it` slot ahead of `$composer`/`$changed` —
 /// `MovableContent({ content() })` invokes its content with the movable
 /// parameter first.
+/// Decision audit (`KLIO_RESOLVE_AUDIT`): for every statically selected call
+/// the lowering compares the pass's threading decision (observable as the
+/// generated `$composer`/`$changed` pair on the call and on lambda params)
+/// against the resolved target's declared ABI, and counts the disagreements.
+/// This turns the pass's wrong guesses — including the ones downstream
+/// absorbers silently strip — into one measurable number per build. Lowering
+/// is single-threaded, so plain counters suffice.
+pub const ComposeAudit = struct {
+    /// Pair present and the resolved target declares it: agreement.
+    threaded_agree: u64 = 0,
+    /// Pair present but the target has no composer ABI; the pair was
+    /// stripped at emission (`selectedCallArgs`).
+    pair_stripped: u64 = 0,
+    /// No pair but the target declares the ABI; lowering completed the
+    /// pair from the ambient composer (`selectedCallArgsForBuilder`).
+    pair_completed: u64 = 0,
+    /// A pass-threaded lambda whose non-pair param count cannot fit the
+    /// resolved parameter's declared arity (short, or more than one over —
+    /// one over is the flattened receiver slot the declared arity omits).
+    lambda_arity_mismatch: u64 = 0,
+
+    pub fn disagreements(a: *const ComposeAudit) u64 {
+        return a.pair_stripped + a.pair_completed + a.lambda_arity_mismatch;
+    }
+};
+pub var compose_audit: ComposeAudit = .{};
+
+var compose_audit_env: ?bool = null;
+
+pub fn composeAuditOn() bool {
+    if (compose_audit_env) |v| return v;
+    const v = blk: {
+        if (comptime !@import("builtin").link_libc) break :blk false;
+        const raw = std.c.getenv("KLIO_RESOLVE_AUDIT") orelse break :blk false;
+        const s = std.mem.span(raw);
+        break :blk s.len != 0 and !std.mem.eql(u8, s, "0");
+    };
+    compose_audit_env = v;
+    return v;
+}
+
 pub var active_sink_arity: ?*const std.StringHashMap(u8) = null;
 
 /// Sink name -> per-parameter slot arity for every `@Composable`
@@ -2686,7 +2727,23 @@ pub fn transformResolvedComposableLambda(
     callee_inline: bool,
 ) std.mem.Allocator.Error!bool {
     const lam = trailingLambda(arg) orelse return false;
-    if (lambdaHasComposerParams(lam)) return false;
+    if (lambdaHasComposerParams(lam)) {
+        // The pass already shaped this lambda; audit its guess against the
+        // declared arity of the parameter resolution just selected. One
+        // param over is the flattened receiver slot the declared arity
+        // does not count.
+        const user_n = lam.params.len - 2;
+        if (user_n < expected_params or user_n > @as(usize, expected_params) + 1) {
+            compose_audit.lambda_arity_mismatch += 1;
+            if (composeAuditOn()) {
+                std.debug.print(
+                    "[KLIO_RESOLVE_AUDIT] compose lambda-arity pass={d} declared={d}\n",
+                    .{ user_n, expected_params },
+                );
+            }
+        }
+        return false;
+    }
     const names = active_composable_names orelse return false;
     const label: ?[]const u8 = switch (arg.*) {
         .Labeled => |labeled| labeled.label.name,

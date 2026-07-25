@@ -1485,6 +1485,22 @@ IR lowering that runs after frontend resolution; klio's runs before.
   crash stream into a finite, measurable worklist over the whole corpus, *including the
   wrong guesses that currently do not crash because something absorbs them*. Gate: the
   count may fall, never rise. **This lands before any further Compose refactoring.**
+
+  LANDED (2026-07-25). The audit compares three things at the static-selection point:
+  the generated pair vs the target's ABI (`selectedCallArgs` counts agreement and the
+  silent strip), the lowering-side pair completion, and a pass-shaped lambda's param
+  count vs the resolved parameter's declared arity. `KLIO_RESOLVE_AUDIT=1` prints one
+  line per disagreement plus a cumulative summary per module build. Dynamic emission
+  paths (`CallMemberOrGlobal` runtime re-dispatch) are not yet audited.
+
+  **Baseline, material3 fixture set (2026-07-25): agree=8, pair-stripped=0,
+  pair-completed=2335, lambda-arity=0.** Reading: at statically selected call sites the
+  pass's appended pair almost never survives to emission — 99.7% of threaded calls get
+  their pair from the LOWERING completion, which already implements "threading decided
+  against the resolved callee". The P11 inversion is therefore mostly a matter of
+  removing the pass's call-side append and widening the completion path, not building a
+  new mechanism. The pass's remaining load-bearing work is declaration-side ABI and
+  lambda shaping.
 - **P11 — Call-side threading becomes resolution-driven.** Deletions:
   `active_composable_receiver_names`, `isGeneratedComposeArg`.
 - **P12 — Lambda shaping from the resolved parameter type.** Deletions:
