@@ -676,7 +676,11 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
     return .{
         .runtime_class = overload_match.runtimeHead(v),
         .is_null = v.* == .Null,
-        .is_lambda = valueIsCallable(v),
+        // A ComposableLambdaImpl wrap is a callable value with a known block
+        // arity — rank it as a lambda so the trailing-callable conventions
+        // can bind it to a sink parameter across defaulted middles, exactly
+        // as the member-side shape already does via isCallable.
+        .is_lambda = valueIsCallable(v) or (v.* == .Instance and arity != null),
         .lambda_arity = arity,
         .lambda_is_literal = arity_authoritative,
         .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
