@@ -1590,12 +1590,19 @@ IR lowering that runs after frontend resolution; klio's runs before.
     the MaterialTheme call moved onto the FUNCTION tier, exposing the final
     layer: with the pick trailing-binding the wrap, the EMISSION still maps
     it positionally ('virtual call receiver is not an instance' — the wrap
-    lands on a defaulted middle at binding). The retirement's last
-    requirement: the emission must honor the pick's binding record
-    (Score.binding.arg_to_param / trailing_lambda_param) for a wrap-trailing
-    call, the pick-vs-binding alignment that IS the post-resolution emission
-    step's first concrete deliverable. Four measured probes on record; the
-    maps stay until the emission consumes the binding.
+    lands on a defaulted middle at binding). A FIFTH probe extended the
+    unification to the positional callFunc trailing gate
+    (callableDeclaredArity + trailing_is_callable see the wrap — LANDED,
+    gated, sweep-identical) and pinned the remaining site precisely: the
+    NAMED binding path still maps a wrap-trailing call positionally — the
+    frame shows content=Null with the composer shifted
+    (`MaterialTheme(colorScheme=…, WRAP, $composer=, $changed=)` binds
+    colorScheme by name, defaults the middles, and drops the wrap). ONE
+    duplicated binding site remains (the named-args reorder used by
+    callFuncTyped's named dispatch); teach it the trailing-callable rule and
+    the renames retire. Five measured probes on record — each layer's fix
+    landed as it was found (three shape tiers + the positional gate); the
+    maps stay until the named binder learns the rule.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
