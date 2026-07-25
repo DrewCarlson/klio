@@ -2371,12 +2371,13 @@ const Walker = struct {
                         // runtime-dispatched member or member-syntax extension
                         // completes at the member-miss tail — both against the
                         // RESOLVED declaration, never a simple name.
-                        const oracle_hit = if (c.callee.* == .Member)
-                            false
-                        else if (c.callee.* == .Path and c.callee.Path.segments.len == 1)
-                            false
-                        else
-                            w.oracle(w.oracle_ctx, nm);
+                        // P11: qualified-path calls (`pkg.f(...)`, the last
+                        // form the pre-resolution oracle threaded) keep their
+                        // source shape too — the same lowering/dispatch
+                        // completions serve them. `oracle_hit` is now
+                        // constant-false; only the value-invocation forms
+                        // above still transform at the call site.
+                        const oracle_hit = false;
                         if (positional or is_composable_val or is_local_composable or oracle_hit) try w.threadCall(c, positional);
                     }
                 }
