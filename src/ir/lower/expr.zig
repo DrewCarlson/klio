@@ -3067,8 +3067,10 @@ fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count
 /// receiver, each walked up its supertype chain — the member may be declared on
 /// a supertype of the receiver we are lowering against.
 fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
+    const mhtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
     if (b.recvTy()) |rt| roots[1] = rsplitLast(rt, '.');
+    if (mhtl_trace) std.debug.print("[mhtl] {s}: owner={?s} recv_root={?s} argc={d}\n", .{ name, roots[0], roots[1], user_arg_count });
     for (roots) |root_opt| {
         const root = root_opt orelse continue;
         // The class itself, then its transitive supertype names (nearest first).
@@ -3087,6 +3089,7 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
                 const fid = entry.value_ptr.*;
                 const f = b.module.funcById(fid) orelse continue;
                 const hosts = memberHostsTrailingLambdaAtArity(b, cls, f, fid, user_arg_count);
+                if (mhtl_trace) std.debug.print("[mhtl] {s}: cls={s} cand #{d} params={d} hosts={} last_ty={s} last_arity={?d}\n", .{ name, cls, fid.int(), f.params.len, hosts, if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
                 if (!hosts) continue;
                 const last = f.params[f.params.len - 1];
                 const arity = fnTypeArityAlias(b, last.ty) orelse continue;
@@ -10734,6 +10737,14 @@ fn lowerUnresolvedBareCall(
                     // `() -> T` block read past the params, kept its
                     // synthetic `it`, and shadowed the enclosing one).
                     const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                    // The arity alone is not the whole lambda shape: a
+                    // `T.() -> R` parameter also owns the block's `this`.
+                    // Without the receiver record the block lowers
+                    // receiverless and its bare `this` captures the
+                    // ENCLOSING instance — `SnapshotStateMap.mutate`'s
+                    // `withCurrent { this }` returned the outer map instead
+                    // of the bound record.
+                    try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
                     break :blk try argFnArities(b, f, args, ast_arg_names, off);
                 }
             }

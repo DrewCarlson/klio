@@ -1683,3 +1683,27 @@ State: the full Material 3 scene (MaterialTheme/Scaffold/TopAppBar/Card/Button t
 the real windowing path) composes, lays out, and renders pixel-correct dark-theme
 output. P11–P13 remain the structural consolidation; the P10 baseline (agree=8,
 pair-completed=2335) says P11 is mostly deletion of the pass's call-side append.
+
+## The deferred trailing-lambda shape carries a receiver, not just an arity
+
+The compose-plugin itest gate failure (`SnapshotStateMapTests.validateEntriesRemoveAll`,
+`get_field 'map' on SnapshotStateMap`) root-caused to lowering, not GC: the GC-stress
+arm was the only arm running the test under `--filter`, and filtered/standalone runs
+lower the file into a context where `mutate`'s bare call `withCurrent { this }` takes
+the deferred `CallMemberOrGlobal` emit path. That path read the trailing lambda's
+expected ARITY from the hosting overload (`overloadHostingTrailingLambda`, which
+correctly prefers the private member `withCurrent(block: StateMapStateRecord.() -> R)`
+over the body-less top-level `T.withCurrent(block: (r: T) -> R)`) — but never recorded
+the RECEIVER half of the shape. The block lowered receiverless, its bare `this`
+captured the enclosing `SnapshotStateMap`, and every `mutate` returned the outer map
+instead of the bound record. Fix: the deferred arm now calls
+`recordLambdaArgReceivers` with the same hosting overload and offset it reads the
+arity from, so a `T.() -> R` parameter owns the block's `this` on the deferred path
+exactly as it does on the resolved-callee paths. Minimal repro:
+`tests/fixtures/` — a 30-line member/top-level `withCurrent` pair; no compose, no GC.
+
+The general rule this confirms for the unification: a lambda argument's static shape
+is (value arity, receiver, composability) as a UNIT read from one resolved candidate —
+any emit path that threads part of the shape from one candidate and lets another half
+default is a latent misbinding. P12's resolved-parameter shaping already made this
+true for the resolved paths; the deferred bare-call arm is now consistent with it.
