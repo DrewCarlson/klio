@@ -1869,7 +1869,31 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // getter name. The same rule handles receiver lambdas, where the
             // innermost candidate may instead be a scope-function receiver.
             const enclosing_only_member = !b.hasOwnMember(name0) and b.hasEnclosingMember(name0);
-            if (!is_known_global and !enclosing_only_member) {
+            // Directly inside an inline extension splice the body was written
+            // against the DECLARATION's scope, where the bound receiver's
+            // members shadow any top-level candidate: `size == 0` in
+            // IntArray.isEmpty means the receiver's size no matter what
+            // same-named globals the CALLER's universe declares. The GetField
+            // read keeps its runtime miss-fallback, so a spliced body whose
+            // receiver lacks the name still reaches the global. A NESTED
+            // lambda inside the splice is excluded — its bare names must keep
+            // resolving against the runtime receiver walk (the
+            // `setSpliceRecvTy` contract).
+            const splice_receiver_first = b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
+            if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name0)) {
+                    std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s}\n", .{
+                        name0,
+                        build.currentRealFn() orelse "-",
+                        is_known_global,
+                        b.hasOwnMember(name0),
+                        b.hasEnclosingMember(name0),
+                        b.spliceRecvTy() orelse "-",
+                        b.ownerClass() orelse "-",
+                    });
+                }
+            }
+            if ((!is_known_global or splice_receiver_first) and !enclosing_only_member) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
                 try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
