@@ -6,6 +6,11 @@ loop: redundant build work, redundant test children, slow interpreted
 iterations, cache pathology. This is the working document; keep measurements
 and decisions here.
 
+> **Superseded in part (2026-07-25).** The ~12 s material3 bake below has regressed to
+> **302 s** (lower 284.5 s of it). The development loop — binary, packs, image bake, one
+> program — is planned separately in `feedback-loop-plan.md`; this document remains the
+> plan for the test-suite loop.
+
 ## Compose pack-set bake + warm run (2026-07-11 — LANDED)
 
 The compose dev loop's dominant costs both fell an order of magnitude:

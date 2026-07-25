@@ -54,9 +54,13 @@ etc.). Two stopgaps from the post-flip sweep join the catalog: the `is_ctor_name
 class-exists gate in `execCallMemberOrGlobal` (a capitalized bare callee should be
 resolved by the index, not a runtime capitalization heuristic) and the
 `instance_prop_private` walk skip (a resolved property slot makes the virtual walk
-itself unnecessary) — both deletable once P4/P7 land. Each deletion is gated on
-`KLIO_RESOLVE_AUDIT` zero-disagreement + the full sweep; a hatch that *can't* be
-removed pins the next fix.
+itself unnecessary) — both deletable once P4/P7 land. The Compose pass contributes its
+own set (RC-I): `NameSetOracle`, `active_sink_arity`, `active_sink_last_param`,
+`active_sink_content_reach`, `active_composable_props`, `active_composable_getter_props`,
+`active_inline_fns`, `active_factories`, `active_composable_receiver_names`, plus the
+`isGeneratedComposeArg` absorber in `applicability.zig` that exists only to tolerate the
+pass's wrong guesses. Each deletion is gated on `KLIO_RESOLVE_AUDIT` zero-disagreement +
+the full sweep; a hatch that *can't* be removed pins the next fix.
 
 The structural invariant this enforces: **resolution is a pure function of (call site,
 sig index, receiver type)** — zero name-list lookups remain in the dispatch/resolution
@@ -1423,3 +1427,83 @@ commit constraint is relaxed.
 - **Negative tests:** abstract instantiation diagnoses; a user class named
   `Error`/`Exception`/`Random` constructs via its own declaration; named args on a
   function-typed value diagnose rather than silently drop.
+
+## RC-I — the Compose lowering pass is a second resolution engine
+
+`compose_pass` runs as an AST transform from `buildModuleWithOverrides`, **before any
+call is resolved**. To decide "is this callee composable", "how many leading value slots
+does this lambda need", "does this callee inline its lambda", it consults program-wide
+**simple-name maps**: `NameSetOracle`, `active_sink_arity`, `active_sink_last_param`,
+`active_sink_content_reach`, `active_composable_props`, `active_composable_getter_props`,
+`active_inline_fns`, `active_factories`, `active_composable_receiver_names`.
+
+That is RC-C verbatim — decided by a program-wide name set instead of the receiver type —
+living outside the resolver. Confirmed instances, each reproduced minimally:
+
+- `contentColorFor`: the name is composable, so a *non*-composable `ColorScheme`
+  extension of the same name was threaded and dispatch missed.
+- `containerColor`: declared ~13 times across material3, mixed `@Stable` and
+  `@Composable`, and `NavigationDrawerItemColors.containerColor(selected)` is composable
+  with the **same arity** as the non-composable `CardColors.containerColor(enabled)`.
+  No name-keyed or name+arity rule can separate them; only the receiver type can.
+- sink arity: a `Scope.() -> Unit` sink reserves a leading receiver slot at the value
+  invocation but not when the sink inlines. The shape depends on the callee, which the
+  pass does not have.
+
+Two properties make this worse than an ordinary hatch:
+
+1. The pass's decisions are **irreversible AST edits**. Once `$composer` is appended to
+   the wrong call, resolution only ever sees a call carrying two extra arguments.
+2. Therefore every wrong guess must be **absorbed** downstream. `isGeneratedComposeArg`
+   in `applicability.zig` is exactly such an absorber and joins the deletion catalog.
+
+This also explains why progress on this plan presents as Compose regressions: the old
+resolver's leniency was silently absorbing bad guesses, and tightening resolution removes
+the shock absorber. `Scaffold` is the clean example — it passed only because the
+baked-base sink-arity walk under-counted receivers, and unifying that walk removed the
+compensating error.
+
+### The split that makes the inversion tractable
+
+- **Declaration side stays pre-resolution.** "Is this declaration `@Composable`" is a
+  local, unambiguous annotation fact. Appending `$composer`/`$changed` to signatures and
+  to function types, and emitting the restart bracket, needs no name lookup.
+- **Call side defers to lowering.** Appending arguments, choosing lambda synthetic slots,
+  and memo-wrapping all require the callee. The pass marks the site; lowering, which has
+  `resolveCall` -> target `FuncId` + signature, decides.
+
+Phase order dissolves the apparent chicken-and-egg (resolution needs signatures, and
+threading changes signatures): declaration rewrite, then index, then resolve calls
+against already-threaded signatures. This is what kotlinc does — its Compose plugin is an
+IR lowering that runs after frontend resolution; klio's runs before.
+
+### Phases
+
+- **P10 — Compose decision audit.** For every threaded call site record the pass's
+  decision; at lowering record the resolved target and whether it declares `$composer`.
+  Report disagreements under the `KLIO_RESOLVE_AUDIT` family. This converts an open-ended
+  crash stream into a finite, measurable worklist over the whole corpus, *including the
+  wrong guesses that currently do not crash because something absorbs them*. Gate: the
+  count may fall, never rise. **This lands before any further Compose refactoring.**
+- **P11 — Call-side threading becomes resolution-driven.** Deletions:
+  `active_composable_receiver_names`, `isGeneratedComposeArg`.
+- **P12 — Lambda shaping from the resolved parameter type.** Deletions:
+  `active_sink_arity`, `active_sink_last_param`, `active_sink_content_reach`,
+  `active_composable_props`, `active_composable_getter_props`, `active_factories`.
+- **P13 — Inline-ness from the declaration.** Deletions: `active_inline_fns` and its
+  hardcoded stdlib inline list (`is_inline` survives the image — verified when the
+  baked-base sink-arity walk was unified, so this may already be deletable).
+
+### Two conformance targets, kept distinct
+
+The Kotlin spec governs the **resolver**. Compose threading is a **compiler-plugin ABI**,
+not spec behavior; its conformance target is kotlinc's plugin output. Keeping these
+separate settles which document decides a given bug, and stops spec-compliance work from
+being blamed for plugin-ABI mismatches.
+
+### Invariants this adds
+
+- (e) every composer-threading decision is a pure function of (call site, resolved target
+  signature) — never of a simple name.
+- (f) zero name-keyed maps remain in the Compose decision path; each deletion is the
+  acceptance test for its phase.
