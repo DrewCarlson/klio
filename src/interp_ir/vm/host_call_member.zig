@@ -4842,6 +4842,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (cid) |c| return newInstanceById(self, allocator, c, args, null);
             }
         }
+        if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
         const g = receiver.Instance.borrow();
         defer g.deinit();
         const cg = g.get().class.borrow();
@@ -4868,6 +4869,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
     missTraceMaybe(name);
     if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
@@ -4875,6 +4877,79 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         ir.eval.debugPrintFrames();
     }
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
+}
+
+/// Recursion guard for the compose member-miss completion: the retried
+/// dispatch must not complete a second pair onto its own miss.
+threadlocal var compose_member_retry: bool = false;
+
+/// Compose ABI completion at the member-miss tails. A bare sibling call to
+/// a `@Composable` METHOD keeps its source argument shape (the pass defers
+/// bare calls to resolution), and a runtime-dispatched member has no
+/// lowering-side completion — so the threaded method's trailing
+/// `($composer, $changed)` params go unsupplied and every overload
+/// declines. When an ambient composer exists, retry the whole dispatch once
+/// with the pair appended, exactly as the closure invoke path completes a
+/// typeless composable value call. Miss-tail only: a call that resolved
+/// without the pair is never touched, and the strict receiver probes (whose
+/// misses are an expected part of the bare-name walk) never retry.
+/// Whether the receiver's class hierarchy declares a method `name` whose
+/// params end with the generated composer pair and whose user arity fits
+/// `args.len + 2` — the proof that the miss is an unthreaded call to a
+/// threaded composable member, not an arbitration probe that must stay
+/// missed so its caller's next arm (an extension, a global) can win.
+fn receiverHasThreadedMember(self: *VmHost, receiver: *const Value, name: []const u8, nargs: usize) bool {
+    if (receiver.* != .Instance) return false;
+    const recv_name = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    // Walk the receiver's class chain by simple name (methods live on the
+    // class, not in the top-level function index). Bounded like the
+    // dispatch walk itself.
+    var cur: ?[]const u8 = recv_name;
+    var hops: usize = 0;
+    while (cur) |cn| : (hops += 1) {
+        if (hops > 32) break;
+        const cid = m.uniqueClassIdBySimpleName(cn) orelse break;
+        const class = &m.classes.items[cid.int()];
+        for (class.methods) |fid| {
+            const f = m.funcById(fid) orelse continue;
+            if (!std.mem.eql(u8, f.name, name)) continue;
+            if (f.params.len < 3) continue;
+            if (!std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) continue;
+            if (!std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed")) continue;
+            const skip: usize = if (std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (f.params.len - skip != nargs + 2) continue;
+            return true;
+        }
+        const supers = m.registry.class_super_names.get(cn) orelse break;
+        cur = if (supers.len != 0) supers[0] else null;
+    }
+    return false;
+}
+
+fn composeMemberPairRetry(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    if (compose_member_retry or strict_ext or !host_call_func.composePluginEnabled()) return null;
+    if (!receiverHasThreadedMember(self, receiver, name, args.len)) return null;
+    const comp = compose.currentComposer() orelse return null;
+    const buf = try allocator.alloc(Value, args.len + 2);
+    defer if (runtime.freeScratch()) allocator.free(buf);
+    @memcpy(buf[0..args.len], args);
+    buf[args.len] = comp;
+    buf[args.len + 1] = .{ .Int = 0 };
+    compose_member_retry = true;
+    defer compose_member_retry = false;
+    const r = try callMemberInnerStatic(self, allocator, receiver, name, buf, strict_ext, static_recv, no_ext, declared_recv);
+    if (r == .ok) return r;
+    if (r == .err and r.err != .Unimplemented) return r;
+    return null;
 }
 
 /// `KLIO_MISS_TRACE=<name>` diagnostic: when a call_member dispatch for
