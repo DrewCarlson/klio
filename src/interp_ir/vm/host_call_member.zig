@@ -8410,6 +8410,23 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             try seen.put(dedup_key, {});
             if (ir_class) |irc| {
                 cur_name = irc.name;
+                if (missTraceWant(name)) {
+                    var matched: usize = 0;
+                    for (irc.methods) |fid| {
+                        if (funcAt(mod, fid)) |f| {
+                            if (std.mem.eql(u8, f.name, name)) matched += 1;
+                        }
+                    }
+                    std.debug.print("[rim] class={s} cid={?} methods={d} named={d} static_recv={s} static_up_ready={} in_up={}\n", .{
+                        irc.fqn,
+                        if (item.cid) |c| c.int() else null,
+                        irc.methods.len,
+                        matched,
+                        static_recv orelse "-",
+                        static_up_ready,
+                        static_up.contains(irc.fqn),
+                    });
+                }
                 // Gather candidates named `name`. A `@LowPriorityInOverloadResolution`
                 // / `@Deprecated(level = ERROR)` member is a guard stub that only
                 // applies when no ordinary candidate (member or top-level extension)
@@ -8485,6 +8502,14 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             try candidates.append(allocator, f);
                         }
                     }
+                }
+                if (missTraceWant(name)) {
+                    std.debug.print("[rim2] class={s} collected={d} picked={} args={d}\n", .{
+                        irc.fqn,
+                        candidates.items.len,
+                        pickMethodOverload(self, mod, candidates.items, args) != null,
+                        args.len,
+                    });
                 }
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
