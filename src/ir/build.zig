@@ -947,12 +947,6 @@ pub const FuncBuilder = struct {
         try self.inline_return.appendSlice(self.allocator, saved);
         self.allocator.free(saved);
     }
-    pub fn inlineInProgress(self: *const FuncBuilder, name: []const u8) bool {
-        for (self.inline_stack.items) |frame| {
-            if (std.mem.eql(u8, frame.name, name)) return true;
-        }
-        return false;
-    }
     pub fn inlineDeclInProgress(self: *const FuncBuilder, decl: *const ast.Function) bool {
         for (self.inline_stack.items) |frame| {
             if (frame.decl == decl) return true;

@@ -4625,7 +4625,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             break :blk false;
         };
-        if (reified_ext and !b.inlineInProgress(mname)) {
+        if (reified_ext) {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
