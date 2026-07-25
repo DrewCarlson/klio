@@ -636,16 +636,25 @@ pub fn collectComposableSinkArity(
     return set;
 }
 
-fn compParamArity(t: *const ast.TypeRef) ?u8 {
+fn compParamArity(t: *const ast.TypeRef, receiver_is_a_slot: bool) ?u8 {
     if (t.function == null or !isComposable(t.annotations)) return null;
     const ft = t.function.?;
     // An extension receiver — and each `context(...)` type — flattens into a
-    // LEADING value slot at the invocation: `MyScope.() -> Unit` is invoked as
-    // `(receiver, $composer, $changed)`. Counting only `params` leaves a
-    // header-less `{ … }` bound to such a sink with no slot for the receiver, so
-    // the threaded `$composer` binds the receiver and every composable call in
-    // the body dispatches its composer methods on the scope object.
-    const n = ft.context_params.len + @as(usize, @intFromBool(ft.receiver != null)) + ft.params.len;
+    // LEADING value slot when the lambda is INVOKED through the value protocol:
+    // a `Scope.() -> Unit` bound to a non-inline sink is memo-wrapped and called
+    // as `(receiver, $composer, $changed)`. Counting only `params` leaves a
+    // header-less `{ … }` there with no slot for the receiver, so the threaded
+    // `$composer` binds the receiver and every composable call in the body
+    // dispatches its composer methods on the scope object.
+    //
+    // An INLINE sink has no such protocol: its body is spliced into the caller
+    // with the receiver bound as `this`, so reserving a slot would instead shift
+    // the spliced parameters and hand `$composer` the Int dirty flag.
+    const recv_slots: usize = if (receiver_is_a_slot)
+        ft.context_params.len + @intFromBool(ft.receiver != null)
+    else
+        0;
+    const n = recv_slots + ft.params.len;
     if (n == 0) return null;
     return @intCast(@min(n, 255));
 }
@@ -653,13 +662,14 @@ fn compParamArity(t: *const ast.TypeRef) ?u8 {
 fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
-            for (f.params) |*p| if (compParamArity(&p.ty)) |n| {
+            for (f.params) |*p| if (compParamArity(&p.ty, !f.is_inline)) |n| {
                 try set.put(f.name.name, n);
                 break;
             };
         },
         .Class => |*c| {
-            for (c.primary_params) |*p| if (compParamArity(&p.ty)) |n| {
+            // A constructor never inlines its lambda argument.
+            for (c.primary_params) |*p| if (compParamArity(&p.ty, true)) |n| {
                 try set.put(c.name.name, n);
                 break;
             };

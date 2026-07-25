@@ -255,7 +255,9 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     try stress_argv.appendSlice(a, sources.items);
     try stress_argv.append(a, "--filter=SnapshotStateMapTests.validateEntriesRemoveAll");
     const stress = try runKlio(a, &env, stress_argv.items, 30_000);
-    _ = env.remove("KLIO_GC_STRESS");
+    // `Environ.Map` owns its keys and values and exposes no `remove`; the flag
+    // is value-gated (`!= "0"`), so clearing it is a `put`.
+    try env.put("KLIO_GC_STRESS", "0");
     if (stress.term != .exited or stress.term.exited != 0) {
         std.debug.print(
             "compose_plugin_commontest: GC-stress Map copy failed:\n{s}\n{s}\n",
