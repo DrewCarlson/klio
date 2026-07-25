@@ -1566,8 +1566,21 @@ IR lowering that runs after frontend resolution; klio's runs before.
     needs the static/dynamic emission split: name only on fully-static Call
     emissions (where the selected f IS the executed target), and let dynamic
     forms carry no provisional name — the runtime named-overload pick can
-    bind the wrap to ITS choice's trailing parameter instead. The maps stay
-    until that split is plumbed through the emit forms.
+    bind the wrap to ITS choice's trailing parameter instead. A SECOND
+    attempt (same session) with NO naming at all also failed the battery the
+    same way (`MaterialTheme` object-invoke miss), even after marking the
+    wrap instance as a lambda-shaped arg in the func-side `shapeOfValue`
+    (`is_lambda` for an Instance with a `composableLambdaBlockArity`) — the
+    reject is `named-6` (content unfilled), so the dispatch rejects BEFORE
+    the runtime named pick's lambda-before-pair block can bind the wrap:
+    the next probe is which arm serves the call (`[cno]`/OR-audit) — likely
+    the object-vs-function arbitration tries the OBJECT's invoke first, or
+    the lowering-time static applicability (AST shapes, where the wrap is a
+    .Call and never lambda-shaped) commits a rejecting form. The func-side
+    shape unification (member-side already treats callable instances as
+    lambdas) is probably correct on its own merits and can land separately.
+    The maps stay until this dispatch path is mapped with the tracing
+    already in place.
   - `active_composable_getter_props`: NOT call-side threading — it feeds
     `branchHasComposable`, the does-this-branch-compose classifier driving
     memo wraps and branch brackets. Retiring it means the wrap decision moves
