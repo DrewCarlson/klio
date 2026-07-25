@@ -1731,10 +1731,28 @@ classes fail or time out on the same subsystem. The `hashCode()` instability
 seen while instrumenting (same object, different values per call site) is a
 separate interpreter bug worth its own probe.
 
-Open question for the fix: what inside the interpreted restart lambda under a
-LINK composer receiver classifies as a suspension (or otherwise abandons the
-frame), and why deb89aae's gate re-homing (later reworked to the
-`timeout_launched` promote-at-loop-top form, with the claim/commit logic since
-removed — `drainTimeouts` has no callers) turned it from pass to fail. Probe
-next with `KLIO_CALLVALUE_TRACE`/`KLIO_RESUME_TRACE` on the
-`block.invoke(composer, 1)` dispatch, comparing Gap-arm vs Link-arm.
+Sharpened by a try/catch/finally probe around the restart invoke: in the Link
+arm the lambda enters and neither the catch NOR THE FINALLY ever runs — the
+frame is not unwound at all. Combined with the pump traces (multi-frame parks
+at wake=MAX persisting awaiting an external resume; `resumeInline` lets the
+resumer continue past a re-park), the mechanism is a BOGUS SUSPENSION: some
+call inside the link restart resolves to a suspend path, the chain parks as
+external-resume, no resume ever arrives, and the frames sit persisted while
+the pump completes normally. That is why nothing surfaces anywhere.
+
+Next probe (tooling already in the scratchpad): diff the `[suspend-frame]`
+chains (KLIO_RESUME_TRACE=1) between a Gap/Gap run (the CompositionTest_dbg
+toggle) and a Gap/Link run of `EffectsTests.testCommit3`; the Link-only
+suspension chain names the mis-resolving call at block:instr precision. Then
+root-cause WHY that call dispatches to a suspend variant under a LinkComposer
+receiver — likely the same resolution family as the session's dispatch work
+(a suspend/non-suspend overload pair picked by name where the receiver should
+decide). The `runSafely on kotlin.Function` member-miss (Cancellable.kt, the
+documented wedge shape) fires in both arms and resolves; it is noise here.
+
+Also fix along the way: (a) an interpreter error raised through a
+`resumeInline`d activation must not vanish — it needs a propagation target or
+a loud diagnostic; (b) `hashCode()` returns different values for the same
+instance at different call sites (seen on Recomposer while instrumenting);
+(c) probe-raised StackOverflow still converts to `unresolved global` (earlier
+finding, same silent-conversion family).
