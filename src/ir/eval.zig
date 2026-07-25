@@ -561,6 +561,7 @@ threadlocal var spin_check_counter: u64 = 0;
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
 pub fn dumpFrameChainForDiag() void {
     if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    dumpCurrentFrameParamsForDiag();
     dumpFrameChainForDiagAlways();
 }
 
