@@ -2979,8 +2979,22 @@ pub const Module = struct {
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
-            // Arity alone does not prove expected parameter or return types.
-            // Full structural function evidence arrives through `arg.ty`.
+            const head = staticTypeHead(param.name);
+            if (std.mem.startsWith(u8, head, "Function")) {
+                const suffix = head["Function".len..];
+                const expected = std.fmt.parseInt(usize, suffix, 10) catch
+                    return .unknown;
+                if (arg.lambda_arity) |arity| {
+                    const got: usize = arity;
+                    if (got == expected or (got > 0 and got - 1 == expected) or
+                        (got == 0 and expected == 1))
+                    {
+                        return .compatible;
+                    }
+                }
+            }
+            // Callable arity proves the FunctionN surface, but not a SAM
+            // conversion or an unknown callable's parameter/return types.
             return .unknown;
         }
         return .unknown;
