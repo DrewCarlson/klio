@@ -856,6 +856,8 @@ fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     return switch (v.*) {
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
         .Function => |fv| fv.decl.params.len,
+        // A memo-wrapped composable lambda: its block's user arity.
+        .Instance => if (composableLambdaBlockArity(self, v)) |cli| cli.n else null,
         else => null,
     };
 }
@@ -1280,7 +1282,9 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // param; the gap params fall back to their defaults.
     if (args.items.len < f.params.len and args.items.len != 0) {
         const last_is_fn = f.params.len > 0 and isFunctionType(&f.params[f.params.len - 1].ty);
-        const trailing_is_callable = valueIsCallable(&args.items[args.items.len - 1]);
+        const trailing_is_callable = valueIsCallable(&args.items[args.items.len - 1]) or
+            (args.items[args.items.len - 1] == .Instance and
+                composableLambdaBlockArity(self, &args.items[args.items.len - 1]) != null);
         if (last_is_fn and trailing_is_callable) {
             const lead = args.items.len - 1;
             const last_param = f.params.len - 1;
