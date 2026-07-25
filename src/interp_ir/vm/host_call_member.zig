@@ -4871,6 +4871,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     missTraceMaybe(name);
     if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
+        ir.eval.dumpCurrentFrameParamsForDiag();
         ir.eval.debugPrintFrames();
     }
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });

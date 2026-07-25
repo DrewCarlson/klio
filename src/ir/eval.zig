@@ -623,17 +623,22 @@ pub fn dumpFrameChainForDiagAlways() void {
 /// slot holding an `Int`) directly instead of leaving it to be inferred
 /// from a downstream receiver failure.
 pub fn dumpCurrentFrameParamsForDiag() void {
-    const fr = frame_chain orelse return;
-    const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
-    std.debug.print("[frame-params] {s} ({d} params, {d} bound):\n", .{
-        label, fr.func.params.len, fr.params.items.len,
-    });
-    for (fr.func.params, 0..) |p, i| {
-        if (i >= fr.params.items.len) break;
-        const v = &fr.params.items[i];
-        std.debug.print("  [{d}] {s} = {s} {s}\n", .{
-            i, p.name, @tagName(std.meta.activeTag(v.*)), v.typeFqn(),
+    var cur = frame_chain;
+    var depth: usize = 0;
+    while (cur) |fr| : (cur = fr.gc_link) {
+        if (depth >= 3) break;
+        depth += 1;
+        const label = if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name;
+        std.debug.print("[frame-params] {s} ({d} params, {d} bound):\n", .{
+            label, fr.func.params.len, fr.params.items.len,
         });
+        for (fr.func.params, 0..) |p, i| {
+            if (i >= fr.params.items.len) break;
+            const v = &fr.params.items[i];
+            std.debug.print("  [{d}] {s} = {s} {s}\n", .{
+                i, p.name, @tagName(std.meta.activeTag(v.*)), v.typeFqn(),
+            });
+        }
     }
 }
 
@@ -1683,6 +1688,14 @@ const Frame = struct {
         captures: std.ArrayList(Value),
     ) Allocator.Error!Frame {
         const params = params_in;
+        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null and
+            params.items.len < func.params.len)
+        {
+            const caller = if (frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
+            std.debug.print("[frame-short] fn={s} args={d} params={d} caller={s}\n", .{
+                if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
+            });
+        }
         coerceIntArgsToLong(func, params.items);
         coerceGenericIntPeersToLong(module, func, params.items);
         const regs = try acquireRegs(allocator, func.n_locals);
@@ -3604,6 +3617,13 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvt.arg_names);
             defer allocator.free(names);
+            if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+                std.debug.print("[cvt-instr] exact={} recv={s} n_args={d} caller={s}", .{
+                    cvt.receiver_shape_exact, @tagName(std.meta.activeTag(recv)), arg_values.len, frame.func.name,
+                });
+                for (arg_values) |*av| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(av.*))});
+                std.debug.print("\n", .{});
+            }
             const result = if (cvt.receiver_shape_exact)
                 try host.callValueWithThisExact(allocator, &callee_v, &recv, arg_values, names)
             else

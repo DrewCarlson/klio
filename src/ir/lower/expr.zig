@@ -5944,6 +5944,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
                     const d0 = b.allocReg();
+                    orEmitAudit(b, "cvom_bare_capture", "CallValueOrMember", nm0);
                     try b.push(.{ .CallValueOrMember = .{
                         .dst = d0,
                         .callee = cv,
@@ -5977,6 +5978,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
                 const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
                 const d0 = b.allocReg();
+                orEmitAudit(b, "cvom_bare_local", "CallValueOrMember", nm0);
                 try b.push(.{ .CallValueOrMember = .{
                     .dst = d0,
                     .callee = cv,
@@ -6986,6 +6988,7 @@ fn lowerSelectedLocalOverloadCall(
     if (member_declared) {
         if (try resolveThisForBareCallNoBind(b)) |this_reg| {
             const name = try b.module.internConst(b.allocator, .{ .String = bare });
+            orEmitAudit(b, "cvom_unresolved_bare", "CallValueOrMember", bare);
             try b.push(.{ .CallValueOrMember = .{
                 .dst = dst,
                 .callee = callee_reg,
@@ -7100,6 +7103,7 @@ fn lowerValueInvocation(
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            orEmitAudit(b, "cvom_redirect_member", "CallValueOrMember", name0);
             try b.push(.{ .CallValueOrMember = .{
                 .dst = dst,
                 .callee = callee_reg,
