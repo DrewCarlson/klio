@@ -1869,7 +1869,31 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // getter name. The same rule handles receiver lambdas, where the
             // innermost candidate may instead be a scope-function receiver.
             const enclosing_only_member = !b.hasOwnMember(name0) and b.hasEnclosingMember(name0);
-            if (!is_known_global and !enclosing_only_member) {
+            // Directly inside an inline extension splice the body was written
+            // against the DECLARATION's scope, where the bound receiver's
+            // members shadow any top-level candidate: `size == 0` in
+            // IntArray.isEmpty means the receiver's size no matter what
+            // same-named globals the CALLER's universe declares. The GetField
+            // read keeps its runtime miss-fallback, so a spliced body whose
+            // receiver lacks the name still reaches the global. A NESTED
+            // lambda inside the splice is excluded — its bare names must keep
+            // resolving against the runtime receiver walk (the
+            // `setSpliceRecvTy` contract).
+            const splice_receiver_first = b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
+            if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name0)) {
+                    std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s}\n", .{
+                        name0,
+                        build.currentRealFn() orelse "-",
+                        is_known_global,
+                        b.hasOwnMember(name0),
+                        b.hasEnclosingMember(name0),
+                        b.spliceRecvTy() orelse "-",
+                        b.ownerClass() orelse "-",
+                    });
+                }
+            }
+            if ((!is_known_global or splice_receiver_first) and !enclosing_only_member) {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
                 try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
@@ -3956,6 +3980,7 @@ fn resolveExtensionRefTarget(
 
     if (staticTypeClassId(b, receiver_ty)) |owner| {
         if (b.module.resolveMemberCall(owner, name.name, args, .{
+            .caller_file = name.span.file,
             .lexical_owner = if (b.ownerClass()) |owner_name|
                 b.module.classId(owner_name)
             else
@@ -5148,6 +5173,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         .want = args.len,
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
         .trailing_lambda_arity = trailingLambdaArity(args),
+        .call_file = callee.Path.segments[0].span.file,
     };
     // An explicit `<T>` argument binds a reified parameter, so a reified
     // inline overload of this shape outranks a non-reified `KClass<T>`
@@ -5943,6 +5969,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
                     const d0 = b.allocReg();
+                    orEmitAudit(b, "cvom_bare_capture", "CallValueOrMember", nm0);
                     try b.push(.{ .CallValueOrMember = .{
                         .dst = d0,
                         .callee = cv,
@@ -5976,6 +6003,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const an0 = try internArgNames(b.allocator, b.module, ast_arg_names);
                 const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
                 const d0 = b.allocReg();
+                orEmitAudit(b, "cvom_bare_local", "CallValueOrMember", nm0);
                 try b.push(.{ .CallValueOrMember = .{
                     .dst = d0,
                     .callee = cv,
@@ -6040,6 +6068,21 @@ fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
 fn narrowingRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
     const cur = b.recvTy() orelse b.ownerClass() orelse return null;
     return try recvChainOf(b, cur);
+}
+
+/// Receiver evidence for a bare call inside an inline body. The inline
+/// extension's receiver is the active lexical receiver while its own body is
+/// lowered. A spliced lambda argument restores the caller's receiver tower.
+fn inlineBodyRecvHead(b: *const FuncBuilder) ?[]const u8 {
+    if (b.lambda_splice_resolve == null) {
+        if (b.spliceRecvTy()) |receiver| return receiver;
+    }
+    return b.recvTy() orelse b.ownerClass();
+}
+
+fn inlineBodyRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
+    const receiver = inlineBodyRecvHead(b) orelse return null;
+    return try recvChainOf(b, receiver);
 }
 
 /// `cur` followed by its transitive supertype simple names (nearest
@@ -6168,12 +6211,7 @@ fn inlineTargetForBareCall(
     // The active splice's declared receiver serves as evidence when the
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
-    const evid_chain: ?[]const []const u8 = if (try narrowingRecvChain(b)) |c|
-        c
-    else if (b.spliceRecvTy()) |srt|
-        try recvChainOf(b, srt)
-    else
-        null;
+    const evid_chain = try inlineBodyRecvChain(b);
     // Host-backed default imports suppress the simple-name candidate table,
     // but not an exact FuncId resolved by the scope-aware index below. The
     // source declaration remains the semantic target of an inline call and
@@ -6386,7 +6424,7 @@ fn inlineTargetForBareCall(
         {
             const rt_name = pf.receiver_type.?.name.name;
             var evidenced = false;
-            if (try narrowingRecvChain(b)) |ch| {
+            if (try inlineBodyRecvChain(b)) |ch| {
                 for (ch) |cn| {
                     if (std.mem.eql(u8, cn, rt_name)) {
                         evidenced = true;
@@ -6511,12 +6549,15 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     const recv_mismatch = blk: {
         if (f.receiver_type) |rt| {
             const rn = rt.name.name;
-            const owner_accepts = if (b.ownerClass()) |oc| b.module.classIsOrExtends(oc, rn) else false;
-            const positive = if (b.recvTy() orelse b.ownerClass()) |cur|
+            const in_extension_splice =
+                b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
+            const owner_accepts = !in_extension_splice and
+                (if (b.ownerClass()) |oc| b.module.classIsOrExtends(oc, rn) else false);
+            const positive = if (inlineBodyRecvHead(b)) |cur|
                 (!b.module.classIsOrExtends(cur, rn) and !owner_accepts)
             else
                 false;
-            const member_wins = b.hasEnclosingMember(nm) and
+            const member_wins = !in_extension_splice and b.hasEnclosingMember(nm) and
                 (if (b.ownerClass()) |oc| !std.mem.eql(u8, oc, rn) else false);
             break :blk positive or member_wins;
         }
@@ -6972,6 +7013,7 @@ fn lowerSelectedLocalOverloadCall(
     if (member_declared) {
         if (try resolveThisForBareCallNoBind(b)) |this_reg| {
             const name = try b.module.internConst(b.allocator, .{ .String = bare });
+            orEmitAudit(b, "cvom_unresolved_bare", "CallValueOrMember", bare);
             try b.push(.{ .CallValueOrMember = .{
                 .dst = dst,
                 .callee = callee_reg,
@@ -7086,6 +7128,7 @@ fn lowerValueInvocation(
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+            orEmitAudit(b, "cvom_redirect_member", "CallValueOrMember", name0);
             try b.push(.{ .CallValueOrMember = .{
                 .dst = dst,
                 .callee = callee_reg,
@@ -7729,6 +7772,7 @@ fn staticCallReturnTypeRef(
                 method,
                 shape_set.shapes,
                 .{
+                    .caller_file = bin.span.file,
                     .lexical_owner = lexical_owner,
                     .actual_type_param_bounds = owned_bounds orelse &.{},
                     .receiver_type = receiver,
@@ -7869,6 +7913,7 @@ fn staticCallReturnTypeRef(
                     member.name.name,
                     shape_set.shapes,
                     .{
+                        .caller_file = member.name.span.file,
                         .lexical_owner = lexical_owner,
                         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
                         .receiver_type = recv_ty,
@@ -9310,7 +9355,17 @@ fn selectedCallArgs(module: *const Module, func_id: FuncId, args: []const Expr, 
         return .{ .args = args, .names = names };
     }
     const f = module.funcById(func_id) orelse return .{ .args = args, .names = names };
-    if (selectedCallHasComposerAbi(module, func_id, f)) return .{ .args = args, .names = names };
+    if (selectedCallHasComposerAbi(module, func_id, f)) {
+        compose_pass.compose_audit.threaded_agree += 1;
+        return .{ .args = args, .names = names };
+    }
+    compose_pass.compose_audit.pair_stripped += 1;
+    if (compose_pass.composeAuditOn()) {
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] compose pair-stripped target={s}#{d}\n",
+            .{ f.fqn, func_id.int() },
+        );
+    }
     return .{
         .args = args[0 .. args.len - 2],
         .names = names[0 .. names.len - 2],
@@ -9359,6 +9414,13 @@ fn selectedCallArgsForBuilder(
             }
         }
         if (has_abi and composer != null) {
+            compose_pass.compose_audit.pair_completed += 1;
+            if (compose_pass.composeAuditOn()) {
+                std.debug.print(
+                    "[KLIO_RESOLVE_AUDIT] compose pair-completed target={s}#{d} caller={s}\n",
+                    .{ f.fqn, func_id.int(), build.currentRealFn() orelse "-" },
+                );
+            }
             const completed_args = try b.allocator.alloc(Expr, selected.args.len + 2);
             errdefer b.allocator.free(completed_args);
             @memcpy(completed_args[0..selected.args.len], selected.args);
@@ -10294,6 +10356,7 @@ fn resolvePrivateMemberCall(
     );
     defer owner_type.deinit(b.allocator);
     return b.module.resolveMemberCall(owner_id, name, shapes, .{
+        .caller_file = file,
         .lexical_owner = owner_id,
         .private_only = true,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
@@ -11139,6 +11202,7 @@ fn lowerResolvedMemberCall(
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
     const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
+        .caller_file = name.span.file,
         .lexical_owner = lexical_owner,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
         .receiver_type = ty,
@@ -14115,6 +14179,7 @@ test "shared member resolution selects overloads and dispatch forms" {
     m.classes.items[owner.int()].is_open = true;
     const final_pick = try Add.member(&m, a, owner, "finalPick", "Int", false, false);
     const virtual_pick = try Add.member(&m, a, owner, "virtualPick", "Int", false, true);
+    const lambda_pick = try Add.member(&m, a, owner, "lambdaPick", "Function1", false, false);
     const member_plus = try Add.member(&m, a, owner, "plus", "Int", true, false);
     const nullable_plus = m.nextFuncId();
     const nullable_params = try a.dupe(ir.Param, &.{
@@ -14190,6 +14255,14 @@ test "shared member resolution selects overloads and dispatch forms" {
     const virtual_result = m.resolveMemberCall(owner, "virtualPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, virtual_result.dispatch);
     try testing.expectEqual(virtual_pick, virtual_result.target.?);
+    const lambda_shapes = [_]applicability.ArgShape{.{
+        .is_lambda = true,
+        .lambda_arity = 1,
+        .lambda_is_literal = true,
+    }};
+    const lambda_result = m.resolveMemberCall(owner, "lambdaPick", &lambda_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.direct, lambda_result.dispatch);
+    try testing.expectEqual(lambda_pick, lambda_result.target.?);
     const recv_reg = b.allocReg();
     try b.bind("target", recv_reg);
     try b.setLocalDeclType("target", "Owner");
@@ -14621,6 +14694,26 @@ test "inline extension receiver type remains available during body splicing" {
     const param = argDeclTypeRefLazy(&b, &param_expr) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Float", param.name);
+}
+
+test "inline extension body receiver outranks the enclosing member receiver" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("MeasurePolicy");
+    b.setSpliceRecvTy("List");
+
+    const body_chain = (try inlineBodyRecvChain(&b)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(body_chain);
+    try testing.expectEqualStrings("List", body_chain[0]);
+
+    b.lambda_splice_resolve = .{ .caller_depth = 0, .own_base = 0 };
+    const lambda_chain = (try inlineBodyRecvChain(&b)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(lambda_chain);
+    try testing.expectEqualStrings("MeasurePolicy", lambda_chain[0]);
 }
 
 test "declared member property chains retain static receiver types" {

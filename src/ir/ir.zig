@@ -1224,7 +1224,6 @@ const FuncIdMap = std.AutoHashMap;
 /// resolution BEFORE the module exists (lowering starts inside the build),
 /// parks it here, and the next module created on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
-pub threadlocal var pending_file_packages: ?std.AutoHashMap(FileId, []const u8) = null;
 /// Companion channel: per-expression static TYPE HEADS from typeck
 /// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
 /// applicability engine otherwise reconstructs from AST string probes.
@@ -1409,6 +1408,16 @@ pub const Module = struct {
     class_fqn_cache: std.StringHashMapUnmanaged(ClassId) = .empty,
     class_fqn_cache_n: usize = 0,
     class_fqn_cache_dead: bool = false,
+    /// Lowering-phase simple name → what the per-name class scans would
+    /// find: the `ClassId` `uniqueClassIdBySimpleName` returns (or
+    /// `class_id_ambiguous`), plus whether any class under the name lives
+    /// outside the `kotlin` packages (`staticBuiltinIdentity`'s scan).
+    /// Each class contributes under both its `name` and its FQN's last
+    /// segment. Entries fold many classes, so the stub-claim FQN rewrite
+    /// cannot patch one contribution out; a claim that touches the cached
+    /// range resets the cache for a lazy rebuild.
+    unique_simple_cache: std.StringHashMapUnmanaged(SimpleNameInfo) = .empty,
+    unique_simple_cache_n: usize = 0,
     /// `internConst` dedup: const hash → first `ConstId` with that hash.
     /// A hash collision falls back to the linear scan for that value.
     const_dedup: std.AutoHashMapUnmanaged(u64, ConstId) = .empty,
@@ -1575,6 +1584,9 @@ pub const Module = struct {
     };
 
     pub const MemberResolveCtx = struct {
+        /// Source file containing the call. Together with the declaration
+        /// span this identifies Kotlin `internal` visibility.
+        caller_file: ?FileId = null,
         /// Innermost lexical class whose body contains the call. Visibility
         /// walks its enclosing-class chain.
         lexical_owner: ?ClassId = null,
@@ -1718,11 +1730,6 @@ pub const Module = struct {
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
             pending_eager_calls = null;
-        }
-        if (pending_file_packages) |pfp| {
-            out__.registry.file_packages.deinit();
-            out__.registry.file_packages = pfp;
-            pending_file_packages = null;
         }
         if (pending_eager_types) |pet| {
             out__.eager_types = pet;
@@ -2162,6 +2169,13 @@ pub const Module = struct {
             if (std.mem.startsWith(u8, path, "kotlin.") and
                 std.mem.eql(u8, applicability.simpleName(path), head)) return .yes;
             return .no;
+        }
+        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+            const mut: *Module = @constCast(self);
+            if (mut.topUpUniqueSimpleCache()) {
+                const info = mut.unique_simple_cache.get(head) orelse return .yes;
+                return if (info.non_kotlin) .ambiguous else .yes;
+            } else |_| {}
         }
         for (self.classes.items) |class| {
             if (!std.mem.eql(u8, applicability.simpleName(class.fqn), head) and
@@ -2982,8 +2996,22 @@ pub const Module = struct {
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
-            // Arity alone does not prove expected parameter or return types.
-            // Full structural function evidence arrives through `arg.ty`.
+            const head = staticTypeHead(param.name);
+            if (std.mem.startsWith(u8, head, "Function")) {
+                const suffix = head["Function".len..];
+                const expected = std.fmt.parseInt(usize, suffix, 10) catch
+                    return .unknown;
+                if (arg.lambda_arity) |arity| {
+                    const got: usize = arity;
+                    if (got == expected or (got > 0 and got - 1 == expected) or
+                        (got == 0 and expected == 1))
+                    {
+                        return .compatible;
+                    }
+                }
+            }
+            // Callable arity proves the FunctionN surface, but not a SAM
+            // conversion or an unknown callable's parameter/return types.
             return .unknown;
         }
         return .unknown;
@@ -3383,11 +3411,12 @@ pub const Module = struct {
                         }
                     },
                     .Internal => {
-                        // Module identity is not yet carried by the call-site
-                        // context, so internal visibility cannot prove either
-                        // accessibility or inaccessibility.
-                        unknown_best_tier = @min(unknown_best_tier, tier);
-                        continue;
+                        if (self.internalVisibleFrom(fid, ctx.caller_file)) |visible| {
+                            if (!visible) continue;
+                        } else {
+                            unknown_best_tier = @min(unknown_best_tier, tier);
+                            continue;
+                        }
                     },
                     .Protected => if (!is_member_extension) continue,
                     .Public => {},
@@ -3757,9 +3786,18 @@ pub const Module = struct {
             };
             const score = applicability.applicable(&sig, args, scope) orelse continue;
             if (ds.visibility == .Internal) {
-                any_applicable = true;
-                visibility_unknown = true;
-                continue;
+                const caller_file = ctx.caller_file orelse {
+                    any_applicable = true;
+                    visibility_unknown = true;
+                    continue;
+                };
+                if (self.internalVisibleFrom(fid, caller_file)) |visible| {
+                    if (!visible) continue;
+                } else {
+                    any_applicable = true;
+                    visibility_unknown = true;
+                    continue;
+                }
             }
             switch (self.staticMemberArgsCompatibility(
                 sa,
@@ -3829,6 +3867,21 @@ pub const Module = struct {
         if (f.is_open) return false;
         if (f.is_override and !f.is_final) return false;
         return true;
+    }
+
+    fn internalVisibleFrom(
+        self: *const Module,
+        fid: FuncId,
+        caller_file: FileId,
+    ) ?bool {
+        const caller_module = self.registry.file_modules.get(caller_file);
+        const decl_file = if (self.decl_span.get(fid.int())) |decl|
+            decl.file
+        else
+            self.registry.private_fn_files.get(fid) orelse return null;
+        const declaration_module = self.registry.file_modules.get(decl_file);
+        if (caller_module == null or declaration_module == null) return null;
+        return caller_module.? == declaration_module.?;
     }
 
     /// Reconstruct the owner-scoped index from serialized declaration records.
@@ -4630,6 +4683,7 @@ pub const Module = struct {
             while (cn_it.next()) |list| list.deinit(cg);
             self.class_name_cache.deinit(cg);
             self.class_fqn_cache.deinit(cg);
+            self.unique_simple_cache.deinit(cg);
             self.const_dedup.deinit(cg);
         }
         var it = self.func_name_index.valueIterator();
@@ -4773,6 +4827,13 @@ pub const Module = struct {
     /// Resolve a simple classifier head only when it denotes one class
     /// identity across the whole module universe.
     pub fn uniqueClassIdBySimpleName(self: *const Module, name: []const u8) ?ClassId {
+        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+            const mut: *Module = @constCast(self);
+            if (mut.topUpUniqueSimpleCache()) {
+                const info = mut.unique_simple_cache.get(name) orelse return null;
+                return if (info.id == class_id_ambiguous) null else info.id;
+            } else |_| {}
+        }
         var found: ?ClassId = null;
         for (self.classes.items) |class| {
             if (!std.mem.eql(u8, class.name, name) and
@@ -4785,6 +4846,39 @@ pub const Module = struct {
             }
         }
         return found;
+    }
+
+    fn topUpUniqueSimpleCache(self: *Module) Allocator.Error!void {
+        const gpa = self.lookup_cache_gpa.?;
+        while (self.unique_simple_cache_n < self.classes.items.len) : (self.unique_simple_cache_n += 1) {
+            const c = self.classes.items[self.unique_simple_cache_n];
+            const non_kotlin = !std.mem.eql(u8, c.package, "kotlin") and
+                !std.mem.startsWith(u8, c.package, "kotlin.");
+            try self.uniqueSimpleInsert(gpa, c.name, c.id, c.fqn, non_kotlin);
+            const seg = applicability.simpleName(c.fqn);
+            if (!std.mem.eql(u8, seg, c.name)) {
+                try self.uniqueSimpleInsert(gpa, seg, c.id, c.fqn, non_kotlin);
+            }
+        }
+    }
+
+    /// Fold one class into the simple-name cache under `key`, replicating
+    /// the scans exactly: the first class wins the unique id; a later class
+    /// conflicts only when both its id and its FQN differ from the winner's;
+    /// one class outside the `kotlin` packages taints the name for
+    /// `staticBuiltinIdentity`.
+    fn uniqueSimpleInsert(self: *Module, gpa: Allocator, key: []const u8, id: ClassId, fqn: []const u8, non_kotlin: bool) Allocator.Error!void {
+        const gop = try self.unique_simple_cache.getOrPut(gpa, key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .id = id, .non_kotlin = non_kotlin };
+            return;
+        }
+        gop.value_ptr.non_kotlin = gop.value_ptr.non_kotlin or non_kotlin;
+        const cur = gop.value_ptr.id;
+        if (cur == class_id_ambiguous or cur == id) return;
+        if (!std.mem.eql(u8, self.classes.items[cur.int()].fqn, fqn)) {
+            gop.value_ptr.id = class_id_ambiguous;
+        }
     }
 
     /// The `ClassId`s registered under simple `name`, in `class_index`
@@ -6897,6 +6991,7 @@ pub const Module = struct {
             }
             const owner = self.staticTypeClassId(receiver).?;
             if (self.resolveMemberCall(owner, name, args, .{
+                .caller_file = caller_file,
                 .lexical_owner = lexical_owner,
                 .actual_type_param_bounds = bounds,
                 .receiver_type = receiver,
@@ -7412,6 +7507,8 @@ pub const Module = struct {
     /// returns null so an ambiguous FQN never silently binds the wrong class.
     const class_id_ambiguous: ClassId = @enumFromInt(std.math.maxInt(u32));
 
+    const SimpleNameInfo = struct { id: ClassId, non_kotlin: bool };
+
     /// The fully-qualified name of the class with id `id`, or null if out of range.
     pub fn classFqnById(self: *const Module, id: ClassId) ?[]const u8 {
         const c = idGet(Class, self.classes.items, id.int()) orelse return null;
@@ -7492,6 +7589,10 @@ pub const Module = struct {
             insertFqnPrefixes(&self.pkg_head_cache, gpa, new_fqn) catch {
                 self.pkg_head_cache_dead = true;
             };
+        }
+        if (id.int() < self.unique_simple_cache_n) {
+            self.unique_simple_cache.clearRetainingCapacity();
+            self.unique_simple_cache_n = 0;
         }
     }
 
@@ -7944,6 +8045,10 @@ pub const ModuleRegistry = struct {
     /// follow the span's file — its package and imports — not the
     /// recipient function's package.
     file_packages: std.AutoHashMap(FileId, []const u8),
+    /// Kotlin compilation-module identity for each source file. `internal`
+    /// declarations are visible across files carrying the same identity and
+    /// inaccessible across dependency/program boundaries.
+    file_modules: std.AutoHashMap(FileId, u32),
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
@@ -8059,6 +8164,7 @@ pub const ModuleRegistry = struct {
             .import_aliases = std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))).init(allocator),
             .import_wildcards = std.AutoHashMap(FileId, std.ArrayList([]const u8)).init(allocator),
             .file_packages = std.AutoHashMap(FileId, []const u8).init(allocator),
+            .file_modules = std.AutoHashMap(FileId, u32).init(allocator),
             .nested_object_aliases = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
@@ -8165,6 +8271,7 @@ pub const ModuleRegistry = struct {
             self.import_wildcards.deinit();
         }
         self.file_packages.deinit();
+        self.file_modules.deinit();
         {
             var it = self.nested_object_aliases.valueIterator();
             while (it.next()) |inner| inner.deinit();
@@ -8319,6 +8426,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.file_packages.iterator();
             while (it.next()) |e| try out.file_packages.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.file_modules.iterator();
+            while (it.next()) |e| try out.file_modules.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.nested_object_aliases.iterator();
@@ -8758,6 +8869,99 @@ test "member resolution uses declaration-owner visibility" {
         any_pick,
         m.resolveMemberCall(base, "identityPick", &kotlin_string, .{}).target.?,
     );
+}
+
+test "internal member and extension visibility follows compilation modules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const declaration_file = FileId.from(10);
+    const same_module_file = FileId.from(11);
+    const other_module_file = FileId.from(12);
+    try m.registry.file_modules.put(declaration_file, 4);
+    try m.registry.file_modules.put(same_module_file, 4);
+    try m.registry.file_modules.put(other_module_file, 5);
+    try m.registry.file_packages.put(declaration_file, "sample");
+    try m.registry.file_packages.put(same_module_file, "sample");
+    try m.registry.file_packages.put(other_module_file, "sample");
+
+    const owner = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Scope",
+        .fqn = "sample.Scope",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    const member = try pushTestFuncOpts(
+        &m,
+        a,
+        "walk",
+        "sample.Scope.walk",
+        "sample",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[member.int()].kind = .instance_method;
+    try m.decl_sigs.put(member.int(), .{
+        .enclosing_class = owner,
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .instance_method,
+        .visibility = .Internal,
+        .has_body = true,
+    });
+    try m.decl_span.put(member.int(), Span.init(declaration_file, 0, 1));
+    try m.registerMemberDecl(a, "sample.Scope", "walk", member);
+
+    const extension = try pushTestFuncOpts(
+        &m,
+        a,
+        "tag",
+        "sample.tag",
+        "sample",
+        0,
+        .{ .extension = true },
+    );
+    m.funcs.items[extension.int()].kind = .top_level_extension;
+    try m.decl_sigs.put(extension.int(), .{
+        .receiver_ty = .{ .name = "String", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .visibility = .Internal,
+        .has_body = true,
+    });
+    try m.decl_span.put(extension.int(), Span.init(declaration_file, 2, 3));
+    try m.rebuildFuncNameIndex(a);
+
+    try testing.expectEqual(
+        member,
+        m.resolveMemberCall(owner, "walk", &.{}, .{
+            .caller_file = same_module_file,
+        }).target.?,
+    );
+    try testing.expect(!m.resolveMemberCall(owner, "walk", &.{}, .{
+        .caller_file = other_module_file,
+    }).applicable);
+    try testing.expect(m.resolveMemberCall(owner, "walk", &.{}, .{}).target == null);
+
+    const receiver = TypeRef{ .name = "String", .nullable = false, .args = &.{} };
+    try testing.expectEqual(
+        extension,
+        m.resolveExtensionCall("tag", receiver, &.{}, .{
+            .caller_file = same_module_file,
+            .caller_package = "sample",
+        }).target.?,
+    );
+    try testing.expect(!m.resolveExtensionCall("tag", receiver, &.{}, .{
+        .caller_file = other_module_file,
+        .caller_package = "sample",
+    }).applicable);
 }
 
 test "member resolution separates class and caller function bounds" {
@@ -12563,6 +12767,24 @@ fn pushTestClass(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, pa
         .companion = null,
         .supertypes = &.{},
     });
+}
+
+test "uniqueClassIdBySimpleName caches without changing scan semantics" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const solo = try pushTestClass(&m, a, "Solo", "lib.Solo", "lib");
+    const inner = try pushTestClass(&m, a, "Outer$Inner", "lib.Outer.Inner", "lib");
+    // Unique names resolve, via both the class name and the FQN's last segment.
+    try testing.expectEqual(solo.int(), m.uniqueClassIdBySimpleName("Solo").?.int());
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Outer$Inner").?.int());
+    try testing.expect(m.uniqueClassIdBySimpleName("Missing") == null);
+    // A class appended after the first lookup is visible to the next one,
+    // and a second identity under the same simple name makes it ambiguous.
+    _ = try pushTestClass(&m, a, "Solo", "app.Solo", "app");
+    try testing.expect(m.uniqueClassIdBySimpleName("Solo") == null);
+    try testing.expectEqual(inner.int(), m.uniqueClassIdBySimpleName("Inner").?.int());
 }
 
 test "classIdIndexed prefers the caller's own package on a collision" {

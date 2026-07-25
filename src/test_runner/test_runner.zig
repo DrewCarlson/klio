@@ -416,18 +416,23 @@ fn failureDetail(st: *RunState, oc: interp_ir.CallOutcome) ?[]const u8 {
     };
 }
 
-/// Per-test wall cap in seconds from `KLIO_TEST_WALL_CAP` (0/unset = off).
-/// A wedged test (a genuine deadlock, a spinning virtual-clock loop) then
-/// fails with "test wall-clock deadline exceeded" instead of hanging every
-/// test after it in the class.
+/// Per-test wall cap in seconds. A wedged test (a genuine deadlock, a
+/// lost-wakeup park, a spinning virtual-clock loop) then fails with
+/// "test wall-clock deadline exceeded" instead of hanging the run
+/// forever. BOUNDED BY DEFAULT: an unset `KLIO_TEST_WALL_CAP` means 300 s
+/// (generous enough for the interpreter-speed floor of the stress tests)
+/// — a `klio test` invocation must never be able to hang silently (an
+/// unwatched wedged child sat for 24 minutes at 0% doing nothing).
+/// `KLIO_TEST_WALL_CAP=0` disables the cap explicitly for genuinely
+/// unbounded workloads.
 fn wallCapSeconds() i64 {
     const S = struct {
         var cached: ?i64 = null;
     };
     if (S.cached) |v| return v;
     const v: i64 = blk: {
-        const s = runtime.getenvSlice("KLIO_TEST_WALL_CAP") orelse break :blk 0;
-        break :blk std.fmt.parseInt(i64, s, 10) catch 0;
+        const s = runtime.getenvSlice("KLIO_TEST_WALL_CAP") orelse break :blk 300;
+        break :blk std.fmt.parseInt(i64, s, 10) catch 300;
     };
     S.cached = v;
     return v;

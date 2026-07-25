@@ -143,6 +143,70 @@ fn boundReferenceFunc(callee: *const Value) ?FuncId {
 }
 
 /// Single callable-value dispatch over the value variants.
+/// Resolve a plain positional exact-arity closure invocation into a ready
+/// flat-call request, or null when any of the value-call ladder's special
+/// shapes applies (receiver rebind, defaults padding, varargs, resolved
+/// native form, composer arg completion) — those fall back to the recursive
+/// path unchanged. Mirrors the `IrClosure` branch of `callValue` up to its
+/// `evalWithCapturesChained` terminal, including the ambient-composer push,
+/// which the flat activation's teardown undoes via `flatCallClosed`.
+pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    const id = callee.IrClosure.id;
+    const captures = callee.IrClosure.captures;
+    const info = self.closures.get(@intCast(id)) orelse return null;
+    if (args.len != info.n_params) return null;
+    const module: *const Module = blk: {
+        if (info.module) |m| break :blk m;
+        // Pointer read only: the host's own reference keeps the main module
+        // alive for the whole run, so the activation may hold the pointer.
+        const g = self.module.clone();
+        defer g.deinit();
+        break :blk g.asPtr();
+    };
+    const func = module.funcById(info.body_func) orelse return null;
+    for (func.params) |*p| {
+        if (p.is_vararg) return null;
+    }
+    if (info.module == null) {
+        host_call_func.linkAuditCheck(self, module, func.id, func, args);
+        if (host_call_func.resolvedNativeForm(self, func.id)) |_| return null;
+    }
+    var call_args: std.ArrayList(Value) = .empty;
+    try call_args.appendSlice(allocator, args);
+    var capture_values: std.ArrayList(Value) = .empty;
+    {
+        const g = captures.borrow();
+        defer g.deinit();
+        try capture_values.appendSlice(allocator, g.get().*);
+    }
+    vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
+    var composer_pushed = false;
+    if (host_call_func.composePluginEnabled()) {
+        if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+            compose.pushComposer(c);
+            composer_pushed = true;
+        }
+    }
+    return .{
+        .func = func,
+        .run_module = module,
+        .owning = info.module,
+        .args = call_args,
+        .captures = capture_values,
+        .chain = info.chain,
+        .closure_id = @intCast(id),
+        .composer_pushed = composer_pushed,
+        .dst = undefined,
+    };
+}
+
+/// Flat-activation close hook: unwind the ambient-composer push
+/// `prepareClosureFlatCall` applied for the call's duration.
+pub fn flatCallClosed(self: *VmHost) void {
+    _ = self;
+    compose.popComposer();
+}
+
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
     // site, so a function-typed one arrives here as the cell, not the closure.

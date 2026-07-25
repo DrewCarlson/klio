@@ -4842,6 +4842,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (cid) |c| return newInstanceById(self, allocator, c, args, null);
             }
         }
+        if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
         const g = receiver.Instance.borrow();
         defer g.deinit();
         const cg = g.get().class.borrow();
@@ -4868,12 +4869,120 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
     missTraceMaybe(name);
     if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
+        ir.eval.dumpCurrentFrameParamsForDiag();
         ir.eval.debugPrintFrames();
     }
     return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, receiver.typeFqn() });
+}
+
+/// Compose ABI completion at the member-miss tails. A bare sibling call to
+/// a `@Composable` METHOD keeps its source argument shape (the pass defers
+/// bare calls to resolution), and a runtime-dispatched member has no
+/// lowering-side completion — so the threaded method's trailing
+/// `($composer, $changed)` params go unsupplied and every overload
+/// declines. When an ambient composer exists, retry the whole dispatch once
+/// with the pair appended, exactly as the closure invoke path completes a
+/// typeless composable value call. Miss-tail only: a call that resolved
+/// without the pair is never touched, and the strict receiver probes (whose
+/// misses are an expected part of the bare-name walk) never retry.
+/// Whether the receiver's class hierarchy declares a method `name` whose
+/// params end with the generated composer pair and whose user arity fits
+/// `args.len + 2` — the proof that the miss is an unthreaded call to a
+/// threaded composable member, not an arbitration probe that must stay
+/// missed so its caller's next arm (an extension, a global) can win.
+fn receiverHasThreadedMember(self: *VmHost, receiver: *const Value, name: []const u8, nargs: usize) bool {
+    if (receiver.* != .Instance) return false;
+    const recv_name = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().name;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    // Walk the receiver's class chain by simple name (methods live on the
+    // class, not in the top-level function index). Bounded like the
+    // dispatch walk itself.
+    var cur: ?[]const u8 = recv_name;
+    var hops: usize = 0;
+    while (cur) |cn| : (hops += 1) {
+        if (hops > 32) break;
+        const cid = m.uniqueClassIdBySimpleName(cn) orelse break;
+        const class = &m.classes.items[cid.int()];
+        for (class.methods) |fid| {
+            const f = m.funcById(fid) orelse continue;
+            if (!std.mem.eql(u8, f.name, name)) continue;
+            if (f.params.len < 3) continue;
+            if (!std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) continue;
+            if (!std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed")) continue;
+            const skip: usize = if (std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            // At least the pair beyond the supplied args; a LARGER gap is a
+            // defaulted middle (CardDefaults.cardElevation's five Dp
+            // defaults) — the retried dispatch's own applicability check
+            // still validates that every unfilled param defaults.
+            if (f.params.len - skip < nargs + 2) continue;
+            return true;
+        }
+        const supers = m.registry.class_super_names.get(cn) orelse break;
+        cur = if (supers.len != 0) supers[0] else null;
+    }
+    // A threaded composable EXTENSION reached by member syntax
+    // (`colorScheme.applyTonalElevation(...)`): same proof over the
+    // top-level index, with the declared receiver checked against the
+    // receiver's hierarchy.
+    for (m.funcsBySimpleName(name)) |fid| {
+        const f = m.funcById(fid) orelse continue;
+        if (f.params.len < 3) continue;
+        if (!std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) continue;
+        if (!std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed")) continue;
+        if (f.params.len - 1 < nargs + 2) continue;
+        const recv_head = applicability.simpleName(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
+        if (m.classIsOrExtends(recv_name, recv_head)) return true;
+    }
+    return false;
+}
+
+fn composeMemberPairRetry(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    _ = static_recv;
+    _ = no_ext;
+    _ = declared_recv;
+    if (strict_ext or !host_call_func.composePluginEnabled()) return null;
+    const comp = compose.currentComposer() orelse return null;
+    // A retried dispatch already carries the pair this completion appended;
+    // recognize it by the ambient composer's identity in the second-to-last
+    // slot rather than a flag — a flag's lifetime would span the retried
+    // callee's whole EXECUTION and suppress the completion for every nested
+    // call in its body (the private-member fixture's `inner` inside the
+    // completed `outer`).
+    if (args.len >= 2 and args[args.len - 1] == .Int and
+        args[args.len - 2] == .Instance and comp == .Instance and
+        ObjRef(InstanceData).ptrEq(args[args.len - 2].Instance, comp.Instance)) return null;
+    if (!receiverHasThreadedMember(self, receiver, name, args.len)) return null;
+    const buf = try allocator.alloc(Value, args.len + 2);
+    defer if (runtime.freeScratch()) allocator.free(buf);
+    @memcpy(buf[0..args.len], args);
+    buf[args.len] = comp;
+    buf[args.len + 1] = .{ .Int = 0 };
+    // The pair binds BY NAME: a threaded member may declare defaulted
+    // params between the user args and the pair (CardDefaults.cardElevation's
+    // five Dp defaults) — appended positionally the composer would land in
+    // the first defaulted slot. The named walk reorders and default-fills.
+    const names_buf = try allocator.alloc(?[]const u8, args.len + 2);
+    defer if (runtime.freeScratch()) allocator.free(names_buf);
+    for (names_buf[0..args.len]) |*nn| nn.* = null;
+    names_buf[args.len] = "$composer";
+    names_buf[args.len + 1] = "$changed";
+    const r = try callMemberNamed(self, allocator, receiver, name, buf, names_buf);
+    if (r == .ok) return r;
+    if (r == .err and r.err != .Unimplemented) return r;
+    return null;
 }
 
 /// `KLIO_MISS_TRACE=<name>` diagnostic: when a call_member dispatch for
@@ -8334,6 +8443,23 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             try seen.put(dedup_key, {});
             if (ir_class) |irc| {
                 cur_name = irc.name;
+                if (missTraceWant(name)) {
+                    var matched: usize = 0;
+                    for (irc.methods) |fid| {
+                        if (funcAt(mod, fid)) |f| {
+                            if (std.mem.eql(u8, f.name, name)) matched += 1;
+                        }
+                    }
+                    std.debug.print("[rim] class={s} cid={?} methods={d} named={d} static_recv={s} static_up_ready={} in_up={}\n", .{
+                        irc.fqn,
+                        if (item.cid) |c| c.int() else null,
+                        irc.methods.len,
+                        matched,
+                        static_recv orelse "-",
+                        static_up_ready,
+                        static_up.contains(irc.fqn),
+                    });
+                }
                 // Gather candidates named `name`. A `@LowPriorityInOverloadResolution`
                 // / `@Deprecated(level = ERROR)` member is a guard stub that only
                 // applies when no ordinary candidate (member or top-level extension)
@@ -8409,6 +8535,14 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                             try candidates.append(allocator, f);
                         }
                     }
+                }
+                if (missTraceWant(name)) {
+                    std.debug.print("[rim2] class={s} collected={d} picked={} args={d}\n", .{
+                        irc.fqn,
+                        candidates.items.len,
+                        pickMethodOverload(self, mod, candidates.items, args) != null,
+                        args.len,
+                    });
                 }
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
@@ -10773,12 +10907,28 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             const smg = self.module.borrow();
             defer smg.deinit();
             const smod = smg.get();
+            // The file tier orders TOP-LEVEL declarations only. A MEMBER
+            // extension's scope level is its owner's position in the
+            // implicit-receiver chain (the scorer's owner rank), not its
+            // declaring file: `with(focusableNode) { applySemantics() }`
+            // written in Clickable.kt must reach FocusableNode's override
+            // in Focusable.kt over the enclosing node's own same-file
+            // member — filtering by file inverted that into infinite
+            // recursion. Skip the tier when every surviving candidate is
+            // a member extension.
+            var all_member_ext = true;
+            for (candidates.items) |c| {
+                if (!isMemberExt(smod, c.fid)) {
+                    all_member_ext = false;
+                    break;
+                }
+            }
             var same_file: usize = 0;
             for (candidates.items) |c| {
                 const ds = smod.decl_span.get(c.fid.int()) orelse continue;
                 if (ds.file.int() == sf.int()) same_file += 1;
             }
-            if (same_file != 0 and same_file != candidates.items.len) {
+            if (!all_member_ext and same_file != 0 and same_file != candidates.items.len) {
                 var filtered: std.ArrayList(Candidate) = .empty;
                 for (candidates.items) |c| {
                     const ds = smod.decl_span.get(c.fid.int()) orelse continue;
@@ -11113,7 +11263,18 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
         // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver
         // specificity, the numeric score, owner rank, parameter specificity,
         // and the stable lowest-FuncId discriminator.
-        const key = (applicability.applicable(&all_sigs[idx], shapes, scope) orelse continue).ext_key.?;
+        const applied = applicability.applicable(&all_sigs[idx], shapes, scope);
+        if (candidates.len > 0 and missTraceWant(candidates[0].func.name)) {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const owner = mg.get().registry.member_ext_owner_class.get(c.fid) orelse "-";
+            if (applied) |ap| {
+                std.debug.print("[extscore] fid={d} owner={s} key={any}\n", .{ c.fid.int(), owner, ap.ext_key.? });
+            } else {
+                std.debug.print("[extscore] fid={d} owner={s} INAPPLICABLE\n", .{ c.fid.int(), owner });
+            }
+        }
+        const key = (applied orelse continue).ext_key.?;
         if (check_inv and best != null and std.mem.eql(i32, &key, &best_key)) {
             tied.append(self.allocator, c.func) catch {};
         }
@@ -11808,16 +11969,10 @@ fn memberApplicableForWalkNamed(self: *VmHost, f: *const Func, args: []const Val
                 }
             }
             if (param == null) {
-                // The compose lowering appends its generated `$composer`/
-                // `$changed` markers from a program-wide name oracle that cannot
-                // see the receiver type, so they also land on same-named
-                // NON-composable members (`CardColors.containerColor(enabled)`
-                // beside a composable `containerColor` on an unrelated colors
-                // type). The declaration is the authority: a candidate that does
-                // not declare the pair is not a composable target and the marker
-                // is not one of its arguments. A source-level named argument that
-                // names no parameter is still inapplicable.
-                if (applicability.isGeneratedComposeArg(nm)) continue;
+                // A named argument that names no parameter is inapplicable —
+                // the generated pair included, now that the pre-resolution
+                // threading oracle is retired and a pair only reaches calls
+                // whose resolved target (or completion probe) declares it.
                 return false;
             }
         } else if (i == args.len - 1 and isCallable(a) and effective.len > 0 and

@@ -676,7 +676,11 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
     return .{
         .runtime_class = overload_match.runtimeHead(v),
         .is_null = v.* == .Null,
-        .is_lambda = valueIsCallable(v),
+        // A ComposableLambdaImpl wrap is a callable value with a known block
+        // arity — rank it as a lambda so the trailing-callable conventions
+        // can bind it to a sink parameter across defaulted middles, exactly
+        // as the member-side shape already does via isCallable.
+        .is_lambda = valueIsCallable(v) or (v.* == .Instance and arity != null),
         .lambda_arity = arity,
         .lambda_is_literal = arity_authoritative,
         .func_typed = std.mem.startsWith(u8, v.typeFqn(), "kotlin.Function"),
@@ -852,6 +856,8 @@ fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     return switch (v.*) {
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
         .Function => |fv| fv.decl.params.len,
+        // A memo-wrapped composable lambda: its block's user arity.
+        .Instance => if (composableLambdaBlockArity(self, v)) |cli| cli.n else null,
         else => null,
     };
 }
@@ -1276,7 +1282,9 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // param; the gap params fall back to their defaults.
     if (args.items.len < f.params.len and args.items.len != 0) {
         const last_is_fn = f.params.len > 0 and isFunctionType(&f.params[f.params.len - 1].ty);
-        const trailing_is_callable = valueIsCallable(&args.items[args.items.len - 1]);
+        const trailing_is_callable = valueIsCallable(&args.items[args.items.len - 1]) or
+            (args.items[args.items.len - 1] == .Instance and
+                composableLambdaBlockArity(self, &args.items[args.items.len - 1]) != null);
         if (last_is_fn and trailing_is_callable) {
             const lead = args.items.len - 1;
             const last_param = f.params.len - 1;
@@ -1388,6 +1396,20 @@ fn composableEval(
     f: *const Func,
     packed_args: std.ArrayList(Value),
 ) Allocator.Error!EvalResult {
+    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (std.mem.eql(u8, w, f.name)) {
+            std.debug.print("[fn-entry] {s}#{d}:", .{ f.fqn, f.id.int() });
+            for (f.params, 0..) |p, i| {
+                if (i >= packed_args.items.len) break;
+                const v = &packed_args.items[i];
+                std.debug.print(" {s}={s}", .{ p.name, @tagName(std.meta.activeTag(v.*)) });
+                if (v.* == .Int) std.debug.print(":{d}", .{v.Int});
+                if (v.* == .Long) std.debug.print(":{d}", .{v.Long});
+                if (v.* == .ULong) std.debug.print(":{x}", .{v.ULong});
+            }
+            std.debug.print("\n", .{});
+        }
+    }
     // Plugin path: the pass already lowered composition into the body; run it
     // directly with no implicit-composer bracketing — but publish the threaded
     // `$composer` argument as the ambient composer for the call. A
@@ -2191,11 +2213,17 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             // receiver chain. The terminal global leg may execute only plain
             // package-scope functions; never reinterpret a receiver-taking
             // declaration as a receiverless global call.
-            if (bounded and cf.kind != .plain) continue;
+            if (bounded and cf.kind != .plain) {
+                if (ntrace) std.debug.print("[cno] {s} cand={d} kind-skip {s}\n", .{ name, cand.int(), @tagName(cf.kind) });
+                continue;
+            }
             if (bounded) {
                 const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
                 candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
-                if (candidate_tier >= ir.Module.other_package_tier) continue;
+                if (candidate_tier >= ir.Module.other_package_tier) {
+                    if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={?}\n", .{ name, cand.int(), candidate_tier, scope_pkg, if (caller_file) |cfl| cfl.int() else null });
+                    continue;
+                }
             }
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
                 host_call_member.builtinReceiverDisproven(&args[0], cf.params[0].ty.name)) continue;
@@ -2218,9 +2246,10 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         const pts = positionalPoints(self, eff, cand, shapes, scope);
         if (ntrace) {
             const dbg_sig = sigViewOfFunc(self, eff, cand, shapes.len);
-            std.debug.print("[cno] {s} cand={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
+            std.debug.print("[cno] {s} cand={d} nargs={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
                 name,
                 cand.int(),
+                shapes.len,
                 pts,
                 if (dbg_sig) |s| s.params.len else null,
                 if (dbg_sig) |s| s.has_body else null,

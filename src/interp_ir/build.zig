@@ -439,7 +439,17 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
     defer func_fqn.deinit();
     var decl_pkg = SpanStrMap.init(allocator);
     defer decl_pkg.deinit();
-    return buildModuleWithOverrides(allocator, file, &fqn, &func_fqn, &decl_pkg, null, null);
+    return buildModuleWithOverrides(
+        allocator,
+        file,
+        &fqn,
+        &func_fqn,
+        &decl_pkg,
+        null,
+        null,
+        null,
+        null,
+    );
 }
 
 /// Drive `buildModule` against multiple parsed files. All declarations
@@ -460,10 +470,10 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
 fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
-        receiver_names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
         factories: std.StringHashMap(void),
         sink_arity: std.StringHashMap(u8),
+        sink_param_arity: std.StringHashMap(std.StringHashMap(u8)),
         comp_props: std.StringHashMap(void),
         comp_getter_props: std.StringHashMap(void),
         inline_fns: std.StringHashMap(void),
@@ -473,10 +483,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
 
         fn deinit(self: *@This()) void {
             self.names.deinit();
-            self.receiver_names.deinit();
             self.sinks.deinit();
             self.factories.deinit();
             self.sink_arity.deinit();
+            compose_pass.deinitSinkParamArity(&self.sink_param_arity);
             self.comp_props.deinit();
             self.comp_getter_props.deinit();
             self.inline_fns.deinit();
@@ -488,10 +498,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     var compose_maps: ?ComposeMaps = null;
     defer {
         compose_pass.active_composable_names = null;
-        compose_pass.active_composable_receiver_names = null;
         compose_pass.active_composable_sinks = null;
         compose_pass.active_factories = null;
         compose_pass.active_sink_arity = null;
+        compose_pass.active_sink_param_arity = null;
         compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = null;
@@ -513,7 +523,21 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     defer decl_pkg.deinit();
 
     var file_pkgs = std.AutoHashMap(ir.FileId, []const u8).init(allocator);
+    defer file_pkgs.deinit();
+    var file_modules = std.AutoHashMap(ir.FileId, u32).init(allocator);
+    defer file_modules.deinit();
+    const compilation_module: u32 = if (base) |bs| blk: {
+        const module_guard = bs.built.module.borrow();
+        defer module_guard.deinit();
+        var next: u32 = 0;
+        var module_it = module_guard.get().registry.file_modules.valueIterator();
+        while (module_it.next()) |module_id| {
+            next = @max(next, module_id.* +| 1);
+        }
+        break :blk next;
+    } else 0;
     for (files) |*f| {
+        try file_modules.put(f.span.file, compilation_module);
         const prefix = try packagePrefix(allocator, f.package);
         if (prefix.len != 0) {
             try file_pkgs.put(f.span.file, prefix);
@@ -546,14 +570,14 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
-        var receiver_names = try compose_pass.collectComposableReceiverNames(allocator, decls.items);
-        defer receiver_names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
         var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
         defer factories.deinit();
         var sink_arity = try compose_pass.collectComposableSinkArity(allocator, decls.items);
         defer sink_arity.deinit();
+        var sink_param_arity = try compose_pass.collectComposableSinkParamArity(allocator, decls.items);
+        defer compose_pass.deinitSinkParamArity(&sink_param_arity);
         var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
         defer comp_props.deinit();
         var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
@@ -569,10 +593,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             // every collector below must read the decoded section instead.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
-            try composeBaseReceiverNames(&receiver_names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
             try composeBaseFactories(&factories, base_decls);
             try composeBaseSinkArity(&sink_arity, base_decls);
+            try composeBaseSinkParamArity(&sink_param_arity, allocator, base_decls);
             try composeBaseComposableProps(&comp_props, base_decls);
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
@@ -587,6 +611,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_factories = null;
         compose_pass.active_sink_arity = &sink_arity;
         defer compose_pass.active_sink_arity = null;
+        compose_pass.active_sink_param_arity = &sink_param_arity;
+        defer compose_pass.active_sink_param_arity = null;
         compose_pass.active_composable_props = &comp_props;
         defer compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = &comp_getter_props;
@@ -597,8 +623,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer compose_pass.active_sink_last_param = null;
         compose_pass.active_sink_content_reach = &sink_content_reach;
         defer compose_pass.active_sink_content_reach = null;
-        compose_pass.active_composable_receiver_names = &receiver_names;
-        defer compose_pass.active_composable_receiver_names = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -610,10 +634,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
         compose_maps = .{
             .names = names,
-            .receiver_names = receiver_names,
             .sinks = sinks,
             .factories = factories,
             .sink_arity = sink_arity,
+            .sink_param_arity = sink_param_arity,
             .comp_props = comp_props,
             .comp_getter_props = comp_getter_props,
             .inline_fns = inline_fns,
@@ -622,10 +646,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             .stability = stability,
         };
         names = std.StringHashMap(void).init(allocator);
-        receiver_names = std.StringHashMap(void).init(allocator);
         sinks = std.StringHashMap(void).init(allocator);
         factories = std.StringHashMap(void).init(allocator);
         sink_arity = std.StringHashMap(u8).init(allocator);
+        sink_param_arity = std.StringHashMap(std.StringHashMap(u8)).init(allocator);
         comp_props = std.StringHashMap(void).init(allocator);
         comp_getter_props = std.StringHashMap(void).init(allocator);
         inline_fns = std.StringHashMap(void).init(allocator);
@@ -635,10 +659,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     }
     if (compose_maps) |*maps| {
         compose_pass.active_composable_names = &maps.names;
-        compose_pass.active_composable_receiver_names = &maps.receiver_names;
         compose_pass.active_composable_sinks = &maps.sinks;
         compose_pass.active_factories = &maps.factories;
         compose_pass.active_sink_arity = &maps.sink_arity;
+        compose_pass.active_sink_param_arity = &maps.sink_param_arity;
         compose_pass.active_composable_props = &maps.comp_props;
         compose_pass.active_composable_getter_props = &maps.comp_getter_props;
         compose_pass.active_inline_fns = &maps.inline_fns;
@@ -934,8 +958,25 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         .decls = try decls.toOwnedSlice(allocator),
         .span = Span.init(span.FileId.from(0), 0, 0),
     };
-    ir.pending_file_packages = file_pkgs;
-    return buildModuleWithOverrides(allocator, &combined, &fqn_overrides, &func_fqn_overrides, &decl_pkg, base, out_lifted);
+    const built = try buildModuleWithOverrides(
+        allocator,
+        &combined,
+        &fqn_overrides,
+        &func_fqn_overrides,
+        &decl_pkg,
+        &file_pkgs,
+        &file_modules,
+        base,
+        out_lifted,
+    );
+    if (composePluginEnabled() and compose_pass.composeAuditOn()) {
+        const ca = &compose_pass.compose_audit;
+        std.debug.print(
+            "[KLIO_RESOLVE_AUDIT] compose summary (cumulative): agree={d} pair-stripped={d} pair-completed={d} lambda-arity={d} disagreements={d}\n",
+            .{ ca.threaded_agree, ca.pair_stripped, ca.pair_completed, ca.lambda_arity_mismatch, ca.disagreements() },
+        );
+    }
+    return built;
 }
 
 fn packagePrefix(allocator: Allocator, pkg: ?ast.PackageHeader) Allocator.Error![]const u8 {
@@ -1397,6 +1438,8 @@ fn buildModuleWithOverrides(
     fqn_overrides: *const SpanStrMap,
     func_fqn_overrides: *const SpanStrMap,
     decl_pkg: *const SpanStrMap,
+    file_packages: ?*const std.AutoHashMap(ir.FileId, []const u8),
+    file_modules: ?*const std.AutoHashMap(ir.FileId, u32),
     base: ?*const StdlibBase,
     out_lifted: ?*[]Decl,
 ) Allocator.Error!BuiltModule {
@@ -1411,6 +1454,18 @@ fn buildModuleWithOverrides(
     const module: *Module = &module_ref.cell.data;
     const a = module.registry.allocator;
     const base_funcs_len = module.funcs.items.len;
+    if (file_packages) |packages| {
+        var package_it = packages.iterator();
+        while (package_it.next()) |entry| {
+            try module.registry.file_packages.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    if (file_modules) |modules| {
+        var module_it = modules.iterator();
+        while (module_it.next()) |entry| {
+            try module.registry.file_modules.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
 
     const package_prefix = try packagePrefix(a, file.package);
 
@@ -4553,13 +4608,6 @@ fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allocato
     }
 }
 
-/// Baked-base equivalent of `collectComposableReceiverNames`: names of
-/// `@Composable` functions reachable via member syntax (extensions or
-/// class/object members).
-fn composeBaseReceiverNames(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try compose_pass.collectReceiverInto(set, @as([*]const Decl, @ptrCast(d))[0..1], false);
-}
-
 /// Add the names of baked-base functions with a `@Composable`-typed lambda
 /// parameter (composable-lambda sinks the user's composable calls pass into).
 fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
@@ -4589,7 +4637,19 @@ fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl)
 }
 
 fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+    for (base_decls) |*d| {
+        try compose_pass.collectSinkArityInto(arity, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
+}
+
+fn composeBaseSinkParamArity(
+    map: *std.StringHashMap(std.StringHashMap(u8)),
+    a: Allocator,
+    base_decls: []const Decl,
+) Allocator.Error!void {
+    for (base_decls) |*d| {
+        try compose_pass.collectSinkParamArityInto(map, a, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseComposableProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
@@ -4618,28 +4678,6 @@ fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl
             for (c.members) |*m| try composeBaseComposablePropDecl(props, m);
         },
         .Object => |*o| for (o.members) |*m| try composeBaseComposablePropDecl(props, m),
-        else => {},
-    }
-}
-
-fn composeBaseSinkArityDecl(arity: *std.StringHashMap(u8), d: *const Decl) Allocator.Error!void {
-    switch (d.*) {
-        .Function => |*f| for (f.params) |*p| {
-            if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
-                try arity.put(f.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
-                break;
-            }
-        },
-        .Class => |*c| {
-            for (c.primary_params) |*p| {
-                if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
-                    try arity.put(c.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
-                    break;
-                }
-            }
-            for (c.members) |*m| try composeBaseSinkArityDecl(arity, m);
-        },
-        .Object => |*o| for (o.members) |*m| try composeBaseSinkArityDecl(arity, m),
         else => {},
     }
 }
@@ -5073,6 +5111,44 @@ test "multi-file assembly retains packaged typealias identities" {
     );
     try testing.expect(shape != null);
     try testing.expectEqualStrings("Long", shape.?.target.name);
+    try testing.expectEqual(
+        @as(u32, 0),
+        mg.get().registry.file_modules.get(s.file).?,
+    );
+}
+
+test "dependency extension assigns a distinct compilation module" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dep_span = span.Span.init(span.FileId.from(20), 0, 0);
+    const user_span = span.Span.init(span.FileId.from(21), 0, 0);
+    const dep_file = KotlinFile{
+        .package = null,
+        .imports = &.{},
+        .decls = &.{},
+        .span = dep_span,
+    };
+    const user_file = KotlinFile{
+        .package = null,
+        .imports = &.{},
+        .decls = &.{},
+        .span = user_span,
+    };
+    const base = (try buildStdlibBase(a, &.{dep_file})).?;
+    var extended = try buildModuleFilesExtend(a, base, &.{user_file});
+    defer extended.deinit();
+
+    const mg = extended.module.borrow();
+    defer mg.deinit();
+    try testing.expectEqual(
+        @as(u32, 0),
+        mg.get().registry.file_modules.get(dep_span.file).?,
+    );
+    try testing.expectEqual(
+        @as(u32, 1),
+        mg.get().registry.file_modules.get(user_span.file).?,
+    );
 }
 
 test "class type-parameter metadata includes where bounds and unbounded identities" {
