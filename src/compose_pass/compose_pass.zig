@@ -659,7 +659,7 @@ fn compParamArity(t: *const ast.TypeRef, receiver_is_a_slot: bool) ?u8 {
     return @intCast(@min(n, 255));
 }
 
-fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+pub fn collectSinkArityInto(set: *std.StringHashMap(u8), decls: []const ast.Decl) std.mem.Allocator.Error!void {
     for (decls) |*d| switch (d.*) {
         .Function => |*f| {
             for (f.params) |*p| if (compParamArity(&p.ty, !f.is_inline)) |n| {

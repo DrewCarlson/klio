@@ -4636,7 +4636,9 @@ fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl)
 }
 
 fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try composeBaseSinkArityDecl(arity, d);
+    for (base_decls) |*d| {
+        try compose_pass.collectSinkArityInto(arity, @as([*]const Decl, @ptrCast(d))[0..1]);
+    }
 }
 
 fn composeBaseComposableProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
@@ -4665,28 +4667,6 @@ fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl
             for (c.members) |*m| try composeBaseComposablePropDecl(props, m);
         },
         .Object => |*o| for (o.members) |*m| try composeBaseComposablePropDecl(props, m),
-        else => {},
-    }
-}
-
-fn composeBaseSinkArityDecl(arity: *std.StringHashMap(u8), d: *const Decl) Allocator.Error!void {
-    switch (d.*) {
-        .Function => |*f| for (f.params) |*p| {
-            if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
-                try arity.put(f.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
-                break;
-            }
-        },
-        .Class => |*c| {
-            for (c.primary_params) |*p| {
-                if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations) and p.ty.function.?.params.len != 0) {
-                    try arity.put(c.name.name, @intCast(@min(p.ty.function.?.params.len, 255)));
-                    break;
-                }
-            }
-            for (c.members) |*m| try composeBaseSinkArityDecl(arity, m);
-        },
-        .Object => |*o| for (o.members) |*m| try composeBaseSinkArityDecl(arity, m),
         else => {},
     }
 }
