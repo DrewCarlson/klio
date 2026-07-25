@@ -11,3 +11,4 @@ scripts/__pycache__/
 /CLAUDE.md
 /third_party/skia/
 .klio-local/
+.fleet-logs/

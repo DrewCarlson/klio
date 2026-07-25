@@ -148,3 +148,32 @@ Small, cheap, and immediately useful:
 - An interpreter edit that cannot affect lowering does not re-bake.
 - A stale pack is reported, never silently loaded.
 - A Compose threading question is answerable by a test that runs in under a second.
+
+## Session addendum (2026-07-26): the measurement loop for compose stability
+
+Two additions from the gate-deficit investigation, which was itself an exercise
+in these loops:
+
+- **`scripts/compose-fleet.py`** — the per-class compose-runtime commontest
+  fleet, mirroring the itest gate's environment (HOME-scoped data home,
+  KLIO_COMPOSE_PLUGIN=1, capped timeouts) without its recompile cost. One
+  class ~1 min; the full 46-class fleet ~10-15 min at 4 jobs; per-class logs
+  under `.fleet-logs/` and a failure-signature census at the end. This is the
+  ratchet-progress measure for driving the itest baseline back past 1210.
+
+- **Item 3's silent-skew hazard, realized.** The repo-local `.klio-local`
+  packs (installed 09:11) silently shadowed a different universe than the
+  itest's freshly built packs: a fleet run against them produced failures that
+  looked like regressions but were environment artifacts, costing a full
+  diagnosis round. Until the staleness stamp lands, compose-fleet.py refuses
+  to run without an explicit installed-pack home, and itest-environment work
+  must use the itest's own home.
+
+Working recipe for pack-source instrumentation (used to localize the Link-arm
+failure): edit the upstream Kotlin under `kotlin-klio/*/upstream`, rebuild the
+one pack (`klio-harness pack build kotlin-klio/klio-compose-runtime-engine`,
+~30 s) and install it into the scratch home, run the one filtered test, revert
+the submodule. Each probe cycle is ~2 min; println placement matters — a
+statement added inside a hot inline chain (`guardChanges { ... .also {} }`)
+perturbed lowering enough to change behavior, so wrap at function boundaries
+instead (expression-body -> named inner function).
