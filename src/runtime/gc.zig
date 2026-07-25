@@ -109,7 +109,28 @@ var live_bytes: usize = 0;
 /// collects frequently to surface root/tracer holes without stress mode's
 /// O(safe-points x live) cost.
 var threshold_floor: usize = 8 * 1024 * 1024;
+var freed_since_trim: usize = 0;
 var threshold: usize = 8 * 1024 * 1024;
+
+/// Appel growth multiplier: the next collection fires after `live * factor`
+/// bytes. 2 keeps peak memory tight but spends ~half the run marking when
+/// the allocation churn rate matches the live-set size (the DeepRecursive
+/// commontests: a 100k-node live tree plus per-step suspension snapshots).
+/// `KLIO_GC_GROWTH` overrides (integer, min 2).
+var growth_factor_cache: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+fn growthFactor() usize {
+    const cached = growth_factor_cache.load(.monotonic);
+    if (cached != 0) return cached;
+    var f: usize = 2;
+    if (comptime @import("builtin").link_libc) {
+        if (std.c.getenv("KLIO_GC_GROWTH")) |raw| {
+            f = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 2;
+            if (f < 2) f = 2;
+        }
+    }
+    growth_factor_cache.store(f, .monotonic);
+    return f;
+}
 var cur_epoch: usize = 1;
 var gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -179,10 +200,18 @@ pub fn noteExternalBytes(bytes: usize) void {
 
 /// External (non-registry) bytes released back — keeps `external_live`
 /// tracking the traced-but-unswept footprint so the Appel threshold can
-/// include it.
+/// include it. The trigger credit matters as much as the live credit:
+/// external buffers are freed explicitly, never swept, so their churn
+/// produces NO collectable garbage — counting their gross allocation into
+/// `bytes_since_gc` made collections scale with CALL RATE (every frame's
+/// register buffer advanced the trigger even when freed a microsecond
+/// later), and each collection re-marked the whole live set for nothing.
+/// External bytes therefore advance the trigger by NET growth only;
+/// registry cells keep gross accounting (their garbage does accumulate).
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
+    _ = bytes_since_gc.fetchSub(@min(bytes, bytes_since_gc.load(.monotonic)), .monotonic);
 }
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -515,13 +544,21 @@ pub fn collect() void {
     last_collect_ms.store(nowMillis(), .monotonic);
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);
-    threshold = @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| 2);
+    threshold = @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| growthFactor());
     // Return the pages the swept cells freed back to the OS. The backing
     // allocator caches freed memory in its free-lists (RSS reflects the
     // allocation high-water, not the live set), so after a collection that
     // reclaimed real garbage, ask it to trim — keeping process RSS tracking the
     // live set, not the cumulative churn. Set by `main` to the platform trim.
-    if (freed != 0) if (release_to_os) |f| f();
+    // Rate-limited: trimming after EVERY freeing collection turned into
+    // steady mmap/munmap traffic under allocation-churn-heavy runs (the
+    // trim itself profiled alongside the marking); RSS only needs to track
+    // the live set coarsely, so trim once a meaningful amount accumulates.
+    freed_since_trim +|= freed;
+    if (freed_since_trim >= 32 * 1024 * 1024) {
+        freed_since_trim = 0;
+        if (release_to_os) |f| f();
+    }
     if (gc_debug) std.debug.print(
         "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
         .{ cur_epoch, marked, live_bytes, freed },

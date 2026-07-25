@@ -471,27 +471,15 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
-        factories: std.StringHashMap(void),
-        sink_arity: std.StringHashMap(u8),
-        sink_param_arity: std.StringHashMap(std.StringHashMap(u8)),
-        comp_props: std.StringHashMap(void),
         comp_getter_props: std.StringHashMap(void),
         inline_fns: std.StringHashMap(void),
-        sink_last_param: std.StringHashMap([]const u8),
-        sink_content_reach: std.StringHashMap(u8),
         stability: std.StringHashMap(compose_pass.Stability),
 
         fn deinit(self: *@This()) void {
             self.names.deinit();
             self.sinks.deinit();
-            self.factories.deinit();
-            self.sink_arity.deinit();
-            compose_pass.deinitSinkParamArity(&self.sink_param_arity);
-            self.comp_props.deinit();
             self.comp_getter_props.deinit();
             self.inline_fns.deinit();
-            self.sink_last_param.deinit();
-            self.sink_content_reach.deinit();
             self.stability.deinit();
         }
     };
@@ -499,14 +487,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     defer {
         compose_pass.active_composable_names = null;
         compose_pass.active_composable_sinks = null;
-        compose_pass.active_factories = null;
-        compose_pass.active_sink_arity = null;
-        compose_pass.active_sink_param_arity = null;
-        compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = null;
-        compose_pass.active_sink_last_param = null;
-        compose_pass.active_sink_content_reach = null;
         compose_pass.active_stability = null;
         if (compose_maps) |*maps| maps.deinit();
     }
@@ -572,57 +554,27 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);
         defer sinks.deinit();
-        var factories = try compose_pass.collectComposableValFactories(allocator, decls.items);
-        defer factories.deinit();
-        var sink_arity = try compose_pass.collectComposableSinkArity(allocator, decls.items);
-        defer sink_arity.deinit();
-        var sink_param_arity = try compose_pass.collectComposableSinkParamArity(allocator, decls.items);
-        defer compose_pass.deinitSinkParamArity(&sink_param_arity);
-        var comp_props = try compose_pass.collectComposableProps(allocator, decls.items);
-        defer comp_props.deinit();
         var comp_getter_props = try compose_pass.collectComposableGetterProps(allocator, decls.items);
         defer comp_getter_props.deinit();
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
-        var sink_last_param = try compose_pass.collectComposableSinkLastParam(allocator, decls.items);
-        defer sink_last_param.deinit();
-        var sink_content_reach = try compose_pass.collectComposableSinkContentReach(allocator, decls.items);
-        defer sink_content_reach.deinit();
         if (base) |bsp| {
             // Decode once: an image-loaded base leaves `lifted_decls` empty, so
             // every collector below must read the decoded section instead.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
-            try composeBaseFactories(&factories, base_decls);
-            try composeBaseSinkArity(&sink_arity, base_decls);
-            try composeBaseSinkParamArity(&sink_param_arity, allocator, base_decls);
-            try composeBaseComposableProps(&comp_props, base_decls);
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
-            try composeBaseSinkLastParam(&sink_last_param, base_decls);
-            try composeBaseSinkContentReach(&sink_content_reach, base_decls);
         }
         if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
-            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} factories, {d} decls\n", .{ names.count(), sinks.count(), factories.count(), decls.items.len });
+            std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
         }
-        compose_pass.active_factories = &factories;
-        defer compose_pass.active_factories = null;
-        compose_pass.active_sink_arity = &sink_arity;
-        defer compose_pass.active_sink_arity = null;
-        compose_pass.active_sink_param_arity = &sink_param_arity;
-        defer compose_pass.active_sink_param_arity = null;
-        compose_pass.active_composable_props = &comp_props;
-        defer compose_pass.active_composable_props = null;
         compose_pass.active_composable_getter_props = &comp_getter_props;
         defer compose_pass.active_composable_getter_props = null;
         compose_pass.active_inline_fns = &inline_fns;
         defer compose_pass.active_inline_fns = null;
-        compose_pass.active_sink_last_param = &sink_last_param;
-        defer compose_pass.active_sink_last_param = null;
-        compose_pass.active_sink_content_reach = &sink_content_reach;
-        defer compose_pass.active_sink_content_reach = null;
         var stability = try compose_pass.collectClassStability(
             allocator,
             decls.items,
@@ -635,39 +587,21 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         compose_maps = .{
             .names = names,
             .sinks = sinks,
-            .factories = factories,
-            .sink_arity = sink_arity,
-            .sink_param_arity = sink_param_arity,
-            .comp_props = comp_props,
             .comp_getter_props = comp_getter_props,
             .inline_fns = inline_fns,
-            .sink_last_param = sink_last_param,
-            .sink_content_reach = sink_content_reach,
             .stability = stability,
         };
         names = std.StringHashMap(void).init(allocator);
         sinks = std.StringHashMap(void).init(allocator);
-        factories = std.StringHashMap(void).init(allocator);
-        sink_arity = std.StringHashMap(u8).init(allocator);
-        sink_param_arity = std.StringHashMap(std.StringHashMap(u8)).init(allocator);
-        comp_props = std.StringHashMap(void).init(allocator);
         comp_getter_props = std.StringHashMap(void).init(allocator);
         inline_fns = std.StringHashMap(void).init(allocator);
-        sink_last_param = std.StringHashMap([]const u8).init(allocator);
-        sink_content_reach = std.StringHashMap(u8).init(allocator);
         stability = std.StringHashMap(compose_pass.Stability).init(allocator);
     }
     if (compose_maps) |*maps| {
         compose_pass.active_composable_names = &maps.names;
         compose_pass.active_composable_sinks = &maps.sinks;
-        compose_pass.active_factories = &maps.factories;
-        compose_pass.active_sink_arity = &maps.sink_arity;
-        compose_pass.active_sink_param_arity = &maps.sink_param_arity;
-        compose_pass.active_composable_props = &maps.comp_props;
         compose_pass.active_composable_getter_props = &maps.comp_getter_props;
         compose_pass.active_inline_fns = &maps.inline_fns;
-        compose_pass.active_sink_last_param = &maps.sink_last_param;
-        compose_pass.active_sink_content_reach = &maps.sink_content_reach;
         compose_pass.active_stability = &maps.stability;
     }
 
@@ -4614,71 +4548,15 @@ fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) A
     for (base_decls) |*d| try composeBaseSinkDecl(sinks, d);
 }
 
-fn composeBaseFactories(factories: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try composeBaseFactoryDecl(factories, d);
-}
-
-fn composeBaseSinkLastParam(set: *std.StringHashMap([]const u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkLastParamInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseSinkContentReach(set: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkContentReachInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
 fn composeBaseInlineFns(set: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectInlineFnNamesInto(set, @as([*]const Decl, @ptrCast(d))[0..1]);
     }
 }
 
-fn composeBaseSinkArity(arity: *std.StringHashMap(u8), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkArityInto(arity, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseSinkParamArity(
-    map: *std.StringHashMap(std.StringHashMap(u8)),
-    a: Allocator,
-    base_decls: []const Decl,
-) Allocator.Error!void {
-    for (base_decls) |*d| {
-        try compose_pass.collectSinkParamArityInto(map, a, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseComposableProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
-    for (base_decls) |*d| try composeBaseComposablePropDecl(props, d);
-}
-
 fn composeBaseComposableGetterProps(props: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| {
         try compose_pass.collectComposableGetterPropsInto(props, @as([*]const Decl, @ptrCast(d))[0..1]);
-    }
-}
-
-fn composeBaseComposablePropDecl(props: *std.StringHashMap(void), d: *const Decl) Allocator.Error!void {
-    switch (d.*) {
-        .Property => |p| {
-            if (p.ty != null and p.ty.?.function != null and compose_pass.isComposable(p.ty.?.annotations)) {
-                try props.put(p.name.name, {});
-            }
-        },
-        .Class => |*c| {
-            for (c.primary_params) |*p| {
-                if (p.property != null and p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
-                    try props.put(p.name.name, {});
-                }
-            }
-            for (c.members) |*m| try composeBaseComposablePropDecl(props, m);
-        },
-        .Object => |*o| for (o.members) |*m| try composeBaseComposablePropDecl(props, m),
-        else => {},
     }
 }
 

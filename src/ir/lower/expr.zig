@@ -3067,8 +3067,10 @@ fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count
 /// receiver, each walked up its supertype chain — the member may be declared on
 /// a supertype of the receiver we are lowering against.
 fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
+    const mhtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
     if (b.recvTy()) |rt| roots[1] = rsplitLast(rt, '.');
+    if (mhtl_trace) std.debug.print("[mhtl] {s}: owner={?s} recv_root={?s} argc={d}\n", .{ name, roots[0], roots[1], user_arg_count });
     for (roots) |root_opt| {
         const root = root_opt orelse continue;
         // The class itself, then its transitive supertype names (nearest first).
@@ -3087,6 +3089,7 @@ fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count
                 const fid = entry.value_ptr.*;
                 const f = b.module.funcById(fid) orelse continue;
                 const hosts = memberHostsTrailingLambdaAtArity(b, cls, f, fid, user_arg_count);
+                if (mhtl_trace) std.debug.print("[mhtl] {s}: cls={s} cand #{d} params={d} hosts={} last_ty={s} last_arity={?d}\n", .{ name, cls, fid.int(), f.params.len, hosts, if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
                 if (!hosts) continue;
                 const last = f.params[f.params.len - 1];
                 const arity = fnTypeArityAlias(b, last.ty) orelse continue;
@@ -4026,6 +4029,44 @@ fn nameInList(name: []const u8, list: []const []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+/// The constructor-call half of the P12 shape repair: for each lambda
+/// argument bound to a primary-constructor parameter with a declared
+/// composable arity, re-shape it against that arity (inserting the implicit
+/// `it` a bare-pair-shaped sink lambda dropped). Alignment mirrors
+/// `ctorArgFnArities`: an unnamed trailing lambda binds the last
+/// function-typed parameter; leading positionals map 1:1 when unnamed.
+fn transformCtorComposableArgs(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!void {
+    if (args.len == 0) return;
+    for (args) |*a| if (a.* == .Spread) return;
+    if (!allNull(arg_names)) return;
+    if (class_id.int() >= b.module.classes.items.len) return;
+    const cls = &b.module.classes.items[class_id.int()];
+    const params = cls.primary_params;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    for (args, 0..) |*arg, i| {
+        const pi: ?usize = blk: {
+            if (trailing_lambda and i == args.len - 1) {
+                var k = params.len;
+                while (k > 0) : (k -= 1) {
+                    if (fnTypeArityAlias(b, params[k - 1].ty) != null) break :blk k - 1;
+                }
+                break :blk null;
+            }
+            break :blk if (i < params.len) i else null;
+        };
+        const p = pi orelse continue;
+        const expected = params[p].composable_arity orelse continue;
+        const expected_slots: u8 = expected +| params[p].composable_recv_slots;
+        _ = try compose_pass.transformResolvedComposableLambda(
+            b.allocator,
+            @constCast(arg),
+            expected_slots,
+            cls.name,
+            false,
+        );
+    }
 }
 
 /// `argFnArities` for a constructor call: the per-argument expected lambda
@@ -5840,6 +5881,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
+            // P12's shape-repair contract for constructor calls: the compose
+            // pass shapes a sink lambda with the bare composer pair and the
+            // LOWERING repairs it against the resolved parameter's declared
+            // arity. Function calls repair in transformSelectedComposableArgs;
+            // a class whose primary constructor takes a composable lambda
+            // (`MovableContent({ content() })`, arity 1) needs the same
+            // repair here, or the content invokes with every slot shifted.
+            try transformCtorComposableArgs(b, class_id, args, ast_arg_names);
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
             const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
             defer if (realigned) |r| b.allocator.free(r);
@@ -6884,6 +6933,102 @@ fn selfLocalFnApplicable(
     return true;
 }
 
+/// Ext-only variant of `selectLocalFnOverload` for a RECEIVER-FULL call
+/// (`this.f(args)` / `recv.f(args)`): only extension siblings can take a
+/// receiver, and their applicability is judged against the receiver's
+/// DECLARED type (in scope at the call), not the enclosing lambda's
+/// receiver context.
+fn selectLocalExtOverload(
+    b: *const FuncBuilder,
+    ovs: []const build.LocalFnOverload,
+    declared_ty: ?TypeRef,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?[]const u8 {
+    var survivor: ?*const build.LocalFnOverload = null;
+    var n_survivors: usize = 0;
+    outer: for (ovs) |*ov| {
+        if (!ov.is_ext) continue;
+        if (declared_ty) |actual| {
+            if (!try localOverloadReceiverCouldApply(b, ov, actual)) continue;
+        }
+        if (args.len < ov.n_required and !ov.has_vararg) continue;
+        if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
+        var bound = [_]bool{false} ** 64;
+        if (ov.param_tys.len > bound.len) continue;
+        var positional: usize = 0;
+        for (args, 0..) |*a, i| {
+            const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            var pi: ?usize = null;
+            if (supplied) |nm| {
+                for (ov.param_names, 0..) |pn, k| {
+                    if (std.mem.eql(u8, pn, nm)) {
+                        if (bound[k]) continue :outer;
+                        pi = k;
+                        bound[k] = true;
+                        break;
+                    }
+                }
+                if (pi == null) continue :outer;
+            } else {
+                if (positional < ov.param_tys.len) {
+                    pi = positional;
+                    bound[positional] = true;
+                } else if (!ov.has_vararg) {
+                    continue :outer;
+                }
+                positional += 1;
+            }
+            if (pi) |k| {
+                const d = ov.param_tys[k] orelse continue;
+                const h = staticArgHead(b, a) orelse continue;
+                if (!headCompatible(h, d, true)) continue :outer;
+            }
+        }
+        survivor = ov;
+        n_survivors += 1;
+    }
+    if (n_survivors == 1) return survivor.?.mangled;
+    return null;
+}
+
+/// Call a selected local EXTENSION overload through its mangled cell with
+/// an EXPLICIT receiver expression prepended as the leading `this` arg.
+/// Null when the cell is unreachable from this scope (forward reference);
+/// the caller keeps its plain-name route.
+fn lowerSelectedLocalExtCallWithReceiver(
+    b: *FuncBuilder,
+    mangled: []const u8,
+    receiver: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+    const cell: Reg = if (b.resolve(mangled)) |r|
+        r
+    else if (b.knowsOuter(mangled))
+        try resolveCapture(b, mangled)
+    else
+        return null;
+    const callee_reg = b.allocReg();
+    try b.push(.{ .CellGet = .{ .dst = callee_reg, .cell = cell } });
+    const recv = try lowerReceiver(b, receiver);
+    const vals = try b.allocator.alloc(Reg, args.len + 1);
+    defer b.allocator.free(vals);
+    vals[0] = recv;
+    for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
+    const args_start = try packContiguous(b, vals);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_reg,
+        .args = args_start,
+        .n_args = @intCast(vals.len),
+        .arg_names = arg_names,
+    } });
+    return dst;
+}
+
 fn selectLocalFnOverload(
     b: *const FuncBuilder,
     ovs: []const build.LocalFnOverload,
@@ -7316,7 +7461,19 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
             break :blk @intCast(n);
         },
         .AnonFun => |af| @intCast(af.params.len),
-        else => null,
+        else => blk: {
+            // A memo-wrapped sink lambda ranks by the inner literal's
+            // declared header, exactly like the bare literal above.
+            const lam = compose_pass.memoWrappedLambda(@constCast(arg)) orelse break :blk null;
+            if (lam.implicit_it) break :blk @as(u8, 0);
+            var n = lam.params.len;
+            if (n >= 2 and std.mem.eql(u8, lam.params[n - 1].name, "$changed") and
+                std.mem.eql(u8, lam.params[n - 2].name, "$composer"))
+            {
+                n -= 2;
+            }
+            break :blk @intCast(n);
+        },
     };
 }
 
@@ -7333,7 +7490,10 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
     const lazy_ty = argDeclTypeRefLazy(b, arg);
     const ty = argDeclTypeRef(b, arg);
     const declared_fn_arity = if (ty) |t| fnTypeArityAlias(b, t) else null;
-    const literal_callable = arg.* == .Lambda or arg.* == .AnonFun;
+    // A memo-wrapped sink lambda is the trailing functional argument for
+    // overload selection — the wrap is transparent to the shape.
+    const literal_callable = arg.* == .Lambda or arg.* == .AnonFun or
+        compose_pass.memoWrappedLambda(@constCast(arg)) != null;
     return .{
         .named = name,
         .is_spread = arg.* == .Spread,
@@ -9508,10 +9668,18 @@ fn transformSelectedComposableArgs(
                 );
             }
         }
+        // The synthetic slot count comes from the RESOLVED parameter: its
+        // declared arity plus, for a non-inline sink, the receiver/context
+        // slots the value protocol flattens in front (an inline sink
+        // splices with the receiver bound as `this`, no slot).
+        const expected_slots: u8 = if (f.is_inline)
+            expected
+        else
+            expected +| f.params[pi].composable_recv_slots;
         _ = try compose_pass.transformResolvedComposableLambda(
             b.allocator,
             @constCast(&args[arg_index]),
-            expected,
+            expected_slots,
             f.name,
             f.is_inline,
         );
@@ -10711,6 +10879,29 @@ fn lowerUnresolvedBareCall(
                     // `() -> T` block read past the params, kept its
                     // synthetic `it`, and shadowed the enclosing one).
                     const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                    // The arity alone is not the whole lambda shape: a
+                    // `T.() -> R` parameter also owns the block's `this`.
+                    // Without the receiver record the block lowers
+                    // receiverless and its bare `this` captures the
+                    // ENCLOSING instance — `SnapshotStateMap.mutate`'s
+                    // `withCurrent { this }` returned the outer map instead
+                    // of the bound record. Record ONLY when the pick came
+                    // from the owner-scoped member walk (it is absent from
+                    // the top-level name index): a member's signature is
+                    // scope-proven, while a top-level namesake pick is
+                    // declaration-order heuristic and a wrong receiver
+                    // stamp OVERRIDES the correct shape other sources
+                    // supply (a same-name `g`/`group` twin re-shaped the
+                    // SlotTable builder blocks and shifted every binding).
+                    const member_pick = blk2: {
+                        const tl = b.module.func_name_index.get(name0) orelse break :blk2 true;
+                        for (tl.items) |tfid| {
+                            if (tfid == fid) break :blk2 false;
+                        }
+                        break :blk2 true;
+                    };
+                    if (member_pick)
+                        try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
                     break :blk try argFnArities(b, f, args, ast_arg_names, off);
                 }
             }
@@ -11754,6 +11945,18 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         (b.isLocalFn(name.name) or b.isParam(name.name) or
             b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
     if (local_callable) {
+        // Same-named local siblings share the plain-name slot, which for a
+        // multi-declaration name may hold a non-extension sibling or the
+        // boxed self-cell's placeholder. A receiver-full call binds only an
+        // EXTENSION sibling, so select it by signature and call through its
+        // mangled cell — the plain slot misbound `this.Test(showThree)` to
+        // an uninitialized cell whenever composable and extension `Test`
+        // overloads coexisted.
+        if (b.localFnOverloads(name.name)) |ovs| {
+            if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
+                if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
+            }
+        }
         const local_reg = blk: {
             if (anon_cap) {
                 const idx = try b.recordCapture(name.name);

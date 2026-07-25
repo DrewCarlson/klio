@@ -1105,3 +1105,10 @@ test "reified_inline_overload_delegation" {
         \\
     );
 }
+
+test "member_receiver_lambda_over_extension" {
+    try check("member_receiver_lambda_over_extension",
+        \\payload
+        \\
+    );
+}
