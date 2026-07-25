@@ -6043,6 +6043,21 @@ fn narrowingRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
     return try recvChainOf(b, cur);
 }
 
+/// Receiver evidence for a bare call inside an inline body. The inline
+/// extension's receiver is the active lexical receiver while its own body is
+/// lowered. A spliced lambda argument restores the caller's receiver tower.
+fn inlineBodyRecvHead(b: *const FuncBuilder) ?[]const u8 {
+    if (b.lambda_splice_resolve == null) {
+        if (b.spliceRecvTy()) |receiver| return receiver;
+    }
+    return b.recvTy() orelse b.ownerClass();
+}
+
+fn inlineBodyRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
+    const receiver = inlineBodyRecvHead(b) orelse return null;
+    return try recvChainOf(b, receiver);
+}
+
 /// `cur` followed by its transitive supertype simple names (nearest
 /// first), from the hierarchy recorded at build time. A type with no
 /// recorded hierarchy (a built-in, a generic parameter) yields just
@@ -6169,12 +6184,7 @@ fn inlineTargetForBareCall(
     // The active splice's declared receiver serves as evidence when the
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
-    const evid_chain: ?[]const []const u8 = if (try narrowingRecvChain(b)) |c|
-        c
-    else if (b.spliceRecvTy()) |srt|
-        try recvChainOf(b, srt)
-    else
-        null;
+    const evid_chain = try inlineBodyRecvChain(b);
     // Host-backed default imports suppress the simple-name candidate table,
     // but not an exact FuncId resolved by the scope-aware index below. The
     // source declaration remains the semantic target of an inline call and
@@ -6387,7 +6397,7 @@ fn inlineTargetForBareCall(
         {
             const rt_name = pf.receiver_type.?.name.name;
             var evidenced = false;
-            if (try narrowingRecvChain(b)) |ch| {
+            if (try inlineBodyRecvChain(b)) |ch| {
                 for (ch) |cn| {
                     if (std.mem.eql(u8, cn, rt_name)) {
                         evidenced = true;
@@ -6512,12 +6522,15 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     const recv_mismatch = blk: {
         if (f.receiver_type) |rt| {
             const rn = rt.name.name;
-            const owner_accepts = if (b.ownerClass()) |oc| b.module.classIsOrExtends(oc, rn) else false;
-            const positive = if (b.recvTy() orelse b.ownerClass()) |cur|
+            const in_extension_splice =
+                b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
+            const owner_accepts = !in_extension_splice and
+                (if (b.ownerClass()) |oc| b.module.classIsOrExtends(oc, rn) else false);
+            const positive = if (inlineBodyRecvHead(b)) |cur|
                 (!b.module.classIsOrExtends(cur, rn) and !owner_accepts)
             else
                 false;
-            const member_wins = b.hasEnclosingMember(nm) and
+            const member_wins = !in_extension_splice and b.hasEnclosingMember(nm) and
                 (if (b.ownerClass()) |oc| !std.mem.eql(u8, oc, rn) else false);
             break :blk positive or member_wins;
         }
@@ -14120,6 +14133,7 @@ test "shared member resolution selects overloads and dispatch forms" {
     m.classes.items[owner.int()].is_open = true;
     const final_pick = try Add.member(&m, a, owner, "finalPick", "Int", false, false);
     const virtual_pick = try Add.member(&m, a, owner, "virtualPick", "Int", false, true);
+    const lambda_pick = try Add.member(&m, a, owner, "lambdaPick", "Function1", false, false);
     const member_plus = try Add.member(&m, a, owner, "plus", "Int", true, false);
     const nullable_plus = m.nextFuncId();
     const nullable_params = try a.dupe(ir.Param, &.{
@@ -14195,6 +14209,14 @@ test "shared member resolution selects overloads and dispatch forms" {
     const virtual_result = m.resolveMemberCall(owner, "virtualPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.virtual, virtual_result.dispatch);
     try testing.expectEqual(virtual_pick, virtual_result.target.?);
+    const lambda_shapes = [_]applicability.ArgShape{.{
+        .is_lambda = true,
+        .lambda_arity = 1,
+        .lambda_is_literal = true,
+    }};
+    const lambda_result = m.resolveMemberCall(owner, "lambdaPick", &lambda_shapes, .{});
+    try testing.expectEqual(ir.Module.MemberDispatch.direct, lambda_result.dispatch);
+    try testing.expectEqual(lambda_pick, lambda_result.target.?);
     const recv_reg = b.allocReg();
     try b.bind("target", recv_reg);
     try b.setLocalDeclType("target", "Owner");
@@ -14626,6 +14648,26 @@ test "inline extension receiver type remains available during body splicing" {
     const param = argDeclTypeRefLazy(&b, &param_expr) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Float", param.name);
+}
+
+test "inline extension body receiver outranks the enclosing member receiver" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("MeasurePolicy");
+    b.setSpliceRecvTy("List");
+
+    const body_chain = (try inlineBodyRecvChain(&b)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(body_chain);
+    try testing.expectEqualStrings("List", body_chain[0]);
+
+    b.lambda_splice_resolve = .{ .caller_depth = 0, .own_base = 0 };
+    const lambda_chain = (try inlineBodyRecvChain(&b)) orelse
+        return error.TestUnexpectedResult;
+    defer testing.allocator.free(lambda_chain);
+    try testing.expectEqualStrings("MeasurePolicy", lambda_chain[0]);
 }
 
 test "declared member property chains retain static receiver types" {
