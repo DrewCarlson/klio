@@ -1284,6 +1284,30 @@ fn nuTraceWant() ?[]const u8 {
     return nu_trace_val;
 }
 
+/// Host→driver flat-call handoff for resolution ladders whose PICK lives
+/// deep in host code (the CMG global-overload terminal): the exec arm arms
+/// the slot, the host's terminal takes the arm (one-shot — inner calls see
+/// it disarmed), prepares the flat request instead of dispatching, and
+/// stashes it here; the arm consumes the stash and pushes the activation.
+threadlocal var host_flat_armed: bool = false;
+threadlocal var host_flat_req: ?FlatCallReq = null;
+pub fn armHostFlatReq() void {
+    host_flat_armed = true;
+}
+pub fn takeHostFlatArm() bool {
+    const a = host_flat_armed;
+    host_flat_armed = false;
+    return a;
+}
+pub fn stashHostFlatReq(req: FlatCallReq) void {
+    host_flat_req = req;
+}
+fn takeHostFlatReq() ?FlatCallReq {
+    const r = host_flat_req;
+    host_flat_req = null;
+    return r;
+}
+
 /// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
 inline fn raiseStep(frame: *Frame, e: EvalError) Step {
     frame.step_err = e;
@@ -6846,7 +6870,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
             break :blk "";
         } else "";
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
+        // Arm the host→driver flat handoff: the overload terminal may
+        // stash a prepared flat request instead of dispatching natively.
+        armHostFlatReq();
+        const cno_res = try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor);
+        _ = takeHostFlatArm();
+        if (takeHostFlatReq()) |req0| {
+            var prep = req0;
+            prep.dst = cmg.dst;
+            frame.flat_call = prep;
+            return .flat_call;
+        }
+        const overload = switch (cno_res) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };

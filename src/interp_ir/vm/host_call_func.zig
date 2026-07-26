@@ -2534,6 +2534,25 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // would re-cross to the twin; dispatch `func` exactly to hold the pick.
     // The narrow condition keeps every ordinary call on the re-pick path.
     const exact_dispatch = bounded or (anchored and excluded_xpkg);
+    // Flat handoff: when the exec arm armed the slot and the picked shape
+    // is a plain positional body call, stash a prepared request instead of
+    // dispatching — the driver pushes it as an activation. The one-shot
+    // take keeps nested resolutions off the slot.
+    if (ir.eval.takeHostFlatArm()) {
+        var all_null = true;
+        for (arg_names) |n| {
+            if (n != null) {
+                all_null = false;
+                break;
+            }
+        }
+        if (all_null) {
+            if (try prepareTypedFlatCall(self, allocator, eff, func, args, &.{}, exact_dispatch)) |req| {
+                ir.eval.stashHostFlatReq(req);
+                return .{ .ok = Value.Unit };
+            }
+        }
+    }
     const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, exact_dispatch);
     return switch (r) {
         .ok => |v| .{ .ok = v },

@@ -258,10 +258,20 @@ dotted globals, not the intrinsic table.
    drains it (`rootPumpBarrierPark`), completion runs the pump tail
    before the caller sees the result (`rootPumpFlatComplete`), scope
    rides the keepalive. Sweep-gated; DeepRecursive 9.4→8.8 s.
-3. **Typed-call flattening:** the activation carries the reified
-   type-name global bindings as a restore list; `attachDeclaredElemTypes`
-   moves into the frame boundary.
-4. **CMG overload-call flattening** (`callNamedOverload`'s terminal).
+3. **Typed-call flattening — LANDED:** `prepareTypedFlatCall` mirrors
+   `callFuncTypedInner` (overload re-pick, receiver guard, narrowing,
+   reified type-name bindings) with the bindings carried opaquely on
+   the activation (`typedBindingsRestore` at teardown AND park — the
+   recursive restore ran across suspensions too) and a duped type-args
+   list for the boundary transform (`typedCallBoundary`); resumed
+   completions skip the attach, as the recursive path did.
+4. **CMG overload-call flattening — LANDED:** the exec arm ARMS a
+   one-shot threadlocal handoff (`armHostFlatReq`/`takeHostFlatArm`/
+   `stashHostFlatReq`) around `callNamedOverload`; the terminal takes
+   the arm (inner resolutions see it disarmed), runs
+   `prepareTypedFlatCall` on the scope-correct pick, and stashes the
+   request instead of dispatching — the driver pushes the activation.
+   DeepRecursive 8.8→8.2 s (session total 10.4→8.2).
 5. **Dotted-global field-walk memo — CLOSED by measurement:** the
    per-step `kotlin.*` resolutions in the trace census were dotted
    FQNs (an earlier regex truncated them at the first dot), and those
