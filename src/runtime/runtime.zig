@@ -192,6 +192,7 @@ pub const notifyWallBlock = threads_mod.notifyWallBlock;
 pub const requestAbandon = threads_mod.requestAbandon;
 pub const clearAbandon = threads_mod.clearAbandon;
 pub const setRunBoundaryAbandon = threads_mod.setRunBoundaryAbandon;
+pub const runBoundaryAbandonActive = threads_mod.runBoundaryAbandonActive;
 pub const shouldAbandon = threads_mod.shouldAbandon;
 
 // safety (host-protection backstops)

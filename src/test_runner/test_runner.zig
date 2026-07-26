@@ -448,6 +448,25 @@ fn clearWallDeadline() void {
     ir.eval.test_wall_deadline_ms.store(0, .monotonic);
 }
 
+/// A wall-capped test raised the drain-everything abandonment so its whole
+/// cohort (pool tasks, explicit threads, resumed coroutines) died
+/// cooperatively instead of cascading against half-torn state. Give
+/// stragglers one grace window (they observe the flag at block granularity
+/// and <=50 ms sleep slices), then clear so the next step starts clean.
+fn drainWallCapAbandon() void {
+    if (!runtime.runBoundaryAbandonActive()) return;
+    // Raw sleep: the sliced runtime sleep would observe the very
+    // abandonment being drained and return immediately.
+    runtime.gc.enterBlockingSafe();
+    {
+        const ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    runtime.gc.exitBlockingSafe();
+    runtime.setRunBoundaryAbandon(false);
+    runtime.clearAbandon();
+}
+
 fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
     defer clearWallDeadline();
     for (st.plan.top) |t| {
@@ -459,9 +478,11 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             try record(st, t.display, .failed, try st.gpa.dupe(u8, "test function not found in built module"));
             continue;
         };
+        if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), t.display });
         armWallDeadline();
         const oc = try vm.callNoArg(fid);
         clearWallDeadline();
+        drainWallCapAbandon();
         if (failureDetail(st, oc)) |d| {
             try record(st, t.display, .failed, d);
         } else {
@@ -480,8 +501,10 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                 continue;
             };
             // Fresh instance per test (JUnit semantics).
+            if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), m.display });
             armWallDeadline();
             const inst = try vm.construct(cid);
+            drainWallCapAbandon();
             switch (inst) {
                 .ok => |receiver| {
                     var detail: ?[]const u8 = null;
@@ -495,6 +518,9 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                     if (detail == null) {
                         detail = failureDetail(st, try vm.callMethod(&receiver, m.name));
                     }
+                    // @AfterTest must run un-abandoned even when the test
+                    // itself was wall-capped.
+                    drainWallCapAbandon();
                     // @AfterTest always runs (on a fresh deadline budget so a
                     // timed-out test still tears down); its failure surfaces
                     // only if the test itself passed.
@@ -506,6 +532,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                         }
                     }
                     clearWallDeadline();
+                    drainWallCapAbandon();
                     if (detail) |d| try record(st, m.display, .failed, d) else try record(st, m.display, .passed, null);
                 },
                 .threw => |v| try record(st, m.display, .failed, describeThrow(st.gpa, v)),

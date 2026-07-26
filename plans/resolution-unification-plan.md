@@ -117,6 +117,33 @@ cannot take it; a proven mismatch now defers to the runtime receiver
 walk, which finds the dispatch owner on the enclosing chain.
 CompositionLocalTests 19 → 27.
 
+**Abort architecture (landed after the census below):** a wall-capped
+test now raises the drain-everything abandonment (`wallCapAbandon` at
+all three deadline-check sites), so its whole cohort dies cooperatively
+instead of cascading through sibling resumes against half-torn state —
+the post-cap GC-profile `incorrect alignment` panic no longer
+reproduces (two clean 45 s runs of the validatePotentialDeadlock
+repro). The runner drains with a 200 ms grace and clears the flags
+around EVERY test invocation (top-level and class-method loops), and
+dispatch-cache writes are gated on `dispatchCacheStable()` so an
+aborted walk can never record a spurious miss.
+
+**Remaining contamination lead (open):** even with the clean death, a
+group whose slow test caps mid-recomposition still poisons later
+composition tests (57× `unresolved global removeKnownCompositionLocked`
+at cap=20 in the 12-class group; the same classes pass with no cap or
+when the cap lands early). The tell is walks probing `kotlin.Int`
+receivers where instances belong (`structuralEqualityPolicy on
+kotlin.Int`, `startRestartGroup on kotlin.Int`) — receiver VALUES are
+corrupted after the abort, pointing at something reused across the
+aborted teardown: prime suspects are closure-id reuse
+(`reclaimDead`) against a leaked reference, or a pooled buffer
+released with stale contents. eval_depth is clean between tests
+(instrumented probe prints nothing). Repro: cap=20 on the
+AbstractApplier 12-class group; the 3-class subset
+(SlotTableBuilder,Recomposer,CompositionReusing) reproduces the
+Int-receiver walks without the full cluster.
+
 **Per-class fleet census (contamination excluded by construction —
 `compose-fleet.py --per-class` is now the honest census mode): 1006
 passed / 144 failed — past the previous 998 best.** Remaining genuine

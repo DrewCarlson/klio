@@ -2075,6 +2075,7 @@ fn pumpLoop(
             if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
                 std.debug.print("[wall-cap] pump wall-clock deadline exceeded — stalled pump state follows:\n", .{});
                 if (coroTop()) |t| diagStalledPump(self, t, root_token.*, true);
+                ir.eval.wallCapAbandon();
                 try pumpExit(self, out, persist);
                 return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
             }
@@ -2334,6 +2335,7 @@ fn pumpLoop(
                 if (wall_dl != 0 and ir.eval.nowMonotonicMs() > wall_dl) {
                     std.debug.print("[wall-cap] pump wall-clock deadline exceeded (parked root) — stalled pump state follows:\n", .{});
                     diagStalledPump(self, coroTop().?, root_token.*, true);
+                    ir.eval.wallCapAbandon();
                     try pumpExit(self, out, persist);
                     return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
                 }

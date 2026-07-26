@@ -135,6 +135,13 @@ pub fn setRunBoundaryAbandon(on: bool) void {
     run_boundary_abandon.store(on, .release);
 }
 
+/// Whether the drain-everything stop is currently raised. The test runner
+/// consults this after a test returns to know a wall-cap abort fired and a
+/// grace drain + flag clear is needed before the next test starts.
+pub fn runBoundaryAbandonActive() bool {
+    return run_boundary_abandon.load(.acquire);
+}
+
 /// Whether the calling thread should abort its current task: abandonment
 /// is requested and the thread is either abandonable (a pool worker) or
 /// the run boundary is draining every worker. The threadlocal gate keeps

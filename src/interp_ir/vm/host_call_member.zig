@@ -2022,6 +2022,7 @@ pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name:
 /// Record that this call resolved to a global with a single implicit-receiver
 /// candidate, so a repeat skips the member passes.
 pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
@@ -9324,6 +9325,7 @@ fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
@@ -9336,6 +9338,7 @@ fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey
 }
 
 fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().ext_method_cache.put(key, fid) catch {};

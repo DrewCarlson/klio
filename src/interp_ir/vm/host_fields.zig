@@ -2719,6 +2719,7 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// Insert into the field-read memo, capped so synthesized per-evaluation
 /// anonymous classes (fresh fqn each time) cannot grow it unboundedly.
 fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     if (pg.get().field_read_cache.count() >= 65536) return;

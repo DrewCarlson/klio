@@ -551,6 +551,38 @@ var spin_interval_read = false;
 /// at the next gate, so retry ladders cannot absorb it.
 pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 
+/// A wall-capped test must DIE, not cascade: without this, the deadline
+/// error unwound one coroutine while its siblings kept being resumed
+/// against half-torn state (each dying at its own next deadline check) —
+/// a resume storm whose half-run `finally` blocks mutated shared state
+/// and whose teardown interleavings crashed the process under the GC
+/// profile. Raising the drain-everything abandonment stops every thread
+/// and coroutine of the dying test at its next block or sleep slice; the
+/// test runner clears the flags (after a short grace) before the next
+/// test starts.
+pub fn wallCapAbandon() void {
+    runtime.requestAbandon();
+    runtime.setRunBoundaryAbandon(true);
+}
+
+/// Whether dispatch caches may be populated. A wall-capped or abandoned
+/// run produces walks that abort mid-probe; caching their outcomes (a
+/// spurious METHOD_MISS, a global-skip note, a wrong field-read route)
+/// poisoned every later execution of the same site — after one capped
+/// test, whole classes failed `unresolved global` on names that resolve
+/// fine in a fresh process (the cross-test contamination family).
+/// The runner's per-test invariant probe: a nonzero depth between tests
+/// is a leak in some unwind path.
+pub fn evalDepthNow() usize {
+    return eval_depth;
+}
+
+pub fn dispatchCacheStable() bool {
+    if (runtime.shouldAbandon()) return false;
+    const dl = test_wall_deadline_ms.load(.monotonic);
+    return dl == 0 or nowMonotonicMs() <= dl;
+}
+
 pub fn nowMonotonicMs() i64 {
     return @intCast(@divTrunc(runtime.clockMonotonicNanos(), std.time.ns_per_ms));
 }
@@ -3468,6 +3500,7 @@ fn runFrameExec(
                 // the culprit function/recursion is named at the abort point.
                 std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
                 dumpFrameChainForDiagAlways();
+                wallCapAbandon();
                 return errResult(.{ .Type = "test wall-clock deadline exceeded" });
             }
         }
