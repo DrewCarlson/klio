@@ -2612,6 +2612,48 @@ pub fn undispatchedFlatLeaveIdent(ident: usize) void {
 /// pump, exactly as the recursive branch's `park` does, and return the
 /// value the Kotlin caller continues with. Ownership of `st` moves to the
 /// pump.
+/// Flat no-driver root entry (`coroutineStartRootOrSuspended`'s pump
+/// branch): push a fresh pump + claim the clock + scope guard, exactly as
+/// the recursive branch's prologue. Null when a driver already encloses
+/// this thread (the barrier prepare handles that branch).
+pub fn rootPumpFlatEnter(allocator: Allocator, scope: *const Value) Allocator.Error!?UndispatchedEnter {
+    if (coroTop() != null) return null;
+    try coroPush(allocator);
+    if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
+    const base = activeScopeDepth();
+    const g = ActiveScopeGuard.enter(scope);
+    return .{ .base = base, .ident = if (g.pushed) g.ident else 0 };
+}
+
+/// Flat root completion: the body finished with `res_ok` (or threw —
+/// `res_ok` null with `aborted` true skips the pump and just exits it).
+/// Runs pumpLoop/pumpExit exactly as the recursive branch's tail.
+pub fn rootPumpFlatFinish(self: *VmIntrinsicHost, out: Output, scope: *const Value, res_ok: ?Value, base: usize, aborted: bool) Allocator.Error!RuntimeEvalResult {
+    defer active_scope_stack.shrinkRetainingCapacity(@min(base, active_scope_stack.items.len));
+    if (aborted) {
+        try pumpExit(self, out, true);
+        return .{ .ok = Value.Unit };
+    }
+    var root_value: ?Value = res_ok;
+    var root_token: ?u64 = null;
+    if (try pumpLoop(self, scope, out, true, true, &root_token, &root_value)) |err_result| return err_result;
+    try pumpExit(self, out, true);
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
+/// Flat root suspension: park the root, pump to quiescence (persisting an
+/// unresumed root), and report the resumed value or COROUTINE_SUSPENDED —
+/// the recursive branch's suspension tail.
+pub fn rootPumpFlatPark(self: *VmIntrinsicHost, allocator: Allocator, out: Output, st: *SuspendState, scope: *const Value, base: usize) Allocator.Error!RuntimeEvalResult {
+    defer active_scope_stack.shrinkRetainingCapacity(@min(base, active_scope_stack.items.len));
+    var root_token: ?u64 = try park(allocator, st, base);
+    var root_value: ?Value = null;
+    if (try pumpLoop(self, scope, out, true, true, &root_token, &root_value)) |err_result| return err_result;
+    try pumpExit(self, out, true);
+    if (root_token != null) return .{ .ok = Value.CoroutineSuspended };
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
 pub fn undispatchedFlatPark(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
     if (pumpDiagEnabled()) std.debug.print("[tok] barrier-park frames={d}\n", .{st.frames.items.len});
     _ = try park(allocator, st, scope_base);

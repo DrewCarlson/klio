@@ -1161,6 +1161,11 @@ pub const FlatCallReq = struct {
     /// teardown removes it by identity. Cleared at park — the parked
     /// delta owns the entry from then on.
     scope_guard_ident: usize = 0,
+    /// This barrier activation owns a fresh pump (the no-driver root
+    /// branch): its completion or suspension must run the pump loop and
+    /// exit through the host hooks. `keepalive` carries the scope value
+    /// the pump drives under.
+    root_pump: bool = false,
     dst: Reg,
 };
 
@@ -1200,6 +1205,7 @@ const Activation = struct {
     suspend_barrier: bool,
     barrier_scope_base: usize,
     scope_guard_ident: usize,
+    root_pump: bool,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -2762,6 +2768,7 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .suspend_barrier = req.suspend_barrier,
         .barrier_scope_base = req.barrier_scope_base,
         .scope_guard_ident = req.scope_guard_ident,
+        .root_pump = req.root_pump,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -3032,11 +3039,34 @@ fn runFlatLoop(
             while (stack.pop()) |a| {
                 eval_depth -= 1;
                 const is_barrier = a.suspend_barrier;
+                const is_root_pump = a.root_pump;
                 const scope_base = a.barrier_scope_base;
+                const scope_keep: Value = a.keepalive orelse .Unit;
                 const rb = a.ret_block;
                 const rix = a.ret_idx;
                 const rd = a.ret_dst;
                 try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
+                if (is_root_pump) {
+                    // No-driver root: park the root into ITS OWN pump,
+                    // drain the pump to quiescence (persisting an
+                    // unresumed root), and continue the caller with the
+                    // resumed value or COROUTINE_SUSPENDED.
+                    if (comptime @hasDecl(H, "rootPumpBarrierPark")) {
+                        const r = try host.rootPumpBarrierPark(allocator, state, scope_keep, scope_base);
+                        const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                        switch (r) {
+                            .ok => |v| try pf2.write(rd, v),
+                            .err => |e| switch (e) {
+                                .Throw => |v| rthrow = v,
+                                else => runwind = e,
+                            },
+                        }
+                        cur = rb;
+                        ridx = rix;
+                        barrier_hit = true;
+                        break;
+                    }
+                }
                 if (is_barrier) {
                     // The undispatched-start boundary: the parked segment
                     // belongs to the enclosing pump, and the CALLER
@@ -3074,6 +3104,14 @@ fn runFlatLoop(
             const act = stack.pop().?;
             eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
+            // A no-driver root's completion runs its pump to quiescence
+            // (launched children, timers) before the caller sees the
+            // result — the recursive branch's tail, guard still pushed.
+            if (act.root_pump) {
+                if (comptime @hasDecl(H, "rootPumpFlatComplete")) {
+                    res = try host.rootPumpFlatComplete(allocator, res, act.keepalive orelse .Unit, act.barrier_scope_base);
+                }
+            }
             const rb = act.ret_block;
             const rix = act.ret_idx;
             const rd = act.ret_dst;
