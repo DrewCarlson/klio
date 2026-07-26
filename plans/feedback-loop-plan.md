@@ -177,3 +177,47 @@ the submodule. Each probe cycle is ~2 min; println placement matters — a
 statement added inside a hot inline chain (`guardChanges { ... .also {} }`)
 perturbed lowering enough to change behavior, so wrap at function boundaries
 instead (expression-body -> named inner function).
+
+## Interpreter performance: the DeepRecursive commontest investigation (2026-07-26)
+
+`DeepRecursiveTest.kt` end-to-end: **166 s -> 117 s** this session, all of it
+in four tests that drive ~460k coroutine suspend/resume cycles (~250 us per
+recursion step against kotlinc/JVM's sub-second total). Landed, each measured:
+
+- `getenvSlice` memoization — libc `getenv` takes a process-wide lock and the
+  trace gates consult it per dispatch; it profiled at a quarter of on-CPU
+  time (~5% wall after caching because other costs dominate).
+- Post-collection RSS trim rate-limited to 32 MB of freed bytes — the
+  per-collection `malloc_zone_pressure_relief` was steady mmap/munmap
+  traffic; ~25% wall on this workload.
+- `KLIO_GC_GROWTH` Appel-multiplier knob — measured nearly flat (149 s at 8x
+  vs 151 s at 4x vs 157 s at 2x), which disproves GC marking as the dominant
+  cost despite its sample share.
+
+What the profile actually says (macOS `sample`, top-of-stack census plus
+call-tree): the cost is the interpreter's PER-CALL machinery, not one hog —
+member-dispatch walks (an instance-method inline cache exists and hits; the
+surrounding probe ladder and value plumbing still cost), the suspension
+snapshot capture/rebuild per park/resume pair, and a full pump lifecycle
+(coroPush + pumpLoop + pumpExit + persisted-registry traffic) TWICE per
+DeepRecursive step because the interpreted `joinBlocking` driver leaves no
+native pump on the thread (`coroTop() == null` forces the fresh-root and
+driveResumed paths). Disproved along the way: resume-chain native nesting
+(the new KLIO_PUMP_DIAG depth counter shows single digits).
+
+The structural root cause, for the record: eval executes every interpreted
+call by NATIVE recursion (~10 native frames per interpreted frame). That is
+why 100k-deep plain recursion segfaults (measured), why suspension must
+snapshot/rebuild frames instead of repointing them, and why per-step costs
+cannot drop to JVM-order without restructuring. The proper fix is an
+iterative frame loop for direct calls (explicit interpreter stack; native
+recursion only at host boundaries) — it removes the eval-depth limit,
+makes suspend/resume O(1) frame repointing, and shrinks every call's cost.
+That is a planned interpreter restructure, not a patch; a DeepRecursive
+host trampoline was prototyped and REJECTED as special-casing.
+
+Also found: `klio test --only-file=F --filter=T` reports the filtered test
+PASSED in 0 ms without executing its body (a vacuous pass — reproduced on
+DeepRecursiveTest.testDeepTreeDepth, which cannot complete in 0 ms). The
+filtered-runner path must be fixed and audited before any filtered result
+is trusted for correctness claims.
