@@ -3616,6 +3616,82 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
     return try callValueRec(self, allocator, &field_val, args);
 }
 
+/// Resolve an all-positional member call into a ready flat-call request when
+/// the resolved-method (or resolved-extension) cache already names the
+/// target and the call is the fully-applied no-vararg shape — the exact
+/// calls `invokeMethodFuncId`'s fast path serves. Anything else (a stored
+/// field shadowing the name, `copy`, defaults, varargs, a cache miss)
+/// returns null and the recursive ladder runs unchanged. Mirrors the ladder
+/// up to `invokeMethodFuncId`'s `evalWith` terminal, including the threaded
+/// ambient-composer push (undone at activation close via `flatCallClosed`).
+pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8, allow_ext_cache: bool) Allocator.Error!?ir.eval.FlatCallReq {
+    // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
+    // args)` with no closure-specific step before it, so the plain closure
+    // invocation flattens identically.
+    if (receiver.* == .IrClosure and std.mem.eql(u8, name, "invoke")) {
+        return host_call_value.prepareClosureFlatCall(self, allocator, receiver, args);
+    }
+    if (receiver.* != .Instance) return null;
+    // `recvFnFieldInvoke` / `varargShadowedFieldInvoke` / data-class `copy`
+    // run before the cache in the ladder; decline so they keep their
+    // precedence.
+    if (std.mem.eql(u8, name, "copy")) return null;
+    {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        if (g.get().get(name) != null) return null;
+    }
+    const k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null) orelse return null;
+    var fid: ?FuncId = null;
+    if (instanceMethodCacheGetRaw(self, k)) |raw| {
+        if (raw != METHOD_MISS) fid = @enumFromInt(raw);
+    }
+    if (fid == null) {
+        // Same owner-independence guards the ext cache was populated under
+        // (and the strict/members-only probes never consult it).
+        if (allow_ext_cache and static_recv == null and declared_recv == null) {
+            if (extMethodCacheGet(self, k)) |raw| fid = @enumFromInt(raw);
+        }
+    }
+    const target = fid orelse return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const f = mod.funcById(target) orelse return null;
+    // The fast fully-applied shape only: no vararg anywhere, no default
+    // padding, no trailing-lambda rebind.
+    for (f.params) |*p| {
+        if (p.is_vararg) return null;
+    }
+    if (args.len + 1 < f.params.len) return null;
+    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+        if (std.mem.eql(u8, want, f.name)) {
+            std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} FLAT\n", .{ f.fqn, target.int(), f.params.len, receiver.typeFqn() });
+        }
+    }
+    var list: std.ArrayList(Value) = .empty;
+    try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+    list.appendAssumeCapacity(receiver.*);
+    list.appendSliceAssumeCapacity(args);
+    if (trace.invariantsEnabled()) {
+        checkFuncInRange(self, "irMethodWalk", f.id);
+        checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
+    }
+    vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
+    const threaded: ?Value = if (host_call_func.composePluginEnabled())
+        compose.threadedComposerArg(f.params, args)
+    else
+        null;
+    if (threaded) |c| compose.pushComposer(c);
+    return .{
+        .func = f,
+        .run_module = mod,
+        .args = list,
+        .composer_pushed = threaded != null,
+        .dst = undefined,
+    };
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:

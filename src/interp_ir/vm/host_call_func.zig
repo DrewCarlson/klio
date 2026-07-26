@@ -976,7 +976,10 @@ const valueIsBuiltin = root.valueIsBuiltin;
 pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     const f = funcAt(module, func) orelse return 1;
     if (!f.hasBody()) return 1;
-    if (f.is_suspend or f.is_inline) return 1;
+    // Inline bodies splice; a runtime call to one keeps the full path. A
+    // plain suspend function needs nothing extra — its suspension
+    // propagates identically on the direct path.
+    if (f.is_inline) return 1;
     // A `@Composable` call must route through `callFunc` so its body is
     // bracketed with the composer group push/pop; never take the fast path.
     if (compose.isComposable(f)) return 1;
@@ -987,11 +990,10 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     if (funcDefaults(self, func) != null) return 1;
     if (resolvedNativeForm(self, func) != null) return 1;
     if (module.funcsBySimpleName(f.name).len != 1) return 1;
-    {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().registry.func_type_params.get(func) != null) return 1;
-    }
+    // Type-parameterized non-inline functions carry no reified binding
+    // (reified requires inline), and the fast path already requires the
+    // call site to bake zero type arguments, so nothing needs the typed
+    // dispatch.
     return @as(u16, @intCast(f.params.len)) + 2;
 }
 

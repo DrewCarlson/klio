@@ -59,19 +59,42 @@ resume machinery, with `frameBoundary` applying the callee-boundary
 transforms per popped activation (shared verbatim with the recursive
 path). Flattened call forms:
 
-1. plain top-level calls (the `fastCallPlan` shape) — `Call`;
+1. plain top-level calls (the `fastCallPlan` shape) — `Call` — with the
+   plan loosened to admit suspend and (non-inline, hence non-reified)
+   type-parameterized functions;
 2. plain positional exact-arity closure calls — `CallValue` on an
    `IrClosure`, via the host's `prepareClosureFlatCall` (resolution and
    binding stay host-side; the driver runs the body), including the
-   ambient-composer push/pop tied to activation open/close.
+   ambient-composer push/pop tied to activation open/close, and the same
+   shape reached as `closure.invoke(...)` through the member ladder;
+3. resolved member calls — `CallMember` and the bare-dispatch strict
+   walk (`CallMemberOrGlobal`), via `prepareMemberFlatCall`: fires only
+   on the resolved-method / resolved-extension cache hit at the
+   fully-applied no-vararg shape (the `invokeMethodFuncId` fast
+   terminal), declining when a stored field shadows the name or a
+   reified binding is in flight; the call-site access-enclosing push is
+   tied to activation close/park.
+
+**O(1) suspension landed:** a flat activation parks LIVE — the intact
+frame moves into the `SuspendState` by pointer (`FrameSnapshot.live`), no
+register/param/chain copies, no retains — and `resumeLiveActivation`
+reinstalls it; a re-park of a resumed activation is O(1) again
+(`runFlatLoop`'s root-activation mode). Only native-rooted frames still
+snapshot. Cancellation destroys parked activations via
+`SuspendState.deinit`; the GC marks them through `gcMarkSnapshot`'s live
+branch.
 
 `KLIO_FLAT=0` is the bisect switch back to full native recursion.
-Member calls (`CallMember` cache-hit fast shape, terminal at
-`invokeMethodFuncId`'s `[receiver] ++ args` path) are the next form; the
-two field-shadow pre-probes (`recvFnFieldInvoke`,
-`varargShadowedFieldInvoke`) run before the cache in the recursive ladder,
-so the member prepare must decline when the receiver class carries a
-same-named field.
+
+Measured on `DeepRecursiveTest`: 117 s → ~101 s so far. The remaining
+cost is the three host-rooted frames per step (closure bodies entered
+through intrinsic seams — `startCoroutine*` / `invokeCallableWithThis` —
+plus the receiver-lambda `callValueWithThis` route, which carries
+call-duration context pushes) and the resume-drive machinery itself.
+Next coverage candidates, in order of leverage: the `callValueWithThis`
+receiver-lambda shape (needs a request-carried ctx mark), and the
+intrinsic-host invoke seams (needs those hosts to run their callee
+through a driver-aware entry).
 
 - Call/return become push/pop on a contiguous frame arena — no host ladder
   on the direct path, no per-call native frames.

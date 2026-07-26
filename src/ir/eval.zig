@@ -1100,6 +1100,10 @@ pub const FlatCallReq = struct {
     /// The host pushed an ambient composer for this call; the activation's
     /// teardown must pop it.
     composer_pushed: bool = false,
+    /// The call site pushed the caller's `this` as an access-enclosing entry
+    /// for the dispatch; the activation's teardown pops it (after the frame
+    /// unwinds, when the caller's chain is active again).
+    pop_enclosing: bool = false,
     dst: Reg,
 };
 
@@ -1111,6 +1115,16 @@ const FlatCallSite = struct {
     ret_idx: usize,
 };
 
+/// The suspension point of the frame a `Suspended` escape left: where the
+/// frame resumes and which register receives the resume value. Set by the
+/// executor for the driver, which parks the frame (live for a flat
+/// activation, snapshot for a native root).
+const ParkPoint = struct {
+    block: BlockId,
+    inst_idx: usize,
+    resume_reg: ?Reg,
+};
+
 /// One interpreted activation on the flat driver's call stack. Heap-allocated
 /// (`allocator.create`) so the Frame's address stays stable on the GC frame
 /// chain while the stack list grows. `ret_*` is the resume point in the
@@ -1119,7 +1133,12 @@ const Activation = struct {
     frame: Frame,
     try_stack: std.ArrayList(TryFrame),
     ctx_mark: usize,
+    /// The context-parameter mark is live and must be truncated when this
+    /// activation unwinds or parks. Cleared at the first park — a resumed
+    /// activation has no host-entry effects left to unwind.
+    ctx_armed: bool,
     composer_pushed: bool,
+    pop_enclosing: bool,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -1248,6 +1267,13 @@ pub const FrameSnapshot = struct {
     /// rooted through this so a collection while it sleeps cannot reclaim the
     /// slot or sweep its capture store.
     closure_id: ?u64 = null,
+    /// A LIVE-parked flat activation: the intact frame (registers, params,
+    /// captures, try-stack, receiver chain) parked by pointer move with no
+    /// copies or retains — the frame's ownership graph is exactly what it was
+    /// during execution. When set, the slice fields above are empty and
+    /// `block`/`inst_idx`/`resume_reg` describe the resume point; the entry
+    /// resumes through `resumeLiveActivation` instead of a frame rebuild.
+    live: ?*Activation = null,
 };
 
 const SavedReg = struct {
@@ -1579,23 +1605,29 @@ pub const SuspendState = struct {
     /// retained references into the rebuilt frames. No-op under the arena.
     /// The caller still owns the `frames` ArrayList itself.
     pub fn deinit(self: *SuspendState, allocator: Allocator) void {
-        if (runtime.reclaimEnabled()) {
-            for (self.frames.items) |snap| releaseSnapshotValues(snap, allocator);
-        }
-        for (self.frames.items) |snap| freeSnapshotBuffers(snap, allocator);
+        for (self.frames.items) |snap| dropSnapshot(snap, allocator);
         self.frames.deinit(allocator);
         var seg = self.tails;
         self.tails = null;
         while (seg) |t| {
             const next = t.next;
-            if (runtime.reclaimEnabled()) {
-                for (t.frames.items[t.head..]) |snap| releaseSnapshotValues(snap, allocator);
-            }
-            for (t.frames.items[t.head..]) |snap| freeSnapshotBuffers(snap, allocator);
+            for (t.frames.items[t.head..]) |snap| dropSnapshot(snap, allocator);
             t.frames.deinit(allocator);
             allocator.destroy(t);
             seg = next;
         }
+    }
+
+    /// Drop one parked frame entry without resuming it: destroy a live
+    /// activation outright (it owns its register references), or release
+    /// and free a copied snapshot.
+    fn dropSnapshot(snap: FrameSnapshot, allocator: Allocator) void {
+        if (snap.live) |act| {
+            destroyParkedActivation(allocator, act);
+            return;
+        }
+        if (runtime.reclaimEnabled()) releaseSnapshotValues(snap, allocator);
+        freeSnapshotBuffers(snap, allocator);
     }
 };
 
@@ -1629,6 +1661,15 @@ pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) voi
 }
 
 fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
+    if (snap.live) |act| {
+        for (act.frame.regs.items) |v| v.gcMark(m);
+        for (act.frame.params.items) |v| v.gcMark(m);
+        for (act.frame.captures.items) |v| v.gcMark(m);
+        for (act.frame.enclosing_this.items) |e| e.v.gcMark(m);
+        act.frame.pending_finally.gcMark(m);
+        markFrameClosure(act.frame.closure_id, m);
+        return;
+    }
     switch (snap.regs) {
         .dense => |values| for (values) |v| v.gcMark(m),
         .sparse => |entries| for (entries) |entry| entry.value.gcMark(m),
@@ -2267,6 +2308,40 @@ pub fn resumeContinuation(
         }
         const snap = frames.items[head];
         head += 1;
+        // A live-parked flat activation resumes by reinstalling the intact
+        // frame — no rebuild, no copies. Its result routes exactly like a
+        // rebuilt frame's.
+        if (snap.live) |act| {
+            var resume_throw: ?Value = null;
+            var resume_unwind: ?EvalError = null;
+            if (pending_throw_from_inner) |exc| {
+                pending_throw_from_inner = null;
+                resume_throw = exc;
+            } else if (pending_unwind_from_inner) |e| {
+                pending_unwind_from_inner = null;
+                resume_unwind = e;
+            } else if (first) {
+                if (carry == .Result and !carry.Result.ok) {
+                    resume_throw = carry.Result.payload.asPtr().*;
+                }
+            }
+            first = false;
+            if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+                std.debug.print("[resume-frame] {s}#{d} LIVE at={d}:{d} throw={} via={s}\n", .{
+                    act.frame.func.name,
+                    act.frame.func.id.int(),
+                    snap.block.int(),
+                    snap.inst_idx,
+                    resume_throw != null,
+                    resume_route,
+                });
+            }
+            const r = try resumeLiveActivation(H, allocator, act, carry, snap.block, snap.inst_idx, snap.resume_reg, resume_throw, resume_unwind, host);
+            switch (try routeResumedResult(allocator, r, &frames, head, &tails, &carry, &pending_throw_from_inner, &pending_unwind_from_inner)) {
+                .next => continue,
+                .done => |out| return out,
+            }
+        }
         // Resolve the frame's `FuncId` against the module it was lowered
         // into — a per-method sub-module for an anon-object / local /
         // nested class, the passed-in (main) module otherwise.
@@ -2372,59 +2447,68 @@ pub fn resumeContinuation(
             resume_unwind,
             host,
         );
-        switch (r) {
-            .ok => |v| carry = v,
-            .err => |e| switch (e) {
-                .Suspended => |inner| {
-                    // Re-suspended before this frame finished. The newly
-                    // captured inner frames stay innermost-first; the
-                    // still-pending outer snapshots are LINKED as an
-                    // inherited segment in O(1) — copying them here made
-                    // deep recursion quadratic in the parked depth.
-                    if (head < frames.items.len or tails != null) {
-                        const seg = try allocator.create(TailSeg);
-                        seg.* = .{ .frames = frames, .head = head, .next = tails };
-                        frames = .empty;
-                        head = 0;
-                        tails = null;
-                        // Append to the END of inner's (short) existing
-                        // chain: inner's own inherited segments are deeper
-                        // (inner-more) than ours.
-                        var slot: *?*TailSeg = &inner.tails;
-                        while (slot.*) |t| slot = &t.next;
-                        slot.* = seg;
-                    }
-                    return errResult(.{ .Suspended = inner });
-                },
-                .Throw => |exc| {
-                    // Route the throw through the next-outer frame's
-                    // restored try-stack: a `try { suspendingCall() }
-                    // catch (e) { … }` should see exceptions raised after
-                    // the parked call resumes.
-                    if (head >= frames.items.len and tails == null) {
-                        return errResult(.{ .Throw = exc });
-                    }
-                    pending_throw_from_inner = exc;
-                },
-                .NonLocalReturn, .LabeledReturn => {
-                    // The return was raised after the innermost frame resumed.
-                    // Re-enter each still-snapshotted caller with the control
-                    // event, just as a resumed throw re-enters its callers.
-                    // This lets the target frame absorb a labeled return and
-                    // lets every intervening frame run its finally blocks.
-                    if (head >= frames.items.len and tails == null) {
-                        return errResult(e);
-                    }
-                    pending_unwind_from_inner = e;
-                },
-                // A resumed frame ran; its unresolved-operation failure is
-                // real, never a dispatch miss (see `CalleeFailed`).
-                .Unimplemented => |msg| return errResult(.{ .CalleeFailed = msg }),
-                else => return errResult(e),
-            },
+        switch (try routeResumedResult(allocator, r, &frames, head, &tails, &carry, &pending_throw_from_inner, &pending_unwind_from_inner)) {
+            .next => {},
+            .done => |out| return out,
         }
     }
     return ok(carry);
+}
+
+const ResumeRoute = union(enum) { next, done: EvalResult };
+
+/// Route one resumed frame's result within `resumeContinuation`'s drive
+/// loop: a value carries outward; a re-suspension links the still-pending
+/// outer snapshots as an inherited segment in O(1) (copying them made deep
+/// recursion quadratic in the parked depth); a throw / non-local return
+/// re-enters the next-outer frame so its restored try-stack (and label
+/// match) can take it; a resolution-class failure of a RAN frame re-tags as
+/// `CalleeFailed` so no walker retries it.
+fn routeResumedResult(
+    allocator: Allocator,
+    r: EvalResult,
+    frames: *std.ArrayList(FrameSnapshot),
+    head: usize,
+    tails: *?*TailSeg,
+    carry: *Value,
+    pending_throw_from_inner: *?Value,
+    pending_unwind_from_inner: *?EvalError,
+) Allocator.Error!ResumeRoute {
+    switch (r) {
+        .ok => |v| carry.* = v,
+        .err => |e| switch (e) {
+            .Suspended => |inner| {
+                if (head < frames.items.len or tails.* != null) {
+                    const seg = try allocator.create(TailSeg);
+                    seg.* = .{ .frames = frames.*, .head = head, .next = tails.* };
+                    frames.* = .empty;
+                    tails.* = null;
+                    // Append to the END of inner's (short) existing chain:
+                    // inner's own inherited segments are deeper (inner-more)
+                    // than ours.
+                    var slot: *?*TailSeg = &inner.tails;
+                    while (slot.*) |t| slot = &t.next;
+                    slot.* = seg;
+                }
+                return .{ .done = errResult(.{ .Suspended = inner }) };
+            },
+            .Throw => |exc| {
+                if (head >= frames.items.len and tails.* == null) {
+                    return .{ .done = errResult(.{ .Throw = exc }) };
+                }
+                pending_throw_from_inner.* = exc;
+            },
+            .NonLocalReturn, .LabeledReturn => {
+                if (head >= frames.items.len and tails.* == null) {
+                    return .{ .done = errResult(e) };
+                }
+                pending_unwind_from_inner.* = e;
+            },
+            .Unimplemented => |msg| return .{ .done = errResult(.{ .CalleeFailed = msg }) },
+            else => return .{ .done = errResult(e) },
+        },
+    }
+    return .next;
 }
 
 /// Run (or resume) a single activation's block loop. `resume_idx` is the
@@ -2544,7 +2628,9 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .frame = try Frame.newWithCaptures(allocator, module, req.func, req.args, req.captures),
         .try_stack = .empty,
         .ctx_mark = 0,
+        .ctx_armed = true,
         .composer_pushed = req.composer_pushed,
+        .pop_enclosing = req.pop_enclosing,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -2568,15 +2654,121 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
 /// Tear down a flat activation: the exact exit sequence of
 /// `evalWithCapturesChained`'s defers, in their LIFO order, then the host's
 /// post-call unwinds (ambient composer pop) that wrapped the recursive call.
+/// A previously-parked activation carries no live host-entry effects (its
+/// flags were cleared at park), so only the frame itself unwinds.
 fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, host: *H) void {
-    if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
+    if (act.ctx_armed) {
+        if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
+        act.ctx_armed = false;
+    }
     act.frame.deactivateChain();
     gcPopFrame(&act.frame);
     act.frame.deinit();
     act.try_stack.deinit(allocator);
     if (act.composer_pushed) {
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
+        act.composer_pushed = false;
     }
+    if (act.pop_enclosing) {
+        popEnclosing();
+        act.pop_enclosing = false;
+    }
+}
+
+/// Park a flat activation live: unwind its host-entry effects and thread
+/// links, then hand the intact activation (frame, registers, try-stack,
+/// receiver chain — no copies, no retains) to the suspend state. Ownership
+/// moves to the state; `resumeLiveActivation` reinstalls it, and
+/// `SuspendState.deinit` destroys it if the coroutine is dropped unresumed.
+fn liveParkActivation(
+    comptime H: type,
+    allocator: Allocator,
+    act: *Activation,
+    block: BlockId,
+    inst_idx: usize,
+    resume_reg: ?Reg,
+    state: *SuspendState,
+    host: *H,
+) Allocator.Error!void {
+    if (act.ctx_armed) {
+        if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
+        act.ctx_armed = false;
+    }
+    if (act.composer_pushed) {
+        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
+        act.composer_pushed = false;
+    }
+    act.frame.deactivateChain();
+    gcPopFrame(&act.frame);
+    if (act.pop_enclosing) {
+        popEnclosing();
+        act.pop_enclosing = false;
+    }
+    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+        std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d} enc={d}\n", .{
+            act.frame.func.name,
+            act.frame.func.id.int(),
+            block.int(),
+            inst_idx,
+            act.frame.captures.items.len,
+            act.frame.enclosing_this.items.len,
+        });
+    }
+    try state.frames.append(allocator, .{
+        .live = act,
+        .func = act.frame.func.id,
+        .module = act.frame.module_arc,
+        .block = block,
+        .inst_idx = inst_idx,
+        .regs = .{ .sparse = &.{} },
+        .params = &.{},
+        .captures = &.{},
+        .enclosing_this = &.{},
+        .try_stack = &.{},
+        .pending_finally = .{},
+        .is_lambda = act.frame.func.is_lambda,
+        .resume_reg = resume_reg,
+        .closure_id = act.frame.closure_id,
+    });
+}
+
+/// Destroy a live-parked activation that is being dropped without a resume
+/// (a cancelled or abandoned coroutine). The frame owns its register
+/// references; params/captures are borrows, exactly as during execution.
+fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
+    act.frame.deinit();
+    act.try_stack.deinit(allocator);
+    allocator.destroy(act);
+}
+
+/// Reinstall a live-parked activation and run it to its next completion or
+/// suspension. `block`/`inst_idx`/`resume_reg` come from the park entry.
+/// On suspension the driver has already re-parked the activation into the
+/// new state (ownership moved); on completion the activation is torn down
+/// here and the boundary-transformed result returned.
+fn resumeLiveActivation(
+    comptime H: type,
+    allocator: Allocator,
+    act: *Activation,
+    carry: Value,
+    block: BlockId,
+    inst_idx: usize,
+    resume_reg: ?Reg,
+    resume_throw: ?Value,
+    resume_unwind: ?EvalError,
+    host: *H,
+) Allocator.Error!EvalResult {
+    gcPushFrame(&act.frame);
+    act.frame.activateAs();
+    if (resume_throw == null) {
+        if (resume_reg) |r| try act.frame.write(r, carry);
+    }
+    const res = try runFlatLoop(H, allocator, &act.frame, &act.try_stack, block, inst_idx, resume_throw, resume_unwind, act, host);
+    if (res == .err and res.err == .Suspended) return res;
+    const out = frameBoundary(act.frame.func, res);
+    teardownActivation(H, allocator, act, host);
+    allocator.destroy(act);
+    return out;
 }
 
 /// Discard a flat call request without running it (depth-cap rejection):
@@ -2590,6 +2782,7 @@ fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host
     if (req.composer_pushed) {
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
     }
+    if (req.pop_enclosing) popEnclosing();
 }
 
 /// The flat call driver. Runs `frame` through `runFrameExec`; when the
@@ -2612,6 +2805,24 @@ fn runFrameInner(
     host: *H,
 ) Allocator.Error!EvalResult {
     _ = module;
+    return runFlatLoop(H, allocator, frame, try_stack, cur_in, resume_idx_in, resume_throw_in, resume_unwind_in, null, host);
+}
+
+/// The driver core. `root_act` is set when the root frame is itself a
+/// resumed live activation — a suspension then live-parks the root too
+/// instead of snapshotting it (the caller relinquished ownership).
+fn runFlatLoop(
+    comptime H: type,
+    allocator: Allocator,
+    frame: *Frame,
+    try_stack: *std.ArrayList(TryFrame),
+    cur_in: BlockId,
+    resume_idx_in: usize,
+    resume_throw_in: ?Value,
+    resume_unwind_in: ?EvalError,
+    root_act: ?*Activation,
+    host: *H,
+) Allocator.Error!EvalResult {
     var stack: std.ArrayList(*Activation) = .empty;
     defer stack.deinit(allocator);
     // On an allocation failure, unwind every open activation so no frame is
@@ -2629,7 +2840,8 @@ fn runFrameInner(
         const f: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
         const ts: *std.ArrayList(TryFrame) = if (stack.items.len > 0) &stack.items[stack.items.len - 1].try_stack else try_stack;
         var flat_site: ?FlatCallSite = null;
-        var res = try runFrameExec(H, allocator, f.module, f, ts, cur, ridx, rthrow, runwind, &flat_site, host);
+        var park_out: ?ParkPoint = null;
+        var res = try runFrameExec(H, allocator, f.module, f, ts, cur, ridx, rthrow, runwind, &flat_site, &park_out, host);
         rthrow = null;
         runwind = null;
         if (flat_site) |site| {
@@ -2660,6 +2872,30 @@ fn runFrameInner(
             ridx = 0;
             continue;
         }
+        // A suspension: park the current frame at its own suspension point,
+        // then every outer activation at its recorded call-return point,
+        // preserving the innermost-first order of the recursive path. Flat
+        // activations park LIVE — the intact frame moves into the state by
+        // pointer, no copies — and only a native root frame snapshots.
+        if (park_out) |pp| {
+            const state = res.err.Suspended;
+            var pb = pp.block;
+            var pi = pp.inst_idx;
+            var pd = pp.resume_reg;
+            while (stack.pop()) |a| {
+                eval_depth -= 1;
+                try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
+                pb = a.ret_block;
+                pi = a.ret_idx;
+                pd = a.ret_dst;
+            }
+            if (root_act) |ra| {
+                try liveParkActivation(H, allocator, ra, pb, pi, pd, state, host);
+            } else {
+                try snapshotSuspendedFrame(allocator, frame, try_stack, pb, pi, pd, state);
+            }
+            return res;
+        }
         // The current frame exited; deliver its result to the calling
         // activation, applying the callee-boundary transforms each popped
         // frame's result crosses.
@@ -2668,29 +2904,6 @@ fn runFrameInner(
             const act = stack.pop().?;
             eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
-            if (res == .err and res.err == .Suspended) {
-                // Snapshot every open activation outward from the suspension
-                // (each resuming at its recorded call-return point), then the
-                // root frame, preserving the innermost-first snapshot order of
-                // the recursive path.
-                const state = res.err.Suspended;
-                var sb = act.ret_block;
-                var si = act.ret_idx;
-                var sd: ?Reg = act.ret_dst;
-                teardownActivation(H, allocator, act, host);
-                allocator.destroy(act);
-                while (stack.pop()) |a| {
-                    eval_depth -= 1;
-                    try snapshotSuspendedFrame(allocator, &a.frame, &a.try_stack, sb, si, sd, state);
-                    sb = a.ret_block;
-                    si = a.ret_idx;
-                    sd = a.ret_dst;
-                    teardownActivation(H, allocator, a, host);
-                    allocator.destroy(a);
-                }
-                try snapshotSuspendedFrame(allocator, frame, try_stack, sb, si, sd, state);
-                return res;
-            }
             const rb = act.ret_block;
             const rix = act.ret_idx;
             const rd = act.ret_dst;
@@ -3191,6 +3404,7 @@ fn runFrameExec(
     resume_throw_in: ?Value,
     resume_unwind_in: ?EvalError,
     flat_out: *?FlatCallSite,
+    park_out: *?ParkPoint,
     host: *H,
 ) Allocator.Error!EvalResult {
     var cur = cur_in;
@@ -3430,16 +3644,16 @@ fn runFrameExec(
                         break;
                     },
                     .Suspended => |state| {
-                        // Snapshot this activation so it can be resumed
-                        // just past the suspending instruction. The resume
-                        // value lands in the suspending call's destination
-                        // register (or one a binding set explicitly via
-                        // `pending_resume_reg`).
+                        // Report the suspension point so the driver can park
+                        // this frame — live for a flat activation, snapshot
+                        // for a native root. The resume value lands in the
+                        // suspending call's destination register (or one a
+                        // binding set explicitly via `pending_resume_reg`).
                         const resume_reg = if (state.pending_resume_reg) |rr| blk: {
                             state.pending_resume_reg = null;
                             break :blk rr;
                         } else instDst(inst);
-                        try snapshotSuspendedFrame(allocator, frame, try_stack, cur, idx + 1, resume_reg, state);
+                        park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),
@@ -5104,6 +5318,21 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     }
     const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
     const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+    // Flat member dispatch: a previously-resolved user method (or cached
+    // top-level extension) at the fully-applied no-vararg shape runs as a
+    // pushed activation. The host consults the same caches the recursive
+    // ladder's entry consults; anything else falls through to the ladder.
+    if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
+        if (flatEnabled() and argNamesAllNull(cm.arg_names)) {
+            if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
+                var prep = prep0;
+                prep.dst = cm.dst;
+                prep.pop_enclosing = pushed_enclosing;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
@@ -6049,6 +6278,23 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     .raised => |e| return raiseStep(frame, e),
                 };
                 continue;
+            }
+            // Flat bare-member dispatch: when this candidate's resolved-method
+            // cache already names the target (the same entry the strict
+            // probe's ladder would fire-and-run first), run it as a pushed
+            // activation. The reified-type-binding shape keeps globals bound
+            // for the call's duration through this arm's defers, so it stays
+            // on the recursive path.
+            if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
+                if (flatEnabled() and mit_saved.items.len == 0 and argNamesAllNull(cmg.arg_names)) {
+                    if (try host.prepareMemberFlatCall(allocator, &c.v, name_str, arg_values, hint, null, false)) |prep0| {
+                        var prep = prep0;
+                        prep.dst = cmg.dst;
+                        orAudit("CallMemberOrGlobal", name_str, "member", c.depth, &c.v);
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                }
             }
             switch (if (committed_ext_h != null)
                 try host.callMemberMembersOnly(allocator, &c.v, name_str, arg_values, names, hint)
