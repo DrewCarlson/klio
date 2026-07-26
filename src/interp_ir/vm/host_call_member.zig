@@ -9289,7 +9289,32 @@ fn instanceMethodKey(self: *VmHost, receiver: *const Value, name: []const u8, ar
 /// both resolutions cached under distinct keys; resolution is a pure function
 /// of (class, name, arg-sig, scope), so each entry stays sound.
 fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
-    if (receiver.* != .Instance) return null;
+    // Non-Instance receivers with a stable type identity key too: a
+    // closure's resolution is fixed by its BODY (the declared shape —
+    // arity, receiver head, suspendness — is a pure function of the body
+    // func), and a `Result`'s by its tag (extensions on `Result<T>` are
+    // erased). The synthesized identity is forced ODD so it can never
+    // collide with a real class-cell pointer (those are aligned). The
+    // hot coroutine boundary (`startCoroutineUninterceptedOrReturn` on a
+    // suspend block, `throwOnFailure` on a `Result`) re-ran the full
+    // extension walk per call without this.
+    const class_identity: usize = switch (receiver.*) {
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        },
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            var h = std.hash.Wyhash.init(0x2545f4914f6cdd1d);
+            h.update(std.mem.asBytes(&info.body_func));
+            const mp: usize = @intFromPtr(info.module);
+            h.update(std.mem.asBytes(&mp));
+            break :blk h.final() | 1;
+        },
+        .Result => 0x5261 | 1,
+        else => return null,
+    };
     var sig = methodArgSig(args) orelse return null;
     if (static_recv != null or declared_recv != null) {
         var h = std.hash.Wyhash.init(0x517cc1b727220a95);
@@ -9300,12 +9325,9 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
         // Keep 0 reserved for the unscoped empty-arg case.
         if (sig == 0) sig = 1;
     }
-    const inst = receiver.Instance;
-    const g = inst.borrow();
-    defer g.deinit();
     const name_p = memberNameIdentity(self, name) orelse return null;
     return .{
-        .class_p = g.get().class.identity(),
+        .class_p = class_identity,
         .name_p = name_p,
         .n_args = @intCast(args.len),
         .sig = sig,
@@ -10643,7 +10665,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             },
             else => receiver.typeFqn(),
         };
-        std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s}\n", .{ strict_ext, args.len, rk });
+        std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s} static={s} declared={s}\n", .{
+            strict_ext, args.len, rk, static_recv orelse "-", declared_recv orelse "-",
+        });
     }
 
     // Inline-cache fast path. A prior *owner-independent* resolution of this
@@ -10653,9 +10677,16 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     // the dominant cost of extension-heavy hot loops. Only keyed when no
     // receiver override is in play (a static/declared receiver, or the strict
     // bare-name probe, can resolve the same names differently).
+    // A `declared_recv`-directed call keys with the scope FOLDED into the
+    // sig (`instanceMethodKeyScoped`): its resolution is a pure function of
+    // (receiver identity, name, arg-sig, declared scope), so it caches
+    // apart from the unscoped call — never served one, never serves one.
+    // The hot coroutine boundary (`fn.startCoroutineUninterceptedOrReturn`
+    // lowered with declared receiver `Function1`) re-walked per call when
+    // any declared scope disabled the key outright.
     const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
-        if (!strict_ext and static_recv == null and declared_recv == null)
-            instanceMethodKey(self, receiver, name, args)
+        if (!strict_ext and static_recv == null)
+            instanceMethodKeyScoped(self, receiver, name, args, null, declared_recv)
         else
             null;
     if (cache_key) |k| {

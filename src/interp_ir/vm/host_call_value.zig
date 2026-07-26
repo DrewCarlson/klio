@@ -159,6 +159,17 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
 /// value is materialized per call.
 const ThisOverride = struct { idx: usize, val: Value };
 
+/// `KLIO_CALLVALUE_TRACE` gate, cached: the memoized `getenvSlice` still
+/// takes a lock + hashmap probe per consult, which shows up when consulted
+/// per call on the flat dispatch path.
+var cvt_trace_cached: ?bool = null;
+fn callValueTraceOn() bool {
+    if (cvt_trace_cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    cvt_trace_cached = on;
+    return on;
+}
+
 fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, captures: ValueSlice, this_override: ?ThisOverride, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (args.len != info.n_params) return null;
@@ -263,27 +274,29 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
             break;
         }
     }
-    const ti = this_idx orelse return null;
     // The receiver is an implicit receiver, hence a context-argument
     // source for a contextual callee inside the block. The mark is taken
     // BEFORE the push so the activation's close truncates it away.
     const ctx_mark = self.ctxStackLen();
     if (self.ctxIsActive()) self.ctxPush(selected_this) catch {};
-    // Bind the receiver into a fresh captures cell's `this` slot, exactly
-    // as the recursive bind does.
+    // With a `this` capture, the receiver binds into that slot exactly as
+    // the recursive bind does, and the displaced prior `this` stays
+    // reachable as an outer implicit receiver. Without one, the body takes
+    // no receiver and the receiver is only the innermost subject — the
+    // recursive path's plain terminal.
     const prior_this: ?Value = blk: {
+        const ti = this_idx orelse break :blk null;
         const g = captures.borrow();
         defer g.deinit();
         const slice = g.get().*;
         if (ti < slice.len) break :blk slice[ti];
         break :blk null;
     };
-    // Keep the displaced prior `this` reachable as an outer implicit
-    // receiver, and the new receiver as the innermost subject — the same
-    // pushes (and LIFO pop order at activation close) as the recursive
-    // bind.
+    // The same pushes (and LIFO pop order at activation close) as the
+    // recursive bind.
     var pushes: u8 = 0;
     const pushed_outer = po: {
+        if (this_idx == null) break :po false;
         const pt = prior_this orelse break :po false;
         if (pt == .Null or pt == .Unit) break :po false;
         if (pt == .Instance and selected_this == .Instance) {
@@ -303,7 +316,8 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     // capture vector; the receiver stays rooted by the caller's registers
     // (or the context stack) for the call's duration, so no bound closure
     // value or keepalive is needed.
-    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, .{ .idx = ti, .val = selected_this }, args)) orelse {
+    const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = selected_this } else null;
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, args)) orelse {
         // Declined at the terminal (native form): undo everything and let
         // the recursive path run.
         while (pushes > 0) : (pushes -= 1) host_call_member.popAccessEnclosing(self);
@@ -312,10 +326,34 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     };
     req.ctx_mark_override = ctx_mark;
     req.pop_enclosing_n = pushes;
-    if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+    if (callValueTraceOn()) {
         std.debug.print("[cvt-flat] id={d} pushes={d}\n", .{ id, pushes });
     }
     return req;
+}
+
+/// Flat counterpart of `callValueNamedRecvCtx`: the receiver-context
+/// dispatch (a no-this-capture exact-arity closure invoked bare with an
+/// Instance implicit receiver at the call site) prepares through the
+/// with-this path; every other closure shape prepares as a plain value
+/// call, mirroring the recursive routing exactly.
+pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (callee.* != .IrClosure) return null;
+    if (recv.* == .Instance) {
+        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            var has_this = false;
+            for (info.capture_names) |n| {
+                if (std.mem.eql(u8, n, "this")) {
+                    has_this = true;
+                    break;
+                }
+            }
+            if (!has_this and args.len == info.n_params) {
+                return prepareClosureWithThisFlatCall(self, allocator, callee, recv, args);
+            }
+        }
+    }
+    return prepareClosureFlatCall(self, allocator, callee, args);
 }
 
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {

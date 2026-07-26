@@ -128,13 +128,56 @@ cost sits in the intrinsic-host invoke seams and member dispatch, not
 this instruction. Those benchmarks carry over to the intrinsic-seam
 stage.
 
-Recorded gap found while smoking this (pre-existing, identical under
-`KLIO_FLAT=0`, dispatch-cluster work): inside a receiver lambda,
-invoking ANOTHER receiver-lambda local by bare name (`add(n)` where
-`add: Box.(Int) -> Int` and `this: Box` is in scope) loses the
-implicit receiver — the callee body fails with ``unresolved global
-`v``` on its receiver-member access. Kotlin passes the implicit
-receiver through the invoke convention here.
+**Variant-arm flattening + dispatch-cache widening (landed next):**
+a 5 s `sample` of the DeepRecursive repro exposed the per-step native
+ladder precisely. Landed from it:
+
+1. `CallMemberOrValue` / `CallValueOrMember` value branches now consult
+   the flat prepares (`prepareValueRecvCtxFlatCall` mirrors
+   `callValueNamedRecvCtx`'s routing; the with-this prepare generalized
+   to the no-`this`-capture exact-arity shape). Both arms vanished from
+   the sampled ladder.
+2. The ext-method/instance-method cache key (`instanceMethodKeyScoped`)
+   now keys non-Instance receivers with a stable identity: an
+   `IrClosure` by its BODY func (+ sub-module), a `Result` by its tag —
+   both forced odd so they never collide with class-cell pointers. And
+   `extensionFnFallback` keys `declared_recv`-directed calls with the
+   scope folded into the sig instead of disabling the key. Effect:
+   `startCoroutineUninterceptedOrReturn` (closure receiver, declared
+   `Function1`) 51→2 walks and `throwOnFailure` (Result receiver) 50→1
+   on a 50-step DeepRecursive run.
+3. Hot-path trace gates (`KLIO_CALLVALUE/LR/RESUME/MISS/CMG/NU_TRACE`)
+   consult cached bools/slices instead of `getenvSlice` (spinlock +
+   hashmap probe per executed instruction; 45 samples in the profile).
+
+DeepRecursive 100k repro: 10.4 s → 8.8 s. Remaining per-step native
+seams, in sample order: (a) `execCallMemberOrGlobal → callNamedOverload
+→ callFunc` (bare overload call, native recursion); (b) `execArmCall`
+typed route (`callFuncTyped` binds reified type-name globals for the
+call duration and post-transforms the result — flattening needs the
+activation to carry a restore list); (c) the intrinsic seam
+`dispatchIntrinsic → ivCoroutineStartRootOrSuspended → evalClosureRaw`
+— the coroutine body runs on its OWN native-rooted driver, so every
+suspend SNAPSHOTS instead of live-parking; making this driver-aware
+(the intrinsic returns a flat-call request plus a completion hook run
+at frame boundary) is the big one for suspend-heavy loops and the
+wall-capped compose benchmarks (still capped after this stage);
+(d) per-step qualified-global resolution (`kotlin` 2×/step,
+`COROUTINE_SUSPENDED` 3×/step) walking package-object fields with
+fresh hashmap allocations per lookup (`companionWalkSeeded` grows in
+the profile).
+
+Recorded gaps found while smoking (pre-existing, identical under
+`KLIO_FLAT=0`, dispatch-cluster work):
+- inside a receiver lambda, invoking ANOTHER receiver-lambda local by
+  bare name (`add(n)` where `add: Box.(Int) -> Int` and `this: Box` is
+  in scope) loses the implicit receiver — the callee body fails with
+  ``unresolved global `v``` on its receiver-member access. Kotlin
+  passes the implicit receiver through the invoke convention here.
+- a DeepRecursive program WITHOUT `import kotlin.coroutines.*` fails
+  ``Vm::call_member `startCoroutineUninterceptedOrReturn` on
+  `kotlin.Function``` — stdlib-internal resolution must not depend on
+  the user program's imports.
 
 - Call/return become push/pop on a contiguous frame arena — no host ladder
   on the direct path, no per-call native frames.
