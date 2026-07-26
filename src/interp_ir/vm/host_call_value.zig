@@ -151,8 +151,15 @@ fn boundReferenceFunc(callee: *const Value) ?FuncId {
 /// `evalWithCapturesChained` terminal, including the ambient-composer push,
 /// which the flat activation's teardown undoes via `flatCallClosed`.
 pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
-    const id = callee.IrClosure.id;
-    const captures = callee.IrClosure.captures;
+    return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args);
+}
+
+/// One capture slot replaced at activation open — the receiver bind of a
+/// with-this call, applied to the COPIED capture vector so no bound closure
+/// value is materialized per call.
+const ThisOverride = struct { idx: usize, val: Value };
+
+fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, captures: ValueSlice, this_override: ?ThisOverride, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (args.len != info.n_params) return null;
     const module: *const Module = blk: {
@@ -178,6 +185,12 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
         const g = captures.borrow();
         defer g.deinit();
         try capture_values.appendSlice(allocator, g.get().*);
+    }
+    if (this_override) |ov| {
+        if (ov.idx >= capture_values.items.len) {
+            try capture_values.appendNTimes(allocator, Value.Null, ov.idx + 1 - capture_values.items.len);
+        }
+        capture_values.items[ov.idx] = ov.val;
     }
     vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
     var composer_pushed = false;
@@ -205,6 +218,104 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
 pub fn flatCallClosed(self: *VmHost) void {
     _ = self;
     compose.popComposer();
+}
+
+/// Resolve a plain receiver-lambda invocation (`recv.block()` /
+/// `block(recv, …)` lowered as CallValueWithThis) into a ready flat-call
+/// request: the same receiver head-match, context-source push, capture
+/// bind, and enclosing pushes `callValueWithThis` performs up to its
+/// `callValue(&bound, …)` terminal, with the receiver bind applied as a
+/// slot override on the activation's capture copy. The special shapes —
+/// local named fn, receiver-fills-param, pass-threaded composable,
+/// explicit-receiver overflow, varargs — decline and keep the recursive
+/// path.
+pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (callee.* != .IrClosure) return null;
+    const id = callee.IrClosure.id;
+    const captures = callee.IrClosure.captures;
+    const info = self.closures.get(@intCast(id)) orelse return null;
+    if (args.len != info.n_params) return null;
+    var selected_this = this_value_in.*;
+    {
+        const module_g = self.module.borrow();
+        defer module_g.deinit();
+        const m = info.module orelse module_g.get();
+        const f = m.funcById(info.body_func) orelse return null;
+        for (f.params) |*p| {
+            if (p.is_vararg) return null;
+        }
+        // A named LOCAL FUNCTION lowered as a closure is not a receiver
+        // lambda; a body with a declared leading `this` param binds the
+        // receiver positionally — both keep the recursive path.
+        const takes_receiver = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (takes_receiver) return null;
+        if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
+        if (f.lambda_receiver_ty) |head| {
+            if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
+                selected_this = matched;
+            }
+        }
+    }
+    var this_idx: ?usize = null;
+    for (info.capture_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this")) {
+            this_idx = i;
+            break;
+        }
+    }
+    const ti = this_idx orelse return null;
+    // The receiver is an implicit receiver, hence a context-argument
+    // source for a contextual callee inside the block. The mark is taken
+    // BEFORE the push so the activation's close truncates it away.
+    const ctx_mark = self.ctxStackLen();
+    if (self.ctxIsActive()) self.ctxPush(selected_this) catch {};
+    // Bind the receiver into a fresh captures cell's `this` slot, exactly
+    // as the recursive bind does.
+    const prior_this: ?Value = blk: {
+        const g = captures.borrow();
+        defer g.deinit();
+        const slice = g.get().*;
+        if (ti < slice.len) break :blk slice[ti];
+        break :blk null;
+    };
+    // Keep the displaced prior `this` reachable as an outer implicit
+    // receiver, and the new receiver as the innermost subject — the same
+    // pushes (and LIFO pop order at activation close) as the recursive
+    // bind.
+    var pushes: u8 = 0;
+    const pushed_outer = po: {
+        const pt = prior_this orelse break :po false;
+        if (pt == .Null or pt == .Unit) break :po false;
+        if (pt == .Instance and selected_this == .Instance) {
+            break :po !ObjRef(InstanceData).ptrEq(pt.Instance, selected_this.Instance);
+        }
+        break :po true;
+    };
+    if (pushed_outer) {
+        if (prior_this) |p| host_call_member.pushAccessEnclosing(self, &p);
+        pushes += 1;
+    }
+    if (selected_this == .Instance or selected_this == .Null) {
+        host_call_member.pushAccessEnclosingSubject(self, &selected_this);
+        pushes += 1;
+    }
+    // The receiver bind is a slot override on the activation's COPIED
+    // capture vector; the receiver stays rooted by the caller's registers
+    // (or the context stack) for the call's duration, so no bound closure
+    // value or keepalive is needed.
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, .{ .idx = ti, .val = selected_this }, args)) orelse {
+        // Declined at the terminal (native form): undo everything and let
+        // the recursive path run.
+        while (pushes > 0) : (pushes -= 1) host_call_member.popAccessEnclosing(self);
+        self.ctxStackTruncate(ctx_mark);
+        return null;
+    };
+    req.ctx_mark_override = ctx_mark;
+    req.pop_enclosing_n = pushes;
+    if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+        std.debug.print("[cvt-flat] id={d} pushes={d}\n", .{ id, pushes });
+    }
+    return req;
 }
 
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {

@@ -284,6 +284,7 @@ pub const VmHost = struct {
     // every `ir.eval.evalWith(VmHost, ...)` call site.
     pub const callValue = host_call_value.callValue;
     pub const prepareClosureFlatCall = host_call_value.prepareClosureFlatCall;
+    pub const prepareClosureWithThisFlatCall = host_call_value.prepareClosureWithThisFlatCall;
     pub const flatCallClosed = host_call_value.flatCallClosed;
     pub const callValueNamed = host_call_value.callValueNamed;
     pub const callValueNamedRecvCtx = host_call_value.callValueNamedRecvCtx;

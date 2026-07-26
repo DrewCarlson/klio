@@ -94,33 +94,47 @@ branch.
 `KLIO_FLAT=0` is the bisect switch back to full native recursion.
 
 Measured on `DeepRecursiveTest`: 117 s → ~101 s so far. The remaining
-cost is the three host-rooted frames per step (closure bodies entered
-through intrinsic seams — `startCoroutine*` / `invokeCallableWithThis` —
-plus the receiver-lambda `callValueWithThis` route, which carries
-call-duration context pushes) and the resume-drive machinery itself.
-Next coverage candidates, in order of leverage: the `callValueWithThis`
-receiver-lambda shape (needs a request-carried ctx mark), and the
-intrinsic-host invoke seams (needs those hosts to run their callee
-through a driver-aware entry).
+cost is the host-rooted frames per step (closure bodies entered
+through intrinsic seams — `startCoroutine*` / `invokeCallableWithThis`)
+and the resume-drive machinery itself. The receiver-lambda
+`callValueWithThis` instruction is now flattened (below); the next
+coverage candidate is the intrinsic-host invoke seams (needs those
+hosts to run their callee through a driver-aware entry).
 
-**`CallValueWithThis` flattening — concrete design (next up):** the
-exec arm at `eval.zig` (`.CallValueWithThis`) consults a new host
-`prepareClosureWithThisFlatCall(callee, recv, args)` mirroring
+**`CallValueWithThis` flattening — LANDED:** the exec arm at
+`eval.zig` (`.CallValueWithThis`) consults the host's
+`prepareClosureWithThisFlatCall(callee, recv, args)`, which mirrors
 `callValueWithThis` up to its `callValue(&bound, …)` terminal for the
 plain receiver-lambda shape only (IrClosure callee, all-positional,
-`args.len == info.n_params`, a `this` capture present, no varargs; the
-local-named-fn / recv-fills-param / pass-threaded-composable shapes
-keep the recursive path). `FlatCallReq` grows: `ctx_mark_override:
-?usize` (the host pushes the receiver as a context source BEFORE the
-activation opens, so `openActivation` must adopt the PRE-push mark
-rather than reading the stack length after) and `pop_enclosing_n: u8`
-(the bind pushes up to TWO access entries — displaced prior `this` and
-the receiver subject — which teardown/live-park must pop in order).
-The bound-captures vector replaces the closure's `this` slot exactly as
-the recursive bind does (fresh vector, retained under reclaim). The 11
-wall-capped tests (`oneRectBenchmarkSimulation`,
-`validatePotentialDeadlock`, …) are the throughput benchmarks for this
+`args.len == info.n_params`, a `this` capture present, no varargs,
+`<lambda>` body with no declared leading `this` param; every other
+shape declines to the recursive path). `FlatCallReq` grew
+`ctx_mark_override: ?usize` (the receiver is pushed as a context
+source BEFORE the activation opens, so the activation adopts the
+PRE-push mark), `pop_enclosing_n: u8` (up to two access-enclosing
+pushes — displaced prior `this` and the receiver subject — popped
+LIFO at teardown/live-park), and `keepalive: ?Value` (available for
+future seams; the with-this path no longer needs it). The receiver
+bind is a SLOT OVERRIDE on the activation's copied capture vector
+(`prepareClosureFlatCallSlots`), not a materialized bound closure —
+the first cut built a fresh `IrClosure` + `ValueSlice` per call and
+measured ~8% SLOWER than recursion on a 2M-call receiver-lambda
+microbench; the override form is at parity (~5.5 s both modes).
+`[cvt-flat]` under `KLIO_CALLVALUE_TRACE` confirms the arm fires.
+Timing verdict: DeepRecursiveTest unchanged (~101 s) and the wall-capped
+compose benchmarks (`oneRectBenchmarkSimulation`,
+`validatePotentialDeadlock`) still hit the 90 s cap — their per-call
+cost sits in the intrinsic-host invoke seams and member dispatch, not
+this instruction. Those benchmarks carry over to the intrinsic-seam
 stage.
+
+Recorded gap found while smoking this (pre-existing, identical under
+`KLIO_FLAT=0`, dispatch-cluster work): inside a receiver lambda,
+invoking ANOTHER receiver-lambda local by bare name (`add(n)` where
+`add: Box.(Int) -> Int` and `this: Box` is in scope) loses the
+implicit receiver — the callee body fails with ``unresolved global
+`v``` on its receiver-member access. Kotlin passes the implicit
+receiver through the invoke convention here.
 
 - Call/return become push/pop on a contiguous frame arena — no host ladder
   on the direct path, no per-call native frames.

@@ -1132,10 +1132,22 @@ pub const FlatCallReq = struct {
     /// The host pushed an ambient composer for this call; the activation's
     /// teardown must pop it.
     composer_pushed: bool = false,
-    /// The call site pushed the caller's `this` as an access-enclosing entry
-    /// for the dispatch; the activation's teardown pops it (after the frame
-    /// unwinds, when the caller's chain is active again).
-    pop_enclosing: bool = false,
+    /// Access-enclosing entries the call site / prepare pushed for the
+    /// dispatch (the caller's `this`, a displaced prior receiver, the
+    /// receiver subject); the activation's teardown pops them LIFO after
+    /// the frame unwinds, when the caller's chain is active again.
+    pop_enclosing_n: u8 = 0,
+    /// The context-parameter mark taken BEFORE the prepare pushed a
+    /// receiver as a context source (`callValueWithThis` feeds the
+    /// receiver into the context stack for the block's duration); the
+    /// activation adopts it so its close truncates the push away. Null =
+    /// the activation reads the stack length itself at open.
+    ctx_mark_override: ?usize = null,
+    /// A value the activation must keep alive for its whole life (the
+    /// receiver-BOUND closure a with-this prepare builds: the frame's
+    /// captures borrow its capture vector). Released at teardown or
+    /// parked-drop; GC-marked while live-parked.
+    keepalive: ?Value = null,
     dst: Reg,
 };
 
@@ -1170,7 +1182,8 @@ const Activation = struct {
     /// activation has no host-entry effects left to unwind.
     ctx_armed: bool,
     composer_pushed: bool,
-    pop_enclosing: bool,
+    pop_enclosing_n: u8,
+    keepalive: ?Value,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -1700,6 +1713,7 @@ fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
         for (act.frame.enclosing_this.items) |e| e.v.gcMark(m);
         act.frame.pending_finally.gcMark(m);
         markFrameClosure(act.frame.closure_id, m);
+        if (act.keepalive) |ka| ka.gcMark(m);
         return;
     }
     switch (snap.regs) {
@@ -2675,7 +2689,8 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .ctx_mark = 0,
         .ctx_armed = true,
         .composer_pushed = req.composer_pushed,
-        .pop_enclosing = req.pop_enclosing,
+        .pop_enclosing_n = req.pop_enclosing_n,
+        .keepalive = req.keepalive,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -2684,7 +2699,8 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
     gcPushFrame(&act.frame);
     act.frame.module_arc = req.owning;
     try act.frame.activateChain(req.chain);
-    act.ctx_mark = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
+    act.ctx_mark = req.ctx_mark_override orelse
+        (if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0);
     if (comptime @hasDecl(H, "ctxPush")) {
         if (module.has_context_decls) {
             if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
@@ -2714,9 +2730,10 @@ fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, 
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
         act.composer_pushed = false;
     }
-    if (act.pop_enclosing) {
-        popEnclosing();
-        act.pop_enclosing = false;
+    while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
+    if (act.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+        act.keepalive = null;
     }
 }
 
@@ -2745,10 +2762,7 @@ fn liveParkActivation(
     }
     act.frame.deactivateChain();
     gcPopFrame(&act.frame);
-    if (act.pop_enclosing) {
-        popEnclosing();
-        act.pop_enclosing = false;
-    }
+    while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
     if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d} enc={d}\n", .{
             act.frame.func.name,
@@ -2783,6 +2797,9 @@ fn liveParkActivation(
 fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     act.frame.deinit();
     act.try_stack.deinit(allocator);
+    if (act.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+    }
     allocator.destroy(act);
 }
 
@@ -2827,7 +2844,11 @@ fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host
     if (req.composer_pushed) {
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
     }
-    if (req.pop_enclosing) popEnclosing();
+    var n = req.pop_enclosing_n;
+    while (n > 0) : (n -= 1) popEnclosing();
+    if (req.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+    }
 }
 
 /// The flat call driver. Runs `frame` through `runFrameExec`; when the
@@ -4248,6 +4269,23 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
                 for (arg_values) |*av| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(av.*))});
                 std.debug.print("\n", .{});
             }
+            // Flat receiver-lambda dispatch: the plain bound shape (a
+            // `this`-capture closure at exact arity) runs as a pushed
+            // activation; the host performs the same receiver selection and
+            // capture binding the recursive path would, then hands back the
+            // ready call. The special shapes (local named fn,
+            // receiver-fills-param, pass-threaded composable, explicit
+            // receiver overflow) decline and keep the recursive path.
+            if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
+                if (flatEnabled() and callee_v == .IrClosure and argNamesAllNull(cvt.arg_names)) {
+                    if (try host.prepareClosureWithThisFlatCall(allocator, &callee_v, &recv, arg_values)) |prep0| {
+                        var prep = prep0;
+                        prep.dst = cvt.dst;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                }
+            }
             const result = if (cvt.receiver_shape_exact)
                 try host.callValueWithThisExact(allocator, &callee_v, &recv, arg_values, names)
             else
@@ -5378,7 +5416,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
-                prep.pop_enclosing = pushed_enclosing;
+                prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
                 frame.flat_call = prep;
                 return .flat_call;
             }
