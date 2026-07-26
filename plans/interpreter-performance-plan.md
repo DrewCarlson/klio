@@ -103,6 +103,25 @@ receiver-lambda shape (needs a request-carried ctx mark), and the
 intrinsic-host invoke seams (needs those hosts to run their callee
 through a driver-aware entry).
 
+**`CallValueWithThis` flattening — concrete design (next up):** the
+exec arm at `eval.zig` (`.CallValueWithThis`) consults a new host
+`prepareClosureWithThisFlatCall(callee, recv, args)` mirroring
+`callValueWithThis` up to its `callValue(&bound, …)` terminal for the
+plain receiver-lambda shape only (IrClosure callee, all-positional,
+`args.len == info.n_params`, a `this` capture present, no varargs; the
+local-named-fn / recv-fills-param / pass-threaded-composable shapes
+keep the recursive path). `FlatCallReq` grows: `ctx_mark_override:
+?usize` (the host pushes the receiver as a context source BEFORE the
+activation opens, so `openActivation` must adopt the PRE-push mark
+rather than reading the stack length after) and `pop_enclosing_n: u8`
+(the bind pushes up to TWO access entries — displaced prior `this` and
+the receiver subject — which teardown/live-park must pop in order).
+The bound-captures vector replaces the closure's `this` slot exactly as
+the recursive bind does (fresh vector, retained under reclaim). The 11
+wall-capped tests (`oneRectBenchmarkSimulation`,
+`validatePotentialDeadlock`, …) are the throughput benchmarks for this
+stage.
+
 - Call/return become push/pop on a contiguous frame arena — no host ladder
   on the direct path, no per-call native frames.
 - Suspension becomes O(1): unlink the interpreted segment (it is already a
