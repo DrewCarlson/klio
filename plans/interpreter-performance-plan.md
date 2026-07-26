@@ -158,10 +158,22 @@ call duration and post-transforms the result — flattening needs the
 activation to carry a restore list); (c) the intrinsic seam
 `dispatchIntrinsic → ivCoroutineStartRootOrSuspended → evalClosureRaw`
 — the coroutine body runs on its OWN native-rooted driver, so every
-suspend SNAPSHOTS instead of live-parking; making this driver-aware
-(the intrinsic returns a flat-call request plus a completion hook run
-at frame boundary) is the big one for suspend-heavy loops and the
-wall-capped compose benchmarks (still capped after this stage);
+suspend SNAPSHOTS instead of live-parking. **Partially landed as the
+SUSPEND BARRIER:** `__klio_co_startRootOrSuspended` under an enclosing
+pump now runs its block as a barrier activation on the caller's flat
+driver (`prepareUndispatchedStartFlatCall`) — a suspension crossing the
+barrier live-parks the segment into the pump (`undispatchedFlatPark`,
+O(1), no snapshots) and the caller continues with COROUTINE_SUSPENDED;
+the scope guard maps to activation open (push) / teardown (leave by
+identity) / park (delta capture owns the entry, ident cleared).
+`FlatCallReq`/`Activation` carry `suspend_barrier`,
+`barrier_scope_base`, `scope_guard_ident`; the driver's park loop
+intercepts at the barrier and resumes the caller instead of unwinding.
+Verified firing (200 barrier-parks on a 200-iteration
+coroutineScope/async probe, byte-identical output vs `KLIO_FLAT=0`).
+The NO-driver branch (DeepRecursive's plain `runCallLoop` — coroPush +
+pump + pumpExit per step) still declines to the recursive path: that
+seam needs the pump itself restructured and is the next piece of (c);
 (d) per-step qualified-global resolution (`kotlin` 2×/step,
 `COROUTINE_SUSPENDED` 3×/step) walking package-object fields with
 fresh hashmap allocations per lookup (`companionWalkSeeded` grows in

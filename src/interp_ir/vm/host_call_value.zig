@@ -332,6 +332,73 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     return req;
 }
 
+/// Resolve an undispatched coroutine start (`__klio_co_startRootOrSuspended`
+/// under an enclosing pump) into a BARRIER flat-call request: the block runs
+/// as an activation on the caller's driver, a suspension parks the segment
+/// into the pump (`undispatchedFlatPark`) and the caller continues with
+/// COROUTINE_SUSPENDED. Mirrors `coroutineStartRootOrSuspended`'s
+/// enclosing-driver branch up to its `evalClosureRaw` terminal: scope-guard
+/// push, empty call args (the block declares none), live captures with
+/// every-`this` override by the scope value. The no-driver root branch
+/// (pump construction) and every non-plain shape decline to the recursive
+/// path.
+pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, module: *const Module, fid: FuncId, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (args.len != 2) return null;
+    const f = module.funcById(fid) orelse return null;
+    if (!std.mem.eql(u8, f.name, "__klio_co_startRootOrSuspended")) return null;
+    // Without the registered native form the Kotlin fallback body serves
+    // the call; without an enclosing pump the root branch's pump machinery
+    // must run.
+    if (host_call_func.resolvedNativeForm(self, fid) == null) return null;
+    if (!vmhost.coroutines.coroutineHasDriver()) return null;
+    const scope_v = args[0];
+    const block = args[1];
+    if (block != .IrClosure) return null;
+    const id = block.IrClosure.id;
+    const captures = block.IrClosure.captures;
+    const info = self.closures.get(@intCast(id)) orelse return null;
+    if (info.n_params != 0) return null;
+    // `evalClosureRaw` falls back to the ClosureInfo cell when the live
+    // vector's length mismatches; that shape declines here.
+    {
+        const g = captures.borrow();
+        defer g.deinit();
+        if (g.get().*.len != info.capture_names.len) return null;
+    }
+    // `evalClosureRaw` overrides EVERY capture named `this`; the slot
+    // override binds one, so a multi-`this` shape declines.
+    var this_idx: ?usize = null;
+    for (info.capture_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this")) {
+            if (this_idx != null) return null;
+            this_idx = i;
+        }
+    }
+    const enter = vmhost.coroutines.undispatchedFlatEnter(&scope_v);
+    const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = scope_v } else null;
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, &.{})) orelse {
+        vmhost.coroutines.undispatchedFlatLeaveIdent(enter.ident);
+        return null;
+    };
+    req.suspend_barrier = true;
+    req.barrier_scope_base = enter.base;
+    req.scope_guard_ident = enter.ident;
+    return req;
+}
+
+/// Driver hook: barrier park for a flat undispatched-start activation.
+pub fn undispatchedBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
+    _ = self;
+    return vmhost.coroutines.undispatchedFlatPark(allocator, st, scope_base);
+}
+
+/// Driver hook: remove the scope entry a barrier prepare pushed, by
+/// identity, at activation teardown.
+pub fn undispatchedScopeLeave(self: *VmHost, ident: usize) void {
+    _ = self;
+    vmhost.coroutines.undispatchedFlatLeaveIdent(ident);
+}
+
 /// Flat counterpart of `callValueNamedRecvCtx`: the receiver-context
 /// dispatch (a no-this-capture exact-arity closure invoked bare with an
 /// Instance implicit receiver at the call site) prepares through the

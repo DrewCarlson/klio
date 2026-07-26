@@ -1148,6 +1148,19 @@ pub const FlatCallReq = struct {
     /// captures borrow its capture vector). Released at teardown or
     /// parked-drop; GC-marked while live-parked.
     keepalive: ?Value = null,
+    /// Undispatched-start boundary (`startCoroutineUninterceptedOrReturn`
+    /// under an enclosing pump): a suspension crossing this activation
+    /// parks the segment into the pump via the host hook and the CALLER
+    /// continues with the hook's value instead of unwinding.
+    suspend_barrier: bool = false,
+    /// The active-scope depth captured BEFORE the prepare's scope push;
+    /// the barrier park hands it to the pump so the scope delta travels
+    /// with the parked segment.
+    barrier_scope_base: usize = 0,
+    /// Identity of the active-scope entry the prepare pushed (0 = none);
+    /// teardown removes it by identity. Cleared at park — the parked
+    /// delta owns the entry from then on.
+    scope_guard_ident: usize = 0,
     dst: Reg,
 };
 
@@ -1184,6 +1197,9 @@ const Activation = struct {
     composer_pushed: bool,
     pop_enclosing_n: u8,
     keepalive: ?Value,
+    suspend_barrier: bool,
+    barrier_scope_base: usize,
+    scope_guard_ident: usize,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -2743,6 +2759,9 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .composer_pushed = req.composer_pushed,
         .pop_enclosing_n = req.pop_enclosing_n,
         .keepalive = req.keepalive,
+        .suspend_barrier = req.suspend_barrier,
+        .barrier_scope_base = req.barrier_scope_base,
+        .scope_guard_ident = req.scope_guard_ident,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -2787,6 +2806,10 @@ fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, 
         if (runtime.reclaimEnabled()) ka.release(allocator);
         act.keepalive = null;
     }
+    if (act.scope_guard_ident != 0) {
+        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(act.scope_guard_ident);
+        act.scope_guard_ident = 0;
+    }
 }
 
 /// Park a flat activation live: unwind its host-entry effects and thread
@@ -2815,6 +2838,8 @@ fn liveParkActivation(
     act.frame.deactivateChain();
     gcPopFrame(&act.frame);
     while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
+    // The park's scope-delta capture owns the guard entry from here on.
+    act.scope_guard_ident = 0;
     if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d} enc={d}\n", .{
             act.frame.func.name,
@@ -2900,6 +2925,9 @@ fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host
     while (n > 0) : (n -= 1) popEnclosing();
     if (req.keepalive) |ka| {
         if (runtime.reclaimEnabled()) ka.release(allocator);
+    }
+    if (req.scope_guard_ident != 0) {
+        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(req.scope_guard_ident);
     }
 }
 
@@ -3000,13 +3028,37 @@ fn runFlatLoop(
             var pb = pp.block;
             var pi = pp.inst_idx;
             var pd = pp.resume_reg;
+            var barrier_hit = false;
             while (stack.pop()) |a| {
                 eval_depth -= 1;
+                const is_barrier = a.suspend_barrier;
+                const scope_base = a.barrier_scope_base;
+                const rb = a.ret_block;
+                const rix = a.ret_idx;
+                const rd = a.ret_dst;
                 try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
-                pb = a.ret_block;
-                pi = a.ret_idx;
-                pd = a.ret_dst;
+                if (is_barrier) {
+                    // The undispatched-start boundary: the parked segment
+                    // belongs to the enclosing pump, and the CALLER
+                    // continues with the hook's value (COROUTINE_SUSPENDED)
+                    // — the defining startCoroutineUninterceptedOrReturn
+                    // split. Ownership of `state` moves to the pump.
+                    const v: Value = if (comptime @hasDecl(H, "undispatchedBarrierPark"))
+                        try host.undispatchedBarrierPark(allocator, state, scope_base)
+                    else
+                        Value.CoroutineSuspended;
+                    const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                    try pf2.write(rd, v);
+                    cur = rb;
+                    ridx = rix;
+                    barrier_hit = true;
+                    break;
+                }
+                pb = rb;
+                pi = rix;
+                pd = rd;
             }
+            if (barrier_hit) continue;
             if (root_act) |ra| {
                 try liveParkActivation(H, allocator, ra, pb, pi, pd, state, host);
             } else {
@@ -5002,6 +5054,22 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
     defer ta.deinit(allocator);
     for (call.type_args) |c| {
         try ta.append(allocator, constStr(frame.module, c) orelse "");
+    }
+
+    // Undispatched-start boundary (`__klio_co_startRootOrSuspended` under
+    // an enclosing pump): run the block as a BARRIER activation on this
+    // driver — a suspension parks the segment into the pump and this frame
+    // continues with COROUTINE_SUSPENDED, with no native pump entry and no
+    // frame snapshots per call.
+    if (comptime @hasDecl(H, "prepareUndispatchedStartFlatCall")) {
+        if (flatEnabled() and argNamesAllNull(call.arg_names)) {
+            if (try host.prepareUndispatchedStartFlatCall(allocator, frame.module, call.func, arg_values)) |prep0| {
+                var prep = prep0;
+                prep.dst = call.dst;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
     }
 
     const bakedExt = struct {

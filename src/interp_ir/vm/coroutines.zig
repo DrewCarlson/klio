@@ -2588,6 +2588,36 @@ pub fn coroutineHasDriver() bool {
     return coroTop() != null;
 }
 
+/// The flat-driver counterpart of `coroutineStartRootOrSuspended`'s
+/// enclosing-driver branch entry: capture the scope base and push the
+/// scope guard, exactly as `ActiveScopeGuard.enter` does. Returned ident
+/// is 0 when nothing was pushed.
+pub const UndispatchedEnter = struct { base: usize, ident: usize };
+pub fn undispatchedFlatEnter(scope: *const Value) UndispatchedEnter {
+    const base = activeScopeDepth();
+    const g = ActiveScopeGuard.enter(scope);
+    return .{ .base = base, .ident = if (g.pushed) g.ident else 0 };
+}
+
+/// Undo `undispatchedFlatEnter`'s push by identity (the guard's `leave`
+/// semantics — never a blind top pop). No-op for ident 0 or when the
+/// entry was already captured into a parked scope delta.
+pub fn undispatchedFlatLeaveIdent(ident: usize) void {
+    if (ident == 0) return;
+    (ActiveScopeGuard{ .pushed = true, .ident = ident }).leave();
+}
+
+/// Barrier park for a flat undispatched-start activation: hand the parked
+/// segment (with its scope delta above `scope_base`) to the enclosing
+/// pump, exactly as the recursive branch's `park` does, and return the
+/// value the Kotlin caller continues with. Ownership of `st` moves to the
+/// pump.
+pub fn undispatchedFlatPark(allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
+    if (pumpDiagEnabled()) std.debug.print("[tok] barrier-park frames={d}\n", .{st.frames.items.len});
+    _ = try park(allocator, st, scope_base);
+    return Value.CoroutineSuspended;
+}
+
 /// Run `block` as a fresh root on this thread with NO enclosing driver
 /// (`DeepRecursive`'s plain `runCallLoop` driving suspend blocks through
 /// `startCoroutineUninterceptedOrReturn`). A synchronous completion
