@@ -71,6 +71,18 @@ Post-dehang fleet follow-ups (first census: two groups completed at
   `unresolved global A$f34` (collision-mangled name), 4× `unresolved
   global map`, plus singles.
 
+Second census (all boundary fixes in, fleet completes bounded — no
+TIMEOUT groups, no crash): 739 passed / 118 failed. The new 59×
+`unresolved global removeKnownCompositionLocked` cluster is CROSS-TEST
+CONTAMINATION, not a resolution regression: the failing tests pass
+standalone; in the fleet child, `RecomposerTests.validatePotentialDeadlock`
+dies at the 90 s wall cap mid-run and its aborted state poisons the
+shared Recomposer machinery for every later test in that process. The
+primal target is therefore the ~11 residual wall-capped hangs
+(`validatePotentialDeadlock` first — it now has a bounded ~90 s repro via
+`scripts/compose-test.sh RecomposerTests.validatePotentialDeadlock`),
+and after those, per-test state isolation for aborted tests.
+
 ## North star
 
 KLIO should turn scripts into **as static a representation as possible without
