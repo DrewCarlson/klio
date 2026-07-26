@@ -1784,3 +1784,32 @@ Remaining clusters, next levers first (per `scripts/compose-fleet.py`):
 The itest ratchet needs ~1210; the per-class fleet after this fix should be
 re-baselined by one full `zig build itest-compose_plugin_commontest` run once
 the top two clusters land.
+
+## Cluster 1 breadcrumbs (invoke_callable_with_this on kotlin.Any)
+
+Raise site: inside `__get_JobSupport_key` (body `get() = Job`), reached from
+`CombinedContext.get` under `KlioDispatcher.dispatch` in ~25 CompositionTests.
+Established with KLIO_BARE_TRACE=Job + the tagged getter trace:
+- the bare `Job` read has TWO same-name candidates: the `Job` interface's
+  companion (`Job.Key`, the correct binding per Kotlin: companion outranks the
+  factory for a bare VALUE read) and the top-level factory
+  `kotlinx.coroutines.Job(parent)#8453` (params=1, body=false at this bake) —
+  a classifier-vs-function shadowing pick, the RC family this plan owns;
+- the dispatch also probes `Job` as an extension property on the receiver
+  chain (`[extprop-walk] try=(TestScopeImpl,Job)` etc.) before settling;
+- the getter itself runs with correct receivers (Job subtypes) in the passing
+  cases; the failing instance ends in `invoke_callable_with_this` on an Any —
+  suggesting the read binds the factory FUNCTION value (or a companion-invoke
+  conversion) and a downstream `==`/invoke path treats it as callable.
+Next probe: dump the lowered body of `__get_JobSupport_key` (KLIO_BARE_TRACE=Job
+prints the pick at lowering; check whether the emit is LoadGlobal(func=8453)
+vs the companion-singleton load) and fix the value-position pick to prefer the
+companion, mirroring the ctor-name rule in the deferred-call tail.
+
+Verification state: stdlib sweep IDENTICAL to baseline with both interpreter
+commits (67ba7492 tightened the reroute's ownership test to the module-backed
+subtype walk). NOTE the environment hazard that faked a mass regression: the
+sweep's scratch home `/tmp/klio_itest_stdlibtest_home` lost its kotlin.test
+pack mid-session, failing every file on `assertEquals`; repopulate with
+`pack build kotlin-klio/klio-kotlin-test` + install into that HOME before
+trusting sweep deltas.
