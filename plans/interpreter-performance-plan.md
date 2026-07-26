@@ -70,8 +70,16 @@ benchmarks, recorded in this plan per landing.
 
 With frames flat, put a monomorphic inline cache on the CALL INSTRUCTION
 (receiver class id -> resolved target) in a side table per module image,
-falling back to today's ladder only on miss/polymorphic sites. The existing
-`instanceMethodCache` becomes the second tier.
+falling back to today's ladder only on miss/polymorphic sites. Scoping fact
+established 2026-07-26: `callMemberInnerStatic`'s ENTRY already consults the
+(class, name, argsig, static_recv)-keyed `instanceMethodCache` for members
+AND top-level-extension hits at every arity, so cache-hit member calls skip
+the probe ladder today; the remaining per-call overhead above the cache is
+execArmCallMember -> callMemberNamedInner's preamble -> the entry check ->
+invokeMethodFuncId -> evalWith frame construction. Stage 2's win is
+therefore mostly in Stage 1's frame-construction savings plus hoisting the
+cache consult to the instruction; do not expect a standalone Stage-2 gain
+before Stage 1 lands.
 
 ### Stage 3 — allocation discipline
 
