@@ -11195,18 +11195,20 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, owner, "PlacementScope")) {
-        std.debug.print("[meoi] owner={s} nentries={d}:", .{ owner, entries.len });
-        for (entries) |e| {
-            if (e.v == .Instance) {
-                const g = e.v.Instance.borrow();
-                const cg = g.get().class.borrow();
-                std.debug.print(" {s}={}", .{ cg.get().name, receiverImplementsOwnerIdentity(self, &e.v, owner) });
-                cg.deinit();
-                g.deinit();
-            } else std.debug.print(" {s}", .{@tagName(e.v)});
+    if (runtime.getenvSlice("KLIO_MEOI_TRACE")) |w| {
+        if (std.mem.eql(u8, owner, w)) {
+            std.debug.print("[meoi] owner={s} nentries={d}:", .{ owner, entries.len });
+            for (entries) |e| {
+                if (e.v == .Instance) {
+                    const g = e.v.Instance.borrow();
+                    const cg = g.get().class.borrow();
+                    std.debug.print(" {s}={}", .{ cg.get().name, receiverImplementsOwnerIdentity(self, &e.v, owner) });
+                    cg.deinit();
+                    g.deinit();
+                } else std.debug.print(" {s}", .{@tagName(e.v)});
+            }
+            std.debug.print("\n", .{});
         }
-        std.debug.print("\n", .{});
     }
     for (entries) |e| {
         if (e.v != .Instance) continue;

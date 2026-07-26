@@ -90,15 +90,22 @@ Cluster root causes found after the second census (fixes below landed):
   run under `KLIO_RECLAIM=debug`, and the likely mechanism of the
   post-wall-cap `incorrect alignment` panics (cell control block
   destroyed twice). First block no longer releases.
-- **`DynamicProvidableCompositionLocal.read` cluster (open)**: the
-  failing dispatch happens INSIDE computed-local evaluation — the
-  `CompositionLocalAccessorScope` member-extension property
-  (`CompositionLocal<T>.currentValue`) loses its DISPATCH receiver (the
-  accessor scope) and its body's call binds against the extension
-  receiver (the key), missing the map-extension `read`. Repro:
-  `scripts/compose-test.sh CompositionLocalTests.testDefaultComputedLocal`
-  with `KLIO_NU_TRACE=read` (the `[rim]` walk shows
-  static_recv=CompositionLocal candidates only).
+- **`DynamicProvidableCompositionLocal.read` cluster (open, breadcrumbs
+  complete)**: computed-local evaluation dispatches the interface-default
+  member-extension getter `__ext_get_CompositionLocal_currentValue`
+  (fid registered with owner FQN in `member_ext_owner_class` — pack
+  serialization fine). At dispatch (`host_fields` site1202) the owner IS
+  resolved from the enclosing chain — `KLIO_MEOI_TRACE=<owner FQN>`
+  prints `PersistentCompositionLocalHashMap=true` — and pushed via
+  `pushEnclosing`. Yet the getter body's walk for its bare `read(this)`
+  probes ONLY the key's class tower (`[extfb] ENTRY recv=Dynamic…`, one
+  candidate): the pushed owner never reaches the getter frame's
+  implicit-receiver set. Next step: dump the getter frame's
+  `enclosing_this` at walk time (extend the `[cmg]` trace or frame-entry
+  dump) and follow where the push is dropped between `pushEnclosing`,
+  `evalGetterTagged`'s eval entry, and `activateChain`'s in-flight copy.
+  Repro:
+  `scripts/compose-test.sh CompositionLocalTests.testDefaultComputedLocal`.
 - **`validatePotentialDeadlock` itself is NOT a deadlock**: at the wall
   cap it is mid-recomposition of a 1000-node `repeat` loop — an
   interpreter-throughput case for the flat-eval plan, not a wakeup bug.
