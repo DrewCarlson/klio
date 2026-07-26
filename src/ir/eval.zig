@@ -6392,6 +6392,34 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
             }
         }
     }
+    // A supplied direct receiver normally REPLACES the frame `this` — but
+    // when the frame carries its OWN receiver param bound to a DIFFERENT
+    // value, dropping the param strands every bare member of the declared
+    // receiver: the pausable pause/resume path was observed leaving a stale
+    // ComposableLambdaImpl in the lowered recv register (which then deduped
+    // against a leaked subject entry) while the receiver PARAM still held
+    // the real MockViewValidator. The param is dispatch truth for the
+    // declared receiver type; keep it in the walk between the direct
+    // receiver and the ambient chain.
+    if (direct_this != null and consult_param) {
+        const pv = implicitThisValue(frame, this_idx, true);
+        if (pv != .Null and pv != .Unit and !sameReceiver(pv, direct_this.?)) {
+            var already = false;
+            for (out.items) |c| {
+                if (sameReceiver(c.v, pv)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                const own_subject = switch (frame.func.kind) {
+                    .top_level_extension, .member_extension => true,
+                    else => false,
+                };
+                try appendCandidateRun(H, allocator, &out, pv, own_subject, &depth, host, bare_name);
+            }
+        }
+    }
     for (entries) |e| try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), &depth, host, bare_name);
     return out.toOwnedSlice(allocator);
 }
