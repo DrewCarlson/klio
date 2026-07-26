@@ -110,6 +110,25 @@ Cluster root causes found after the second census (fixes below landed):
   cap it is mid-recomposition of a 1000-node `repeat` loop — an
   interpreter-throughput case for the flat-eval plan, not a wakeup bug.
 
+**The `read` cluster is FIXED** (commit `501d742c`): the resolver
+emitted a static this-bound `CallMember` for a resolved extension even
+when `knownReceiverExtApplicable` had proven the innermost receiver
+cannot take it; a proven mismatch now defers to the runtime receiver
+walk, which finds the dispatch owner on the enclosing chain.
+CompositionLocalTests 19 → 27.
+
+**Per-class fleet census (contamination excluded by construction —
+`compose-fleet.py --per-class` is now the honest census mode): 1006
+passed / 144 failed — past the previous 998 best.** Remaining genuine
+clusters by size: 15 `exception`, 11 `unresolved global next`, 11
+wall-cap (slow tests — interpreter throughput, feeds the flat-eval
+plan), 7+6 mock-text asserts, 6 LabeledReturn, 5 `plusAssign` on Int,
+4 `A$f34`, 4 View-not-found, 4 `invoke` on ComposableLambdaImpl, 4
+`trySend`, 4 `map`, singles. The grouped fleet still shows the
+contamination clusters (59× removeKnownCompositionLocked, 50×
+assert-true) — per-test state isolation after an aborted test remains
+the fix for grouped/ratchet fidelity.
+
 Second census (all boundary fixes in, fleet completes bounded — no
 TIMEOUT groups, no crash): 739 passed / 118 failed. The new 59×
 `unresolved global removeKnownCompositionLocked` cluster is CROSS-TEST
