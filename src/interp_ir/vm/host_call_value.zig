@@ -459,7 +459,15 @@ pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: 
                     break;
                 }
             }
-            if (!has_this and args.len == info.n_params) {
+            const receiver_lambda = blk: {
+                if (!has_this) break :blk false;
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const f = m.funcById(info.body_func) orelse break :blk false;
+                break :blk f.lambda_receiver_ty != null;
+            };
+            if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 return prepareClosureWithThisFlatCall(self, allocator, callee, recv, args);
             }
         }
@@ -1204,7 +1212,21 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                     break;
                 }
             }
-            if (!has_this and args.len == info.n_params) {
+            // A RECEIVER LAMBDA invoked bare binds the call site's
+            // implicit receiver through the invoke convention regardless
+            // of its `this` capture: a `Box.(Int) -> Int` local called as
+            // `add(n)` inside a Box scope runs against that scope's
+            // receiver — the capture only holds the creation-site
+            // leftover, values never carry receivers in Kotlin.
+            const receiver_lambda = blk: {
+                if (!has_this) break :blk false;
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const f = m.funcById(info.body_func) orelse break :blk false;
+                break :blk f.lambda_receiver_ty != null;
+            };
+            if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 if (runtime.getenvSlice("KLIO_CVNRC") != null) {
                     const tn = blk: {
                         const g = recv.Instance.borrow();
