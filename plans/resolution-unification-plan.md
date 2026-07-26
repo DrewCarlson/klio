@@ -1885,11 +1885,26 @@ the list. Two defects compound:
 2. The candidate walk lets the pushed-subject stack SHADE OUT the frame's
    own receiver parameter entirely (`consult_param` should make p0 the
    first candidate regardless).
-Fix order: (2) first — the frame's own `this` param must always be a
-candidate ahead of ambient subjects (safe, walk-local, sweep-gated); then
-(1) — audit push/pop pairing across the suspension snapshot/resume seam
-(the snapshot captures `enclosing_this` and the resume re-establishes it;
-a re-suspension must not double-account). The `LabeledReturn` 6x
+NARROWED one further level with an instrumented par-miss (hrp/itv fields):
+the frame's receiver facts are intact (`has_receiver_param=true`,
+`implicitThisValue=Instance` — the validator), yet the candidate list is
+`[ComposableLambdaImpl]` alone. That is only possible through the
+`direct_this` path: the CallMemberOrGlobal's lowered `recv` REGISTER (from
+`b.resolve("this")` inside the extension body) holds the ComposableLambdaImpl
+at runtime — it then `sameReceiver`-dedups against the stale innermost
+enclosing entry and REPLACES the frame receiver ("a supplied direct receiver
+replaces, rather than precedes, the frame this"). So the primary defect is a
+CLOBBERED RECEIVER REGISTER in the pausable pause/resume path — the resumed
+frame's register rebuild (or the paused segment's snapshot) restores the
+wrong value into the receiver register — with the stale-subject leak as the
+secondary defect that makes the clobber unrecoverable. Fix order:
+(1) trace the register snapshot/rebuild for the paused `view` frame
+(`snapshotRegisters` dense/sparse forms and `resumeContinuation`'s restore)
+to find where the receiver register gets the lambda's value;
+(2) make `implicitCandidatesAlloc` refuse a `direct_this` that dedups
+against a SUBJECT entry while the frame's own receiver param differs —
+prefer the param (defense the walk should have regardless);
+(3) the enclosing-subject push/pop pairing audit across pause/resume. The `LabeledReturn` 6x
 (movableContentParameters_*) are the same tests that previously failed
 masked; the label unwind now escapes visibly through the movable-content
 parameter path.
