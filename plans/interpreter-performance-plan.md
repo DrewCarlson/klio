@@ -229,6 +229,35 @@ instead of per-call slices, and suspension segments that do not allocate on
 the hot park/resume path. Success metric: collections per test run drop by
 an order of magnitude on the compose suite.
 
+**2026-07-27 measurement:** after the flattening/cache stages, the
+DeepRecursive profile's dominant SELF cost is GC marking (~660 of
+~5000 busy samples: `Value.gcMark` 479 + `Marker.shade` 96 +
+`gcMarkSnapshot` 53 + `collect` 34) plus slab alloc/free ~160 —
+collections still scale with call rate, confirming this stage as the
+next structural item. The `auditIntrinsicProbe` samples in earlier
+profiles were a symbol-dedup artifact of `lookupIntrinsic` (identical
+bodies); the stdlib table is already a comptime StaticStringMap, so
+item (d)'s remaining cost is the package-object FIELD walks for
+dotted globals, not the intrinsic table.
+
+### Work queue (kept current)
+
+1. **Stage 3 kickoff:** frame arena reuse + argument windows; GC
+   trigger decoupled from call rate (the profile above is the
+   baseline).
+2. **No-driver undispatched root** (`coroutineStartRootOrSuspended`'s
+   pump-construction branch — DeepRecursive's per-step cost): needs
+   the pump entry restructured around the barrier activation the
+   enclosing-driver branch now uses.
+3. **Typed-call flattening:** the activation carries the reified
+   type-name global bindings as a restore list; `attachDeclaredElemTypes`
+   moves into the frame boundary.
+4. **CMG overload-call flattening** (`callNamedOverload`'s terminal).
+5. **Dotted-global field-walk memo** (`kotlin.coroutines.intrinsics.*`
+   resolved per step through package-object field walks).
+6. Dispatch-cluster gaps recorded above (receiver-lambda bare invoke,
+   import-sensitive stdlib resolution).
+
 ## What was already landed (kept, measured)
 
 - clocks/sleeps direct to libc (idle saturation eliminated; 81->48 s on the
