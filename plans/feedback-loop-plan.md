@@ -213,8 +213,9 @@ cannot drop to JVM-order without restructuring. The proper fix is an
 iterative frame loop for direct calls (explicit interpreter stack; native
 recursion only at host boundaries) — it removes the eval-depth limit,
 makes suspend/resume O(1) frame repointing, and shrinks every call's cost.
-That is a planned interpreter restructure, not a patch; a DeepRecursive
-host trampoline was prototyped and REJECTED as special-casing.
+That restructure now has its own plan — `interpreter-performance-plan.md`
+(the flat-eval loop, staged with measured targets); a DeepRecursive host
+trampoline was prototyped and REJECTED as special-casing.
 
 Also found (and fixed): the streamed `[test] ... Nms` duration was the delta
 since the PREVIOUS record with an unset base, so the FIRST test always
