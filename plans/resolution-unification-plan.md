@@ -1811,10 +1811,21 @@ arm (expr.zig ~11845, CallValueWithThis with callee = the captured local-fn
 slot). At runtime the captured callee slot holds a bare `kotlin.Any` instead
 of the callable — the capture-space arg-shift family (note the test ALSO
 declares a same-named composable `Test`, so two local `Test` declarations are
-in scope). Next probe: dump the failing lambda frame's captures at the raise
-(extend the [icwt] dump with the innermost frame's capture values) and check
-`resolveCapture(b, "Test")` slot assignment against the lambda's recorded
-captures when two same-named locals exist.
+in scope). Captures dumped at the raise (the frame-params diag now prints capture
+slots): the failing lambda `{ this.Test(showThree) }` carries
+`[Cell kotlin.Any, Instance, Cell kotlin.Any]` — NO callable at all; the
+callee capture for `Test` holds an uninitialized-Any sentinel. The test
+declares THREE local `Test` overloads (composable `Test(Boolean)`, composable
+`Test()`, extension `MockViewValidator.Test(Boolean)`) plus two same-named
+`Show` pairs; the capture is resolved BY NAME through the nested local fn
+`validate`'s own captures, and with three same-named locals the slot the
+lambda reads never receives the extension-fn closure. This is the name-keyed
+local-capture decision the P13 scope-keeping move exists for: the capture must
+bind the RESOLVED declaration (receiver+arity applicable: the extension fn),
+not a name slot shared by three declarations. Fix direction: overload-aware
+local-fn capture — key the captured slot by declaration (FuncId), or at
+minimum pick the applicable overload at the `member_or_local_exact_value`
+emit (expr.zig ~11845) where receiver and arity are both known.
 
 Verification state: stdlib sweep IDENTICAL to baseline with both interpreter
 commits (67ba7492 tightened the reroute's ownership test to the module-backed

@@ -640,6 +640,13 @@ pub fn dumpCurrentFrameParamsForDiag() void {
                 i, p.name, @tagName(std.meta.activeTag(v.*)), v.typeFqn(),
             });
         }
+        // Captures carry a closure's environment; a mis-captured callee
+        // slot (`this.LocalFn(...)` binding an Any) is only visible here.
+        for (fr.captures.items, 0..) |*cv, i| {
+            std.debug.print("  [cap {d}] {s} {s}\n", .{
+                i, @tagName(std.meta.activeTag(cv.*)), cv.typeFqn(),
+            });
+        }
     }
 }
 
