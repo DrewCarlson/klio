@@ -2226,7 +2226,13 @@ pub const FuncBuilder = struct {
                 .CallMember => |c| {
                     if (c.name.int() < self.module.consts.items.len) {
                         switch (self.module.consts.items[c.name.int()]) {
-                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" }),
+                            .String => |n| if (std.mem.eql(u8, n, want)) {
+                                std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" });
+                                // `KLIO_EMIT_STACK`: name the emitting arm.
+                                if (std.c.getenv("KLIO_EMIT_STACK") != null) {
+                                    std.debug.dumpCurrentStackTrace(.{});
+                                }
+                            },
                             else => {},
                         }
                     }

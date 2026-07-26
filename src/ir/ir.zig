@@ -7135,6 +7135,26 @@ pub const Module = struct {
                 if (cast_static or renamed_target) {
                     return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
                 }
+                // The innermost receiver type PROVABLY cannot take this
+                // extension: the receiver must come from an OUTER implicit
+                // receiver that only the runtime walk can supply. The
+                // static `.CallMember` bind would put the wrong `this` in
+                // the extension's receiver slot with no runtime recovery —
+                // `read(this)` inside the `CompositionLocal.currentValue`
+                // accessor resolves `PersistentCompositionLocalMap.read`,
+                // whose receiver is the accessor's DISPATCH owner, present
+                // only on the enclosing chain.
+                if (known_receiver_applicable == false) {
+                    const cs = try self.candidateSet(
+                        alloc,
+                        name,
+                        candidates,
+                        caller_pkg,
+                        caller_file,
+                        tier,
+                    );
+                    return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
+                }
                 return .{ .target = t, .confidence = .virtual, .emit_form = .CallMember, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
             // A positional tail call to a tailrec target from a tailrec body
