@@ -252,10 +252,12 @@ dotted globals, not the intrinsic table.
    adoption), and the marking cost itself for deep parked chains
    (Appel re-marks the whole live chain per collection — needs
    generational/segment marking, large).
-2. **No-driver undispatched root** (`coroutineStartRootOrSuspended`'s
-   pump-construction branch — DeepRecursive's per-step cost): needs
-   the pump entry restructured around the barrier activation the
-   enclosing-driver branch now uses.
+2. **No-driver undispatched root — LANDED:** the prepare pushes the
+   fresh pump (`rootPumpFlatEnter`) and the body runs as a `root_pump`
+   barrier activation; suspension parks the root into its own pump and
+   drains it (`rootPumpBarrierPark`), completion runs the pump tail
+   before the caller sees the result (`rootPumpFlatComplete`), scope
+   rides the keepalive. Sweep-gated; DeepRecursive 9.4→8.8 s.
 3. **Typed-call flattening:** the activation carries the reified
    type-name global bindings as a restore list; `attachDeclaredElemTypes`
    moves into the frame boundary.

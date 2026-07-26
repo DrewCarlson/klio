@@ -1949,6 +1949,131 @@ pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module,
     return callFuncTypedInner(self, allocator, module, func, args, arg_names, type_args, exact);
 }
 
+
+/// One reified type-name global binding saved by `prepareTypedFlatCall`,
+/// restored LIFO by `typedBindingsRestore` at activation teardown or park
+/// (the recursive path's unconditional restore loop).
+const TypedSaved = struct { name: []const u8, prev: ?Value };
+const TypedSavedList = struct { items: []TypedSaved };
+
+/// Resolve a plain positional TYPED call (`f<T>(args)`) into a flat-call
+/// request: overload resolution, the incompatible-receiver guard, literal
+/// narrowing, and the reified type-name global bindings exactly as
+/// `callFuncTypedInner` performs them, with the bindings carried on the
+/// request for restore at the activation boundary and the type args kept
+/// for the result transform. The reified-special forms (`arrayOf`
+/// unsigned retag, `enumValues`/`enumValueOf`/`enumEntries`, reified
+/// `typeOf`) and any shape the fast plan rejects decline to the
+/// recursive path.
+pub fn prepareTypedFlatCall(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, type_args: []const []const u8, exact: bool) Allocator.Error!?ir.eval.FlatCallReq {
+    const f0 = funcAt(module, func) orelse return null;
+    if (std.mem.startsWith(u8, f0.fqn, "kotlin")) {
+        if (std.mem.eql(u8, f0.name, "arrayOf") or std.mem.eql(u8, f0.name, "enumValues") or
+            std.mem.eql(u8, f0.name, "enumValueOf") or std.mem.eql(u8, f0.name, "enumEntries") or
+            std.mem.eql(u8, f0.name, "enumEntriesIntrinsic")) return null;
+    }
+    if (std.mem.eql(u8, f0.name, "typeOf") and std.mem.startsWith(u8, f0.fqn, "kotlin.reflect")) return null;
+    const resolved: FuncId = if (exact) func else (pickOverloadCached(self, module, func, args) orelse func);
+    const f = funcAt(module, resolved) orelse return null;
+    if (paramIsThis(f.params) and args.len != 0 and
+        extDeclRecvIsUserClass(f.params[0].ty.name) and valueIsBuiltin(&args[0])) return null;
+    var plan = f.fast_call;
+    if (plan == 0) {
+        plan = fastCallPlan(self, module, resolved);
+        @constCast(f).fast_call = plan;
+    }
+    if (!(plan >= 2 and plan - 2 == args.len)) return null;
+    var call_args: std.ArrayList(Value) = .empty;
+    errdefer call_args.deinit(allocator);
+    try call_args.appendSlice(allocator, args);
+    for (f.params, 0..) |*prm, i| {
+        if (i >= call_args.items.len) break;
+        narrowIntListArg(&prm.ty, &call_args.items[i]);
+    }
+    // Bind each call-site type-arg name to a synth Class global for the
+    // call's duration; the activation's teardown/park restores.
+    var names: []const []const u8 = &.{};
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.func_type_params.get(resolved)) |list| names = list.items;
+    }
+    var typed_saved: ?*anyopaque = null;
+    if (names.len != 0) {
+        var saved: std.ArrayList(TypedSaved) = .empty;
+        errdefer saved.deinit(allocator);
+        for (names, 0..) |type_name, idx| {
+            const arg_name: []const u8 = if (idx < type_args.len) type_args[idx] else "";
+            if (arg_name.len == 0) continue;
+            const cls_value: ?Value = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
+                break :blk host_globals.lookupGlobal(self, arg_name);
+            };
+            const prev = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(type_name);
+            };
+            try saved.append(allocator, .{ .name = type_name, .prev = prev });
+            if (cls_value) |v| {
+                const g = self.globals.borrowMut();
+                defer g.deinit();
+                g.get().define(type_name, v) catch {};
+            }
+        }
+        if (saved.items.len != 0) {
+            const list = try allocator.create(TypedSavedList);
+            list.* = .{ .items = try saved.toOwnedSlice(allocator) };
+            typed_saved = list;
+        } else {
+            saved.deinit(allocator);
+        }
+    }
+    const composer_pushed = flatPlainCallOpen(self, f, call_args.items);
+    // The call site's type-args LIST buffer dies with the exec arm; the
+    // strings are module-owned. Dupe the list — the activation frees it.
+    const ta_owned = try allocator.dupe([]const u8, type_args);
+    return .{
+        .func = f,
+        .args = call_args,
+        .composer_pushed = composer_pushed,
+        .typed_saved = typed_saved,
+        .type_args = ta_owned,
+        .dst = undefined,
+    };
+}
+
+/// Restore the reified type-name globals a typed flat call bound, LIFO,
+/// and free the carried list.
+pub fn typedBindingsRestore(self: *VmHost, allocator: Allocator, ts: *anyopaque) void {
+    const list: *TypedSavedList = @ptrCast(@alignCast(ts));
+    var ri: usize = list.items.len;
+    while (ri > 0) {
+        ri -= 1;
+        const sv = list.items[ri];
+        const g = self.globals.borrowMut();
+        defer g.deinit();
+        if (sv.prev) |v| {
+            g.get().define(sv.name, v) catch {};
+        } else {
+            g.get().removeLocal(sv.name);
+        }
+    }
+    allocator.free(list.items);
+    allocator.destroy(list);
+}
+
+/// Boundary transform for a typed flat call's result — the container
+/// element-type attachment `callFuncTypedInner` applies after the call.
+pub fn typedCallBoundary(self: *VmHost, module: *const Module, func: *const ir.Func, type_args: []const []const u8, res: *EvalResult) void {
+    _ = self;
+    _ = module;
+    if (res.* != .ok) return;
+    runtime.attachDeclaredElemTypes(func.fqn, type_args, &res.ok);
+}
+
 fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
     // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)` /
     // `enumEntries<T>()` (whose inline body survives as the
