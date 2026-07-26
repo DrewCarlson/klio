@@ -12,3 +12,4 @@ scripts/__pycache__/
 /third_party/skia/
 .klio-local/
 .fleet-logs/
+.sweep-times.json
