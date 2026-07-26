@@ -4031,6 +4031,44 @@ fn nameInList(name: []const u8, list: []const []const u8) bool {
     return false;
 }
 
+/// The constructor-call half of the P12 shape repair: for each lambda
+/// argument bound to a primary-constructor parameter with a declared
+/// composable arity, re-shape it against that arity (inserting the implicit
+/// `it` a bare-pair-shaped sink lambda dropped). Alignment mirrors
+/// `ctorArgFnArities`: an unnamed trailing lambda binds the last
+/// function-typed parameter; leading positionals map 1:1 when unnamed.
+fn transformCtorComposableArgs(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!void {
+    if (args.len == 0) return;
+    for (args) |*a| if (a.* == .Spread) return;
+    if (!allNull(arg_names)) return;
+    if (class_id.int() >= b.module.classes.items.len) return;
+    const cls = &b.module.classes.items[class_id.int()];
+    const params = cls.primary_params;
+    const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
+    for (args, 0..) |*arg, i| {
+        const pi: ?usize = blk: {
+            if (trailing_lambda and i == args.len - 1) {
+                var k = params.len;
+                while (k > 0) : (k -= 1) {
+                    if (fnTypeArityAlias(b, params[k - 1].ty) != null) break :blk k - 1;
+                }
+                break :blk null;
+            }
+            break :blk if (i < params.len) i else null;
+        };
+        const p = pi orelse continue;
+        const expected = params[p].composable_arity orelse continue;
+        const expected_slots: u8 = expected +| params[p].composable_recv_slots;
+        _ = try compose_pass.transformResolvedComposableLambda(
+            b.allocator,
+            @constCast(arg),
+            expected_slots,
+            cls.name,
+            false,
+        );
+    }
+}
+
 /// `argFnArities` for a constructor call: the per-argument expected lambda
 /// arity from the class's primary-constructor parameters. A `T.() -> R`
 /// receiver-lambda parameter reports arity 0 so the lambda drops its `it` and
@@ -5843,6 +5881,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
+            // P12's shape-repair contract for constructor calls: the compose
+            // pass shapes a sink lambda with the bare composer pair and the
+            // LOWERING repairs it against the resolved parameter's declared
+            // arity. Function calls repair in transformSelectedComposableArgs;
+            // a class whose primary constructor takes a composable lambda
+            // (`MovableContent({ content() })`, arity 1) needs the same
+            // repair here, or the content invokes with every slot shifted.
+            try transformCtorComposableArgs(b, class_id, args, ast_arg_names);
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
             const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
             defer if (realigned) |r| b.allocator.free(r);
