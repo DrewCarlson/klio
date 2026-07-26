@@ -275,7 +275,19 @@ dotted globals, not the intrinsic table.
    `pumpLoop`/`pumpExit` natively exactly as today (the pump drains
    launched children and may replace the result with the resumed
    root's value). Prepare = `coroPush` + `claimNow` + scope guard;
-   suspension at the barrier parks the root then pumps.
+   suspension at the barrier parks the root then pumps. Wiring facts
+   pinned for the implementation: `makeIntrinsicHost(self: *VmHost)`
+   in host_call_value.zig builds the transient `VmIntrinsicHost` the
+   pump fns need (`intrinsicHostDeinit` releases it); Activation gets
+   `root_pump: bool`; ORDER on normal completion is hook BEFORE
+   `teardownActivation` (recursive runs pumpLoop/pumpExit with the
+   scope guard still pushed, guard.leave is a defer); the hook returns
+   `RuntimeEvalResult` and the barrier/deliver sites map its err back
+   into rthrow/runwind (inverse of `mapDriverErr`); the recursive
+   branch's `shrinkRetainingCapacity(scope_depth)` safety net moves
+   into the hook; suspension-path hook = `park(root_scope_base)` →
+   `pumpLoop(&root_token, &root_value)` → `pumpExit(true)` → return
+   root_value or CoroutineSuspended.
 6. Dispatch-cluster gaps recorded above (receiver-lambda bare invoke,
    import-sensitive stdlib resolution).
 
