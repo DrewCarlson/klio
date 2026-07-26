@@ -3057,6 +3057,24 @@ fn runFrameInner(
                         unwound = e;
                         break;
                     },
+                    .CalleeFailed, .StackOverflow => {
+                        // An interpreter-level failure from a body that RAN
+                        // (the callee boundary re-tags resolution-class
+                        // escapes to `CalleeFailed` exactly so walkers never
+                        // retry it) unwinds like a throw for `finally`
+                        // purposes: Kotlin guarantees finally on every
+                        // unwind, and skipping it left global state behind
+                        // (a dying compose test's un-run `finally` leaked a
+                        // stale recomposer flag/scope into later tests — the
+                        // cross-test no-changes contamination family). No
+                        // catch clause takes it: it is not a Kotlin
+                        // Throwable. Probe-class misses (`Unimplemented`)
+                        // stay on the immediate path below — they are
+                        // dispatch control flow, and running user finallys
+                        // per candidate probe would corrupt state.
+                        unwound = e;
+                        break;
+                    },
                     .Suspended => |state| {
                         // Snapshot this activation so it can be resumed
                         // just past the suspending instruction. The resume
