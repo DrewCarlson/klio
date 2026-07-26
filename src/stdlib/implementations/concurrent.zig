@@ -65,7 +65,11 @@ fn monitorFor(key: usize) std.mem.Allocator.Error!*Monitor {
 /// is free or already owned by the calling thread, then take/deepen
 /// ownership. The enter ordering is carried by the monitor's own
 /// `SpinMutex` acquire.
-pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
+/// Returns false when the wait was abandoned at a run boundary: the owner
+/// may never release (it can itself have been abandoned while holding the
+/// monitor), so a boundary drain must not wait it out. The caller must not
+/// treat the monitor as held on a false return.
+pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
     const mon = try monitorFor(key);
     const me = std.Thread.getCurrentId();
     var rounds: u32 = 0;
@@ -75,7 +79,7 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
             if (o == me) {
                 mon.state.depth += 1;
                 mon.mutex.unlock();
-                return;
+                return true;
             }
             // Held by another thread. The owner is running an arbitrary
             // interpreted `synchronized` body, so the wait is unbounded:
@@ -87,6 +91,7 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
             // brackets the GC blocking-safe region, so a parked waiter
             // never stalls a collection.
             mon.mutex.unlock();
+            if (runtime.shouldAbandon()) return false;
             rounds +|= 1;
             if (rounds <= 64) {
                 std.atomic.spinLoopHint();
@@ -99,7 +104,7 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!void {
             mon.state.owner = me;
             mon.state.depth = 1;
             mon.mutex.unlock();
-            return;
+            return true;
         }
     }
 }
@@ -159,7 +164,7 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     else
         return .{ .err = .{ .Arity = "synchronized expects (lock, block)" } };
     const key = lock.lockIdentity() orelse 0;
-    try monitorEnter(key);
+    if (!try monitorEnter(key)) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
     const result = ctx.host.invokeCallable(&block, &.{}, ctx.out);
     _ = try monitorExit(key);
     return result;
@@ -167,7 +172,7 @@ pub fn concurrent_synchronized(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
 
 pub fn concurrent_monitor_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const key = if (ctx.args.len > 0) (ctx.args[0].lockIdentity() orelse 0) else 0;
-    try monitorEnter(key);
+    if (!try monitorEnter(key)) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
     return .{ .ok = .Unit };
 }
 
@@ -191,7 +196,7 @@ fn receiverLockKey(ctx: *const CallCtx) usize {
 /// packs bind: `kotlinx.atomicfu.locks`, `io.ktor.utils.io.locks`).
 /// Blocks until the receiver's monitor is owned; reentrant.
 pub fn concurrent_lock_enter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    try monitorEnter(receiverLockKey(ctx));
+    if (!try monitorEnter(receiverLockKey(ctx))) return .{ .err = .{ .Type = "daemon task abandoned at run boundary" } };
     return .{ .ok = .Unit };
 }
 
@@ -364,8 +369,8 @@ test "distinct value locks map to the sentinel monitor" {
 
 test "monitor enter is reentrant and exit releases by depth" {
     const key: usize = 0xC0FFEE;
-    try monitorEnter(key);
-    try monitorEnter(key); // reentrant deepen, no self-deadlock
+    try testing.expect(try monitorEnter(key));
+    try testing.expect(try monitorEnter(key)); // reentrant deepen, no self-deadlock
     try testing.expect(try monitorTryEnter(key)); // reentrant try also succeeds
     try testing.expect(try monitorExit(key));
     try testing.expect(try monitorExit(key));
@@ -382,7 +387,7 @@ const MonitorWorker = struct {
     fn run(self: MonitorWorker) void {
         var i: usize = 0;
         while (i < self.iters) : (i += 1) {
-            monitorEnter(self.key) catch unreachable;
+            if (!(monitorEnter(self.key) catch unreachable)) return;
             // Unsynchronized read-modify-write; only the monitor makes
             // it exact across the workers.
             self.counter.* += 1;
@@ -412,7 +417,7 @@ const TryEnterHolder = struct {
     release: *std.atomic.Value(bool),
 
     fn run(self: TryEnterHolder) void {
-        monitorEnter(self.key) catch unreachable;
+        if (!(monitorEnter(self.key) catch unreachable)) return;
         self.held.store(true, .release);
         while (!self.release.load(.acquire)) {
             std.atomic.spinLoopHint();

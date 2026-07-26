@@ -206,7 +206,7 @@ include = [
 # engine reimplemented in plain Kotlin, plus actuals for the platform/atomic
 # `expect`s and the host-intrinsic entrypoints (backed by src/compose_runtime).
 [[source]]
-root = "../klio-compose-runtime/klioMain"
+root = "klioMain"
 # Engine variant: only platform actuals + klio-specific annotations/host
 # bridges kept; composer/composition/effects/tooling supplied by upstream.
 include = [

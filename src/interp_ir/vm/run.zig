@@ -743,6 +743,17 @@ pub fn vmRunCalls(
 /// it — keeps a stale entry from surviving into the next run's reset arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
+    // The run's result is computed; every worker still executing user code
+    // — explicit threads included — must stop cooperatively so a leaked
+    // spinner or sleeper cannot hold this join open forever (the per-test
+    // wall cap is already cleared here, and the pool's own abandonment
+    // only begins after the explicit joins). The pool shutdown inside the
+    // drain loop clears `abandon_requested` when it finishes; re-arm it at
+    // each pass so the request stays live for stragglers.
+    runtime.setRunBoundaryAbandon(true);
+    defer runtime.setRunBoundaryAbandon(false);
+    defer runtime.clearAbandon();
+    runtime.requestAbandon();
     // Once both worker populations have drained, sweep the process-global
     // registries that key into this run's value graph: the slot-owner and
     // persisted-continuation maps here, and each library layer's run-scoped
@@ -758,6 +769,9 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     // a full pass leaves both empty.
     while (true) {
         var joined_any = false;
+        // The pool-shutdown pass below clears the abandon request when it
+        // finishes; re-arm for this pass's joins.
+        runtime.requestAbandon();
         while (true) {
             // Take one outstanding handle under the lock, then join it
             // without holding the lock so the worker's own result

@@ -10,6 +10,13 @@ fleet/sweep scheduling), the honest numbers are:
 - Compose-runtime commonTest suite, ONE process, warm packs: **80 tests in
   300 s** (~0.3 tests/s). The JVM runs the same ~910-test suite in well
   under a minute.
+  **2026-07-26 correction:** that floor was NOT interpreter speed — it was
+  the `runTest` deadlock family burning the 90 s wall cap per affected
+  test (see the resolution plan's deadlock entry). With the receiver
+  binding fixed and fresh packs, the same one-process measurement runs
+  **745 tests in 300 s** (~2.5 tests/s) — a ~10× floor shift that
+  re-baselines every compose timing in this plan. Interpreted per-call
+  cost (this plan's subject) is the remaining gap to the JVM.
 - `DeepRecursiveTest.kt`: **117 s** for four tests the JVM completes in
   under a second (~460k suspend/resume steps at ~250 us each).
 - The stdlib commontest sweep's floor is the same phenomenon: a handful of

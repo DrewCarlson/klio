@@ -45,6 +45,32 @@ trySend→receive all pass; `BroadcastFrameClockTest` 4/4 including
 lowering fixes to take effect — a stale installed pack reproduces the
 hang.
 
+Post-dehang fleet follow-ups (first census: two groups completed at
+651/705; one group hung at the final join, one crashed at its tail):
+
+- **Run-boundary joins bounded** (landed with this entry): a test-leaked
+  spinning or sleeping thread held `joinAllThreads` open forever — the
+  per-test wall cap is cleared by then and pool abandonment only started
+  after the explicit joins. The boundary now sets a drain-everything
+  abandon flag every pass (explicit threads included) and every wall
+  sleep is sliced, so leaked workers stop at their next block or slice.
+- **field_read_cache grow panic**: one group died with `reached
+  unreachable code` inside `fieldReadCachePut` → hashmap grow →
+  `vtable.free` (trace preserved in the session scratchpad,
+  crash_bitvector.log). The ObjRef rwlock rules out a plain data race;
+  suspect the map's stored allocator outliving its backing. Reproduce
+  under the group's exact class list.
+- **`klio pack build kotlin-klio/klio-compose-runtime` yields a broken
+  pack** (installs cleanly, missing `SlotTable`/`compositionLocalOf` at
+  run time). The real source dir is `klio-compose-runtime-engine` (what
+  the itest builds). Either make the runtime dir build fail loudly or
+  produce a correct pack.
+- Remaining fleet clusters to root-cause, by size: 10× wall-cap
+  (residual hangs), 8× `unresolved global rootSize`, 7×
+  `DynamicProvidableCompositionLocal.read` member miss, 4×
+  `unresolved global A$f34` (collision-mangled name), 4× `unresolved
+  global map`, plus singles.
+
 ## North star
 
 KLIO should turn scripts into **as static a representation as possible without
