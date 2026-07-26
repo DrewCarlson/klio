@@ -242,9 +242,16 @@ dotted globals, not the intrinsic table.
 
 ### Work queue (kept current)
 
-1. **Stage 3 kickoff:** frame arena reuse + argument windows; GC
-   trigger decoupled from call rate (the profile above is the
-   baseline).
+1. **Stage 3 kickoff:** register-buffer pooling already existed
+   (`acquireRegs`/`releaseRegs`, GC-profile buffers on libc storage);
+   the missing half was the TRIGGER: freed external bytes now credit
+   `bytes_since_gc` (net-growth accounting), so pooled call churn nets
+   zero trigger advance and collections stop scaling with call rate.
+   Remaining sub-items: an ARGUMENT/params buffer pool mirroring the
+   regs pool (ownership subtleties: `owns_params_caps`, snapshot
+   adoption), and the marking cost itself for deep parked chains
+   (Appel re-marks the whole live chain per collection — needs
+   generational/segment marking, large).
 2. **No-driver undispatched root** (`coroutineStartRootOrSuspended`'s
    pump-construction branch — DeepRecursive's per-step cost): needs
    the pump entry restructured around the barrier activation the
