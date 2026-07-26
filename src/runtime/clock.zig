@@ -80,15 +80,18 @@ pub fn sleepMillis(ms: i64) void {
     // collection's stop-the-world rendezvous rather than blocking it.
     gc.enterBlockingSafe();
     defer gc.exitBlockingSafe();
+    // Every sleep is sliced so an abandon request — the pool's daemon
+    // shutdown for its workers, or the run boundary's drain-everything
+    // stop for explicit threads — wakes the sleeper promptly instead of
+    // waiting out the full duration. Non-abandonable threads use coarse
+    // slices: the overhead is one wakeup per 50 ms, and a leaked sleeper
+    // no longer holds the run's final join open.
+    const slice_ms: i64 = if (threads_mod.isThreadAbandonable()) 2 else 50;
     if (comptime builtin.link_libc) {
-        if (!threads_mod.isThreadAbandonable()) {
-            _ = cSleepNs(@as(u64, @intCast(ms)) * std.time.ns_per_ms);
-            return;
-        }
         var remaining = ms;
         while (remaining > 0) {
             if (threads_mod.shouldAbandon()) return;
-            const slice = @min(remaining, @as(i64, 2));
+            const slice = @min(remaining, slice_ms);
             _ = cSleepNs(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
             remaining -= slice;
         }
@@ -97,14 +100,10 @@ pub fn sleepMillis(ms: i64) void {
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    if (!threads_mod.isThreadAbandonable()) {
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
-        return;
-    }
     var remaining = ms;
     while (remaining > 0) {
         if (threads_mod.shouldAbandon()) return;
-        const slice = @min(remaining, @as(i64, 2));
+        const slice = @min(remaining, slice_ms);
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(slice), .awake) catch {};
         remaining -= slice;
     }

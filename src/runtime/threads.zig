@@ -122,11 +122,25 @@ pub fn clearAbandon() void {
     abandon_requested.store(false, .release);
 }
 
-/// Whether the calling thread should abort its current task: it is
-/// abandonable and the run boundary has requested abandonment. The
-/// threadlocal gate keeps the check free for every non-pool thread.
+/// Run-boundary hard stop: the run's result is already computed and the
+/// boundary is draining workers, so EVERY thread still executing user
+/// code — including explicit `kotlin.concurrent.thread` workers, which
+/// are otherwise never abandonable — must stop cooperatively. A test
+/// that leaks a spinning or sleeping thread previously hung the whole
+/// run at the final join (the per-test wall cap is cleared by then, and
+/// the pool's own abandonment only starts after the explicit joins).
+var run_boundary_abandon = std.atomic.Value(bool).init(false);
+
+pub fn setRunBoundaryAbandon(on: bool) void {
+    run_boundary_abandon.store(on, .release);
+}
+
+/// Whether the calling thread should abort its current task: abandonment
+/// is requested and the thread is either abandonable (a pool worker) or
+/// the run boundary is draining every worker. The threadlocal gate keeps
+/// the check cheap for non-pool threads outside the boundary.
 pub fn shouldAbandon() bool {
-    if (!thread_abandonable) return false;
+    if (!thread_abandonable and !run_boundary_abandon.load(.acquire)) return false;
     return abandon_requested.load(.acquire);
 }
 
