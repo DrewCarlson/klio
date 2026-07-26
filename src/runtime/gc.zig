@@ -109,6 +109,7 @@ var live_bytes: usize = 0;
 /// collects frequently to surface root/tracer holes without stress mode's
 /// O(safe-points x live) cost.
 var threshold_floor: usize = 8 * 1024 * 1024;
+var freed_since_trim: usize = 0;
 var threshold: usize = 8 * 1024 * 1024;
 
 /// Appel growth multiplier: the next collection fires after `live * factor`
@@ -541,7 +542,15 @@ pub fn collect() void {
     // allocation high-water, not the live set), so after a collection that
     // reclaimed real garbage, ask it to trim — keeping process RSS tracking the
     // live set, not the cumulative churn. Set by `main` to the platform trim.
-    if (freed != 0) if (release_to_os) |f| f();
+    // Rate-limited: trimming after EVERY freeing collection turned into
+    // steady mmap/munmap traffic under allocation-churn-heavy runs (the
+    // trim itself profiled alongside the marking); RSS only needs to track
+    // the live set coarsely, so trim once a meaningful amount accumulates.
+    freed_since_trim +|= freed;
+    if (freed_since_trim >= 32 * 1024 * 1024) {
+        freed_since_trim = 0;
+        if (release_to_os) |f| f();
+    }
     if (gc_debug) std.debug.print(
         "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
         .{ cur_epoch, marked, live_bytes, freed },

@@ -1994,8 +1994,20 @@ pub fn driveSuspendMain(self: *VmIntrinsicHost, main_id: ir.FuncId, out: Output)
 /// worker, because the resume itself travels as a dispatched runnable).
 /// A new indefinite park is re-persisted, so a coroutine can hop pumps
 /// any number of times.
+threadlocal var drive_depth: usize = 0;
+threadlocal var drive_depth_max: usize = 0;
+threadlocal var drive_count: usize = 0;
+
 pub fn driveResumed(self: *VmIntrinsicHost, state_in: SuspendState, value: Value, scope_delta: []const Value, out: Output) Allocator.Error!void {
     const a = self.allocator;
+    drive_depth += 1;
+    drive_count += 1;
+    if (drive_depth > drive_depth_max) {
+        drive_depth_max = drive_depth;
+        if (pumpDiagEnabled() and drive_depth_max % 64 == 0)
+            std.debug.print("[PUMP] driveResumed depth={d} count={d}\n", .{ drive_depth_max, drive_count });
+    }
+    defer drive_depth -= 1;
     try coroPush(a);
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const scope_depth = active_scope_stack.items.len;
