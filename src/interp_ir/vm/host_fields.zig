@@ -885,11 +885,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         // owner's getter must run on the enclosing owner
                         // instance from the receiver chain, never on a foreign
                         // receiver — that misbound every bare enclosing-class
-                        // property read inside such a splice.
-                        if (receiver.* == .Instance and !receiver.isRuntimeType(owner)) {
-                            var recv_probe = receiver.*;
-                            if (try host_call_member.memberExtOwnerInstance(self, allocator, &recv_probe, owner)) |inst| {
-                                return evalGetterTagged(self, allocator, fid, inst, "owner-enclosing");
+                        // property read inside such a splice. The ownership
+                        // test is the module-backed subtype walk, exactly as
+                        // the probe guard above uses it — the Value-level
+                        // runtime-type check misses native-backed subtype
+                        // chains and rerouted the whole collections suite.
+                        if (receiver.* == .Instance) {
+                            const rcn2 = className(receiver.Instance);
+                            const recv_owns = std.mem.eql(u8, rcn2, owner) or blk: {
+                                const mg2 = self.module.borrow();
+                                defer mg2.deinit();
+                                break :blk mg2.get().classIsOrExtends(rcn2, owner);
+                            };
+                            if (!recv_owns) {
+                                var recv_probe = receiver.*;
+                                if (try host_call_member.memberExtOwnerInstance(self, allocator, &recv_probe, owner)) |inst| {
+                                    return evalGetterTagged(self, allocator, fid, inst, "owner-enclosing");
+                                }
                             }
                         }
                         return evalGetterTagged(self, allocator, fid, receiver.*, "owner-lexical");
