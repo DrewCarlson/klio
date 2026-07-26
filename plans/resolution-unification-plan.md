@@ -1834,3 +1834,31 @@ sweep's scratch home `/tmp/klio_itest_stdlibtest_home` lost its kotlin.test
 pack mid-session, failing every file on `assertEquals`; repopulate with
 `pack build kotlin-klio/klio-kotlin-test` + install into that HOME before
 trusting sweep deltas.
+
+## Fleet at 734; the residual no-changes cluster is cross-test contamination
+
+After the constructor shape repair (3dc6f218) and the clock fix, the fleet
+reads **734 passed / 176 failed** (from 553 at session start). The
+`invoke_callable_with_this` cluster is gone (the local-overload capture fix)
+and MovableContent's arg-shift family is gone (the ctor repair).
+
+The biggest residual cluster (29x "Expected changes but none were found",
+concentrated in CompositionTests' conditional/non-local-return tests) is
+CROSS-TEST CONTAMINATION: every sampled member PASSES in isolation and fails
+only when the whole class runs in one process. Candidate mechanism, from the
+instrumented evidence earlier in the session: a test whose interpreted frames
+vanish without running `finally` (the stashed-CalleeFailed silent-unwind
+family) leaves global compose state behind — a stale recompose scope was
+observed invalidating a LATER test's recomposer (`[rin] invalidate on=` a
+dead instance). The fix order is therefore: (1) make interpreter-level
+errors run Kotlin `finally` blocks during unwind (they currently skip them —
+proven with a try/finally probe), (2) surface stashed pump errors loudly,
+then re-measure the cluster; only then chase any remaining members
+individually. The wall-clock-deadline cluster (11x) shares the
+lost-wakeup hang found in `concurrentMixingWriteApply_*` (a parked
+interpreted wait whose wakeup never fires; hangs forever without
+KLIO_TEST_WALL_CAP).
+
+Remaining named clusters after these two: unresolved global `next` (13x),
+`rootSize` (8x), `read` on DynamicProvidableCompositionLocal (7x) — bare-name
+resolution family, the plan's home turf.
