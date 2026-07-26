@@ -242,16 +242,19 @@ dotted globals, not the intrinsic table.
 
 ### Work queue (kept current)
 
-1. **Stage 3 kickoff:** register-buffer pooling already existed
+1. **Stage 3 — trigger half LANDED, params pool CLOSED by
+   measurement:** register-buffer pooling already existed
    (`acquireRegs`/`releaseRegs`, GC-profile buffers on libc storage);
    the missing half was the TRIGGER: freed external bytes now credit
    `bytes_since_gc` (net-growth accounting), so pooled call churn nets
    zero trigger advance and collections stop scaling with call rate.
-   Remaining sub-items: an ARGUMENT/params buffer pool mirroring the
-   regs pool (ownership subtleties: `owns_params_caps`, snapshot
-   adoption), and the marking cost itself for deep parked chains
-   (Appel re-marks the whole live chain per collection — needs
-   generational/segment marking, large).
+   The params/captures buffers are explicitly freed at `Frame.deinit`
+   — slab traffic, never GC garbage and never trigger input — and the
+   profile prices ALL slab alloc/free at ~3%; a params pool would
+   require a cross-allocator audit over 16 `readArgRun` sites plus
+   every prepare fn and the snapshot-adoption paths for that ~3%
+   ceiling. Not warranted at the current profile; revisit only if a
+   future profile shows the slab dominating.
 2. **No-driver undispatched root — LANDED:** the prepare pushes the
    fresh pump (`rootPumpFlatEnter`) and the body runs as a `root_pump`
    barrier activation; suspension parks the root into its own pump and
@@ -300,8 +303,26 @@ dotted globals, not the intrinsic table.
    into the hook; suspension-path hook = `park(root_scope_base)` →
    `pumpLoop(&root_token, &root_value)` → `pumpExit(true)` → return
    root_value or CoroutineSuspended.
-6. Dispatch-cluster gaps recorded above (receiver-lambda bare invoke,
-   import-sensitive stdlib resolution).
+6. **Dispatch-cluster gaps — FIXED:** a receiver-typed lambda invoked
+   bare now binds the call site's implicit receiver through the invoke
+   convention regardless of its `this` capture (recursive and flat
+   routes); and the curated stdlib load gate closes over the selected
+   files' OWN import lines to a fixpoint, so stdlib-internal resolution
+   (DeepRecursive → `kotlin.coroutines.intrinsics`) no longer depends
+   on the user program's imports. Both sweep-gated byte-identical.
+
+The queue above is drained. The remaining LARGE programs, each its own
+plan-level effort rather than a queue item, are: **generational /
+segment marking** (Appel re-marks the whole live set per collection —
+the dominant self cost on deep-parked-chain workloads like
+DeepRecursive, ~660/5000 samples) and **further flat coverage of the
+remaining intrinsic re-entry seams** (HOF intrinsics that invoke
+callables mid-body and post-process — each needs its own CPS split or
+boundary hook, the pattern the suspend barrier and root pump
+established). DeepRecursive 100k over this effort: 117 s (baseline) →
+10.4 s (session start) → 8.2 s; suspend/park is O(1) at both
+undispatched-start boundaries; the compose fleet and stdlib sweep held
+byte-identical at every commit.
 
 ## What was already landed (kept, measured)
 
