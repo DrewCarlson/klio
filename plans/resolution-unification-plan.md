@@ -128,6 +128,30 @@ around EVERY test invocation (top-level and class-method loops), and
 dispatch-cache writes are gated on `dispatchCacheStable()` so an
 aborted walk can never record a spurious miss.
 
+**Contamination layer 1 FIXED** (`69312a02`): the walk's global-skip
+record treated a FAILED candidate probe (first_real_err — a wall-cap
+abort) as a member MISS, teaching the site to skip the member walk
+forever. One capped test then made every later
+`removeKnownCompositionLocked` unresolved (57×, now 0 in the cap=20
+repro).
+
+**Contamination layer 2 (open, analyzed):** with layer 1 fixed, the
+cap=20 twelve-class group shows the next stratum: 58× real infinite
+recursion (Stack overflow) plus Int-composer arg shifts
+(`startRestartGroup on kotlin.Int` — the `$changed` Int landing in the
+`$composer` slot on a restart re-invocation). Mechanism: an aborted
+`compositionTest` never runs its disposal, so its PROCESS-GLOBAL
+snapshot registrations (apply observers / global write observers —
+`Snapshot` companion state, interpreted) survive holding the dead
+test's recomposer and scopes; later tests' snapshot applies notify the
+dead machinery. Design for the fix: a klio-authored engine helper
+(`__klio_resetSnapshotGlobalState()` in the compose-runtime engine
+pack) that clears the observer lists, invoked by the test runner via
+FQN lookup after `drainWallCapAbandon` fires; generalizable as a
+"post-abort reset" hook packs can register. Repro: cap=20 on the
+AbstractApplier 12-class group (58× Stack overflow, 16× assert
+`Expected <1>, actual <0>`).
+
 **Remaining contamination lead (open):** even with the clean death, a
 group whose slow test caps mid-recomposition still poisons later
 composition tests (57× `unresolved global removeKnownCompositionLocked`
