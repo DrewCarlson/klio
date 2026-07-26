@@ -6532,8 +6532,13 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         result = v;
     } else {
         // The member passes all missed on a single implicit-receiver
-        // candidate: record so a repeat call skips straight here.
-        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture)
+        // candidate: record so a repeat call skips straight here. A pass
+        // that FAILED (first_real_err — an abort, a callee error) is not a
+        // miss: recording it taught the site to skip the member walk
+        // forever, so after one wall-capped test every later
+        // `removeKnownCompositionLocked` in the same process resolved as
+        // an unresolved global (the contamination cluster).
+        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null)
             host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
