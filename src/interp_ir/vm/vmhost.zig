@@ -329,6 +329,7 @@ pub const VmHost = struct {
     pub const getMemberField = host_fields.getMemberField;
     pub const fastCallPlan = host_call_func.fastCallPlan;
     pub const callFuncFast = host_call_func.callFuncFast;
+    pub const flatPlainCallOpen = host_call_func.flatPlainCallOpen;
     pub const plainStoredFieldIndex = host_fields.plainStoredFieldIndex;
     pub const plainStoredScalarFieldNN = host_fields.plainStoredScalarFieldNN;
     pub const setField = host_fields.setField;

@@ -1800,16 +1800,53 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
     }
 }
 
+/// Whether `v` is a receiver lambda whose `this` arrives through a capture
+/// slot: its body declares a receiver type and carries a `this` capture,
+/// so a bare invocation (`proc()`) must bind the caller's implicit
+/// receiver into that slot before the body runs. Without the bind the slot
+/// keeps the creation-time lexical `this`, and every bare call in the body
+/// resolves against the WRONG scope — `createTestResult { launch {…} }`
+/// launched the runTest work runner on the outer TestScope, whose
+/// dispatcher queues onto the very scheduler only that runner pumps.
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
-    _ = self;
-    _ = v;
+    if (v.* != .IrClosure) return false;
+    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return false;
+    if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+        std.debug.print("[needs-this] id={d} has_recv={} caps={d}\n", .{ v.IrClosure.id, info.has_receiver, info.capture_names.len });
+    }
+    if (!info.has_receiver) return false;
+    for (info.capture_names) |n| {
+        if (std.mem.eql(u8, n, "this")) return true;
+    }
     return false;
 }
 
+/// Bind `new_this` into the closure's `this` capture slot (see
+/// `closureNeedsThisCapture`). The slot is written in place through the
+/// captures cell: the invocation is about to run and the binding is the
+/// receiver for exactly this call, the same in-place channel the
+/// receiver-split paths use.
 pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Value) void {
-    _ = self;
-    _ = v;
-    _ = new_this;
+    if (v.* != .IrClosure) return;
+    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return;
+    var this_idx: ?usize = null;
+    for (info.capture_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this")) {
+            this_idx = i;
+            break;
+        }
+    }
+    const ti = this_idx orelse return;
+    const g = v.IrClosure.captures.borrowMut();
+    defer g.deinit();
+    const slice = g.get().*;
+    if (ti < slice.len) {
+        if (runtime.reclaimEnabled()) {
+            new_this.retain();
+            slice[ti].release(self.allocator);
+        }
+        slice[ti] = new_this.*;
+    }
 }
 
 // -------------------------------------------------------------------------

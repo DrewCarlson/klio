@@ -2226,7 +2226,13 @@ pub const FuncBuilder = struct {
                 .CallMember => |c| {
                     if (c.name.int() < self.module.consts.items.len) {
                         switch (self.module.consts.items[c.name.int()]) {
-                            .String => |n| if (std.mem.eql(u8, n, want)) std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" }),
+                            .String => |n| if (std.mem.eql(u8, n, want)) {
+                                std.debug.print("[emit] CallMember name={s} in_fn={s}\n", .{ n, currentRealFn() orelse "-" });
+                                // `KLIO_EMIT_STACK`: name the emitting arm.
+                                if (std.c.getenv("KLIO_EMIT_STACK") != null) {
+                                    std.debug.dumpCurrentStackTrace(.{});
+                                }
+                            },
                             else => {},
                         }
                     }
@@ -2364,6 +2370,15 @@ pub const FuncBuilder = struct {
             .capture_order = capture_order,
             .implicit_label = null,
             .low_priority = false,
+            // The declaring package in effect for this lowering. Explicit
+            // decl paths overwrite it after `finish`; the synthetic paths
+            // (init blocks, delegate/property thunks, lambda bodies) keep
+            // it — without the stamp every synthetic frame ran with an
+            // EMPTY package and package-scoped resolution from inside one
+            // treated its own package's internals as foreign (tier 5): an
+            // init block's bare `rootSize(size)` skipped the same-package
+            // internal and died "unresolved global".
+            .package = lower_self_package,
         };
     }
 };

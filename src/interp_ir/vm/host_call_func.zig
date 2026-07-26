@@ -980,9 +980,10 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     // plain suspend function needs nothing extra — its suspension
     // propagates identically on the direct path.
     if (f.is_inline) return 1;
-    // A `@Composable` call must route through `callFunc` so its body is
-    // bracketed with the composer group push/pop; never take the fast path.
-    if (compose.isComposable(f)) return 1;
+    // A `@Composable` function is plugin-lowered: composition is already in
+    // the body, and the only per-call work is publishing the threaded
+    // `$composer` as ambient — which the flat path does via
+    // `flatPlainCallOpen`. No exclusion needed.
     if (f.params.len > 253) return 1;
     if (paramIsThis(f.params) or f.has_receiver_param) return 1;
     if (lastIsVararg(f.params)) return 1;
@@ -1003,7 +1004,29 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
 /// vararg/default handling is needed.
 pub fn callFuncFast(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_list: std.ArrayList(Value)) Allocator.Error!EvalResult {
     const f = funcAt(module, func).?;
+    const pushed = flatPlainCallOpen(self, f, args_list.items);
+    defer if (pushed) flatCallClosed(self);
     return ir.eval.evalWith(VmHost, allocator, module, f, args_list, self);
+}
+
+/// Host-entry effects of a flat plain call (the `fastCallPlan` shape): a
+/// `@Composable` publishes its threaded `$composer` argument as the ambient
+/// composer for the call's duration, mirroring `composableEval`. Returns
+/// whether the activation's close must pop it.
+pub fn flatPlainCallOpen(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
+    _ = self;
+    if (compose.threadedComposerArg(f.params, args)) |c| {
+        compose.pushComposer(c);
+        return true;
+    }
+    return false;
+}
+
+/// Flat-activation close hook shared by every prepare that pushed an
+/// ambient composer (see `host_call_value.flatCallClosed`).
+fn flatCallClosed(self: *VmHost) void {
+    _ = self;
+    compose.popComposer();
 }
 
 /// Trailing-lambda syntax bit for the next `callFunc` bind (see
@@ -2252,11 +2275,22 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 continue;
             }
             if (bounded) {
-                const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
-                candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
-                if (candidate_tier >= ir.Module.other_package_tier) {
-                    if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={?}\n", .{ name, cand.int(), candidate_tier, scope_pkg, if (caller_file) |cfl| cfl.int() else null });
-                    continue;
+                // The bounded set was scoped at LOWERING with the call
+                // site's real file and package (import tiers included).
+                // This runtime re-derivation only has the FRAME's context;
+                // a synthetic frame (init block, ctor-default thunk, lifted
+                // lambda) may carry no current span, and its import tiers
+                // are then unknowable — re-filtering with that weaker
+                // context rejected candidates the bake already proved in
+                // scope (an init block's `persistentListOf()` resolved at
+                // bake through the file's import, then tier-skipped at run
+                // time). With no caller file, trust the bake.
+                if (caller_file) |cfile| {
+                    candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
+                    if (candidate_tier >= ir.Module.other_package_tier) {
+                        if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={d}\n", .{ name, cand.int(), candidate_tier, scope_pkg, cfile.int() });
+                        continue;
+                    }
                 }
             }
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and

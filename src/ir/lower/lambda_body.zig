@@ -513,7 +513,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const id = module.nextFuncId();
     func.id = id;
     func.is_lambda = is_lambda;
-    func.lambda_receiver_ty = b.recvTy();
+    // The receiver head may alias a span-keyed `lambda_arg_recv` entry the
+    // builder frees at teardown; the Func outlives the builder, so it must
+    // own its copy (reading the alias at run time observed whatever string
+    // later reused the freed bytes, silently breaking receiver binding for
+    // every receiver lambda recorded through a call-bound shape).
+    func.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
     // Declared parameter annotations (`{ s: String -> … }`, an anonymous
     // function's typed params) land on the body func so runtime overload
     // dispatch can match the value against a declared function-type

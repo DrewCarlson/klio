@@ -1047,6 +1047,7 @@ pub const CooperativeInterceptor = struct {
     /// release it after running it).
     pub fn enqueueLaunch(self: *CooperativeInterceptor, block: Value) Allocator.Error!void {
         if (runtime.reclaimEnabled()) block.retain();
+        if (pumpDiagEnabled()) std.debug.print("[tok] enqueueLaunch n={d}\n", .{self.launched.items.len + 1});
         try self.launched.append(self.allocator, block);
     }
 
@@ -2106,10 +2107,14 @@ fn pumpLoop(
                     const m: *const ir.Module = snap.module orelse mg.get();
                     const f = m.funcById(snap.func);
                     const nm = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "?";
-                    // The declaration file disambiguates same-named frames
+                    // The declaration site disambiguates same-named frames
                     // (`<lambda>`): which source declared the parked caller.
-                    const file: i64 = if (m.decl_span.get(snap.func.int())) |ds| @intCast(ds.file.int()) else -1;
-                    std.debug.print(" {s}#{d}@f{d}", .{ nm, snap.func.int(), file });
+                    if (f) |ff| {
+                        const loc = ir.eval.funcFirstLoc(ff);
+                        std.debug.print(" {s}#{d}({s}:{d})", .{ nm, snap.func.int(), loc.path, loc.line });
+                    } else {
+                        std.debug.print(" {s}#{d}", .{ nm, snap.func.int() });
+                    }
                 }
                 std.debug.print("\n", .{});
             }
@@ -2167,6 +2172,13 @@ fn pumpLoop(
         for (launched) |child| {
             const child_scope_base = activeScopeDepth();
             const child_res = try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out);
+            if (pumpDiagEnabled()) {
+                const tag: []const u8 = switch (child_res) {
+                    .ok => "ok",
+                    .err => |e| @tagName(std.meta.activeTag(e)),
+                };
+                std.debug.print("[tok] launched-child -> {s}\n", .{tag});
+            }
             switch (child_res) {
                 // The block ran to completion: the launch queue's owned
                 // reference is no longer needed. A *suspended* block is still
