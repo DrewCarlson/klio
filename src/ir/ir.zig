@@ -2174,7 +2174,14 @@ pub const Module = struct {
                 std.mem.eql(u8, applicability.simpleName(path), head)) return .yes;
             return .no;
         }
-        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+        if (self.class_fqn_map != null) {
+            // Finalized module: lock-free read of the completed cache (see
+            // `uniqueClassIdBySimpleName`).
+            if (self.unique_simple_cache_n == self.classes.items.len) {
+                const info = self.unique_simple_cache.get(head) orelse return .yes;
+                return if (info.non_kotlin) .ambiguous else .yes;
+            }
+        } else if (self.lookup_cache_gpa != null) {
             const mut: *Module = @constCast(self);
             if (mut.topUpUniqueSimpleCache()) {
                 const info = mut.unique_simple_cache.get(head) orelse return .yes;
@@ -4831,7 +4838,16 @@ pub const Module = struct {
     /// Resolve a simple classifier head only when it denotes one class
     /// identity across the whole module universe.
     pub fn uniqueClassIdBySimpleName(self: *const Module, name: []const u8) ?ClassId {
-        if (self.class_fqn_map == null and self.lookup_cache_gpa != null) {
+        if (self.class_fqn_map != null) {
+            // Finalized module: the simple-name cache was completed by
+            // `buildClassIdMap` and runtime lookups are concurrent, so read
+            // it lock-free while it still mirrors the (append-only) class
+            // list; a post-finalize class addition falls back to the scan.
+            if (self.unique_simple_cache_n == self.classes.items.len) {
+                const info = self.unique_simple_cache.get(name) orelse return null;
+                return if (info.id == class_id_ambiguous) null else info.id;
+            }
+        } else if (self.lookup_cache_gpa != null) {
             const mut: *Module = @constCast(self);
             if (mut.topUpUniqueSimpleCache()) {
                 const info = mut.unique_simple_cache.get(name) orelse return null;
@@ -4930,6 +4946,16 @@ pub const Module = struct {
         }
         if (self.class_fqn_map) |*old| old.deinit();
         self.class_fqn_map = fm;
+
+        // Complete the simple-name cache while still single-threaded, so the
+        // finalized read paths (`uniqueClassIdBySimpleName`,
+        // `staticBuiltinIdentity`) can consult it lock-free at run time
+        // instead of linear-scanning the class list per dispatch.
+        if (self.lookup_cache_gpa == null) self.lookup_cache_gpa = allocator;
+        self.topUpUniqueSimpleCache() catch {
+            self.unique_simple_cache.clearRetainingCapacity();
+            self.unique_simple_cache_n = 0;
+        };
 
         // The nesting tree. A class's parent is the class whose FQN is its
         // own FQN minus the last segment; children key by that last segment.
@@ -6640,21 +6666,34 @@ pub const Module = struct {
     /// compatibility boundary remains active until P10 supplies a complete
     /// declaration for the host shape.
     fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
-        if (self.decl_sigs.get(id.int())) |ds| {
-            if (want < ds.arity.required) return false;
-            return ds.arity.has_vararg or want <= ds.arity.total;
+        // The compose pass appends ($composer, $changed) to composable
+        // signatures. Call sites lower with USER argument counts (the pair
+        // is threaded later, or completed at runtime), so the pair never
+        // counts toward the REQUIRED arity — excluding an exact-arity
+        // composable here left only a vararg sibling in the bounded set and
+        // committed the wrong overload. A post-pass site that already
+        // carries the pair still binds through the untrimmed total.
+        const has_pair = f.params.len >= 2 and
+            std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer");
+        if (!has_pair) {
+            if (self.decl_sigs.get(id.int())) |ds| {
+                if (want < ds.arity.required) return false;
+                return ds.arity.has_vararg or want <= ds.arity.total;
+            }
         }
+        const counted = if (has_pair) f.params[0 .. f.params.len - 2] else f.params;
         var required: usize = 0;
-        var total: usize = 0;
+        var total: usize = f.params.len;
         var has_vararg = false;
-        for (f.params) |p| {
-            total += 1;
+        for (counted) |p| {
             if (p.is_vararg) {
                 has_vararg = true;
             } else if (!p.has_default) {
                 required += 1;
             }
         }
+        _ = &total;
         if (want < required) return false;
         return has_vararg or want <= total;
     }

@@ -350,7 +350,7 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
     // the call; without an enclosing pump the root branch's pump machinery
     // must run.
     if (host_call_func.resolvedNativeForm(self, fid) == null) return null;
-    if (!vmhost.coroutines.coroutineHasDriver()) return null;
+    const has_driver = vmhost.coroutines.coroutineHasDriver();
     const scope_v = args[0];
     const block = args[1];
     if (block != .IrClosure) return null;
@@ -374,16 +374,60 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
             this_idx = i;
         }
     }
-    const enter = vmhost.coroutines.undispatchedFlatEnter(&scope_v);
     const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = scope_v } else null;
-    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, &.{})) orelse {
-        vmhost.coroutines.undispatchedFlatLeaveIdent(enter.ident);
-        return null;
-    };
-    req.suspend_barrier = true;
-    req.barrier_scope_base = enter.base;
-    req.scope_guard_ident = enter.ident;
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, &.{})) orelse return null;
+    if (has_driver) {
+        const enter = vmhost.coroutines.undispatchedFlatEnter(&scope_v);
+        req.suspend_barrier = true;
+        req.barrier_scope_base = enter.base;
+        req.scope_guard_ident = enter.ident;
+    } else {
+        // No enclosing pump: this activation becomes its own root pump —
+        // completion and suspension run the pump loop through the host
+        // hooks. The scope value rides as the keepalive for the hooks.
+        const enter = (try vmhost.coroutines.rootPumpFlatEnter(allocator, &scope_v)).?;
+        req.suspend_barrier = true;
+        req.root_pump = true;
+        req.barrier_scope_base = enter.base;
+        req.scope_guard_ident = enter.ident;
+        if (runtime.reclaimEnabled()) scope_v.retain();
+        req.keepalive = scope_v;
+    }
     return req;
+}
+
+/// Driver hook: no-driver root suspension — park the root into its own
+/// pump, drain it, exit it, and hand back the resumed value or
+/// COROUTINE_SUSPENDED.
+pub fn rootPumpBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendState, scope: Value, base: usize) Allocator.Error!EvalResult {
+    var sink = self.out_sink.clone();
+    defer sink.deinit();
+    var intrinsic = makeIntrinsicHost(self);
+    defer intrinsicHostDeinit(&intrinsic);
+    const r = try vmhost.coroutines.rootPumpFlatPark(&intrinsic, allocator, sink.output(), st, &scope, base);
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| try runtimeErrToEval(allocator, e),
+    };
+}
+
+/// Driver hook: no-driver root completion — run the pump to quiescence
+/// with the body's result as the root value (or just exit the pump when
+/// the body raised), the recursive branch's tail.
+pub fn rootPumpFlatComplete(self: *VmHost, allocator: Allocator, res: EvalResult, scope: Value, base: usize) Allocator.Error!EvalResult {
+    var sink = self.out_sink.clone();
+    defer sink.deinit();
+    var intrinsic = makeIntrinsicHost(self);
+    defer intrinsicHostDeinit(&intrinsic);
+    if (res == .ok) {
+        const r = try vmhost.coroutines.rootPumpFlatFinish(&intrinsic, sink.output(), &scope, res.ok, base, false);
+        return switch (r) {
+            .ok => |v| .{ .ok = v },
+            .err => |e| try runtimeErrToEval(allocator, e),
+        };
+    }
+    _ = try vmhost.coroutines.rootPumpFlatFinish(&intrinsic, sink.output(), &scope, null, base, true);
+    return res;
 }
 
 /// Driver hook: barrier park for a flat undispatched-start activation.
@@ -415,7 +459,15 @@ pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: 
                     break;
                 }
             }
-            if (!has_this and args.len == info.n_params) {
+            const receiver_lambda = blk: {
+                if (!has_this) break :blk false;
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const f = m.funcById(info.body_func) orelse break :blk false;
+                break :blk f.lambda_receiver_ty != null;
+            };
+            if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 return prepareClosureWithThisFlatCall(self, allocator, callee, recv, args);
             }
         }
@@ -1160,7 +1212,21 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                     break;
                 }
             }
-            if (!has_this and args.len == info.n_params) {
+            // A RECEIVER LAMBDA invoked bare binds the call site's
+            // implicit receiver through the invoke convention regardless
+            // of its `this` capture: a `Box.(Int) -> Int` local called as
+            // `add(n)` inside a Box scope runs against that scope's
+            // receiver — the capture only holds the creation-site
+            // leftover, values never carry receivers in Kotlin.
+            const receiver_lambda = blk: {
+                if (!has_this) break :blk false;
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const f = m.funcById(info.body_func) orelse break :blk false;
+                break :blk f.lambda_receiver_ty != null;
+            };
+            if ((!has_this or receiver_lambda) and args.len == info.n_params) {
                 if (runtime.getenvSlice("KLIO_CVNRC") != null) {
                     const tn = blk: {
                         const g = recv.Instance.borrow();

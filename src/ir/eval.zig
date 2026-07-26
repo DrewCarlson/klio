@@ -1161,6 +1161,19 @@ pub const FlatCallReq = struct {
     /// teardown removes it by identity. Cleared at park — the parked
     /// delta owns the entry from then on.
     scope_guard_ident: usize = 0,
+    /// This barrier activation owns a fresh pump (the no-driver root
+    /// branch): its completion or suspension must run the pump loop and
+    /// exit through the host hooks. `keepalive` carries the scope value
+    /// the pump drives under.
+    root_pump: bool = false,
+    /// Reified type-name globals the typed-call prepare bound for the
+    /// call's duration (opaque host payload); restored via the host hook
+    /// at teardown or park, exactly where the recursive path's restore
+    /// loop ran (including across a suspension).
+    typed_saved: ?*anyopaque = null,
+    /// The call site's type arguments (module-owned strings) for the
+    /// result transform at the frame boundary (`attachDeclaredElemTypes`).
+    type_args: []const []const u8 = &.{},
     dst: Reg,
 };
 
@@ -1200,6 +1213,9 @@ const Activation = struct {
     suspend_barrier: bool,
     barrier_scope_base: usize,
     scope_guard_ident: usize,
+    root_pump: bool,
+    typed_saved: ?*anyopaque,
+    type_args: []const []const u8,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -1266,6 +1282,30 @@ fn nuTraceWant() ?[]const u8 {
         nu_trace_init = true;
     }
     return nu_trace_val;
+}
+
+/// Host→driver flat-call handoff for resolution ladders whose PICK lives
+/// deep in host code (the CMG global-overload terminal): the exec arm arms
+/// the slot, the host's terminal takes the arm (one-shot — inner calls see
+/// it disarmed), prepares the flat request instead of dispatching, and
+/// stashes it here; the arm consumes the stash and pushes the activation.
+threadlocal var host_flat_armed: bool = false;
+threadlocal var host_flat_req: ?FlatCallReq = null;
+pub fn armHostFlatReq() void {
+    host_flat_armed = true;
+}
+pub fn takeHostFlatArm() bool {
+    const a = host_flat_armed;
+    host_flat_armed = false;
+    return a;
+}
+pub fn stashHostFlatReq(req: FlatCallReq) void {
+    host_flat_req = req;
+}
+fn takeHostFlatReq() ?FlatCallReq {
+    const r = host_flat_req;
+    host_flat_req = null;
+    return r;
 }
 
 /// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
@@ -2762,6 +2802,9 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .suspend_barrier = req.suspend_barrier,
         .barrier_scope_base = req.barrier_scope_base,
         .scope_guard_ident = req.scope_guard_ident,
+        .root_pump = req.root_pump,
+        .typed_saved = req.typed_saved,
+        .type_args = req.type_args,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -2810,6 +2853,14 @@ fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, 
         if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(act.scope_guard_ident);
         act.scope_guard_ident = 0;
     }
+    if (act.typed_saved) |ts| {
+        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
+        act.typed_saved = null;
+    }
+    if (act.type_args.len > 0) {
+        allocator.free(act.type_args);
+        act.type_args = &.{};
+    }
 }
 
 /// Park a flat activation live: unwind its host-entry effects and thread
@@ -2840,6 +2891,13 @@ fn liveParkActivation(
     while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
     // The park's scope-delta capture owns the guard entry from here on.
     act.scope_guard_ident = 0;
+    // Reified bindings restore across a suspension exactly as the
+    // recursive path's unconditional restore loop did; the resumed body
+    // reads no type-name globals (its reified reads were lowering-bound).
+    if (act.typed_saved) |ts| {
+        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
+        act.typed_saved = null;
+    }
     if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d} enc={d}\n", .{
             act.frame.func.name,
@@ -2877,6 +2935,7 @@ fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     if (act.keepalive) |ka| {
         if (runtime.reclaimEnabled()) ka.release(allocator);
     }
+    if (act.type_args.len > 0) allocator.free(act.type_args);
     allocator.destroy(act);
 }
 
@@ -2929,6 +2988,10 @@ fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host
     if (req.scope_guard_ident != 0) {
         if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(req.scope_guard_ident);
     }
+    if (req.typed_saved) |ts| {
+        if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
+    }
+    if (req.type_args.len > 0) allocator.free(req.type_args);
 }
 
 /// The flat call driver. Runs `frame` through `runFrameExec`; when the
@@ -3032,11 +3095,34 @@ fn runFlatLoop(
             while (stack.pop()) |a| {
                 eval_depth -= 1;
                 const is_barrier = a.suspend_barrier;
+                const is_root_pump = a.root_pump;
                 const scope_base = a.barrier_scope_base;
+                const scope_keep: Value = a.keepalive orelse .Unit;
                 const rb = a.ret_block;
                 const rix = a.ret_idx;
                 const rd = a.ret_dst;
                 try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
+                if (is_root_pump) {
+                    // No-driver root: park the root into ITS OWN pump,
+                    // drain the pump to quiescence (persisting an
+                    // unresumed root), and continue the caller with the
+                    // resumed value or COROUTINE_SUSPENDED.
+                    if (comptime @hasDecl(H, "rootPumpBarrierPark")) {
+                        const r = try host.rootPumpBarrierPark(allocator, state, scope_keep, scope_base);
+                        const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                        switch (r) {
+                            .ok => |v| try pf2.write(rd, v),
+                            .err => |e| switch (e) {
+                                .Throw => |v| rthrow = v,
+                                else => runwind = e,
+                            },
+                        }
+                        cur = rb;
+                        ridx = rix;
+                        barrier_hit = true;
+                        break;
+                    }
+                }
                 if (is_barrier) {
                     // The undispatched-start boundary: the parked segment
                     // belongs to the enclosing pump, and the CALLER
@@ -3074,6 +3160,17 @@ fn runFlatLoop(
             const act = stack.pop().?;
             eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
+            // A no-driver root's completion runs its pump to quiescence
+            // (launched children, timers) before the caller sees the
+            // result — the recursive branch's tail, guard still pushed.
+            if (act.root_pump) {
+                if (comptime @hasDecl(H, "rootPumpFlatComplete")) {
+                    res = try host.rootPumpFlatComplete(allocator, res, act.keepalive orelse .Unit, act.barrier_scope_base);
+                }
+            }
+            if (act.type_args.len > 0) {
+                if (comptime @hasDecl(H, "typedCallBoundary")) host.typedCallBoundary(act.frame.module, act.frame.func, act.type_args, &res);
+            }
             const rb = act.ret_block;
             const rix = act.ret_idx;
             const rd = act.ret_dst;
@@ -5166,6 +5263,21 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
             }
         }
     }
+    // Flat typed call: the resolved plain shape runs as a pushed
+    // activation carrying its reified type-name bindings (restored at
+    // teardown/park) and the call's type args for the boundary
+    // transform. Special shapes decline to the recursive path.
+    if (comptime @hasDecl(H, "prepareTypedFlatCall")) {
+        if (flatEnabled() and ta.items.len > 0 and argNamesAllNull(call.arg_names)) {
+            if (try host.prepareTypedFlatCall(allocator, frame.module, eff_func, arg_values, ta.items, call.exact)) |prep0| {
+                var prep = prep0;
+                prep.dst = call.dst;
+                prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
     if (call.trailing_lambda) {
         if (comptime @hasDecl(H, "setTrailingLambdaCall")) H.setTrailingLambdaCall(true);
     }
@@ -6758,7 +6870,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
             break :blk "";
         } else "";
-        const overload = switch (try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor)) {
+        // Arm the host→driver flat handoff: the overload terminal may
+        // stash a prepared flat request instead of dispatching natively.
+        armHostFlatReq();
+        const cno_res = try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor);
+        _ = takeHostFlatArm();
+        if (takeHostFlatReq()) |req0| {
+            var prep = req0;
+            prep.dst = cmg.dst;
+            frame.flat_call = prep;
+            return .flat_call;
+        }
+        const overload = switch (cno_res) {
             .ok => |maybe| maybe,
             .err => |e| return raiseStep(frame, e),
         };

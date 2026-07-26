@@ -410,9 +410,52 @@ fn loadEmbeddedStdlibSources(
         }
     }
 
-    for (parsed.items) |p| {
+    // Stdlib-INTERNAL closure: an always-loaded implicit file may itself
+    // import a gated curated package (`DeepRecursive.kt` needs
+    // `kotlin.coroutines.intrinsics`); its resolution must not depend on
+    // whether the USER program also imported it. Iterate to a fixpoint:
+    // a file joins the load set when any already-included file's own
+    // import lines cover its package.
+    var include = try allocator.alloc(bool, parsed.items.len);
+    defer allocator.free(include);
+    for (parsed.items, 0..) |p, i| {
         const is_implicit = p.pkg.len != 0 and stdlib.isImplicitlyImportedPackage(p.pkg);
-        if (!is_implicit and !load_gated) continue;
+        include[i] = is_implicit or load_gated;
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var internal_prefixes = std.StringHashMap(void).init(allocator);
+        defer internal_prefixes.deinit();
+        for (parsed.items, 0..) |p, i| {
+            if (!include[i]) continue;
+            for (p.file.imports) |imp| {
+                if (imp.path.len == 0) continue;
+                const upto: usize = if (imp.wildcard) imp.path.len else imp.path.len - 1;
+                if (upto == 0) continue;
+                var buf: std.ArrayList(u8) = .empty;
+                for (imp.path[0..upto], 0..) |seg, k| {
+                    if (k != 0) buf.append(allocator, '.') catch break;
+                    buf.appendSlice(allocator, seg.name) catch break;
+                }
+                const key = buf.toOwnedSlice(allocator) catch continue;
+                internal_prefixes.put(key, {}) catch allocator.free(key);
+            }
+        }
+        defer {
+            var it = internal_prefixes.keyIterator();
+            while (it.next()) |k| allocator.free(k.*);
+        }
+        for (parsed.items, 0..) |p, i| {
+            if (include[i] or p.pkg.len == 0) continue;
+            if (importPrefixMatches(allocator, &internal_prefixes, p.pkg)) {
+                include[i] = true;
+                changed = true;
+            }
+        }
+    }
+    for (parsed.items, 0..) |p, i| {
+        if (!include[i]) continue;
         if (p.pkg.len != 0) {
             stdlib.registerKnownPackage(p.pkg);
             if (report) |rep| try rep.known_packages.append(allocator, try allocator.dupe(u8, p.pkg));

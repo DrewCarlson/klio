@@ -1491,6 +1491,26 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     // A dotted hint canonicalizes through the same mangle table as `pn`.
     if (mangledNestedKey(mod, std.mem.trimEnd(u8, static_name, "?"))) |m| sn = m;
     if (std.mem.eql(u8, sn, pn)) return true;
+    // The candidate scan below is O(classes) with per-entry hierarchy walks
+    // and depends only on (module, sn, pn); memoize its verdict. The class
+    // count folds into the key so a post-finalize class addition starts a
+    // fresh entry instead of serving a stale verdict.
+    const sra_key = blk: {
+        var h = std.hash.Wyhash.init(0x53524143);
+        const mp: usize = @intFromPtr(mod);
+        h.update(std.mem.asBytes(&mp));
+        const n: usize = mod.class_index.items.len;
+        h.update(std.mem.asBytes(&n));
+        h.update(sn);
+        h.update(&[_]u8{0});
+        h.update(pn);
+        break :blk h.final();
+    };
+    if (sra_cache.get(sra_key)) |v| return switch (v) {
+        0 => false,
+        1 => true,
+        else => null,
+    };
     // Resolve `sn` against EVERY class sharing that simple name, not just the
     // one the simple-name-keyed hierarchy map happens to hold. Compose vendors
     // two distinct `Node` types (`Modifier.Node : DelegatableNode` and an
@@ -1536,9 +1556,22 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
             }
         }
     }
+    const verdict: u8 = if (relates) 1 else if (matches != 1) 2 else 0;
+    sra_cache.put(std.heap.page_allocator, sra_key, verdict) catch {};
     if (relates) return true;
     if (matches != 1) return null;
     return false;
+}
+
+/// Memoized verdicts of `staticReceiverApplicable`'s candidate scan, keyed by
+/// (module identity, class count, sn, pn). Thread-local: dispatch runs on
+/// several threads and the scan verdict is cheap to fill per thread.
+threadlocal var sra_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty;
+
+/// Drop this thread's memoized scan verdicts at a program-run boundary (an
+/// in-process re-run may mint a new module at a reused address).
+pub fn resetStaticApplicabilityCache() void {
+    sra_cache.clearRetainingCapacity();
 }
 
 /// Whether the DECLARED signature refuses `n_args` user args outright:

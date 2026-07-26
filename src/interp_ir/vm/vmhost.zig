@@ -166,6 +166,7 @@ pub fn resetReceiverThreadLocals() void {
 /// anon-object instantiation.
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
+    host_call_member.resetStaticApplicabilityCache();
     ir.eval.resetSuspendLivenessCache();
     stdlib.resetEmptyCollectionSingletons();
     stdlib.resetEmptySequenceSingleton();
@@ -289,6 +290,11 @@ pub const VmHost = struct {
     pub const prepareUndispatchedStartFlatCall = host_call_value.prepareUndispatchedStartFlatCall;
     pub const undispatchedBarrierPark = host_call_value.undispatchedBarrierPark;
     pub const undispatchedScopeLeave = host_call_value.undispatchedScopeLeave;
+    pub const rootPumpBarrierPark = host_call_value.rootPumpBarrierPark;
+    pub const rootPumpFlatComplete = host_call_value.rootPumpFlatComplete;
+    pub const prepareTypedFlatCall = host_call_func.prepareTypedFlatCall;
+    pub const typedBindingsRestore = host_call_func.typedBindingsRestore;
+    pub const typedCallBoundary = host_call_func.typedCallBoundary;
     pub const flatCallClosed = host_call_value.flatCallClosed;
     pub const callValueNamed = host_call_value.callValueNamed;
     pub const callValueNamedRecvCtx = host_call_value.callValueNamedRecvCtx;
