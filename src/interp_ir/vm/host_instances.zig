@@ -2767,7 +2767,9 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     return .{ .err = e };
                 },
             }
-            d.deinit();
+            // The handle stays live for the defaults-padding block below,
+            // which releases it on every path — a second deinit here
+            // double-freed the class def under the reclaim profile.
         }
         // Fill any trailing primary-ctor params the subclass omitted from
         // its `super(...)` delegation with the parent's defaults.

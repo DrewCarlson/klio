@@ -71,6 +71,38 @@ Post-dehang fleet follow-ups (first census: two groups completed at
   `unresolved global A$f34` (collision-mangled name), 4× `unresolved
   global map`, plus singles.
 
+Cluster root causes found after the second census (fixes below landed):
+
+- **`rootSize` / `map` / synthetic-package family**: `FuncBuilder.finish`
+  never stamped `Func.package`, so EVERY synthetic function (init blocks,
+  ctor-default thunks, delegate/property thunks, lambda bodies) ran with
+  an empty package and package-scoped resolution from inside one treated
+  its own package's internals as tier-5 foreign. `finish` now stamps the
+  active lowering package. Additionally `callNamedOverload`'s runtime
+  tier re-filter re-derived scope with only the FRAME's context — for a
+  synthetic with no current span (no caller file) it rejected candidates
+  the bake had already proven in scope through the file's imports
+  (`persistentListOf` in a ctor-default thunk); with no caller file the
+  bounded set is now trusted as baked.
+- **materializeInstance double-release**: two consecutive
+  `if (parent_def)` blocks each `deinit`ed the same class-def handle on
+  success — 28 identical double-frees per `validatePotentialDeadlock`
+  run under `KLIO_RECLAIM=debug`, and the likely mechanism of the
+  post-wall-cap `incorrect alignment` panics (cell control block
+  destroyed twice). First block no longer releases.
+- **`DynamicProvidableCompositionLocal.read` cluster (open)**: the
+  failing dispatch happens INSIDE computed-local evaluation — the
+  `CompositionLocalAccessorScope` member-extension property
+  (`CompositionLocal<T>.currentValue`) loses its DISPATCH receiver (the
+  accessor scope) and its body's call binds against the extension
+  receiver (the key), missing the map-extension `read`. Repro:
+  `scripts/compose-test.sh CompositionLocalTests.testDefaultComputedLocal`
+  with `KLIO_NU_TRACE=read` (the `[rim]` walk shows
+  static_recv=CompositionLocal candidates only).
+- **`validatePotentialDeadlock` itself is NOT a deadlock**: at the wall
+  cap it is mid-recomposition of a 1000-node `repeat` loop — an
+  interpreter-throughput case for the flat-eval plan, not a wakeup bug.
+
 Second census (all boundary fixes in, fleet completes bounded — no
 TIMEOUT groups, no crash): 739 passed / 118 failed. The new 59×
 `unresolved global removeKnownCompositionLocked` cluster is CROSS-TEST

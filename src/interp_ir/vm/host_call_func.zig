@@ -2275,11 +2275,22 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 continue;
             }
             if (bounded) {
-                const cfile = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
-                candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
-                if (candidate_tier >= ir.Module.other_package_tier) {
-                    if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={?}\n", .{ name, cand.int(), candidate_tier, scope_pkg, if (caller_file) |cfl| cfl.int() else null });
-                    continue;
+                // The bounded set was scoped at LOWERING with the call
+                // site's real file and package (import tiers included).
+                // This runtime re-derivation only has the FRAME's context;
+                // a synthetic frame (init block, ctor-default thunk, lifted
+                // lambda) may carry no current span, and its import tiers
+                // are then unknowable — re-filtering with that weaker
+                // context rejected candidates the bake already proved in
+                // scope (an init block's `persistentListOf()` resolved at
+                // bake through the file's import, then tier-skipped at run
+                // time). With no caller file, trust the bake.
+                if (caller_file) |cfile| {
+                    candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
+                    if (candidate_tier >= ir.Module.other_package_tier) {
+                        if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={d}\n", .{ name, cand.int(), candidate_tier, scope_pkg, cfile.int() });
+                        continue;
+                    }
                 }
             }
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this") and args.len != 0 and
