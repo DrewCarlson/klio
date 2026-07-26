@@ -260,8 +260,22 @@ dotted globals, not the intrinsic table.
    type-name global bindings as a restore list; `attachDeclaredElemTypes`
    moves into the frame boundary.
 4. **CMG overload-call flattening** (`callNamedOverload`'s terminal).
-5. **Dotted-global field-walk memo** (`kotlin.coroutines.intrinsics.*`
-   resolved per step through package-object field walks).
+5. **Dotted-global field-walk memo — CLOSED by measurement:** the
+   per-step `kotlin.*` resolutions in the trace census were dotted
+   FQNs (an earlier regex truncated them at the first dot), and those
+   already resolve through the link-settled name→FQN map + comptime
+   intrinsic table — one hashmap probe each. The package-object
+   field-walk stack (`companionWalkSeeded` growth) was
+   `lookupGlobalThrowing`'s ~5% branch, not the dominant path; a
+   LoadGlobal-site VALUE cache would risk cross-run contamination for
+   marginal gain. No change warranted.
+   **No-driver root design note (#2):** the root branch needs a
+   COMPLETION HOOK on the barrier activation — the body runs flat
+   (saving per-call native entry), and at the boundary the hook runs
+   `pumpLoop`/`pumpExit` natively exactly as today (the pump drains
+   launched children and may replace the result with the resumed
+   root's value). Prepare = `coroPush` + `claimNow` + scope guard;
+   suspension at the barrier parks the root then pumps.
 6. Dispatch-cluster gaps recorded above (receiver-lambda bare invoke,
    import-sensitive stdlib resolution).
 
