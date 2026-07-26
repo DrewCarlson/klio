@@ -1908,3 +1908,22 @@ prefer the param (defense the walk should have regardless);
 (movableContentParameters_*) are the same tests that previously failed
 masked; the label unwind now escapes visibly through the movable-content
 parameter path.
+
+## Continuation entry point
+
+The two bugs before the 1210 ratchet, in fix order:
+1. **Pause/resume receiver clobber** — repro: `scripts/compose-test.sh
+   PausableCompositionTests.canRecordAComposition` (bounded ~96 s). The
+   walk defense (72faad4d) advanced it past `unresolved global next` into
+   the hang; the open question is whether the CallMemberOrGlobal recv
+   register holds the stale ComposableLambdaImpl (rebuild clobber) or the
+   `view` frame's receiver PARAM itself is the lambda (wrong-receiver
+   call) — the frame-params dump prints the tag but not the class; extend
+   it with the instance class name first, then trace accordingly.
+2. **Lost-wakeup hang** — repro: same test (it now parks at the wall cap),
+   or `SnapshotStateMapTests.concurrentMixingWriteApply_set`. The main
+   thread polls an interpreted wait whose wakeup never fires; KLIO_PUMP_DIAG
+   park/resume traces around the last park are the tool.
+Then: the remaining named clusters, the compose itest as the ratchet gate,
+and the flat-eval restructure (`interpreter-performance-plan.md`) as the
+standing top-priority interpreter workstream.
