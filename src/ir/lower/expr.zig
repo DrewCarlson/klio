@@ -6887,6 +6887,102 @@ fn selfLocalFnApplicable(
     return true;
 }
 
+/// Ext-only variant of `selectLocalFnOverload` for a RECEIVER-FULL call
+/// (`this.f(args)` / `recv.f(args)`): only extension siblings can take a
+/// receiver, and their applicability is judged against the receiver's
+/// DECLARED type (in scope at the call), not the enclosing lambda's
+/// receiver context.
+fn selectLocalExtOverload(
+    b: *const FuncBuilder,
+    ovs: []const build.LocalFnOverload,
+    declared_ty: ?TypeRef,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?[]const u8 {
+    var survivor: ?*const build.LocalFnOverload = null;
+    var n_survivors: usize = 0;
+    outer: for (ovs) |*ov| {
+        if (!ov.is_ext) continue;
+        if (declared_ty) |actual| {
+            if (!try localOverloadReceiverCouldApply(b, ov, actual)) continue;
+        }
+        if (args.len < ov.n_required and !ov.has_vararg) continue;
+        if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
+        var bound = [_]bool{false} ** 64;
+        if (ov.param_tys.len > bound.len) continue;
+        var positional: usize = 0;
+        for (args, 0..) |*a, i| {
+            const supplied: ?[]const u8 = if (i < ast_arg_names.len) ast_arg_names[i] else null;
+            var pi: ?usize = null;
+            if (supplied) |nm| {
+                for (ov.param_names, 0..) |pn, k| {
+                    if (std.mem.eql(u8, pn, nm)) {
+                        if (bound[k]) continue :outer;
+                        pi = k;
+                        bound[k] = true;
+                        break;
+                    }
+                }
+                if (pi == null) continue :outer;
+            } else {
+                if (positional < ov.param_tys.len) {
+                    pi = positional;
+                    bound[positional] = true;
+                } else if (!ov.has_vararg) {
+                    continue :outer;
+                }
+                positional += 1;
+            }
+            if (pi) |k| {
+                const d = ov.param_tys[k] orelse continue;
+                const h = staticArgHead(b, a) orelse continue;
+                if (!headCompatible(h, d, true)) continue :outer;
+            }
+        }
+        survivor = ov;
+        n_survivors += 1;
+    }
+    if (n_survivors == 1) return survivor.?.mangled;
+    return null;
+}
+
+/// Call a selected local EXTENSION overload through its mangled cell with
+/// an EXPLICIT receiver expression prepended as the leading `this` arg.
+/// Null when the cell is unreachable from this scope (forward reference);
+/// the caller keeps its plain-name route.
+fn lowerSelectedLocalExtCallWithReceiver(
+    b: *FuncBuilder,
+    mangled: []const u8,
+    receiver: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+    const cell: Reg = if (b.resolve(mangled)) |r|
+        r
+    else if (b.knowsOuter(mangled))
+        try resolveCapture(b, mangled)
+    else
+        return null;
+    const callee_reg = b.allocReg();
+    try b.push(.{ .CellGet = .{ .dst = callee_reg, .cell = cell } });
+    const recv = try lowerReceiver(b, receiver);
+    const vals = try b.allocator.alloc(Reg, args.len + 1);
+    defer b.allocator.free(vals);
+    vals[0] = recv;
+    for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
+    const args_start = try packContiguous(b, vals);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValue = .{
+        .dst = dst,
+        .callee = callee_reg,
+        .args = args_start,
+        .n_args = @intCast(vals.len),
+        .arg_names = arg_names,
+    } });
+    return dst;
+}
+
 fn selectLocalFnOverload(
     b: *const FuncBuilder,
     ovs: []const build.LocalFnOverload,
@@ -11803,6 +11899,18 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         (b.isLocalFn(name.name) or b.isParam(name.name) or
             b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
     if (local_callable) {
+        // Same-named local siblings share the plain-name slot, which for a
+        // multi-declaration name may hold a non-extension sibling or the
+        // boxed self-cell's placeholder. A receiver-full call binds only an
+        // EXTENSION sibling, so select it by signature and call through its
+        // mangled cell — the plain slot misbound `this.Test(showThree)` to
+        // an uninitialized cell whenever composable and extension `Test`
+        // overloads coexisted.
+        if (b.localFnOverloads(name.name)) |ovs| {
+            if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
+                if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
+            }
+        }
         const local_reg = blk: {
             if (anon_cap) {
                 const idx = try b.recordCapture(name.name);

@@ -97,10 +97,26 @@ var reclaim_req_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0
 
 /// libc `getenv` wrapper returning a borrowed slice. Returns null in a build
 /// without libc (module test binaries) — those never set the env anyway.
+///
+/// Memoized: the trace/diagnostic gates consult this on hot dispatch and
+/// suspend paths, and libc's `getenv` takes a process-wide lock per call —
+/// it profiled at a quarter of on-CPU time in the DeepRecursive commontests.
+/// The process env never changes mid-run (children get their env via
+/// spawn-time maps), so each name's first answer is authoritative.
+var env_cache_mutex: SpinMutex = .{};
+var env_cache: ?std.StringHashMap(?[]const u8) = null;
+
 pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     if (comptime !@import("builtin").link_libc) return null;
-    const raw = std.c.getenv(name) orelse return null;
-    return std.mem.span(raw);
+    const key = std.mem.span(name);
+    env_cache_mutex.lock();
+    defer env_cache_mutex.unlock();
+    if (env_cache == null) env_cache = std.StringHashMap(?[]const u8).init(std.heap.page_allocator);
+    if (env_cache.?.get(key)) |cached| return cached;
+    const value: ?[]const u8 = if (std.c.getenv(name)) |raw| std.mem.span(raw) else null;
+    const stable_key = std.heap.page_allocator.dupe(u8, key) catch return value;
+    env_cache.?.put(stable_key, value) catch {};
+    return value;
 }
 
 /// Diagnostic: when `KLIO_RC_DETECT` is set, `ObjRef.deinit` leaks freed cells
