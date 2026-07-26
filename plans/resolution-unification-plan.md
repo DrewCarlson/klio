@@ -1756,3 +1756,31 @@ a loud diagnostic; (b) `hashCode()` returns different values for the same
 instance at different call sites (seen on Recomposer while instrumenting);
 (c) probe-raised StackOverflow still converts to `unresolved global` (earlier
 finding, same silent-conversion family).
+
+## Fleet after the owner-enclosing fix (2026-07-26)
+
+`e4979f4c` (scoped property reads bind the enclosing owner in receiver
+splices) repaired the Link-composer arm wholesale: the fleet moved from 553
+passed / ~177 failed with five whole classes timing out, to **698 passed /
+212 failed with every snapshot class completing** (SnapshotTests 66/66,
+SnapshotStateObserverTestsCommon 30/30, SnapshotStateMapTests 51/59; the
+"failed" count rose only because former-timeout classes now report their
+individual failures instead of losing all their passes). Verified alongside:
+interp_ir unit tests, the corpus repro, and the GC-stress gate test.
+
+Remaining clusters, next levers first (per `scripts/compose-fleet.py`):
+1. 28x `invoke_callable_with_this on kotlin.Any` — raise site inside
+   `__get_JobSupport_key` (body `get() = Job`) reached from
+   `CombinedContext.get` under `KlioDispatcher.dispatch`; kills ~25
+   CompositionTests. Pre-existing (same count before the fix).
+2. 20x "Expected changes but none were found" residual (CompositionTests 11,
+   MovableContent 5) — re-diagnose with the same amp/getter tooling; may
+   share the JobSupport cluster's root.
+3. 14x "virtual call receiver is not an instance" — 9 in MovableContentTests
+   (1/44 passing; likely one mechanism for the whole class).
+4. 13x unresolved global `next`, 8x `rootSize` — bare-name families.
+5. SlotTableTests still TIMEOUT at 480 s; profile before assuming a hang.
+
+The itest ratchet needs ~1210; the per-class fleet after this fix should be
+re-baselined by one full `zig build itest-compose_plugin_commontest` run once
+the top two clusters land.
