@@ -1,17 +1,40 @@
 //! Portable clock and sleep helpers.
 //!
 //! Zig 0.16 routes wall-clock, monotonic time, and sleeping through the
-//! `Io` interface rather than direct syscalls, which keeps these portable
-//! across Linux, macOS, and Windows. Each helper spins up a short-lived
-//! `std.Io.Threaded` instance; the cost is negligible next to the work
-//! these intrinsics back.
+//! `Io` interface; these helpers instead go straight to the libc syscalls
+//! when libc is linked. The original per-call `std.Io.Threaded` ceremony
+//! (allocator setup, a syscall-helper thread hop, teardown) profiled as
+//! the TOP consumer of a whole commontest run: every idle pool worker,
+//! monitor waiter, and pump poll sleeps at a ~1 ms cadence, and paying a
+//! runtime construction per tick multiplied into whole cores of overhead
+//! (and its allocation churn drove GC collections while idle). The `Io`
+//! path remains as the no-libc fallback.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const threads_mod = @import("threads.zig");
 const gc = @import("gc.zig");
 
+fn cNowNs(clk: std.c.clockid_t) ?i128 {
+    if (comptime !builtin.link_libc) return null;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(clk, &ts) != 0) return null;
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+fn cSleepNs(ns: u64) bool {
+    if (comptime !builtin.link_libc) return false;
+    const ts = std.c.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = std.c.nanosleep(&ts, null);
+    return true;
+}
+
 /// Wall-clock time in milliseconds since the Unix epoch.
 pub fn wallMillis() i64 {
+    if (cNowNs(.REALTIME)) |ns| return @intCast(@divFloor(ns, std.time.ns_per_ms));
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -22,10 +45,12 @@ pub fn wallMillis() i64 {
 pub const WallTime = struct { secs: i64, nanos: u32 };
 
 pub fn wallTime() WallTime {
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const ns: i128 = @intCast(std.Io.Clock.real.now(io).nanoseconds);
+    const ns: i128 = cNowNs(.REALTIME) orelse blk: {
+        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        break :blk @intCast(std.Io.Clock.real.now(io).nanoseconds);
+    };
     const secs = @divFloor(ns, std.time.ns_per_s);
     const nanos: u32 = @intCast(@mod(ns, std.time.ns_per_s));
     return .{ .secs = @intCast(secs), .nanos = nanos };
@@ -34,10 +59,12 @@ pub fn wallTime() WallTime {
 /// Monotonic clock reading in nanoseconds (since some unspecified epoch).
 /// Only differences between readings are meaningful. Returns 0 on failure.
 pub fn monotonicNanos() u64 {
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    const ns: i128 = cNowNs(.MONOTONIC) orelse blk: {
+        var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        break :blk @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    };
     if (ns <= 0) return 0;
     return @intCast(@min(ns, @as(i128, std.math.maxInt(u64))));
 }
@@ -53,6 +80,20 @@ pub fn sleepMillis(ms: i64) void {
     // collection's stop-the-world rendezvous rather than blocking it.
     gc.enterBlockingSafe();
     defer gc.exitBlockingSafe();
+    if (comptime builtin.link_libc) {
+        if (!threads_mod.isThreadAbandonable()) {
+            _ = cSleepNs(@as(u64, @intCast(ms)) * std.time.ns_per_ms);
+            return;
+        }
+        var remaining = ms;
+        while (remaining > 0) {
+            if (threads_mod.shouldAbandon()) return;
+            const slice = @min(remaining, @as(i64, 2));
+            _ = cSleepNs(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
+            remaining -= slice;
+        }
+        return;
+    }
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
