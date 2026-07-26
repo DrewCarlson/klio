@@ -663,6 +663,10 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
     }
 
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable_with_this on `{s}`", .{callable.typeFqn()});
+    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        std.debug.print("[icwt] callable={s} this={s} nargs={d}\n", .{ callable.typeFqn(), this_value.typeFqn(), args.len });
+        ir.eval.dumpFrameChainForDiagAlways();
+    }
     return .{ .err = .{ .Unimplemented = msg } };
 }
 

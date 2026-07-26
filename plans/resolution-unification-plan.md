@@ -1801,10 +1801,20 @@ Established with KLIO_BARE_TRACE=Job + the tagged getter trace:
   cases; the failing instance ends in `invoke_callable_with_this` on an Any —
   suggesting the read binds the factory FUNCTION value (or a companion-invoke
   conversion) and a downstream `==`/invoke path treats it as callable.
-Next probe: dump the lowered body of `__get_JobSupport_key` (KLIO_BARE_TRACE=Job
-prints the pick at lowering; check whether the emit is LoadGlobal(func=8453)
-vs the companion-singleton load) and fix the value-position pick to prefer the
-companion, mirroring the ctor-name rule in the deferred-call tail.
+CORRECTED after instrumenting the raise itself (`[icwt]` dump in
+`ivInvokeCallableWithThis`, plus the new `KLIO_DUMP_FN=<name>` lowered-IR
+dump): the Job traces were benign miss-recovery noise. The real raise is in
+the test MOCK VALIDATOR: `validate { this.Test(showThree) }` at
+CompositionTests.kt:569 — a LOCAL extension fun (`fun MockViewValidator.Test`)
+invoked on the receiver-lambda's `this` through the `member_or_local_exact_value`
+arm (expr.zig ~11845, CallValueWithThis with callee = the captured local-fn
+slot). At runtime the captured callee slot holds a bare `kotlin.Any` instead
+of the callable — the capture-space arg-shift family (note the test ALSO
+declares a same-named composable `Test`, so two local `Test` declarations are
+in scope). Next probe: dump the failing lambda frame's captures at the raise
+(extend the [icwt] dump with the innermost frame's capture values) and check
+`resolveCapture(b, "Test")` slot assignment against the lambda's recorded
+captures when two same-named locals exist.
 
 Verification state: stdlib sweep IDENTICAL to baseline with both interpreter
 commits (67ba7492 tightened the reroute's ownership test to the module-backed

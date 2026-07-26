@@ -1914,7 +1914,35 @@ pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args
 /// call site (`VmHost` in the interpreter, `NullHost` in ir's own tests);
 /// every `host.method(...)` is a comptime-duck-typed direct call.
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
+    dumpFnIfRequested(module, func);
     return evalWithCaptures(H, allocator, module, func, args, .empty, host);
+}
+
+/// `KLIO_DUMP_FN=<name>`: print the named function's lowered instruction
+/// stream (tag + key operands) the first time it runs. The only way to see
+/// what an emit path actually produced for a body inside a baked pack.
+var dump_fn_done: bool = false;
+pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
+    const want = runtime.getenvSlice("KLIO_DUMP_FN") orelse return;
+    if (dump_fn_done or !std.mem.eql(u8, func.name, want)) return;
+    dump_fn_done = true;
+    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d}\n", .{ func.name, func.id.int(), func.params.len, func.blocks.len });
+    for (func.blocks, 0..) |*blk, bi| {
+        std.debug.print("  block {d}:\n", .{bi});
+        for (blk.insts, 0..) |*inst, ii| {
+            std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
+            switch (inst.*) {
+                .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
+                .GetField => |x| std.debug.print(" field={s}", .{constStr(module, x.field) orelse "?"}),
+                .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
+                .CallMemberOrGlobal => |x| std.debug.print(" name={s}", .{constStr(module, x.name) orelse "?"}),
+                .CallMember => |x| std.debug.print(" name={s}", .{constStr(module, x.name) orelse "?"}),
+                else => {},
+            }
+            std.debug.print("\n", .{});
+        }
+        std.debug.print("    term: {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
+    }
 }
 
 /// Like `evalWith` but seeds the frame with a captured-values vector.
