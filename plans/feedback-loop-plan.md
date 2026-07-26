@@ -216,8 +216,8 @@ makes suspend/resume O(1) frame repointing, and shrinks every call's cost.
 That is a planned interpreter restructure, not a patch; a DeepRecursive
 host trampoline was prototyped and REJECTED as special-casing.
 
-Also found: `klio test --only-file=F --filter=T` reports the filtered test
-PASSED in 0 ms without executing its body (a vacuous pass — reproduced on
-DeepRecursiveTest.testDeepTreeDepth, which cannot complete in 0 ms). The
-filtered-runner path must be fixed and audited before any filtered result
-is trusted for correctness claims.
+Also found (and fixed): the streamed `[test] ... Nms` duration was the delta
+since the PREVIOUS record with an unset base, so the FIRST test always
+printed 0 ms — under `--filter` that is the target test, which read as "did
+not run" and briefly derailed this investigation. The base is now stamped at
+run start.
