@@ -1068,10 +1068,73 @@ pub const EvalResult = union(enum) {
 
 /// Per-instruction control signal from `execInst`. `cont` = the instruction
 /// completed (its result, if any, was written to a register); `raised` = a
-/// control-flow event occurred and its `EvalError` is in `frame.step_err`.
+/// control-flow event occurred and its `EvalError` is in `frame.step_err`;
+/// `flat_call` = the instruction is a direct interpreted call the flat driver
+/// should run as a pushed activation (request in `frame.flat_call`).
 /// A 1-byte return keeps the hot dispatch loop from copying an `EvalResult` per
 /// instruction (whose `.ok` is always the ignored `.Unit`).
-pub const Step = enum { cont, raised };
+pub const Step = enum { cont, raised, flat_call };
+
+/// A direct interpreted call the flat driver runs by pushing an activation
+/// instead of recursing natively. Carries the resolved callee and the arg
+/// buffer (ownership transfers to the new frame's params, exactly as the
+/// host fast path transferred it). A closure invocation additionally carries
+/// its capture vector, creation-time receiver chain, owning sub-module and
+/// closure id — the exact seed `evalWithCapturesChained` would receive.
+pub const FlatCallReq = struct {
+    func: *const Func,
+    /// The module the body resolves against (a closure body always resolves
+    /// against its creation module, never the caller's). Null = the calling
+    /// frame's module (a same-module direct call).
+    run_module: ?*const Module = null,
+    /// Owning sub-module for a body lowered into one (anon object / local
+    /// class); null for a main-module body. Recorded as the frame's
+    /// `module_arc` so a suspension resumes against the right module.
+    owning: ?*const Module = null,
+    args: std.ArrayList(Value),
+    captures: std.ArrayList(Value) = .empty,
+    /// Creation-time receiver-chain seed (borrowed; copied into the frame's
+    /// chain at activation open).
+    chain: []const EnclosingEntry = &.{},
+    closure_id: ?u64 = null,
+    /// The host pushed an ambient composer for this call; the activation's
+    /// teardown must pop it.
+    composer_pushed: bool = false,
+    dst: Reg,
+};
+
+/// A `FlatCallReq` plus the caller's resume point: the block/instruction the
+/// caller continues at once the callee's result lands in `req.dst`.
+const FlatCallSite = struct {
+    req: FlatCallReq,
+    ret_block: BlockId,
+    ret_idx: usize,
+};
+
+/// One interpreted activation on the flat driver's call stack. Heap-allocated
+/// (`allocator.create`) so the Frame's address stays stable on the GC frame
+/// chain while the stack list grows. `ret_*` is the resume point in the
+/// CALLER frame where this activation's result is delivered.
+const Activation = struct {
+    frame: Frame,
+    try_stack: std.ArrayList(TryFrame),
+    ctx_mark: usize,
+    composer_pushed: bool,
+    ret_block: BlockId,
+    ret_idx: usize,
+    ret_dst: Reg,
+};
+
+/// `KLIO_FLAT=0` falls back to native recursion for every call — the bisect
+/// switch for the flat driver.
+var flat_enabled_cached: ?bool = null;
+fn flatEnabled() bool {
+    if (flat_enabled_cached) |b| return b;
+    const raw = runtime.getenvSlice("KLIO_FLAT");
+    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    flat_enabled_cached = b;
+    return b;
+}
 
 /// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
 inline fn raiseStep(frame: *Frame, e: EvalError) Step {
@@ -1681,6 +1744,9 @@ const Frame = struct {
     /// `EvalResult` by value on every instruction (its `.ok` is always the
     /// ignored `.Unit`). Read by the dispatch loop only on `.raised`.
     step_err: ?EvalError = null,
+    /// Out-of-band payload for `Step.flat_call`: the resolved direct call the
+    /// flat driver should push. Set and consumed within one dispatch step.
+    flat_call: ?FlatCallReq = null,
     pending_finally: PendingFinallyState = .{},
     /// Source span of the statement this frame is currently executing, set by
     /// the `Trace` instruction the lowerer emits per statement. Read when a
@@ -2078,7 +2144,18 @@ pub fn evalWithCapturesChained(
     }
     defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
     const cur = func.entry;
-    var result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
+    const result = try runFrame(H, allocator, module, &frame, &try_stack, cur, 0, host);
+    return frameBoundary(func, result);
+}
+
+/// The transforms every interpreted frame's result crosses at its callee
+/// boundary, whether the frame ran via native recursion or as a flat
+/// activation: absorb a labeled return this function owns, normalize an
+/// `Int` literal in a `Long` return slot, and re-tag resolution-class
+/// escapes of a RAN body as `CalleeFailed` so no enclosing candidate walk
+/// retries (and re-executes) a body that already performed side effects.
+fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
+    var result = result_in;
     // A labeled return whose target is this function exits it as a
     // normal return. Other labels propagate further outward until the
     // matching frame catches them.
@@ -2104,12 +2181,6 @@ pub fn evalWithCapturesChained(
     if (result == .ok) {
         coerceIntToLongTy(func.return_ty, &result.ok);
     }
-    // The body ran: a resolution-class error escaping it (`Unimplemented`,
-    // `Unbound`, `Type`, `Unsupported`, `Arity`) is a real failure of an
-    // executed statement, not a dispatch miss. Re-tag it so no enclosing
-    // candidate walk retries (and re-executes) this body — a walker that
-    // re-runs a body which already performed side effects corrupts state
-    // (a measure pass re-measuring already-measured children).
     if (result == .err) {
         switch (result.err) {
             .Unimplemented, .Unbound, .Type, .Unsupported, .Arity => |m| {
@@ -2385,6 +2456,275 @@ fn runFrame(
         if (eval_depth == 0) jit_loop.evictIfOverBudget();
     }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
+}
+
+/// Snapshot `frame` (resuming at `block`:`inst_idx`, resume value delivered
+/// into `resume_reg`) and append it to `state`'s frame list. Ownership of the
+/// frame's pending-finally payload moves into the snapshot; the frame's own
+/// teardown must then run (it releases regs the snapshot has retained).
+fn snapshotSuspendedFrame(
+    allocator: Allocator,
+    frame: *Frame,
+    try_stack: *std.ArrayList(TryFrame),
+    block: BlockId,
+    inst_idx: usize,
+    resume_reg: ?Reg,
+    state: *SuspendState,
+) Allocator.Error!void {
+    const saved_regs = try snapshotRegisters(
+        allocator,
+        frame.func,
+        block,
+        inst_idx,
+        resume_reg,
+        frame.regs.items,
+        try_stack.items.len == 0,
+    );
+    noteSuspendSnapshot(
+        saved_regs.isDense(),
+        frame.regs.items.len,
+        saved_regs.savedLen(),
+        frame.params.items.len,
+        frame.captures.items.len,
+        frame.enclosing_this.items.len,
+    );
+    const snap: FrameSnapshot = .{
+        .func = frame.func.id,
+        .module = frame.module_arc,
+        .block = block,
+        .inst_idx = inst_idx,
+        .regs = saved_regs,
+        .params = blk: {
+            if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.items.len + frame.captures.items.len) * @sizeOf(Value));
+            break :blk try allocator.dupe(Value, frame.params.items);
+        },
+        .captures = try allocator.dupe(Value, frame.captures.items),
+        .enclosing_this = try allocator.dupe(EnclosingEntry, frame.enclosing_this.items),
+        .try_stack = try allocator.dupe(TryFrame, try_stack.items),
+        .pending_finally = frame.pending_finally,
+        .is_lambda = frame.func.is_lambda,
+        .resume_reg = resume_reg,
+        .closure_id = frame.closure_id,
+    };
+    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+        std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} pending={}/{}/{} caps={d} enc={d}\n", .{
+            frame.func.name,
+            frame.func.id.int(),
+            block.int(),
+            inst_idx,
+            frame.pending_finally.rethrow != null,
+            frame.pending_finally.return_value != null,
+            frame.pending_finally.unwind != null,
+            frame.captures.items.len,
+            frame.enclosing_this.items.len,
+        });
+        traceEnclosingEntries("suspend-enclosing", frame.enclosing_this.items);
+    }
+    // The snapshot now holds the only references that will survive this
+    // frame's teardown (its regs are released as the stack unwinds; its
+    // params/captures alias caller regs / closure captures the unwind also
+    // releases).
+    retainSnapshotValues(snap);
+    try state.frames.append(allocator, snap);
+    // Ownership of the pending control-flow payload moved into `snap`;
+    // frame teardown must not release it.
+    frame.pending_finally = .{};
+}
+
+/// Open a flat activation for a direct interpreted call: the same entry
+/// sequence `evalWithCapturesChained` performs for a recursive call (frame
+/// construction with the arg buffer transferred as params, GC chain push,
+/// lexical receiver-chain activation, context-parameter seeding).
+fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
+    const module = req.run_module orelse caller_module;
+    dumpFnIfRequested(module, req.func);
+    const act = try allocator.create(Activation);
+    errdefer allocator.destroy(act);
+    act.* = .{
+        .frame = try Frame.newWithCaptures(allocator, module, req.func, req.args, req.captures),
+        .try_stack = .empty,
+        .ctx_mark = 0,
+        .composer_pushed = req.composer_pushed,
+        .ret_block = undefined,
+        .ret_idx = 0,
+        .ret_dst = req.dst,
+    };
+    act.frame.closure_id = req.closure_id;
+    gcPushFrame(&act.frame);
+    act.frame.module_arc = req.owning;
+    try act.frame.activateChain(req.chain);
+    act.ctx_mark = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
+    if (comptime @hasDecl(H, "ctxPush")) {
+        if (module.has_context_decls) {
+            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
+            if (req.func.has_receiver_param and act.frame.params.items.len > 0) {
+                host.ctxPush(act.frame.params.items[0]) catch {};
+            }
+        }
+    }
+    return act;
+}
+
+/// Tear down a flat activation: the exact exit sequence of
+/// `evalWithCapturesChained`'s defers, in their LIFO order, then the host's
+/// post-call unwinds (ambient composer pop) that wrapped the recursive call.
+fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, host: *H) void {
+    if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
+    act.frame.deactivateChain();
+    gcPopFrame(&act.frame);
+    act.frame.deinit();
+    act.try_stack.deinit(allocator);
+    if (act.composer_pushed) {
+        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
+    }
+}
+
+/// Discard a flat call request without running it (depth-cap rejection):
+/// free the transferred buffers (values are borrows) and unwind any host
+/// side effect the prepare step applied.
+fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host: *H) void {
+    var args = req.args;
+    args.deinit(allocator);
+    var caps = req.captures;
+    caps.deinit(allocator);
+    if (req.composer_pushed) {
+        if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
+    }
+}
+
+/// The flat call driver. Runs `frame` through `runFrameExec`; when the
+/// executor surfaces a direct interpreted call, pushes the callee as a new
+/// heap activation and continues in the same loop instead of recursing
+/// natively. Results, throws, non-local returns and suspensions re-enter the
+/// calling frame through the executor's resume machinery — the same routes a
+/// coroutine resume uses — so control-flow semantics are identical to the
+/// recursive path.
+fn runFrameInner(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    frame: *Frame,
+    try_stack: *std.ArrayList(TryFrame),
+    cur_in: BlockId,
+    resume_idx_in: usize,
+    resume_throw_in: ?Value,
+    resume_unwind_in: ?EvalError,
+    host: *H,
+) Allocator.Error!EvalResult {
+    _ = module;
+    var stack: std.ArrayList(*Activation) = .empty;
+    defer stack.deinit(allocator);
+    // On an allocation failure, unwind every open activation so no frame is
+    // left dangling on the GC chain.
+    errdefer while (stack.pop()) |act| {
+        eval_depth -= 1;
+        teardownActivation(H, allocator, act, host);
+        allocator.destroy(act);
+    };
+    var cur = cur_in;
+    var ridx = resume_idx_in;
+    var rthrow = resume_throw_in;
+    var runwind = resume_unwind_in;
+    while (true) {
+        const f: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+        const ts: *std.ArrayList(TryFrame) = if (stack.items.len > 0) &stack.items[stack.items.len - 1].try_stack else try_stack;
+        var flat_site: ?FlatCallSite = null;
+        var res = try runFrameExec(H, allocator, f.module, f, ts, cur, ridx, rthrow, runwind, &flat_site, host);
+        rthrow = null;
+        runwind = null;
+        if (flat_site) |site| {
+            // Same depth bound as the recursive path: an unbounded interpreted
+            // recursion becomes a catchable StackOverflowError at the caller.
+            if (eval_depth >= maxEvalDepth()) {
+                dumpFrameChainForDiag();
+                discardFlatReq(H, allocator, site.req, host);
+                runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
+                cur = site.ret_block;
+                ridx = site.ret_idx;
+                continue;
+            }
+            eval_depth += 1;
+            const act = openActivation(H, allocator, f.module, site.req, host) catch |e| {
+                eval_depth -= 1;
+                return e;
+            };
+            act.ret_block = site.ret_block;
+            act.ret_idx = site.ret_idx;
+            stack.append(allocator, act) catch |e| {
+                eval_depth -= 1;
+                teardownActivation(H, allocator, act, host);
+                allocator.destroy(act);
+                return e;
+            };
+            cur = site.req.func.entry;
+            ridx = 0;
+            continue;
+        }
+        // The current frame exited; deliver its result to the calling
+        // activation, applying the callee-boundary transforms each popped
+        // frame's result crosses.
+        deliver: while (true) {
+            if (stack.items.len == 0) return res;
+            const act = stack.pop().?;
+            eval_depth -= 1;
+            res = frameBoundary(act.frame.func, res);
+            if (res == .err and res.err == .Suspended) {
+                // Snapshot every open activation outward from the suspension
+                // (each resuming at its recorded call-return point), then the
+                // root frame, preserving the innermost-first snapshot order of
+                // the recursive path.
+                const state = res.err.Suspended;
+                var sb = act.ret_block;
+                var si = act.ret_idx;
+                var sd: ?Reg = act.ret_dst;
+                teardownActivation(H, allocator, act, host);
+                allocator.destroy(act);
+                while (stack.pop()) |a| {
+                    eval_depth -= 1;
+                    try snapshotSuspendedFrame(allocator, &a.frame, &a.try_stack, sb, si, sd, state);
+                    sb = a.ret_block;
+                    si = a.ret_idx;
+                    sd = a.ret_dst;
+                    teardownActivation(H, allocator, a, host);
+                    allocator.destroy(a);
+                }
+                try snapshotSuspendedFrame(allocator, frame, try_stack, sb, si, sd, state);
+                return res;
+            }
+            const rb = act.ret_block;
+            const rix = act.ret_idx;
+            const rd = act.ret_dst;
+            teardownActivation(H, allocator, act, host);
+            allocator.destroy(act);
+            const pf: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+            switch (res) {
+                .ok => |v| {
+                    try pf.write(rd, v);
+                    cur = rb;
+                    ridx = rix;
+                    break :deliver;
+                },
+                .err => |e| switch (e) {
+                    .Throw => |v| {
+                        rthrow = v;
+                        cur = rb;
+                        ridx = rix;
+                        break :deliver;
+                    },
+                    .NonLocalReturn, .LabeledReturn, .CalleeFailed, .StackOverflow => {
+                        runwind = e;
+                        cur = rb;
+                        ridx = rix;
+                        break :deliver;
+                    },
+                    // Anything else exits the calling frame as-is (matching
+                    // the recursive raised-switch's default arm); keep
+                    // popping so each crossed frame's boundary applies.
+                    else => {},
+                },
+            }
+        }
+    }
 }
 
 fn typeRefName(name: []const u8) TypeRef {
@@ -2836,7 +3176,11 @@ fn LoopTramp(comptime H: type) type {
 /// `resume_unwind` is the corresponding path for a non-local return raised
 /// by a resumed inner frame; it crosses the restored frame's finally stack
 /// and is absorbed when this frame carries its target label.
-fn runFrameInner(
+/// `flat_out`: when the frame hits a direct interpreted call the flat driver
+/// can run, the executor parks the request there and returns; the returned
+/// `EvalResult` is meaningless in that case (the driver checks `flat_out`
+/// first).
+fn runFrameExec(
     comptime H: type,
     allocator: Allocator,
     module: *const Module,
@@ -2846,6 +3190,7 @@ fn runFrameInner(
     resume_idx_in: usize,
     resume_throw_in: ?Value,
     resume_unwind_in: ?EvalError,
+    flat_out: *?FlatCallSite,
     host: *H,
 ) Allocator.Error!EvalResult {
     var cur = cur_in;
@@ -3031,6 +3376,15 @@ fn runFrameInner(
             if (idx < start_idx) continue;
             const inst = &insts[idx];
             const r = try execInst(H, allocator, frame, inst, host);
+            if (r == .flat_call) {
+                // Hand the resolved direct call to the flat driver: it pushes
+                // the callee as a new activation and re-enters this frame at
+                // the next instruction once the result is in `req.dst`.
+                const req = frame.flat_call.?;
+                frame.flat_call = null;
+                flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
+                return ok(.Unit);
+            }
             if (r == .raised) {
                 const e = frame.step_err.?;
                 frame.step_err = null;
@@ -3085,64 +3439,7 @@ fn runFrameInner(
                             state.pending_resume_reg = null;
                             break :blk rr;
                         } else instDst(inst);
-                        const saved_regs = try snapshotRegisters(
-                            allocator,
-                            frame.func,
-                            cur,
-                            idx + 1,
-                            resume_reg,
-                            frame.regs.items,
-                            try_stack.items.len == 0,
-                        );
-                        noteSuspendSnapshot(
-                            saved_regs.isDense(),
-                            frame.regs.items.len,
-                            saved_regs.savedLen(),
-                            frame.params.items.len,
-                            frame.captures.items.len,
-                            frame.enclosing_this.items.len,
-                        );
-                        const snap: FrameSnapshot = .{
-                            .func = frame.func.id,
-                            .module = frame.module_arc,
-                            .block = cur,
-                            .inst_idx = idx + 1,
-                            .regs = saved_regs,
-                            .params = blk: {
-                                if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.items.len + frame.captures.items.len) * @sizeOf(Value));
-                                break :blk try allocator.dupe(Value, frame.params.items);
-                            },
-                            .captures = try allocator.dupe(Value, frame.captures.items),
-                            .enclosing_this = try allocator.dupe(EnclosingEntry, frame.enclosing_this.items),
-                            .try_stack = try allocator.dupe(TryFrame, try_stack.items),
-                            .pending_finally = frame.pending_finally,
-                            .is_lambda = frame.func.is_lambda,
-                            .resume_reg = resume_reg,
-                            .closure_id = frame.closure_id,
-                        };
-                        if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
-                            std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} pending={}/{}/{} caps={d} enc={d}\n", .{
-                                frame.func.name,
-                                frame.func.id.int(),
-                                cur.int(),
-                                idx + 1,
-                                frame.pending_finally.rethrow != null,
-                                frame.pending_finally.return_value != null,
-                                frame.pending_finally.unwind != null,
-                                frame.captures.items.len,
-                                frame.enclosing_this.items.len,
-                            });
-                            traceEnclosingEntries("suspend-enclosing", frame.enclosing_this.items);
-                        }
-                        // The snapshot now holds the only references that will
-                        // survive this frame's teardown (its regs are released
-                        // as the stack unwinds; its params/captures alias caller
-                        // regs / closure captures the unwind also releases).
-                        retainSnapshotValues(snap);
-                        try state.frames.append(allocator, snap);
-                        // Ownership of the pending control-flow payload moved
-                        // into `snap`; frame teardown must not release it.
-                        frame.pending_finally = .{};
+                        try snapshotSuspendedFrame(allocator, frame, try_stack, cur, idx + 1, resume_reg, state);
                         return errResult(.{ .Suspended = state });
                     },
                     else => return errResult(e),
@@ -4327,6 +4624,12 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                 if (plan >= 2 and plan - 2 == call.n_args) {
                     const buf = try readArgRun(allocator, frame, call.args, call.n_args);
                     const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                    // The flat driver runs the body as a pushed activation in
+                    // the same dispatch loop — no native recursion per call.
+                    if (flatEnabled()) {
+                        frame.flat_call = .{ .func = cf, .args = args_list, .dst = call.dst };
+                        return .flat_call;
+                    }
                     switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
                         .ok => |result| try frame.write(call.dst, result),
                         .err => |e| return raiseStep(frame, e),
@@ -4495,6 +4798,21 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
     // receiver-split / `this`-capture binding above. Pushing the
     // dynamic caller's `this` would hand the body a receiver it
     // never lexically saw.
+    //
+    // Flat closure dispatch: a plain positional exact-arity closure call
+    // runs as a pushed activation in the flat driver. The host performs the
+    // same resolution and binding the recursive path would, then hands back
+    // the ready call instead of invoking the evaluator itself.
+    if (comptime @hasDecl(H, "prepareClosureFlatCall")) {
+        if (flatEnabled() and callee_v == .IrClosure and cv.type_args.len == 0 and argNamesAllNull(cv.arg_names)) {
+            if (try host.prepareClosureFlatCall(allocator, &callee_v, arg_values_list.items)) |prep0| {
+                var prep = prep0;
+                prep.dst = cv.dst;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
     const result = blk: {
         // Explicit call-site type args reach the host so an
         // unsigned element-type argument can coerce integral

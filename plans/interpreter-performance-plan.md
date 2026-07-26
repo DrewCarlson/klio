@@ -50,6 +50,29 @@ one `runLoop` that pushes/pops interpreted frames for DIRECT calls and
 returns; native recursion remains only at genuine host boundaries
 (intrinsics that re-enter, JNI-like seams). Deliverables:
 
+**Landed so far (2026-07-26):** the flat driver exists. `runFrameInner` is
+now a driver loop over heap-allocated activations; the renamed executor
+(`runFrameExec`) surfaces a direct interpreted call as a `FlatCallSite`
+instead of recursing, and results / throws / non-local returns /
+suspensions re-enter the calling frame through the executor's existing
+resume machinery, with `frameBoundary` applying the callee-boundary
+transforms per popped activation (shared verbatim with the recursive
+path). Flattened call forms:
+
+1. plain top-level calls (the `fastCallPlan` shape) — `Call`;
+2. plain positional exact-arity closure calls — `CallValue` on an
+   `IrClosure`, via the host's `prepareClosureFlatCall` (resolution and
+   binding stay host-side; the driver runs the body), including the
+   ambient-composer push/pop tied to activation open/close.
+
+`KLIO_FLAT=0` is the bisect switch back to full native recursion.
+Member calls (`CallMember` cache-hit fast shape, terminal at
+`invokeMethodFuncId`'s `[receiver] ++ args` path) are the next form; the
+two field-shadow pre-probes (`recvFnFieldInvoke`,
+`varargShadowedFieldInvoke`) run before the cache in the recursive ladder,
+so the member prepare must decline when the receiver class carries a
+same-named field.
+
 - Call/return become push/pop on a contiguous frame arena — no host ladder
   on the direct path, no per-call native frames.
 - Suspension becomes O(1): unlink the interpreted segment (it is already a
