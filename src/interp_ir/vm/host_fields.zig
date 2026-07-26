@@ -154,6 +154,10 @@ fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entries: b
 /// Run the IR-lowered function `fid` with the receiver bound as the
 /// sole positional argument (custom getter / extension prop invocation).
 fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
+    return evalGetterTagged(self, allocator, fid, receiver, "untagged");
+}
+
+fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value, site: []const u8) Allocator.Error!EvalResult {
     const mptr: *const Module = self.module.asPtr();
     const func = mptr.funcById(fid) orelse {
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
@@ -165,6 +169,13 @@ fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value)
     // until the new frame's params are installed), so a collection mid-getter
     // would otherwise sweep it — and everything transitively reachable through
     // it, which the getter is about to read.
+    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (std.mem.indexOf(u8, func.name, w) != null) {
+            const rc: []const u8 = if (receiver == .Instance) className(receiver.Instance) else receiver.typeFqn();
+            std.debug.print("[getter] {s}#{d} recv={s} site={s}\n", .{ func.name, fid.int(), rc, site });
+            ir.eval.dumpFrameChainForDiagAlways();
+        }
+    }
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePush(receiver);
@@ -548,7 +559,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 const fid: FuncId = @enumFromInt(h.getter);
                 const mptr: *const Module = self.module.asPtr();
                 if (fid.int() < mptr.funcCount()) {
-                    return try evalGetter(self, allocator, fid, receiver.*);
+                    return try evalGetterTagged(self, allocator, fid, receiver.*, "site562");
                 }
             } else if (h.stored_idx != NONE) {
                 const v: ?Value = blk: {
@@ -739,6 +750,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
                         lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
                 };
+                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, prop)) {
+                        std.debug.print("[sgp] owner={s} prop={s} rcn={s} owns={} owner_declares={}\n", .{ owner, prop, rcn, owns, owner_declares });
+                    }
+                }
                 if (!owns and owner_declares) {
                     return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ prop, rcn }) });
                 }
@@ -836,7 +852,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                             break :blk lookupPairFunc(pg.get().instance_prop_private, cn, prop) != null;
                         };
                         if (!foreign_private and fid.int() < mptr.funcCount()) {
-                            return evalGetter(self, allocator, fid, receiver.*);
+                            return evalGetterTagged(self, allocator, fid, receiver.*, "virtual-walk");
                         }
                     }
                     cur = firstSupertype(self, cn);
@@ -862,7 +878,21 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 };
                 if (fid_opt) |fid| {
                     if (fid.int() < mptr.funcCount()) {
-                        return evalGetter(self, allocator, fid, receiver.*);
+                        // A direct scoped read normally runs with `this` being
+                        // an `owner` instance, but inside an inline
+                        // receiver-splice (`holder.apply { ... readerTable ... }`)
+                        // the frame's `this` is the SPLICE receiver. The
+                        // owner's getter must run on the enclosing owner
+                        // instance from the receiver chain, never on a foreign
+                        // receiver — that misbound every bare enclosing-class
+                        // property read inside such a splice.
+                        if (receiver.* == .Instance and !receiver.isRuntimeType(owner)) {
+                            var recv_probe = receiver.*;
+                            if (try host_call_member.memberExtOwnerInstance(self, allocator, &recv_probe, owner)) |inst| {
+                                return evalGetterTagged(self, allocator, fid, inst, "owner-enclosing");
+                            }
+                        }
+                        return evalGetterTagged(self, allocator, fid, receiver.*, "owner-lexical");
                     }
                 }
             }
@@ -1183,7 +1213,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     pushed_owner = true;
                 }
             }
-            const r = try evalGetter(self, allocator, fid, getter_recv);
+            const r = try evalGetterTagged(self, allocator, fid, getter_recv, "site1202");
             if (pushed_owner) ir.eval.popEnclosing();
             return r;
         }
@@ -1733,7 +1763,7 @@ fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []con
             if (getter) |fid| {
                 const mptr: *const Module = self.module.asPtr();
                 if (fid.int() < mptr.funcCount()) {
-                    return try evalGetter(self, allocator, fid, s);
+                    return try evalGetterTagged(self, allocator, fid, s, "site1752");
                 }
             }
         }
@@ -2066,7 +2096,7 @@ fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value
                 pushed_owner = true;
             }
         }
-        const r = try evalGetter(self, allocator, fid, getter_recv);
+        const r = try evalGetterTagged(self, allocator, fid, getter_recv, "ext-prop");
         if (pushed_owner) ir.eval.popEnclosing();
         return r;
     }
@@ -2481,7 +2511,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             return errRes(.{ .Type = msg });
         }
         fieldReadCachePut(self, cache_fqn, name, .{ .getter = fid.int(), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
-        return try evalGetter(self, allocator, fid, receiver.*);
+        return try evalGetterTagged(self, allocator, fid, receiver.*, "site2500");
     }
     // Most-derived override cell: an initialized `override val/var` keeps
     // its own backing cell under the owner-mangled key (JVM semantics);
