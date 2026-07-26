@@ -200,10 +200,18 @@ pub fn noteExternalBytes(bytes: usize) void {
 
 /// External (non-registry) bytes released back — keeps `external_live`
 /// tracking the traced-but-unswept footprint so the Appel threshold can
-/// include it.
+/// include it. The trigger credit matters as much as the live credit:
+/// external buffers are freed explicitly, never swept, so their churn
+/// produces NO collectable garbage — counting their gross allocation into
+/// `bytes_since_gc` made collections scale with CALL RATE (every frame's
+/// register buffer advanced the trigger even when freed a microsecond
+/// later), and each collection re-marked the whole live set for nothing.
+/// External bytes therefore advance the trigger by NET growth only;
+/// registry cells keep gross accounting (their garbage does accumulate).
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
+    _ = bytes_since_gc.fetchSub(@min(bytes, bytes_since_gc.load(.monotonic)), .monotonic);
 }
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
