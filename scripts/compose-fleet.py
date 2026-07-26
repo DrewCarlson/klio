@@ -63,7 +63,10 @@ def main():
     ap.add_argument("--filter", help="only classes containing this substring")
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--home", default="/tmp/klio_itest_compose_plugin_home")
-    ap.add_argument("--timeout", type=int, default=480, help="per-class wall cap (s)")
+    ap.add_argument("--timeout", type=int, default=0, help="per-child wall cap (s); 0 = auto (600 per-class, 2400 grouped)")
+    ap.add_argument("--per-class", action="store_true",
+                    help="one child per class (per-class hang isolation) instead "
+                         "of the default grouped children (one lowering per job)")
     args = ap.parse_args()
 
     if not os.path.isdir(os.path.join(args.home, ".klio", "packs")):
@@ -74,6 +77,16 @@ def main():
     classes = test_classes(srcs)
     if args.filter:
         classes = [c for c in classes if args.filter in c]
+    # Grouped mode (default): partition the classes into `jobs` children so
+    # the 68-file lowering runs `jobs` times instead of once per class —
+    # per-class children spent ~60% of every fleet run re-lowering the same
+    # sources. The comma filter selects each group's classes in one child.
+    # Round-robin by name keeps the heavy classes spread across groups.
+    groups = None
+    if not args.per_class and len(classes) > args.jobs:
+        groups = [classes[i::args.jobs] for i in range(args.jobs)]
+    if args.timeout == 0:
+        args.timeout = 2400 if groups is not None else 600
     logdir = os.path.join(REPO, ".fleet-logs")
     os.makedirs(logdir, exist_ok=True)
 
@@ -93,12 +106,15 @@ def main():
     totals = Counter()
 
     def run(cls):
+        # `cls` is a class name (per-class mode) or a list (grouped mode).
+        members = cls if isinstance(cls, list) else [cls]
+        cls = members[0] if len(members) == 1 else ("group-" + members[0])
         log = os.path.join(logdir, cls + ".log")
         with open(log, "w") as out:
             try:
                 subprocess.run(
                     ["nice", "-n", "10", "zig-out/bin/klio-harness", "test",
-                     *srcs, "--filter=" + cls],
+                     *srcs, "--filter=" + ",".join(members)],
                     cwd=REPO, stdout=out, stderr=subprocess.STDOUT,
                     timeout=args.timeout, env=env,
                 )
@@ -115,7 +131,7 @@ def main():
         return f"{cls}: NO-SUMMARY"
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        for line in ex.map(run, classes):
+        for line in ex.map(run, groups if groups is not None else classes):
             print(line, flush=True)
 
     print(f"\nfleet: {totals['passed']} passed, {totals['failed']} failed, "
