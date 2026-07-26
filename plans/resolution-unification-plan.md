@@ -1862,3 +1862,34 @@ KLIO_TEST_WALL_CAP).
 Remaining named clusters after these two: unresolved global `next` (13x),
 `rootSize` (8x), `read` on DynamicProvidableCompositionLocal (7x) — bare-name
 resolution family, the plan's home turf.
+
+## Fleet at 998; the bare-name cluster is a stale enclosing-subject leak
+
+The finally-unwind fix (691fb95c) moved the fleet 734 -> **998 passed / 152
+failed** (+264: the contamination was depressing nearly every class).
+CompositionTests 62 -> 101 in one step; previously-wedged classes now report
+their full totals.
+
+The bare-name cluster (`unresolved global next` 11x, `rootSize` 8x,
+CompositionLocal `read` 7x) is now diagnosed one level deeper with the
+par-miss diagnostics: inside `MockViewValidator.view`'s bare `next()` call
+(PausableCompositionTests.canRecordAComposition), the implicit-receiver walk
+reports `ncands=1: ComposableLambdaImpl` and `par-enc n=1:
+ComposableLambdaImpl*` — a STALE pushed outer subject is the only candidate,
+and the frame's own `this` param (the validator, bound as p0) never enters
+the list. Two defects compound:
+1. The pausable pause/resume path leaks enclosing-subject stack entries
+   (pushed during composable invocation, not re-popped across a
+   pause/resume cycle), leaving a dead ComposableLambdaImpl as the
+   innermost "receiver" for every later bare call on the thread.
+2. The candidate walk lets the pushed-subject stack SHADE OUT the frame's
+   own receiver parameter entirely (`consult_param` should make p0 the
+   first candidate regardless).
+Fix order: (2) first — the frame's own `this` param must always be a
+candidate ahead of ambient subjects (safe, walk-local, sweep-gated); then
+(1) — audit push/pop pairing across the suspension snapshot/resume seam
+(the snapshot captures `enclosing_this` and the resume re-establishes it;
+a re-suspension must not double-account). The `LabeledReturn` 6x
+(movableContentParameters_*) are the same tests that previously failed
+masked; the label unwind now escapes visibly through the movable-content
+parameter path.
