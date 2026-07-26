@@ -1,5 +1,50 @@
 # Resolved IR — Static Representation, One Engine, Tiered Execution
 
+## 2026-07-26: the runTest deadlock family — root-caused and fixed
+
+Every default-dispatcher `runTest` (and everything built on it —
+`compositionTest`, the whole compose hang family measured at 90 s wall-cap
+per test) deadlocked. The minimal repro was `runTest {}`. Three stacked
+defects, found by driving `KLIO_PUMP_DIAG` → per-frame park identification
+→ candidate-walk class dumps:
+
+1. **Receiver-head string corruption** (`lambda_body.zig`): the Func's
+   `lambda_receiver_ty` aliased a span-keyed `lambda_arg_recv` entry the
+   builder frees at teardown; at run time it read reused bytes
+   (`"advanceUntilId"`), so receiver-lambda invocation head-matching
+   silently failed. Fix: the Func owns a copy.
+2. **Missing receiver shape for single-candidate top-level callees**
+   (`expr.zig` deferred bare-call arm): `recordLambdaArgReceivers` was
+   gated to member picks (the SlotTable namesake regression), which also
+   skipped unambiguous top-level callees — `createTestResult { … }`'s
+   lambda never learned its `CoroutineScope` receiver. Fix: a
+   single-candidate top-level pick records too (no namesake exists whose
+   shape the stamp could override).
+3. **`implicitThisValue` trusting a placeholder capture index**
+   (`eval.zig`): emit arms that carry the receiver in a direct register
+   bake `this_idx = 0`; the walk's receiver-param defense then read
+   `captures[0]` — whatever capture is first (`scope` = the enclosing
+   `TestScopeImpl`) — and injected it as the innermost implicit receiver.
+   The bare `launch` in `createTestResult` then bound the OUTER TestScope,
+   whose StandardTestDispatcher queues the work runner onto the very
+   scheduler only that runner pumps: deadlock by construction. Fix: the
+   baked index is only trusted when `capture_order[this_idx] == "this"`;
+   otherwise the `this` capture is located by name, and a frame without
+   one contributes no capture-borne receiver.
+
+Also landed on the way, per the multithreading directive: real atomicfu
+actual bodies (the stubs returned `false`/`0` when a host binding missed —
+inline members splice and bindings can never intercept them), real
+compose-ui/compose-ui-text `synchronized` actuals, a real per-thread
+`getCurrentThread` for animation-core, and implemented
+`closureNeedsThisCapture`/`overrideClosureThis` (previously stubs).
+
+Verified: `runTest {}`, `launch`+`join`, `yield` ping-pong, conflated
+trySend→receive all pass; `BroadcastFrameClockTest` 4/4 including
+`locklessCancellation` (90 s hang → 46 ms). Packs must be rebuilt for the
+lowering fixes to take effect — a stale installed pack reproduces the
+hang.
+
 ## North star
 
 KLIO should turn scripts into **as static a representation as possible without

@@ -2038,9 +2038,19 @@ pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, f
 var dump_fn_done: bool = false;
 pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     const want = runtime.getenvSlice("KLIO_DUMP_FN") orelse return;
-    if (dump_fn_done or !std.mem.eql(u8, func.name, want)) return;
+    if (dump_fn_done) return;
+    // `#<id>` selects by FuncId — the only handle for synthetic names
+    // (`<lambda>`) that dozens of functions share.
+    if (want.len > 1 and want[0] == '#') {
+        const id = std.fmt.parseInt(u32, want[1..], 10) catch return;
+        if (func.id.int() != id) return;
+    } else if (!std.mem.eql(u8, func.name, want)) return;
+    // A deferred body has no blocks yet; wait for the post-materialize call.
+    if (func.blocks.len == 0) return;
     dump_fn_done = true;
-    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d}\n", .{ func.name, func.id.int(), func.params.len, func.blocks.len });
+    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d} recv_ty={?s} caps=", .{ func.name, func.id.int(), func.params.len, func.blocks.len, func.lambda_receiver_ty });
+    for (func.capture_order) |cn| std.debug.print("{s},", .{cn});
+    std.debug.print("\n", .{});
     for (func.blocks, 0..) |*blk, bi| {
         std.debug.print("  block {d}:\n", .{bi});
         for (blk.insts, 0..) |*inst, ii| {
@@ -2049,8 +2059,10 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .GetField => |x| std.debug.print(" field={s}", .{constStr(module, x.field) orelse "?"}),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .CallMemberOrGlobal => |x| std.debug.print(" name={s}", .{constStr(module, x.name) orelse "?"}),
-                .CallMember => |x| std.debug.print(" name={s}", .{constStr(module, x.name) orelse "?"}),
+                .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int() }),
+                .CallMember => |x| std.debug.print(" name={s} recv=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int() }),
+                .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
+                .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
                 else => {},
             }
             std.debug.print("\n", .{});
@@ -2160,6 +2172,7 @@ pub fn evalWithCapturesChained(
     closure_id: ?u64,
     host: *H,
 ) Allocator.Error!EvalResult {
+    dumpFnIfRequested(module, func);
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
@@ -3421,6 +3434,7 @@ fn runFrameExec(
     if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
         return errResult(.{ .Type = "virtual method target is not executable" });
     }
+    dumpFnIfRequested(frame.module, func);
     const jit_on = jit_loop.enabled();
     // Loop-JIT call trampoline wiring (only hosts that can run a callee qualify).
     const tramp_ok = comptime @hasDecl(H, "callFunc");
@@ -4841,7 +4855,11 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                     // The flat driver runs the body as a pushed activation in
                     // the same dispatch loop — no native recursion per call.
                     if (flatEnabled()) {
-                        frame.flat_call = .{ .func = cf, .args = args_list, .dst = call.dst };
+                        const composer_pushed = if (comptime @hasDecl(H, "flatPlainCallOpen"))
+                            host.flatPlainCallOpen(cf, args_list.items)
+                        else
+                            false;
+                        frame.flat_call = .{ .func = cf, .args = args_list, .composer_pushed = composer_pushed, .dst = call.dst };
                         return .flat_call;
                     }
                     switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
@@ -6138,7 +6156,13 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     }
     if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
         if (std.mem.eql(u8, w, name_str)) {
-            std.debug.print("[cmg] {s} this_tag={s} ctor_name={} in_fn={s} this_idx={d} ncaps={d}\n", .{ name_str, @tagName(std.meta.activeTag(this_val)), is_ctor_name, frame.func.name, cmg.this_idx, frame.captures.items.len });
+            const dtc: []const u8 = if (direct_this != null and comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&direct_this.?) else "-";
+            std.debug.print("[cmg] {s} this_tag={s} ctor_name={} in_fn={s}#{d} this_idx={d} ncaps={d} recv_reg={?d} direct_cls={s}\n", .{ name_str, @tagName(std.meta.activeTag(this_val)), is_ctor_name, frame.func.name, frame.func.id.int(), cmg.this_idx, frame.captures.items.len, if (cmg.recv) |r| r.int() else null, dtc });
+            for (frame.captures.items, 0..) |cv, cvi| {
+                const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&cv) else "-";
+                const nm: []const u8 = if (cvi < frame.func.capture_order.len) frame.func.capture_order[cvi] else "?";
+                std.debug.print("[cmg-cap] [{d}] {s} = {s} {s}\n", .{ cvi, nm, @tagName(std.meta.activeTag(cv)), cn });
+            }
         }
     }
     var committed_ext_h: ?FuncId = null;
@@ -6255,6 +6279,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.
         for (cands, 0..) |c, ci| {
+            if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name_str)) {
+                    const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&c.v) else @tagName(std.meta.activeTag(c.v));
+                    std.debug.print("[cmg-cand] {s} ci={d} depth={d} tag={s} class={s}\n", .{ name_str, ci, c.depth, @tagName(std.meta.activeTag(c.v)), cn });
+                }
+            }
             // The lowering-recorded receiver type describes the innermost
             // implicit receiver — the first candidate — regardless of the
             // wrapper identity a suspend transform gave the value.
@@ -6789,8 +6819,29 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
             if (idx < frame.params.items.len) return frame.params.items[idx];
         }
     }
-    const this_val: Value = if (this_idx < frame.captures.items.len)
-        frame.captures.items[this_idx]
+    // The baked capture index is only trusted when it actually names the
+    // `this` capture: several emit arms bake `0` as a placeholder (the
+    // direct receiver register carries the real value), and `captures[0]`
+    // is then whatever capture happens to be first — a non-receiver local
+    // (`scope`) that must never enter the implicit-receiver walk. When the
+    // index does not name `this`, locate the real `this` capture by name;
+    // a frame with no `this` capture has no capture-borne receiver at all.
+    var idx = this_idx;
+    const order = frame.func.capture_order;
+    if (order.len != 0 and
+        !(this_idx < order.len and std.mem.eql(u8, order[this_idx], "this")))
+    {
+        var found: ?usize = null;
+        for (order, 0..) |n, i| {
+            if (std.mem.eql(u8, n, "this")) {
+                found = i;
+                break;
+            }
+        }
+        idx = found orelse return Value.Null;
+    }
+    const this_val: Value = if (idx < frame.captures.items.len)
+        frame.captures.items[idx]
     else
         Value.Null;
     return this_val;
@@ -7003,6 +7054,12 @@ fn appendCandidateRun(
     host: *H,
     bare_name: []const u8,
 ) Allocator.Error!void {
+    if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+        if (std.mem.eql(u8, w, bare_name)) {
+            const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&v) else "-";
+            std.debug.print("[icand-append] {s} tag={s} class={s} subject={} depth={d}\n", .{ bare_name, @tagName(std.meta.activeTag(v)), cn, is_subject, depth.* });
+        }
+    }
     if (v == .Unit) return;
     // A null `with`/`run` subject is a real receiver candidate — a
     // nullable-receiver extension applies to it — but a null dispatch

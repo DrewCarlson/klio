@@ -10900,7 +10900,19 @@ fn lowerUnresolvedBareCall(
                         }
                         break :blk2 true;
                     };
-                    if (member_pick)
+                    // A SINGLE-candidate top-level pick is equally
+                    // scope-proven: there is no namesake whose shape the
+                    // stamp could override, and skipping it strands a
+                    // receiver lambda's `this` on the creation-time
+                    // lexical receiver — `createTestResult { launch {…} }`
+                    // bound the runner to the OUTER TestScope, whose
+                    // dispatcher queues onto the very scheduler only the
+                    // runner pumps, deadlocking every `runTest`.
+                    const single_toplevel = blk2: {
+                        const tl = b.module.func_name_index.get(name0) orelse break :blk2 false;
+                        break :blk2 tl.items.len == 1 and tl.items[0] == fid;
+                    };
+                    if (member_pick or single_toplevel)
                         try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
                     break :blk try argFnArities(b, f, args, ast_arg_names, off);
                 }
