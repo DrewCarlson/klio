@@ -1,5 +1,5 @@
-// Platform actual for the ui engine's atomics, backed by kotlinx.atomicfu (klio
-// is single-threaded but the engine's lock-free paths still expect these ops).
+// Platform actual for the ui engine's atomics, backed by kotlinx.atomicfu,
+// whose operations are atomic across klio's real worker threads.
 package androidx.compose.ui
 
 import kotlinx.atomicfu.atomic

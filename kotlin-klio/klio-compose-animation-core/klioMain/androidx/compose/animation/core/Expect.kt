@@ -1,6 +1,7 @@
-// Platform actuals for the animation-core commonMain expects. klio is
-// single-threaded, so the atomics reduce to atomicfu and the "current thread"
-// is a single shared token (thread-change detection always sees the same one).
+// Platform actuals for the animation-core commonMain expects. klio runs real
+// worker threads: the atomics are atomicfu (atomic across threads) and the
+// "current thread" is a stable per-thread identity token, so thread-change
+// detection observes real thread hops.
 package androidx.compose.animation.core
 
 import kotlinx.atomicfu.atomic
@@ -13,6 +14,13 @@ internal actual class AtomicReference<V> actual constructor(value: V) {
     actual fun compareAndSet(expect: V, newValue: V): Boolean = ref.compareAndSet(expect, newValue)
 }
 
-private val theThread: Any = Any()
+// Per-thread identity tokens keyed on the calling thread's stable name
+// (klio's `Thread.currentThread().name` is unique per OS thread), so
+// repeated calls on one thread return the SAME object and a thread hop
+// returns a different one — the identity contract thread-change
+// detection compares against.
+private val threadTokens = HashMap<String, Any>()
 
-internal actual fun getCurrentThread(): Any = theThread
+internal actual fun getCurrentThread(): Any = kotlin.synchronized(threadTokens) {
+    threadTokens.getOrPut(Thread.currentThread().name) { Any() }
+}
