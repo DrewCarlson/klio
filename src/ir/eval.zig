@@ -551,6 +551,38 @@ var spin_interval_read = false;
 /// at the next gate, so retry ladders cannot absorb it.
 pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 
+/// A wall-capped test must DIE, not cascade: without this, the deadline
+/// error unwound one coroutine while its siblings kept being resumed
+/// against half-torn state (each dying at its own next deadline check) —
+/// a resume storm whose half-run `finally` blocks mutated shared state
+/// and whose teardown interleavings crashed the process under the GC
+/// profile. Raising the drain-everything abandonment stops every thread
+/// and coroutine of the dying test at its next block or sleep slice; the
+/// test runner clears the flags (after a short grace) before the next
+/// test starts.
+pub fn wallCapAbandon() void {
+    runtime.requestAbandon();
+    runtime.setRunBoundaryAbandon(true);
+}
+
+/// Whether dispatch caches may be populated. A wall-capped or abandoned
+/// run produces walks that abort mid-probe; caching their outcomes (a
+/// spurious METHOD_MISS, a global-skip note, a wrong field-read route)
+/// poisoned every later execution of the same site — after one capped
+/// test, whole classes failed `unresolved global` on names that resolve
+/// fine in a fresh process (the cross-test contamination family).
+/// The runner's per-test invariant probe: a nonzero depth between tests
+/// is a leak in some unwind path.
+pub fn evalDepthNow() usize {
+    return eval_depth;
+}
+
+pub fn dispatchCacheStable() bool {
+    if (runtime.shouldAbandon()) return false;
+    const dl = test_wall_deadline_ms.load(.monotonic);
+    return dl == 0 or nowMonotonicMs() <= dl;
+}
+
 pub fn nowMonotonicMs() i64 {
     return @intCast(@divTrunc(runtime.clockMonotonicNanos(), std.time.ns_per_ms));
 }
@@ -1100,10 +1132,35 @@ pub const FlatCallReq = struct {
     /// The host pushed an ambient composer for this call; the activation's
     /// teardown must pop it.
     composer_pushed: bool = false,
-    /// The call site pushed the caller's `this` as an access-enclosing entry
-    /// for the dispatch; the activation's teardown pops it (after the frame
-    /// unwinds, when the caller's chain is active again).
-    pop_enclosing: bool = false,
+    /// Access-enclosing entries the call site / prepare pushed for the
+    /// dispatch (the caller's `this`, a displaced prior receiver, the
+    /// receiver subject); the activation's teardown pops them LIFO after
+    /// the frame unwinds, when the caller's chain is active again.
+    pop_enclosing_n: u8 = 0,
+    /// The context-parameter mark taken BEFORE the prepare pushed a
+    /// receiver as a context source (`callValueWithThis` feeds the
+    /// receiver into the context stack for the block's duration); the
+    /// activation adopts it so its close truncates the push away. Null =
+    /// the activation reads the stack length itself at open.
+    ctx_mark_override: ?usize = null,
+    /// A value the activation must keep alive for its whole life (the
+    /// receiver-BOUND closure a with-this prepare builds: the frame's
+    /// captures borrow its capture vector). Released at teardown or
+    /// parked-drop; GC-marked while live-parked.
+    keepalive: ?Value = null,
+    /// Undispatched-start boundary (`startCoroutineUninterceptedOrReturn`
+    /// under an enclosing pump): a suspension crossing this activation
+    /// parks the segment into the pump via the host hook and the CALLER
+    /// continues with the hook's value instead of unwinding.
+    suspend_barrier: bool = false,
+    /// The active-scope depth captured BEFORE the prepare's scope push;
+    /// the barrier park hands it to the pump so the scope delta travels
+    /// with the parked segment.
+    barrier_scope_base: usize = 0,
+    /// Identity of the active-scope entry the prepare pushed (0 = none);
+    /// teardown removes it by identity. Cleared at park — the parked
+    /// delta owns the entry from then on.
+    scope_guard_ident: usize = 0,
     dst: Reg,
 };
 
@@ -1138,7 +1195,11 @@ const Activation = struct {
     /// activation has no host-entry effects left to unwind.
     ctx_armed: bool,
     composer_pushed: bool,
-    pop_enclosing: bool,
+    pop_enclosing_n: u8,
+    keepalive: ?Value,
+    suspend_barrier: bool,
+    barrier_scope_base: usize,
+    scope_guard_ident: usize,
     ret_block: BlockId,
     ret_idx: usize,
     ret_dst: Reg,
@@ -1153,6 +1214,58 @@ fn flatEnabled() bool {
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
     return b;
+}
+
+/// Cached hot-path trace gates: the memoized `getenvSlice` still takes a
+/// lock + hashmap probe per consult, which prices every dispatch arm when
+/// consulted per executed instruction. The env never changes mid-run.
+var cv_trace_cached: ?bool = null;
+fn cvTraceOn() bool {
+    if (cv_trace_cached) |b| return b;
+    const b = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    cv_trace_cached = b;
+    return b;
+}
+var lr_trace_cached: ?bool = null;
+fn lrTraceOn() bool {
+    if (lr_trace_cached) |b| return b;
+    const b = runtime.getenvSlice("KLIO_LR_TRACE") != null;
+    lr_trace_cached = b;
+    return b;
+}
+var resume_trace_cached: ?bool = null;
+fn resumeTraceOn() bool {
+    if (resume_trace_cached) |b| return b;
+    const b = runtime.getenvSlice("KLIO_RESUME_TRACE") != null;
+    resume_trace_cached = b;
+    return b;
+}
+var miss_trace_init: bool = false;
+var miss_trace_val: ?[]const u8 = null;
+fn missTraceWant() ?[]const u8 {
+    if (!miss_trace_init) {
+        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_init = true;
+    }
+    return miss_trace_val;
+}
+var cmg_trace_init: bool = false;
+var cmg_trace_val: ?[]const u8 = null;
+fn cmgTraceWant() ?[]const u8 {
+    if (!cmg_trace_init) {
+        cmg_trace_val = runtime.getenvSlice("KLIO_CMG_TRACE");
+        cmg_trace_init = true;
+    }
+    return cmg_trace_val;
+}
+var nu_trace_init: bool = false;
+var nu_trace_val: ?[]const u8 = null;
+fn nuTraceWant() ?[]const u8 {
+    if (!nu_trace_init) {
+        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_init = true;
+    }
+    return nu_trace_val;
 }
 
 /// Stash a control-flow `EvalError` on the frame and signal `Step.raised`.
@@ -1668,6 +1781,7 @@ fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
         for (act.frame.enclosing_this.items) |e| e.v.gcMark(m);
         act.frame.pending_finally.gcMark(m);
         markFrameClosure(act.frame.closure_id, m);
+        if (act.keepalive) |ka| ka.gcMark(m);
         return;
     }
     switch (snap.regs) {
@@ -1803,7 +1917,7 @@ const Frame = struct {
         captures: std.ArrayList(Value),
     ) Allocator.Error!Frame {
         const params = params_in;
-        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (missTraceWant()) |w| {
             if (std.mem.eql(u8, w, func.name) and params.items.len == 4 and func.params.len == 4) {
                 std.debug.print("[frame-entry] {s}:", .{func.fqn});
                 for (func.params, 0..) |p, i| {
@@ -1815,7 +1929,7 @@ const Frame = struct {
                 std.debug.print("\n", .{});
             }
         }
-        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null and
+        if (cvTraceOn() and
             params.items.len < func.params.len)
         {
             const caller = if (frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
@@ -2214,7 +2328,7 @@ fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
     // normal return. Other labels propagate further outward until the
     // matching frame catches them.
     if (result == .err and result.err == .LabeledReturn) {
-        if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+        if (lrTraceOn()) {
             std.debug.print("[lr-exit] label={s} func={s} match={}\n", .{ result.err.LabeledReturn.label, func.name, frameMatchesLabel(func, result.err.LabeledReturn.label) });
         }
     }
@@ -2224,7 +2338,7 @@ fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
         result = ok(result.err.LabeledReturn.value);
     }
     if (result == .err and result.err == .LabeledReturn) {
-        if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+        if (lrTraceOn()) {
             std.debug.print("[lr] label={s} passed_frame={s} implicit={s}\n", .{ result.err.LabeledReturn.label, func.name, func.implicit_label orelse "-" });
         }
     }
@@ -2339,7 +2453,7 @@ pub fn resumeContinuation(
                 }
             }
             first = false;
-            if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+            if (resumeTraceOn()) {
                 std.debug.print("[resume-frame] {s}#{d} LIVE at={d}:{d} throw={} via={s}\n", .{
                     act.frame.func.name,
                     act.frame.func.id.int(),
@@ -2365,7 +2479,7 @@ pub fn resumeContinuation(
         // instrument that finds a tail executing twice in one unwind. The
         // route tag says which delivery path drove it (set by the host's
         // resumeRaw call sites).
-        if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+        if (resumeTraceOn()) {
             const loc = funcFirstLoc(func);
             std.debug.print("[resume-frame] {s}#{d} ({s}:{d}) at={d}:{d} throw={} pending={}/{}/{} caps={d} enc={d} via={s} id={x}\n", .{
                 func.name,
@@ -2603,7 +2717,7 @@ fn snapshotSuspendedFrame(
         .resume_reg = resume_reg,
         .closure_id = frame.closure_id,
     };
-    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+    if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} pending={}/{}/{} caps={d} enc={d}\n", .{
             frame.func.name,
             frame.func.id.int(),
@@ -2643,7 +2757,11 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
         .ctx_mark = 0,
         .ctx_armed = true,
         .composer_pushed = req.composer_pushed,
-        .pop_enclosing = req.pop_enclosing,
+        .pop_enclosing_n = req.pop_enclosing_n,
+        .keepalive = req.keepalive,
+        .suspend_barrier = req.suspend_barrier,
+        .barrier_scope_base = req.barrier_scope_base,
+        .scope_guard_ident = req.scope_guard_ident,
         .ret_block = undefined,
         .ret_idx = 0,
         .ret_dst = req.dst,
@@ -2652,7 +2770,8 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
     gcPushFrame(&act.frame);
     act.frame.module_arc = req.owning;
     try act.frame.activateChain(req.chain);
-    act.ctx_mark = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
+    act.ctx_mark = req.ctx_mark_override orelse
+        (if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0);
     if (comptime @hasDecl(H, "ctxPush")) {
         if (module.has_context_decls) {
             if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
@@ -2682,9 +2801,14 @@ fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, 
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
         act.composer_pushed = false;
     }
-    if (act.pop_enclosing) {
-        popEnclosing();
-        act.pop_enclosing = false;
+    while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
+    if (act.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+        act.keepalive = null;
+    }
+    if (act.scope_guard_ident != 0) {
+        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(act.scope_guard_ident);
+        act.scope_guard_ident = 0;
     }
 }
 
@@ -2713,11 +2837,10 @@ fn liveParkActivation(
     }
     act.frame.deactivateChain();
     gcPopFrame(&act.frame);
-    if (act.pop_enclosing) {
-        popEnclosing();
-        act.pop_enclosing = false;
-    }
-    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+    while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
+    // The park's scope-delta capture owns the guard entry from here on.
+    act.scope_guard_ident = 0;
+    if (resumeTraceOn()) {
         std.debug.print("[suspend-frame] {s}#{d} at={d}:{d} LIVE caps={d} enc={d}\n", .{
             act.frame.func.name,
             act.frame.func.id.int(),
@@ -2751,6 +2874,9 @@ fn liveParkActivation(
 fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     act.frame.deinit();
     act.try_stack.deinit(allocator);
+    if (act.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+    }
     allocator.destroy(act);
 }
 
@@ -2795,7 +2921,14 @@ fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host
     if (req.composer_pushed) {
         if (comptime @hasDecl(H, "flatCallClosed")) host.flatCallClosed();
     }
-    if (req.pop_enclosing) popEnclosing();
+    var n = req.pop_enclosing_n;
+    while (n > 0) : (n -= 1) popEnclosing();
+    if (req.keepalive) |ka| {
+        if (runtime.reclaimEnabled()) ka.release(allocator);
+    }
+    if (req.scope_guard_ident != 0) {
+        if (comptime @hasDecl(H, "undispatchedScopeLeave")) host.undispatchedScopeLeave(req.scope_guard_ident);
+    }
 }
 
 /// The flat call driver. Runs `frame` through `runFrameExec`; when the
@@ -2895,13 +3028,37 @@ fn runFlatLoop(
             var pb = pp.block;
             var pi = pp.inst_idx;
             var pd = pp.resume_reg;
+            var barrier_hit = false;
             while (stack.pop()) |a| {
                 eval_depth -= 1;
+                const is_barrier = a.suspend_barrier;
+                const scope_base = a.barrier_scope_base;
+                const rb = a.ret_block;
+                const rix = a.ret_idx;
+                const rd = a.ret_dst;
                 try liveParkActivation(H, allocator, a, pb, pi, pd, state, host);
-                pb = a.ret_block;
-                pi = a.ret_idx;
-                pd = a.ret_dst;
+                if (is_barrier) {
+                    // The undispatched-start boundary: the parked segment
+                    // belongs to the enclosing pump, and the CALLER
+                    // continues with the hook's value (COROUTINE_SUSPENDED)
+                    // — the defining startCoroutineUninterceptedOrReturn
+                    // split. Ownership of `state` moves to the pump.
+                    const v: Value = if (comptime @hasDecl(H, "undispatchedBarrierPark"))
+                        try host.undispatchedBarrierPark(allocator, state, scope_base)
+                    else
+                        Value.CoroutineSuspended;
+                    const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                    try pf2.write(rd, v);
+                    cur = rb;
+                    ridx = rix;
+                    barrier_hit = true;
+                    break;
+                }
+                pb = rb;
+                pi = rix;
+                pd = rd;
             }
+            if (barrier_hit) continue;
             if (root_act) |ra| {
                 try liveParkActivation(H, allocator, ra, pb, pi, pd, state, host);
             } else {
@@ -3468,6 +3625,7 @@ fn runFrameExec(
                 // the culprit function/recursion is named at the abort point.
                 std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
                 dumpFrameChainForDiagAlways();
+                wallCapAbandon();
                 return errResult(.{ .Type = "test wall-clock deadline exceeded" });
             }
         }
@@ -3911,7 +4069,7 @@ fn runFrameExec(
                 return unwindTerminal(frame, e);
             },
             .LabeledReturn => |lr| {
-                if (runtime.getenvSlice("KLIO_LR_TRACE") != null) {
+                if (lrTraceOn()) {
                     if (frame.cur_span) |sp| std.debug.print("[lr-raise] label={s} span={d}:{d} in_fn={s}\n", .{ lr.label, sp.file.int(), sp.start, frame.func.name });
                     dumpFrameChainForDiagAlways();
                 }
@@ -4208,12 +4366,29 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvt.arg_names);
             defer allocator.free(names);
-            if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+            if (cvTraceOn()) {
                 std.debug.print("[cvt-instr] exact={} recv={s} n_args={d} caller={s}", .{
                     cvt.receiver_shape_exact, @tagName(std.meta.activeTag(recv)), arg_values.len, frame.func.name,
                 });
                 for (arg_values) |*av| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(av.*))});
                 std.debug.print("\n", .{});
+            }
+            // Flat receiver-lambda dispatch: the plain bound shape (a
+            // `this`-capture closure at exact arity) runs as a pushed
+            // activation; the host performs the same receiver selection and
+            // capture binding the recursive path would, then hands back the
+            // ready call. The special shapes (local named fn,
+            // receiver-fills-param, pass-threaded composable, explicit
+            // receiver overflow) decline and keep the recursive path.
+            if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
+                if (flatEnabled() and callee_v == .IrClosure and argNamesAllNull(cvt.arg_names)) {
+                    if (try host.prepareClosureWithThisFlatCall(allocator, &callee_v, &recv, arg_values)) |prep0| {
+                        var prep = prep0;
+                        prep.dst = cvt.dst;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                }
             }
             const result = if (cvt.receiver_shape_exact)
                 try host.callValueWithThisExact(allocator, &callee_v, &recv, arg_values, names)
@@ -4323,14 +4498,14 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
                     std.debug.print("[unresolved] `{s}` in fn {s} (fqn={s}) span={any}\n", .{ name_str, frame.func.name, frame.func.fqn, frame.cur_span });
                 }
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                if (missTraceWant()) |w| {
                     if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s} func={?} class={?} span={d}:{d} in_fn={s}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null, if (frame.cur_span) |sp| sp.file.int() else 0, if (frame.cur_span) |sp| sp.start else 0, frame.func.name });
                 }
                 dumpFrameChainForDiag();
                 return raiseStep(frame, .{ .Unbound = msg });
             } else {
                 const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                if (missTraceWant()) |w| {
                     if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-b] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
                 }
                 dumpFrameChainForDiag();
@@ -4881,6 +5056,22 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
         try ta.append(allocator, constStr(frame.module, c) orelse "");
     }
 
+    // Undispatched-start boundary (`__klio_co_startRootOrSuspended` under
+    // an enclosing pump): run the block as a BARRIER activation on this
+    // driver — a suspension parks the segment into the pump and this frame
+    // continues with COROUTINE_SUSPENDED, with no native pump entry and no
+    // frame snapshots per call.
+    if (comptime @hasDecl(H, "prepareUndispatchedStartFlatCall")) {
+        if (flatEnabled() and argNamesAllNull(call.arg_names)) {
+            if (try host.prepareUndispatchedStartFlatCall(allocator, frame.module, call.func, arg_values)) |prep0| {
+                var prep = prep0;
+                prep.dst = call.dst;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
+
     const bakedExt = struct {
         fn f(m: *const Module, id: FuncId) bool {
             const ff = m.funcById(id) orelse return false;
@@ -5345,7 +5536,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
-                prep.pop_enclosing = pushed_enclosing;
+                prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
                 frame.flat_call = prep;
                 return .flat_call;
             }
@@ -5395,7 +5586,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
         fb = cg.get().*;
         cg.deinit();
     }
-    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name_str, "placementBlock")) {
+    if (nuTraceWant() != null and std.mem.eql(u8, name_str, "placementBlock")) {
         const rcls: []const u8 = if (recv == .Instance) blk: {
             const g = recv.Instance.borrow();
             const cg = g.get().class.borrow();
@@ -5446,6 +5637,24 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
     const members_visible = !cmv.recv_erased and host.hostHasMember(&recv, name_str);
     if (fb_invocable and (!fb_misfit or cmv.recv_erased) and !members_visible) {
         orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
+        // Flat dispatch for the closure fallback: the shape-known route is
+        // a plain value call, the shape-unknown route the with-this bind;
+        // the declared-receiver (`fallback_takes_receiver`) route keeps
+        // the recursive path.
+        if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
+            if (flatEnabled() and fb == .IrClosure and !cmv.fallback_takes_receiver and argNamesAllNull(cmv.arg_names)) {
+                const maybe = if (cmv.fallback_receiver_shape_known)
+                    try host.prepareClosureFlatCall(allocator, &fb, user_args)
+                else
+                    try host.prepareClosureWithThisFlatCall(allocator, &fb, &recv, user_args);
+                if (maybe) |prep0| {
+                    var prep = prep0;
+                    prep.dst = cmv.dst;
+                    frame.flat_call = prep;
+                    return .flat_call;
+                }
+            }
+        }
         if (fb == .Class) {
             // Constructors take no receiver: `65.f()` with
             // `f = ::Char` is `Char(65)`.
@@ -5573,6 +5782,19 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
         // innermost implicit receiver; a receiver-typed closure
         // invoked bare binds it as dispatch context.
         const recv_ctx = frame.read(cvm.this_recv);
+        // Flat dispatch: the plain closure shapes run as a pushed
+        // activation; the host mirrors `callValueNamedRecvCtx`'s routing
+        // and declines every special shape to the recursive path.
+        if (comptime @hasDecl(H, "prepareValueRecvCtxFlatCall")) {
+            if (flatEnabled() and callee_v == .IrClosure and argNamesAllNull(cvm.arg_names)) {
+                if (try host.prepareValueRecvCtxFlatCall(allocator, &callee_v, &recv_ctx, arg_values)) |prep0| {
+                    var prep = prep0;
+                    prep.dst = cvm.dst;
+                    frame.flat_call = prep;
+                    return .flat_call;
+                }
+            }
+        }
         const r = if (comptime @hasDecl(H, "callValueNamedRecvCtx"))
             try host.callValueNamedRecvCtx(allocator, &callee_v, &recv_ctx, arg_values, names)
         else
@@ -5918,7 +6140,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                         }
                     }
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
-                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {
                             std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
                                 bare_name,
@@ -6154,7 +6376,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
         }
     }
-    if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+    if (cmgTraceWant()) |w| {
         if (std.mem.eql(u8, w, name_str)) {
             const dtc: []const u8 = if (direct_this != null and comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&direct_this.?) else "-";
             std.debug.print("[cmg] {s} this_tag={s} ctor_name={} in_fn={s}#{d} this_idx={d} ncaps={d} recv_reg={?d} direct_cls={s}\n", .{ name_str, @tagName(std.meta.activeTag(this_val)), is_ctor_name, frame.func.name, frame.func.id.int(), cmg.this_idx, frame.captures.items.len, if (cmg.recv) |r| r.int() else null, dtc });
@@ -6279,7 +6501,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.
         for (cands, 0..) |c, ci| {
-            if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+            if (cmgTraceWant()) |w| {
                 if (std.mem.eql(u8, w, name_str)) {
                     const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&c.v) else @tagName(std.meta.activeTag(c.v));
                     std.debug.print("[cmg-cand] {s} ci={d} depth={d} tag={s} class={s}\n", .{ name_str, ci, c.depth, @tagName(std.meta.activeTag(c.v)), cn });
@@ -6429,7 +6651,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
         }
     }
-    if (resolved == null and if (runtime.getenvSlice("KLIO_NU_TRACE")) |w| std.mem.eql(u8, name_str, w) else false) {
+    if (resolved == null and if (nuTraceWant()) |w| std.mem.eql(u8, name_str, w) else false) {
         const cands2 = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands2);
         const cands_keepalive = pinImplicitCandidates(cands2);
@@ -6499,8 +6721,13 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         result = v;
     } else {
         // The member passes all missed on a single implicit-receiver
-        // candidate: record so a repeat call skips straight here.
-        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture)
+        // candidate: record so a repeat call skips straight here. A pass
+        // that FAILED (first_real_err — an abort, a callee error) is not a
+        // miss: recording it taught the site to skip the member walk
+        // forever, so after one wall-capped test every later
+        // `removeKnownCompositionLocked` in the same process resolved as
+        // an unresolved global (the contamination cluster).
+        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null)
             host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
@@ -6616,7 +6843,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     }
                 } else switch (try host.callValueNamed(allocator, &callee, arg_values, names)) {
                     .ok => |v| {
-                        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                        if (missTraceWant()) |w| {
                             if (std.mem.eql(u8, w, name_str)) {
                                 std.debug.print("[gid-result] {s} in_fn={s} callee={s} nargs={d} -> {s}", .{
                                     name_str,
@@ -6667,7 +6894,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     result = .Unit;
                 } else {
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, name_str)) {
                             std.debug.print("[cmg-tail] name={s} func={?} class={?} this_tag={s} n_seen_err={} span={d}:{d} cands={d} in_fn={s} recvp={} np={d} p0={s} nparams_vals={d} this_idx={d} ncaps={d}\n", .{
                                 name_str,
@@ -6951,7 +7178,7 @@ fn samCandidateInvoke(
         .err => |se| switch (se) {
             .Suspended, .CalleeFailed, .Throw, .NonLocalReturn, .LabeledReturn => return .{ .raised = se },
             else => {
-                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                if (missTraceWant()) |w| {
                     if (std.mem.eql(u8, w, name_str)) std.debug.print("[sam-inv] {s} swallowed err={s}\n", .{ name_str, @tagName(se) });
                 }
                 return null;
@@ -7054,7 +7281,7 @@ fn appendCandidateRun(
     host: *H,
     bare_name: []const u8,
 ) Allocator.Error!void {
-    if (runtime.getenvSlice("KLIO_CMG_TRACE")) |w| {
+    if (cmgTraceWant()) |w| {
         if (std.mem.eql(u8, w, bare_name)) {
             const cn: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&v) else "-";
             std.debug.print("[icand-append] {s} tag={s} class={s} subject={} depth={d}\n", .{ bare_name, @tagName(std.meta.activeTag(v)), cn, is_subject, depth.* });

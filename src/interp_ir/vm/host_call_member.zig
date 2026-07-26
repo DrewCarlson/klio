@@ -2022,6 +2022,7 @@ pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name:
 /// Record that this call resolved to a global with a single implicit-receiver
 /// candidate, so a repeat skips the member passes.
 pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
@@ -3388,7 +3389,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             if (n != args.len) return r;
         }
         freeDispatchMiss(allocator, r);
-        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-direct] name={s} nargs={d}\n", .{ name, args.len });
+        if (samTraceOn()) std.debug.print("[sam-direct] name={s} nargs={d}\n", .{ name, args.len });
         // The interface method may declare an extension receiver
         // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`):
         // Kotlin resolves it from the call site's enclosing implicit
@@ -3664,7 +3665,7 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
         if (p.is_vararg) return null;
     }
     if (args.len + 1 < f.params.len) return null;
-    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+    if (nuTraceEnv()) |want| {
         if (std.mem.eql(u8, want, f.name)) {
             std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} FLAT\n", .{ f.fqn, target.int(), f.params.len, receiver.typeFqn() });
         }
@@ -4157,9 +4158,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             break :blk false;
         };
-        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-gate] name={s} nargs={d} has_ext={} arity_ok={} tl={}\n", .{ name, args.len, has_ext, arity_ok, toplevel_serves });
+        if (samTraceOn()) std.debug.print("[sam-gate] name={s} nargs={d} has_ext={} arity_ok={} tl={}\n", .{ name, args.len, has_ext, arity_ok, toplevel_serves });
         if (!std.mem.eql(u8, name, "invoke") and !has_ext and arity_ok and !toplevel_serves) {
-            if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
+            if (samTraceOn()) std.debug.print("[sam-arm] name={s} nargs={d} arity_ok={} tl={}\n", .{ name, args.len, arity_ok, toplevel_serves });
             const r = try callValueRec(self, allocator, receiver, args);
             switch (r) {
                 .ok => return r,
@@ -4947,7 +4948,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
     missTraceMaybe(name);
-    if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
+    if (missTraceEnv() != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
         ir.eval.dumpCurrentFrameParamsForDiag();
         ir.eval.debugPrintFrames();
@@ -5071,8 +5072,36 @@ fn missTraceMaybe(name: []const u8) void {
     ir.eval.dumpFrameChainForDiagAlways();
 }
 
+/// Cached hot-path trace gates: the memoized `getenvSlice` still takes a
+/// lock + hashmap probe per consult; these sit on per-call dispatch paths.
+var miss_trace_init: bool = false;
+var miss_trace_val: ?[]const u8 = null;
+fn missTraceEnv() ?[]const u8 {
+    if (!miss_trace_init) {
+        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_init = true;
+    }
+    return miss_trace_val;
+}
+var nu_trace_init: bool = false;
+var nu_trace_val: ?[]const u8 = null;
+fn nuTraceEnv() ?[]const u8 {
+    if (!nu_trace_init) {
+        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_init = true;
+    }
+    return nu_trace_val;
+}
+var sam_trace_cached: ?bool = null;
+fn samTraceOn() bool {
+    if (sam_trace_cached) |b| return b;
+    const b = runtime.getenvSlice("KLIO_SAM_TRACE") != null;
+    sam_trace_cached = b;
+    return b;
+}
+
 fn missTraceWant(name: []const u8) bool {
-    const want = runtime.getenvSlice("KLIO_MISS_TRACE") orelse return false;
+    const want = missTraceEnv() orelse return false;
     return std.mem.eql(u8, want, name);
 }
 
@@ -9106,7 +9135,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
-    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+    if (nuTraceEnv()) |want| {
         if (std.mem.eql(u8, want, f.name)) {
             std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} args=", .{ f.fqn, fid.int(), f.params.len, receiver.typeFqn() });
             for (args) |a| switch (a) {
@@ -9288,7 +9317,32 @@ fn instanceMethodKey(self: *VmHost, receiver: *const Value, name: []const u8, ar
 /// both resolutions cached under distinct keys; resolution is a pure function
 /// of (class, name, arg-sig, scope), so each entry stays sound.
 fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
-    if (receiver.* != .Instance) return null;
+    // Non-Instance receivers with a stable type identity key too: a
+    // closure's resolution is fixed by its BODY (the declared shape —
+    // arity, receiver head, suspendness — is a pure function of the body
+    // func), and a `Result`'s by its tag (extensions on `Result<T>` are
+    // erased). The synthesized identity is forced ODD so it can never
+    // collide with a real class-cell pointer (those are aligned). The
+    // hot coroutine boundary (`startCoroutineUninterceptedOrReturn` on a
+    // suspend block, `throwOnFailure` on a `Result`) re-ran the full
+    // extension walk per call without this.
+    const class_identity: usize = switch (receiver.*) {
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        },
+        .IrClosure => |c| blk: {
+            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            var h = std.hash.Wyhash.init(0x2545f4914f6cdd1d);
+            h.update(std.mem.asBytes(&info.body_func));
+            const mp: usize = @intFromPtr(info.module);
+            h.update(std.mem.asBytes(&mp));
+            break :blk h.final() | 1;
+        },
+        .Result => 0x5261 | 1,
+        else => return null,
+    };
     var sig = methodArgSig(args) orelse return null;
     if (static_recv != null or declared_recv != null) {
         var h = std.hash.Wyhash.init(0x517cc1b727220a95);
@@ -9299,12 +9353,9 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
         // Keep 0 reserved for the unscoped empty-arg case.
         if (sig == 0) sig = 1;
     }
-    const inst = receiver.Instance;
-    const g = inst.borrow();
-    defer g.deinit();
     const name_p = memberNameIdentity(self, name) orelse return null;
     return .{
-        .class_p = g.get().class.identity(),
+        .class_p = class_identity,
         .name_p = name_p,
         .n_args = @intCast(args.len),
         .sig = sig,
@@ -9324,6 +9375,7 @@ fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
@@ -9336,6 +9388,7 @@ fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey
 }
 
 fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
+    if (!ir.eval.dispatchCacheStable()) return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().ext_method_cache.put(key, fid) catch {};
@@ -10043,7 +10096,7 @@ pub fn boundRefFile(callee: *const Value) ?ir.FileId {
 fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
-    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+    if (nuTraceEnv()) |want| {
         if (funcAt(mod, fid)) |f| {
             if (std.mem.eql(u8, f.name, want) or std.mem.eql(u8, want, "1")) {
                 std.debug.print("[mev] fid={d} owner={s} vis={}\n", .{ fid.int(), owner, visible_owners.contains(owner) });
@@ -10640,7 +10693,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             },
             else => receiver.typeFqn(),
         };
-        std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s}\n", .{ strict_ext, args.len, rk });
+        std.debug.print("[extfb] ENTRY strict={} nargs={d} recv={s} static={s} declared={s}\n", .{
+            strict_ext, args.len, rk, static_recv orelse "-", declared_recv orelse "-",
+        });
     }
 
     // Inline-cache fast path. A prior *owner-independent* resolution of this
@@ -10650,9 +10705,16 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     // the dominant cost of extension-heavy hot loops. Only keyed when no
     // receiver override is in play (a static/declared receiver, or the strict
     // bare-name probe, can resolve the same names differently).
+    // A `declared_recv`-directed call keys with the scope FOLDED into the
+    // sig (`instanceMethodKeyScoped`): its resolution is a pure function of
+    // (receiver identity, name, arg-sig, declared scope), so it caches
+    // apart from the unscoped call — never served one, never serves one.
+    // The hot coroutine boundary (`fn.startCoroutineUninterceptedOrReturn`
+    // lowered with declared receiver `Function1`) re-walked per call when
+    // any declared scope disabled the key outright.
     const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
-        if (!strict_ext and static_recv == null and declared_recv == null)
-            instanceMethodKey(self, receiver, name, args)
+        if (!strict_ext and static_recv == null)
+            instanceMethodKeyScoped(self, receiver, name, args, null, declared_recv)
         else
             null;
     if (cache_key) |k| {
@@ -10675,7 +10737,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         const mg = self.module.borrow();
         defer mg.deinit();
         const mod = mg.get();
-        const mtrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+        const mtrace = if (missTraceEnv()) |w| std.mem.eql(u8, w, name) else false;
         if (mtrace) {
             std.debug.print("[extfb] name={s} simple-name fids={d} want={d} args:", .{ name, mod.funcsBySimpleName(name).len, want });
             for (args) |*a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a.*))});
@@ -11550,7 +11612,7 @@ pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *con
 /// runtime value is a subtype with its own `describe` extension.
 pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
     const r = try callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
-    if (runtime.getenvSlice("KLIO_NU_TRACE")) |w| {
+    if (nuTraceEnv()) |w| {
         if (std.mem.eql(u8, w, name)) {
             const tag: []const u8 = switch (r) {
                 .ok => "ok",
@@ -12233,7 +12295,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
             if (seen.contains(dedup_key)) continue;
             try seen.put(dedup_key, {});
             if (ir_class) |irc| {
-                if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                if (nuTraceEnv()) |want| {
                     if (std.mem.eql(u8, want, name)) {
                         std.debug.print("[mwalk-class] {s} methods={d} supers=", .{ irc.fqn, irc.methods.len });
                         for (irc.supertypes, 0..) |sid, si| {
@@ -12259,7 +12321,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 for (irc.methods) |fid| {
                     if (funcAt(mod, fid)) |f| {
                         if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, simpleName(f.name), name)) {
-                            if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                            if (nuTraceEnv()) |want| {
                                 if (std.mem.eql(u8, want, name)) {
                                     const defaults = funcDefaults(self, &f);
                                     std.debug.print("[mwalk] class={s} fid={d} params=", .{ irc.fqn, fid.int() });

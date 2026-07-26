@@ -151,8 +151,26 @@ fn boundReferenceFunc(callee: *const Value) ?FuncId {
 /// `evalWithCapturesChained` terminal, including the ambient-composer push,
 /// which the flat activation's teardown undoes via `flatCallClosed`.
 pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
-    const id = callee.IrClosure.id;
-    const captures = callee.IrClosure.captures;
+    return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args);
+}
+
+/// One capture slot replaced at activation open — the receiver bind of a
+/// with-this call, applied to the COPIED capture vector so no bound closure
+/// value is materialized per call.
+const ThisOverride = struct { idx: usize, val: Value };
+
+/// `KLIO_CALLVALUE_TRACE` gate, cached: the memoized `getenvSlice` still
+/// takes a lock + hashmap probe per consult, which shows up when consulted
+/// per call on the flat dispatch path.
+var cvt_trace_cached: ?bool = null;
+fn callValueTraceOn() bool {
+    if (cvt_trace_cached) |v| return v;
+    const on = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    cvt_trace_cached = on;
+    return on;
+}
+
+fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, captures: ValueSlice, this_override: ?ThisOverride, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (args.len != info.n_params) return null;
     const module: *const Module = blk: {
@@ -178,6 +196,12 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
         const g = captures.borrow();
         defer g.deinit();
         try capture_values.appendSlice(allocator, g.get().*);
+    }
+    if (this_override) |ov| {
+        if (ov.idx >= capture_values.items.len) {
+            try capture_values.appendNTimes(allocator, Value.Null, ov.idx + 1 - capture_values.items.len);
+        }
+        capture_values.items[ov.idx] = ov.val;
     }
     vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
     var composer_pushed = false;
@@ -205,6 +229,198 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
 pub fn flatCallClosed(self: *VmHost) void {
     _ = self;
     compose.popComposer();
+}
+
+/// Resolve a plain receiver-lambda invocation (`recv.block()` /
+/// `block(recv, …)` lowered as CallValueWithThis) into a ready flat-call
+/// request: the same receiver head-match, context-source push, capture
+/// bind, and enclosing pushes `callValueWithThis` performs up to its
+/// `callValue(&bound, …)` terminal, with the receiver bind applied as a
+/// slot override on the activation's capture copy. The special shapes —
+/// local named fn, receiver-fills-param, pass-threaded composable,
+/// explicit-receiver overflow, varargs — decline and keep the recursive
+/// path.
+pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (callee.* != .IrClosure) return null;
+    const id = callee.IrClosure.id;
+    const captures = callee.IrClosure.captures;
+    const info = self.closures.get(@intCast(id)) orelse return null;
+    if (args.len != info.n_params) return null;
+    var selected_this = this_value_in.*;
+    {
+        const module_g = self.module.borrow();
+        defer module_g.deinit();
+        const m = info.module orelse module_g.get();
+        const f = m.funcById(info.body_func) orelse return null;
+        for (f.params) |*p| {
+            if (p.is_vararg) return null;
+        }
+        // A named LOCAL FUNCTION lowered as a closure is not a receiver
+        // lambda; a body with a declared leading `this` param binds the
+        // receiver positionally — both keep the recursive path.
+        const takes_receiver = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (takes_receiver) return null;
+        if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
+        if (f.lambda_receiver_ty) |head| {
+            if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
+                selected_this = matched;
+            }
+        }
+    }
+    var this_idx: ?usize = null;
+    for (info.capture_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this")) {
+            this_idx = i;
+            break;
+        }
+    }
+    // The receiver is an implicit receiver, hence a context-argument
+    // source for a contextual callee inside the block. The mark is taken
+    // BEFORE the push so the activation's close truncates it away.
+    const ctx_mark = self.ctxStackLen();
+    if (self.ctxIsActive()) self.ctxPush(selected_this) catch {};
+    // With a `this` capture, the receiver binds into that slot exactly as
+    // the recursive bind does, and the displaced prior `this` stays
+    // reachable as an outer implicit receiver. Without one, the body takes
+    // no receiver and the receiver is only the innermost subject — the
+    // recursive path's plain terminal.
+    const prior_this: ?Value = blk: {
+        const ti = this_idx orelse break :blk null;
+        const g = captures.borrow();
+        defer g.deinit();
+        const slice = g.get().*;
+        if (ti < slice.len) break :blk slice[ti];
+        break :blk null;
+    };
+    // The same pushes (and LIFO pop order at activation close) as the
+    // recursive bind.
+    var pushes: u8 = 0;
+    const pushed_outer = po: {
+        if (this_idx == null) break :po false;
+        const pt = prior_this orelse break :po false;
+        if (pt == .Null or pt == .Unit) break :po false;
+        if (pt == .Instance and selected_this == .Instance) {
+            break :po !ObjRef(InstanceData).ptrEq(pt.Instance, selected_this.Instance);
+        }
+        break :po true;
+    };
+    if (pushed_outer) {
+        if (prior_this) |p| host_call_member.pushAccessEnclosing(self, &p);
+        pushes += 1;
+    }
+    if (selected_this == .Instance or selected_this == .Null) {
+        host_call_member.pushAccessEnclosingSubject(self, &selected_this);
+        pushes += 1;
+    }
+    // The receiver bind is a slot override on the activation's COPIED
+    // capture vector; the receiver stays rooted by the caller's registers
+    // (or the context stack) for the call's duration, so no bound closure
+    // value or keepalive is needed.
+    const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = selected_this } else null;
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, args)) orelse {
+        // Declined at the terminal (native form): undo everything and let
+        // the recursive path run.
+        while (pushes > 0) : (pushes -= 1) host_call_member.popAccessEnclosing(self);
+        self.ctxStackTruncate(ctx_mark);
+        return null;
+    };
+    req.ctx_mark_override = ctx_mark;
+    req.pop_enclosing_n = pushes;
+    if (callValueTraceOn()) {
+        std.debug.print("[cvt-flat] id={d} pushes={d}\n", .{ id, pushes });
+    }
+    return req;
+}
+
+/// Resolve an undispatched coroutine start (`__klio_co_startRootOrSuspended`
+/// under an enclosing pump) into a BARRIER flat-call request: the block runs
+/// as an activation on the caller's driver, a suspension parks the segment
+/// into the pump (`undispatchedFlatPark`) and the caller continues with
+/// COROUTINE_SUSPENDED. Mirrors `coroutineStartRootOrSuspended`'s
+/// enclosing-driver branch up to its `evalClosureRaw` terminal: scope-guard
+/// push, empty call args (the block declares none), live captures with
+/// every-`this` override by the scope value. The no-driver root branch
+/// (pump construction) and every non-plain shape decline to the recursive
+/// path.
+pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, module: *const Module, fid: FuncId, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (args.len != 2) return null;
+    const f = module.funcById(fid) orelse return null;
+    if (!std.mem.eql(u8, f.name, "__klio_co_startRootOrSuspended")) return null;
+    // Without the registered native form the Kotlin fallback body serves
+    // the call; without an enclosing pump the root branch's pump machinery
+    // must run.
+    if (host_call_func.resolvedNativeForm(self, fid) == null) return null;
+    if (!vmhost.coroutines.coroutineHasDriver()) return null;
+    const scope_v = args[0];
+    const block = args[1];
+    if (block != .IrClosure) return null;
+    const id = block.IrClosure.id;
+    const captures = block.IrClosure.captures;
+    const info = self.closures.get(@intCast(id)) orelse return null;
+    if (info.n_params != 0) return null;
+    // `evalClosureRaw` falls back to the ClosureInfo cell when the live
+    // vector's length mismatches; that shape declines here.
+    {
+        const g = captures.borrow();
+        defer g.deinit();
+        if (g.get().*.len != info.capture_names.len) return null;
+    }
+    // `evalClosureRaw` overrides EVERY capture named `this`; the slot
+    // override binds one, so a multi-`this` shape declines.
+    var this_idx: ?usize = null;
+    for (info.capture_names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, "this")) {
+            if (this_idx != null) return null;
+            this_idx = i;
+        }
+    }
+    const enter = vmhost.coroutines.undispatchedFlatEnter(&scope_v);
+    const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = scope_v } else null;
+    var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, &.{})) orelse {
+        vmhost.coroutines.undispatchedFlatLeaveIdent(enter.ident);
+        return null;
+    };
+    req.suspend_barrier = true;
+    req.barrier_scope_base = enter.base;
+    req.scope_guard_ident = enter.ident;
+    return req;
+}
+
+/// Driver hook: barrier park for a flat undispatched-start activation.
+pub fn undispatchedBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
+    _ = self;
+    return vmhost.coroutines.undispatchedFlatPark(allocator, st, scope_base);
+}
+
+/// Driver hook: remove the scope entry a barrier prepare pushed, by
+/// identity, at activation teardown.
+pub fn undispatchedScopeLeave(self: *VmHost, ident: usize) void {
+    _ = self;
+    vmhost.coroutines.undispatchedFlatLeaveIdent(ident);
+}
+
+/// Flat counterpart of `callValueNamedRecvCtx`: the receiver-context
+/// dispatch (a no-this-capture exact-arity closure invoked bare with an
+/// Instance implicit receiver at the call site) prepares through the
+/// with-this path; every other closure shape prepares as a plain value
+/// call, mirroring the recursive routing exactly.
+pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+    if (callee.* != .IrClosure) return null;
+    if (recv.* == .Instance) {
+        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            var has_this = false;
+            for (info.capture_names) |n| {
+                if (std.mem.eql(u8, n, "this")) {
+                    has_this = true;
+                    break;
+                }
+            }
+            if (!has_this and args.len == info.n_params) {
+                return prepareClosureWithThisFlatCall(self, allocator, callee, recv, args);
+            }
+        }
+    }
+    return prepareClosureFlatCall(self, allocator, callee, args);
 }
 
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
