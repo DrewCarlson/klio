@@ -83,6 +83,10 @@ def main():
         "KLIO_COMPOSE_PLUGIN": "1",
         "kotlinx_coroutines_test_default_timeout": "10s",
         "KLIO_TEST_WALL_CAP": "90",
+        # Bound each child's dispatcher pool: a concurrent-test class
+        # otherwise fans out toward the 64-worker ceiling and jobs
+        # children multiply into full-machine saturation.
+        "KLIO_MAX_WORKERS": "3",
     }
 
     signatures = Counter()
