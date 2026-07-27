@@ -1170,12 +1170,16 @@ pub fn transformComposableFunction(
         }
         for (f.params) |p| {
             if (p.is_vararg) {
-                try out.append(a, .{ .Assign = .{
-                    .target = b.pathExpr(dirty_local),
-                    .op = .Assign,
-                    .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(b.intLit(2))),
-                    .span = b.gen_span,
-                } });
+                // A vararg packs a FRESH array every call, so identity
+                // `changed(values)` never skips. Probe the CONTENTS —
+                // `changed(values.toList())` compares structurally against
+                // the remembered slot, matching the reference compiler's
+                // per-element dirty walk (b/286132194).
+                try out.append(a, dirtyOrProbe(b, b.callMember(
+                    b.pathExpr(composer_param),
+                    "changed",
+                    b.slice1(b.callMember(b.pathExpr(p.name.name), "toList", try a.alloc(Expr, 0))),
+                )));
                 continue;
             }
             const probe = dirtyOrProbe(b, b.callMember(

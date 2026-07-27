@@ -156,7 +156,32 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
         }
     }
     const vp = vararg_pos orelse return args.*;
-    const tail_fixed = n_params - vp - 1;
+    var tail_fixed = n_params - vp - 1;
+    // A pass-threaded composable's trailing ($composer, $changed) pair does
+    // not consume the caller's positionals on a PAIRLESS call: the vararg
+    // absorbs everything and the pair completes from the ambient composer
+    // after packing (`consumer.Varargs(0, 1, 2, 3)` must pack all four ints,
+    // not surrender the last two to the pair slots). A call that already
+    // carries the pair (a Composer instance + Int tail) keeps them fixed.
+    var pairless_pair = false;
+    if (composePluginEnabled() and tail_fixed >= 2 and n_params >= 2 and
+        std.mem.eql(u8, func.params[n_params - 1].name, "$changed") and
+        std.mem.eql(u8, func.params[n_params - 2].name, "$composer"))
+    {
+        const has_pair_tail = args.items.len >= 2 and
+            args.items[args.items.len - 1] == .Int and
+            args.items[args.items.len - 2] == .Instance and blk: {
+                const ig = args.items[args.items.len - 2].Instance.borrow();
+                defer ig.deinit();
+                const cg = ig.get().class.borrow();
+                defer cg.deinit();
+                break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+            };
+        if (!has_pair_tail) {
+            tail_fixed -= 2;
+            pairless_pair = true;
+        }
+    }
     // Already packed: an Array sits at the vararg slot of a slot-exact list.
     if (args.items.len == n_params and args.items[vp] == .Array) {
         return args.*;
@@ -181,6 +206,12 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     j = vp + n_var;
     while (j < args.items.len) : (j += 1) {
         try out.append(allocator, args.items[j]);
+    }
+    // Leave the pairless pair slots Null; `callFuncTypedInner`'s completion
+    // fills them from the ambient composer.
+    if (pairless_pair) {
+        try out.append(allocator, .Null);
+        try out.append(allocator, .Null);
     }
     args.deinit(allocator);
     return out;
@@ -1382,11 +1413,26 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         }
     }
 
-    const packed_args = try packVarargArgs(allocator, f, &args);
+    var packed_args = try packVarargArgs(allocator, f, &args);
     // `packVarargArgs` either returns `args` itself or a fresh list after
     // deiniting `args`; the outer `defer args.deinit` would then double
     // free. Take ownership of the final list and disarm the defer.
     args = .empty;
+    // Compose ABI completion after packing: a pairless composable call left
+    // its ($composer, $changed) tail Null (the vararg member path —
+    // `consumer.Varargs(0, 1, 2, 3)` — where the non-vararg exact-fit
+    // completion never runs). Fill from the ambient composer.
+    if (composePluginEnabled() and f.params.len >= 2 and
+        std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
+        std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
+        packed_args.items.len == f.params.len and
+        packed_args.items[f.params.len - 2] == .Null)
+    {
+        if (compose.currentComposer()) |c| {
+            packed_args.items[f.params.len - 2] = c;
+            packed_args.items[f.params.len - 1] = .{ .Int = 0 };
+        }
+    }
     vmhost.emitPath(allocator, "call_func", f.fqn, func, null, args_in);
     return composableEval(self, allocator, module, f, packed_args);
 }
@@ -1843,8 +1889,23 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     // by name, and absorbing through them is the pre-existing
                     // behaviour.
                     var required_tail: usize = 0;
-                    for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1..) |_, j| {
+                    // A pass-appended ($composer, $changed) tail claims the
+                    // caller's positionals only when the call actually
+                    // CARRIES the pair (a Composer instance + Int tail); a
+                    // pairless `consumer.Varargs(0, 1, 2, 3)` packs every
+                    // int and completes the pair from the ambient composer.
+                    const tail_is_pair = composePluginEnabled() and args.len >= 2 and
+                        args[args.len - 1] == .Int and args[args.len - 2] == .Instance and blk: {
+                        const ig = args[args.len - 2].Instance.borrow();
+                        defer ig.deinit();
+                        const cg = ig.get().class.borrow();
+                        defer cg.deinit();
+                        break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+                    };
+                    for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1..) |*pp, j| {
                         if (slots[j] != null) continue;
+                        if (!tail_is_pair and
+                            (std.mem.eql(u8, pp.name, "$composer") or std.mem.eql(u8, pp.name, "$changed"))) continue;
                         const has_default = walk_defaults != null and j < walk_defaults.?.len and walk_defaults.?[j] != null;
                         if (!has_default) required_tail += 1;
                     }

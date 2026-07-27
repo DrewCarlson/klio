@@ -3123,8 +3123,9 @@ fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
     return false;
 }
 
-fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args: []const Value) ?Func {
+fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args_in: []const Value) ?Func {
     if (candidates.len == 0) return null;
+    const args = args_in;
     if (candidates.len == 1) {
         // Even a lone same-named member must be *applicable*. By arity:
         // when fewer args are supplied than it declares and an unsupplied
@@ -3136,11 +3137,34 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // endIndex = size)`.
         const f = candidates[0];
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        const effective = f.params[skip..];
+        var effective = f.params[skip..];
+        var eff_args = args_in;
+        // A pass-threaded composable MEMBER carries a trailing ($composer,
+        // $changed) pair the call site appended positionally
+        // (`consumer.Varargs(0, 1, 2, 3, $composer, $changed)` with
+        // `Varargs(vararg ints, $composer, $changed)`): judge the USER shape
+        // pair-trimmed — the mid-vararg check otherwise refuses on the
+        // undefaulted pair params. Only when the tail VALUES look like the
+        // pair (a Composer instance + the changed Int).
+        if (host_call_func.composePluginEnabled() and effective.len >= 2 and
+            std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
+            std.mem.eql(u8, effective[effective.len - 2].name, "$composer"))
+        {
+            if (eff_args.len >= 2 and eff_args[eff_args.len - 1] == .Int and
+                eff_args[eff_args.len - 2] == .Instance)
+            {
+                effective = effective[0 .. effective.len - 2];
+                eff_args = eff_args[0 .. eff_args.len - 2];
+            } else if (compose.currentComposer() != null) {
+                // Pairless call in composition: the dispatch completes the
+                // pair from the ambient composer; judge the user shape.
+                effective = effective[0 .. effective.len - 2];
+            }
+        }
         // Non-final vararg (a vararg before trailing defaulted / named-only
         // params): the prefix binds positionally, the vararg consumes the
-        // remaining positional args, and the post-vararg params take their
-        // defaults. The naive args[i]-vs-effective[i] pairing below would
+        // remaining positional eff_args, and the post-vararg params take their
+        // defaults. The naive eff_args[i]-vs-effective[i] pairing below would
         // wrongly type-check a vararg-bound arg against a post-vararg param
         // (e.g. `report("A", 1, 2)` checking `2` against `footer: String`).
         var nf_vararg: ?usize = null;
@@ -3153,8 +3177,8 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         if (nf_vararg) |vp| {
             const defaults = funcDefaults(self, &f);
             // Prefix params not supplied positionally must be defaulted.
-            if (args.len < vp) {
-                var k: usize = args.len;
+            if (eff_args.len < vp) {
+                var k: usize = eff_args.len;
                 while (k < vp) : (k += 1) {
                     if (!paramHasDefault(defaults, skip + k)) return null;
                 }
@@ -3164,17 +3188,17 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
             while (k < effective.len) : (k += 1) {
                 if (!paramHasDefault(defaults, skip + k)) return null;
             }
-            // Prefix args against prefix params; the rest against the vararg
+            // Prefix eff_args against prefix params; the rest against the vararg
             // element type. A param typed as an in-scope type variable is
             // never adjudicated nominally.
             var i: usize = 0;
-            while (i < args.len and i < vp) : (i += 1) {
-                if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
+            while (i < eff_args.len and i < vp) : (i += 1) {
+                if (argDefinitelyNotParamType(self, &effective[i].ty, &eff_args[i]) and
                     !paramTypeIsTypeVar(self, &f, &effective[i].ty)) return null;
             }
             var j: usize = vp;
-            while (j < args.len) : (j += 1) {
-                if (argDefinitelyNotParamType(self, &effective[vp].ty, &args[j]) and
+            while (j < eff_args.len) : (j += 1) {
+                if (argDefinitelyNotParamType(self, &effective[vp].ty, &eff_args[j]) and
                     !paramTypeIsTypeVar(self, &f, &effective[vp].ty)) return null;
             }
             return f;
@@ -3183,25 +3207,25 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // applicable top-level/extension overload wins — e.g. the stdlib
         // `buildString { … }` inside an extension on a class that declares
         // its own zero-arg `buildString()` member (`URLBuilder.authority`).
-        if (args.len > effective.len and
+        if (eff_args.len > effective.len and
             (effective.len == 0 or !effective[effective.len - 1].is_vararg))
         {
-            if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=oversupply args={d} params={d}\n", .{ f.name, args.len, effective.len });
+            if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=oversupply eff_args={d} params={d}\n", .{ f.name, eff_args.len, effective.len });
             return null;
         }
-        if (args.len < effective.len) {
+        if (eff_args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
             // Trailing-lambda rule: a final callable arg binds the LAST
             // parameter when that parameter is function-typed; only the GAP
-            // parameters between it and the lead positional args need
+            // parameters between it and the lead positional eff_args need
             // defaults. `observe(readObserver) { block }` on
             // `(readObserver = null, writeObserver = null, block)` is
             // applicable -- block is filled by the lambda, writeObserver by
             // its default.
-            const trailing_bind = args.len > 0 and
+            const trailing_bind = eff_args.len > 0 and
                 isFunctionTypeRef(&effective[effective.len - 1].ty) and
-                isCallable(&args[args.len - 1]);
-            const first_unfilled = if (trailing_bind) args.len - 1 else args.len;
+                isCallable(&eff_args[eff_args.len - 1]);
+            const first_unfilled = if (trailing_bind) eff_args.len - 1 else eff_args.len;
             const last_checked = if (trailing_bind) effective.len - 1 else effective.len;
             var k: usize = first_unfilled;
             while (k < last_checked) : (k += 1) {
@@ -3216,7 +3240,7 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // an in-scope type variable (the function's own, or the owning
         // class's) is never adjudicated nominally.
         var i: usize = 0;
-        while (i < args.len and i < effective.len) : (i += 1) {
+        while (i < eff_args.len and i < effective.len) : (i += 1) {
             // A LONE member whose function-typed parameter meets an Instance
             // argument whose class chain declares `invoke` stays applicable:
             // a memo-wrapped ComposableLambdaImpl keeps its invoke overloads
@@ -3225,15 +3249,15 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
             // candidate. Answered from the caller's live module borrow; an
             // invoke-less instance (a JobNode against a CompletionHandler
             // parameter) still declines so the extension wins.
-            if (args[i] == .Instance and std.mem.startsWith(u8, effective[i].ty.name, "Function")) {
+            if (eff_args[i] == .Instance and std.mem.startsWith(u8, effective[i].ty.name, "Function")) {
                 if (mod_opt) |m| {
-                    if (classChainHasInvokeIn(m, &args[i])) continue;
+                    if (classChainHasInvokeIn(m, &eff_args[i])) continue;
                 }
             }
-            if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i]) and
+            if (argDefinitelyNotParamType(self, &effective[i].ty, &eff_args[i]) and
                 !paramTypeIsTypeVar(self, &f, &effective[i].ty))
             {
-                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(args[i])) });
+                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(eff_args[i])) });
                 return null;
             }
         }
@@ -9227,7 +9251,7 @@ pub fn invokeVirtualMember(
     return callFuncNamedRec(self, allocator, module, target, all, names);
 }
 
-fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args_in: []const Value) Allocator.Error!?EvalResult {
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
@@ -9235,7 +9259,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     if (nuTraceEnv()) |want| {
         if (std.mem.eql(u8, want, f.name)) {
             std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} args=", .{ f.fqn, fid.int(), f.params.len, receiver.typeFqn() });
-            for (args) |a| switch (a) {
+            for (args_in) |a| switch (a) {
                 .Int => |v| std.debug.print(" Int({d})", .{v}),
                 else => std.debug.print(" {s}", .{@tagName(a)}),
             };
@@ -9255,11 +9279,36 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
     // handles that alignment.
     const threaded_composer: ?Value = if (host_call_func.composePluginEnabled())
-        compose.threadedComposerArg(f.params, args)
+        compose.threadedComposerArg(f.params, args_in)
     else
         null;
     if (threaded_composer) |c| compose.pushComposer(c);
     defer if (threaded_composer != null) compose.popComposer();
+
+    // Pairless composable member call accepted by the pair-trimmed pick
+    // (`ReadStringCompositionLocal(local)` against `(this, local, $composer,
+    // $changed)`): complete the pair from the ambient composer before
+    // binding, or the body runs with Unit in `$composer`.
+    var pair_ext: ?[]Value = null;
+    defer if (pair_ext) |pe| if (runtime.freeScratch()) allocator.free(pe);
+    var args = args_in;
+    if (host_call_func.composePluginEnabled() and f.params.len >= 2 and
+        std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
+        std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
+        args.len + 3 == f.params.len and threaded_composer == null)
+    {
+        if (compose.currentComposer()) |c| {
+            const pe = try allocator.alloc(Value, args.len + 2);
+            @memcpy(pe[0..args.len], args);
+            pe[args.len] = c;
+            pe[args.len + 1] = .{ .Int = 0 };
+            pair_ext = pe;
+            args = pe;
+            compose.pushComposer(c);
+        }
+    }
+    const pushed_completed = pair_ext != null;
+    defer if (pushed_completed) compose.popComposer();
 
     // Non-final vararg (a vararg before trailing defaulted / named-only params):
     // the prepend + trailing-collapse path cannot bind it — the vararg must
