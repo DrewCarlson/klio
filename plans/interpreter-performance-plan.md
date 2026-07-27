@@ -586,12 +586,15 @@ Remaining clusters (8): ResultTest (past
 `throwOnFailure`, assertion-level, 4), thenBy
 receiver above (2),
 CollectionTest.sortedByNullable local-ext layer above (1), GroupingTest
-iterator on anon (1 — narrowed: `"chars".groupingBy { it.code }
-.sourceIterator().asSequence().toList()` fails "Vm::call_member
-`iterator` on $anon$2"; the `Iterator.asSequence()` anon
-(`object : Sequence { override fun iterator() = this@asSequence }`)
-misses its override when drained through the toList seam, while the
-List/Array/Sequence producers work — repro scratchpad grouping2.kt).
+iterator on anon (1 — narrowed twice: `"abc".groupingBy { it.code }
+.sourceIterator()` itself fails; inside the spliced
+`CharSequence.groupingBy` anon, `sourceIterator()`'s
+`this@groupingBy.iterator()` resolves the label-qualified this to the
+ANON instead of the spliced String receiver ("Vm::call_member
+`iterator` on $anon$0"). The List/Iterable variant of the same shape
+works, so the anon enclosing-receiver capture exists but drops the
+CharSequence/String receiver — likely the non-Instance-receiver case
+of the anon capture machinery. Repro scratchpad asseq3.kt).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in
