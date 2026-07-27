@@ -586,7 +586,12 @@ Remaining clusters (8): ResultTest (past
 `throwOnFailure`, assertion-level, 4), thenBy
 receiver above (2),
 CollectionTest.sortedByNullable local-ext layer above (1), GroupingTest
-iterator on anon (1).
+iterator on anon (1 — narrowed: `"chars".groupingBy { it.code }
+.sourceIterator().asSequence().toList()` fails "Vm::call_member
+`iterator` on $anon$2"; the `Iterator.asSequence()` anon
+(`object : Sequence { override fun iterator() = this@asSequence }`)
+misses its override when drained through the toList seam, while the
+List/Array/Sequence producers work — repro scratchpad grouping2.kt).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in
