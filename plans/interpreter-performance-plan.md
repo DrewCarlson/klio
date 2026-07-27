@@ -792,9 +792,17 @@ STILL records cands=[9403] — so the single-candidate set comes from a
 COMMIT-TIME PICK channel, not the boundedCallCandidates filter: the
 lowering resolved the call (func=9403 committed) and recorded the pick
 as the sole candidate; that picker chose the vararg overload by the
-same composer-pair arity blindness. Next: find the resolver that
-commits `cmg.func` + single-candidate sets for bare calls in anon
-sub-module bodies (resolveBareRefIndexed / the pick behind the
-`member_inline_typed`-era emits) and give its arity/shape comparison
-the same pair-trimmed treatment — or record all arity-fitting
-overloads instead of the pick.
+same composer-pair arity blindness. Refinement from the full [cno] dump: the
+`bounded=true cands=1 nargs=2` round (in_fn=<lambda>) SCORES 191 and
+dispatches — that invocation likely SUCCEEDS; the cmg-tail site is a
+DIFFERENT invocation that produces NO [cno] round at all — consistent
+with an AUTHORITATIVE EMPTY candidate slice (boundedCallCandidates
+returns len-0 non-null when the winning tier is other-package:
+`first_tier >= other_package_tier`) or an eval-side skip for empty
+sets. Next: check `lowestVisibleGlobalTier` for the anon sub-module
+caller file (its package/imports differ from the test file's, so all
+three main-module composables may land in other_package_tier → empty
+authoritative set → tail), and whether the eval leg calls the binder
+at all for an empty non-null set. boundedCallCandidates keeps all
+tier-passing overloads (the singleton theory was wrong); the arity
+trim stands on its own.
