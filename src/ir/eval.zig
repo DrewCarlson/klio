@@ -136,18 +136,41 @@ const DEFAULT_MAX_EVAL_DEPTH: usize = 2_000;
 /// Per-thread evaluator activation depth. Incremented on entry to each
 /// `runFrame` and decremented on exit, so it counts native recursion across
 /// the host call-back boundary (every nested Kotlin call re-enters here).
-threadlocal var eval_depth: usize = 0;
+threadlocal var evtls: EvalTls = .{};
+
+/// The evaluator's per-thread hot state, batched into ONE threadlocal so a
+/// function touching several of these fields pays one dyld TLV address
+/// lookup instead of one per variable (separate threadlocals each cost
+/// their own `_tlv_get_addr` per access site; the compiler only CSEs
+/// repeated reads of the same variable).
+const EvalTls = struct {
+    /// Per-thread evaluator activation depth (native recursion across the
+    /// host call-back boundary).
+    eval_depth: usize = 0,
+    /// Native-recursion depth for the whole-function JIT (see
+    /// JIT_NATIVE_DEPTH_LIMIT).
+    jit_native_depth: usize = 0,
+    /// Resolved depth cap; `0` = not yet read from the env.
+    eval_depth_cap: usize = 0,
+    /// The enclosing-`this` chain of the currently executing frame (always
+    /// points at a live Frame's `enclosing_this`, or null between runs).
+    active_chain: ?*std.ArrayList(EnclosingEntry) = null,
+    /// Length of the active chain's seeded (frame-entry) prefix.
+    active_chain_base: usize = 0,
+    /// Innermost-first chain of active interpreter frames (GC root seed).
+    frame_chain: ?*Frame = null,
+    /// Innermost in-flight resume node chain (GC root seed).
+    resuming: ?*ResumeFrames = null,
+};
 /// Native-recursion depth for the whole-function JIT: a compiled body recursing
 /// into a compiled callee runs it frameless (no interpreter frame), so each level
 /// costs a few C-stack frames. Bounded so deep recursion falls back to the
-/// frame-based path (whose `eval_depth` bound raises a catchable StackOverflow)
+/// frame-based path (whose `evtls.eval_depth` bound raises a catchable StackOverflow)
 /// before the native stack faults.
-threadlocal var jit_native_depth: usize = 0;
 const JIT_NATIVE_DEPTH_LIMIT: usize = 1500;
 
 /// Resolved depth cap for the current thread. `0` means "not yet read"; the
 /// first `runFrame` reads the env once and caches the result.
-threadlocal var eval_depth_cap: usize = 0;
 
 /// One implicit receiver on the enclosing-`this` chain.
 ///
@@ -181,16 +204,14 @@ pub const EnclosingEntry = runtime.ImplicitReceiver;
 /// boundary at entry are the ones the dispatch just pushed for this very
 /// call (a bound receiver-lambda subject, a displaced `this`, a
 /// member-extension owner): the in-flight suffix beyond the caller's
-/// `active_chain_base`, minus `access` entries. Because the chain lives on
+/// `evtls.active_chain_base`, minus `access` entries. Because the chain lives on
 /// the frame, it travels with a parked continuation and cannot leak past
 /// the frame or across a `run` boundary.
-threadlocal var active_chain: ?*std.ArrayList(EnclosingEntry) = null;
 
 /// Length of the active chain's seeded (frame-entry) prefix. Entries at
-/// `>= active_chain_base` are in-flight pushes made by the currently
+/// `>= evtls.active_chain_base` are in-flight pushes made by the currently
 /// executing frame around a dispatch; only those transfer into the next
 /// frame entered.
-threadlocal var active_chain_base: usize = 0;
 
 // -------------------------------------------------------------------------
 // GC roots: the per-thread chain of active interpreter frames. The tracing
@@ -199,14 +220,13 @@ threadlocal var active_chain_base: usize = 0;
 // each `evalWithCapturesChained`/`resumeContinuation` activation links its
 // frame onto this innermost-first chain for its lifetime. Registered once.
 // -------------------------------------------------------------------------
-threadlocal var frame_chain: ?*Frame = null;
 
 /// The source span of the statement the innermost active frame is currently
 /// executing — i.e. the call site of a call being dispatched from that frame.
 /// The compose `@Composable` hook reads this to derive a stable positional
 /// group key per call site (set per-statement by the `.Trace` instruction).
 pub fn currentCallSiteSpan() ?ir.Span {
-    return if (frame_chain) |fr| fr.cur_span else null;
+    return if (evtls.frame_chain) |fr| fr.cur_span else null;
 }
 
 /// The declaring package of the innermost executing frame's function.
@@ -214,7 +234,7 @@ pub fn currentCallSiteSpan() ?ir.Span {
 /// nullable extension properties in different packages resolve to the
 /// one the executing code can see.
 pub fn currentFramePackage() ?[]const u8 {
-    const fr = frame_chain orelse return null;
+    const fr = evtls.frame_chain orelse return null;
     const pkg = fr.func.package;
     return if (pkg.len == 0) null else pkg;
 }
@@ -226,7 +246,7 @@ pub fn currentFramePackage() ?[]const u8 {
 /// read inside nested lambdas whose frames never pushed the chain).
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
     var out: std.ArrayList(Value) = .empty;
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     var steps: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         if (steps > 256) break;
@@ -244,7 +264,7 @@ pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 /// frames without one (synthesized accessors / init thunks carry no
 /// package of their own; their lexical home is the calling frame's).
 pub fn nearestFramePackage() ?[]const u8 {
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
         if (f.func.package.len != 0) return f.func.package;
     }
@@ -266,7 +286,7 @@ threadlocal var ref_site_override: ?RefSiteOverride = null;
 /// one the override was pushed under.
 pub fn refSiteFile() ?ir.FileId {
     const o = ref_site_override orelse return null;
-    const fr = frame_chain orelse return null;
+    const fr = evtls.frame_chain orelse return null;
     return if (fr == o.frame) o.file else null;
 }
 
@@ -275,7 +295,7 @@ pub fn refSiteFile() ?ir.FileId {
 /// `popRefSiteFile` when its dispatch completes.
 pub fn pushRefSiteFile(file: ir.FileId) ?RefSiteOverride {
     const prev = ref_site_override;
-    if (frame_chain) |fr| ref_site_override = .{ .file = file, .frame = fr };
+    if (evtls.frame_chain) |fr| ref_site_override = .{ .file = file, .frame = fr };
     return prev;
 }
 
@@ -285,14 +305,14 @@ pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
 
 /// Simple name of the function the innermost active frame is executing.
 pub fn currentFuncName() ?[]const u8 {
-    return if (frame_chain) |fr| fr.func.name else null;
+    return if (evtls.frame_chain) |fr| fr.func.name else null;
 }
 
 /// The function the innermost active frame is executing. A bare-name field read
 /// consults it to learn whether the reader is a member-extension body, whose
 /// declaring class is an implicit receiver the read must prefer.
 pub fn currentFrameFunc() ?*const ir.Func {
-    return if (frame_chain) |fr| fr.func else null;
+    return if (evtls.frame_chain) |fr| fr.func else null;
 }
 
 /// Per-thread free-list of register buffers, reused across calls so a freeing
@@ -342,16 +362,16 @@ fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value
     return regs;
 }
 
-/// Return a frame's register buffer. A nested frame's buffer (`eval_depth > 0`)
+/// Return a frame's register buffer. A nested frame's buffer (`evtls.eval_depth > 0`)
 /// is recycled into the pool for a sibling call; the outermost frame's teardown
-/// (`eval_depth == 0`) frees its own buffer and drains the pool, so no recycled
+/// (`evtls.eval_depth == 0`) frees its own buffer and drains the pool, so no recycled
 /// buffer ever outlives the top-level evaluation that produced it (or crosses an
 /// allocator). Only under a freeing backend — the tracing GC owns this memory and
 /// the arena never frees, so neither pools.
 fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
     const ra = regsAlloc(allocator);
     const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
-    const pool_ok = (gc_pool or (runtime.reclaimEnabled() and eval_depth > 0)) and
+    const pool_ok = (gc_pool or (runtime.reclaimEnabled() and evtls.eval_depth > 0)) and
         regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX;
     if (pool_ok) {
         const buf = regs.allocatedSlice();
@@ -365,7 +385,7 @@ fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
         return;
     }
     regs.deinit(ra);
-    if (!gc_pool and eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+    if (!gc_pool and evtls.eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
 }
 
 /// Free every pooled register buffer. Called when the outermost frame unwinds
@@ -379,7 +399,7 @@ fn drainRegsPool(allocator: Allocator) void {
 /// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
 /// activation one frame at a time, the not-yet-rebuilt snapshots live only in
 /// its Zig-local `frames` list (already taken out of the park registry, not yet
-/// on `frame_chain`), so a collection during an inner frame's eval would sweep
+/// on `evtls.frame_chain`), so a collection during an inner frame's eval would sweep
 /// them. Each resume links a node here; the GC marks `frames.items[head..]`.
 /// Resumes nest (a resumed frame can suspend/resume again), so it is a chain.
 const ResumeFrames = struct {
@@ -389,7 +409,6 @@ const ResumeFrames = struct {
     /// Unconsumed inherited segments of the in-flight resume.
     tails: *const ?*TailSeg,
 };
-threadlocal var resuming: ?*ResumeFrames = null;
 
 /// The per-thread root anchor: stable addresses of this thread's frame chain
 /// and in-flight-resume chain. `frame_troot.ctx` points at this.
@@ -410,11 +429,11 @@ inline fn gcPushFrame(f: *Frame) void {
     // capture, not only GC marking); only the GC root registration is gated on
     // the collector being active.
     if (runtime.gc.gc_enabled) gcInstallFrameRoot();
-    f.gc_link = frame_chain;
-    frame_chain = f;
+    f.gc_link = evtls.frame_chain;
+    evtls.frame_chain = f;
 }
 inline fn gcPopFrame(f: *Frame) void {
-    frame_chain = f.gc_link;
+    evtls.frame_chain = f.gc_link;
 }
 
 /// Mark every live Value reachable from the `ctx` thread's frame chain and any
@@ -464,7 +483,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &frame_chain, .resuming = &resuming };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -491,12 +510,12 @@ pub fn gcUninstallFrameRoot() void {
 /// slice is owned by the returned cell.
 fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     var n: usize = 0;
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     while (cur) |f| : (cur = f.gc_link) n += 1;
     if (n == 0) return null;
     const frames = try allocator.alloc(runtime.StackFrame, n);
     var i: usize = 0;
-    cur = frame_chain;
+    cur = evtls.frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
         if (f.cur_span) |sp| {
@@ -512,7 +531,7 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
 /// Debug helper: print the active frame chain (fqn + current span) to
 /// stderr. Env-gated call sites only.
 pub fn debugPrintFrames() void {
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     while (cur) |f| : (cur = f.gc_link) {
         var path: []const u8 = "?";
         var line: u32 = 0;
@@ -576,7 +595,7 @@ pub fn wallCapAbandon() void {
 /// The runner's per-test invariant probe: a nonzero depth between tests
 /// is a leak in some unwind path.
 pub fn evalDepthNow() usize {
-    return eval_depth;
+    return evtls.eval_depth;
 }
 
 pub fn dispatchCacheStable() bool {
@@ -631,7 +650,7 @@ pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
 /// their own call site (e.g. `KLIO_MISS_TRACE`).
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
@@ -658,7 +677,7 @@ pub fn dumpFrameChainForDiagAlways() void {
 /// slot holding an `Int`) directly instead of leaving it to be inferred
 /// from a downstream receiver failure.
 pub fn dumpCurrentFrameParamsForDiag() void {
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     var depth: usize = 0;
     while (cur) |fr| : (cur = fr.gc_link) {
         if (depth >= 3) break;
@@ -703,7 +722,7 @@ fn spinDumpMaybe() void {
     // Innermost frames' scalar registers — live loop state (probe offsets,
     // masks, bit groups) for a loop that never terminates.
     {
-        var rf = frame_chain;
+        var rf = evtls.frame_chain;
         var fi: usize = 0;
         while (rf) |f0| : (rf = f0.gc_link) {
             if (fi >= 3) break;
@@ -721,7 +740,7 @@ fn spinDumpMaybe() void {
             fi += 1;
         }
     }
-    var cur = frame_chain;
+    var cur = evtls.frame_chain;
     var depth: usize = 0;
     while (cur) |f| : (cur = f.gc_link) {
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
@@ -971,14 +990,14 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
 /// callable. Appends to the current frame's chain; the invoked frame picks
 /// it up at entry. A no-op (silently dropped) when no frame is active.
 pub fn pushEnclosing(v: *const Value) void {
-    const chain = active_chain orelse return;
+    const chain = evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};
 }
 
 /// Push a receiver-lambda subject (`with(x) { … }`'s `x`). The subject is a
 /// receiver inside the lambda body, but its `outer` links are not.
 pub fn pushEnclosingSubject(v: *const Value) void {
-    const chain = active_chain orelse return;
+    const chain = evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .subject }) catch {};
 }
 
@@ -987,27 +1006,27 @@ pub fn pushEnclosingSubject(v: *const Value) void {
 /// while resolving one call). The entry never becomes part of a callee
 /// frame's lexical receiver scope.
 pub fn pushEnclosingAccess(v: *const Value) void {
-    const chain = active_chain orelse return;
+    const chain = evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .access }) catch {};
 }
 
 /// Pop the most recent `pushEnclosing`/`pushEnclosingSubject`. A no-op when no
 /// frame is active or the chain is empty.
 pub fn popEnclosing() void {
-    const chain = active_chain orelse return;
+    const chain = evtls.active_chain orelse return;
     if (chain.items.len > 0) _ = chain.pop();
 }
 
 /// The innermost enclosing `this`, or `null` when the chain is empty.
 pub fn enclosingThisLast() ?Value {
-    const chain = active_chain orelse return null;
+    const chain = evtls.active_chain orelse return null;
     if (chain.items.len == 0) return null;
     return chain.items[chain.items.len - 1].v;
 }
 
 /// The enclosing-`this` chain, innermost first. Caller owns the returned slice.
 pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
-    const chain = active_chain orelse return allocator.alloc(Value, 0);
+    const chain = evtls.active_chain orelse return allocator.alloc(Value, 0);
     var out = try allocator.alloc(Value, chain.items.len);
     var i: usize = 0;
     while (i < chain.items.len) : (i += 1) {
@@ -1019,7 +1038,7 @@ pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 /// The enclosing-`this` chain with subject tags, innermost first. Caller owns
 /// the returned slice.
 pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
-    const chain = active_chain orelse return allocator.alloc(EnclosingEntry, 0);
+    const chain = evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out = try allocator.alloc(EnclosingEntry, chain.items.len);
     var i: usize = 0;
     while (i < chain.items.len) : (i += 1) {
@@ -1036,7 +1055,7 @@ pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEn
 /// whichever thread) that happens. `access` entries are dispatch-transient
 /// and excluded. Caller owns the returned slice.
 pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
-    const chain = active_chain orelse return allocator.alloc(EnclosingEntry, 0);
+    const chain = evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out: std.ArrayList(EnclosingEntry) = .empty;
     errdefer out.deinit(allocator);
     for (chain.items) |e| {
@@ -1076,7 +1095,7 @@ fn chainAllocator() Allocator {
 }
 
 fn maxEvalDepth() usize {
-    if (eval_depth_cap != 0) return eval_depth_cap;
+    if (evtls.eval_depth_cap != 0) return evtls.eval_depth_cap;
     // `procEnvGetVar` reads the whole environment block into a scratch
     // allocator, so a tiny fixed buffer would fail; use the page allocator.
     const a = std.heap.page_allocator;
@@ -1089,7 +1108,7 @@ fn maxEvalDepth() usize {
         if (parsed == 0) break :blk DEFAULT_MAX_EVAL_DEPTH;
         break :blk parsed;
     };
-    eval_depth_cap = cap;
+    evtls.eval_depth_cap = cap;
     return cap;
 }
 
@@ -1409,7 +1428,7 @@ pub const FrameSnapshot = struct {
     /// (bare member / `this@Outer`) inside a receiver-lambda / `with` /
     /// member-extension body sees the same receivers after the park that it saw
     /// before: the chain travels with the parked continuation instead of being
-    /// recovered from process-global state the resuming thread happens to hold.
+    /// recovered from process-global state the evtls.resuming thread happens to hold.
     enclosing_this: []EnclosingEntry,
     try_stack: []TryFrame,
     pending_finally: PendingFinallyState = .{},
@@ -1785,7 +1804,7 @@ pub const SuspendState = struct {
         }
     }
 
-    /// Drop one parked frame entry without resuming it: destroy a live
+    /// Drop one parked frame entry without evtls.resuming it: destroy a live
     /// activation outright (it owns its register references), or release
     /// and free a copied snapshot.
     fn dropSnapshot(snap: FrameSnapshot, allocator: Allocator) void {
@@ -1922,11 +1941,11 @@ const Frame = struct {
     /// Snapshotted into `FrameSnapshot.enclosing_this` on suspend and restored
     /// verbatim on resume.
     enclosing_this: std.ArrayList(EnclosingEntry),
-    /// The `active_chain` pointer to restore when this frame exits, so a frame
+    /// The `evtls.active_chain` pointer to restore when this frame exits, so a frame
     /// running under a caller frame returns enclosing-`this` resolution to the
     /// caller's chain rather than leaving a dangling pointer.
     prev_chain: ?*std.ArrayList(EnclosingEntry),
-    /// The caller's `active_chain_base`, restored on exit alongside
+    /// The caller's `evtls.active_chain_base`, restored on exit alongside
     /// `prev_chain`.
     prev_chain_base: usize,
     /// The owning module handle when this frame runs in a per-method
@@ -1944,7 +1963,7 @@ const Frame = struct {
     /// to balance the retain the snapshot took on suspend. A freshly-called
     /// frame leaves this false — its params/captures are borrows.
     owns_params_caps: bool = false,
-    /// Intrusive link onto the per-thread GC frame chain (see `frame_chain`).
+    /// Intrusive link onto the per-thread GC frame chain (see `evtls.frame_chain`).
     gc_link: ?*Frame = null,
     /// The closure side-table id when this frame is executing a closure body
     /// (`null` for a plain function / method body). A running closure body holds
@@ -1993,7 +2012,7 @@ const Frame = struct {
         if (cvTraceOn() and
             params.items.len < func.params.len)
         {
-            const caller = if (frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
+            const caller = if (evtls.frame_chain) |fr| (if (fr.func.fqn.len != 0) fr.func.fqn else fr.func.name) else "<none>";
             std.debug.print("[frame-short] fn={s} args={d} params={d} caller={s}\n", .{
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
@@ -2028,8 +2047,8 @@ const Frame = struct {
             if (e.kind == .access) continue;
             try self.enclosing_this.append(chainAllocator(), e);
         }
-        if (active_chain) |caller| {
-            for (caller.items[@min(active_chain_base, caller.items.len)..]) |e| {
+        if (evtls.active_chain) |caller| {
+            for (caller.items[@min(evtls.active_chain_base, caller.items.len)..]) |e| {
                 if (e.kind == .access) continue;
                 try self.enclosing_this.append(chainAllocator(), e);
             }
@@ -2056,15 +2075,15 @@ const Frame = struct {
     }
 
     fn activateAs(self: *Frame) void {
-        self.prev_chain = active_chain;
-        self.prev_chain_base = active_chain_base;
-        active_chain = &self.enclosing_this;
-        active_chain_base = self.enclosing_this.items.len;
+        self.prev_chain = evtls.active_chain;
+        self.prev_chain_base = evtls.active_chain_base;
+        evtls.active_chain = &self.enclosing_this;
+        evtls.active_chain_base = self.enclosing_this.items.len;
     }
 
     fn deactivateChain(self: *Frame) void {
-        active_chain = self.prev_chain;
-        active_chain_base = self.prev_chain_base;
+        evtls.active_chain = self.prev_chain;
+        evtls.active_chain_base = self.prev_chain_base;
     }
 
     fn deinit(self: *Frame) void {
@@ -2484,13 +2503,13 @@ pub fn resumeContinuation(
     // the unconsumed tail segments) for the duration of the resume: they are
     // out of the park registry and not yet on the frame chain, so an inner
     // frame's collection would otherwise sweep them.
-    var resume_node = ResumeFrames{ .prev = resuming, .frames = &frames, .head = &head, .tails = &tails };
+    var resume_node = ResumeFrames{ .prev = evtls.resuming, .frames = &frames, .head = &head, .tails = &tails };
     if (runtime.gc.gc_enabled) {
         gcInstallFrameRoot();
-        resuming = &resume_node;
+        evtls.resuming = &resume_node;
     }
     defer if (runtime.gc.gc_enabled) {
-        resuming = resume_node.prev;
+        evtls.resuming = resume_node.prev;
     };
     var first = true;
     var pending_throw_from_inner: ?Value = null;
@@ -2729,21 +2748,21 @@ fn runFrame(
     // calling back into the evaluator). Bounding this depth converts an
     // unbounded recursion into a catchable `StackOverflowError` before the
     // native stack faults.
-    if (eval_depth >= maxEvalDepth()) {
+    if (evtls.eval_depth >= maxEvalDepth()) {
         dumpFrameChainForDiag();
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
-    eval_depth += 1;
+    evtls.eval_depth += 1;
     defer {
-        eval_depth -= 1;
+        evtls.eval_depth -= 1;
         // Safe point: back at the outermost activation, no native JIT frame is on
         // the stack, so the JIT cache can be trimmed if it has grown past its cap.
-        if (eval_depth == 0) jit_loop.evictIfOverBudget();
+        if (evtls.eval_depth == 0) jit_loop.evictIfOverBudget();
     }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }
 
-/// Snapshot `frame` (resuming at `block`:`inst_idx`, resume value delivered
+/// Snapshot `frame` (evtls.resuming at `block`:`inst_idx`, resume value delivered
 /// into `resume_reg`) and append it to `state`'s frame list. Ownership of the
 /// frame's pending-finally payload moves into the snapshot; the frame's own
 /// teardown must then run (it releases regs the snapshot has retained).
@@ -3071,7 +3090,7 @@ fn runFlatLoop(
     // On an allocation failure, unwind every open activation so no frame is
     // left dangling on the GC chain.
     errdefer while (stack.pop()) |act| {
-        eval_depth -= 1;
+        evtls.eval_depth -= 1;
         teardownActivation(H, allocator, act, host);
         allocator.destroy(act);
     };
@@ -3090,7 +3109,7 @@ fn runFlatLoop(
         if (flat_site) |site| {
             // Same depth bound as the recursive path: an unbounded interpreted
             // recursion becomes a catchable StackOverflowError at the caller.
-            if (eval_depth >= maxEvalDepth()) {
+            if (evtls.eval_depth >= maxEvalDepth()) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
                 runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
@@ -3098,15 +3117,15 @@ fn runFlatLoop(
                 ridx = site.ret_idx;
                 continue;
             }
-            eval_depth += 1;
+            evtls.eval_depth += 1;
             const act = openActivation(H, allocator, f.module, site.req, host) catch |e| {
-                eval_depth -= 1;
+                evtls.eval_depth -= 1;
                 return e;
             };
             act.ret_block = site.ret_block;
             act.ret_idx = site.ret_idx;
             stack.append(allocator, act) catch |e| {
-                eval_depth -= 1;
+                evtls.eval_depth -= 1;
                 teardownActivation(H, allocator, act, host);
                 allocator.destroy(act);
                 return e;
@@ -3127,7 +3146,7 @@ fn runFlatLoop(
             var pd = pp.resume_reg;
             var barrier_hit = false;
             while (stack.pop()) |a| {
-                eval_depth -= 1;
+                evtls.eval_depth -= 1;
                 const is_barrier = a.suspend_barrier;
                 const is_root_pump = a.root_pump;
                 const scope_base = a.barrier_scope_base;
@@ -3192,7 +3211,7 @@ fn runFlatLoop(
         deliver: while (true) {
             if (stack.items.len == 0) return res;
             const act = stack.pop().?;
-            eval_depth -= 1;
+            evtls.eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
             // A no-driver root's completion runs its pump to quiescence
             // (launched children, timers) before the caller sees the
@@ -3538,11 +3557,11 @@ fn LoopTramp(comptime H: type) type {
             if (!site.is_member and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
-                        if (jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
+                        if (evtls.jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
                             var fslots: [192]i64 = undefined;
-                            jit_native_depth += 1;
+                            evtls.jit_native_depth += 1;
                             const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], &call, tctx.user);
-                            jit_native_depth -= 1;
+                            evtls.jit_native_depth -= 1;
                             if (fo) |o| {
                                 if (o.code.inst == jit_loop.RETURN_INST) {
                                     if (site.has_result) {
@@ -3927,7 +3946,7 @@ fn runFrameExec(
                     .Throw => |v| {
                         // Capture the call stack at the throw seam: the
                         // innermost frame to surface this value records the
-                        // full chain (frame_chain is intact and innermost-first
+                        // full chain (evtls.frame_chain is intact and innermost-first
                         // here); the attach is once-only, so the outward unwind
                         // through enclosing frames leaves it untouched.
                         var tv = v;
@@ -9131,9 +9150,9 @@ test "resumed labeled return reaches its snapshotted target frame" {
 test "enclosing chain tags subjects and projects innermost-first" {
     var chain: std.ArrayList(EnclosingEntry) = .empty;
     defer chain.deinit(chainAllocator());
-    const prev = active_chain;
-    active_chain = &chain;
-    defer active_chain = prev;
+    const prev = evtls.active_chain;
+    evtls.active_chain = &chain;
+    defer evtls.active_chain = prev;
 
     const receiver = Value{ .Int = 1 };
     const subject = Value{ .Int = 2 };
@@ -9165,9 +9184,9 @@ test "enclosing chain tags subjects and projects innermost-first" {
 }
 
 test "enclosing chain pushes are dropped with no active frame" {
-    const prev = active_chain;
-    active_chain = null;
-    defer active_chain = prev;
+    const prev = evtls.active_chain;
+    evtls.active_chain = null;
+    defer evtls.active_chain = prev;
 
     const v = Value{ .Int = 7 };
     pushEnclosing(&v);

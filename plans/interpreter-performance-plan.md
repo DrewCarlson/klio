@@ -432,19 +432,21 @@ call (~130 samples), `runFlatLoop` entry/exit, and `_tlv_get_addr`
 (~230 samples, threadlocal reads through dyld TLV at every call
 boundary).
 
-Remaining per-call program (next items, in expected-value order):
-1. Batch call-boundary threadlocal traffic: `_tlv_get_addr` is ~5-9% of
-   busy time on the lambda-call profile because eval's per-call state
-   lives in SEPARATE threadlocals (`frame_chain`, `active_chain`,
-   `active_chain_base`, `eval_depth`, ...) — each gets its own dyld TLV
-   lookup per access site (the compiler CSEs repeated reads of one
-   variable, not of siblings). Moving them into ONE threadlocal struct
-   lets a single address load per function serve all of them. Mechanical
-   but broad (dozens of use sites across eval.zig) — do it in a
-   dedicated pass with the sweep gate, not as a drive-by.
+Remaining per-call program:
+1. Batch call-boundary threadlocal traffic — LANDED for eval.zig: the
+   seven hot threadlocals (`frame_chain`, `active_chain`,
+   `active_chain_base`, `eval_depth`, `eval_depth_cap`,
+   `jit_native_depth`, `resuming`) now live in ONE `EvalTls` struct, so
+   a function touching several pays one dyld TLV address lookup instead
+   of one per variable. `_tlv_get_addr` 231 → 176 samples, ~2% on the
+   lambda-call bench. The remaining TLV traffic is cross-module
+   (`host_keepalive` in runtime/value.zig, `regs_pool`, the compose
+   stack, the flat-armed slots) — batching those means a shared context
+   or per-module structs; log-scale returns, take it only with a
+   dedicated pass.
 2. Per-JIT-site resolution memo (closure id → prepared template), so
    repeat iterations skip the closure-table probe and param scan
-   (~2% as measured; do after 1).
+   (~2% as measured).
 
 NOT on the list: pooling the per-call args/captures ArrayLists — the
 params-buffer pool was already evaluated and closed in an earlier
