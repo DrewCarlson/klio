@@ -864,14 +864,22 @@ Composition`. Landed toward it: (1) local_fn_overloads shadow rule in
 shadowedByClass; (2) LocalFnOverload n_required is pair-trimmed so the
 3-arg call is applicable; (3) the eval by-id serve skips a
 NON-CONSTRUCTIBLE committed class (interface/abstract, non-SAM call) —
-the serve arm moved from global_id to global. STILL FAILING: the
-runtime-lowered inner lambda's CMG name lookup returns the interface's
-CLASS VALUE — the local fn's plain-name cell is not reachable through
-the scoped-global chain at that point (either never captured at runtime
-lowering or shadowed by the class publish). Next: instrument
-lookupGlobalThrowing's scoped walk for the name at that arm, and check
-whether the runtime-lowered lambda's capture set includes the plain
-local-fn slot (`isLowerAnonCapture` at its lowering).
+the serve arm moved from global_id to global. STILL FAILING — refined: the STATIC lowering now routes ONE call via
+`member_or_local_exact_value` (CallValueWithThis on the local value ✓),
+but TWO RUNTIME-LOWERED copies of the same call (emission audit
+`unresolved_bare_call` with pkg="") still emit CMG and serve
+`arm=global` → the interface's class value → newInstance(5 args incl
+the appended pair) → pickFactory only sees the 2-param pack factory →
+"Cannot create an instance of an interface". The [ifact] dump proves
+the failing invocation is the TEST's call (tags Bool,Bool,Bool,
+Instance,Int). The [lgt] frame chain at the lookup shows innermost
+frame `compose` (CompositionTest.kt:76) with the content lambda at
+frame 2 — identify WHAT re-lowers the content lambda at runtime with
+pkg="" (its builder sees no local_fn decls and no captures), then give
+that lowering the enclosing capture universe or route the call through
+the static closure. Alternatively: newInstance's interface fallback
+could walk the scoped/enclosing envs for a callable of the name before
+throwing.
 
 Remaining CompositionTests (25) census: 4x plain "exception", 2x
 "Expected children but none found", 2x Expected<9>/actual<7>, 2x
