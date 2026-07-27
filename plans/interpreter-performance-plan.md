@@ -634,3 +634,35 @@ per-class clusters tracked in the resolution plan.
   site. Default-filled slots now lower in a nested scope with the
   callee's receiver bound as `this` (earlier params are already bound
   progressively), matching Kotlin's declaration-scope evaluation.
+
+
+## Post-zero long tail (probe-discovered + compose clusters)
+
+- **lastIndexOf 3-arg truncation — FIXED.** `stdlibNamedDispatch` mapped
+  a named call against the intrinsic's PUBLIC param-name table and
+  silently DROPPED both an unmatched named argument (`last = true`) and
+  positionals beyond the table (the internal indexOf's ignoreCase flag),
+  serving a truncated call. A shape mismatch (unmatched name, surplus
+  positional) now declines the probe so the call falls to the source
+  overload. `"bceded".lastIndexOf("ED", 4, ignoreCase = true)` → 4.
+- **Compose spread re-entry — FIXED (testProvideAllLocals advances).**
+  `CompositionLocalProvider(*values, content = content)` (the
+  context-overload's body) reached the overload binder without the
+  compose ABI pair and every candidate scored null. The binder now
+  scores composable candidates against the pair-reduced signature when
+  an ambient composer is available and completes the pair at dispatch;
+  `callFuncTypedInner` applies the same completion for the exact
+  non-vararg fit; a committed FuncId whose name mismatches the frame's
+  (sub-module) table re-validates against the main module before the
+  by-id serve.
+- **Diagnosed, open — sub-composition ambient composer.** The remaining
+  `testProvideAllLocals` failure and the three `deferredSubCompose_*`
+  "Vm::call_member `consume` on CompositionImpl" failures share the
+  sub-composition seam: inside `composition2.setContent { ... }` content,
+  `compose.currentComposer()` is null (the pair-threading publication
+  does not survive into the second composition's content invocation), so
+  bare composable calls cannot complete their ABI pair and
+  `CompositionLocalContext.consume`-era dispatches miss. Next step:
+  trace how `CompositionImpl.setContent` invokes content in the
+  interpreted runtime and where `threadedComposerArg` fails to see the
+  pair (likely an invoke seam that strips or never appends it).

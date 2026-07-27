@@ -2075,6 +2075,48 @@ pub fn typedCallBoundary(self: *VmHost, module: *const Module, func: *const ir.F
 }
 
 fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    // Compose ABI completion: a composable's trailing ($composer, $changed)
+    // pair is appended by the caller's pass, but a call reaching here from a
+    // context the pass could not see as composable (a sub-composition's
+    // content lambda invoked through a committed-id dispatch) arrives
+    // without it. With an ambient composer available and the argument count
+    // exactly two short of the non-vararg parameter list, complete the pair
+    // — the same completion `callValue` applies for closures. Vararg shapes
+    // are completed by the overload binder, which scored the reduced
+    // signature and knows the pair is absent.
+    if (composePluginEnabled()) {
+        if (funcAt(module, func)) |cf| {
+            const p = cf.params;
+            if (p.len >= 2 and args.len + 2 == p.len and
+                std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                std.mem.eql(u8, p[p.len - 2].name, "$composer"))
+            {
+                var no_vararg = true;
+                for (p) |pp| {
+                    if (pp.is_vararg) no_vararg = false;
+                }
+                var pair_supplied = false;
+                for (arg_names) |n| {
+                    if (n) |nm| {
+                        if (std.mem.eql(u8, nm, "$composer")) pair_supplied = true;
+                    }
+                }
+                if (no_vararg and !pair_supplied) {
+                    if (compose.currentComposer()) |comp| {
+                        const buf = try allocator.alloc(Value, args.len + 2);
+                        defer if (runtime.freeScratch()) allocator.free(buf);
+                        @memcpy(buf[0..args.len], args);
+                        buf[args.len] = comp;
+                        buf[args.len + 1] = .{ .Int = 0 };
+                        const names2 = try allocator.alloc(?[]const u8, buf.len);
+                        defer if (runtime.freeScratch()) allocator.free(names2);
+                        for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+                        return callFuncTypedInner(self, allocator, module, func, buf, names2, type_args, exact);
+                    }
+                }
+            }
+        }
+    }
     // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)` /
     // `enumEntries<T>()` (whose inline body survives as the
     // `enumEntriesIntrinsic` header — an `expect` with no compiled
@@ -2383,6 +2425,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     var best_low: ?FuncId = null;
     var best_low_score: i32 = 0;
     var best_scope_tier: u8 = 255;
+    var best_needs_pair = false;
     for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
@@ -2436,7 +2479,33 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 }
             }
         }
-        const pts = positionalPoints(self, eff, cand, shapes, scope);
+        var cand_needs_pair = false;
+        var pts = positionalPoints(self, eff, cand, shapes, scope);
+        // Compose ABI completion: a composable candidate's trailing
+        // ($composer, $changed) pair is appended by the caller's pass, but a
+        // call re-entering the binder from a synthesized route (a spread
+        // body's re-entry) arrives WITHOUT the pair. With an ambient composer
+        // available, score the user-visible params and complete the pair at
+        // dispatch — the same completion callValue applies for closures.
+        if (pts == null and composePluginEnabled()) {
+            if (sigViewOfFunc(self, eff, cand, shapes.len)) |sv| {
+                const p = sv.params;
+                if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                    std.mem.eql(u8, p[p.len - 2].name, "$composer") and
+                    compose.currentComposer() != null)
+                {
+                    var sv2 = sv;
+                    sv2.params = p[0 .. p.len - 2];
+                    if (sv2.defaults) |d| {
+                        if (d.len >= 2) sv2.defaults = d[0 .. d.len - 2];
+                    }
+                    if (applicability.applicable(&sv2, shapes, scope)) |sc2| {
+                        pts = sc2.points;
+                        cand_needs_pair = true;
+                    }
+                }
+            }
+        }
         if (ntrace) {
             const dbg_sig = sigViewOfFunc(self, eff, cand, shapes.len);
             std.debug.print("[cno] {s} cand={d} nargs={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
@@ -2475,6 +2544,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             } else if (best_ord == null or total > best_ord_score) {
                 best_ord = cand;
                 best_ord_score = total;
+                best_needs_pair = cand_needs_pair;
             }
         }
     }
@@ -2552,6 +2622,24 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 return .{ .ok = Value.Unit };
             }
         }
+    }
+    if (best_needs_pair) {
+        // Complete the compose ABI pair from the ambient composer (matched
+        // against the reduced signature above).
+        const comp = compose.currentComposer().?;
+        const buf = try allocator.alloc(Value, args.len + 2);
+        defer if (runtime.freeScratch()) allocator.free(buf);
+        @memcpy(buf[0..args.len], args);
+        buf[args.len] = comp;
+        buf[args.len + 1] = .{ .Int = 0 };
+        const names2 = try allocator.alloc(?[]const u8, buf.len);
+        defer if (runtime.freeScratch()) allocator.free(names2);
+        for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+        const rp = try callFuncTyped(self, allocator, eff, func, buf, names2, &.{}, exact_dispatch);
+        return switch (rp) {
+            .ok => |v| .{ .ok = v },
+            .err => |e| .{ .err = e },
+        };
     }
     const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, exact_dispatch);
     return switch (r) {

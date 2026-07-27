@@ -11912,19 +11912,28 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         for (slots) |*s| s.* = null;
         var positionals: std.ArrayList(Value) = .empty;
         defer positionals.deinit(allocator);
+        var shape_mismatch = false;
         for (args, 0..) |a, i| {
             const named: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
             if (named) |arg_name| {
+                var matched = false;
                 for (params, 0..) |p, pos| {
                     if (std.mem.eql(u8, p, arg_name)) {
                         slots[pos] = a;
+                        matched = true;
                         break;
                     }
                 }
+                // A named argument this signature does not declare means the
+                // call targets a DIFFERENT overload (the stdlib's internal
+                // `indexOf(..., last = true)` reaching the public 3-param
+                // table): silently dropping it truncated real arguments.
+                if (!matched) shape_mismatch = true;
             } else {
                 try positionals.append(allocator, a);
             }
         }
+        if (shape_mismatch) continue;
         // Trailing lambda binds to the last parameter.
         if (positionals.items.len != 0) {
             const last = positionals.items[positionals.items.len - 1];
@@ -11941,6 +11950,10 @@ fn stdlibNamedDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
                 } else break;
             }
         }
+        // Positional arguments beyond this signature's parameter count mean
+        // the call targets a different overload; dropping them truncated
+        // real arguments (the internal indexOf's ignoreCase flag).
+        if (pit < positionals.items.len) continue;
         var reordered: std.ArrayList(Value) = .empty;
         defer reordered.deinit(allocator);
         for (slots) |s| try reordered.append(allocator, s orelse Value.Null);

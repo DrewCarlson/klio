@@ -6985,6 +6985,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (cmg.candidates != null) break :blk null;
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
+                // A committed id can belong to the MAIN module's table while
+                // this frame runs sub-module code (the same integer names an
+                // unrelated function there — a restart lambda served a
+                // CompositionLocalProvider call). A name mismatch in the
+                // frame's table re-validates against the main module, whose
+                // id space the host's by-id lookup resolves.
+                if (!std.mem.eql(u8, cf.name, name_str)) {
+                    if (comptime @hasDecl(H, "mainFuncNameMatches")) {
+                        if (host.mainFuncNameMatches(fid, name_str)) break :blk fid;
+                    }
+                    break :blk null;
+                }
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
                 break :blk fid;
             };

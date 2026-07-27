@@ -359,6 +359,7 @@ pub const VmHost = struct {
     pub const localClassValue = host_classes.localClassValue;
     pub const lookupGlobal = host_globals.lookupGlobal;
     pub const lookupGlobalById = host_globals.lookupGlobalById;
+    pub const mainFuncNameMatches = host_globals.mainFuncNameMatches;
     pub const lookupGlobalThrowing = host_globals.lookupGlobalThrowing;
     pub const storeGlobal = host_globals.storeGlobal;
     pub const isShadowingCapture = host_globals.isShadowingCapture;

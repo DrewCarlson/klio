@@ -1575,6 +1575,16 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
     return .{ .ok = {} };
 }
 
+/// Whether `fid` names `name` in the MAIN module's function table — the id
+/// space lowering commits for cross-module bare calls. A sub-module frame
+/// validates a committed id here before serving it by id.
+pub fn mainFuncNameMatches(self: *VmHost, fid: ir.FuncId, name: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const f = mg.get().funcById(fid) orelse return false;
+    return std.mem.eql(u8, f.name, name);
+}
+
 pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []const u8) Allocator.Error!MaybeValueResult {
     var top_prop_buf: [256]u8 = undefined;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
