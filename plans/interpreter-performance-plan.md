@@ -745,3 +745,30 @@ per-class clusters tracked in the resolution plan.
   CAPTURED main-`\$composer` through a stale binding rather than the
   passed `c`). Note the pack in the itest home now carries this
   session's lowering (rebuilt); baseline held at 27/31.
+
+
+## Deferred sub-compose cluster — CLOSED (pass threading fix)
+
+Root cause chain, fully instrumented: a PLAIN `() -> Unit` lambda in
+value position (returned from `testDeferredSubcomposition`) inherited
+the compose pass's `thread` flag from the enclosing composable body, so
+its inner setContent-sink wrap emitted
+`rememberComposableLambda($composer, ...)` capturing the ENCLOSING
+composer. Executed later OUTSIDE composition (`doSubCompose()`), the
+`remember` recorded an AppendValue into that composer's already-drained
+change list (`isComposing=false`), and the next recompose tripped
+"Expected applyChanges() to have been called" — surfacing as the
+deferredSubCompose "consume on CompositionImpl"/"no changes" family.
+The walker now RESETS `thread` for value-position lambda literals
+(kotlinc composes only through composable sinks and inline splices);
+inline-callee lambda args keep threading via an explicit arm.
+
+Results: deferredSubCompose_{Static,Dynamic,Nested_Static} pass;
+CompositionLocalTests 27/31 → 30/31; CompositionReusingTests 9/25 →
+25/25; CompositionObserverTests 8/13 → 13/13; every other probe and the
+full stdlib sweep (117 files, 0 failures) unchanged. Remaining in
+CompositionLocalTests: testProvideAllLocals ("unresolved global
+CompositionLocalProvider" — the sub-module bare-call resolution case
+diagnosed earlier: the CMG global leg cannot resolve the main-module
+composable by name from the anon sub-module frame; candidates/committed
+id validated but the name-lookup fallback still misses).

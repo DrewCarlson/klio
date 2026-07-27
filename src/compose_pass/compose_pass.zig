@@ -2048,6 +2048,14 @@ const Walker = struct {
                             // positionally.
                         }
                     } else if (arg.* == .Lambda and w.thread and name != null and
+                        calleeInlinesLambda(name.?))
+                    {
+                        // An INLINE callee's lambda body composes inline in
+                        // the enclosing composable: keep threading (the
+                        // generic lambda walk below now RESETS it for plain
+                        // value-position lambdas).
+                        if (!lambdaHasComposerParams(&arg.Lambda)) try w.walkBlock(&arg.Lambda.body);
+                    } else if (arg.* == .Lambda and w.thread and name != null and
                         !calleeInlinesLambda(name.?))
                     {
                         // A plain callback lambda at a non-inline callee
@@ -2253,7 +2261,24 @@ const Walker = struct {
                 // lambda's own composer immediately. A surrounding expression
                 // walk may encounter that shared node again; do not thread or
                 // bracket its body a second time.
-                if (!lambdaHasComposerParams(lam)) try w.walkBlock(&lam.body);
+                //
+                // A PLAIN lambda in value position (a returned `() -> Unit`,
+                // a stored callback) is not composable content even inside a
+                // composable body: kotlinc composes only through composable
+                // sinks and inline splices. Keeping the thread flag made a
+                // deferred `{ Composition(...).apply { setContent { ... } } }`
+                // emit `rememberComposableLambda($composer, ...)` capturing
+                // the ENCLOSING composer — executed later OUTSIDE composition,
+                // it recorded into that composer's drained change list and
+                // tripped "Expected applyChanges() to have been called".
+                // Inline-callee lambda args keep threading via their explicit
+                // arm in the call walk.
+                if (!lambdaHasComposerParams(lam)) {
+                    const saved = w.thread;
+                    w.thread = false;
+                    try w.walkBlock(&lam.body);
+                    w.thread = saved;
+                }
             },
             .AnonFun => |*af| if (af.body) |ab| switch (ab.*) {
                 .Block => |*blk| try w.walkBlock(blk),
