@@ -7037,7 +7037,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // class) may bind by id here; a receiverless value invocation
             // of an extension misbinds every parameter.
             const by_id_func: ?FuncId = blk: {
-                if (cmg.candidates != null) break :blk null;
+                // A bounded candidate set blocks the NAME fallback below, but
+                // not the lowering's own committed id: the restart lambda's
+                // `Defaults($rc, $changed or 1)` carries both a Unit-receiver
+                // candidate (which misses) and the committed global — the id
+                // is the lowering's resolution, not a same-simple-name
+                // widening, and the name/arity guards below still validate it.
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
                 // A committed id can belong to the MAIN module's table while
