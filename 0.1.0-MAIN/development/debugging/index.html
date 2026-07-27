@@ -2370,8 +2370,14 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <tr>
 <td><code>KLIO_GC_DEBUG</code></td>
 <td>set; <code>0</code>/empty off</td>
-<td>One summary line per collection: epoch, marked, live bytes, freed</td>
+<td>One summary line per collection: epoch, kind (minor/major), marked, live bytes, freed</td>
 <td><code>[kgc]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_GC_GEN</code></td>
+<td><code>1</code> on (default), <code>0</code> off</td>
+<td>Generational collection: minor (nursery-only) sweeps between Appel-scheduled majors; <code>0</code> forces every collection major</td>
+<td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_GC_HIST</code></td>
