@@ -519,7 +519,26 @@ pub fn spliceInlineLambda(
         b.setSpliceHint(true, b.receiverLambdaRecvHead(lambda_name));
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
+    // Body-declared `var`s a nested closure WRITES must box (`var expected
+    // = 0` in a spliced lambda whose `repeat { expected += 2 }` closure
+    // mutates it) — the same scan `tryInlineCallWithTypeArgs` runs for an
+    // inline FN body. Without the mark the decl emits a plain slot and the
+    // closure's compound assign mis-routes to `plusAssign` on the value.
+    var lam_boxed_here: std.ArrayList([]const u8) = .empty;
+    defer lam_boxed_here.deinit(b.allocator);
+    {
+        var body_boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
+        defer body_boxed.deinit();
+        var bit = body_boxed.keyIterator();
+        while (bit.next()) |k| {
+            if (!b.isBoxed(k.*)) {
+                try b.markBoxed(k.*);
+                try lam_boxed_here.append(b.allocator, k.*);
+            }
+        }
+    }
     const v = try lowerBlock(b, &body);
+    for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
