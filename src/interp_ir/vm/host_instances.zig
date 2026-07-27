@@ -2240,6 +2240,46 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             defer mg.deinit();
             return self.callFunc(allocator, mg.get(), fid, effective.items);
         }
+        // Compose ABI completion: a same-named COMPOSABLE factory (a
+        // file-private `@Composable fun Stack(...)` shadowed by a pack's
+        // internal `class Stack`) carries the pass-appended ($composer,
+        // $changed) pair the ctor-shaped call site never wrote. With a
+        // composer ambient, complete the pair and re-pick.
+        if (host_call_func.composePluginEnabled()) {
+            if (@import("compose.zig").currentComposer()) |c| {
+                var ext: std.ArrayList(Value) = .empty;
+                defer ext.deinit(allocator);
+                try ext.appendSlice(allocator, effective.items);
+                try ext.append(allocator, c);
+                try ext.append(allocator, .{ .Int = 0 });
+                if (try pickFactory(self, allocator, class_name, ext.items)) |fid| {
+                    const module_ref = self.module.clone();
+                    defer module_ref.deinit();
+                    const mg = module_ref.borrow();
+                    defer mg.deinit();
+                    return self.callFunc(allocator, mg.get(), fid, ext.items);
+                }
+            }
+        }
+        // A same-named member EXTENSION on an enclosing implicit receiver is
+        // Kotlin's target when the ctor shape does not fit: `validate {
+        // Stack(h) { ... } }` calls the file's `MockViewValidator.Stack`,
+        // never the pack's internal `class Stack` constructor.
+        {
+            const encl = ir.eval.enclosingEntriesAlloc(allocator) catch &.{};
+            defer allocator.free(@constCast(encl));
+            for (encl) |e| {
+                if (e.v != .Instance) continue;
+                const r = try host_call_member.callMember(self, allocator, &e.v, class_name, effective.items);
+                if (!(r == .err and r.err == .Unimplemented)) return r;
+                if (r.err == .Unimplemented) {
+                    const m3 = r.err.Unimplemented;
+                    if (std.mem.indexOf(u8, m3, "Vm::call_member") != null and runtime.freeScratch()) {
+                        allocator.free(m3);
+                    }
+                }
+            }
+        }
         if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
             std.debug.print("[ctor-arity-miss] class={s} fqn={s} n_primary={d} got={d}\n", .{ class_name, classDefFqn(class_def), n_primary, effective.items.len });
             ir.eval.dumpFrameChainForDiagAlways();
