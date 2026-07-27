@@ -520,7 +520,8 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   re-fetched after the receiver lowers (plus a zero-param virtual guard).
   NOTE the pattern: any `*const Func` held across expression lowering is
   a landmine; other sites should be audited for the same shape.
-- **Unmasked by the crash fix, diagnosed, open:** `thenBy`'s SAM lambda
+- **thenBy receiver — FIXED by the splice `this@<fn>` binding below:**
+  (previously) `thenBy`'s SAM lambda
   (`Comparator { a, b -> this.compare(a, b) ... }` in the inline body)
   loses the spliced receiver: the lambda's creation chain does not carry
   the splice's bound `this`, so `this.compare` resolves against the
@@ -582,19 +583,19 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   frame/module context the local-ext member resolution needs. Repro:
   scratchpad localext.kt line 6.
 
-Remaining clusters (8): ResultTest (past
-`throwOnFailure`, assertion-level, 4), thenBy
-receiver above (2),
-CollectionTest.sortedByNullable local-ext layer above (1), GroupingTest
-iterator on anon (1 — narrowed twice: `"abc".groupingBy { it.code }
-.sourceIterator()` itself fails; inside the spliced
-`CharSequence.groupingBy` anon, `sourceIterator()`'s
-`this@groupingBy.iterator()` resolves the label-qualified this to the
-ANON instead of the spliced String receiver ("Vm::call_member
-`iterator` on $anon$0"). The List/Iterable variant of the same shape
-works, so the anon enclosing-receiver capture exists but drops the
-CharSequence/String receiver — likely the non-Instance-receiver case
-of the anon capture machinery. Repro scratchpad asseq3.kt).
+- **Splice `this@<fn>` label binding — FIXED (3 tests: GroupingTest +
+  both thenBy).** A real extension call binds `this@<fn>` at function
+  entry; an inline SPLICE bound only `this`, so a label-qualified
+  receiver inside the spliced body — including an anon object's member
+  (`this@groupingBy.iterator()` in `CharSequence.groupingBy`) and a SAM
+  lambda's `this.compare` in `thenBy` — fell back to the anon/class walk
+  and resolved the wrong receiver. The splice now binds the label
+  alongside `this`, and the existing capture machinery carries it into
+  anon members and lambdas.
+
+Remaining clusters (5): ResultTest (past `throwOnFailure`,
+assertion-level, 4), CollectionTest.sortedByNullable local-ext layer
+above (1).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in

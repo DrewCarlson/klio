@@ -1359,7 +1359,15 @@ pub fn tryInlineCallWithTypeArgs(
         }
     };
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
-    if (explicit_receiver) |receiver| try b.bind("this", receiver);
+    if (explicit_receiver) |receiver| {
+        try b.bind("this", receiver);
+        // `this@<fn>` inside the spliced body (including an anon object's
+        // members, which capture it by this name) must reach the splice
+        // receiver — a real call binds the label at function entry; the
+        // splice provides the same binding in its scope.
+        const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{fname});
+        try b.bind(label, receiver);
+    }
     if (ext_splice) {
         prev_splice_window = b.lambda_splice_resolve;
         b.lambda_splice_resolve = null;
