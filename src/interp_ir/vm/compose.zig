@@ -92,6 +92,16 @@ pub fn currentComposer() ?Value {
 /// 1`). In both shapes the `$composer` value is the second-to-last argument. It
 /// must be an `Instance` (the real Composer) — a defaulted/absent composer is
 /// not a stack entry.
+/// As `threadedComposerArg`, logging the owning declaration under the
+/// KLIO_COMPOSER_BIND_TRACE diagnostic.
+pub fn threadedComposerArgFor(fqn: []const u8, params: []const ir.Param, args: []const Value) ?Value {
+    const got = threadedComposerArg(params, args);
+    if (got != null and runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
+        std.debug.print("[composer-bind-fn] {s}\n", .{fqn});
+    }
+    return got;
+}
+
 pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value {
     if (params.len < 2 or args.len < 2) return null;
     if (args.len != params.len and args.len != params.len - 1) return null;
@@ -102,9 +112,15 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     if (runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
         const ig = composer.Instance.borrow();
         const cg = ig.get().class.borrow();
-        std.debug.print("[composer-bind] class={s} args={d} params={d}\n", .{ cg.get().name, args.len, params.len });
+        const cls_name = cg.get().name;
+        std.debug.print("[composer-bind] class={s} args={d} params={d} last={s}\n", .{ cls_name, args.len, params.len, @tagName(std.meta.activeTag(args[args.len - 1])) });
+        // A non-Composer instance in the pair slot is the misbind under
+        // investigation: dump the interpreter frame chain to find the frame
+        // that first received it.
+        const is_composer = std.mem.indexOf(u8, cls_name, "Composer") != null;
         cg.deinit();
         ig.deinit();
+        if (!is_composer) ir.eval.dumpFrameChainForDiagAlways();
     }
     return composer;
 }

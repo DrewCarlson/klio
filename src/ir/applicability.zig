@@ -930,6 +930,18 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     var idx: usize = 0;
     while (idx < params.len and idx < args.len) : (idx += 1) {
         if (vp != null and idx == vp.?) break;
+        if (params[idx].is_vararg) {
+            // A MID-position vararg fed one packed array (the flattened
+            // spread `f(*arr, content, $composer, $changed)`): this is the
+            // exact shape `packVarargArgs` passes through at dispatch, so
+            // scoring the array against the ELEMENT type must not refute
+            // the candidate. Neutral score, counted unknown.
+            const cls = args[idx].runtime_class orelse "";
+            if (std.mem.endsWith(u8, cls, "Array")) {
+                unknown += 1;
+                continue;
+            }
+        }
         const sc = scoreArg(sig, &params[idx].ty, &args[idx], &scope) orelse return null;
         total += sc;
         if (argIsProven(&args[idx])) proven += 1 else unknown += 1;

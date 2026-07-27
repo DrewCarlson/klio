@@ -5104,6 +5104,13 @@ noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Fram
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+fn modCountFrozenEval(mc: ?runtime.ObjRef(u64)) bool {
+    const cell = mc orelse return false;
+    const g = cell.borrow();
+    defer g.deinit();
+    return (g.get().* & runtime.FROZEN_MOD_BIT) != 0;
+}
+
 noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: *Frame, cf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cf.receiver);
     const v = frame.read(cf.value);
@@ -5119,8 +5126,15 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
     // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
     // from its `add`. Either way there is NO write-back to the
     // (read-only) property.
+    // A READ-ONLY collection value cannot inhabit a Mutable*-typed
+    // property in well-typed Kotlin, so its `+=` resolved to the binary
+    // `plus` with a property write-back (`var invalidations: List<...>;
+    // reference.invalidations += pair` builds a NEW list) — never the
+    // in-place `plusAssign` (which the intrinsic guard would refuse).
     const is_collection = switch (cur) {
-        .List, .Set, .Map => true,
+        .List => |l| l.mutable and !modCountFrozenEval(l.mod_count),
+        .Set => |st| st.mutable and !modCountFrozenEval(st.mod_count),
+        .Map => |m| m.mutable,
         else => false,
     };
     const assign = compoundAssignMethod(cf.op);
@@ -5156,6 +5170,20 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
                     .err => |e| return raiseStep(frame, e),
                 }
             }
+        }
+        // A read-only collection combines through its binary operator
+        // intrinsic (`List + element`, `Map + Pair`), producing the fresh
+        // value the property write-back stores.
+        switch (cur) {
+            .List, .Set, .Map => {
+                if (operatorMethod(cf.op)) |method| {
+                    switch (try host.callMember(allocator, &cur, method, &.{v})) {
+                        .ok => |rv| break :blk rv,
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            },
+            else => {},
         }
         switch (try applyBinop(allocator, cf.op, &cur, &v)) {
             .ok => |rv| break :blk rv,
@@ -6601,12 +6629,16 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // value's type, which may be a subtype carrying its own
         // same-name extension. Hand the declared head to the strict
         // probe for exactly that candidate.
+        var static_from_instr = false;
         const static_recv_ty: ?[]const u8 = blk: {
             // The lowering-recorded declared receiver wins: the executing
             // frame may be a synthesized closure (a suspend body) whose own
             // kind says nothing about the extension receiver.
             if (cmg.static_recv) |sc| {
-                if (constStr(frame.module, sc)) |sname| break :blk sname;
+                if (constStr(frame.module, sc)) |sname| {
+                    static_from_instr = true;
+                    break :blk sname;
+                }
             }
             // Extension bodies resolve a bare call against the extension's
             // DECLARED receiver type.
@@ -6692,8 +6724,14 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
             // The lowering-recorded receiver type describes the innermost
             // implicit receiver — the first candidate — regardless of the
-            // wrapper identity a suspend transform gave the value.
-            const hint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
+            // wrapper identity a suspend transform gave the value. A
+            // FRAME-derived hint (the enclosing extension's declared
+            // receiver) describes only the frame's own `this`: applying it
+            // to an inner receiver-lambda subject (`apply { minusAssign(k) }`
+            // inside `Map.minus`) refutes the very candidates the subject
+            // satisfies.
+            const hint: ?[]const u8 = if (static_recv_ty != null and
+                (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
                 static_recv_ty
             else
                 null;
@@ -6778,7 +6816,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // strictly, so an unprovable pick never outranks a real member.
         if (resolved == null) {
             for (cands, 0..) |c, ci| {
-                const lhint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
+                const lhint: ?[]const u8 = if (static_recv_ty != null and
+                    (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
                     static_recv_ty
                 else
                     null;
@@ -6974,6 +7013,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                 if (cmg.candidates != null) break :blk null;
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
+                // A committed id can belong to the MAIN module's table while
+                // this frame runs sub-module code (the same integer names an
+                // unrelated function there — a restart lambda served a
+                // CompositionLocalProvider call). A name mismatch in the
+                // frame's table re-validates against the main module, whose
+                // id space the host's by-id lookup resolves.
+                if (!std.mem.eql(u8, cf.name, name_str)) {
+                    if (comptime @hasDecl(H, "mainFuncNameMatches")) {
+                        if (host.mainFuncNameMatches(fid, name_str)) break :blk fid;
+                    }
+                    break :blk null;
+                }
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
                 break :blk fid;
             };

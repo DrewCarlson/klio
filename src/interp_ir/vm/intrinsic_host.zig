@@ -463,6 +463,14 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
             return .{ .err = .{ .Type = msg } };
         };
+        // A receiver lambda invoked as a plain value with one extra leading
+        // arg is the compiler ABI's flattened form: the receiver rides as the
+        // first positional (`ComposableLambdaImpl.invoke(p1, c, changed)`
+        // feeding an `R.()` block). Bind it as the receiver; padding it into
+        // the positional params would misfeed a pass-appended pair.
+        if (info.receiver_shape_known and info.has_receiver and args.len == info.n_params + 1) {
+            return invokeCallableWithThis(self, callable, args[1..], &args[0], out);
+        }
         const module_g = self.module.borrow();
         defer module_g.deinit();
         const module = info.module orelse module_g.get();
@@ -596,10 +604,27 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
             // The receiver fills the leading declared positional when the
             // caller left one unfilled; otherwise the lambda is an
             // ordinary value function and the receiver must not displace
-            // its parameter.
+            // its parameter. Pass-threaded ($composer, $changed) params are
+            // NOT user positionals: filling one with the receiver made the
+            // `apply { setContent { ... } }` subject the ambient composer
+            // for the whole sub-composition.
+            var fill_params = inf.n_params;
+            {
+                const mg2 = self.module.borrow();
+                defer mg2.deinit();
+                const m2 = inf.module orelse mg2.get();
+                if (m2.funcById(inf.body_func)) |bf| {
+                    const p2 = bf.params;
+                    if (p2.len >= 2 and std.mem.eql(u8, p2[p2.len - 1].name, "$changed") and
+                        std.mem.eql(u8, p2[p2.len - 2].name, "$composer"))
+                    {
+                        fill_params -|= 2;
+                    }
+                }
+            }
             var all: std.ArrayList(Value) = .empty;
             defer all.deinit(self.allocator);
-            if (inf.n_params >= 1 and args.len < inf.n_params) {
+            if (fill_params >= 1 and args.len < fill_params) {
                 try all.append(self.allocator, this_value.*);
                 for (args) |a| try all.append(self.allocator, a);
             } else {

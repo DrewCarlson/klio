@@ -836,6 +836,31 @@ fn lowerAssign(
         else => false,
     };
     if (op != .Assign and path_is_val) {
+        // A bare name the enclosing class declares as a MEMBER (`count++`
+        // inside an anon object's method, with `override var count`) is a
+        // compound on `this.count` — never an `<op>Assign` dispatch on the
+        // member's VALUE (an Int has no plusAssign).
+        blk: {
+            const pname = target.Path.segments[0].name;
+            if (b.resolve(pname) != null or !b.hasOwnMember(pname)) break :blk;
+            const this_reg = b.resolve("this") orelse break :blk;
+            const bin: BinOp = switch (op) {
+                .Add => .Add,
+                .Sub => .Sub,
+                .Mul => .Mul,
+                .Div => .Div,
+                .Rem => .Mod,
+                .Assign => unreachable,
+            };
+            const field = try b.module.internConst(b.allocator, .{ .String = pname });
+            try b.push(.{ .CompoundField = .{
+                .receiver = this_reg,
+                .field = field,
+                .op = bin,
+                .value = v,
+            } });
+            return null;
+        }
         const method_name = switch (op) {
             .Add => "plusAssign",
             .Sub => "minusAssign",

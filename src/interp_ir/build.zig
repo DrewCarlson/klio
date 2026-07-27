@@ -1247,6 +1247,26 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]c
     return null;
 }
 
+/// The materialized array head a `vararg` property has (mirrors the body-side
+/// mapping in ir/lower/decl.zig): a primitive-specialized array for primitive
+/// elements, `Array` otherwise (including generic elements).
+fn varargPropArrayHead(elem: []const u8) []const u8 {
+    const eq = std.mem.eql;
+    if (eq(u8, elem, "Byte")) return "ByteArray";
+    if (eq(u8, elem, "Short")) return "ShortArray";
+    if (eq(u8, elem, "Int")) return "IntArray";
+    if (eq(u8, elem, "Long")) return "LongArray";
+    if (eq(u8, elem, "Char")) return "CharArray";
+    if (eq(u8, elem, "Boolean")) return "BooleanArray";
+    if (eq(u8, elem, "Float")) return "FloatArray";
+    if (eq(u8, elem, "Double")) return "DoubleArray";
+    if (eq(u8, elem, "UByte")) return "UByteArray";
+    if (eq(u8, elem, "UShort")) return "UShortArray";
+    if (eq(u8, elem, "UInt")) return "UIntArray";
+    if (eq(u8, elem, "ULong")) return "ULongArray";
+    return "Array";
+}
+
 fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     const head = ty.name.name;
     for (c.type_params) |*tp| {
@@ -1861,7 +1881,17 @@ fn buildModuleWithOverrides(
             const c = &d.Class;
             for (c.primary_params) |*pp| {
                 if (pp.property == null) continue;
-                if (classPropHead(c, &pp.ty)) |head| {
+                // A `vararg val` property's OBSERVED type is the materialized
+                // array (`vararg val elements: T` is an `Array<out T>`), never
+                // the element head — recording the element (or its bound)
+                // made `elements.any { ... }` resolve against the wrong
+                // receiver and decline the Array extension.
+                if (pp.is_vararg) {
+                    try module.registry.class_prop_type_heads.put(
+                        .{ .a = c.name.name, .b = pp.name.name },
+                        varargPropArrayHead(pp.ty.name.name),
+                    );
+                } else if (classPropHead(c, &pp.ty)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
                 }
             }

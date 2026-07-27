@@ -4811,6 +4811,47 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A qualified member-inline call whose lambda (literal or forwarded)
+    // carries a labeled return TARGETING AN OPEN INLINE SPLICE must splice:
+    // kotlinc inlines these, and the label targets a frameless spliced
+    // scope in the caller, so the dynamic member dispatch can never deliver
+    // the return (`slots.table.traverseGroupAndParents(target) {
+    // … return@apply … }` otherwise unwinds a LabeledReturn past every
+    // frame). Everything else keeps the dynamic path.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        inline_call.argLambdaTargetsSplicedLabel(b, args))
+    {
+        const mname = callee.Member.name.name;
+        const receiver = callee.Member.receiver;
+        const expected = b.peekExpected();
+        const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+        if (inline_state.candidatesForName(mname)) |cands| {
+            // STRICT owner evidence only: the receiver's static type must be
+            // known and carry the candidate's owner in its hierarchy. The
+            // lenient unknown-receiver keep would splice an unrelated
+            // same-named member (`values.forEach` on a Set binding
+            // LockFreeLinkedListNode.forEach).
+            const head = try inline_call.gateReceiverHead(b, receiver);
+            if (head != null) {
+                for (cands) |cf| {
+                    if (cf.receiver_type != null) continue;
+                    const owner = inline_state.inlineMemberOwner(cf) orelse continue;
+                    // A duplicated class name is uniquified per file at
+                    // registration (`SlotTable$f356`); the inferred head
+                    // carries the source-level name, so also accept a
+                    // base-name match.
+                    const owner_base = if (std.mem.indexOf(u8, owner, "$f")) |i| owner[0..i] else owner;
+                    if (!classIsOrExtendsHosted(b, head.?, owner) and
+                        !std.mem.eql(u8, head.?, owner_base)) continue;
+                    if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+                        return r;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     // `recv?.m(args)` — null-guard the whole call.
     if (callee.* == .Member and callee.Member.safe) {
         const receiver = callee.Member.receiver;
@@ -8861,8 +8902,11 @@ fn resolveCtxFor(
         .has_type_args = ast_type_args.len != 0,
         .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
-        .recv_ty = b.recvTy(),
-        .recv_type = b.recvTypeRef(),
+        .recv_ty = b.thisNarrow() orelse b.recvTy(),
+        .recv_type = if (b.thisNarrow()) |t|
+            ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else
+            b.recvTypeRef(),
         .actual_type_param_bounds = actual_type_param_bounds,
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
@@ -10213,8 +10257,20 @@ fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
 }
 
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
-    const rt = b.recvTy() orelse return null;
+    const rt = bareStaticRecvHead(b) orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
+}
+
+/// The static-receiver head a BARE call's dispatch hint should carry.
+/// Inside an active inline splice this is the spliced fn's own receiver
+/// (null for a receiver-less inline fn) — Kotlin inline bodies are
+/// hygienic, so a bare call written in the stdlib body must never resolve
+/// against the inline SITE's class. Outside a splice: the enclosing
+/// function's receiver, as before.
+fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
+    if (b.thisNarrow()) |t| return t;
+    if (b.spliceHintActive()) return b.spliceHintRecv();
+    return b.recvTy();
 }
 
 /// Package/import-scoped declarations carried by a deferred bare call. The
@@ -10458,7 +10514,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         // Inside an extension body the implicit `this` has the
         // extension's declared receiver type; record it so dispatch
         // resolves extensions against the STATIC type, as kotlinc does.
-        const static_recv: ?ConstId = if (b.recvTy()) |rt|
+        const static_recv: ?ConstId = if (bareStaticRecvHead(b)) |rt|
             try b.module.internConst(b.allocator, .{ .String = rt })
         else
             null;
@@ -11433,7 +11489,7 @@ fn lowerResolvedMemberCall(
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
     if (resolved.dispatch == .deferred) return .deferred;
-    const target = b.module.funcById(func_id) orelse return .deferred;
+    var target = b.module.funcById(func_id) orelse return .deferred;
     const has_spread = anySpread(args);
     if (resolved.dispatch == .direct and has_spread) return .deferred;
     if (resolved.dispatch == .virtual) {
@@ -11469,7 +11525,15 @@ fn lowerResolvedMemberCall(
     b.pending_arg_lambda_param_types = lambda_param_types;
 
     const recv_reg = try lowerReceiver(b, receiver);
+    // Lowering the receiver expression can append functions (a lambda in the
+    // receiver lowers into the module's func table) and reallocate it,
+    // invalidating `target`; re-fetch the pointer before reading it again.
+    target = b.module.funcById(func_id) orelse return .deferred;
     if (resolved.dispatch == .virtual) {
+        // A virtual target without even a receiver param cannot be bound
+        // here on any path (the named/vararg mapping below already deferred
+        // it); defer before the receiver-skipping scans slice params[1..].
+        if (target.params.len == 0) return .deferred;
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -11477,7 +11541,6 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            if (target.params.len == 0) return .deferred;
             const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return .deferred;
             defer b.allocator.free(mapped);
             for (mapped) |param| if (param == null) return .deferred;
@@ -11832,6 +11895,31 @@ fn localOverloadReceiverCouldApply(
     defer if (owned_bounds) |bounds| b.allocator.free(bounds);
     const actual_bounds: []const ir.ModuleRegistry.TypeParamBound =
         owned_bounds orelse &.{};
+    // An actual head that names NO known classifier and carries no bound
+    // here is a type parameter of a spliced/generic context (`it: T` inside
+    // `compareBy`'s SAM lambda, where T instantiates to the caller's
+    // element type) — statically unresolvable, so it must not DISPROVE the
+    // overload; the runtime receiver decides.
+    {
+        const head = typeHead(actual.name);
+        var bound_known = false;
+        for (actual_bounds) |tb| {
+            if (std.mem.eql(u8, tb.param, head)) bound_known = true;
+        }
+        // Builtin heads (`Nothing?`, primitives, `Any`, `String`, ...) are
+        // known classifiers even without a module class entry — they keep
+        // the full subtype judgment (a `Nothing?` actual must still refute
+        // a `String` receiver).
+        const builtin_head = isPrimitiveTypeName(head) or
+            std.mem.eql(u8, head, "Nothing") or std.mem.eql(u8, head, "Any") or
+            std.mem.eql(u8, head, "Unit") or std.mem.eql(u8, head, "String") or
+            std.mem.eql(u8, head, "CharSequence");
+        if (!builtin_head and !bound_known and b.module.classId(head) == null and
+            b.module.registry.class_super_names.get(head) == null)
+        {
+            return true;
+        }
+    }
     if (overload.receiver_has_type_params) {
         return b.module.staticGenericReceiverApplicable(
             b.allocator,

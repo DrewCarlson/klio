@@ -207,12 +207,36 @@ pub fn lowerWhenWithSubjectReg(
             .f = next_blk,
         } });
         b.switchTo(body_blk);
+        // A subjectless branch narrows by EVERY proof its condition
+        // establishes, `&&`-chains included (`v1 is ByteArray && v2 is
+        // ByteArray -> v1 contentEquals v2` smart-casts both), plus the
+        // truthy null-checks — the same collection an `if` guard applies.
+        var cond_narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+        defer cond_narrowed.deinit(b.allocator);
         const narrowed = if (subject != null)
             try narrowSubjectForBranch(b, subject, &branch)
-        else
-            try narrowConditionForBranch(b, &branch);
+        else blk: {
+            try narrowConditionForBranchAll(b, &branch, &cond_narrowed);
+            break :blk null;
+        };
+        // `when (this) { is T -> ... }` smart-casts the implicit receiver:
+        // the branch body's calls resolve extensions against T (kotlinc
+        // resolves statically, so `is List -> this.single()` must select
+        // `List.single`, not recurse into the enclosing `Iterable.single`).
+        const narrowed_this: ?(?[]const u8) = blk: {
+            const subj = subject orelse break :blk null;
+            if (subj.* != .This) break :blk null;
+            if (branch.patterns.len != 1) break :blk null;
+            if (branch.patterns[0].kind != .IsType) break :blk null;
+            const head = expr_lower.loweredCheckTypeName(b, &branch.patterns[0].kind.IsType);
+            if (head.len == 0) break :blk null;
+            break :blk b.setThisNarrow(head);
+        };
         const v = try lowerExpr(b, &branch.body);
+        if (narrowed_this) |prev| _ = b.setThisNarrow(prev);
         if (narrowed) |n| b.restoreLocal(n);
+        var cn = cond_narrowed.items.len;
+        while (cn > 0) : (cn -= 1) b.restoreLocal(cond_narrowed.items[cn - 1]);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         b.terminate(.{ .Goto = join });
         b.switchTo(next_blk);
@@ -224,16 +248,20 @@ pub fn lowerWhenWithSubjectReg(
     return result;
 }
 
-/// A subjectless `when` branch whose sole condition is an `is` check carries
-/// the same smart-cast evidence as an `if` condition.
-fn narrowConditionForBranch(
+/// A subjectless `when` branch's condition carries the same smart-cast
+/// evidence as an `if` condition: every `is` check in its `&&` chain and
+/// every truthy null-check narrows for the branch body. Applied in source
+/// order; the caller restores in reverse.
+fn narrowConditionForBranchAll(
     b: *FuncBuilder,
     branch: *const ast.WhenBranch,
-) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
-    if (branch.patterns.len != 1) return null;
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (branch.patterns.len != 1) return;
     const p = &branch.patterns[0];
-    if (p.kind != .Value) return null;
-    return expr_lower.narrowIsCheck(b, &p.kind.Value);
+    if (p.kind != .Value) return;
+    try expr_lower.narrowIsCheckAll(b, &p.kind.Value, out);
+    try expr_lower.narrowNullCheckAll(b, &p.kind.Value, true, out);
 }
 
 /// A single `is T` pattern over a bare-name subject smart-casts that name to
@@ -249,13 +277,22 @@ fn narrowSubjectForBranch(
     branch: *const ast.WhenBranch,
 ) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
     const subj = subject orelse return null;
-    if (subj.* != .Path or subj.Path.segments.len != 1) return null;
+    // `when (this)` smart-casts the implicit receiver: the branch body's
+    // member/extension calls on `this` resolve against the narrowed type
+    // (argDeclTypeRefLazy consults `localDeclTypeRef("this")` first), so
+    // `is List -> this.single()` selects `List.single` instead of
+    // recursing into the enclosing `Iterable.single`.
+    const bind_name: []const u8 = blk: {
+        if (subj.* == .This and subj.This.qualifier == null) break :blk "this";
+        if (subj.* == .Path and subj.Path.segments.len == 1) break :blk subj.Path.segments[0].name;
+        return null;
+    };
     if (branch.patterns.len != 1) return null;
     const p = &branch.patterns[0];
     if (p.kind != .IsType) return null;
     const head = expr_lower.loweredCheckTypeName(b, &p.kind.IsType);
     if (head.len == 0) return null;
-    return try b.narrowLocal(subj.Path.segments[0].name, head);
+    return try b.narrowLocal(bind_name, head);
 }
 
 /// Lower one `when` pattern of a subject-bound branch into a Boolean

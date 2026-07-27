@@ -222,7 +222,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
     var composer_pushed = false;
     if (host_call_func.composePluginEnabled()) {
-        if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+        if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
             compose.pushComposer(c);
             composer_pushed = true;
         }
@@ -985,7 +985,20 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             break :blk null;
         };
-        if (info.has_receiver and !last_vararg and args.len == info.n_params + 1) {
+        // A pass-wrapped composable block loses its receiver shape when the
+        // compose pass moves the literal into `composableLambdaInstance(...)`
+        // (the wrapper's param carries no function type for the lowering to
+        // read). The compose ABI is the one caller of such a block with an
+        // extra leading arg (`ComposableLambdaImpl.invoke(p1, c, changed)`
+        // feeding an `R.()` block), so a pair-tailed closure with a `this`
+        // capture infers the receiver there; padding the receiver into the
+        // `$composer` slot is never right.
+        const compose_recv_infer = !info.receiver_shape_known and
+            host_call_func.composePluginEnabled() and
+            this_cap_idx != null and func.params.len >= 2 and
+            std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
+        if ((info.has_receiver or compose_recv_infer) and !last_vararg and args.len == info.n_params + 1) {
             if (runtime.getenvSlice("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }
@@ -1154,7 +1167,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // named-call path: a `@Composable` property getter reached from the
         // body reads it via `__compose_currentComposer`.
         if (host_call_func.composePluginEnabled()) {
-            if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+            if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
                 compose.pushComposer(c);
                 defer compose.popComposer();
                 return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);

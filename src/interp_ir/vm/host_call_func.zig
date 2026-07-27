@@ -1015,7 +1015,7 @@ pub fn callFuncFast(self: *VmHost, allocator: Allocator, module: *const Module, 
 /// whether the activation's close must pop it.
 pub fn flatPlainCallOpen(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
     _ = self;
-    if (compose.threadedComposerArg(f.params, args)) |c| {
+    if (compose.threadedComposerArgFor(f.fqn, f.params, args)) |c| {
         compose.pushComposer(c);
         return true;
     }
@@ -1446,7 +1446,7 @@ fn composableEval(
     // the body; run it directly and publish the threaded `$composer` argument as
     // the ambient composer so a `@Composable` property getter reached from this
     // body (compiled to the `__compose_currentComposer` intrinsic) reads it.
-    if (compose.threadedComposerArg(f.params, packed_args.items)) |c| {
+    if (compose.threadedComposerArgFor(f.fqn, f.params, packed_args.items)) |c| {
         compose.pushComposer(c);
         defer compose.popComposer();
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);
@@ -2075,6 +2075,48 @@ pub fn typedCallBoundary(self: *VmHost, module: *const Module, func: *const ir.F
 }
 
 fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    // Compose ABI completion: a composable's trailing ($composer, $changed)
+    // pair is appended by the caller's pass, but a call reaching here from a
+    // context the pass could not see as composable (a sub-composition's
+    // content lambda invoked through a committed-id dispatch) arrives
+    // without it. With an ambient composer available and the argument count
+    // exactly two short of the non-vararg parameter list, complete the pair
+    // — the same completion `callValue` applies for closures. Vararg shapes
+    // are completed by the overload binder, which scored the reduced
+    // signature and knows the pair is absent.
+    if (composePluginEnabled()) {
+        if (funcAt(module, func)) |cf| {
+            const p = cf.params;
+            if (p.len >= 2 and args.len + 2 == p.len and
+                std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                std.mem.eql(u8, p[p.len - 2].name, "$composer"))
+            {
+                var no_vararg = true;
+                for (p) |pp| {
+                    if (pp.is_vararg) no_vararg = false;
+                }
+                var pair_supplied = false;
+                for (arg_names) |n| {
+                    if (n) |nm| {
+                        if (std.mem.eql(u8, nm, "$composer")) pair_supplied = true;
+                    }
+                }
+                if (no_vararg and !pair_supplied) {
+                    if (compose.currentComposer()) |comp| {
+                        const buf = try allocator.alloc(Value, args.len + 2);
+                        defer if (runtime.freeScratch()) allocator.free(buf);
+                        @memcpy(buf[0..args.len], args);
+                        buf[args.len] = comp;
+                        buf[args.len + 1] = .{ .Int = 0 };
+                        const names2 = try allocator.alloc(?[]const u8, buf.len);
+                        defer if (runtime.freeScratch()) allocator.free(names2);
+                        for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+                        return callFuncTypedInner(self, allocator, module, func, buf, names2, type_args, exact);
+                    }
+                }
+            }
+        }
+    }
     // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)` /
     // `enumEntries<T>()` (whose inline body survives as the
     // `enumEntriesIntrinsic` header — an `expect` with no compiled
@@ -2307,7 +2349,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // side module. The set narrows which ids may run; it must be dereferenced
     // by the image that owns those ids. Legacy unbounded lookup retains the
     // frame-module rule because it searches that module's name index.
-    const eff: *const Module = if (bounded or module.func_index.items.len == 0) mg.get() else module;
+    const eff0: *const Module = if (bounded or module.func_index.items.len == 0) mg.get() else module;
     // The package the visibility filter scopes against. For an ordinary
     // packaged caller this is `caller_pkg`, so the filter and the dispatch
     // below behave exactly as before. Only when the caller frame is a
@@ -2323,7 +2365,21 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // authority as `func_index` (every append pairs with a name-index
     // push); the old per-call linear scan of the whole index was the
     // hottest frame in the interpreter profile.
-    const candidates = candidate_ids orelse eff.funcsBySimpleName(name);
+    var eff_resolved = eff0;
+    const candidates = candidate_ids orelse blk: {
+        const own = eff0.funcsBySimpleName(name);
+        // An anon sub-module frame has its OWN func index (its methods), so
+        // the empty-index main fallback above never fires — yet a bare call
+        // written in its body resolves main-module top-levels
+        // (`CompositionLocalProvider` from a DisposableEffect anon). No
+        // same-name candidate in the sub-module: collect from main.
+        if (own.len == 0 and eff0 != mg.get()) {
+            eff_resolved = mg.get();
+            break :blk mg.get().funcsBySimpleName(name);
+        }
+        break :blk own;
+    };
+    const eff = eff_resolved;
     const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     if (ntrace) {
         std.debug.print("[cno] {s} bounded={} cands={d} in_fn={s} nargs={d} names:", .{
@@ -2383,6 +2439,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     var best_low: ?FuncId = null;
     var best_low_score: i32 = 0;
     var best_scope_tier: u8 = 255;
+    var best_needs_pair = false;
     for (candidates) |cand| {
         // A receiver-taking candidate whose declared receiver names a
         // builtin shape the first arg definitely is not (UIntArray.fill
@@ -2436,7 +2493,41 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 }
             }
         }
-        const pts = positionalPoints(self, eff, cand, shapes, scope);
+        var cand_needs_pair = false;
+        var pts = positionalPoints(self, eff, cand, shapes, scope);
+        // Compose ABI completion: a composable candidate's trailing
+        // ($composer, $changed) pair is appended by the caller's pass, but a
+        // call re-entering the binder from a synthesized route (a spread
+        // body's re-entry) arrives WITHOUT the pair. With an ambient composer
+        // available, score the user-visible params and complete the pair at
+        // dispatch — the same completion callValue applies for closures.
+        if (composePluginEnabled()) {
+            if (sigViewOfFunc(self, eff, cand, shapes.len)) |sv| {
+                const p = sv.params;
+                if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and
+                    std.mem.eql(u8, p[p.len - 2].name, "$composer") and
+                    compose.currentComposer() != null)
+                {
+                    var sv2 = sv;
+                    sv2.params = p[0 .. p.len - 2];
+                    if (sv2.defaults) |d| {
+                        if (d.len >= 2) sv2.defaults = d[0 .. d.len - 2];
+                    }
+                    // Pair-reduced scoring wins even over a non-null full
+                    // score: a pairless call whose args leak into the
+                    // ($composer, $changed) slots (a mid-vararg absorbing
+                    // them) can still produce a weak full score, and
+                    // dispatching that binding runs the body with a
+                    // non-composer in `$composer`.
+                    if (applicability.applicable(&sv2, shapes, scope)) |sc2| {
+                        if (pts == null or sc2.points > pts.?) {
+                            pts = sc2.points;
+                            cand_needs_pair = true;
+                        }
+                    }
+                }
+            }
+        }
         if (ntrace) {
             const dbg_sig = sigViewOfFunc(self, eff, cand, shapes.len);
             std.debug.print("[cno] {s} cand={d} nargs={d} pts={?} np={?} has_body={?} p0={s} last_def={?} defs={?}\n", .{
@@ -2475,6 +2566,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
             } else if (best_ord == null or total > best_ord_score) {
                 best_ord = cand;
                 best_ord_score = total;
+                best_needs_pair = cand_needs_pair;
             }
         }
     }
@@ -2499,7 +2591,10 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                         .has_body = true,
                     };
                     if (applicability.applicable(&ctor_sig, shapes, scope)) |csc| {
-                        if (csc.points > best_ord_score) return .{ .ok = null };
+                        if (csc.points > best_ord_score) {
+                            if (ntrace) std.debug.print("[cno] {s} ctor-decline class={d} ctor_pts={d} best={d}\n", .{ name, ccid.int(), csc.points, best_ord_score });
+                            return .{ .ok = null };
+                        }
                     }
                 }
             }
@@ -2552,6 +2647,24 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 return .{ .ok = Value.Unit };
             }
         }
+    }
+    if (best_needs_pair) {
+        // Complete the compose ABI pair from the ambient composer (matched
+        // against the reduced signature above).
+        const comp = compose.currentComposer().?;
+        const buf = try allocator.alloc(Value, args.len + 2);
+        defer if (runtime.freeScratch()) allocator.free(buf);
+        @memcpy(buf[0..args.len], args);
+        buf[args.len] = comp;
+        buf[args.len + 1] = .{ .Int = 0 };
+        const names2 = try allocator.alloc(?[]const u8, buf.len);
+        defer if (runtime.freeScratch()) allocator.free(names2);
+        for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+        const rp = try callFuncTyped(self, allocator, eff, func, buf, names2, &.{}, exact_dispatch);
+        return switch (rp) {
+            .ok => |v| .{ .ok = v },
+            .err => |e| .{ .err = e },
+        };
     }
     const r = try callFuncTyped(self, allocator, eff, func, args, arg_names, &.{}, exact_dispatch);
     return switch (r) {

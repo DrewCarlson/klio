@@ -1142,9 +1142,11 @@ pub const SeqOp = union(enum) {
 /// Compiled regex + the original pattern source. The compiled engine is
 /// not in the Zig std; `engine` is an opaque host-provided handle.
 pub const RegexData = struct {
-    /// A compiled regex is immutable after construction (pattern, engine handle,
-    /// and option singletons are all fixed), so its cell is never write-locked;
-    /// elide the reader lock.
+    /// A compiled regex is immutable once PUBLISHED: `regex_ctor` attaches
+    /// `options` through `asPtr` after `compileRegexFlags` mints the cell but
+    /// before the value escapes the constructor, so no reader can observe a
+    /// mutation and the cell is never write-locked; elide the reader lock.
+    /// Any new mutation site must stay inside that pre-escape window.
     pub const objref_immutable = true;
 
     pattern: StringRef,
