@@ -31,6 +31,13 @@ const StringRegMap = std.StringHashMap(Reg);
 const InlineLambdaFrame = struct {
     subst: std.StringHashMap(*const ast.Expr),
     snapshot: []InlineReturn,
+    /// The bare-call static-receiver hint that was active at the inline
+    /// CALL SITE (before the spliced body installed its own). A lambda
+    /// argument spliced from this frame is caller code, so its bare calls
+    /// must resolve under the call site's hint, not the callee body's.
+    caller_hint_active: bool = false,
+    caller_hint_recv: ?[]const u8 = null,
+    caller_this_narrow: ?[]const u8 = null,
     /// Scope count at the inline call site, before the inline fn's
     /// parameters were bound. A lambda argument spliced from this frame
     /// was defined in the caller, so its free names must resolve in the
@@ -439,6 +446,13 @@ pub const FuncBuilder = struct {
     /// preserves nullability, arguments, and classifier identity.
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
+    splice_hint_active: bool = false,
+    splice_hint_recv: ?[]const u8 = null,
+    /// Smart-cast narrowing of the implicit `this` (a `when (this) { is T ->`
+    /// branch): the branch body's bare/`this.` calls resolve extensions
+    /// against the NARROWED static type, as kotlinc does. Cleared on inline
+    /// splice entry (the spliced body has its own receiver context).
+    this_narrow: ?[]const u8 = null,
     /// The receiver-type name in scope as the implicit `this` at this
     /// lambda body's construction site, carried across the lambda boundary
     /// (a plain `() -> R` block captures the enclosing `this`, and a
@@ -963,8 +977,22 @@ pub const FuncBuilder = struct {
     /// snapshot of the current `inline_return` is duplicated into the
     /// frame.
     pub fn pushInlineLambdaFrame(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr), caller_scope_depth: usize) Allocator.Error!void {
+        try self.pushInlineLambdaFrameHinted(m, caller_scope_depth, self.splice_hint_active, self.splice_hint_recv, self.this_narrow);
+    }
+
+    /// As `pushInlineLambdaFrame`, recording an explicit call-site bare-call
+    /// hint (see `InlineLambdaFrame.caller_hint_*`).
+    pub fn pushInlineLambdaFrameHinted(self: *FuncBuilder, m: std.StringHashMap(*const ast.Expr), caller_scope_depth: usize, hint_active: bool, hint_recv: ?[]const u8, this_narrow: ?[]const u8) Allocator.Error!void {
         const snap = try self.allocator.dupe(InlineReturn, self.inline_return.items);
-        try self.inline_lambda_subst.append(self.allocator, .{ .subst = m, .snapshot = snap, .caller_scope_depth = caller_scope_depth });
+        try self.inline_lambda_subst.append(self.allocator, .{ .subst = m, .snapshot = snap, .caller_scope_depth = caller_scope_depth, .caller_hint_active = hint_active, .caller_hint_recv = hint_recv, .caller_this_narrow = this_narrow });
+    }
+
+    /// The call-site bare-call hint recorded on the innermost inline-lambda
+    /// frame, for restoring while a caller lambda's body is spliced.
+    pub fn inlineLambdaCallerHint(self: *const FuncBuilder) ?struct { active: bool, recv: ?[]const u8, this_narrow: ?[]const u8 } {
+        if (self.inline_lambda_subst.items.len == 0) return null;
+        const f = self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1];
+        return .{ .active = f.caller_hint_active, .recv = f.caller_hint_recv, .this_narrow = f.caller_this_narrow };
     }
 
     /// The caller scope depth recorded for the innermost inline-lambda
@@ -1263,6 +1291,31 @@ pub const FuncBuilder = struct {
     /// the runtime receiver walk.
     pub fn setSpliceRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
         self.splice_recv_ty = name;
+    }
+
+    /// Bare-call static-receiver hint override. While an inline splice is
+    /// active, the spliced body's bare calls resolve against the inline
+    /// fn's OWN receiver (null for a receiver-less inline fn) — Kotlin
+    /// inline bodies are hygienic and never see the caller's class scope.
+    pub fn setSpliceHint(self: *FuncBuilder, active: bool, recv: ?[]const u8) void {
+        self.splice_hint_active = active;
+        self.splice_hint_recv = recv;
+    }
+    pub fn spliceHintActive(self: *const FuncBuilder) bool {
+        return self.splice_hint_active;
+    }
+    pub fn spliceHintRecv(self: *const FuncBuilder) ?[]const u8 {
+        return self.splice_hint_recv;
+    }
+    /// Set the smart-cast narrow of `this`, returning the previous value for
+    /// restore at branch exit.
+    pub fn setThisNarrow(self: *FuncBuilder, head: ?[]const u8) ?[]const u8 {
+        const prev = self.this_narrow;
+        self.this_narrow = head;
+        return prev;
+    }
+    pub fn thisNarrow(self: *const FuncBuilder) ?[]const u8 {
+        return self.this_narrow;
     }
     pub fn spliceRecvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.splice_recv_ty;

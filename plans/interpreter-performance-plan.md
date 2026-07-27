@@ -360,12 +360,16 @@ behavior for comparison):
   9.1–9.3 s full-mark vs 7.9–8.3 s generational (~13%); minor marks
   ~5.4k cells vs 200–750k full-chain re-marks, 6 majors total.
 
-Recorded opens from the census (not perf, tracked here so they are not
-lost): `ProgramImage` has no `gcTrace` (traced as a leaf — confirm every
-`installed_bindings` graph is perm); `RegexData` declares
-`objref_immutable` yet is mutated post-construction through `asPtr`
-(regexp options attach) — the barrier covers the GC side, the
-immutability claim is stale.
+Census opens — both RESOLVED by audit:
+- `ProgramImage` leaf-trace is safe: `installed_bindings` is minted by
+  `vmSetInstalledBindings` BEFORE `run` (alloc_perm still true → the
+  cell is permanent, never swept) and `HostBindings` is an FQN→fn-pointer
+  table with no Value out-edges. Nothing reachable only through `prog`
+  is collectable.
+- `RegexData`'s post-construction `options` attach happens inside
+  `regex_ctor` before the value escapes, so the `objref_immutable`
+  claim holds observably (immutable once published); the doc comment now
+  states the pre-escape-window invariant explicitly.
 
 ## Finalized-module dispatch scans (LANDED)
 
@@ -442,8 +446,12 @@ Remaining per-call program:
    lambda-call bench. The remaining TLV traffic is cross-module
    (`host_keepalive` in runtime/value.zig, `regs_pool`, the compose
    stack, the flat-armed slots) — batching those means a shared context
-   or per-module structs; log-scale returns, take it only with a
-   dedicated pass.
+   or per-module structs; log-scale returns. A dedicated pass was RUN:
+   caching `&evtls` in a local per hot function measured within noise
+   (LLVM already CSEs per function), so the remaining ~176 samples are
+   the one-lookup-per-function-invocation floor. CLOSED at this design;
+   going lower means threading the TLS pointer through `Frame`, whose
+   cross-thread resume restamp hazard is not worth ~2%.
 2. Per-JIT-site resolution memo (closure id → prepared template), so
    repeat iterations skip the closure-table probe and param scan
    (~2% as measured).
@@ -466,3 +474,49 @@ These hold the line; they do not change the verdict. Stage 1 is the next
 substantial interpreter work item and takes precedence over further
 compose-cluster fixes once the current cluster queue is drained, per the
 project rule that the right fix is the structural one.
+
+
+## Stdlib sweep long tail (the 40-failure baseline)
+
+The 40 baseline failures cluster into ~13 root causes. Landed this pass:
+
+- **Inline-body bare-call hygiene (8 fixed: all ArraysTest).** A bare call
+  in a spliced inline stdlib body carried the inline SITE's class as its
+  static-receiver hint (`cmgStaticRecv` = the enclosing builder's
+  `recvTy()`), so `isEmpty()` inside `DoubleArray.runningFold` resolved
+  against the test class (`@Test fun isEmpty()` returning Unit → "non-bool
+  in branch"). Splices now install a bare-call hint (`FuncBuilder
+  .setSpliceHint`): the inline fn's own receiver, or none for a
+  receiver-less inline fn; a caller lambda spliced into the body restores
+  the call-site hint recorded on its inline-lambda frame. Kotlin inline
+  bodies are hygienic; this makes the hint match.
+- **Custom-Iterable receivers in collection intrinsics (6 fixed: all
+  IterableTest).** ~30 intrinsics used the context-free `iterableItems`
+  (List/Set/Array/Map/Range only) and errored on a user `Iterable`
+  instance; they now use `iterableItemsCtx`, which drains any receiver
+  exposing `iterator()` through the host.
+
+Diagnosed, open (groundwork landed):
+
+- **Smart-cast `this` in extension bodies (4 tests: ListTest/ArrayListTest
+  first/single, Stack overflow).** `Iterable<T>.single()`'s
+  `when (this) { is List -> return this.single() }` is committed at
+  LOWERING as a direct self-call — the overload pick ignores the smart
+  cast and selects the enclosing Iterable extension by declared-receiver
+  match, recursing forever. Groundwork landed: `FuncBuilder.this_narrow`
+  (set/restored by `when (this) { is T -> }` branch lowering, cleared on
+  splice entry, recorded on inline-lambda frames) feeds
+  `bareStaticRecvHead`, `inferReceiverType`, and the bare-call resolver
+  config. The remaining gap: the committing pick for `this.single()`
+  reaches its receiver evidence through a path that does not consult
+  `this_narrow` yet — find the direct-Call commit site for member-on-this
+  calls (the emit has no OR_AUDIT hook; `[RESOLVE] call_func` at runtime
+  confirms fid self-commit) and thread the narrow into its pick.
+
+Remaining clusters (untouched): MapTest.minus family
+(UnsupportedOperationException, 4), SetOperationsTest `any` on Array via
+identity-set (4), ResultTest (now past `throwOnFailure`, assertion-level,
+4), Random nextUBytes (4), comparisons ABRT crash (1),
+StringTest.indexOfStringIgnoreCase (1), CollectionTest.sortedByNullable
+Comparator invoke (1), GroupingTest iterator on anon (1),
+InstantIsoStrings `length` (2).

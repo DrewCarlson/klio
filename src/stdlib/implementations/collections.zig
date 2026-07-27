@@ -1052,7 +1052,7 @@ pub fn coll_mut_list_shuffle(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const items = switch (try iterableItems(a, ctx.args[0], "filterNotNull")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "filterNotNull")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1094,7 +1094,7 @@ fn sumKindOfValue(v: Value) ?SumKind {
 pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("sumOf expects (receiver, block)");
-    const items = switch (try iterableItems(a, ctx.args[0], "sumOf")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "sumOf")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1170,7 +1170,7 @@ pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
 fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1226,7 +1226,7 @@ pub fn coll_iter_min_of_or_null(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("distinctBy expects (receiver, block)");
-    const items = switch (try iterableItems(a, ctx.args[0], "distinctBy")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "distinctBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1251,7 +1251,7 @@ pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     // `groupBy(keySelector)` or `groupBy(keySelector, valueTransform)`.
     if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("groupBy expects (receiver, keySelector[, valueTransform])");
-    const items = switch (try iterableItems(a, ctx.args[0], "groupBy")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "groupBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1471,7 +1471,7 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("associate expects (receiver, block)");
-    const items = switch (try iterableItems(a, ctx.args[0], "associate")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "associate")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1513,7 +1513,7 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     // `associateBy(keySelector)` or `associateBy(keySelector, valueTransform)`.
     if (ctx.args.len != 2 and ctx.args.len != 3) return arityErr("associateBy expects (receiver, keySelector[, valueTransform])");
-    const items = switch (try iterableItems(a, ctx.args[0], "associateBy")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "associateBy")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1564,7 +1564,7 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("associateWith expects (receiver, block)");
-    const items = switch (try iterableItems(a, ctx.args[0], "associateWith")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "associateWith")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1631,7 +1631,7 @@ fn sortByKeyInsertion(ctx: *CallCtx, items: []Value, block: Value, descending: b
 fn iterSortedByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1652,7 +1652,7 @@ pub fn coll_iter_sorted_by_desc(ctx: *CallCtx) Error!EvalResult {
 fn iterMaxMinByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1831,7 +1831,7 @@ pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("sortedWith expects (receiver, comparator)");
-    const items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "sortedWith")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1858,7 +1858,7 @@ pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
 fn iterExtreme(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1901,7 +1901,7 @@ pub fn coll_iter_on_each(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("onEach expects (receiver, block)");
     const recv = ctx.args[0];
-    const items = switch (try iterableItems(a, recv, "onEach")) {
+    const items = switch (try iterableItemsCtx(ctx, recv, "onEach")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -1919,7 +1919,7 @@ pub fn coll_iter_on_each(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_iter_map_not_null(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 2) return arityErr("mapNotNull expects (receiver, block)");
-    const items = switch (try iterableItems(a, ctx.args[0], "mapNotNull")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "mapNotNull")) {
         .items => |xs| xs,
         .err => |e| return e,
     };
@@ -2576,7 +2576,7 @@ pub fn coll_to_typed_array(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         }
-    else switch (try iterableItems(a, recv, "toTypedArray")) {
+    else switch (try iterableItemsCtx(ctx, recv, "toTypedArray")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -2848,7 +2848,7 @@ pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const items = switch (try iterableItems(a, ctx.args[0], "indexOfFirst")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "indexOfFirst")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -2866,7 +2866,7 @@ pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_iter_index_of_last(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const items = switch (try iterableItems(a, ctx.args[0], "indexOfLast")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "indexOfLast")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -2885,7 +2885,7 @@ pub fn coll_iter_index_of_last(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_list_fold_right(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const items = switch (try iterableItems(a, ctx.args[0], "foldRight")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "foldRight")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -2906,7 +2906,7 @@ pub fn coll_list_fold_right(ctx: *CallCtx) Error!EvalResult {
 }
 fn reduceRightImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
     const a = ctx.allocator;
-    const items = switch (try iterableItems(a, ctx.args[0], "reduceRight")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "reduceRight")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -2957,7 +2957,7 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
             else => {},
         }
     }
-    const items = switch (try iterableItems(a, ctx.args[0], "last")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "last")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -3088,7 +3088,7 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
 pub fn coll_list_join_to_string(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return arityErr("joinToString expects an iterable receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "joinToString")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "joinToString")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -3099,7 +3099,7 @@ pub fn coll_list_join_to_string(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("Array.joinToString requires a receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "Array.joinToString")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "Array.joinToString")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -4614,7 +4614,7 @@ fn sumValues(a: Allocator, items: []const Value, what: []const u8) Error!EvalRes
 pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("average requires a receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "average")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "average")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -4653,7 +4653,7 @@ fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []cons
     // Iterable-generic: the erased receiver-type-arg decline routes
     // Set/Array receivers here through the Iterable/Set-form probes.
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -5076,7 +5076,7 @@ fn iterableListOpAdapter(ctx: *CallCtx, comptime core: fn (*CallCtx) Error!EvalR
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
     if (ctx.args[0] == .List) return core(ctx);
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -6465,7 +6465,7 @@ pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("Array.withIndex requires a receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "Array.withIndex")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "Array.withIndex")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -6807,7 +6807,7 @@ pub fn coll_map_to_sorted_map(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len >= 2) {
-        const items = switch (try iterableItems(a, ctx.args[0], "count")) {
+        const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "count")) {
             .items => |x| x,
             .err => |e| return e,
         };
@@ -7269,7 +7269,7 @@ pub fn array_content_deep_hash_code(ctx: *CallCtx) Error!EvalResult {
 pub fn array_contains(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len < 2) return arityErr("contains expects (element)");
-    const items = switch (try iterableItems(a, ctx.args[0], "contains")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "contains")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7281,7 +7281,7 @@ pub fn array_contains(ctx: *CallCtx) Error!EvalResult {
 pub fn array_contains_all(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len < 2) return arityErr("containsAll expects (elements)");
-    const items = switch (try iterableItems(a, ctx.args[0], "containsAll")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "containsAll")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7302,7 +7302,7 @@ pub fn array_contains_all(ctx: *CallCtx) Error!EvalResult {
 pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("elementAt requires a receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "elementAt")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "elementAt")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7619,7 +7619,7 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
 fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7638,7 +7638,7 @@ pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sum requires an array receiver");
     const prim = ctx.args[0].Array.prim orelse return typeErr("sum requires a primitive unsigned array");
-    const items = switch (try iterableItems(a, ctx.args[0], "sum")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "sum")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7656,7 +7656,7 @@ pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
 pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr("Array.average requires a receiver");
-    const items = switch (try iterableItems(a, ctx.args[0], "Array.average")) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "Array.average")) {
         .items => |x| x,
         .err => |e| return e,
     };
@@ -7689,7 +7689,7 @@ pub fn array_max_or_null(ctx: *CallCtx) Error!EvalResult {
 fn arrayMaxMinCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
-    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,
     };

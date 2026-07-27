@@ -8861,8 +8861,11 @@ fn resolveCtxFor(
         .has_type_args = ast_type_args.len != 0,
         .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
-        .recv_ty = b.recvTy(),
-        .recv_type = b.recvTypeRef(),
+        .recv_ty = b.thisNarrow() orelse b.recvTy(),
+        .recv_type = if (b.thisNarrow()) |t|
+            ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else
+            b.recvTypeRef(),
         .actual_type_param_bounds = actual_type_param_bounds,
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
@@ -10213,8 +10216,20 @@ fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
 }
 
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
-    const rt = b.recvTy() orelse return null;
+    const rt = bareStaticRecvHead(b) orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
+}
+
+/// The static-receiver head a BARE call's dispatch hint should carry.
+/// Inside an active inline splice this is the spliced fn's own receiver
+/// (null for a receiver-less inline fn) — Kotlin inline bodies are
+/// hygienic, so a bare call written in the stdlib body must never resolve
+/// against the inline SITE's class. Outside a splice: the enclosing
+/// function's receiver, as before.
+fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
+    if (b.thisNarrow()) |t| return t;
+    if (b.spliceHintActive()) return b.spliceHintRecv();
+    return b.recvTy();
 }
 
 /// Package/import-scoped declarations carried by a deferred bare call. The
@@ -10458,7 +10473,7 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg
         // Inside an extension body the implicit `this` has the
         // extension's declared receiver type; record it so dispatch
         // resolves extensions against the STATIC type, as kotlinc does.
-        const static_recv: ?ConstId = if (b.recvTy()) |rt|
+        const static_recv: ?ConstId = if (bareStaticRecvHead(b)) |rt|
             try b.module.internConst(b.allocator, .{ .String = rt })
         else
             null;

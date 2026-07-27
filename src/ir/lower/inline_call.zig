@@ -36,9 +36,12 @@ const lowerBlock = expr_lower.lowerBlock;
 /// `null` when the type can't be inferred cheaply — the caller then falls
 /// back to shape-based overload resolution.
 pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
-    const arg = this_arg orelse return b.recvTy();
+    const arg = this_arg orelse return b.thisNarrow() orelse b.recvTy();
     switch (arg.*) {
-        .This, .Super => return b.recvTy(),
+        // A smart-cast `this` (`when (this) { is List -> this.single() }`)
+        // resolves against the narrowed type; `super` keeps the declared one.
+        .This => return b.thisNarrow() orelse b.recvTy(),
+        .Super => return b.recvTy(),
         .Call => |call| {
             // `recv.method(...)` — use the called function's declared return
             // type. Resolve by simple name against the lowered module's
@@ -310,6 +313,7 @@ pub fn spliceInlineLambda(
     // caller variable the lambda body references. The caller depth was
     // recorded on the current inline-lambda frame at the call site.
     const splice_caller_depth = b.inlineLambdaCallerDepth();
+    const site_hint = b.inlineLambdaCallerHint();
     const counted = inline_state.inlineExpandEnter();
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
@@ -350,7 +354,16 @@ pub fn spliceInlineLambda(
     // scopes in between.
     const prev_splice = b.lambda_splice_resolve;
     if (splice_caller_depth) |d| b.lambda_splice_resolve = .{ .caller_depth = d, .own_base = lambda_own_base };
+    // The lambda body is CALLER code: its bare calls resolve under the
+    // hint that was active at the inline call site, not the spliced
+    // body's own receiver hint.
+    const lam_prev_active = b.spliceHintActive();
+    const lam_prev_recv = b.spliceHintRecv();
+    if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
+    const lam_prev_narrow = b.setThisNarrow(if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     const v = try lowerBlock(b, &body);
+    _ = b.setThisNarrow(lam_prev_narrow);
+    b.setSpliceHint(lam_prev_active, lam_prev_recv);
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
     b.terminate(.{ .Goto = end });
@@ -1097,6 +1110,19 @@ pub fn tryInlineCallWithTypeArgs(
     const prev_splice_recv = b.spliceRecvTy();
     if (f.receiver_type) |rt| b.setSpliceRecvTy(rt.name.name);
     defer b.setSpliceRecvTy(prev_splice_recv);
+    // Bare-call hygiene for the spliced body: its bare calls resolve
+    // against the inline fn's own receiver (none for a receiver-less
+    // inline fn), never the caller's class. The pre-splice hint is
+    // recorded on the inline-lambda frame below so a spliced caller
+    // lambda restores it.
+    const prev_hint_active = b.spliceHintActive();
+    const prev_hint_recv = b.spliceHintRecv();
+    b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else null);
+    defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
+    // The spliced body has its own receiver context: the caller's
+    // smart-cast narrow of `this` must not leak into it.
+    const prev_this_narrow = b.setThisNarrow(null);
+    defer _ = b.setThisNarrow(prev_this_narrow);
     // Scope depth before the inline fn binds its parameters: a lambda
     // argument spliced from this call resolves its free names in these
     // caller scopes, not against the inline fn's parameter scope.
@@ -1241,7 +1267,7 @@ pub fn tryInlineCallWithTypeArgs(
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }
-    try b.pushInlineLambdaFrame(lambda_map, caller_scope_depth);
+    try b.pushInlineLambdaFrameHinted(lambda_map, caller_scope_depth, prev_hint_active, prev_hint_recv, prev_this_narrow);
     // An inline extension splice's body resolves names against the inline
     // function's own parameter/receiver scopes, not the caller lambda's free
     // names. When this splice is itself nested inside a spliced

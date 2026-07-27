@@ -211,7 +211,21 @@ pub fn lowerWhenWithSubjectReg(
             try narrowSubjectForBranch(b, subject, &branch)
         else
             try narrowConditionForBranch(b, &branch);
+        // `when (this) { is T -> ... }` smart-casts the implicit receiver:
+        // the branch body's calls resolve extensions against T (kotlinc
+        // resolves statically, so `is List -> this.single()` must select
+        // `List.single`, not recurse into the enclosing `Iterable.single`).
+        const narrowed_this: ?(?[]const u8) = blk: {
+            const subj = subject orelse break :blk null;
+            if (subj.* != .This) break :blk null;
+            if (branch.patterns.len != 1) break :blk null;
+            if (branch.patterns[0].kind != .IsType) break :blk null;
+            const head = expr_lower.loweredCheckTypeName(b, &branch.patterns[0].kind.IsType);
+            if (head.len == 0) break :blk null;
+            break :blk b.setThisNarrow(head);
+        };
         const v = try lowerExpr(b, &branch.body);
+        if (narrowed_this) |prev| _ = b.setThisNarrow(prev);
         if (narrowed) |n| b.restoreLocal(n);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         b.terminate(.{ .Goto = join });
