@@ -6666,21 +6666,34 @@ pub const Module = struct {
     /// compatibility boundary remains active until P10 supplies a complete
     /// declaration for the host shape.
     fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
-        if (self.decl_sigs.get(id.int())) |ds| {
-            if (want < ds.arity.required) return false;
-            return ds.arity.has_vararg or want <= ds.arity.total;
+        // The compose pass appends ($composer, $changed) to composable
+        // signatures. Call sites lower with USER argument counts (the pair
+        // is threaded later, or completed at runtime), so the pair never
+        // counts toward the REQUIRED arity — excluding an exact-arity
+        // composable here left only a vararg sibling in the bounded set and
+        // committed the wrong overload. A post-pass site that already
+        // carries the pair still binds through the untrimmed total.
+        const has_pair = f.params.len >= 2 and
+            std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer");
+        if (!has_pair) {
+            if (self.decl_sigs.get(id.int())) |ds| {
+                if (want < ds.arity.required) return false;
+                return ds.arity.has_vararg or want <= ds.arity.total;
+            }
         }
+        const counted = if (has_pair) f.params[0 .. f.params.len - 2] else f.params;
         var required: usize = 0;
-        var total: usize = 0;
+        var total: usize = f.params.len;
         var has_vararg = false;
-        for (f.params) |p| {
-            total += 1;
+        for (counted) |p| {
             if (p.is_vararg) {
                 has_vararg = true;
             } else if (!p.has_default) {
                 required += 1;
             }
         }
+        _ = &total;
         if (want < required) return false;
         return has_vararg or want <= total;
     }

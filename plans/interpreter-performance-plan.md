@@ -784,9 +784,17 @@ dispatched. The defect is the LOWERING's bounded candidate set for
 this sub-module call site: it recorded a single main-space id (9403)
 and EXCLUDED #9405 (context, content) — the overload the 2-arg call
 actually fits — so the runtime faithfully dispatches the wrong body
-whose innards then miss. Next: find where `cmgCandidates`/
-`boundedCallCandidates` filtered the set during the anon sub-module
-lowering of `CompositionLocalProvider(locals) { ... }` (the shape
-filter likely ran against pre-pass signatures or dropped 9405 by
-arity), and make the bounded set complete or null (null → the
-unbounded main collection, which now works, picks #9405 at 350 pts).
+whose innards then miss. LANDED toward it: `globalArityCanBind` no longer counts the
+pass-appended ($composer, $changed) toward REQUIRED arity (an
+exact-arity composable was excluded from bounded sets while the vararg
+sibling survived); gated green (sweep 0, probes unchanged). The site
+STILL records cands=[9403] — so the single-candidate set comes from a
+COMMIT-TIME PICK channel, not the boundedCallCandidates filter: the
+lowering resolved the call (func=9403 committed) and recorded the pick
+as the sole candidate; that picker chose the vararg overload by the
+same composer-pair arity blindness. Next: find the resolver that
+commits `cmg.func` + single-candidate sets for bare calls in anon
+sub-module bodies (resolveBareRefIndexed / the pick behind the
+`member_inline_typed`-era emits) and give its arity/shape comparison
+the same pair-trimmed treatment — or record all arity-fitting
+overloads instead of the pick.
