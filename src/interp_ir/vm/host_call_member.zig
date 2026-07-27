@@ -12837,7 +12837,19 @@ fn receiverPropCanHoldCallable(self: *VmHost, receiver: *const Value, name: []co
             defer mg.deinit();
             const func = mg.get().funcById(f) orelse return true;
             const rt = func.return_ty;
+            // An unrecorded getter return lowers as Unit — no knowledge, so
+            // no refutation (a real property getter is never Unit-typed).
+            if (std.mem.eql(u8, rt.name, "kotlin.Unit") or std.mem.eql(u8, rt.name, "Unit") or rt.name.len == 0) return true;
             if (isFunctionTypeRefResolved(self, &rt)) return true;
+            // A TYPE-PARAMETER return (`State<T>.value: T`) says nothing —
+            // and its short name can collide with a registered class
+            // (a test's `class T`), which wrongly refuted the probe.
+            if (rt.name.len <= 2 and blk: {
+                for (rt.name) |ch| {
+                    if (!std.ascii.isUpper(ch)) break :blk false;
+                }
+                break :blk rt.name.len != 0;
+            }) return true;
             if (isScalarKindName(rt.name)) return false;
             const known = blk: {
                 const g = self.classes.borrow();
