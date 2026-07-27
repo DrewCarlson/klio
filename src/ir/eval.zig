@@ -2211,8 +2211,18 @@ pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, f
 /// stream (tag + key operands) the first time it runs. The only way to see
 /// what an emit path actually produced for a body inside a baked pack.
 var dump_fn_done: bool = false;
+/// Cached `KLIO_DUMP_FN` value; empty slice = unset.
+var dump_fn_want: ?[]const u8 = null;
 pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
-    const want = runtime.getenvSlice("KLIO_DUMP_FN") orelse return;
+    const want = dump_fn_want orelse blk: {
+        // Consulted per frame creation on the hot call path: even the
+        // memoized env probe costs a spinlock + hashmap probe, so cache
+        // the answer in a file-local once.
+        const w = runtime.getenvSlice("KLIO_DUMP_FN") orelse "";
+        dump_fn_want = w;
+        break :blk w;
+    };
+    if (want.len == 0) return;
     if (dump_fn_done) return;
     // `#<id>` selects by FuncId — the only handle for synthetic names
     // (`<lambda>`) that dozens of functions share.
@@ -3329,6 +3339,24 @@ fn LoopTramp(comptime H: type) type {
                         .null_ => .Null,
                         else => jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]),
                     };
+                }
+                // Plain exact-arity closure: skip the value-dispatch preamble
+                // and run the resolved body directly; a declined shape falls
+                // through to the full route below.
+                if (comptime @hasDecl(H, "callClosureFast")) {
+                    if (callee == .IrClosure) {
+                        const fr = lc.host.callClosureFast(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
+                            lc.pending = .{ .Type = "out of memory in JIT value call" };
+                            return jit_loop.throwCode(site.block);
+                        };
+                        if (fr) |r2| switch (r2) {
+                            .ok => return 0,
+                            .err => |e| {
+                                lc.pending = e;
+                                return jit_loop.throwCode(site.block);
+                            },
+                        };
+                    }
                 }
                 const r = lc.host.callValue(lc.allocator, &callee, argbuf2[0..site.n_args]) catch {
                     lc.pending = .{ .Type = "out of memory in JIT value call" };

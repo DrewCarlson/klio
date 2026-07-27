@@ -394,6 +394,53 @@ After both, the benchmark profile is diffuse interpreter work (no
 single dominant scan); the remaining wall-capped tests need raw
 interpreter speed (the flat-coverage / seam item), not another cache.
 
+## Seam item — measured re-diagnosis
+
+The "HOF-intrinsic re-entry seam" hypothesis was tested and REVISED:
+
+- Non-suspend intrinsic re-entry is cheap. Microbench (20M callback
+  invocations): manual loop 4.1s, intrinsic `forEach` 4.7s, intrinsic
+  `fold` 4.5s — the stdlib HOFs inline through lowering, so the seam
+  costs ~nothing. No CPS splits needed for speed on this path.
+- Suspend copy-parks are not hot: zero `snapshotSuspendedFrame` /
+  `retainSnapshotValues` samples in the DeepRecursive and
+  validatePotentialDeadlock profiles after the flat/barrier work.
+- The REAL per-call seam is the JIT call-out: an interpreted-Kotlin HOF
+  (`fun myForEach(n, action)` calling `action(i)` 20M times) runs 14s —
+  3x the intrinsic. The enclosing `while` loop is JIT-compiled, and
+  each `CallValue` leaves JIT code through `LoopTramp.call` → the full
+  `callValue` host resolution (closure info probe, capture-vector copy,
+  receiver-shape checks) → a fresh recursive `runFlatLoop` per call,
+  ~500ns each. `execArmCallValue`'s `prepareClosureFlatCall` hook never
+  runs because the call site lives in JIT code, not the flat driver.
+- Secondary named costs on that profile: `_tlv_get_addr` ~4% (threadlocal
+  reads through dyld TLV on every call boundary — frame chain push/pop,
+  keepalive, flat-armed slots), and per-frame trace-gate env consults
+  (`dumpFnIfRequested`, `KLIO_CALLVALUE_TRACE` raw consults — now cached).
+
+JIT call-out fast path — LANDED (first stage): the trampoline's
+`is_call_value` site now tries `callClosureFast` (the same
+`prepareClosureFlatCallSlots` resolution `execArmCallValue`'s flat hook
+uses, then the recursive nested entry directly); the full `callValue`
+preamble is gone from the lambda-call profile (0 samples, was the
+dominant host frame). Declined shapes (arity mismatch, vararg, native
+form, non-closure) fall back to `callValue`, which keeps every special
+case. Measured ~3-5% on the 20M-call bench — the preamble was a smaller
+share than the profile suggested; the remaining per-call cost is
+structural: `Frame.newWithCaptures` + arg/capture ArrayList copies per
+call (~130 samples), `runFlatLoop` entry/exit, and `_tlv_get_addr`
+(~230 samples, threadlocal reads through dyld TLV at every call
+boundary).
+
+Remaining per-call program (next items, in expected-value order):
+1. Frame/argument buffer reuse for the nested entry: a per-thread
+   free-list of frames or caller-provided arg storage, removing the two
+   ArrayList allocations + copies per call.
+2. Batch call-boundary threadlocal traffic into one context struct
+   (single TLV read per call instead of one per threadlocal).
+3. Per-JIT-site resolution memo (closure id → prepared template), so
+   repeat iterations skip the closure-table probe and param scan.
+
 ## What was already landed (kept, measured)
 
 - clocks/sleeps direct to libc (idle saturation eliminated; 81->48 s on the
