@@ -2672,6 +2672,15 @@ fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     {
         const g = v.Instance.borrow();
         defer g.deinit();
+        // A pack-loaded ComposableLambdaImpl keeps its invoke overloads in
+        // the lowered module, which this fn must NOT borrow (callers hold
+        // exclusive module borrows — a consult deadlocks); the wrapper's
+        // class identity answers directly.
+        {
+            const cg0 = g.get().class.borrow();
+            defer cg0.deinit();
+            if (std.mem.indexOf(u8, cg0.get().fqn, "ComposableLambda") != null) return true;
+        }
         var cls: ?ObjRef(runtime.ClassDef) = g.get().class.clone();
         while (cls) |c| {
             const cg = c.borrow();

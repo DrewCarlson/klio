@@ -1442,6 +1442,17 @@ const Walker = struct {
                             ini,
                             @intCast(@min(p.ty.?.function.?.params.len, 255)),
                         );
+                        // In a PLAIN scope the val's lambda is a composable
+                        // value with no composer ambient at creation; kotlinc
+                        // wraps it in composableLambdaInstance(key, true,
+                        // block) so every invocation gets its own restart
+                        // group — the per-lambda KEY is what keeps
+                        // currentCompositeKeyHashCode distinct between two
+                        // different content lambdas run under the same
+                        // movable-content root.
+                        if (emit_lambda_memo and !w.thread and ini.* == .Lambda) {
+                            w.wrapInComposableLambdaInstance(ini);
+                        }
                     } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
                         // No declared type: the literal's own header is the
                         // arity, and a headerless literal is `() -> Unit`

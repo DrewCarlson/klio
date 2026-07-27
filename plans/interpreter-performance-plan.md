@@ -876,6 +876,22 @@ members (`values.forEach` binding LockFreeLinkedListNode.forEach) and
 broke Duration.parse; the strict spliced-label + known-owner gate holds
 the wins with no regressions (sweep 0, all probes green).
 
+MovableContentTests 27/44 -> 28/44: the composite-key family. The pass
+now wraps a PLAIN-scope `val x: @Composable () -> Unit = { ... }`
+initializer in composableLambdaInstance(key, true, block) (kotlinc
+wraps every composable value lambda; the per-lambda key is what keeps
+currentCompositeKeyHashCode distinct between two content lambdas run
+under the same movable-content root — the stable-keys test asserted
+NOT-equal hashes and klio's raw closures compounded nothing).
+Follow-on: a wrapped value flowing into `compose(content)` is an
+INSTANCE, and the anon-object member walk's param-type disproof
+(`argDefinitelyNotParamType` on a Function0 param) killed the
+override — `instanceHasInvokeSurface` now recognizes a
+ComposableLambda wrapper by class identity. It must answer WITHOUT
+borrowing the module: an earlier draft consulted the module class
+table for pack-loaded classes and deadlocked every suite (callers
+hold exclusive module borrows — the fn's own doc warned).
+
 Original MovableContentTests failure modes (28 total): 7× "Expected a Text,
 but none found"; 6× LabeledReturn (the old recorded cluster — an eval
 LabeledReturn escaping); 4× "Vm::call_member `invoke` on
