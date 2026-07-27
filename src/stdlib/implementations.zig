@@ -1445,6 +1445,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Result.isSuccess", .f = result.result_is_success },
     .{ .fqn = "kotlin.Result.isFailure", .f = result.result_is_failure },
     .{ .fqn = "kotlin.Result.getOrThrow", .f = result.result_get_or_throw },
+    .{ .fqn = "kotlin.throwOnFailure", .f = result.result_throw_on_failure },
     .{ .fqn = "kotlin.Result.getOrNull", .f = result.result_get_or_null },
     .{ .fqn = "kotlin.Result.exceptionOrNull", .f = result.result_exception_or_null },
     .{ .fqn = "kotlin.Result.getOrDefault", .f = result.result_get_or_default },

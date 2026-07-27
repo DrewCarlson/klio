@@ -360,6 +360,19 @@ pub fn result_get_or_throw(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
+/// `Result.throwOnFailure()` — the internal helper the inline `getOrThrow`
+/// (spliced at declared-type call sites) delegates to. The interpreted source
+/// checks `value is Failure`, which the NATIVE Result representation never
+/// satisfies; this binding throws from the native payload directly.
+pub fn result_throw_on_failure(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const recv = recvResult(ctx.args) orelse
+        return .{ .err = .{ .Type = "throwOnFailure requires a Result receiver" } };
+    if (recv.ok) return .{ .ok = Value.Unit };
+    const thrown = recv.payload.*;
+    thrown.retain();
+    return .{ .err = .{ .Thrown = thrown } };
+}
+
 pub fn result_get_or_else(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 2) {
         return .{ .err = .{ .Arity = "Result.getOrElse expects (receiver, onFailure)" } };

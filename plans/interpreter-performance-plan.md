@@ -593,9 +593,19 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   alongside `this`, and the existing capture machinery carries it into
   anon members and lambdas.
 
-Remaining clusters (5): ResultTest (past `throwOnFailure`,
-assertion-level, 4), CollectionTest.sortedByNullable local-ext layer
-above (1).
+- **Result.throwOnFailure native binding — 2 more ResultTest tests
+  FIXED.** The inline `getOrThrow` splices at declared-type call sites
+  (a `Result<T>` parameter) and its body's bare `throwOnFailure()` ran
+  the interpreted source, whose `value is Failure` check never matches
+  the NATIVE Result representation — the failure returned as a value
+  instead of throwing. A `kotlin.throwOnFailure` intrinsic binding now
+  throws from the native payload. The two remaining ResultTest lines
+  advanced to a deeper assertion ("Expected value to be false" — the
+  `checkFailure(fail.map { 42 })` tail, likely a spliced `map`/
+  `mapCatching` producing a success-shaped value from a failure).
+
+Remaining clusters (3): ResultTest map-tail above (2),
+CollectionTest.sortedByNullable local-ext layer (1).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in
