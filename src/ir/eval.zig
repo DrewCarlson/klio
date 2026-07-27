@@ -5104,6 +5104,13 @@ noinline fn execArmSetField(comptime H: type, allocator: Allocator, frame: *Fram
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+fn modCountFrozenEval(mc: ?runtime.ObjRef(u64)) bool {
+    const cell = mc orelse return false;
+    const g = cell.borrow();
+    defer g.deinit();
+    return (g.get().* & runtime.FROZEN_MOD_BIT) != 0;
+}
+
 noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: *Frame, cf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cf.receiver);
     const v = frame.read(cf.value);
@@ -5119,8 +5126,15 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
     // (`map.entries`, `keys`, `values`) raises UnsupportedOperationException
     // from its `add`. Either way there is NO write-back to the
     // (read-only) property.
+    // A READ-ONLY collection value cannot inhabit a Mutable*-typed
+    // property in well-typed Kotlin, so its `+=` resolved to the binary
+    // `plus` with a property write-back (`var invalidations: List<...>;
+    // reference.invalidations += pair` builds a NEW list) — never the
+    // in-place `plusAssign` (which the intrinsic guard would refuse).
     const is_collection = switch (cur) {
-        .List, .Set, .Map => true,
+        .List => |l| l.mutable and !modCountFrozenEval(l.mod_count),
+        .Set => |st| st.mutable and !modCountFrozenEval(st.mod_count),
+        .Map => |m| m.mutable,
         else => false,
     };
     const assign = compoundAssignMethod(cf.op);
@@ -5156,6 +5170,20 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
                     .err => |e| return raiseStep(frame, e),
                 }
             }
+        }
+        // A read-only collection combines through its binary operator
+        // intrinsic (`List + element`, `Map + Pair`), producing the fresh
+        // value the property write-back stores.
+        switch (cur) {
+            .List, .Set, .Map => {
+                if (operatorMethod(cf.op)) |method| {
+                    switch (try host.callMember(allocator, &cur, method, &.{v})) {
+                        .ok => |rv| break :blk rv,
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            },
+            else => {},
         }
         switch (try applyBinop(allocator, cf.op, &cur, &v)) {
             .ok => |rv| break :blk rv,
