@@ -32,6 +32,20 @@ pub const GcHeader = struct {
     /// `@typeName(T)` of the payload, for the live-cell type histogram
     /// (`KLIO_GC_HIST`). Interned per type, so pointer identity keys the buckets.
     gc_type: [*:0]const u8 = "",
+    /// Generation: 0 = nursery (swept by every collection), 1 = tenured
+    /// (swept only by major collections). A cell is tenured when it survives
+    /// its first collection; permanent-image cells are minted tenured so a
+    /// minor mark never walks the stdlib graph.
+    gc_gen: u8 = 0,
+    /// Set by `writeBarrier` when a reference is stored into this (tenured)
+    /// cell after tenuring: the cell joins the remembered set and is re-traced
+    /// by the next minor mark so a tenured→nursery edge cannot be missed.
+    /// Cleared when the remembered set drains (every collection).
+    gc_remembered: bool = false,
+    /// Registered size of the cell (`@sizeOf(Cell)` + external payload bytes at
+    /// mint), so promotion can advance the major-collection trigger by real
+    /// bytes. Fits the header's existing padding.
+    gc_bytes: u32 = 0,
 };
 
 /// Diagnostic (KLIO_GC_HIST): after each collection, print the live-cell count
@@ -46,6 +60,11 @@ pub const Marker = struct {
     epoch: usize,
     grey: std.ArrayListUnmanaged(*GcHeader) = .empty,
     arena: Allocator,
+    /// Minor collection: only nursery cells are swept, so marking stops at
+    /// every tenured cell — its children are covered either by tenure (they
+    /// were reachable when it was promoted) or by the remembered set (it was
+    /// mutated since). A major collection traces the full graph.
+    minor: bool = false,
 
     pub fn shade(self: *Marker, h: *GcHeader) void {
         if (gc_poison and h.gc_trace == poisonTrap) {
@@ -53,6 +72,7 @@ pub const Marker = struct {
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
+        if (self.minor and h.gc_gen != 0) return; // tenured: not swept by a minor
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
         h.gc_mark = self.epoch;
         self.grey.append(self.arena, h) catch {
@@ -98,9 +118,54 @@ const SpinLock = struct {
 };
 
 var reg_lock: SpinLock = .{};
-var all_cells: ?*GcHeader = null;
+/// Cells minted since the last collection. Every collection sweeps this list;
+/// survivors move to `tenured`.
+var nursery: ?*GcHeader = null;
+/// Cells that survived a collection. Swept only by major collections; a minor
+/// mark never visits them (the remembered set covers tenured→nursery edges).
+var tenured: ?*GcHeader = null;
+var tenured_count: usize = 0;
 var bytes_since_gc: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+/// Bytes promoted into the tenured generation (plus net external growth)
+/// since the last major collection — the major trigger's accumulator.
+var bytes_since_major: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var live_bytes: usize = 0;
+
+/// Generational mode: collections default to minor (nursery-only) sweeps, with
+/// major (full-graph) collections on an Appel schedule over promoted bytes.
+/// `KLIO_GC_GEN=0` forces every collection major (the pre-generational
+/// behavior) for comparison and diagnosis.
+pub var generational: bool = true;
+var major_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Appel trigger for major collections: fires once `bytes_since_major`
+/// crosses it; recomputed after each major from the surviving live set.
+var major_threshold: usize = 8 * 1024 * 1024;
+
+/// The remembered set: tenured cells mutated since promotion. Re-traced at the
+/// start of every minor mark (a tenured cell's new children may be nursery
+/// cells); drained (flags cleared, list emptied) by every collection.
+var remembered: std.ArrayListUnmanaged(*GcHeader) = .empty;
+var remembered_lock: SpinLock = .{};
+
+/// Record a reference-store into an already-registered cell. Nursery cells
+/// need no record (a minor mark traces them from the roots); a tenured cell
+/// joins the remembered set once so the next minor mark re-traces it. With the
+/// GC disabled every header keeps `gc_gen == 0`, so this is one predictable
+/// branch.
+pub inline fn writeBarrier(h: *GcHeader) void {
+    if (h.gc_gen == 0) return;
+    if (@atomicLoad(bool, &h.gc_remembered, .monotonic)) return;
+    writeBarrierSlow(h);
+}
+
+fn writeBarrierSlow(h: *GcHeader) void {
+    remembered_lock.lock();
+    defer remembered_lock.unlock();
+    if (h.gc_remembered) return;
+    h.gc_remembered = true;
+    remembered.append(std.heap.page_allocator, h) catch
+        @panic("KGC: remembered set allocation failed");
+}
 
 /// Collection-trigger floor in bytes. A collection is requested once this many
 /// bytes of cells have been registered since the last one; after each
@@ -139,6 +204,7 @@ var gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 pub fn setThresholdFloor(bytes: usize) void {
     threshold_floor = bytes;
     threshold = bytes;
+    major_threshold = bytes;
 }
 
 /// Whether the process runs the GC reclamation path (set by `main` for
@@ -176,10 +242,17 @@ pub threadlocal var alloc_perm: bool = true;
 /// Push a freshly-minted cell onto the registry and account its size. Called
 /// only in GC mode, from `ObjRef.initOwned`.
 pub fn register(h: *GcHeader, bytes: usize) void {
-    if (alloc_perm) return; // permanent — never swept, still traceable
+    if (alloc_perm) {
+        // Permanent — never swept, still traceable. Minted tenured so a minor
+        // mark stops at it instead of walking the stdlib image graph, and so
+        // a runtime mutation of a permanent cell hits the write barrier.
+        h.gc_gen = 1;
+        return;
+    }
+    h.gc_bytes = std.math.lossyCast(u32, bytes);
     reg_lock.lock();
-    h.gc_next = all_cells;
-    all_cells = h;
+    h.gc_next = nursery;
+    nursery = h;
     reg_lock.unlock();
     const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
     if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
@@ -194,6 +267,8 @@ pub fn register(h: *GcHeader, bytes: usize) void {
 pub fn noteExternalBytes(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchAdd(bytes, .monotonic);
+    const mprev = bytes_since_major.fetchAdd(bytes, .monotonic);
+    if (mprev + bytes >= major_threshold) major_pending.store(true, .monotonic);
     const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
     if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
 }
@@ -212,6 +287,7 @@ pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
     _ = bytes_since_gc.fetchSub(@min(bytes, bytes_since_gc.load(.monotonic)), .monotonic);
+    _ = bytes_since_major.fetchSub(@min(bytes, bytes_since_major.load(.monotonic)), .monotonic);
 }
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -261,6 +337,7 @@ fn idleProbe() void {
     const now = nowMillis();
     if (now -| last < IDLE_COLLECT_MS) return;
     idle_collected.store(true, .monotonic);
+    major_pending.store(true, .monotonic); // idle reclamation wants the full heap back
     gc_pending.store(true, .monotonic);
     if (gc_debug) std.debug.print("[gc] idle collection requested\n", .{});
 }
@@ -284,7 +361,7 @@ pub fn safePoint() void {
     const sampled = gc_stress_every != 0 and safepoint_counter >= gc_stress_every;
     if (sampled) safepoint_counter = 0;
     if (!gc_stress and !sampled and !gc_pending.load(.monotonic)) return;
-    collect();
+    collectImpl(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +575,10 @@ pub fn poisonTrap(h: *GcHeader, _: *Marker) void {
 }
 
 pub fn collect() void {
+    collectImpl(true);
+}
+
+fn collectImpl(force_major: bool) void {
     // Single collector at a time. A thread that loses the race for `gc_lock`
     // found a collection already underway; it parks (publishing its roots) and
     // returns rather than queueing a redundant second collection.
@@ -516,9 +597,16 @@ pub fn collect() void {
         while (parked_count.load(.acquire) < others) std.atomic.spinLoopHint();
     }
 
+    const major = force_major or !generational or gc_stress or
+        major_pending.load(.monotonic);
+
     cur_epoch +%= 1;
     if (cur_epoch == 0) cur_epoch = 1; // 0 is the never-marked sentinel
-    var marker: Marker = .{ .epoch = cur_epoch, .arena = std.heap.page_allocator };
+    var marker: Marker = .{
+        .epoch = cur_epoch,
+        .arena = std.heap.page_allocator,
+        .minor = !major,
+    };
     defer marker.grey.deinit(std.heap.page_allocator);
 
     roots_lock.lock();
@@ -526,13 +614,27 @@ pub fn collect() void {
     roots_lock.unlock();
     for (root_list) |f| f(&marker);
     markThreadRoots(&marker);
+    // Minor: re-trace every tenured cell mutated since promotion — its
+    // children may be nursery cells the root scan cannot otherwise reach.
+    // Traced directly (not shaded): tenured cells are outside a minor sweep.
+    if (!major) {
+        for (remembered.items) |h| h.gc_trace(h, &marker);
+    }
     const marked = marker.drainCounted();
+    // Drain the remembered set under both kinds: after a minor every survivor
+    // is tenured (old→young edges became old→old); after a major the fresh
+    // full mark subsumes it. Cleared before the sweep so no entry dangles.
+    for (remembered.items) |h| h.gc_remembered = false;
+    remembered.clearRetainingCapacity();
 
-    const freed = sweep();
+    const freed = if (major) sweepFull() else sweepMinor();
     // Reclaim closure side-table metadata for slots no live value marked this
-    // epoch (still stop-the-world: the side-table is stable). Done after the
-    // sweep so the capture-store cells of dead closures are already gone.
-    if (sweepClosureHook) |f| f(cur_epoch);
+    // epoch (still stop-the-world: the side-table is stable). Major only: a
+    // minor mark never re-stamps tenured closures, so its epoch proves nothing
+    // about their liveness.
+    if (major) {
+        if (sweepClosureHook) |f| f(cur_epoch);
+    }
     gc_pending.store(false, .monotonic);
     // A collection that saw real allocation re-arms the idle probe, so
     // the NEXT quiescent period gets its bonus reclamation; the idle
@@ -544,7 +646,15 @@ pub fn collect() void {
     last_collect_ms.store(nowMillis(), .monotonic);
     bytes_since_gc.store(0, .monotonic);
     if (others != 0) stop_flag.store(false, .release);
-    threshold = @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| growthFactor());
+    if (major) {
+        major_pending.store(false, .monotonic);
+        bytes_since_major.store(0, .monotonic);
+        major_threshold = @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| growthFactor());
+        threshold = if (generational)
+            threshold_floor
+        else
+            @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| growthFactor());
+    }
     // Return the pages the swept cells freed back to the OS. The backing
     // allocator caches freed memory in its free-lists (RSS reflects the
     // allocation high-water, not the live set), so after a collection that
@@ -560,8 +670,8 @@ pub fn collect() void {
         if (release_to_os) |f| f();
     }
     if (gc_debug) std.debug.print(
-        "[kgc] epoch={d} marked={d} live={d} freed={d}\n",
-        .{ cur_epoch, marked, live_bytes, freed },
+        "[kgc] epoch={d} kind={s} marked={d} live={d} freed={d}\n",
+        .{ cur_epoch, if (major) "major" else "minor", marked, live_bytes, freed },
     );
     if (gc_hist) liveTypeHistogram();
 }
@@ -574,18 +684,20 @@ fn liveTypeHistogram() void {
     var buckets: [128]Bucket = undefined;
     var n: usize = 0;
     reg_lock.lock();
-    var cur = all_cells;
-    while (cur) |h| : (cur = h.gc_next) {
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (buckets[i].name == h.gc_type) {
-                buckets[i].count += 1;
-                break;
+    for ([2]?*GcHeader{ nursery, tenured }) |head| {
+        var cur = head;
+        while (cur) |h| : (cur = h.gc_next) {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (buckets[i].name == h.gc_type) {
+                    buckets[i].count += 1;
+                    break;
+                }
             }
-        }
-        if (i == n and n < buckets.len) {
-            buckets[n] = .{ .name = h.gc_type, .count = 1 };
-            n += 1;
+            if (i == n and n < buckets.len) {
+                buckets[n] = .{ .name = h.gc_type, .count = 1 };
+                n += 1;
+            }
         }
     }
     reg_lock.unlock();
@@ -611,34 +723,115 @@ fn liveTypeHistogram() void {
 /// (e.g. `malloc_zone_pressure_relief` on macOS). Null = no trim.
 pub var release_to_os: ?*const fn () void = null;
 
-fn sweep() usize {
+/// Minor sweep: walk only the nursery. Marked cells promote to the tenured
+/// list (their promotion bytes advance the major trigger); white cells free.
+/// The nursery is empty afterwards.
+fn sweepMinor() usize {
     reg_lock.lock();
     defer reg_lock.unlock();
-    var live: usize = 0;
     var freed: usize = 0;
-    var prev: ?*GcHeader = null;
-    var cur = all_cells;
+    var promoted: usize = 0;
+    var promoted_bytes: usize = 0;
+    var cur = nursery;
     while (cur) |h| {
         const next = h.gc_next;
-        if (h.gc_mark == cur_epoch) {
-            prev = h;
-            cur = next;
-            live += 1;
-        } else if (gc_nofree) {
-            // Diagnostic: keep white cells linked and alive.
-            prev = h;
-            cur = next;
-            live += 1;
+        if (h.gc_mark == cur_epoch or gc_nofree) {
+            h.gc_gen = 1;
+            h.gc_next = tenured;
+            tenured = h;
+            promoted += 1;
+            promoted_bytes += h.gc_bytes;
         } else {
-            // White: unlink, shallow-finalize, destroy.
-            if (prev) |p| p.gc_next = next else all_cells = next;
             h.gc_finalize(h);
-            cur = next;
             freed += 1;
         }
+        cur = next;
     }
-    live_bytes = live; // cell count proxy until Stage 2 tracks bytes
+    nursery = null;
+    tenured_count += promoted;
+    live_bytes = tenured_count; // cell count proxy
+    const mprev = bytes_since_major.fetchAdd(promoted_bytes, .monotonic);
+    if (mprev + promoted_bytes >= major_threshold) major_pending.store(true, .monotonic);
     return freed;
+}
+
+/// Major sweep: promote nursery survivors, then free every unmarked tenured
+/// cell. Runs after a full-graph mark, so an unmarked tenured cell is garbage.
+fn sweepFull() usize {
+    reg_lock.lock();
+    defer reg_lock.unlock();
+    var freed: usize = 0;
+    var cur = nursery;
+    while (cur) |h| {
+        const next = h.gc_next;
+        if (h.gc_mark == cur_epoch or gc_nofree) {
+            h.gc_gen = 1;
+            h.gc_next = tenured;
+            tenured = h;
+        } else {
+            h.gc_finalize(h);
+            freed += 1;
+        }
+        cur = next;
+    }
+    nursery = null;
+    var live: usize = 0;
+    var prev: ?*GcHeader = null;
+    cur = tenured;
+    while (cur) |h| {
+        const next = h.gc_next;
+        if (h.gc_mark == cur_epoch or gc_nofree) {
+            prev = h;
+            live += 1;
+        } else {
+            if (prev) |p| p.gc_next = next else tenured = next;
+            h.gc_finalize(h);
+            freed += 1;
+        }
+        cur = next;
+    }
+    tenured_count = live;
+    live_bytes = live; // cell count proxy
+    return freed;
+}
+
+test "minor mark stops at tenured cells; major stamps them" {
+    const T = struct {
+        fn trace(_: *GcHeader, _: *Marker) void {}
+        fn fin(_: *GcHeader) void {}
+    };
+    var a: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin, .gc_gen = 1 };
+    var minor: Marker = .{ .epoch = 3, .arena = std.testing.allocator, .minor = true };
+    defer minor.grey.deinit(std.testing.allocator);
+    minor.shade(&a);
+    try std.testing.expectEqual(@as(usize, 0), minor.grey.items.len);
+    try std.testing.expectEqual(@as(usize, 0), a.gc_mark); // untouched by a minor
+    var major: Marker = .{ .epoch = 3, .arena = std.testing.allocator };
+    defer major.grey.deinit(std.testing.allocator);
+    major.shade(&a);
+    try std.testing.expectEqual(@as(usize, 1), major.grey.items.len);
+    try std.testing.expectEqual(@as(usize, 3), a.gc_mark);
+}
+
+test "write barrier records a tenured cell once and skips nursery cells" {
+    const T = struct {
+        fn trace(_: *GcHeader, _: *Marker) void {}
+        fn fin(_: *GcHeader) void {}
+    };
+    var young: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin };
+    writeBarrier(&young);
+    try std.testing.expect(!young.gc_remembered);
+    var old: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin, .gc_gen = 1 };
+    writeBarrier(&old);
+    try std.testing.expect(old.gc_remembered);
+    const n = remembered.items.len;
+    writeBarrier(&old); // second store: already remembered, no duplicate entry
+    try std.testing.expectEqual(n, remembered.items.len);
+    // Undo the global side effect so other tests see a clean remembered set.
+    remembered_lock.lock();
+    remembered.clearRetainingCapacity();
+    old.gc_remembered = false;
+    remembered_lock.unlock();
 }
 
 test "marker shades, drains, and stops at fixpoint without recursion" {

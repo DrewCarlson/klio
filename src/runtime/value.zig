@@ -629,7 +629,9 @@ pub const PrimBuf = struct {
     }
 
     /// GC: scalars have no out-edges, so tracing is a no-op (the decl makes the
-    /// generic tracer treat this as a leaf rather than guessing).
+    /// generic tracer treat this as a leaf rather than guessing), and mutable
+    /// access needs no write barrier.
+    pub const gc_pointer_free = true;
     pub fn gcTrace(self: *const PrimBuf, m: *objcell.gc.Marker) void {
         _ = self;
         _ = m;

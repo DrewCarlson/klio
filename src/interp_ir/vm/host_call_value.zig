@@ -154,6 +154,22 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
     return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args);
 }
 
+/// JIT call-out fast path. A trampoline's loop-invariant `CallValue` site
+/// re-enters the interpreter through the full `callValue` preamble every
+/// iteration; when the callee is a plain exact-arity closure, the same
+/// prepare `execArmCallValue`'s flat hook uses resolves it, and the body
+/// runs on the recursive nested entry directly. Null = shape declined
+/// (arity mismatch, vararg, native form, unknown id); the caller falls
+/// back to `callValue`, which owns every special case.
+pub fn callClosureFast(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?EvalResult {
+    if (callee.* != .IrClosure) return null;
+    const prep = (try prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args)) orelse return null;
+    defer if (prep.composer_pushed) compose.popComposer();
+    // `prepareClosureFlatCallSlots` always resolves and records the body's
+    // module in the request.
+    return try ir.eval.evalWithCapturesChained(VmHost, allocator, prep.run_module.?, prep.owning, prep.func, prep.args, prep.captures, prep.chain, prep.closure_id, self);
+}
+
 /// One capture slot replaced at activation open — the receiver bind of a
 /// with-this call, applied to the COPIED capture vector so no bound closure
 /// value is materialized per call.
@@ -935,7 +951,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return dispatchIntrinsic(self, func.fqn, intrinsic, args);
             }
         }
-        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null and args.len < info.n_params) {
+        if (callValueTraceOn() and args.len < info.n_params) {
             std.debug.print("[callvalue-short] id={d} fn={s} args={d} params={d} recv_shape={}/{} caller={s}\n", .{
                 id,
                 func.fqn,
@@ -1554,7 +1570,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
         const id = callee.IrClosure.id;
         const captures = callee.IrClosure.captures;
         if (self.closures.get(@intCast(id))) |info| {
-            if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+            if (callValueTraceOn()) {
                 const module_g = self.module.borrow();
                 defer module_g.deinit();
                 const m = info.module orelse module_g.get();
@@ -1626,7 +1642,7 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                     if (std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
                         pass_threaded and args.len + 1 == info.n_params)
                     {
-                        if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+                        if (callValueTraceOn()) {
                             std.debug.print("[recv-fill] id={d} params={d} args={d} caller={s}\n", .{
                                 id, info.n_params, args.len,
                                 if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>",
@@ -2093,7 +2109,7 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
     if (v.* != .IrClosure) return false;
     const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return false;
-    if (runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null) {
+    if (callValueTraceOn()) {
         std.debug.print("[needs-this] id={d} has_recv={} caps={d}\n", .{ v.IrClosure.id, info.has_receiver, info.capture_names.len });
     }
     if (!info.has_receiver) return false;

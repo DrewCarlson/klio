@@ -833,6 +833,10 @@ pub const CooperativeInterceptor = struct {
         m.shade(&self.wakeup.cell.hdr);
         var pit = self.parked.valueIterator();
         while (pit.next()) |e| {
+            // Quiescent skip (minor marks): a fully-traced parked entry is
+            // frozen — its state AND its scope delta were promoted by the
+            // collection that first scanned it.
+            if (m.minor and e.state.gc_quiesced) continue;
             ir.eval.gcMarkSuspendState(&e.state, m);
             for (e.scope_delta) |v| v.gcMark(m);
         }
@@ -1373,6 +1377,8 @@ fn gcMarkCoroGlobal(m: *runtime.gc.Marker) void {
     if (PersistedParked.map) |*pm| {
         var it = pm.valueIterator();
         while (it.next()) |e| {
+            // Quiescent skip (minor marks): see CooperativeInterceptor.gcMark.
+            if (m.minor and e.state.gc_quiesced) continue;
             ir.eval.gcMarkSuspendState(&e.state, m);
             for (e.scope_delta) |v| v.gcMark(m);
         }

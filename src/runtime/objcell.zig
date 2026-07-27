@@ -387,6 +387,24 @@ fn isObjRef(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
 }
 
+/// Whether a payload of type `U` can hold references to other GC cells.
+/// Mirrors `gcTraceData`'s dispatch: if the tracer would walk nothing, a store
+/// into the payload cannot create a cell edge, so mutable access needs no
+/// write barrier — decided at compile time, the scalar/bytes fast paths pay
+/// nothing. A payload with a (possibly no-op) `gcTrace` can opt out with
+/// `pub const gc_pointer_free = true;`.
+fn mayHoldRefs(comptime U: type) bool {
+    if (comptime hasDeclSafe(U, "gc_pointer_free")) return false;
+    if (comptime hasDeclSafe(U, "gcTrace")) return true;
+    if (comptime hasDeclSafe(U, "gcMark")) return true;
+    if (comptime isObjRef(U)) return true;
+    if (comptime @typeInfo(U) == .optional) return mayHoldRefs(@typeInfo(U).optional.child);
+    if (comptime isArrayListLike(U)) return mayHoldRefs(@typeInfo(@FieldType(U, "items")).pointer.child);
+    if (comptime isSlice(U)) return mayHoldRefs(@typeInfo(U).pointer.child);
+    if (comptime isHashMapLike(U)) return true; // value type not recoverable generically; conservative
+    return false;
+}
+
 /// Trace one out-edge value `e` of type `E` (a Value, a struct with gcTrace, an
 /// `ObjRef` handle, or an optional thereof). Shading an `ObjRef` cell is how the
 /// graph advances; the cell's own `gc_trace` reaches the next level.
@@ -630,6 +648,12 @@ pub fn ObjRef(comptime T: type) type {
             const cell = self.cell;
             raceJitter();
             cell.lock.lockExclusive();
+            // Generational write barrier: a mutable borrow of a tenured cell
+            // may store a nursery reference into it, so the cell joins the
+            // remembered set for the next minor mark. Covers every guarded
+            // mutation choke point at once; payloads that cannot hold cell
+            // references skip it at compile time.
+            if (comptime mayHoldRefs(T)) gc.writeBarrier(&cell.hdr);
             return .{ .cell = cell };
         }
 
@@ -643,6 +667,9 @@ pub fn ObjRef(comptime T: type) type {
         }
 
         pub fn asPtr(self: Self) *T {
+            // Unguarded mutable access: same write-barrier obligation as a
+            // mutable borrow (several host paths store Values through this).
+            if (comptime mayHoldRefs(T)) gc.writeBarrier(&self.cell.hdr);
             return &self.cell.data;
         }
 
