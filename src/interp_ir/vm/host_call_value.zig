@@ -962,6 +962,56 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // trailing `($composer, $changed)` more than the call supplied and
         // a composer is ambient, complete the pair and re-enter, exactly
         // as the type-directed emission would have.
+        // A pair-tailed composable local fn called WITH the pair but fewer
+        // user args than declared (`useA()` lowered as useA($composer,
+        // $changed) against `useA(a: A = A(), $composer, $changed)`): keep
+        // the pair in the trailing slots and fill the defaulted gap from
+        // the registered local-fn default thunks — positional Null-padding
+        // shoved the composer into `a` and the changed flags into
+        // `$composer`.
+        if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
+            args.len >= 2 and args.len < info.n_params and
+            std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer") and
+            args[args.len - 1] == .Int and args[args.len - 2] == .Instance and blk: {
+            const ig = args[args.len - 2].Instance.borrow();
+            defer ig.deinit();
+            const cg = ig.get().class.borrow();
+            defer cg.deinit();
+            break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+        }) {
+            const n_user = args.len - 2;
+            var re: std.ArrayList(Value) = .empty;
+            defer re.deinit(allocator);
+            try re.appendSlice(allocator, args[0..n_user]);
+            const dslots: ?[]const ?FuncId = dblk: {
+                const mg2 = self.module.borrow();
+                defer mg2.deinit();
+                if (mg2.get().registry.local_fn_defaults.get(info.body_func)) |slots| break :dblk slots.items;
+                break :dblk null;
+            };
+            var gap_i: usize = n_user;
+            while (gap_i < info.n_params - 2) : (gap_i += 1) {
+                var filled = false;
+                if (dslots) |slots| {
+                    if (gap_i < slots.len) {
+                        if (slots[gap_i]) |dfid| {
+                            switch (try self.callFunc(allocator, module, dfid, re.items[0..gap_i])) {
+                                .ok => |dv| {
+                                    try re.append(allocator, dv);
+                                    filled = true;
+                                },
+                                .err => |e| return .{ .err = e },
+                            }
+                        }
+                    }
+                }
+                if (!filled) try re.append(allocator, .Null);
+            }
+            try re.append(allocator, args[args.len - 2]);
+            try re.append(allocator, args[args.len - 1]);
+            return callValue(self, allocator, callee, re.items);
+        }
         if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
             args.len + 2 == info.n_params and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
