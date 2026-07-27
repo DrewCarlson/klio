@@ -992,7 +992,41 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer ctx.allocator.free(needle);
     const start_i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     const start_u16: usize = if (start_i64 < 0) 0 else @intCast(start_i64);
-    const ignore_case = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
+    // Two shapes share this name: the public
+    // `indexOf(other, startIndex = 0, ignoreCase = false)` and the stdlib's
+    // internal `indexOf(other, startIndex, endIndex, ignoreCase, last = ...)`
+    // (args[3] is an Int endIndex there, and args[4] the flag). Reading the
+    // internal shape's endIndex as the flag searched case-sensitively and
+    // ignored the bound.
+    const internal_shape = ctx.args.len > 3 and ctx.args[3] != .Bool;
+    const end_u16: ?usize = if (internal_shape) blk: {
+        const e = ctx.args[3].asI64() orelse break :blk null;
+        break :blk if (e < 0) 0 else @intCast(e);
+    } else null;
+    const flag_idx: usize = if (internal_shape) 4 else 3;
+    const ignore_case = ctx.args.len > flag_idx and ctx.args[flag_idx] == .Bool and ctx.args[flag_idx].Bool;
+    const last_flag = internal_shape and ctx.args.len > 5 and ctx.args[5] == .Bool and ctx.args[5].Bool;
+    if (last_flag) {
+        // Backward form (the lastIndexOf driver): the largest match start in
+        // `[endIndex, startIndex]` (the internal signature runs its indices
+        // from startIndex DOWN to endIndex).
+        const total = utf16Len(s);
+        const upper: usize = @min(start_u16, total);
+        const lower: usize = end_u16 orelse 0;
+        const hay2 = if (ignore_case) try mapCase(ctx.allocator, s, false) else s;
+        defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(hay2);
+        const ndl2 = if (ignore_case) try mapCase(ctx.allocator, needle, false) else needle;
+        defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(ndl2);
+        var best: i64 = -1;
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, hay2, search_from, ndl2)) |pos| {
+            const start_char = utf16Len(s[0..pos]);
+            if (start_char > upper) break;
+            if (start_char >= lower) best = @intCast(start_char);
+            search_from = pos + 1;
+        }
+        return .{ .ok = Value.newInt(best) };
+    }
     // The empty string matches at the start index, clamped to the length (the
     // JVM behavior `"abc".indexOf("", n)` returns `n.coerceAtMost(length)`).
     if (needle.len == 0) {
@@ -1001,6 +1035,10 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const start_byte = utf16IndexToByte(s, start_u16);
     if (start_byte > s.len) return .{ .ok = Value.newInt(-1) };
+    // The internal shape's endIndex bounds the match START (a match may
+    // extend past it); search the full tail and bound-check the hit.
+    const end_start_byte: usize = if (end_u16) |e| @min(utf16IndexToByte(s, e), s.len) else s.len;
+    if (end_start_byte < start_byte) return .{ .ok = Value.newInt(-1) };
     const hay = s[start_byte..];
     var found: ?usize = null;
     if (ignore_case) {
@@ -1011,6 +1049,9 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (std.mem.indexOf(u8, lhay, lneed)) |off| found = start_byte + off;
     } else {
         if (std.mem.indexOf(u8, hay, needle)) |off| found = start_byte + off;
+    }
+    if (found) |f| {
+        if (f > end_start_byte) found = null;
     }
     return .{ .ok = Value.newInt(byteToCharIndex(s, found)) };
 }

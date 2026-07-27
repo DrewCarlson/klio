@@ -552,9 +552,28 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   value's `prim` (the same view-kind mechanism `IntArray.asUIntArray()`
   already used in the other direction).
 
-Remaining clusters (9): ResultTest (past
+- **String indexOf internal shape — FIXED (1 test:
+  indexOfStringIgnoreCase).** The `kotlin.String.indexOf` intrinsic read
+  the stdlib's INTERNAL `indexOf(other, startIndex, endIndex, ignoreCase,
+  last)` call shape as the public 3-arg one — the Int endIndex landed in
+  the ignoreCase slot, searching case-sensitively and unbounded. The
+  intrinsic now recognizes the internal shape (args[3] non-Bool),
+  bound-checks the match start against endIndex, and implements the
+  `last = true` backward form.
+- **Diagnosed, open: lastIndexOf 3-arg truncation.**
+  `"bceded".lastIndexOf("ED", 4, ignoreCase = true)` returns -1: the
+  interpreted `kotlin.text.lastIndexOf#5406` body's internal
+  `indexOf(string, startIndex, 0, ignoreCase, last = true)` call reaches
+  the intrinsic with only THREE user args (`String,Int,Int` — both the
+  positional ignoreCase and the named `last` are dropped), so the flags
+  never arrive. The truncation happens at lowering (the call site binds
+  the public 3-param decl and drops the extras) — find the site that
+  maps a 5-arg call onto a 3-param non-vararg target instead of
+  deferring. Not currently covered by the sweep baseline.
+
+Remaining clusters (8): ResultTest (past
 `throwOnFailure`, assertion-level, 4), thenBy
-receiver above (2), StringTest.indexOfStringIgnoreCase (1),
+receiver above (2),
 CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
 iterator on anon (1).
 
