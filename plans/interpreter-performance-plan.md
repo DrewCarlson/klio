@@ -910,17 +910,23 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 123/148,
-MovableContentTests 41/44, RecomposerTests 9/12
+CURRENT STANDING (post this stretch): CompositionTests 125/148,
+MovableContentTests 41/44, RecomposerTests 10/12
 (+testMultipleRecompose via default-filled pair padding in closure
 calls), probes all green, sweep 0 on every commit. The remaining
 failures cluster into DEEP families:
-(1) SKIP CALCULUS: testSimpleSkipping, testMovingMemoization,
-composableWithUnstableParameters_skipped, testRecomposition
-("Expected no changes but changes occurred" / invokeCount 2) — the
-`$dirty == 0 && composer.skipping` path does not skip where the
-reference runtime does; suspect the caller-side $changed bits (klio
-passes 0=unknown) and/or composer.skipping state during recompose.
+(1) SKIP CALCULUS — ROOT-CAUSED AND PARTLY FIXED: the family's front
+tests (testSimpleSkipping and friends) were never skip-calculus bugs
+at all. A capitalized bare call sharing a class's name (`Point(it)`
+inside the validator lambda, data class `Point(x, y)`) was routed to
+the constructor tail whenever the class existed, ignoring
+applicability; the dispatcher constructed a garbage instance and the
+validator consumed nothing. Fixed by gating `is_ctor_name` on ctor
+arity applicability (primary params + a host secondary-ctor arity
+probe); inapplicable ctors fall through to the member/extension walk
+with the ctor tail still fallback. Skip calculus itself verified
+correct via a temporary emitted-probe: recompose with unchanged params
+produces dirty=0 + skipping=true and takes skipToGroupEnd.
 (2) SPLICED-LOOP SLOT IDENTITY: slotsAreUsedCorrectly_forEach —
 collectAsState dispatches once instead of per loop iteration; the
 spliced forEach body's remember slots collide across iterations.
