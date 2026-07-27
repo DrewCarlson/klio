@@ -604,8 +604,16 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   `checkFailure(fail.map { 42 })` tail, likely a spliced `map`/
   `mapCatching` producing a success-shaped value from a failure).
 
-Remaining clusters (3): ResultTest map-tail above (2),
-CollectionTest.sortedByNullable local-ext layer (1).
+- **Result inline-splice gate — the last 2 ResultTest tests FIXED.**
+  `Result` is natively represented; its inline members' source bodies
+  (`map`'s `else -> Result(value)`, the `value`/`Failure` internals)
+  can never run correctly against the native value. The inline resolver
+  now declines to splice any inline fn declared on a `Result` receiver,
+  so every call reaches the runtime dispatch and the native intrinsics.
+
+Remaining baseline failure (1): CollectionTest.sortedByNullable — the
+local-extension-from-selector-closure layer (diagnosis + repro
+scratchpad localext.kt recorded above).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in

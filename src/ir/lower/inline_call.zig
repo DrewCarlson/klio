@@ -982,6 +982,14 @@ pub fn tryInlineCallWithTypeArgs(
     if (b.inlineDeclInProgress(f)) {
         return null;
     }
+    // `Result` is natively represented (a value class the interpreter models
+    // directly): its inline members' SOURCE bodies read the internal `value`
+    // slot and the `Failure` wrapper, which the native value never carries.
+    // Never splice them — the runtime dispatch serves them from the native
+    // intrinsics (`Result.map`, `getOrThrow`, ...).
+    if (f.receiver_type) |rt| {
+        if (std.mem.eql(u8, rt.name.name, "Result")) return null;
+    }
     // `kotlin.reflect.typeOf<T>()` is a reified intrinsic: its source body
     // is a placeholder throw, and the runtime serves the call from the
     // reified type argument — never splice it.
