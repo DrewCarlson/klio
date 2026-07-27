@@ -112,12 +112,15 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     if (runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
         const ig = composer.Instance.borrow();
         const cg = ig.get().class.borrow();
-        std.debug.print("[composer-bind] class={s} args={d} params={d} last={s}", .{ cg.get().name, args.len, params.len, @tagName(std.meta.activeTag(args[args.len - 1])) });
+        const cls_name = cg.get().name;
+        std.debug.print("[composer-bind] class={s} args={d} params={d} last={s}\n", .{ cls_name, args.len, params.len, @tagName(std.meta.activeTag(args[args.len - 1])) });
+        // A non-Composer instance in the pair slot is the misbind under
+        // investigation: dump the interpreter frame chain to find the frame
+        // that first received it.
+        const is_composer = std.mem.indexOf(u8, cls_name, "Composer") != null;
         cg.deinit();
         ig.deinit();
-        var frames = std.ArrayList(u8).empty;
-        defer frames.deinit(std.heap.page_allocator);
-        std.debug.print("\n", .{});
+        if (!is_composer) ir.eval.dumpFrameChainForDiagAlways();
     }
     return composer;
 }

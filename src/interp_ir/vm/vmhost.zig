@@ -128,13 +128,17 @@ pub fn emitPathLabeled(
         tags.appendSlice(allocator, label) catch return;
     }
     const fn_name = pathSimpleName(decl_fqn);
+    const caller: []const u8 = if (ir.eval.currentFrameFunc()) |cf|
+        (if (cf.fqn.len != 0) cf.fqn else cf.name)
+    else
+        "-";
     if (fid) |f| {
-        trace.path("fn={s} recv={s} argc={d} args={s} decl={s}#{d} path={s}", .{
-            fn_name, recv_label, args.len, tags.items, decl_fqn, f.int(), path_tag,
+        trace.path("fn={s} recv={s} argc={d} args={s} decl={s}#{d} path={s} caller={s}", .{
+            fn_name, recv_label, args.len, tags.items, decl_fqn, f.int(), path_tag, caller,
         });
     } else {
-        trace.path("fn={s} recv={s} argc={d} args={s} decl={s} path={s}", .{
-            fn_name, recv_label, args.len, tags.items, decl_fqn, path_tag,
+        trace.path("fn={s} recv={s} argc={d} args={s} decl={s} path={s} caller={s}", .{
+            fn_name, recv_label, args.len, tags.items, decl_fqn, path_tag, caller,
         });
     }
 }
