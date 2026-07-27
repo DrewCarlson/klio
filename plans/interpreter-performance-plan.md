@@ -805,4 +805,16 @@ three main-module composables may land in other_package_tier → empty
 authoritative set → tail), and whether the eval leg calls the binder
 at all for an empty non-null set. boundedCallCandidates keeps all
 tier-passing overloads (the singleton theory was wrong); the arity
-trim stands on its own.
+trim stands on its own. FURTHER: the tail's `cands=3` field IS
+`cmg.candidates.len` — the instr carries all three; three binder
+invocations for the site score and pick #9405 (350) successfully; the
+ctor-decline branch does NOT fire (new ntrace print); yet ONE
+execution reaches the unresolved tail with no binder entry line at
+all. The leg has no pre-print return, so that execution diverges
+between the member passes and the overload leg — remaining suspects:
+a strict/lenient-pass `.Suspended` exit-and-resume路径 that re-enters
+dispatch differently, or the `resolved` variable set by a pass whose
+value then fails a later guard. Next: add a missTraceWant-gated print
+at the else-arm entry (before cmgGlobalRecord) and at each `resolved
+= v` assignment to see which pass serves/short-circuits the failing
+execution.

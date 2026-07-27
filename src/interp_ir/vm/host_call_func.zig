@@ -2583,7 +2583,10 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                         .has_body = true,
                     };
                     if (applicability.applicable(&ctor_sig, shapes, scope)) |csc| {
-                        if (csc.points > best_ord_score) return .{ .ok = null };
+                        if (csc.points > best_ord_score) {
+                            if (ntrace) std.debug.print("[cno] {s} ctor-decline class={d} ctor_pts={d} best={d}\n", .{ name, ccid.int(), csc.points, best_ord_score });
+                            return .{ .ok = null };
+                        }
                     }
                 }
             }
