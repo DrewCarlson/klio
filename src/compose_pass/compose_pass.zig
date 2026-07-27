@@ -1845,6 +1845,99 @@ const Walker = struct {
     /// `wrapBranchInReplaceGroup`, boxing a non-Block branch into a
     /// single-statement Block first. Idempotent for already-wrapped
     /// blocks (their first stmt is the startReplaceGroup call).
+    /// Bracket a loop whose body composes: the body gets a per-iteration
+    /// REPLACEABLE GROUP (one sibling group per iteration, same span key —
+    /// the runtime reconciles duplicate sibling keys positionally) and the
+    /// loop itself an outer group, so a change in iteration count inserts or
+    /// removes body groups instead of shifting every slot that follows the
+    /// loop (a growing `for { remember(...) }` must not displace the
+    /// remembers after it). Bodies that jump out (`break`/`continue`/
+    /// `return`) are left unbracketed: the jump would skip the end call.
+    fn wrapLoopContent(w: *Walker, loop: *Expr, body: *Expr) void {
+        if (!(w.thread and !w.explicit_groups)) return;
+        if (!w.branchHasComposable(body)) return;
+        if (loopBodyEscapes(body)) return;
+        w.wrapBranchBoxed(body);
+        const sp = exprSpanOf(loop);
+        const key = positionalKey(sp);
+        const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
+        start_args[0] = w.b.intLit(key);
+        const stmts = w.a.alloc(ast.Stmt, 3) catch @panic("oom");
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startReplaceGroup", start_args) };
+        stmts[1] = .{ .Expr = loop.* };
+        stmts[2] = .{ .Expr = w.b.callMember(w.composerRef(), "endReplaceGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        loop.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+    }
+
+    /// Whether a loop body contains a jump that leaves the body (`break`,
+    /// `continue`, `return`) at any depth. Nested loops keep their own
+    /// break/continue, but scanning conservatively at all depths only costs
+    /// a missed bracket, never an unbalanced group.
+    fn loopBodyEscapes(e: *const Expr) bool {
+        switch (e.*) {
+            .Break, .Continue, .Return => return true,
+            .Block => |blk| {
+                for (blk.stmts) |*st| switch (st.*) {
+                    .Expr => |*se| if (loopBodyEscapes(se)) return true,
+                    .Assign => |a| if (loopBodyEscapes(&a.value)) return true,
+                    .Decl => |d| switch (d) {
+                        .Property => |pp| {
+                            if (pp.init) |*ini| if (loopBodyEscapes(ini)) return true;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                };
+                return false;
+            },
+            .If => |ff| {
+                if (loopBodyEscapes(ff.cond)) return true;
+                if (loopBodyEscapes(ff.then_branch)) return true;
+                if (ff.else_branch) |eb| if (loopBodyEscapes(eb)) return true;
+                return false;
+            },
+            .When => |wh| {
+                if (wh.subject) |sub| if (loopBodyEscapes(sub)) return true;
+                for (wh.branches) |*br| if (loopBodyEscapes(&br.body)) return true;
+                return false;
+            },
+            .For => |fr| {
+                if (loopBodyEscapes(fr.iter)) return true;
+                return loopBodyEscapes(fr.body);
+            },
+            .While => |wl| {
+                if (loopBodyEscapes(wl.cond)) return true;
+                return loopBodyEscapes(wl.body);
+            },
+            .DoWhile => |dw| {
+                if (dw.body) |bd| if (loopBodyEscapes(bd)) return true;
+                return loopBodyEscapes(dw.cond);
+            },
+            .Try => |t| {
+                var tb = Expr{ .Block = t.body };
+                if (loopBodyEscapes(&tb)) return true;
+                for (t.catches) |*ca| {
+                    var cb = Expr{ .Block = ca.body };
+                    if (loopBodyEscapes(&cb)) return true;
+                }
+                if (t.finally) |fin| {
+                    var fb = Expr{ .Block = fin };
+                    if (loopBodyEscapes(&fb)) return true;
+                }
+                return false;
+            },
+            .Labeled => |l| return loopBodyEscapes(l.expr),
+            .Call => |c| {
+                for (c.args) |*arg| {
+                    if (arg.* == .Lambda) continue;
+                    if (loopBodyEscapes(arg)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn wrapBranchBoxed(w: *Walker, branch: *Expr) void {
         if (branch.* == .Block) {
             if (branch.Block.stmts.len != 0 and
@@ -2251,14 +2344,17 @@ const Walker = struct {
             .While => |*wl| {
                 try w.walkExpr(wl.cond);
                 try w.walkExpr(wl.body);
+                w.wrapLoopContent(e, wl.body);
             },
             .DoWhile => |*dw| {
                 if (dw.body) |bd| try w.walkExpr(bd);
                 try w.walkExpr(dw.cond);
+                if (dw.body) |bd| w.wrapLoopContent(e, bd);
             },
             .For => |*fr| {
                 try w.walkExpr(fr.iter);
                 try w.walkExpr(fr.body);
+                w.wrapLoopContent(e, fr.body);
             },
             .Return => |*r| {
                 if (r.value) |v| {
