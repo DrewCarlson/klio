@@ -767,8 +767,20 @@ Results: deferredSubCompose_{Static,Dynamic,Nested_Static} pass;
 CompositionLocalTests 27/31 → 30/31; CompositionReusingTests 9/25 →
 25/25; CompositionObserverTests 8/13 → 13/13; every other probe and the
 full stdlib sweep (117 files, 0 failures) unchanged. Remaining in
-CompositionLocalTests: testProvideAllLocals ("unresolved global
-CompositionLocalProvider" — the sub-module bare-call resolution case
-diagnosed earlier: the CMG global leg cannot resolve the main-module
-composable by name from the anon sub-module frame; candidates/committed
-id validated but the name-lookup fallback still misses).
+CompositionLocalTests: testProvideAllLocals only. Landed toward it: the
+overload binder's unbounded collection now falls back to the MAIN
+module when an anon sub-module frame (own non-empty func index) has no
+same-name candidate — two of the three CompositionLocalProvider call
+sites now score and bind correctly ([cno] rounds: the spread site
+accepts via the pair-reduced signature, the 4-arg site picks the
+context overload #9405 at 350 pts). The LAST site (span 290:18650,
+`CompositionLocalProvider(locals) { ... }` inside the sub-module
+lambda, nparams_vals=2, committed func=9403 name-mismatched in-frame)
+still reaches the cmg-tail WITHOUT a [cno] round for nargs=2 — the
+overload leg never executes for it. Prime suspect: `cmgGlobalRecord`'s
+miss-skip fast path recorded on the FIRST (pre-ambient) invocation
+re-routes repeat calls around the overload leg (the "contamination
+cluster" comment at the record site describes exactly this shape) —
+check `cmg_skip`/`cmgGlobalRecord`'s replay path and whether it can
+bypass callNamedOverload; alternatively dump which branch serves the
+site by instrumenting the else-arm.

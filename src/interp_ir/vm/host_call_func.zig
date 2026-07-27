@@ -2349,7 +2349,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // side module. The set narrows which ids may run; it must be dereferenced
     // by the image that owns those ids. Legacy unbounded lookup retains the
     // frame-module rule because it searches that module's name index.
-    const eff: *const Module = if (bounded or module.func_index.items.len == 0) mg.get() else module;
+    const eff0: *const Module = if (bounded or module.func_index.items.len == 0) mg.get() else module;
     // The package the visibility filter scopes against. For an ordinary
     // packaged caller this is `caller_pkg`, so the filter and the dispatch
     // below behave exactly as before. Only when the caller frame is a
@@ -2365,7 +2365,21 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // authority as `func_index` (every append pairs with a name-index
     // push); the old per-call linear scan of the whole index was the
     // hottest frame in the interpreter profile.
-    const candidates = candidate_ids orelse eff.funcsBySimpleName(name);
+    var eff_resolved = eff0;
+    const candidates = candidate_ids orelse blk: {
+        const own = eff0.funcsBySimpleName(name);
+        // An anon sub-module frame has its OWN func index (its methods), so
+        // the empty-index main fallback above never fires — yet a bare call
+        // written in its body resolves main-module top-levels
+        // (`CompositionLocalProvider` from a DisposableEffect anon). No
+        // same-name candidate in the sub-module: collect from main.
+        if (own.len == 0 and eff0 != mg.get()) {
+            eff_resolved = mg.get();
+            break :blk mg.get().funcsBySimpleName(name);
+        }
+        break :blk own;
+    };
+    const eff = eff_resolved;
     const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     if (ntrace) {
         std.debug.print("[cno] {s} bounded={} cands={d} in_fn={s} nargs={d} names:", .{
