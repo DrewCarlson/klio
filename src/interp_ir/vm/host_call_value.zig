@@ -981,6 +981,46 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
                 return dispatchIntrinsic(self, func.fqn, intrinsic, args);
             }
+            // A closure published for an OVERLOADED top-level name carries
+            // only ONE signature (first-wins). A call its arity cannot bind
+            // belongs to a same-name sibling (a same-file private 3-arg
+            // published over the public 2-arg overload in another file);
+            // padding it with Nulls runs the wrong body. Re-rank the full
+            // same-name set through the overload binder.
+            // The SOURCE-level simple name: a file-private top-level fn is
+            // registered under a per-file rename (`over$f220`); its overload
+            // siblings live under the plain name.
+            const src_name = blk: {
+                const n = func.name;
+                const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse break :blk n;
+                if (i + 2 > n.len or n[i + 1] != 'f') break :blk n;
+                for (n[i + 2 ..]) |c| {
+                    if (!std.ascii.isDigit(c)) break :blk n;
+                }
+                break :blk n[0..i];
+            };
+            const sibling_count = module.funcsBySimpleName(src_name).len +
+                @intFromBool(src_name.len != func.name.len);
+            if (args.len != info.n_params and info.capture_names.len == 0 and
+                !module.globalArityCanBind(func.id, func, args.len) and
+                sibling_count > 1)
+            {
+                if (module.funcsBySimpleName(src_name).len > 1) {
+                    switch (try host_call_func.callNamedOverload(self, allocator, module, null, src_name, args, &.{}, null, false, func.package, null, "")) {
+                        .ok => |maybe| if (maybe) |v2| return .{ .ok = v2 },
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+                // A single plain-named sibling of a renamed file-private fn:
+                // dispatch it directly when the arity fits.
+                for (module.funcsBySimpleName(src_name)) |sib_id| {
+                    if (sib_id.int() == func.id.int()) continue;
+                    const sib = module.funcById(sib_id) orelse continue;
+                    if (!sib.hasBody()) continue;
+                    if (!module.globalArityCanBind(sib_id, sib, args.len)) continue;
+                    return self.callFunc(allocator, module, sib_id, args);
+                }
+            }
         }
         if (callValueTraceOn() and args.len < info.n_params) {
             std.debug.print("[callvalue-short] id={d} fn={s} args={d} params={d} recv_shape={}/{} caller={s}\n", .{

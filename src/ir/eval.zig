@@ -7026,6 +7026,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     break :blk null;
                 }
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
+                // First-wins commit vs overloads: a committed fn the call's
+                // ARITY cannot bind (a same-file private 3-arg picked for a
+                // 2-arg call whose true target is a public overload in
+                // another file) must not serve by id — decline so the
+                // overload leg ranks the full same-name set.
+                if (!frame.module.globalArityCanBind(fid, cf, arg_values.len)) break :blk null;
                 break :blk fid;
             };
             // A constructor-name call (`Foo(args)` where `Foo` is a class) must

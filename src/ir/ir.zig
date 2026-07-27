@@ -6665,7 +6665,7 @@ pub const Module = struct {
     /// bind. If no scoped declaration can bind, the host/incomplete-header
     /// compatibility boundary remains active until P10 supplies a complete
     /// declaration for the host shape.
-    fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
+    pub fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
         // The compose pass appends ($composer, $changed) to composable
         // signatures. Call sites lower with USER argument counts (the pair
         // is threaded later, or completed at runtime), so the pair never
