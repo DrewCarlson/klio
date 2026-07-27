@@ -777,10 +777,16 @@ context overload #9405 at 350 pts). The LAST site (span 290:18650,
 `CompositionLocalProvider(locals) { ... }` inside the sub-module
 lambda, nparams_vals=2, committed func=9403 name-mismatched in-frame)
 still reaches the cmg-tail WITHOUT a [cno] round for nargs=2 — the
-overload leg never executes for it. Prime suspect: `cmgGlobalRecord`'s
-miss-skip fast path recorded on the FIRST (pre-ambient) invocation
-re-routes repeat calls around the overload leg (the "contamination
-cluster" comment at the record site describes exactly this shape) —
-check `cmg_skip`/`cmgGlobalRecord`'s replay path and whether it can
-bypass callNamedOverload; alternatively dump which branch serves the
-site by instrumenting the else-arm.
+overload leg never executes for it. RESOLVED FURTHER (full [cno] dump): the site IS served by the
+binder — `bounded=true cands=1`, candidate set = [9403] ONLY (the
+vararg overload), scored 191 through the pair-reduced completion and
+dispatched. The defect is the LOWERING's bounded candidate set for
+this sub-module call site: it recorded a single main-space id (9403)
+and EXCLUDED #9405 (context, content) — the overload the 2-arg call
+actually fits — so the runtime faithfully dispatches the wrong body
+whose innards then miss. Next: find where `cmgCandidates`/
+`boundedCallCandidates` filtered the set during the anon sub-module
+lowering of `CompositionLocalProvider(locals) { ... }` (the shape
+filter likely ran against pre-pass signatures or dropped 9405 by
+arity), and make the bounded set complete or null (null → the
+unbounded main collection, which now works, picks #9405 at 350 pts).
