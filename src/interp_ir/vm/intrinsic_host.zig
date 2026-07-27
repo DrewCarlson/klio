@@ -550,6 +550,15 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         return flattenEval(r);
     }
 
+    // `Comparator` is a `fun interface`: invoking it as a value
+    // (`comparator(a, b)` inside `compareBy(comparator, selector)`)
+    // calls `compare` — same bridge the main-evaluator `callValue` has.
+    if (callable.* == .Comparator and args.len == 2) {
+        var host = vmHost(self, out);
+        const r = try host.callMember(self.allocator, callable, "compare", args);
+        return flattenEval(r);
+    }
+
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable on `{s}`", .{callable.typeFqn()});
     return .{ .err = .{ .Unimplemented = msg } };
 }

@@ -571,10 +571,21 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   maps a 5-arg call onto a 3-param non-vararg target instead of
   deferring. Not currently covered by the sweep baseline.
 
+- **sortedByNullable — PARTIAL:** the intrinsic host's `invokeCallable`
+  now bridges a `Comparator` value to its `compare` member (the same
+  fun-interface bridge the main evaluator's `callValue` has); the
+  remaining layer is a LOCAL EXTENSION FN (`fun String.nonEmptyLength()`
+  declared inside the test) called from the selector closure when that
+  closure is invoked through the new compare bridge — the member walk
+  misses it there while the same selector works through `sortedBy` and a
+  direct value call, so the bridge's invocation path loses whatever
+  frame/module context the local-ext member resolution needs. Repro:
+  scratchpad localext.kt line 6.
+
 Remaining clusters (8): ResultTest (past
 `throwOnFailure`, assertion-level, 4), thenBy
 receiver above (2),
-CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
+CollectionTest.sortedByNullable local-ext layer above (1), GroupingTest
 iterator on anon (1).
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
