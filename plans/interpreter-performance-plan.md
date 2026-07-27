@@ -818,3 +818,23 @@ value then fails a later guard. Next: add a missTraceWant-gated print
 at the else-arm entry (before cmgGlobalRecord) and at each `resolved
 = v` assignment to see which pass serves/short-circuits the failing
 execution.
+
+
+## Compose fleet snapshot (post pass-threading fix)
+
+Green classes: EffectsTests 18/18, SnapshotStateObserverTests 30/30,
+CompositionReusingTests 25/25, CompositionObserverTests 13/13,
+CompositionAndDerivedStateTests 17/17, AbstractApplierTest 10/10,
+BroadcastFrameClockTest 4/4. Remaining clusters:
+- CompositionTests 106/148 (42 failures)
+- MovableContentTests 16/44 (28 failures)
+- RecomposerTests 8/12 (4)
+- CompositionLocalTests 30/31 (testProvideAllLocals — see the traced
+  lead above: three binder invocations pick correctly, one execution
+  reaches the unresolved tail with NO binder entry and NO serve audit,
+  i.e. it diverges before the overload leg; next instrument the
+  else-arm entry directly)
+
+Next cluster to attack: MovableContentTests (28 failures, likely few
+root causes — movable content machinery was untouched by this effort
+and exercises the withChangeList/insert seams).
