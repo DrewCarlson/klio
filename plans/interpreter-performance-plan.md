@@ -864,7 +864,25 @@ Composition`. Landed toward it: (1) local_fn_overloads shadow rule in
 shadowedByClass; (2) LocalFnOverload n_required is pair-trimmed so the
 3-arg call is applicable; (3) the eval by-id serve skips a
 NON-CONSTRUCTIBLE committed class (interface/abstract, non-SAM call) —
-the serve arm moved from global_id to global. STILL FAILING — refined: the STATIC lowering now routes ONE call via
+the serve arm moved from global_id to global. ADVANCED FURTHER — the interface instantiation is FIXED: the local-fn
+overload SELECTION refuted the composable because the pass appends the
+($composer, $changed) pair POSITIONALLY behind NAMED user args, and the
+positional binder did not skip name-bound slots — the composer arg
+scored against param `a: Boolean` and killed the candidate
+(selectLocalFnOverload / anyLocalFnOverloadApplicable / the third
+sibling walk now advance past bound slots). The local ext-fn call path
+also shifts arg names one slot right when it prepends the receiver.
+NOW FAILING at the next layer: "unresolved global `next`" — the
+VALIDATOR ext (`fun MockViewValidator.Composition(a, b, c)`) invoked
+via `this.Composition(a = true, ...)` (member_or_local_exact_value →
+CallValueWithThis, named args) runs its body with `this` = Bool (the
+first named arg landed in the receiver): the runtime named-arg binding
+of CallValueWithThis on a local EXT closure misaligns receiver vs
+named args. Next: inspect callValueWithThis/callValueWithThisExact for
+the named-args + receiver-capture closure shape (n_params, has_receiver
+of the local ext fn's closure) and align the binding.
+
+STILL FAILING (previous note) — refined: the STATIC lowering now routes ONE call via
 `member_or_local_exact_value` (CallValueWithThis on the local value ✓),
 but TWO RUNTIME-LOWERED copies of the same call (emission audit
 `unresolved_bare_call` with pkg="") still emit CMG and serve

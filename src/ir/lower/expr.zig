@@ -6931,6 +6931,11 @@ fn anyLocalFnOverloadApplicable(
                 }
                 if (!found) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7012,6 +7017,11 @@ fn selectLocalExtOverload(
                 }
                 if (pi == null) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7111,6 +7121,11 @@ fn selectLocalFnOverload(
                 }
                 if (pi == null) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7172,7 +7187,17 @@ fn lowerSelectedLocalOverloadCall(
             vals[0] = recv;
             for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
             const args_start = try packContiguous(b, vals);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            // The receiver rides as slot 0: shift the arg-name list one
+            // slot right, or a named call (`Composition(a = ..., ...)`)
+            // labels the RECEIVER "a" and every binding misaligns.
+            const shifted: []const ?[]const u8 = blk: {
+                if (ast_arg_names.len == 0) break :blk ast_arg_names;
+                const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+                sh[0] = null;
+                @memcpy(sh[1..], ast_arg_names);
+                break :blk sh;
+            };
+            const arg_names = try internArgNames(b.allocator, b.module, shifted);
             const dst = b.allocReg();
             try b.push(.{ .CallValue = .{
                 .dst = dst,
@@ -10921,6 +10946,21 @@ fn lowerUnresolvedBareCall(
         !b.capturesThisSlot())
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
+    }
+    // A runtime-relowered body calling a LOCAL FN captured under its
+    // MANGLED overload name (`Composition$ovl0`): route through the
+    // captured value. The CMG name walk cannot see frame captures, so it
+    // fell to a same-named classifier — the pack's `interface Composition`
+    // instead of the test's local `@Composable fun Composition`.
+    {
+        var ovl_i: usize = 0;
+        while (ovl_i < 4) : (ovl_i += 1) {
+            var mb: [96]u8 = undefined;
+            const mangled = std.fmt.bufPrint(&mb, "{s}$ovl{d}", .{ name0, ovl_i }) catch break;
+            if (isLowerAnonCapture(mangled)) {
+                return try emitValueCall(b, args, ast_arg_names, ast_type_args, try b.module.func_name_index.allocator.dupe(u8, mangled));
+            }
+        }
     }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
