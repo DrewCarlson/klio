@@ -706,6 +706,19 @@ per-class clusters tracked in the resolution plan.
   no changes for the main composition (invalidation → recomposition
   delivery), then the un-applied sub-composition trips
   "Expected applyChanges() to have been called" on the second
-  doSubCompose. Next: trace the invalidate→recompose delivery in
-  compositionTest's mock clock (why the invalidated scope produces no
-  changes).
+  doSubCompose. Traced further: the ComposeRuntimeError fires in the MAIN
+  composition's recompose (`GapComposer.recompose`'s
+  `runtimeCheck(changes.isEmpty())`) during `expectChanges()` — the
+  main composer's `changes` is non-empty after its initial
+  `applyChanges` DID run (PATH-verified for both compositions, caller
+  `Recomposer.composeInitial`). Source verifies each CompositionImpl
+  passes ITS OWN `changes` object to its composer (no cross-composition
+  sharing), and `applyChangesInLocked` drains via
+  `changes.execute(...)`. Next: determine whether klio's
+  `ChangeList.execute` clears the list (isEmpty must flip true) or
+  what appends to the MAIN list between its apply and the recompose —
+  instrument the size of the composer's `changes` at the recompose
+  check and at applyChanges exit (a gated print in the interpreted
+  runtime via a temporary edit, or a value-identity probe). The
+  "Expected changes but none were found" assertion is DOWNSTREAM of
+  this aborted recompose.
