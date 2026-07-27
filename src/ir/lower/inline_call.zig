@@ -314,6 +314,15 @@ pub fn spliceInlineLambda(
     // recorded on the current inline-lambda frame at the call site.
     const splice_caller_depth = b.inlineLambdaCallerDepth();
     const site_hint = b.inlineLambdaCallerHint();
+    // Collect the enclosing inline fn's param names BEFORE this splice
+    // pushes its own (empty-subst) frame — these are the marks to suspend
+    // while the caller's body lowers.
+    var enclosing_subst_keys: std.ArrayList([]const u8) = .empty;
+    defer enclosing_subst_keys.deinit(b.allocator);
+    if (b.innermostInlineLambdaSubst()) |subst0| {
+        var kit0 = subst0.keyIterator();
+        while (kit0.next()) |k0| try enclosing_subst_keys.append(b.allocator, k0.*);
+    }
     const counted = inline_state.inlineExpandEnter();
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
@@ -362,11 +371,18 @@ pub fn spliceInlineLambda(
     // simple name refers to a caller binding (`apply`'s `block: T.() -> Unit`
     // param vs the test's captured composable `block`), and a leaked mark
     // emits CallValueWithThis with the scope subject as receiver — the
-    // subject then rides the composable pair. Clear the marks for the
-    // caller body; restore after.
-    var saved_rlp = try b.receiverLambdaParamNames();
-    defer saved_rlp.deinit();
-    b.clearReceiverLambdaParams();
+    // subject then rides the composable pair. Suspend exactly the enclosing
+    // inline fn's own param marks (the frame's substitution keys) for the
+    // caller body; every other mark stays (a `buildMap { put(...) }` body
+    // still resolves through its own receiver machinery).
+    var suspended_rlp: std.ArrayList([]const u8) = .empty;
+    defer suspended_rlp.deinit(b.allocator);
+    for (enclosing_subst_keys.items) |k| {
+        if (b.isReceiverLambdaParam(k)) {
+            b.unmarkReceiverLambdaParam(k);
+            try suspended_rlp.append(b.allocator, k);
+        }
+    }
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
     if (receiver != null) {
@@ -379,7 +395,7 @@ pub fn spliceInlineLambda(
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     const v = try lowerBlock(b, &body);
-    try b.inheritReceiverLambdaParams(&saved_rlp);
+    for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
     b.lambda_splice_resolve = prev_splice;

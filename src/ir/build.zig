@@ -1844,11 +1844,12 @@ pub const FuncBuilder = struct {
     pub fn receiverLambdaParamNames(self: *const FuncBuilder) Allocator.Error!StringSet {
         return cloneStringSet(self.allocator, &self.receiver_lambda_params);
     }
-    /// Drop every receiver-lambda-param mark (a spliced caller-lambda body
-    /// resolves the names against the caller's scope, where the inline fn's
-    /// marks do not apply).
-    pub fn clearReceiverLambdaParams(self: *FuncBuilder) void {
-        self.receiver_lambda_params.clearRetainingCapacity();
+    /// The innermost inline-lambda frame's substitution map — its keys are
+    /// the enclosing inline fn's lambda-param names (the ones whose
+    /// receiver-lambda marks must not leak into a spliced caller body).
+    pub fn innermostInlineLambdaSubst(self: *const FuncBuilder) ?*const std.StringHashMap(*const ast.Expr) {
+        if (self.inline_lambda_subst.items.len == 0) return null;
+        return &self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1].subst;
     }
     /// Seed this builder's receiver-lambda-param set from an enclosing
     /// scope's. Copies the names; the caller keeps ownership of `names`.
