@@ -512,9 +512,27 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   materialized array head (primitive-specialized when the element is
   primitive), mirroring the body-side vararg param rule.
 
-Remaining clusters (18 failures): MapTest.minus family
-(UnsupportedOperationException, 4 — passes standalone, context-dependent),
-ResultTest (past `throwOnFailure`, assertion-level, 4), Random nextUBytes
-(4), comparisons ABRT crash (1), StringTest.indexOfStringIgnoreCase (1),
+- **Comparisons batch native crash — FIXED.** `lowerResolvedMemberCall`
+  held the `funcById` `*const Func` across `lowerReceiver`, which can
+  lower a lambda in the receiver expression, append to the module's func
+  table, and reallocate it — the held pointer then dangled and the
+  virtual-dispatch vararg scan segfaulted the whole batch. The pointer is
+  re-fetched after the receiver lowers (plus a zero-param virtual guard).
+  NOTE the pattern: any `*const Func` held across expression lowering is
+  a landmine; other sites should be audited for the same shape.
+- **Unmasked by the crash fix, diagnosed, open:** `thenBy`'s SAM lambda
+  (`Comparator { a, b -> this.compare(a, b) ... }` in the inline body)
+  loses the spliced receiver: the lambda's creation chain does not carry
+  the splice's bound `this`, so `this.compare` resolves against the
+  enclosing test-class instance and misses ("Vm::call_member `compare` on
+  OrderingTest", 2 tests). Fix direction: a lambda lowered inside an
+  active inline splice with a bound receiver must capture that binding
+  (chain-seed or `this` capture), not fall back to the class receiver
+  walk.
+
+Remaining clusters: MapTest.minus family (UnsupportedOperationException,
+4 — passes standalone, context-dependent), ResultTest (past
+`throwOnFailure`, assertion-level, 4), Random nextUBytes (4), thenBy
+receiver above (2), StringTest.indexOfStringIgnoreCase (1),
 CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
 iterator on anon (1), InstantIsoStrings `length` (2).

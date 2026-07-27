@@ -11448,7 +11448,7 @@ fn lowerResolvedMemberCall(
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
     if (resolved.dispatch == .deferred) return .deferred;
-    const target = b.module.funcById(func_id) orelse return .deferred;
+    var target = b.module.funcById(func_id) orelse return .deferred;
     const has_spread = anySpread(args);
     if (resolved.dispatch == .direct and has_spread) return .deferred;
     if (resolved.dispatch == .virtual) {
@@ -11484,7 +11484,15 @@ fn lowerResolvedMemberCall(
     b.pending_arg_lambda_param_types = lambda_param_types;
 
     const recv_reg = try lowerReceiver(b, receiver);
+    // Lowering the receiver expression can append functions (a lambda in the
+    // receiver lowers into the module's func table) and reallocate it,
+    // invalidating `target`; re-fetch the pointer before reading it again.
+    target = b.module.funcById(func_id) orelse return .deferred;
     if (resolved.dispatch == .virtual) {
+        // A virtual target without even a receiver param cannot be bound
+        // here on any path (the named/vararg mapping below already deferred
+        // it); defer before the receiver-skipping scans slice params[1..].
+        if (target.params.len == 0) return .deferred;
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -11492,7 +11500,6 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            if (target.params.len == 0) return .deferred;
             const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return .deferred;
             defer b.allocator.free(mapped);
             for (mapped) |param| if (param == null) return .deferred;
