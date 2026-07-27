@@ -662,7 +662,18 @@ per-class clusters tracked in the resolution plan.
   `compose.currentComposer()` is null (the pair-threading publication
   does not survive into the second composition's content invocation), so
   bare composable calls cannot complete their ABI pair and
-  `CompositionLocalContext.consume`-era dispatches miss. Next step:
-  trace how `CompositionImpl.setContent` invokes content in the
-  interpreted runtime and where `threadedComposerArg` fails to see the
-  pair (likely an invoke seam that strips or never appends it).
+  `CompositionLocalContext.consume`-era dispatches miss. Verified so
+  far: the delegation chain is sound in source (CompositionContextImpl
+  .composeInitial → Recomposer.composeInitial → CompositionImpl
+  .composeContent → GapComposer.composeContent → the engine's
+  `invokeComposable(this, content)` wrapping content in
+  `ComposableLambdaImpl(...).invoke(composer, 1)`), and the failing
+  read is the content frame's own `$composer` PARAM holding the
+  CompositionImpl. Note `threadedComposerArg` publishes ANY Instance at
+  the `$composer` slot — including a mis-bound composition — and
+  accepts the one-arg-short shape (`args.len == params.len - 1`), so a
+  single positional misbind upstream silently becomes the ambient
+  composer. Next: instrument the sub-composition content's closure
+  invocation (log arg0's runtime class at `ComposableLambdaImpl.invoke`
+  and at the content closure's frame entry) to find which call binds
+  the composition into the pair slot.
