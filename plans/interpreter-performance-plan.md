@@ -835,6 +835,17 @@ BroadcastFrameClockTest 4/4. Remaining clusters:
   i.e. it diverges before the overload leg; next instrument the
   else-arm entry directly)
 
-Next cluster to attack: MovableContentTests (28 failures, likely few
-root causes — movable content machinery was untouched by this effort
-and exercises the withChangeList/insert seams).
+MovableContentTests failure modes (28 total): 7× "Expected a Text,
+but none found"; 6× LabeledReturn (the old recorded cluster — an eval
+LabeledReturn escaping); 4× "Vm::call_member `invoke` on
+ComposableLambdaImpl" (the movableContentReceiver_{None,One,Two,Three}
+family — traced: `[rim2] class=ComposableLambdaImpl collected=19
+picked=false args=2` — the receiver-variant invocation reaches the
+wrapper's member walk with TWO args, matching none of the 19 invoke
+overloads; expected 3 (receiver, composer, changed) — one argument is
+lost upstream, likely in the composable-typed PROPERTY invoke route
+`content.content(parameter)` at GapComposer.kt:2266's engine lambda);
+4× "View not found"; 2× UnsupportedOperationException. Attack order:
+the invoke-arity family first (single mechanism, four tests), then
+LabeledReturn (recorded old cluster), then the Text/View content-move
+assertions (likely one movable-content transplant defect).
