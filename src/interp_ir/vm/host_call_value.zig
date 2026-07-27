@@ -782,6 +782,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             .native_state = null,
         });
         const inst_value: Value = .{ .Instance = inst };
+        // A MODULE parent chain (`class MyApplier : AbstractApplier<T>(root)`)
+        // binds its primary-param fields and runs its body-property inits
+        // through the registered `$super$arg$<i>` thunks and the static
+        // per-class init maps.
+        if (try host_instances.initLocalParentChain(self, allocator, inst, inst_value, cls, cls_name, args)) |e| {
+            return .{ .err = e };
+        }
         // Interleave `init { … }` blocks (lowered as `$init$block$<idx>` anon
         // thunks at registration, with the enclosing scope's captured cells
         // bound) with the complex property initializers in declaration order.

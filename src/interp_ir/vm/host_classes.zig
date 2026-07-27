@@ -808,6 +808,40 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     defer own_members.deinit();
     try collectOwnMembers(class, &own_members);
     try lowerAndRegisterMethods(self, allocator, class, &own_members, &.{});
+    // Parent-constructor arguments (`class C : Base(expr...)`) lower as
+    // `$super$arg$<i>` thunks declaring the primary params, so a MODULE
+    // parent's fields and body properties can initialize at construction.
+    for (class.supertypes, 0..) |_, si| {
+        if (si >= class.supertype_args.len) break;
+        const sargs = class.supertype_args[si] orelse continue;
+        for (sargs, 0..) |*se, ai| {
+            const thunk_name: ast.Ident = .{
+                .name = try std.fmt.allocPrint(allocator, "$super$arg${d}", .{ai}),
+                .span = class.name.span,
+            };
+            var thunk = host_instances.synthThunk(thunk_name, .{ .Expr = se.* }, null, false);
+            const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+            for (class.primary_params, 0..) |*pp, pi| {
+                tparams[pi] = .{
+                    .name = pp.name,
+                    .ty = pp.ty,
+                    .default = null,
+                    .is_vararg = false,
+                    .is_crossinline = false,
+                    .is_noinline = false,
+                    .annotations = &.{},
+                    .span = pp.name.span,
+                };
+            }
+            thunk.params = tparams;
+            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, &own_members);
+            const tbl = self.anon_methods.borrowMut();
+            defer tbl.deinit();
+            try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = &.{} });
+        }
+        break;
+    }
     return .ok;
 }
 

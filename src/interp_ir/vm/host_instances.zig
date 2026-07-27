@@ -478,6 +478,137 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
 }
 
+/// Initialize a runtime-registered LOCAL class instance's MODULE parent
+/// chain: evaluate the leaf's `$super$arg$<i>` thunks (registered by
+/// `registerClass`) against the constructor args, bind each module
+/// ancestor's primary-param fields, run its body-property init thunks, and
+/// continue up with that level's own parent-ctor-arg thunks. Parent
+/// `init { }` blocks are not yet replayed here.
+pub fn initLocalParentChain(
+    self: *VmHost,
+    allocator: Allocator,
+    inst: ObjRef(InstanceData),
+    inst_value: Value,
+    cls: ObjRef(ClassDef),
+    cls_name: []const u8,
+    leaf_args: []const Value,
+) Allocator.Error!?ir.eval.EvalError {
+    var cur_def: ?ObjRef(ClassDef) = blk: {
+        const g = cls.borrow();
+        defer g.deinit();
+        break :blk if (g.get().parent) |p| p.clone() else null;
+    };
+    if (cur_def == null) return null;
+    // Leaf-level super args via the anon `$super$arg$<i>` thunks.
+    var cur_args: std.ArrayList(Value) = .empty;
+    defer cur_args.deinit(allocator);
+    {
+        var ai: usize = 0;
+        while (true) : (ai += 1) {
+            var kb: [48]u8 = undefined;
+            const nm = std.fmt.bufPrint(&kb, "$super$arg${d}", .{ai}) catch break;
+            const key = try std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ cls_name, nm });
+            const present = blk: {
+                const tbl = self.anon_methods.borrow();
+                defer tbl.deinit();
+                break :blk tbl.get().contains(key);
+            };
+            allocator.free(key);
+            if (!present) break;
+            switch (try host_call_member.callMember(self, allocator, &inst_value, nm, leaf_args)) {
+                .ok => |v| try cur_args.append(allocator, v),
+                .err => |e| return e,
+            }
+        }
+    }
+    while (cur_def) |pd| {
+        defer pd.deinit();
+        const pg = pd.borrow();
+        const p_name = pg.get().name;
+        const p_fqn = pg.get().fqn;
+        // Bind primary-param fields.
+        for (pg.get().primary_params, 0..) |*pp, i| {
+            if (i >= cur_args.items.len) break;
+            const g = inst.borrowMut();
+            defer g.deinit();
+            if (g.get().get(pp.name) == null) {
+                if (runtime.reclaimEnabled()) cur_args.items[i].retain();
+                try g.get().fields.append(allocator, .{ .name = pp.name, .value = cur_args.items[i] });
+            }
+        }
+        // Body-property init thunks (static build map).
+        for (pg.get().body_properties) |*bp| {
+            if (bodyPropInit(self, p_fqn, p_name, bp.name)) |fid| {
+                const fr = try funcAt(self, fid, "parent body prop init");
+                switch (fr) {
+                    .err => |e| {
+                        pg.deinit();
+                        return e;
+                    },
+                    .ok => |func| {
+                        var all: std.ArrayList(Value) = .empty;
+                        defer all.deinit(allocator);
+                        try all.append(allocator, inst_value);
+                        try all.appendSlice(allocator, cur_args.items);
+                        switch (try evalThunk(self, func, all.items)) {
+                            .ok => |v| {
+                                const g = inst.borrowMut();
+                                defer g.deinit();
+                                if (g.get().get(bp.name) == null) {
+                                    try g.get().define(allocator, shadowFieldKey(self, p_name, bp.name), v);
+                                }
+                            },
+                            .err => |e| {
+                                pg.deinit();
+                                return e;
+                            },
+                        }
+                    },
+                }
+            } else if (bp.init == null and bp.getter == null and bp.delegate == null) {
+                const g = inst.borrowMut();
+                defer g.deinit();
+                if (g.get().get(bp.name) == null) {
+                    try g.get().fields.append(allocator, .{ .name = bp.name, .value = bp.primitive_zero orelse Value.Null });
+                }
+            }
+        }
+        // Next level's args via the module side table.
+        var next_args: std.ArrayList(Value) = .empty;
+        var have_next = false;
+        if (parentCtorArgThunks(self, p_fqn, p_name)) |thunks| {
+            have_next = true;
+            for (thunks) |fid| {
+                const fr = try funcAt(self, fid, "parent ctor arg");
+                switch (fr) {
+                    .err => |e| {
+                        next_args.deinit(allocator);
+                        pg.deinit();
+                        return e;
+                    },
+                    .ok => |func| {
+                        switch (try evalParentCtorThunk(self, func, cur_args.items, null)) {
+                            .ok => |v| next_args.append(allocator, v) catch {},
+                            .err => |e| {
+                                next_args.deinit(allocator);
+                                pg.deinit();
+                                return e;
+                            },
+                        }
+                    },
+                }
+            }
+        }
+        const next_def: ?ObjRef(ClassDef) = if (pg.get().parent) |np| np.clone() else null;
+        pg.deinit();
+        cur_args.deinit(allocator);
+        cur_args = if (have_next) next_args else .empty;
+        if (!have_next) next_args.deinit(allocator);
+        cur_def = next_def;
+    }
+    return null;
+}
+
 fn evalParentCtorThunk(
     self: *VmHost,
     func: *const ir.Func,
