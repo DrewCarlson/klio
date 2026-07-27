@@ -1766,6 +1766,42 @@ const Walker = struct {
                     active_composable_getter_props.?.contains(m.name.name)) return true;
                 return w.branchHasComposable(m.receiver);
             },
+            // Composable calls under control flow still make the branch
+            // composable content: a `Linear { for (id in items) Text("$id") }`
+            // lambda must be memoized like its straight-line sibling, or every
+            // re-run passes a fresh closure and the callee's `changed(content)`
+            // probe records a change the reference runtime never sees.
+            .For => |fr| {
+                if (w.branchHasComposable(fr.iter)) return true;
+                return w.branchHasComposable(fr.body);
+            },
+            .While => |wl| {
+                if (w.branchHasComposable(wl.cond)) return true;
+                return w.branchHasComposable(wl.body);
+            },
+            .DoWhile => |dw| {
+                if (dw.body) |bd| if (w.branchHasComposable(bd)) return true;
+                return w.branchHasComposable(dw.cond);
+            },
+            .When => |wh| {
+                if (wh.subject) |sub| if (w.branchHasComposable(sub)) return true;
+                for (wh.branches) |*br| if (w.branchHasComposable(&br.body)) return true;
+                return false;
+            },
+            .Try => |t| {
+                var tb = Expr{ .Block = t.body };
+                if (w.branchHasComposable(&tb)) return true;
+                for (t.catches) |*ca| {
+                    var cb = Expr{ .Block = ca.body };
+                    if (w.branchHasComposable(&cb)) return true;
+                }
+                if (t.finally) |fin| {
+                    var fb = Expr{ .Block = fin };
+                    if (w.branchHasComposable(&fb)) return true;
+                }
+                return false;
+            },
+            .Labeled => |l| return w.branchHasComposable(l.expr),
             else => return false,
         }
     }
