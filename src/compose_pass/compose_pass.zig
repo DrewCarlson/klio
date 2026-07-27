@@ -495,8 +495,22 @@ fn calleeInlinesLambda(name: []const u8) bool {
     for (stdlib_inline_hofs) |n| {
         if (std.mem.eql(u8, n, name)) return true;
     }
+    // Compose runtime `inline` HOFs, loaded from the baked pack image (their
+    // `inline` modifiers are outside the collected AST universe when the
+    // pass runs over user/test files). kotlinc inlines their lambdas, so the
+    // pass must keep the literal raw and threaded — wrapping it re-shapes
+    // the call and the overload pick lands on a sibling that drops the
+    // content (`ComposeNode(factory, update) { content }` bound the 2-arg
+    // overload and the content never composed).
+    for (compose_inline_hofs) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
     return false;
 }
+
+const compose_inline_hofs = [_][]const u8{
+    "ComposeNode", "ReusableComposeNode", "key", "ReusableContent", "ReusableContentHost",
+};
 
 /// Calls whose trailing calculation produces their result value. An expected
 /// composable function type on the call therefore flows into the calculation

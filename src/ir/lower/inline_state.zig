@@ -595,12 +595,26 @@ fn pickByShapeNarrowed(
     return first;
 }
 
+/// A pass-threaded composable declaration carries a trailing
+/// `($composer, $changed)` pair the CALL SITE does not write; every
+/// shape judgment runs on the user-visible params.
+fn userParams(f: *const ast.Function) []const ast.Param {
+    const p = f.params;
+    if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name.name, "$changed") and
+        std.mem.eql(u8, p[p.len - 2].name.name, "$composer"))
+    {
+        return p[0 .. p.len - 2];
+    }
+    return p;
+}
+
 /// Parameter arity of `f`'s trailing function-typed parameter (the
 /// non-receiver parameters of `T.(A, B) -> R`), or `null` when the last
 /// parameter is not a function type.
 fn trailingFnTypeArity(f: *const ast.Function) ?usize {
-    if (f.params.len == 0) return null;
-    return fnArityOfType(f.params[f.params.len - 1].ty);
+    const params = userParams(f);
+    if (params.len == 0) return null;
+    return fnArityOfType(params[params.len - 1].ty);
 }
 
 fn pickNonlambdaShapeNarrowed(
@@ -624,10 +638,11 @@ fn pickNonlambdaShapeNarrowed(
 }
 
 fn fitsTrailingLambda(f: *const ast.Function, lead: usize) bool {
-    const n = f.params.len;
+    const params = userParams(f);
+    const n = params.len;
     if (n == 0) return false;
-    if (fnArityOfType(f.params[n - 1].ty) == null) return false;
-    const leading = f.params[0 .. n - 1];
+    if (fnArityOfType(params[n - 1].ty) == null) return false;
+    const leading = params[0 .. n - 1];
     var required: usize = 0;
     for (leading) |p| {
         if (p.default == null and !p.is_vararg) required += 1;
@@ -665,9 +680,10 @@ fn noRequiredFnParam(f: *const ast.Function) bool {
 /// (non-defaulted, non-vararg) count, and no more than the declared total —
 /// unless a vararg absorbs the excess.
 fn fitsArity(f: *const ast.Function, want: usize) bool {
+    const params = userParams(f);
     var required: usize = 0;
     var has_vararg = false;
-    for (f.params) |p| {
+    for (params) |p| {
         if (p.is_vararg) {
             has_vararg = true;
             continue;
@@ -675,7 +691,7 @@ fn fitsArity(f: *const ast.Function, want: usize) bool {
         if (p.default == null) required += 1;
     }
     if (want < required) return false;
-    return has_vararg or want <= f.params.len;
+    return has_vararg or want <= params.len;
 }
 
 /// The single overload whose arity fits the call's argument count, or null

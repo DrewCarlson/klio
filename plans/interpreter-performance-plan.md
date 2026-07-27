@@ -892,6 +892,21 @@ borrowing the module: an earlier draft consulted the module class
 table for pack-loaded classes and deadlocked every suite (callers
 hold exclusive module borrows — the fn's own doc warned).
 
+MovableContentTests 28/44 -> 38/44 — the content-move family was ONE
+LOWERING BUG: the inline-overload shape helpers (fitsTrailingLambda /
+fitsArity / trailingFnTypeArity) judged the PASS-TRANSFORMED pack ASTs,
+whose params end with the appended ($composer, $changed) pair the call
+site never writes. Every trailing-lambda shape test failed, the pick
+fell back to FIRST-DECLARED — the 2-arg ComposeNode(factory, update) —
+and the splice's lambda_to_last dumped the content lambda into the
+\$changed slot. `ComposeNode(factory, update) { content }` (the tests'
+private Row/Column wrappers) composed the node with NO children, so
+every "Expected a Text/View" assert failed. The helpers now judge the
+user-visible params (pair-trimmed). Also: the compose pass knows the
+compose-runtime inline HOFs (ComposeNode, ReusableComposeNode, key,
+ReusableContent, ReusableContentHost) as inline callees — their literal
+lambdas stay raw and threaded instead of being memo-wrapped.
+
 Original MovableContentTests failure modes (28 total): 7× "Expected a Text,
 but none found"; 6× LabeledReturn (the old recorded cluster — an eval
 LabeledReturn escaping); 4× "Vm::call_member `invoke` on
