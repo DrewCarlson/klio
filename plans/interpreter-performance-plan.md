@@ -313,16 +313,59 @@ dotted globals, not the intrinsic table.
 
 The queue above is drained. The remaining LARGE programs, each its own
 plan-level effort rather than a queue item, are: **generational /
-segment marking** (Appel re-marks the whole live set per collection —
-the dominant self cost on deep-parked-chain workloads like
-DeepRecursive, ~660/5000 samples) and **further flat coverage of the
-remaining intrinsic re-entry seams** (HOF intrinsics that invoke
+segment marking — LANDED** (see below) and **further flat coverage of
+the remaining intrinsic re-entry seams** (HOF intrinsics that invoke
 callables mid-body and post-process — each needs its own CPS split or
 boundary hook, the pattern the suspend barrier and root pump
 established). DeepRecursive 100k over this effort: 117 s (baseline) →
 10.4 s (session start) → 8.2 s; suspend/park is O(1) at both
 undispatched-start boundaries; the compose fleet and stdlib sweep held
 byte-identical at every commit.
+
+## Generational marking + segment quiescence (LANDED)
+
+The collector is now generational (`KLIO_GC_GEN=0` restores full-mark
+behavior for comparison):
+
+- Two sweep registries: a nursery (cells minted since the last
+  collection) and a tenured list. Every collection sweeps the nursery;
+  survivors promote on first survival. Major collections (Appel
+  schedule over promoted + net-external bytes since the last major)
+  full-mark and sweep both lists; minors mark only nursery-reachable
+  cells (`Marker.minor` — `shade` stops at any tenured cell) and run at
+  the threshold floor. Permanent-image cells are minted tenured so a
+  minor never walks the stdlib graph. Closure side-table reclamation
+  (`sweepClosureHook`) is major-only (its epoch check proves nothing on
+  a minor).
+- Write barrier at the two universal mutation choke points
+  (`ObjRef.tryBorrowMut` / `ObjRef.asPtr`): a mutable access to a
+  tenured cell whose payload can hold cell references (comptime
+  predicate mirroring the tracer's dispatch; `gc_pointer_free` opts
+  scalar payloads out) puts the cell on the remembered set, which every
+  minor re-traces. An adversarial census of all ~250 Value-store sites
+  confirmed every path flows through these two choke points (the
+  `asPtr` bypasses in kotlinx_coroutines / regexp / map-entry refresh
+  included); direct `.cell.data` accesses are IR-module lowering only
+  (no Values).
+- Segment quiescence: a parked `SuspendState` (and each inherited
+  `TailSeg`) is flagged after its first full trace; the snapshots are
+  frozen while parked, and every cell they reference is tenured by that
+  same collection's sweep, so minor marks skip the state entirely —
+  including the per-entry `scope_delta` walk in the persisted/interceptor
+  maps. The flag clears at `resumeContinuation` entry (the single point
+  where parked values become mutable again).
+- Validation: poison + 64KB floor (constant minors) clean on the
+  deeprec/barrier/receiver-lambda/typed repros and DeepRecursive 100k;
+  stdlib sweep byte-identical (40=40). DeepRecursive A/B on one binary:
+  9.1–9.3 s full-mark vs 7.9–8.3 s generational (~13%); minor marks
+  ~5.4k cells vs 200–750k full-chain re-marks, 6 majors total.
+
+Recorded opens from the census (not perf, tracked here so they are not
+lost): `ProgramImage` has no `gcTrace` (traced as a leaf — confirm every
+`installed_bindings` graph is perm); `RegexData` declares
+`objref_immutable` yet is mutated post-construction through `asPtr`
+(regexp options attach) — the barrier covers the GC side, the
+immutability claim is stale.
 
 ## What was already landed (kept, measured)
 

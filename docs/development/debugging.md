@@ -198,7 +198,8 @@ backend (the default for `fast`/`safe`).
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_GC_DEBUG` | set; `0`/empty off | One summary line per collection: epoch, marked, live bytes, freed | `[kgc]` |
+| `KLIO_GC_DEBUG` | set; `0`/empty off | One summary line per collection: epoch, kind (minor/major), marked, live bytes, freed | `[kgc]` |
+| `KLIO_GC_GEN` | `1` on (default), `0` off | Generational collection: minor (nursery-only) sweeps between Appel-scheduled majors; `0` forces every collection major | none |
 | `KLIO_GC_HIST` | set; `0`/empty off | Top-16 live-cell payload types per collection | `[kgc-hist]` |
 | `KLIO_GC_STRESS` | set; `0`/empty off | Collects at every safe point; surfaces incomplete roots/tracers immediately | none |
 | `KLIO_GC_STRESS_EVERY` | number (`0` off) | Collects every N safe points (cheaper sampled stress) | none |

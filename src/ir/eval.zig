@@ -435,7 +435,9 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
     while (r) |node| : (r = node.prev) {
         var seg = node.tails.*;
         while (seg) |t| : (seg = t.next) {
+            if (m.minor and t.gc_quiesced) continue;
             for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
+            t.gc_quiesced = true;
         }
         const head = node.head.*;
         const items = node.frames.items;
@@ -1732,6 +1734,12 @@ pub const TailSeg = struct {
     /// First unconsumed index into `frames`.
     head: usize,
     next: ?*TailSeg,
+    /// Set by the GC after a collection has fully traced this segment: every
+    /// cell it references is tenured from then on, and the segment is frozen
+    /// (no Value slot is written while parked), so a minor mark skips it.
+    /// Cleared whenever the segment becomes live again (promotion into a
+    /// resume). Majors always retrace.
+    gc_quiesced: bool = false,
 };
 
 pub const SuspendState = struct {
@@ -1750,6 +1758,12 @@ pub const SuspendState = struct {
     /// it records the frame snapshot. Always `null` once a frame has
     /// been pushed.
     pending_resume_reg: ?Reg = null,
+    /// Set by the GC once a collection has fully traced this parked state:
+    /// every cell it references is tenured from then on, and the snapshots
+    /// are frozen while parked (no Value slot is written until resume), so a
+    /// minor mark skips the whole state. Cleared on every path that hands the
+    /// state back to a mutator (take/adopt/resume). Majors always retrace.
+    gc_quiesced: bool = false,
 
     /// Release every value reference this state's snapshots retained on
     /// suspend and free the snapshot slice buffers. Call this exactly once
@@ -1805,12 +1819,19 @@ fn retainSnapshotValues(snap: FrameSnapshot) void {
 /// `retainSnapshotValues` set plus the receiver chain (the GC owns the view of
 /// it: a parked continuation is the chain's sole keeper while parked). Driven by
 /// the coroutine root provider for every persisted/active parked activation.
-pub fn gcMarkSuspendState(state: *const SuspendState, m: *runtime.gc.Marker) void {
+pub fn gcMarkSuspendState(state: *SuspendState, m: *runtime.gc.Marker) void {
+    // Quiescent skip: a state a prior collection fully traced references only
+    // tenured cells and is frozen while parked, so a minor mark has nothing to
+    // find in it. A major must retrace (tenured cells are sweep candidates).
+    if (m.minor and state.gc_quiesced) return;
     for (state.frames.items) |snap| gcMarkSnapshot(snap, m);
     var seg = state.tails;
     while (seg) |t| : (seg = t.next) {
+        if (m.minor and t.gc_quiesced) continue;
         for (t.frames.items[t.head..]) |snap| gcMarkSnapshot(snap, m);
+        t.gc_quiesced = true;
     }
+    state.gc_quiesced = true;
 }
 
 fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
@@ -1838,7 +1859,7 @@ fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
 /// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an
 /// opaque `*SuspendState` by a `Sequence`'s `Builder` source.
 pub fn gcMarkSuspendStateOpaque(cont: *anyopaque, m: *runtime.gc.Marker) void {
-    const st: *const SuspendState = @ptrCast(@alignCast(cont));
+    const st: *SuspendState = @ptrCast(@alignCast(cont));
     gcMarkSuspendState(st, m);
 }
 
@@ -2435,6 +2456,9 @@ pub fn resumeContinuation(
     // them down (or double-free segments a re-suspend hands to the inner
     // continuation).
     state.tails = null;
+    // The state is live again: resume writes carry values into its frames,
+    // so it no longer qualifies for the minor-mark quiescent skip.
+    state.gc_quiesced = false;
     defer frames.deinit(allocator);
     defer {
         var seg = tails;

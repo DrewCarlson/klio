@@ -175,6 +175,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (runtime.getenvSlice("KLIO_GC_STRESS_EVERY")) |v| {
                 runtime.gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
             }
+            if (runtime.getenvSlice("KLIO_GC_GEN")) |v| {
+                runtime.gc.generational = v.len != 0 and !std.mem.eql(u8, v, "0");
+            }
             runtime.setReclaim(false);
             if (runtime.getenvSlice("KLIO_GC_GUARD")) |v| {
                 // GUARD=dbg: route the GC's freeing backing through the checking
