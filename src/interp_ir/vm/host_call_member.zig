@@ -9130,6 +9130,18 @@ pub fn invokeVirtualMember(
             const owner = sig.enclosing_class orelse
                 return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
             if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
+                if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                    const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
+                    std.debug.print("[vcall-callable] slot={d} method={s} recv_ty={s} has_body={} nargs={d} caller={s}\n", .{
+                        slot.int(),
+                        mname,
+                        receiver.typeFqn(),
+                        sig.has_body,
+                        args.len,
+                        if (ir.eval.currentFrameFunc()) |f| f.fqn else "<none>",
+                    });
+                    ir.eval.dumpFrameChainForDiagAlways();
+                }
                 return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
             }
             if (arg_params) |params| {
@@ -9295,9 +9307,31 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     if (host_call_func.composePluginEnabled() and f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
         std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
-        args.len + 3 == f.params.len and threaded_composer == null)
+        args.len + 3 <= f.params.len and threaded_composer == null)
     {
         if (compose.currentComposer()) |c| {
+            // Defaulted user params omitted at the call site (`Test()` against
+            // `(this, number$arg = marker, $composer, $changed)`): a positional
+            // append would land the composer in the first open user slot, so
+            // bind the pair BY NAME and let the named binder fill the middle
+            // defaults.
+            if (args.len + 3 < f.params.len) {
+                const all = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(all);
+                const full = try allocator.alloc(Value, all.len + 2);
+                defer if (runtime.freeScratch()) allocator.free(full);
+                @memcpy(full[0..all.len], all);
+                full[all.len] = c;
+                full[all.len + 1] = .{ .Int = 0 };
+                const names = try allocator.alloc(?[]const u8, full.len);
+                defer if (runtime.freeScratch()) allocator.free(names);
+                for (names[0..all.len]) |*n| n.* = null;
+                names[all.len] = "$composer";
+                names[all.len + 1] = "$changed";
+                compose.pushComposer(c);
+                defer compose.popComposer();
+                return try callFuncNamedRec(self, allocator, mod, fid, full, names);
+            }
             const pe = try allocator.alloc(Value, args.len + 2);
             @memcpy(pe[0..args.len], args);
             pe[args.len] = c;
