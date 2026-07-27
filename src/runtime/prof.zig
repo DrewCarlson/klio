@@ -122,6 +122,77 @@ pub fn maybeStart() void {
 
 const NameCount = struct { name: []const u8, count: u32 };
 
+// ---------------------------------------------------------------------------
+// Opcode sampler (`KLIO_OP_PROF`): instead of machine PCs (which the linker's
+// identical-code folding merges into unattributable blobs), sample the
+// interpreter's own "currently executing opcode" tag. The eval loop stores
+// each instruction's enum tag into `current_op` (a threadlocal, gated on
+// `op_prof_active`); the SIGPROF handler increments a per-tag counter. The
+// innermost frame's store wins, so the histogram reads as self-time by
+// opcode — including time spent inside the host machinery an opcode
+// dispatches into. Works on macOS and Linux (libc setitimer).
+// ---------------------------------------------------------------------------
+
+pub var op_prof_active: bool = false;
+pub threadlocal var current_op: u16 = OP_OUTSIDE;
+/// Tag meaning "not inside execInst" (startup, host-only threads, GC).
+pub const OP_OUTSIDE: u16 = 0x1FF;
+/// Host-route sub-tags: stages inside a dispatch arm set these so the
+/// histogram splits an opcode's time by route. The eval loop overwrites the
+/// tag at the next instruction, so a route tag covers exactly the host work
+/// until either the callee's first instruction or the next stage marker.
+pub const OP_ROUTE_BASE: u16 = 0x100;
+pub inline fn opRoute(route: u16) void {
+    if (op_prof_active) current_op = OP_ROUTE_BASE + route;
+}
+const OP_SLOTS = 512;
+var op_hist: [OP_SLOTS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+
+const c_itimerval = extern struct {
+    it_interval: std.c.timeval,
+    it_value: std.c.timeval,
+};
+extern "c" fn setitimer(which: c_int, new: *const c_itimerval, old: ?*c_itimerval) c_int;
+const ITIMER_PROF_C: c_int = 2;
+
+fn opHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    _ = op_hist[current_op & (OP_SLOTS - 1)].fetchAdd(1, .monotonic);
+}
+
+pub fn opProfMaybeStart() void {
+    if (comptime !builtin.link_libc) return;
+    const env = std.c.getenv("KLIO_OP_PROF") orelse return;
+    const env_s = std.mem.span(env);
+    var usec: i64 = 1000;
+    if (env_s.len > 0 and env_s[0] >= '0' and env_s[0] <= '9') {
+        usec = std.fmt.parseInt(i64, env_s, 10) catch 1000;
+        if (usec < 100) usec = 100;
+    }
+    op_prof_active = true;
+    var act = posix.Sigaction{
+        .handler = .{ .sigaction = opHandler },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = posix.SA.SIGINFO | posix.SA.RESTART,
+    };
+    posix.sigaction(.PROF, &act, null);
+    const itv = c_itimerval{
+        .it_interval = .{ .sec = @intCast(@divFloor(usec, 1_000_000)), .usec = @intCast(@mod(usec, 1_000_000)) },
+        .it_value = .{ .sec = @intCast(@divFloor(usec, 1_000_000)), .usec = @intCast(@mod(usec, 1_000_000)) },
+    };
+    _ = setitimer(ITIMER_PROF_C, &itv, null);
+}
+
+/// The raw per-tag sample counts (index = instruction enum tag;
+/// `OP_OUTSIDE` = time outside the eval loop). The caller maps indexes to
+/// opcode names — the runtime layer cannot see the IR enum.
+pub fn opProfCounts() ?*const [OP_SLOTS]std.atomic.Value(u64) {
+    if (!op_prof_active) return null;
+    return &op_hist;
+}
+
 /// Stop sampling and print the by-function histogram to stderr.
 pub fn maybeReport() void {
     if (builtin.os.tag != .linux) return;

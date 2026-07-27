@@ -144,6 +144,22 @@ fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const roo
     return g.get().secondary_ctors.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
+/// Whether any declared secondary constructor of the class can bind `n`
+/// arguments by count (required-without-defaults through total). Serves the
+/// dispatcher's ctor-applicability gate: a capitalized bare call whose class
+/// has no bindable constructor is not a construction.
+pub fn classSecondaryCtorCanBind(self: *VmHost, fqn: []const u8, name: []const u8, n: usize) bool {
+    const entries = secondaryCtors(self, if (fqn.len != 0) fqn else null, name);
+    for (entries) |e| {
+        var required: usize = 0;
+        for (e.default_arg_thunks) |d| {
+            if (d == null) required += 1;
+        }
+        if (n >= required and n <= e.param_count) return true;
+    }
+    return false;
+}
+
 /// Simple runtime type-name head of a value (`IntArray`, `Int`).
 fn valueTypeHead(v: Value) []const u8 {
     const fqn = v.typeFqn();
@@ -476,6 +492,137 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     // Ownership of `args_list` transfers into `evalWith`: the frame adopts
     // it as its `params` backing and frees it on `frame.deinit()`.
     return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
+}
+
+/// Initialize a runtime-registered LOCAL class instance's MODULE parent
+/// chain: evaluate the leaf's `$super$arg$<i>` thunks (registered by
+/// `registerClass`) against the constructor args, bind each module
+/// ancestor's primary-param fields, run its body-property init thunks, and
+/// continue up with that level's own parent-ctor-arg thunks. Parent
+/// `init { }` blocks are not yet replayed here.
+pub fn initLocalParentChain(
+    self: *VmHost,
+    allocator: Allocator,
+    inst: ObjRef(InstanceData),
+    inst_value: Value,
+    cls: ObjRef(ClassDef),
+    cls_name: []const u8,
+    leaf_args: []const Value,
+) Allocator.Error!?ir.eval.EvalError {
+    var cur_def: ?ObjRef(ClassDef) = blk: {
+        const g = cls.borrow();
+        defer g.deinit();
+        break :blk if (g.get().parent) |p| p.clone() else null;
+    };
+    if (cur_def == null) return null;
+    // Leaf-level super args via the anon `$super$arg$<i>` thunks.
+    var cur_args: std.ArrayList(Value) = .empty;
+    defer cur_args.deinit(allocator);
+    {
+        var ai: usize = 0;
+        while (true) : (ai += 1) {
+            var kb: [48]u8 = undefined;
+            const nm = std.fmt.bufPrint(&kb, "$super$arg${d}", .{ai}) catch break;
+            const key = try std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ cls_name, nm });
+            const present = blk: {
+                const tbl = self.anon_methods.borrow();
+                defer tbl.deinit();
+                break :blk tbl.get().contains(key);
+            };
+            allocator.free(key);
+            if (!present) break;
+            switch (try host_call_member.callMember(self, allocator, &inst_value, nm, leaf_args)) {
+                .ok => |v| try cur_args.append(allocator, v),
+                .err => |e| return e,
+            }
+        }
+    }
+    while (cur_def) |pd| {
+        defer pd.deinit();
+        const pg = pd.borrow();
+        const p_name = pg.get().name;
+        const p_fqn = pg.get().fqn;
+        // Bind primary-param fields.
+        for (pg.get().primary_params, 0..) |*pp, i| {
+            if (i >= cur_args.items.len) break;
+            const g = inst.borrowMut();
+            defer g.deinit();
+            if (g.get().get(pp.name) == null) {
+                if (runtime.reclaimEnabled()) cur_args.items[i].retain();
+                try g.get().fields.append(allocator, .{ .name = pp.name, .value = cur_args.items[i] });
+            }
+        }
+        // Body-property init thunks (static build map).
+        for (pg.get().body_properties) |*bp| {
+            if (bodyPropInit(self, p_fqn, p_name, bp.name)) |fid| {
+                const fr = try funcAt(self, fid, "parent body prop init");
+                switch (fr) {
+                    .err => |e| {
+                        pg.deinit();
+                        return e;
+                    },
+                    .ok => |func| {
+                        var all: std.ArrayList(Value) = .empty;
+                        defer all.deinit(allocator);
+                        try all.append(allocator, inst_value);
+                        try all.appendSlice(allocator, cur_args.items);
+                        switch (try evalThunk(self, func, all.items)) {
+                            .ok => |v| {
+                                const g = inst.borrowMut();
+                                defer g.deinit();
+                                if (g.get().get(bp.name) == null) {
+                                    try g.get().define(allocator, shadowFieldKey(self, p_name, bp.name), v);
+                                }
+                            },
+                            .err => |e| {
+                                pg.deinit();
+                                return e;
+                            },
+                        }
+                    },
+                }
+            } else if (bp.init == null and bp.getter == null and bp.delegate == null) {
+                const g = inst.borrowMut();
+                defer g.deinit();
+                if (g.get().get(bp.name) == null) {
+                    try g.get().fields.append(allocator, .{ .name = bp.name, .value = bp.primitive_zero orelse Value.Null });
+                }
+            }
+        }
+        // Next level's args via the module side table.
+        var next_args: std.ArrayList(Value) = .empty;
+        var have_next = false;
+        if (parentCtorArgThunks(self, p_fqn, p_name)) |thunks| {
+            have_next = true;
+            for (thunks) |fid| {
+                const fr = try funcAt(self, fid, "parent ctor arg");
+                switch (fr) {
+                    .err => |e| {
+                        next_args.deinit(allocator);
+                        pg.deinit();
+                        return e;
+                    },
+                    .ok => |func| {
+                        switch (try evalParentCtorThunk(self, func, cur_args.items, null)) {
+                            .ok => |v| next_args.append(allocator, v) catch {},
+                            .err => |e| {
+                                next_args.deinit(allocator);
+                                pg.deinit();
+                                return e;
+                            },
+                        }
+                    },
+                }
+            }
+        }
+        const next_def: ?ObjRef(ClassDef) = if (pg.get().parent) |np| np.clone() else null;
+        pg.deinit();
+        cur_args.deinit(allocator);
+        cur_args = if (have_next) next_args else .empty;
+        if (!have_next) next_args.deinit(allocator);
+        cur_def = next_def;
+    }
+    return null;
 }
 
 fn evalParentCtorThunk(
@@ -2240,6 +2387,46 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
             defer mg.deinit();
             return self.callFunc(allocator, mg.get(), fid, effective.items);
         }
+        // Compose ABI completion: a same-named COMPOSABLE factory (a
+        // file-private `@Composable fun Stack(...)` shadowed by a pack's
+        // internal `class Stack`) carries the pass-appended ($composer,
+        // $changed) pair the ctor-shaped call site never wrote. With a
+        // composer ambient, complete the pair and re-pick.
+        if (host_call_func.composePluginEnabled()) {
+            if (@import("compose.zig").currentComposer()) |c| {
+                var ext: std.ArrayList(Value) = .empty;
+                defer ext.deinit(allocator);
+                try ext.appendSlice(allocator, effective.items);
+                try ext.append(allocator, c);
+                try ext.append(allocator, .{ .Int = 0 });
+                if (try pickFactory(self, allocator, class_name, ext.items)) |fid| {
+                    const module_ref = self.module.clone();
+                    defer module_ref.deinit();
+                    const mg = module_ref.borrow();
+                    defer mg.deinit();
+                    return self.callFunc(allocator, mg.get(), fid, ext.items);
+                }
+            }
+        }
+        // A same-named member EXTENSION on an enclosing implicit receiver is
+        // Kotlin's target when the ctor shape does not fit: `validate {
+        // Stack(h) { ... } }` calls the file's `MockViewValidator.Stack`,
+        // never the pack's internal `class Stack` constructor.
+        {
+            const encl = ir.eval.enclosingEntriesAlloc(allocator) catch &.{};
+            defer allocator.free(@constCast(encl));
+            for (encl) |e| {
+                if (e.v != .Instance) continue;
+                const r = try host_call_member.callMember(self, allocator, &e.v, class_name, effective.items);
+                if (!(r == .err and r.err == .Unimplemented)) return r;
+                if (r.err == .Unimplemented) {
+                    const m3 = r.err.Unimplemented;
+                    if (std.mem.indexOf(u8, m3, "Vm::call_member") != null and runtime.freeScratch()) {
+                        allocator.free(m3);
+                    }
+                }
+            }
+        }
         if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
             std.debug.print("[ctor-arity-miss] class={s} fqn={s} n_primary={d} got={d}\n", .{ class_name, classDefFqn(class_def), n_primary, effective.items.len });
             ir.eval.dumpFrameChainForDiagAlways();
@@ -3162,7 +3349,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                 break :hblk ag.get().contains(key);
                             };
                             if (has) {
-                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, cls_args)) {
                                     .ok => |rv| break :blk rv,
                                     .err => |e| return .{ .err = e },
                                 }
@@ -3173,6 +3360,37 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
                     } else {
+                        // A local class's delegated property: the delegate
+                        // expression was lowered as a `$init$` thunk at
+                        // registration; evaluate it and store the delegate
+                        // under the property name (the shape the getValue/
+                        // setValue read/write routes expect).
+                        const has_delegate = blk: {
+                            const g = cls.borrow();
+                            defer g.deinit();
+                            break :blk g.get().body_properties[prop_idx].delegate != null;
+                        };
+                        if (has_delegate) {
+                            const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{prop_name});
+                            defer allocator.free(init_name);
+                            const has_thunk = hblk: {
+                                const key = try anonKey(allocator, cls_name, init_name);
+                                defer allocator.free(key);
+                                const ag = self.anon_methods.borrow();
+                                defer ag.deinit();
+                                break :hblk ag.get().contains(key);
+                            };
+                            if (has_thunk) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, cls_args)) {
+                                    .ok => |rv| {
+                                        const g = inst.borrowMut();
+                                        try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), rv);
+                                        g.deinit();
+                                    },
+                                    .err => |e| return .{ .err = e },
+                                }
+                            }
+                        }
                         const skip = blk: {
                             const g = cls.borrow();
                             defer g.deinit();
@@ -3210,7 +3428,15 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
     const is_delegated = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
-        break :blk mg.get().registry.delegated_body_props.contains(.{ .a = cls_name, .b = prop_name });
+        const mod = mg.get();
+        if (mod.registry.delegated_body_props.contains(.{ .a = cls_name, .b = prop_name })) break :blk true;
+        if (mod.classId(cls_name)) |cid| {
+            if (cid.int() < mod.classes.items.len) {
+                const fqn = mod.classes.items[cid.int()].fqn;
+                if (mod.registry.delegated_body_props.contains(.{ .a = fqn, .b = prop_name })) break :blk true;
+            }
+        }
+        break :blk false;
     };
     if (!is_delegated) return v;
     // The delegate provides a `provideDelegate` operator when its OWN runtime
@@ -3313,6 +3539,23 @@ fn findCapture(pairs: []const NameValue, name: []const u8) ?Value {
         if (std.mem.eql(u8, p.name, name)) return p.value;
     }
     return null;
+}
+
+/// A captured mutable local arrives as its shared cell. A field or super-arg
+/// initialized from it must SNAPSHOT the content at construction — storing the
+/// cell makes every later read see the local's current value (`val name = key`
+/// in an object literal built inside a lambda tracked `key` live).
+fn snapshotCapture(v: Value) Value {
+    switch (v) {
+        .Cell => |c| {
+            const g = c.borrow();
+            defer g.deinit();
+            const inner = g.get().*;
+            inner.retain();
+            return inner;
+        },
+        else => return v,
+    }
 }
 
 /// Is `expr` a bare one-segment name the captured scope can resolve
@@ -3983,7 +4226,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 } else if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
                     const nm = init_expr.Path.segments[0].name;
                     if (findCapture(capture_pairs, nm)) |cv| {
-                        v = cv;
+                        v = snapshotCapture(cv);
                     } else if (findCapture(capture_pairs, "this")) |tv| {
                         if (tv == .Instance) {
                             const ig = tv.Instance.borrow();
@@ -4340,7 +4583,7 @@ fn evalSuperArg(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, capt
     if (try simpleLiteral(allocator, expr)) |v| return v;
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const nm = expr.Path.segments[0].name;
-        if (findCapture(capture_pairs, nm)) |v| return v;
+        if (findCapture(capture_pairs, nm)) |v| return snapshotCapture(v);
         // A bare class/interface name in value position resolves to its
         // companion object — e.g. the CEH factory's
         // `AbstractCoroutineContextElement(CoroutineExceptionHandler)` passes

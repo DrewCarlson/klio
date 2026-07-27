@@ -5740,10 +5740,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const bare = callee.Path.segments[0].name;
         var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
+            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} ovs={d}\n", .{ bare, ovs.len });
             if (try selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
+                if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                    std.debug.print("[lfn] {s} selected={s} cell={} outer={}\n", .{ bare, m, b.resolve(m) != null, b.knowsOuter(m) });
                 if (try lowerSelectedLocalOverloadCall(b, bare, m, args, ast_arg_names)) |r| return r;
-            }
-        }
+            } else if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} no-select\n", .{bare});
+        } else if (b.resolve(bare) != null and runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+            std.debug.print("[lfn] {s} no-registry\n", .{bare});
         // SELF-reference: a bare call to the enclosing local fn's own name
         // from inside its body — including generated nested lambdas (the
         // compose restart re-invoke) — binds the fn ITSELF through its
@@ -5776,8 +5782,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // rebinds the shared plain-name slot, so a by-name capture
             // runs the sibling. Multi-overload sets select above; an
             // inapplicable local keeps outward resolution.
+            // The plain name may also be bound to a same-named local
+            // PROPERTY (`var seen = ...; fun seen(x)`): the property owns
+            // the bare binding, so a CALL routes through the fn's mangled
+            // cell — Kotlin resolves `seen(x)` to the fun and `seen` to
+            // the var.
+            const plain_is_property = b.resolve(bare) != null and !b.isLocalFn(bare);
             if (decls.len == 1 and !local_fn_inapplicable and
-                b.resolve(bare) == null and
+                (b.resolve(bare) == null or plain_is_property) and
                 (b.resolve(decls[0].mangled) != null or b.knowsOuter(decls[0].mangled)))
             {
                 if (try lowerSelectedLocalOverloadCall(b, bare, decls[0].mangled, args, ast_arg_names)) |r| return r;
@@ -6907,8 +6919,15 @@ fn anyLocalFnOverloadApplicable(
 ) Allocator.Error!bool {
     outer: for (ovs) |*ov| {
         if (ov.is_ext) {
-            const receiver = b.recvTypeRef() orelse return false;
-            if (!try localOverloadReceiverCouldApply(b, ov, receiver)) continue;
+            // A statically known receiver type adjudicates; a scope with a
+            // REACHABLE `this` but no threaded type (a nested lambda inside
+            // the local ext's own body) keeps the candidate UNPROVEN — only
+            // a genuinely receiver-less scope drops it.
+            if (b.recvTypeRef()) |receiver| {
+                if (!try localOverloadReceiverCouldApply(b, ov, receiver)) continue;
+            } else if (b.resolve("this") == null and !b.knowsOuter("this") and !b.capturesThisSlot()) {
+                return false;
+            }
         }
         if (args.len < ov.n_required and !ov.has_vararg) continue;
         if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
@@ -6931,6 +6950,11 @@ fn anyLocalFnOverloadApplicable(
                 }
                 if (!found) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7012,6 +7036,11 @@ fn selectLocalExtOverload(
                 }
                 if (pi == null) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7058,7 +7087,17 @@ fn lowerSelectedLocalExtCallWithReceiver(
     vals[0] = recv;
     for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
     const args_start = try packContiguous(b, vals);
-    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    // The receiver rides as slot 0: shift the arg-name list one slot right,
+    // or a named call (`this.Composition(a = true, ...)`) labels the RECEIVER
+    // "a" and every binding misaligns.
+    const shifted: []const ?[]const u8 = blk: {
+        if (ast_arg_names.len == 0) break :blk ast_arg_names;
+        const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+        sh[0] = null;
+        @memcpy(sh[1..], ast_arg_names);
+        break :blk sh;
+    };
+    const arg_names = try internArgNames(b.allocator, b.module, shifted);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -7111,6 +7150,11 @@ fn selectLocalFnOverload(
                 }
                 if (pi == null) continue :outer;
             } else {
+                // A generated positional arg after named ones (the compose
+                // pass appends the ($composer, $changed) pair positionally
+                // behind named user args): skip slots the names already
+                // bound, or the pair refutes against the first user param.
+                while (positional < ov.param_tys.len and bound[positional]) positional += 1;
                 if (positional < ov.param_tys.len) {
                     pi = positional;
                     bound[positional] = true;
@@ -7172,7 +7216,17 @@ fn lowerSelectedLocalOverloadCall(
             vals[0] = recv;
             for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
             const args_start = try packContiguous(b, vals);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            // The receiver rides as slot 0: shift the arg-name list one
+            // slot right, or a named call (`Composition(a = ..., ...)`)
+            // labels the RECEIVER "a" and every binding misaligns.
+            const shifted: []const ?[]const u8 = blk: {
+                if (ast_arg_names.len == 0) break :blk ast_arg_names;
+                const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+                sh[0] = null;
+                @memcpy(sh[1..], ast_arg_names);
+                break :blk sh;
+            };
+            const arg_names = try internArgNames(b.allocator, b.module, shifted);
             const dst = b.allocReg();
             try b.push(.{ .CallValue = .{
                 .dst = dst,
@@ -7272,7 +7326,17 @@ fn lowerValueInvocation(
             vals[0] = recv;
             for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
             const args_start = try packContiguous(b, vals);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            // The receiver rides as slot 0: shift the arg-name list one slot
+            // right, or a named call (`Composition(a = true, ...)`) labels
+            // the RECEIVER "a" and every binding misaligns.
+            const shifted: []const ?[]const u8 = blk: {
+                if (ast_arg_names.len == 0) break :blk ast_arg_names;
+                const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+                sh[0] = null;
+                @memcpy(sh[1..], ast_arg_names);
+                break :blk sh;
+            };
+            const arg_names = try internArgNames(b.allocator, b.module, shifted);
             const dst = b.allocReg();
             try b.push(.{ .CallValue = .{
                 .dst = dst,
@@ -7419,7 +7483,17 @@ fn lowerValueInvocation(
                 vals[0] = recv;
                 for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
                 const args_start = try packContiguous(b, vals);
-                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                // The receiver rides as slot 0: shift the arg-name list one
+                // slot right, or a named call (`Composition(a = true, ...)`)
+                // labels the RECEIVER "a" and every binding misaligns.
+                const shifted: []const ?[]const u8 = blk: {
+                    if (ast_arg_names.len == 0) break :blk ast_arg_names;
+                    const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+                    sh[0] = null;
+                    @memcpy(sh[1..], ast_arg_names);
+                    break :blk sh;
+                };
+                const arg_names = try internArgNames(b.allocator, b.module, shifted);
                 const dst = b.allocReg();
                 try b.push(.{ .CallValue = .{
                     .dst = dst,
@@ -8291,6 +8365,11 @@ fn factorySigRejectsArgs(b: *FuncBuilder, sig: []const ir.TypeRef, args: []const
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
+    // A LOCAL fn of the name (declared in an enclosing body — a test's
+    // `@Composable fun Composition(a, b, c)`) is the nearest scope: it
+    // shadows any same-named classifier (the pack's `interface
+    // Composition`) for a bare call.
+    if (b.local_fn_overloads.getPtr(name) != null) return false;
     // Resolve the class the SAME way the construct path below does — through
     // the scope-aware index (file imports, then self package, then global) —
     // not the simple-name-global `classId`, which picks an arbitrary winner on
@@ -10164,6 +10243,13 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     const arg_arity: ?[]const i16 = blk: {
         if (b.module.funcById(func_id)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            // The receiver-type head of a receiver-lambda argument comes from
+            // the same committed candidate: a deferred `validate { … }` must
+            // lower its block with `MockViewValidator` as the body's receiver,
+            // or bare ext-overload selection inside (`Composition(a, b, c)`
+            // beside a local `MockViewValidator.Composition`) has no receiver
+            // evidence and picks the wrong sibling.
+            try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
             break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
         }
         break :blk null;
@@ -10916,6 +11002,21 @@ fn lowerUnresolvedBareCall(
         !b.capturesThisSlot())
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
+    }
+    // A runtime-relowered body calling a LOCAL FN captured under its
+    // MANGLED overload name (`Composition$ovl0`): route through the
+    // captured value. The CMG name walk cannot see frame captures, so it
+    // fell to a same-named classifier — the pack's `interface Composition`
+    // instead of the test's local `@Composable fun Composition`.
+    {
+        var ovl_i: usize = 0;
+        while (ovl_i < 4) : (ovl_i += 1) {
+            var mb: [96]u8 = undefined;
+            const mangled = std.fmt.bufPrint(&mb, "{s}$ovl{d}", .{ name0, ovl_i }) catch break;
+            if (isLowerAnonCapture(mangled)) {
+                return try emitValueCall(b, args, ast_arg_names, ast_type_args, try b.module.func_name_index.allocator.dupe(u8, mangled));
+            }
+        }
     }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
@@ -13043,16 +13144,21 @@ test "selected composable parameters bind named and trailing lambdas exactly" {
     try testing.expectEqual(@as(usize, 4), selected.args.len);
     try testing.expect(selected.args[0] == .Call);
     try testing.expectEqual(@as(usize, 5), selected.args[0].Call.args.len);
-    const wrapped_top_bar = selected.args[0].Call.args[2];
+    // The memo wrap re-attaches the callee-derived label around the block.
+    const wrapped_top_bar_arg = selected.args[0].Call.args[2];
+    try testing.expect(wrapped_top_bar_arg == .Labeled);
+    const wrapped_top_bar = wrapped_top_bar_arg.Labeled.expr.*;
     try testing.expect(wrapped_top_bar == .Lambda);
     try testing.expectEqual(@as(usize, 2), wrapped_top_bar.Lambda.params.len);
     try testing.expectEqualStrings("$composer", wrapped_top_bar.Lambda.params[0].name);
     try testing.expectEqualStrings("$changed", wrapped_top_bar.Lambda.params[1].name);
-    try testing.expect(selected.args[1] == .Lambda);
-    try testing.expectEqual(@as(usize, 3), selected.args[1].Lambda.params.len);
-    try testing.expectEqualStrings("padding", selected.args[1].Lambda.params[0].name);
-    try testing.expectEqualStrings("$composer", selected.args[1].Lambda.params[1].name);
-    try testing.expectEqualStrings("$changed", selected.args[1].Lambda.params[2].name);
+    const content_arg = selected.args[1];
+    try testing.expect(content_arg == .Call);
+    const content_lam = content_arg.Call.args[2].Labeled.expr.*;
+    try testing.expectEqual(@as(usize, 3), content_lam.Lambda.params.len);
+    try testing.expectEqualStrings("padding", content_lam.Lambda.params[0].name);
+    try testing.expectEqualStrings("$composer", content_lam.Lambda.params[1].name);
+    try testing.expectEqualStrings("$changed", content_lam.Lambda.params[2].name);
 }
 
 test "member-or-global emission binds a composable trailing lambda by parameter" {

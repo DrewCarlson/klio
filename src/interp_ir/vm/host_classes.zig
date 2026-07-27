@@ -176,6 +176,17 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     }
 
     if (std.mem.eql(u8, ty.name, "KClass")) return value.* == .Class;
+    // `x is Enum<*>`: every enum entry is an instance of a class registered
+    // with `is_enum` (kotlin.Enum is its implicit supertype).
+    if (std.mem.eql(u8, ty.name, "Enum")) {
+        if (value.* == .Instance) {
+            const g = value.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            if (cg.get().is_enum) return true;
+        }
+    }
     if (std.mem.eql(u8, ty.name, "EnumEntries")) {
         return switch (value.*) {
             .List => |l| l.enum_entries,
@@ -683,7 +694,11 @@ fn lowerAndRegisterMethods(
             // `override val size get() = …` is otherwise unreadable.
             .Property => |p| {
                 if (p.getter) |getter| {
-                    const thunk = host_instances.synthThunk(p.name, getter.body, getter.return_type, p.is_override);
+                    // `field` in the accessor body targets the raw backing
+                    // storage (`this.__klio_field__<prop>`), bypassing the
+                    // accessor dispatch exactly like a module class's.
+                    const gbody = try rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
+                    const thunk = host_instances.synthThunk(p.name, gbody, getter.return_type, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
@@ -698,7 +713,8 @@ fn lowerAndRegisterMethods(
                 // writes instead of landing on a phantom raw field.
                 if (p.setter) |setter| {
                     const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
-                    const thunk = try host_instances.synthSetterThunk(allocator, p.name, vp, setter.body, p.is_override);
+                    const sbody = try rewriteAccessorFieldRefs(allocator, setter.body, p.name.name);
+                    const thunk = try host_instances.synthSetterThunk(allocator, p.name, vp, sbody, p.is_override);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
@@ -711,8 +727,61 @@ fn lowerAndRegisterMethods(
                 // A complex initializer (`val items = mutableListOf<...>()`)
                 // lowers as a `$init$` thunk the construction pipeline runs;
                 // simple literals stay inline (`simpleLiteral`).
+                // A delegated property (`var left by Box(left)`) lowers its
+                // DELEGATE expression as the `$init$` thunk; construction
+                // stores the evaluated delegate under the property name and
+                // reads/writes route through getValue/setValue.
+                if (p.delegate) |dexpr| {
+                    // The delegate expression may read PLAIN constructor
+                    // params (`Node(value, left)` with `var left by
+                    // Box(left)`), so the thunk declares the primary params
+                    // and construction passes the ctor args.
+                    var thunk = host_instances.synthThunk(p.name, .{ .Expr = dexpr.* }, null, false);
+                    const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+                    for (class.primary_params, 0..) |*pp, pi| {
+                        tparams[pi] = .{
+                            .name = pp.name,
+                            .ty = pp.ty,
+                            .default = null,
+                            .is_vararg = false,
+                            .is_crossinline = false,
+                            .is_noinline = false,
+                            .annotations = &.{},
+                            .span = pp.name.span,
+                        };
+                    }
+                    thunk.params = tparams;
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+                    const fid = func.id;
+                    const caps = try allocator.dupe(NameValue, capture_pairs);
+                    const key = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    defer tbl.deinit();
+                    try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
+                }
                 if (p.init) |init_expr| {
-                    const thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, p.ty, false);
+                    // The initializer may read PLAIN constructor params —
+                    // including one the property itself shadows (`class N(
+                    // property: String) { var property = property }`): declare
+                    // the primary params so the bare name binds the param,
+                    // never the not-yet-initialized property. Construction
+                    // passes the ctor args.
+                    var thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, null, false);
+                    const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+                    for (class.primary_params, 0..) |*pp, pi| {
+                        tparams[pi] = .{
+                            .name = pp.name,
+                            .ty = pp.ty,
+                            .default = null,
+                            .is_vararg = false,
+                            .is_crossinline = false,
+                            .is_noinline = false,
+                            .annotations = &.{},
+                            .span = pp.name.span,
+                        };
+                    }
+                    thunk.params = tparams;
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
@@ -775,7 +844,53 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     defer own_members.deinit();
     try collectOwnMembers(class, &own_members);
     try lowerAndRegisterMethods(self, allocator, class, &own_members, &.{});
+    // Parent-constructor arguments (`class C : Base(expr...)`) lower as
+    // `$super$arg$<i>` thunks declaring the primary params, so a MODULE
+    // parent's fields and body properties can initialize at construction.
+    for (class.supertypes, 0..) |_, si| {
+        if (si >= class.supertype_args.len) break;
+        const sargs = class.supertype_args[si] orelse continue;
+        for (sargs, 0..) |*se, ai| {
+            const thunk_name: ast.Ident = .{
+                .name = try std.fmt.allocPrint(allocator, "$super$arg${d}", .{ai}),
+                .span = class.name.span,
+            };
+            var thunk = host_instances.synthThunk(thunk_name, .{ .Expr = se.* }, null, false);
+            const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+            for (class.primary_params, 0..) |*pp, pi| {
+                tparams[pi] = .{
+                    .name = pp.name,
+                    .ty = pp.ty,
+                    .default = null,
+                    .is_vararg = false,
+                    .is_crossinline = false,
+                    .is_noinline = false,
+                    .annotations = &.{},
+                    .span = pp.name.span,
+                };
+            }
+            thunk.params = tparams;
+            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, &own_members);
+            const tbl = self.anon_methods.borrowMut();
+            defer tbl.deinit();
+            try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = &.{} });
+        }
+        break;
+    }
     return .ok;
+}
+
+/// Rewrite bare `field` references in an accessor body to the raw backing
+/// member (`this.__klio_field__<prop>`), the same substitution the module
+/// class pipeline applies — the host's get/set detect the prefix and bypass
+/// the accessor dispatch, so a custom setter's `field = value` writes the
+/// stored property instead of recursing or landing on a phantom field.
+fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: []const u8) Allocator.Error!ast.FunctionBody {
+    return switch (body) {
+        .Expr => |e| .{ .Expr = (try build.lift.substituteFieldWithThis(allocator, prop, &e)).* },
+        .Block => |blk| .{ .Block = try build.lift.rewriteBlockField(allocator, &blk, prop) },
+    };
 }
 
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {

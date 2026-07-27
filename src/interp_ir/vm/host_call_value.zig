@@ -782,6 +782,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             .native_state = null,
         });
         const inst_value: Value = .{ .Instance = inst };
+        // A MODULE parent chain (`class MyApplier : AbstractApplier<T>(root)`)
+        // binds its primary-param fields and runs its body-property inits
+        // through the registered `$super$arg$<i>` thunks and the static
+        // per-class init maps.
+        if (try host_instances.initLocalParentChain(self, allocator, inst, inst_value, cls, cls_name, args)) |e| {
+            return .{ .err = e };
+        }
         // Interleave `init { … }` blocks (lowered as `$init$block$<idx>` anon
         // thunks at registration, with the enclosing scope's captured cells
         // bound) with the complex property initializers in declaration order.
@@ -801,7 +808,12 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().body_properties[prop_idx].name;
             };
-            const complex = blk: {
+            const is_delegate = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().body_properties[prop_idx].delegate != null;
+            };
+            const complex = is_delegate or blk: {
                 const g = cls.borrow();
                 defer g.deinit();
                 const init_field = g.get().body_properties[prop_idx].init orelse break :blk false;
@@ -818,11 +830,39 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 break :blk ag.get().contains(key);
             };
             if (!has) continue;
-            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+            // Both delegate and plain-initializer thunks declare the primary
+            // params so the expression can read plain ctor params — including
+            // one the property itself shadows (`class N(property: String) {
+            // var property = property }`). Pass the args, filling omitted
+            // trailing params from their literal defaults.
+            var eff_args: std.ArrayList(Value) = .empty;
+            defer eff_args.deinit(allocator);
+            {
+                const g = cls.borrow();
+                defer g.deinit();
+                const pps = g.get().primary_params;
+                for (pps, 0..) |*pp, ai| {
+                    if (ai < args.len) {
+                        try eff_args.append(allocator, args[ai]);
+                    } else {
+                        const dv: Value = if (pp.default) |e|
+                            (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                        else
+                            Value.Null;
+                        try eff_args.append(allocator, dv);
+                    }
+                }
+            }
+            const thunk_args: []const Value = eff_args.items;
+            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, thunk_args)) {
                 .ok => |rv| {
                     const ig = inst.borrowMut();
                     defer ig.deinit();
-                    _ = ig.get().set(pname, rv);
+                    if (is_delegate) {
+                        try ig.get().define(allocator, pname, rv);
+                    } else {
+                        _ = ig.get().set(pname, rv);
+                    }
                 },
                 .err => |e| return .{ .err = e },
             }
@@ -924,6 +964,56 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // trailing `($composer, $changed)` more than the call supplied and
         // a composer is ambient, complete the pair and re-enter, exactly
         // as the type-directed emission would have.
+        // A pair-tailed composable local fn called WITH the pair but fewer
+        // user args than declared (`useA()` lowered as useA($composer,
+        // $changed) against `useA(a: A = A(), $composer, $changed)`): keep
+        // the pair in the trailing slots and fill the defaulted gap from
+        // the registered local-fn default thunks — positional Null-padding
+        // shoved the composer into `a` and the changed flags into
+        // `$composer`.
+        if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
+            args.len >= 2 and args.len < info.n_params and
+            std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
+            std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer") and
+            args[args.len - 1] == .Int and args[args.len - 2] == .Instance and blk: {
+            const ig = args[args.len - 2].Instance.borrow();
+            defer ig.deinit();
+            const cg = ig.get().class.borrow();
+            defer cg.deinit();
+            break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+        }) {
+            const n_user = args.len - 2;
+            var re: std.ArrayList(Value) = .empty;
+            defer re.deinit(allocator);
+            try re.appendSlice(allocator, args[0..n_user]);
+            const dslots: ?[]const ?FuncId = dblk: {
+                const mg2 = self.module.borrow();
+                defer mg2.deinit();
+                if (mg2.get().registry.local_fn_defaults.get(info.body_func)) |slots| break :dblk slots.items;
+                break :dblk null;
+            };
+            var gap_i: usize = n_user;
+            while (gap_i < info.n_params - 2) : (gap_i += 1) {
+                var filled = false;
+                if (dslots) |slots| {
+                    if (gap_i < slots.len) {
+                        if (slots[gap_i]) |dfid| {
+                            switch (try self.callFunc(allocator, module, dfid, re.items[0..gap_i])) {
+                                .ok => |dv| {
+                                    try re.append(allocator, dv);
+                                    filled = true;
+                                },
+                                .err => |e| return .{ .err = e },
+                            }
+                        }
+                    }
+                }
+                if (!filled) try re.append(allocator, .Null);
+            }
+            try re.append(allocator, args[args.len - 2]);
+            try re.append(allocator, args[args.len - 1]);
+            return callValue(self, allocator, callee, re.items);
+        }
         if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
             args.len + 2 == info.n_params and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
@@ -949,6 +1039,46 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             host_call_func.linkAuditCheck(self, module, func.id, func, args);
             if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
                 return dispatchIntrinsic(self, func.fqn, intrinsic, args);
+            }
+            // A closure published for an OVERLOADED top-level name carries
+            // only ONE signature (first-wins). A call its arity cannot bind
+            // belongs to a same-name sibling (a same-file private 3-arg
+            // published over the public 2-arg overload in another file);
+            // padding it with Nulls runs the wrong body. Re-rank the full
+            // same-name set through the overload binder.
+            // The SOURCE-level simple name: a file-private top-level fn is
+            // registered under a per-file rename (`over$f220`); its overload
+            // siblings live under the plain name.
+            const src_name = blk: {
+                const n = func.name;
+                const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse break :blk n;
+                if (i + 2 > n.len or n[i + 1] != 'f') break :blk n;
+                for (n[i + 2 ..]) |c| {
+                    if (!std.ascii.isDigit(c)) break :blk n;
+                }
+                break :blk n[0..i];
+            };
+            const sibling_count = module.funcsBySimpleName(src_name).len +
+                @intFromBool(src_name.len != func.name.len);
+            if (args.len != info.n_params and info.capture_names.len == 0 and
+                !module.globalArityCanBind(func.id, func, args.len) and
+                sibling_count > 1)
+            {
+                if (module.funcsBySimpleName(src_name).len > 1) {
+                    switch (try host_call_func.callNamedOverload(self, allocator, module, null, src_name, args, &.{}, null, false, func.package, null, "")) {
+                        .ok => |maybe| if (maybe) |v2| return .{ .ok = v2 },
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+                // A single plain-named sibling of a renamed file-private fn:
+                // dispatch it directly when the arity fits.
+                for (module.funcsBySimpleName(src_name)) |sib_id| {
+                    if (sib_id.int() == func.id.int()) continue;
+                    const sib = module.funcById(sib_id) orelse continue;
+                    if (!sib.hasBody()) continue;
+                    if (!module.globalArityCanBind(sib_id, sib, args.len)) continue;
+                    return self.callFunc(allocator, module, sib_id, args);
+                }
             }
         }
         if (callValueTraceOn() and args.len < info.n_params) {

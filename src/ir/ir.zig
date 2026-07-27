@@ -225,6 +225,14 @@ pub const Inst = union(enum) {
         dst: Reg,
         receiver: Reg,
         field: ConstId,
+        /// Runtime site memo, single-fill: the first resolving class's
+        /// identity claims the site (CAS from 0), then `site_route`
+        /// holds that class's packed field-read route. Only the CAS
+        /// winner ever writes `site_route`, so the pair can never tear.
+        /// A stale baked value mismatches every live identity and the
+        /// site just stays on the slow path.
+        site_cls: u64 = 0,
+        site_route: u64 = 0,
     },
     /// Write a local property of a class instance.
     SetField: struct {
@@ -587,6 +595,13 @@ pub const Inst = union(enum) {
         name: ConstId,
         func: ?FuncId = null,
         class: ?ClassId = null,
+        /// Runtime site memo for the implicit-receiver walk: a packed
+        /// {shape-hash, winner-index, verdict} word filled in place under
+        /// the same benign-race convention as `Func.fast_call`. The shape
+        /// hash folds each candidate's class identity and field count, so
+        /// a stale entry (including one baked into an image by another
+        /// process) mismatches and the full walk re-fills it.
+        site_cache: u64 = 0,
     },
     /// Symmetric write counterpart of `LoadFromThisOrGlobal`: the
     /// innermost implicit receiver with a member named `name` takes the
@@ -1008,10 +1023,28 @@ pub const Func = struct {
     /// top-level user function a positional, exact-arity call dispatches straight
     /// to its body. See `eval`'s `.Call` fast path.
     fast_call: u16 = 0,
+    /// Which argument-coercion walks can ever apply to this func's declared
+    /// params, computed on first frame entry: bit0 = computed, bit1 = a
+    /// non-vararg `Long` param exists (Int->Long widening), bit2 = >=2 params
+    /// with a type-variable-typed one (generic Int/Long peer widening).
+    /// Filled in place under the same benign-race convention as `fast_call`.
+    coerce_plan: u8 = 0,
     /// Index of `"this"` in `capture_order`, cached on first use by
     /// `callerThisValue` (hot: every GetField in a lambda frame consults
     /// it). `-2` = not yet computed, `-1` = no `this` capture.
     this_cap_idx: i32 = -2,
+    /// Accessor-shape memo (benign-race fill): 0 = unknown, 1 = not an
+    /// accessor, 2 = the body is exactly `LoadParam #0; GetField; return`
+    /// with `acc_field` holding the GetField name ConstId. See
+    /// `accessorFieldConst`.
+    acc_state: u8 = 0,
+    acc_field: u32 = 0,
+    /// Single-fill (CAS from 0) claimed receiver-class identity and its
+    /// packed stored-slot route for the frameless accessor read; only the
+    /// CAS winner writes `acc_route`, so the pair never tears. A stale
+    /// baked value mismatches every live identity harmlessly.
+    acc_cls: u64 = 0,
+    acc_route: u64 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
@@ -1097,6 +1130,49 @@ pub const Func = struct {
     /// this, never a bare `blocks.len`, so deferral stays invisible to dispatch.
     pub fn hasBody(self: *const Func) bool {
         return self.blocks.len != 0 or self.deferred_offset != 0;
+    }
+
+    /// The GetField name ConstId when this function's body is exactly the
+    /// accessor shape `LoadParam #0; GetField; return` — the canonical
+    /// property-getter lowering — else null. Cached in place under the
+    /// `fast_call` benign-race convention. A deferred (not yet decoded)
+    /// body is never classified, so the verdict is only ever computed from
+    /// real instructions.
+    pub fn accessorFieldConst(self: *const Func) ?ConstId {
+        switch (self.acc_state) {
+            1 => return null,
+            2 => return @enumFromInt(self.acc_field),
+            else => {},
+        }
+        if (self.blocks.len == 0) return null;
+        const verdict: ?ConstId = blk: {
+            if (self.params.len != 1 or self.is_suspend or self.blocks.len != 1) break :blk null;
+            const b = &self.blocks[0];
+            if (b.catches.len != 0 or b.insts.len != 2) break :blk null;
+            const lp = switch (b.insts[0]) {
+                .LoadParam => |lp| lp,
+                else => break :blk null,
+            };
+            if (lp.idx != 0) break :blk null;
+            const gf = switch (b.insts[1]) {
+                .GetField => |gf| gf,
+                else => break :blk null,
+            };
+            if (gf.receiver != lp.dst) break :blk null;
+            const ret = switch (b.terminator) {
+                .Return => |r| r orelse break :blk null,
+                else => break :blk null,
+            };
+            if (ret != gf.dst) break :blk null;
+            break :blk gf.field;
+        };
+        if (verdict) |f| {
+            @constCast(self).acc_field = @intCast(f.int());
+            @constCast(self).acc_state = 2;
+            return f;
+        }
+        @constCast(self).acc_state = 1;
+        return null;
     }
 };
 
@@ -6665,7 +6741,7 @@ pub const Module = struct {
     /// bind. If no scoped declaration can bind, the host/incomplete-header
     /// compatibility boundary remains active until P10 supplies a complete
     /// declaration for the host shape.
-    fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
+    pub fn globalArityCanBind(self: *const Module, id: FuncId, f: *const Func, want: usize) bool {
         // The compose pass appends ($composer, $changed) to composable
         // signatures. Call sites lower with USER argument counts (the pair
         // is threaded later, or completed at runtime), so the pair never

@@ -612,8 +612,181 @@ threadlocal var spin_check_counter: u64 = 0;
 
 /// Diagnostic: print the live frame chain (as the spin tracer does), for an
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
+/// KLIO_CALL_STATS: per-function invocation counters over the whole run.
+/// `callStatsDump` prints the top entries — the workload census that
+/// separates "the interpreter is slow per call" from "the program runs more
+/// calls than the reference would" (missed skipping, repeated recompose).
+var call_stats_state: u8 = 0;
+var call_stats_mutex: runtime.SpinMutex = .{};
+var call_stats: ?std.StringHashMap(u64) = null;
+fn callStatsBump(fqn: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = call_stats.?.getOrPut(fqn) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+/// KLIO_CALL_STATS census tap for slow-ladder GetField executions: keys are
+/// `<gf>Type.name`, so the dump separates the field-read workload from the
+/// call workload.
+fn gfStatsBump(recv: *const Value, name: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = call_stats.?.getOrPut(key) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += 1;
+}
+
+/// Host-route sub-tag names for the op profiler (see `runtime.prof.opRoute`).
+/// Order is the route index contract shared with the host dispatch stages.
+pub const op_route_names = [_][]const u8{
+    "route:member-arg-prep", // 0
+    "route:member-flat-prep", // 1
+    "route:member-ladder", // 2
+    "route:member-ext-fallback", // 3
+    "route:member-invoke-fid", // 4
+    "route:flat-activation", // 5
+    "route:member-stdlib-dispatch", // 6
+    "route:recv-fn-field", // 7
+    "route:vararg-shadow", // 8
+    "route:ir-method-walk", // 9
+    "route:member-named-inner", // 10
+    "route:ltg-cands", // 11
+    "route:ltg-probe", // 12
+    "route:ltg-global", // 13
+    "route:gf-slow", // 14
+    "route:member-cache-probe", // 15
+};
+
+/// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
+/// names and print the distribution. Lives here because only the IR layer
+/// can name `Inst` tags.
+pub fn opProfDump() void {
+    const counts = runtime.prof.opProfCounts() orelse return;
+    const Entry = struct { name: []const u8, n: u64 };
+    var list: [512]Entry = undefined;
+    var used: usize = 0;
+    var total: u64 = 0;
+    const n_tags = @typeInfo(@typeInfo(Inst).@"union".tag_type.?).@"enum".fields.len;
+    for (counts, 0..) |*slot, i| {
+        const n = slot.load(.monotonic);
+        if (n == 0) continue;
+        total += n;
+        const name: []const u8 = if (i == runtime.prof.OP_OUTSIDE)
+            "<outside-eval>"
+        else if (i < n_tags)
+            @tagName(@as(@typeInfo(Inst).@"union".tag_type.?, @enumFromInt(i)))
+        else if (i >= runtime.prof.OP_ROUTE_BASE and
+            i - runtime.prof.OP_ROUTE_BASE < op_route_names.len)
+            op_route_names[i - runtime.prof.OP_ROUTE_BASE]
+        else
+            "<unknown>";
+        list[used] = .{ .name = name, .n = n };
+        used += 1;
+    }
+    if (total == 0) return;
+    std.mem.sort(Entry, list[0..used], {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[op-prof] {d} samples by opcode:\n", .{total});
+    const ft: f64 = @floatFromInt(total);
+    for (list[0..used]) |e| {
+        const pct = 100.0 * @as(f64, @floatFromInt(e.n)) / ft;
+        if (pct < 0.3) break;
+        std.debug.print("[op-prof] {d:>6.2}%  {d:>9}  {s}\n", .{ pct, e.n, e.name });
+    }
+}
+
+/// Probe channel for the call census: host dispatch stages report the names
+/// that miss their caches, prefixed per stage in a second map.
+var probe_stats: ?std.StringHashMap(u64) = null;
+pub fn callStatsProbe(name: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (probe_stats == null) probe_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = probe_stats.?.getOrPut(name) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+pub fn probeStatsDump() void {
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    const stats = &(probe_stats orelse return);
+    const Entry = struct { fqn: []const u8, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, stats.count()) catch return;
+    defer list.deinit(std.heap.page_allocator);
+    var it = stats.iterator();
+    var total: u64 = 0;
+    while (it.next()) |e| {
+        list.appendAssumeCapacity(.{ .fqn = e.key_ptr.*, .n = e.value_ptr.* });
+        total += e.value_ptr.*;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[probe-stats] total={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| std.debug.print("[probe-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
+}
+
+pub fn callStatsDump() void {
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    const stats = &(call_stats orelse return);
+    const Entry = struct { fqn: []const u8, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, stats.count()) catch return;
+    defer list.deinit(std.heap.page_allocator);
+    var it = stats.iterator();
+    var total: u64 = 0;
+    while (it.next()) |e| {
+        list.appendAssumeCapacity(.{ .fqn = e.key_ptr.*, .n = e.value_ptr.* });
+        total += e.value_ptr.*;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[call-stats] total={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 60);
+    for (list.items[0..top]) |e| std.debug.print("[call-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
+}
+
+/// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
+/// diagnostic path, and `getenvSlice` takes a global mutex per call. The env
+/// is set at launch; a mid-run change is not observed (benign data race:
+/// both racers store the same verdict).
+var err_trace_state: u8 = 0;
+pub fn errTraceOn() bool {
+    if (err_trace_state == 0)
+        err_trace_state = if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) 2 else 1;
+    return err_trace_state == 2;
+}
+
 pub fn dumpFrameChainForDiag() void {
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    if (!errTraceOn()) return;
     dumpCurrentFrameParamsForDiag();
     dumpFrameChainForDiagAlways();
 }
@@ -1037,6 +1210,30 @@ pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 
 /// The enclosing-`this` chain with subject tags, innermost first. Caller owns
 /// the returned slice.
+/// Fold the active enclosing-`this` chain's shape (entry kinds + receiver
+/// class identities) into a hash, without allocating. Used to key
+/// chain-dependent resolutions (member-extension applicability) in the
+/// extension cache: identical chain shapes resolve identically.
+pub fn enclosingChainClassHash() u64 {
+    var h = std.hash.Wyhash.init(0x8f14e45fceea167a);
+    if (evtls.active_chain) |chain| {
+        for (chain.items) |e| {
+            const kb: u8 = @intFromEnum(e.kind);
+            h.update((&kb)[0..1]);
+            var k: u64 = undefined;
+            if (e.v == .Instance) {
+                const g = e.v.Instance.borrow();
+                k = @intCast(g.get().class.identity());
+                g.deinit();
+            } else {
+                k = @as(u64, @intFromEnum(std.meta.activeTag(e.v))) +% 0x2b8c;
+            }
+            h.update(std.mem.asBytes(&k));
+        }
+    }
+    return h.final() | 1;
+}
+
 pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
     const chain = evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out = try allocator.alloc(EnclosingEntry, chain.items.len);
@@ -2017,8 +2214,30 @@ const Frame = struct {
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
         }
-        coerceIntArgsToLong(func, params.items);
-        coerceGenericIntPeersToLong(module, func, params.items);
+        // The coercion walks trigger only on specific declared param shapes;
+        // compute once per func which can ever apply (filled in place under
+        // the same benign-race convention as `fast_call`).
+        var plan = func.coerce_plan;
+        if (plan == 0) {
+            plan = 1;
+            for (func.params) |*p| {
+                if (!p.is_vararg and !p.ty.nullable and std.mem.eql(u8, p.ty.name, "Long")) {
+                    plan |= 2;
+                    break;
+                }
+            }
+            if (func.params.len >= 2) {
+                for (func.params) |*p| {
+                    if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
+                        plan |= 4;
+                        break;
+                    }
+                }
+            }
+            @constCast(func).coerce_plan = plan;
+        }
+        if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
+        if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         const regs = try acquireRegs(allocator, func.n_locals);
         return .{
             .module = module,
@@ -2223,7 +2442,27 @@ pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args
 /// every `host.method(...)` is a comptime-duck-typed direct call.
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
+    boolThisTrap(func, args.items);
     return evalWithCaptures(H, allocator, module, func, args, .empty, host);
+}
+
+/// `KLIO_THIS_TRAP=1`: print every frame entry that binds a Bool into a
+/// `this` parameter — the ext-receiver misbind signature — with the caller.
+pub fn boolThisTrap(func: *const Func, args: []const Value) void {
+    if (runtime.getenvSlice("KLIO_THIS_TRAP") == null) return;
+    if (func.params.len == 0 or args.len == 0) return;
+    if (!std.mem.eql(u8, func.params[0].name, "this")) return;
+    if (args[0] != .Bool and args[0] != .Int) return;
+    const cf = currentFrameFunc();
+    std.debug.print("[this-trap] fn={s}#{d} nargs={d} caller={s}#{d} vals:", .{
+        func.fqn,
+        func.id.int(),
+        args.len,
+        if (cf) |c| c.fqn else "<none>",
+        if (cf) |c| c.id.int() else 0,
+    });
+    for (args) |a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a))});
+    std.debug.print("\n", .{});
 }
 
 /// `KLIO_DUMP_FN=<name>`: print the named function's lowered instruction
@@ -2261,7 +2500,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
             std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
             switch (inst.*) {
                 .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .GetField => |x| std.debug.print(" field={s}", .{constStr(module, x.field) orelse "?"}),
+                .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int() }),
                 .CallMember => |x| std.debug.print(" name={s} recv=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int() }),
@@ -2377,6 +2616,8 @@ pub fn evalWithCapturesChained(
     host: *H,
 ) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
+    boolThisTrap(func, args.items);
+    callStatsBump(func.fqn);
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
@@ -2840,6 +3081,7 @@ fn snapshotSuspendedFrame(
 /// construction with the arg buffer transferred as params, GC chain push,
 /// lexical receiver-chain activation, context-parameter seeding).
 fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
+    boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
     const act = try allocator.create(Activation);
@@ -4450,6 +4692,7 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// call runs native code -> `LoopTramp.call` -> `callFunc` and never reaches
 /// here. That path is served by outlining the trampoline's bulky sites.
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
+    if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
         .SuspendResumePoint => {
             // No runtime effect on its own.
@@ -4522,7 +4765,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(nn.dst, v);
         },
-        .GetField => |gf| return execArmGetField(H, allocator, frame, gf, host),
+        .GetField => |*gf| return execArmGetField(H, allocator, frame, gf, host),
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
         .Call => |call| return execArmCall(H, allocator, frame, call, host),
@@ -4687,7 +4930,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(lc.dst, v);
         },
-        .LoadFromThisOrGlobal => |lt| return execArmLoadFromThisOrGlobal(H, allocator, frame, lt, host),
+        .LoadFromThisOrGlobal => |*lt| return execArmLoadFromThisOrGlobal(H, allocator, frame, lt, host),
         .Index => |ix| return execArmIndex(H, allocator, frame, ix, host),
         .IndexSet => |ixs| return execArmIndexSet(H, allocator, frame, ixs, host),
         .NewList => |nl| return execArmNewList(H, allocator, frame, nl, host),
@@ -5076,12 +5319,80 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             pushed_enclosing = true;
         }
     }
+    // Site memo: serve a stored-slot read or a class getter directly when
+    // the receiver's class is the one that claimed this site. The slot
+    // read re-verifies by name and declines the lateinit/delegate shapes,
+    // exactly as the (class, name) memo it mirrors.
+    if (comptime @hasDecl(H, "fieldSiteRoute")) {
+        if (recv == .Instance) {
+            const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+            if (w0 > 1) fast: {
+                var getter_fid: u64 = 0;
+                {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const b = g.get();
+                    if (w0 != @as(u64, @intCast(b.class.identity()))) break :fast;
+                    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+                    if (route == 0) break :fast;
+                    if (route & 3 == 1) {
+                        const idx: usize = @intCast(route >> 2);
+                        if (idx >= b.fields.items.len) break :fast;
+                        const f = &b.fields.items[idx];
+                        // A scoped `$sgetter$<owner>\u{1f}<prop>` site stores
+                        // its slot under the bare property name; the
+                        // separator-guarded suffix match keeps the index-drift
+                        // guard exact.
+                        if (!std.mem.eql(u8, f.name, name) and
+                            !(std.mem.startsWith(u8, name, "$sgetter$") and
+                                name.len > f.name.len and
+                                std.mem.endsWith(u8, name, f.name) and
+                                name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
+                        const v = f.value;
+                        if (v == .Null or v == .Delegate) break :fast;
+                        v.retain();
+                        if (pushed_enclosing) popEnclosing();
+                        try frame.write(gf.dst, v);
+                        return .cont;
+                    }
+                    if (route & 3 == 2) getter_fid = route >> 2;
+                }
+                if (getter_fid != 0) {
+                    const got_g = host.runFieldGetter(allocator, @enumFromInt(getter_fid), recv);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (try got_g) {
+                        .ok => |v| {
+                            v.retain();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
+        }
+    }
+    runtime.prof.opRoute(14);
+    gfStatsBump(&recv, name);
     const got = host.getField(allocator, &recv, name);
     if (pushed_enclosing) popEnclosing();
     switch (try got) {
         // host.getField returns a borrowed field value; the register owns its ref.
         .ok => |v| {
             v.retain();
+            if (comptime @hasDecl(H, "fieldSiteRoute")) {
+                if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
+                    var claim_cls: u64 = 1;
+                    var claim_route: u64 = 0;
+                    if (host.fieldSiteRoute(&recv, name)) |r| {
+                        claim_cls = r.cls;
+                        claim_route = r.route;
+                    }
+                    if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, claim_cls, .acq_rel, .monotonic) == null) {
+                        if (claim_route != 0) @atomicStore(u64, @constCast(&gf.site_route), claim_route, .release);
+                    }
+                }
+            }
             try frame.write(gf.dst, v);
         },
         .err => |e| return raiseStep(frame, e),
@@ -5718,6 +6029,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     defer recv.release(allocator);
     const name_str = constStr(frame.module, cm.name) orelse
         return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
+    runtime.prof.opRoute(0);
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
@@ -5744,15 +6056,18 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // ladder's entry consults; anything else falls through to the ladder.
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
         if (flatEnabled() and argNamesAllNull(cm.arg_names)) {
+            runtime.prof.opRoute(1);
             if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
                 frame.flat_call = prep;
+                runtime.prof.opRoute(5);
                 return .flat_call;
             }
         }
     }
+    runtime.prof.opRoute(2);
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
@@ -6267,6 +6582,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // `consult_param = true`: in a method / extension body the
         // implicit receiver is the frame's `this` *parameter*, not
         // a capture slot.
+        runtime.prof.opRoute(11);
         const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
         defer allocator.free(cands);
         const cands_keepalive = pinImplicitCandidates(cands);
@@ -6279,36 +6595,85 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // even when the member's value IS `Unit` (`var u: Unit`):
         // the strict probe reports misses as errors, never as a
         // spurious `Unit`.
-        for (cands) |c| {
-            switch (try host.getMemberField(allocator, &c.v, name_str)) {
-                .ok => |v| {
-                    orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
-                    resolved = v;
-                    break;
-                },
-                // Only the dispatch-miss sentinel (`Unimplemented`)
-                // means "this candidate has no such member" — discard
-                // its `Vm::get_field` message and walk to the next
-                // candidate / global tier. Any other error is a member
-                // that resolved and whose accessor actually ran: a
-                // throw from a delegated property's `getValue`
-                // (`NoSuchElementException` on a missing map key), a
-                // `CalleeFailed`, a `StackOverflow`. Those propagate —
-                // swallowing them would mask the throw and fall through
-                // to a spurious `unresolved global`.
-                .err => |e| {
-                    if (e == .Unimplemented) {
-                        freeMissErr(allocator, e);
-                    } else {
-                        return raiseStep(frame, e);
+        //
+        // The instruction's site memo short-circuits the walk when the
+        // candidate shape matches a prior execution: a member's presence
+        // on a candidate is a function of its class graph and stored
+        // field set, both folded into the shape word, so under an equal
+        // shape the recorded misses still miss and only the recorded
+        // winner (if any) needs its probe re-run.
+        runtime.prof.opRoute(12);
+        const shape = implicitSiteShape(cands);
+        var full_walk = true;
+        if (shape) |sh| {
+            const cached = @atomicLoad(u64, @constCast(&lt.site_cache), .monotonic);
+            if (cached != 0 and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
+                const verdict = cached & 3;
+                if (verdict == SITE_MISS) {
+                    full_walk = false;
+                } else if (verdict == SITE_WIN) {
+                    const w: usize = @intCast((cached >> 2) & 0xFF);
+                    if (w < cands.len) {
+                        switch (try host.getMemberField(allocator, &cands[w].v, name_str)) {
+                            .ok => |v| {
+                                orAudit("LoadFromThisOrGlobal", name_str, "member", cands[w].depth, &cands[w].v);
+                                resolved = v;
+                                full_walk = false;
+                            },
+                            .err => |e| {
+                                if (e == .Unimplemented) {
+                                    freeMissErr(allocator, e);
+                                } else {
+                                    return raiseStep(frame, e);
+                                }
+                            },
+                        }
                     }
-                },
+                }
+            }
+        }
+        if (full_walk and resolved == null) {
+            var winner: ?usize = null;
+            for (cands, 0..) |c, ci| {
+                switch (try host.getMemberField(allocator, &c.v, name_str)) {
+                    .ok => |v| {
+                        orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
+                        resolved = v;
+                        winner = ci;
+                        break;
+                    },
+                    // Only the dispatch-miss sentinel (`Unimplemented`)
+                    // means "this candidate has no such member" — discard
+                    // its `Vm::get_field` message and walk to the next
+                    // candidate / global tier. Any other error is a member
+                    // that resolved and whose accessor actually ran: a
+                    // throw from a delegated property's `getValue`
+                    // (`NoSuchElementException` on a missing map key), a
+                    // `CalleeFailed`, a `StackOverflow`. Those propagate —
+                    // swallowing them would mask the throw and fall through
+                    // to a spurious `unresolved global`.
+                    .err => |e| {
+                        if (e == .Unimplemented) {
+                            freeMissErr(allocator, e);
+                        } else {
+                            return raiseStep(frame, e);
+                        }
+                    },
+                }
+            }
+            if (shape) |sh| {
+                const entry: u64 = if (winner) |w|
+                    (if (w <= 0xFF) (sh & SITE_SHAPE_MASK) | (@as(u64, @intCast(w)) << 2) | SITE_WIN else 0)
+                else
+                    (sh & SITE_SHAPE_MASK) | SITE_MISS;
+                if (entry != 0) @atomicStore(u64, @constCast(&lt.site_cache), entry, .monotonic);
             }
         }
     }
     // The scope-qualified form carries the lexical owner only for
     // the getter reads above; the global fallback uses the bare
     // name.
+    runtime.prof.opRoute(13);
     const bare_name = stripScopeGetter(name_str);
     // A lowering-resolved identity binds that exact declaration;
     // the name string remains the unresolved-shape fallback. A
@@ -6567,6 +6932,33 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // names a class.
     var is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
         cmg.class != null;
+    // An INAPPLICABLE constructor is not a candidate at all: Kotlin filters
+    // by applicability before scope rank, so `Point(it)` against `data class
+    // Point(x: Int, y: Int)` never means construction — the member/extension
+    // walk must run and bind the receiver's `MockViewValidator.Point`
+    // extension. The class-carrying ctor tail stays the fallback for calls
+    // nothing else serves, so a bindable secondary constructor is still
+    // reachable when the walk misses.
+    if (is_ctor_name) applicable: {
+        const cid = cmg.class.?;
+        if (cid.int() >= frame.module.classes.items.len) break :applicable;
+        const cls = &frame.module.classes.items[cid.int()];
+        var required: usize = 0;
+        var has_vararg = false;
+        for (cls.primary_params) |*p| {
+            if (p.is_vararg) {
+                has_vararg = true;
+                continue;
+            }
+            if (!p.has_default) required += 1;
+        }
+        const n = arg_values.len;
+        if (n >= required and (has_vararg or n <= cls.primary_params.len)) break :applicable;
+        if (comptime @hasDecl(H, "classSecondaryCtorCanBind")) {
+            if (host.classSecondaryCtorCanBind(cls.fqn, cls.name, n)) break :applicable;
+        }
+        is_ctor_name = false;
+    }
     // A capitalized name that is ALSO a method of the implicit receiver is a
     // nearer-scope member call, not a constructor (`Test(...)` inside a class
     // declaring `fun Test(...)` next to an imported `kotlin.test.Test`): run
@@ -7010,7 +7402,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // class) may bind by id here; a receiverless value invocation
             // of an extension misbinds every parameter.
             const by_id_func: ?FuncId = blk: {
-                if (cmg.candidates != null) break :blk null;
+                // A bounded candidate set blocks the NAME fallback below, but
+                // not the lowering's own committed id: the restart lambda's
+                // `Defaults($rc, $changed or 1)` carries both a Unit-receiver
+                // candidate (which misses) and the committed global — the id
+                // is the lowering's resolution, not a same-simple-name
+                // widening, and the name/arity guards below still validate it.
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
                 // A committed id can belong to the MAIN module's table while
@@ -7026,6 +7423,12 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     break :blk null;
                 }
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
+                // First-wins commit vs overloads: a committed fn the call's
+                // ARITY cannot bind (a same-file private 3-arg picked for a
+                // 2-arg call whose true target is a public overload in
+                // another file) must not serve by id — decline so the
+                // overload leg ranks the full same-name set.
+                if (!frame.module.globalArityCanBind(fid, cf, arg_values.len)) break :blk null;
                 break :blk fid;
             };
             // A constructor-name call (`Foo(args)` where `Foo` is a class) must
@@ -7035,9 +7438,27 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // returns for a class-value read); otherwise, once the companion has
             // been published (e.g. a prior `Foo.member` access), `Foo(args)`
             // resolves to `Companion.invoke` instead of constructing.
-            const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
+            // A committed class that cannot CONSTRUCT (an interface/abstract
+            // classifier sharing the name with a callable — the pack's
+            // `interface Composition` vs a local `@Composable fun
+            // Composition`) never wins the by-id serve for a non-SAM call;
+            // the lexical name lookup and the overload leg resolve the real
+            // callable instead.
+            const ctor_class: ?ir.ClassId = blk: {
+                const cid = cmg.class orelse break :blk null;
+                if (cid.int() < frame.module.classes.items.len) {
+                    const cls = &frame.module.classes.items[cid.int()];
+                    if ((cls.is_interface or cls.is_abstract) and
+                        !(arg_values.len == 1 and valueInvocable(frame.module, arg_values[0])))
+                    {
+                        break :blk null;
+                    }
+                }
+                break :blk cid;
+            };
+            const by_id: ?Value = if ((ctor_class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, cmg.class, is_ctor_name)
+                host.lookupGlobalById(allocator, by_id_func, ctor_class, is_ctor_name)
             else
                 null;
             // A bounded candidate set is authoritative. Once lowering has
@@ -7326,6 +7747,38 @@ const ImplicitCandidate = struct {
     v: Value,
     depth: u16,
 };
+
+/// Low bits of a `site_cache` word: 2-bit verdict + 8-bit winner index;
+/// the rest is the shape hash.
+const SITE_SHAPE_MASK: u64 = ~@as(u64, 0x3FF);
+const SITE_MISS: u64 = 1;
+const SITE_WIN: u64 = 2;
+
+/// Fold the candidate list into a stable shape word for the bare-name
+/// site memo: an Instance contributes its class identity and stored
+/// field count (a dynamically defined field flips the shape), every
+/// other value contributes its tag. Null disables the memo for this
+/// execution — a candidate carrying lexical `this@` captures probes
+/// foreign receivers whose state the shape cannot cover.
+fn implicitSiteShape(cands: []const ImplicitCandidate) ?u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (cands) |c| {
+        var k: u64 = undefined;
+        if (c.v == .Instance) {
+            const g = c.v.Instance.borrow();
+            defer g.deinit();
+            const b = g.get();
+            if (b.anon_captures.len != 0) return null;
+            k = @as(u64, @intCast(b.class.identity())) ^ (@as(u64, b.fields.items.len) *% 0x9e3779b97f4a7c15);
+        } else {
+            k = @as(u64, @intFromEnum(std.meta.activeTag(c.v))) +% 0x51ed270b;
+        }
+        h = (h ^ k) *% 0x100000001b3;
+    }
+    // Zero means "no entry"; nudge a colliding shape off it.
+    if (h & SITE_SHAPE_MASK == 0) h = 0x400;
+    return h;
+}
 
 /// Candidate walks are assembled in host scratch memory, but probing a
 /// property/getter or member can re-enter interpreted code and collect. Keep
