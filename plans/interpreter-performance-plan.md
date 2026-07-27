@@ -910,6 +910,34 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
+CURRENT STANDING (post this stretch): CompositionTests 123/148,
+MovableContentTests 41/44, RecomposerTests 9/12
+(+testMultipleRecompose via default-filled pair padding in closure
+calls), probes all green, sweep 0 on every commit. The remaining
+failures cluster into DEEP families:
+(1) SKIP CALCULUS: testSimpleSkipping, testMovingMemoization,
+composableWithUnstableParameters_skipped, testRecomposition
+("Expected no changes but changes occurred" / invokeCount 2) — the
+`$dirty == 0 && composer.skipping` path does not skip where the
+reference runtime does; suspect the caller-side $changed bits (klio
+passes 0=unknown) and/or composer.skipping state during recompose.
+(2) SPLICED-LOOP SLOT IDENTITY: slotsAreUsedCorrectly_forEach —
+collectAsState dispatches once instead of per loop iteration; the
+spliced forEach body's remember slots collide across iterations.
+(3) SUBCOMPOSITION invalidation propagation:
+testModificationsPropagateToSubcomposition now reaches "Expected
+changes but none were found" (state write does not invalidate the
+subcomposition's scope).
+(4) MOVABLE-CONTENT deep three: endGroup imbalance
+(compositionLocalsShouldBeAvailable), subcompose double-insert
+(moveContent_subcompose), infinite-recompose guard
+(removeAndInsertWithMoveAway).
+(5) NAME-CLASH remainder: testRemember_Forget_ForgetOnRemember — see
+the ext-receiver misbind evidence above.
+(6) COROUTINE-LIFECYCLE flakes: validatePotentialDeadlock +
+movableContentInvalidatedWhileDeleted_linkComposer ("daemon task
+abandoned at run boundary"), pausingTheFrameClock* (passes solo).
+
 Remaining CompositionTests (25) census: 4x plain "exception", 2x
 "Expected children but none found", 2x Expected<9>/actual<7>, 2x
 Expected<1>/actual<2>, singles: Vm::call_member `Varargs` on
