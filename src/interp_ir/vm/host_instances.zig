@@ -3173,6 +3173,37 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                         try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
                     } else {
+                        // A local class's delegated property: the delegate
+                        // expression was lowered as a `$init$` thunk at
+                        // registration; evaluate it and store the delegate
+                        // under the property name (the shape the getValue/
+                        // setValue read/write routes expect).
+                        const has_delegate = blk: {
+                            const g = cls.borrow();
+                            defer g.deinit();
+                            break :blk g.get().body_properties[prop_idx].delegate != null;
+                        };
+                        if (has_delegate) {
+                            const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{prop_name});
+                            defer allocator.free(init_name);
+                            const has_thunk = hblk: {
+                                const key = try anonKey(allocator, cls_name, init_name);
+                                defer allocator.free(key);
+                                const ag = self.anon_methods.borrow();
+                                defer ag.deinit();
+                                break :hblk ag.get().contains(key);
+                            };
+                            if (has_thunk) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, cls_args)) {
+                                    .ok => |rv| {
+                                        const g = inst.borrowMut();
+                                        try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), rv);
+                                        g.deinit();
+                                    },
+                                    .err => |e| return .{ .err = e },
+                                }
+                            }
+                        }
                         const skip = blk: {
                             const g = cls.borrow();
                             defer g.deinit();

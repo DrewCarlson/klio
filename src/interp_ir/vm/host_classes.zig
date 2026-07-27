@@ -711,6 +711,39 @@ fn lowerAndRegisterMethods(
                 // A complex initializer (`val items = mutableListOf<...>()`)
                 // lowers as a `$init$` thunk the construction pipeline runs;
                 // simple literals stay inline (`simpleLiteral`).
+                // A delegated property (`var left by Box(left)`) lowers its
+                // DELEGATE expression as the `$init$` thunk; construction
+                // stores the evaluated delegate under the property name and
+                // reads/writes route through getValue/setValue.
+                if (p.delegate) |dexpr| {
+                    // The delegate expression may read PLAIN constructor
+                    // params (`Node(value, left)` with `var left by
+                    // Box(left)`), so the thunk declares the primary params
+                    // and construction passes the ctor args.
+                    var thunk = host_instances.synthThunk(p.name, .{ .Expr = dexpr.* }, null, false);
+                    const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+                    for (class.primary_params, 0..) |*pp, pi| {
+                        tparams[pi] = .{
+                            .name = pp.name,
+                            .ty = pp.ty,
+                            .default = null,
+                            .is_vararg = false,
+                            .is_crossinline = false,
+                            .is_noinline = false,
+                            .annotations = &.{},
+                            .span = pp.name.span,
+                        };
+                    }
+                    thunk.params = tparams;
+                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+                    const fid = func.id;
+                    const caps = try allocator.dupe(NameValue, capture_pairs);
+                    const key = try std.fmt.allocPrint(allocator, "$init${s}", .{p.name.name});
+                    const tbl = self.anon_methods.borrowMut();
+                    defer tbl.deinit();
+                    try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
+                }
                 if (p.init) |init_expr| {
                     const thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, p.ty, false);
                     const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));

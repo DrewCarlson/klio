@@ -11894,6 +11894,25 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
             return r;
         }
     }
+    // Compose ABI completion on the explicit `.invoke()` route — same
+    // completion `callMember` applies (the two entries do not share a
+    // miss tail).
+    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke") and
+        host_call_func.composePluginEnabled())
+    {
+        if (compose.currentComposer()) |c| {
+            if (instanceInvokeWantsPair(self, receiver, args.len)) {
+                freeDispatchMiss(allocator, primary);
+                var ext: std.ArrayList(Value) = .empty;
+                defer ext.deinit(allocator);
+                try ext.ensureTotalCapacityPrecise(allocator, args.len + 2);
+                ext.appendSliceAssumeCapacity(args);
+                ext.appendAssumeCapacity(c);
+                ext.appendAssumeCapacity(.{ .Int = 0 });
+                return callMemberInnerStatic(self, allocator, receiver, name, ext.items, strict_ext, static_recv, no_ext, declared_recv);
+            }
+        }
+    }
     return primary;
 }
 

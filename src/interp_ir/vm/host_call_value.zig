@@ -801,7 +801,12 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().body_properties[prop_idx].name;
             };
-            const complex = blk: {
+            const is_delegate = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().body_properties[prop_idx].delegate != null;
+            };
+            const complex = is_delegate or blk: {
                 const g = cls.borrow();
                 defer g.deinit();
                 const init_field = g.get().body_properties[prop_idx].init orelse break :blk false;
@@ -818,11 +823,37 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 break :blk ag.get().contains(key);
             };
             if (!has) continue;
-            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+            // A delegated property's thunk declares the primary params so the
+            // delegate expression can read plain ctor params; pass the args,
+            // filling omitted trailing params from their literal defaults.
+            var eff_args: std.ArrayList(Value) = .empty;
+            defer eff_args.deinit(allocator);
+            if (is_delegate) {
+                const g = cls.borrow();
+                defer g.deinit();
+                const pps = g.get().primary_params;
+                for (pps, 0..) |*pp, ai| {
+                    if (ai < args.len) {
+                        try eff_args.append(allocator, args[ai]);
+                    } else {
+                        const dv: Value = if (pp.default) |e|
+                            (simpleLiteral(allocator, e.get()) orelse Value.Null)
+                        else
+                            Value.Null;
+                        try eff_args.append(allocator, dv);
+                    }
+                }
+            }
+            const thunk_args: []const Value = if (is_delegate) eff_args.items else &.{};
+            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, thunk_args)) {
                 .ok => |rv| {
                     const ig = inst.borrowMut();
                     defer ig.deinit();
-                    _ = ig.get().set(pname, rv);
+                    if (is_delegate) {
+                        try ig.get().define(allocator, pname, rv);
+                    } else {
+                        _ = ig.get().set(pname, rv);
+                    }
                 },
                 .err => |e| return .{ .err = e },
             }

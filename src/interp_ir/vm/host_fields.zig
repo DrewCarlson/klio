@@ -2452,6 +2452,38 @@ fn memberExtOwnerRead(self: *VmHost, allocator: Allocator, receiver: *const Valu
     }
 }
 
+/// Whether the instance's RUNTIME class chain declares `name` as a
+/// `by`-delegated body property. Local classes register at runtime and never
+/// reach the module registry's `delegated_body_props`, so the classdef chain
+/// is the authority for them.
+fn runtimeClassDelegatesProp(inst: anytype, name: []const u8) bool {
+    var cur: ?ObjRef(ClassDef) = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    var hops: u8 = 0;
+    while (cur) |c| : (hops += 1) {
+        if (hops > 16) {
+            c.deinit();
+            return false;
+        }
+        const g = c.borrow();
+        for (g.get().body_properties) |bp| {
+            if (bp.delegate != null and std.mem.eql(u8, bp.name, name)) {
+                g.deinit();
+                c.deinit();
+                return true;
+            }
+        }
+        const next: ?ObjRef(ClassDef) = if (g.get().parent) |p| p.clone() else null;
+        g.deinit();
+        c.deinit();
+        cur = next;
+    }
+    return false;
+}
+
 fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
@@ -2468,7 +2500,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         break :blk cg.get().fqn;
     };
     // Delegated body property: route through the delegate's `getValue`.
-    const delegate_owner: bool = blk: {
+    const delegate_owner: bool = runtimeClassDelegatesProp(inst, name) or blk: {
         // Almost every program declares zero `by`-delegated body properties;
         // skip the per-access supertype walk + scratch allocation entirely then.
         {
@@ -3236,7 +3268,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const class_name = className(inst);
         if (!bypass_setter) {
             // Delegated body property -> route through `setValue`.
-            const is_delegated: bool = blk: {
+            const is_delegated: bool = runtimeClassDelegatesProp(inst, real_name) or blk: {
                 var cur: ?[]const u8 = class_name;
                 var seen: std.ArrayList([]const u8) = .empty;
                 defer seen.deinit(allocator);
