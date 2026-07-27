@@ -367,6 +367,17 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 ov_names[j] = p.name.name;
                 if (p.is_vararg) has_vararg = true else if (p.default == null) n_required += 1;
             }
+            // A pass-threaded composable local fn carries a trailing
+            // ($composer, $changed) pair the CALL SITE never writes: the
+            // pair never counts toward the required arity, or a 3-arg call
+            // to `fun Composition(a, b, c)` judged inapplicable and the
+            // classifier arms constructed the pack's `interface Composition`.
+            if (f.params.len >= 2 and n_required >= 2 and
+                std.mem.eql(u8, f.params[f.params.len - 1].name.name, "$changed") and
+                std.mem.eql(u8, f.params[f.params.len - 2].name.name, "$composer"))
+            {
+                n_required -= 2;
+            }
             const ordinal = if (b.local_fn_overloads.getPtr(f.name.name)) |l| l.items.len else 0;
             // Module-lifetime: the mangled name ships inside the AstLambda
             // instruction's captured-name list, read at runtime.

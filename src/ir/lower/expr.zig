@@ -8291,6 +8291,11 @@ fn factorySigRejectsArgs(b: *FuncBuilder, sig: []const ir.TypeRef, args: []const
 fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
+    // A LOCAL fn of the name (declared in an enclosing body — a test's
+    // `@Composable fun Composition(a, b, c)`) is the nearest scope: it
+    // shadows any same-named classifier (the pack's `interface
+    // Composition`) for a bare call.
+    if (b.local_fn_overloads.getPtr(name) != null) return false;
     // Resolve the class the SAME way the construct path below does — through
     // the scope-aware index (file imports, then self package, then global) —
     // not the simple-name-global `classId`, which picks an arbitrary winner on

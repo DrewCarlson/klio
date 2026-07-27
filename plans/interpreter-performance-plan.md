@@ -855,6 +855,24 @@ removeAndInsertWithMoveAway (infinite recomposition guard trips).
 movableContentInvalidatedWhileDeleted_linkComposer passes in-suite but
 is slow/flaky solo ("daemon task abandoned at run boundary").
 
+OPEN LEAD — local-fn vs pack-interface name clash
+(testRemember_Forget_ForgetOnRemember, "Cannot create an instance of an
+interface: Composition"): a fn-LOCAL `@Composable fun Composition(a, b,
+c)` called from a RUNTIME-LOWERED nested lambda (`compose { Composition(
+a=..., ...) }` inside compositionTest) loses to the pack's `interface
+Composition`. Landed toward it: (1) local_fn_overloads shadow rule in
+shadowedByClass; (2) LocalFnOverload n_required is pair-trimmed so the
+3-arg call is applicable; (3) the eval by-id serve skips a
+NON-CONSTRUCTIBLE committed class (interface/abstract, non-SAM call) —
+the serve arm moved from global_id to global. STILL FAILING: the
+runtime-lowered inner lambda's CMG name lookup returns the interface's
+CLASS VALUE — the local fn's plain-name cell is not reachable through
+the scoped-global chain at that point (either never captured at runtime
+lowering or shadowed by the class publish). Next: instrument
+lookupGlobalThrowing's scoped walk for the name at that arm, and check
+whether the runtime-lowered lambda's capture set includes the plain
+local-fn slot (`isLowerAnonCapture` at its lowering).
+
 Remaining CompositionTests (25) census: 4x plain "exception", 2x
 "Expected children but none found", 2x Expected<9>/actual<7>, 2x
 Expected<1>/actual<2>, singles: Vm::call_member `Varargs` on

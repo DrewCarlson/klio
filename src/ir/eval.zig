@@ -7041,9 +7041,27 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // returns for a class-value read); otherwise, once the companion has
             // been published (e.g. a prior `Foo.member` access), `Foo(args)`
             // resolves to `Companion.invoke` instead of constructing.
-            const by_id: ?Value = if ((cmg.class != null or by_id_func != null) and
+            // A committed class that cannot CONSTRUCT (an interface/abstract
+            // classifier sharing the name with a callable — the pack's
+            // `interface Composition` vs a local `@Composable fun
+            // Composition`) never wins the by-id serve for a non-SAM call;
+            // the lexical name lookup and the overload leg resolve the real
+            // callable instead.
+            const ctor_class: ?ir.ClassId = blk: {
+                const cid = cmg.class orelse break :blk null;
+                if (cid.int() < frame.module.classes.items.len) {
+                    const cls = &frame.module.classes.items[cid.int()];
+                    if ((cls.is_interface or cls.is_abstract) and
+                        !(arg_values.len == 1 and valueInvocable(frame.module, arg_values[0])))
+                    {
+                        break :blk null;
+                    }
+                }
+                break :blk cid;
+            };
+            const by_id: ?Value = if ((ctor_class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, cmg.class, is_ctor_name)
+                host.lookupGlobalById(allocator, by_id_func, ctor_class, is_ctor_name)
             else
                 null;
             // A bounded candidate set is authoritative. Once lowering has
