@@ -263,13 +263,22 @@ fn narrowSubjectForBranch(
     branch: *const ast.WhenBranch,
 ) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
     const subj = subject orelse return null;
-    if (subj.* != .Path or subj.Path.segments.len != 1) return null;
+    // `when (this)` smart-casts the implicit receiver: the branch body's
+    // member/extension calls on `this` resolve against the narrowed type
+    // (argDeclTypeRefLazy consults `localDeclTypeRef("this")` first), so
+    // `is List -> this.single()` selects `List.single` instead of
+    // recursing into the enclosing `Iterable.single`.
+    const bind_name: []const u8 = blk: {
+        if (subj.* == .This and subj.This.qualifier == null) break :blk "this";
+        if (subj.* == .Path and subj.Path.segments.len == 1) break :blk subj.Path.segments[0].name;
+        return null;
+    };
     if (branch.patterns.len != 1) return null;
     const p = &branch.patterns[0];
     if (p.kind != .IsType) return null;
     const head = expr_lower.loweredCheckTypeName(b, &p.kind.IsType);
     if (head.len == 0) return null;
-    return try b.narrowLocal(subj.Path.segments[0].name, head);
+    return try b.narrowLocal(bind_name, head);
 }
 
 /// Lower one `when` pattern of a subject-bound branch into a Boolean

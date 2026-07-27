@@ -496,27 +496,25 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   instance; they now use `iterableItemsCtx`, which drains any receiver
   exposing `iterator()` through the host.
 
-Diagnosed, open (groundwork landed):
+- **Smart-cast `this` in extension bodies — FIXED (4 tests).** The
+  committing channel turned out to already exist: `argDeclTypeRefLazy`'s
+  `.This` case consults `localDeclTypeRef("this")` — the when-branch
+  narrowing just never bound `this` (it required a Path subject).
+  `narrowSubjectForBranch` now binds `"this"` for a `when (this)` subject,
+  so `is List -> this.single()` resolves `List.single` and the
+  Iterable.single self-recursion is gone. The parallel `this_narrow`
+  channel stays for the bare-call hint head and `inferReceiverType`.
+- **Vararg ctor-property type heads — FIXED (4 tests: SetOperationsTest
+  identity-set family).** `vararg val elements: T` recorded its element
+  bound (`Any`) as the property's declared head, so `elements.any { }`
+  declined the inline Array extension at lowering and missed at runtime
+  ("Vm::call_member `any` on kotlin.Array"). The registry now records the
+  materialized array head (primitive-specialized when the element is
+  primitive), mirroring the body-side vararg param rule.
 
-- **Smart-cast `this` in extension bodies (4 tests: ListTest/ArrayListTest
-  first/single, Stack overflow).** `Iterable<T>.single()`'s
-  `when (this) { is List -> return this.single() }` is committed at
-  LOWERING as a direct self-call — the overload pick ignores the smart
-  cast and selects the enclosing Iterable extension by declared-receiver
-  match, recursing forever. Groundwork landed: `FuncBuilder.this_narrow`
-  (set/restored by `when (this) { is T -> }` branch lowering, cleared on
-  splice entry, recorded on inline-lambda frames) feeds
-  `bareStaticRecvHead`, `inferReceiverType`, and the bare-call resolver
-  config. The remaining gap: the committing pick for `this.single()`
-  reaches its receiver evidence through a path that does not consult
-  `this_narrow` yet — find the direct-Call commit site for member-on-this
-  calls (the emit has no OR_AUDIT hook; `[RESOLVE] call_func` at runtime
-  confirms fid self-commit) and thread the narrow into its pick.
-
-Remaining clusters (untouched): MapTest.minus family
-(UnsupportedOperationException, 4), SetOperationsTest `any` on Array via
-identity-set (4), ResultTest (now past `throwOnFailure`, assertion-level,
-4), Random nextUBytes (4), comparisons ABRT crash (1),
-StringTest.indexOfStringIgnoreCase (1), CollectionTest.sortedByNullable
-Comparator invoke (1), GroupingTest iterator on anon (1),
-InstantIsoStrings `length` (2).
+Remaining clusters (18 failures): MapTest.minus family
+(UnsupportedOperationException, 4 — passes standalone, context-dependent),
+ResultTest (past `throwOnFailure`, assertion-level, 4), Random nextUBytes
+(4), comparisons ABRT crash (1), StringTest.indexOfStringIgnoreCase (1),
+CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
+iterator on anon (1), InstantIsoStrings `length` (2).
