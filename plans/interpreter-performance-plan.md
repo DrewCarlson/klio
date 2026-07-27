@@ -673,7 +673,16 @@ per-class clusters tracked in the resolution plan.
   the `$composer` slot — including a mis-bound composition — and
   accepts the one-arg-short shape (`args.len == params.len - 1`), so a
   single positional misbind upstream silently becomes the ambient
-  composer. Next: instrument the sub-composition content's closure
-  invocation (log arg0's runtime class at `ComposableLambdaImpl.invoke`
-  and at the content closure's frame entry) to find which call binds
-  the composition into the pair slot.
+  composer. PINNED (KLIO_COMPOSER_BIND_TRACE, now a permanent gated
+  diagnostic): exactly one publish binds `class=CompositionImpl` on a
+  2-param (pair-only) closure — the
+  `Composition(...).apply { setContent { block() } }` RECEIVER lambda
+  carries pass-threaded ($composer, $changed) params it should not
+  have (it is not composable), and the receiver-lambda invocation binds
+  the `apply` subject (the Composition) into the `$composer` slot; the
+  wrong value then threads down into `block()`'s pair. Next: either the
+  pass must not thread the pair onto a non-composable receiver lambda
+  (find why `{ setContent { block() } }` got pair params), or the
+  receiver-lambda invoke must not let the subject land in a
+  `$composer`-named param slot. Also harden `threadedComposerArg` to
+  require a Composer-typed instance once the misbind is fixed.

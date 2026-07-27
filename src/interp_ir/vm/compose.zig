@@ -99,6 +99,13 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     if (!std.mem.eql(u8, params[params.len - 1].name, "$changed")) return null;
     const composer = args[args.len - 2];
     if (composer != .Instance) return null;
+    if (runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
+        const ig = composer.Instance.borrow();
+        const cg = ig.get().class.borrow();
+        std.debug.print("[composer-bind] class={s} args={d} params={d}\n", .{ cg.get().name, args.len, params.len });
+        cg.deinit();
+        ig.deinit();
+    }
     return composer;
 }
 
