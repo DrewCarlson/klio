@@ -4811,6 +4811,47 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // A qualified member-inline call whose lambda (literal or forwarded)
+    // carries a labeled return TARGETING AN OPEN INLINE SPLICE must splice:
+    // kotlinc inlines these, and the label targets a frameless spliced
+    // scope in the caller, so the dynamic member dispatch can never deliver
+    // the return (`slots.table.traverseGroupAndParents(target) {
+    // … return@apply … }` otherwise unwinds a LabeledReturn past every
+    // frame). Everything else keeps the dynamic path.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        inline_call.argLambdaTargetsSplicedLabel(b, args))
+    {
+        const mname = callee.Member.name.name;
+        const receiver = callee.Member.receiver;
+        const expected = b.peekExpected();
+        const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+        if (inline_state.candidatesForName(mname)) |cands| {
+            // STRICT owner evidence only: the receiver's static type must be
+            // known and carry the candidate's owner in its hierarchy. The
+            // lenient unknown-receiver keep would splice an unrelated
+            // same-named member (`values.forEach` on a Set binding
+            // LockFreeLinkedListNode.forEach).
+            const head = try inline_call.gateReceiverHead(b, receiver);
+            if (head != null) {
+                for (cands) |cf| {
+                    if (cf.receiver_type != null) continue;
+                    const owner = inline_state.inlineMemberOwner(cf) orelse continue;
+                    // A duplicated class name is uniquified per file at
+                    // registration (`SlotTable$f356`); the inferred head
+                    // carries the source-level name, so also accept a
+                    // base-name match.
+                    const owner_base = if (std.mem.indexOf(u8, owner, "$f")) |i| owner[0..i] else owner;
+                    if (!classIsOrExtendsHosted(b, head.?, owner) and
+                        !std.mem.eql(u8, head.?, owner_base)) continue;
+                    if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+                        return r;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     // `recv?.m(args)` — null-guard the whole call.
     if (callee.* == .Member and callee.Member.safe) {
         const receiver = callee.Member.receiver;

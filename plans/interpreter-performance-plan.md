@@ -843,7 +843,40 @@ BroadcastFrameClockTest 4/4. Remaining clusters:
 - CompositionLocalTests 31/31 GREEN (testProvideAllLocals fixed via
   the two binder mechanisms above)
 
-MovableContentTests failure modes (28 total): 7× "Expected a Text,
+MovableContentTests 16/44 -> 26/44 via four stacked mechanisms (the
+receiver-variant family plus part of the LabeledReturn family):
+(1) runtime pair completion at the member-invoke surface: a composable
+lambda wrapper invoked as a plain value (`receiver.content()`) reaches
+`callMember("invoke", ...)` without the ($composer, $changed) pair; on
+the dispatch miss, when the receiver class declares an invoke overload
+at nargs+2 whose tail is (Composer, Int), the pair completes from the
+ambient composer and the call retries (`instanceInvokeWantsPair`).
+(2) receiver inference for pass-wrapped blocks in `callValue`: the
+compose pass moves a literal into `composableLambdaInstance(...)`, so
+the closure loses its declared receiver shape; a pair-tailed closure
+with a `this` capture invoked with one extra leading arg binds that arg
+as the receiver instead of padding it into `$composer`.
+(3) qualified member-inline calls whose lambda (literal or FORWARDED)
+carries a `return@LABEL` targeting an OPEN INLINE SPLICE now splice
+(`argLambdaTargetsSplicedLabel` + strict owner-on-chain narrowing via
+`gateReceiverHead`): the label targets a frameless spliced scope, so
+the dynamic unwind could never deliver it (`IntStack().apply {
+slots.table.traverseGroupAndParents(target) { return@apply } }`).
+Member splices now set the OWNER class as splice receiver/hint so the
+body's bare property reads (`addressSpace`) resolve.
+(4) forwarded-lambda provenance: a splice whose substituted lambdas are
+all FORWARDED inherits the outer frame's caller scope depth and
+bare-call hint — the literal is caller-of-caller code, and resolving
+its free names at the inner callsite lost the original receiver
+context (`push` fell to an unresolved global).
+An early broad version of (3) (splicing on any nonlocal return or any
+forwarded lambda, with lenient unknown-receiver owner matching)
+regressed MovableContentTests 16->4 by splicing unrelated same-named
+members (`values.forEach` binding LockFreeLinkedListNode.forEach) and
+broke Duration.parse; the strict spliced-label + known-owner gate holds
+the wins with no regressions (sweep 0, all probes green).
+
+Original MovableContentTests failure modes (28 total): 7× "Expected a Text,
 but none found"; 6× LabeledReturn (the old recorded cluster — an eval
 LabeledReturn escaping); 4× "Vm::call_member `invoke` on
 ComposableLambdaImpl" (the movableContentReceiver_{None,One,Two,Three}

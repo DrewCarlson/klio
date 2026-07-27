@@ -3398,6 +3398,37 @@ fn dispatchWithReceiver(self: *VmHost, allocator: Allocator, fqn: []const u8, fu
 // `callMember` — the central dispatch.
 // -------------------------------------------------------------------------
 
+fn instanceInvokeWantsPair(self: *VmHost, receiver: *const Value, nargs: usize) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const recv_fqn = blk: {
+        const ig = receiver.Instance.borrow();
+        defer ig.deinit();
+        const cg = ig.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const cid = mod.classIdByFqn(recv_fqn) orelse return false;
+    const irc = &mod.classes.items[cid.int()];
+    var paired = false;
+    for (irc.methods) |fid| {
+        const f = funcAt(mod, fid) orelse continue;
+        if (!std.mem.eql(u8, f.name, "invoke")) continue;
+        const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        const n = f.params.len - @intFromBool(has_this);
+        // The wrapper's overloads are real source (`invoke(p1, c: Composer,
+        // changed: Int)`), so the pair is recognized by shape: a
+        // Composer-typed slot followed by the changed flags. Reaching this
+        // helper at all means the plain dispatch missed, so a same-arity
+        // sibling needs no exclusion — nothing bound.
+        if (n == nargs + 2 and
+            std.mem.endsWith(u8, f.params[f.params.len - 2].ty.name, "Composer") and
+            std.mem.eql(u8, f.params[f.params.len - 1].ty.name, "Int")) paired = true;
+    }
+    return paired;
+}
+
 pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
     const r = try callMemberInner(self, allocator, receiver, name, args, false);
     // A raw callable value asked for a member nothing serves: the value
@@ -3437,6 +3468,30 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             return host_call_value.callValueWithThis(self, allocator, receiver, &e.v, args, &.{});
         }
         return host_call_value.callValue(self, allocator, receiver, args);
+    }
+    // Compose ABI completion at the callable-instance surface: a composable
+    // lambda wrapper invoked as a plain value (`receiver.content()`) arrives
+    // WITHOUT the pass-appended ($composer, $changed) pair — the pass leaves
+    // unclassified value invocations unthreaded and relies on the runtime to
+    // complete the pair. The closure route completes it already; this is the
+    // same completion for a wrapper CLASS whose only matching `invoke`
+    // overload carries the trailing pair.
+    if (r == .err and r.err == .Unimplemented and receiver.* == .Instance and
+        std.mem.eql(u8, name, "invoke") and host_call_func.composePluginEnabled())
+    {
+        if (missTraceWant(name)) std.debug.print("[inv-pair] reach recv={s} nargs={d} composer={} wants={}\n", .{ receiver.typeFqn(), args.len, compose.currentComposer() != null, instanceInvokeWantsPair(self, receiver, args.len) });
+        if (compose.currentComposer()) |c| {
+            if (instanceInvokeWantsPair(self, receiver, args.len)) {
+                freeDispatchMiss(allocator, r);
+                var ext: std.ArrayList(Value) = .empty;
+                defer ext.deinit(allocator);
+                try ext.ensureTotalCapacityPrecise(allocator, args.len + 2);
+                ext.appendSliceAssumeCapacity(args);
+                ext.appendAssumeCapacity(c);
+                ext.appendAssumeCapacity(.{ .Int = 0 });
+                return callMemberInner(self, allocator, receiver, name, ext.items, false);
+            }
+        }
     }
     return r;
 }

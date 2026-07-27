@@ -463,6 +463,14 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
             const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
             return .{ .err = .{ .Type = msg } };
         };
+        // A receiver lambda invoked as a plain value with one extra leading
+        // arg is the compiler ABI's flattened form: the receiver rides as the
+        // first positional (`ComposableLambdaImpl.invoke(p1, c, changed)`
+        // feeding an `R.()` block). Bind it as the receiver; padding it into
+        // the positional params would misfeed a pass-appended pair.
+        if (info.receiver_shape_known and info.has_receiver and args.len == info.n_params + 1) {
+            return invokeCallableWithThis(self, callable, args[1..], &args[0], out);
+        }
         const module_g = self.module.borrow();
         defer module_g.deinit();
         const module = info.module orelse module_g.get();

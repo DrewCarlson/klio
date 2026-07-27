@@ -130,12 +130,60 @@ pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocato
     }
 }
 
+/// Receiver-head inference for the qualified member-inline splice gate:
+/// `inferReceiverType` extended with the shapes that gate needs — a
+/// constructor-call initializer (`val w = Walker()`), a member property
+/// read (`slots.table`), and a splice-receiver member — WITHOUT changing
+/// the shared inference every other inline pick consults.
+pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.Error!?[]const u8 {
+    if (try inferReceiverType(b, receiver)) |h| return h;
+    switch (receiver.*) {
+        .Path => |p| {
+            if (p.segments.len != 1) return null;
+            const name = p.segments[0].name;
+            if (b.localInitExpr(name)) |e| {
+                if (ctorClassName(b, e)) |cn| return cn;
+            }
+            if (b.lambda_splice_resolve == null) {
+                if (b.spliceRecvTy()) |srt| {
+                    if (classMemberDeclType(b, srt, name)) |t| return t;
+                }
+            }
+            return null;
+        },
+        .Member => |m| {
+            if (m.safe) return null;
+            const base = (try gateReceiverHead(b, m.receiver)) orelse return null;
+            return classMemberDeclType(b, base, m.name.name);
+        },
+        .Call => |call| return ctorClassName(b, receiver) orelse blk: {
+            _ = call;
+            break :blk null;
+        },
+        else => return null,
+    }
+}
+
+fn ctorClassName(b: *const FuncBuilder, e: *const Expr) ?[]const u8 {
+    if (e.* != .Call) return null;
+    const callee = e.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const name = callee.Path.segments[0].name;
+    if (b.module.classId(name) != null) return name;
+    return null;
+}
+
 /// The declared type head of member `name` on the enclosing class, searching
 /// the class and then its transitive supertypes: a primary-constructor `val`
 /// (`class Node(val modifierNode: Modifier.Node)`) or a body property. Null
 /// when no enclosing class declares the name.
 fn ownerMemberDeclType(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
     const owner = b.ownerClass() orelse return null;
+    return classMemberDeclType(b, owner, name);
+}
+
+/// As `ownerMemberDeclType`, from an explicit starting class.
+fn classMemberDeclType(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     var seen: [16][]const u8 = undefined;
     var n_seen: usize = 0;
     var queue: [16][]const u8 = undefined;
@@ -213,6 +261,83 @@ pub fn argsForwardInlineLambda(b: *const FuncBuilder, args: []const Expr) bool {
         if (forwardedInlineLambda(b, arg) != null) return true;
     }
     return false;
+}
+
+/// Whether any argument lambda contains a `return@LABEL` whose label is an
+/// inline splice currently open in this builder — a FRAMELESS scope the
+/// dynamic unwind can never find. Such a call must splice (kotlinc inlines
+/// it); a labeled return targeting a real frame unwinds fine dynamically.
+pub fn argLambdaTargetsSplicedLabel(b: *const FuncBuilder, args: []const Expr) bool {
+    if (b.inline_lambda_ret.items.len == 0) return false;
+    for (args) |*a| {
+        const lam: *const Expr = if (a.* == .Lambda) a else forwardedInlineLambda(b, a) orelse continue;
+        if (lam.* != .Lambda) continue;
+        for (b.inline_lambda_ret.items) |ret| {
+            if (labelScanStmts(lam.Lambda.body.stmts, ret.label)) return true;
+        }
+    }
+    return false;
+}
+
+fn labelScanStmts(stmts: []const Stmt, label: []const u8) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| labelScan(e, label),
+            .Assign => |asg| labelScan(&asg.target, label) or labelScan(&asg.value, label),
+            .DestructuringDecl => |d| labelScan(&d.init, label),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| if (pr.init) |*init| labelScan(init, label) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+fn labelScanArgs(args: []const Expr, label: []const u8) bool {
+    for (args) |*a| {
+        if (labelScan(a, label)) return true;
+    }
+    return false;
+}
+
+fn labelScan(e: *const Expr, label: []const u8) bool {
+    return switch (e.*) {
+        .Return => |r| if (r.label) |l| std.mem.eql(u8, l.name, label) else false,
+        .Lambda, .AnonFun, .ObjectExpr => false,
+        .Member => |m| labelScan(m.receiver, label),
+        .Unary => |u| labelScan(u.expr, label),
+        .Postfix => |po| labelScan(po.expr, label),
+        .Spread => |sp| labelScan(sp.expr, label),
+        .Throw => |t| labelScan(t.value, label),
+        .Labeled => |l| labelScan(l.expr, label),
+        .As => |a| labelScan(a.expr, label),
+        .IsCheck => |c| labelScan(c.expr, label),
+        .MemberRef => |r| labelScan(r.receiver, label),
+        .Call => |c| labelScan(c.callee, label) or labelScanArgs(c.args, label),
+        .Index => |i| labelScan(i.receiver, label) or labelScanArgs(i.args, label),
+        .Binary => |bin| labelScan(bin.lhs, label) or labelScan(bin.rhs, label),
+        .If => |i| labelScan(i.cond, label) or labelScan(i.then_branch, label) or
+            (if (i.else_branch) |eb| labelScan(eb, label) else false),
+        .While => |w| labelScan(w.cond, label) or labelScan(w.body, label),
+        .DoWhile => |dw| (if (dw.body) |body| labelScan(body, label) else false) or labelScan(dw.cond, label),
+        .For => |f| labelScan(f.iter, label) or labelScan(f.body, label),
+        .Block => |blk| labelScanStmts(blk.stmts, label),
+        .When => |w| (if (w.subject) |sub| labelScan(sub, label) else false) or blk: {
+            for (w.branches) |*br| {
+                if (labelScan(&br.body, label)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Try => |t| labelScanStmts(t.body.stmts, label) or blk: {
+            for (t.catches) |*c| {
+                if (labelScanStmts(c.body.stmts, label)) break :blk true;
+            }
+            break :blk (if (t.finally) |fb| labelScanStmts(fb.stmts, label) else false);
+        },
+        else => false,
+    };
 }
 
 fn scanStmts(stmts: []const Stmt) bool {
@@ -1154,7 +1279,15 @@ pub fn tryInlineCallWithTypeArgs(
     // (`collect { }` inside a flow operator body) keep resolving through
     // the runtime receiver walk instead of pinning to the innermost this.
     const prev_splice_recv = b.spliceRecvTy();
-    if (f.receiver_type) |rt| b.setSpliceRecvTy(rt.name.name);
+    if (f.receiver_type) |rt| {
+        b.setSpliceRecvTy(rt.name.name);
+    } else if (member_splice) {
+        // A member-inline splice's bare names resolve against the OWNER
+        // class exactly as an extension's resolve against its receiver
+        // (`inner.walkInner(...)` inside a spliced `Walker.walk` reads
+        // Walker's `inner` property).
+        if (inline_state.inlineMemberOwner(f)) |ow| b.setSpliceRecvTy(ow);
+    }
     defer b.setSpliceRecvTy(prev_splice_recv);
     // Bare-call hygiene for the spliced body: its bare calls resolve
     // against the inline fn's own receiver (none for a receiver-less
@@ -1163,7 +1296,7 @@ pub fn tryInlineCallWithTypeArgs(
     // lambda restores it.
     const prev_hint_active = b.spliceHintActive();
     const prev_hint_recv = b.spliceHintRecv();
-    b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else null);
+    b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else if (member_splice) inline_state.inlineMemberOwner(f) else null);
     defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
     // The spliced body has its own receiver context: the caller's
     // smart-cast narrow of `this` must not leak into it.
@@ -1172,7 +1305,7 @@ pub fn tryInlineCallWithTypeArgs(
     // Scope depth before the inline fn binds its parameters: a lambda
     // argument spliced from this call resolves its free names in these
     // caller scopes, not against the inline fn's parameter scope.
-    const caller_scope_depth = b.scopeDepth();
+    var caller_scope_depth = b.scopeDepth();
     try b.pushScope();
     // Precise captured-`var` carrier across the inline splice. The inline
     // body is lowered into THIS (the caller's) builder, so its own `var`
@@ -1209,6 +1342,8 @@ pub fn tryInlineCallWithTypeArgs(
     var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
     const arg_regs = try b.allocator.alloc(Reg, f.params.len);
     defer b.allocator.free(arg_regs);
+    var any_forwarded_lambda = false;
+    var any_literal_lambda = false;
     for (f.params, 0..) |*p, i| {
         const a = if (p.is_vararg) vararg_value.? else ordered[i].?;
         const forwarded_lambda = forwardedInlineLambda(b, a);
@@ -1281,8 +1416,12 @@ pub fn tryInlineCallWithTypeArgs(
         // diagnostic for the violation; the runtime semantics still
         // match Kotlin.
         if (!p.is_noinline) {
-            if (forwarded_lambda orelse (if (a.* == .Lambda) a else null)) |lam| {
+            if (forwarded_lambda) |lam| {
                 try lambda_map.put(p.name.name, lam);
+                any_forwarded_lambda = true;
+            } else if (a.* == .Lambda) {
+                try lambda_map.put(p.name.name, a);
+                any_literal_lambda = true;
             }
         }
     }
@@ -1335,7 +1474,22 @@ pub fn tryInlineCallWithTypeArgs(
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }
-    try b.pushInlineLambdaFrameHinted(lambda_map, caller_scope_depth, prev_hint_active, prev_hint_recv, prev_this_narrow);
+    // A FORWARDED inline lambda is caller-of-caller code: its free names,
+    // bare-call hints, and receiver context belong to the frame it was
+    // forwarded FROM, not this call site. When every substituted lambda is
+    // forwarded, inherit the outer frame's provenance wholesale.
+    var frame_hint_active = prev_hint_active;
+    var frame_hint_recv = prev_hint_recv;
+    var frame_this_narrow = prev_this_narrow;
+    if (any_forwarded_lambda and !any_literal_lambda) {
+        if (b.inlineLambdaCallerDepth()) |d| caller_scope_depth = d;
+        if (b.inlineLambdaCallerHint()) |h| {
+            frame_hint_active = h.active;
+            frame_hint_recv = h.recv;
+            frame_this_narrow = h.this_narrow;
+        }
+    }
+    try b.pushInlineLambdaFrameHinted(lambda_map, caller_scope_depth, frame_hint_active, frame_hint_recv, frame_this_narrow);
     // An inline extension splice's body resolves names against the inline
     // function's own parameter/receiver scopes, not the caller lambda's free
     // names. When this splice is itself nested inside a spliced
