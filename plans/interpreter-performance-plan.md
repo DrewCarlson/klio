@@ -717,8 +717,31 @@ per-class clusters tracked in the resolution plan.
   `changes.execute(...)`. Next: determine whether klio's
   `ChangeList.execute` clears the list (isEmpty must flip true) or
   what appends to the MAIN list between its apply and the recompose —
-  instrument the size of the composer's `changes` at the recompose
-  check and at applyChanges exit (a gated print in the interpreted
-  runtime via a temporary edit, or a value-identity probe). The
-  "Expected changes but none were found" assertion is DOWNSTREAM of
-  this aborted recompose.
+  DONE via temporary pack instrumentation (edit the upstream
+  runtime source, `pack build kotlin-klio/klio-compose-runtime-engine`
+  + install into /tmp/klio_itest_compose_plugin_home + rm its
+  .klio/cache — the itest home's pack, NOT the live sources, serves
+  the runtime). Findings, in order:
+  - Sequence (composer identities): main(647) recompose+apply clean →
+    sub(863) recompose+apply clean → main(647) recompose trips on ONE
+    stale operation.
+  - The stale op: `AppendValue(anchor location=-1,
+    value=ComposableLambdaImpl)` — recorded by GapComposer.updateValue's
+    slow path (GapComposer.kt:1011, `changeListWriter.appendValue(
+    reader.anchor(reader.parent), value)`), i.e. MAIN-composer code ran
+    and recorded into MAIN's list DURING the sub-composition's cycle,
+    after main's apply.
+  - Each CompositionImpl owns its list (ctor-verified); the cross-write
+    is a main-composer method executing in the sub window — candidates:
+    the shared ComposableLambdaImpl (created/remembered in MAIN via
+    rememberComposableLambda, invoked by SUB) whose invoke-side
+    `c.changed(this)`/updateValue targeted the WRONG composer, or a
+    scope re-invocation carrying the main composer.
+  Next: instrument `updateValue`'s slow path to print
+  `this.hashCode()` + the current ambient composer + the value's class
+  at record time during the sub cycle, and identify the interpreted
+  call path that routes a sub-cycle update through the main composer
+  (suspect: `wrapper.invoke(c, changed)`'s `c.changed(this)` reaching a
+  CAPTURED main-`\$composer` through a stale binding rather than the
+  passed `c`). Note the pack in the itest home now carries this
+  session's lowering (rebuilt); baseline held at 27/31.
