@@ -6601,12 +6601,16 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // value's type, which may be a subtype carrying its own
         // same-name extension. Hand the declared head to the strict
         // probe for exactly that candidate.
+        var static_from_instr = false;
         const static_recv_ty: ?[]const u8 = blk: {
             // The lowering-recorded declared receiver wins: the executing
             // frame may be a synthesized closure (a suspend body) whose own
             // kind says nothing about the extension receiver.
             if (cmg.static_recv) |sc| {
-                if (constStr(frame.module, sc)) |sname| break :blk sname;
+                if (constStr(frame.module, sc)) |sname| {
+                    static_from_instr = true;
+                    break :blk sname;
+                }
             }
             // Extension bodies resolve a bare call against the extension's
             // DECLARED receiver type.
@@ -6692,8 +6696,14 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
             // The lowering-recorded receiver type describes the innermost
             // implicit receiver — the first candidate — regardless of the
-            // wrapper identity a suspend transform gave the value.
-            const hint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
+            // wrapper identity a suspend transform gave the value. A
+            // FRAME-derived hint (the enclosing extension's declared
+            // receiver) describes only the frame's own `this`: applying it
+            // to an inner receiver-lambda subject (`apply { minusAssign(k) }`
+            // inside `Map.minus`) refutes the very candidates the subject
+            // satisfies.
+            const hint: ?[]const u8 = if (static_recv_ty != null and
+                (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
                 static_recv_ty
             else
                 null;
@@ -6778,7 +6788,8 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // strictly, so an unprovable pick never outranks a real member.
         if (resolved == null) {
             for (cands, 0..) |c, ci| {
-                const lhint: ?[]const u8 = if (static_recv_ty != null and (ci == 0 or sameReceiver(c.v, this_val)))
+                const lhint: ?[]const u8 = if (static_recv_ty != null and
+                    (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
                     static_recv_ty
                 else
                     null;

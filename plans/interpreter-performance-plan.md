@@ -530,8 +530,21 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   (chain-seed or `this` capture), not fall back to the class receiver
   walk.
 
-Remaining clusters: MapTest.minus family (UnsupportedOperationException,
-4 — passes standalone, context-dependent), ResultTest (past
+- **Frame-derived receiver hints in the bare-dispatch walk — FIXED
+  (4 tests: MapTest.minus family).** Inside a receiver lambda spliced
+  into an extension body (`apply { minusAssign(key) }` in `Map.minus`),
+  the runtime derived the bare call's static hint from the EXECUTING
+  frame's declared receiver (`Map`) and applied it to the innermost
+  candidate — the lambda's subject — refuting every `MutableMap`
+  candidate the subject satisfies; the fallback then ran the intrinsic
+  against the immutable original and threw. The frame-derived hint now
+  applies only to the frame's own `this`; an instruction-recorded hint
+  keeps describing the innermost candidate. The splice also now hints a
+  receiver-lambda body's bare calls with the LAMBDA's declared receiver
+  head (none when it names a type parameter), and vararg-property /
+  default-scope groundwork rides along.
+
+Remaining clusters: ResultTest (past
 `throwOnFailure`, assertion-level, 4), Random nextUBytes (4), thenBy
 receiver above (2), StringTest.indexOfStringIgnoreCase (1),
 CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest

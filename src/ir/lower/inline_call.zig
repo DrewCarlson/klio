@@ -359,8 +359,15 @@ pub fn spliceInlineLambda(
     // body's own receiver hint.
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
-    if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
-    const lam_prev_narrow = b.setThisNarrow(if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
+    if (receiver != null) {
+        // Receiver lambda (`apply { minusAssign(key) }`): the innermost
+        // implicit receiver inside the body is the lambda's SUBJECT, so
+        // bare calls hint its declared head (none when generic) — never
+        // the enclosing fn's receiver, which would refute candidates the
+        // subject satisfies.
+        b.setSpliceHint(true, b.receiverLambdaRecvHead(lambda_name));
+    } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
+    const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     const v = try lowerBlock(b, &body);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
@@ -1280,6 +1287,16 @@ pub fn tryInlineCallWithTypeArgs(
         const has_recv = if (p.ty.function) |ft| ft.receiver != null else false;
         if (has_recv and !b.isReceiverLambdaParam(p.name.name)) {
             try b.markReceiverLambdaParam(p.name.name);
+            // Record the declared receiver head so a spliced lambda body's
+            // bare calls hint the LAMBDA's receiver (the innermost implicit
+            // receiver), not the enclosing fn's; a type-parameter head is
+            // statically unresolvable and records no hint.
+            const rhead = p.ty.function.?.receiver.?.name.name;
+            var head_is_tp = false;
+            for (f.type_params) |tp| {
+                if (std.mem.eql(u8, tp.name.name, rhead)) head_is_tp = true;
+            }
+            try b.setReceiverLambdaRecvHead(p.name.name, if (head_is_tp) null else rhead);
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }

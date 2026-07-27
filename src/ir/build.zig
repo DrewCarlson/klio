@@ -548,6 +548,7 @@ pub const FuncBuilder = struct {
     /// must dispatch with the enclosing `this` as the implicit
     /// receiver.
     receiver_lambda_params: StringSet,
+    receiver_lambda_recv_heads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     receiver_lambda_arity: std.StringHashMap(usize),
     context_fn_params: std.StringHashMap(ContextFnShape),
     /// Params (and locals) whose declared type is an unconstrained
@@ -872,6 +873,7 @@ pub const FuncBuilder = struct {
         self.local_ext_fns.deinit();
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
+        self.receiver_lambda_recv_heads.deinit(self.allocator);
         self.receiver_lambda_arity.deinit();
         self.context_fn_params.deinit();
         self.generic_typed_params.deinit();
@@ -1805,6 +1807,14 @@ pub const FuncBuilder = struct {
     }
     pub fn markReceiverLambdaParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.receiver_lambda_params.put(name, {});
+    }
+    /// Declared receiver head of a receiver-lambda param, for splice
+    /// bare-call hints; null when it names an unresolvable type parameter.
+    pub fn setReceiverLambdaRecvHead(self: *FuncBuilder, name: []const u8, head: ?[]const u8) Allocator.Error!void {
+        try self.receiver_lambda_recv_heads.put(self.allocator, name, head);
+    }
+    pub fn receiverLambdaRecvHead(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
+        return self.receiver_lambda_recv_heads.get(name) orelse null;
     }
     /// The declared NON-receiver arity of a receiver-lambda param
     /// (`f: T.(A) -> R` has arity 1). Disambiguates a call `f(x)`:
