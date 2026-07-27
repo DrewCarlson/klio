@@ -673,16 +673,21 @@ per-class clusters tracked in the resolution plan.
   the `$composer` slot — including a mis-bound composition — and
   accepts the one-arg-short shape (`args.len == params.len - 1`), so a
   single positional misbind upstream silently becomes the ambient
-  composer. PINNED (KLIO_COMPOSER_BIND_TRACE, now a permanent gated
-  diagnostic): exactly one publish binds `class=CompositionImpl` on a
-  2-param (pair-only) closure — the
-  `Composition(...).apply { setContent { block() } }` RECEIVER lambda
-  carries pass-threaded ($composer, $changed) params it should not
-  have (it is not composable), and the receiver-lambda invocation binds
-  the `apply` subject (the Composition) into the `$composer` slot; the
-  wrong value then threads down into `block()`'s pair. Next: either the
-  pass must not thread the pair onto a non-composable receiver lambda
-  (find why `{ setContent { block() } }` got pair params), or the
-  receiver-lambda invoke must not let the subject land in a
-  `$composer`-named param slot. Also harden `threadedComposerArg` to
-  require a Composer-typed instance once the misbind is fixed.
+  composer. PINNED PARTWAY (KLIO_COMPOSER_BIND_TRACE, a permanent
+  gated diagnostic printing the class + arg tags bound into a
+  composable protocol's pair): the bad publish binds
+  (CompositionImpl, Instance) on a pair-only `<lambda>`, reached
+  through a lowering-emitted `CallValueWithThis` with n_args=2
+  (`[cvt-instr] recv=Instance n_args=2 caller=<lambda> Instance Int`)
+  whose ARG values are the CALLER lambda's own (already wrong) pair —
+  i.e. the corruption originates at least one frame further up each
+  time it is traced. `invokeCallableWithThis`'s receiver-fill was
+  hardened to never fill a pass-threaded pair slot (landed — correct
+  regardless, though not the origin). Next pass needs a FRAME-ANCESTRY
+  instrument: when the pair binds a non-Composer, dump the frame chain
+  (funcs + their own pair values) to find the first frame that received
+  the composition — candidates: the `apply` splice's receiver-lambda
+  emission (`CallValueWithThis` with the subject as recv and the
+  enclosing pair as args), or `prepareClosureWithThisFlatCall`'s
+  binding for a pair-only callee. Also harden `threadedComposerArg` to
+  require a Composer-typed instance once the origin is fixed.

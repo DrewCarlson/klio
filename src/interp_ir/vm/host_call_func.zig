@@ -1015,7 +1015,7 @@ pub fn callFuncFast(self: *VmHost, allocator: Allocator, module: *const Module, 
 /// whether the activation's close must pop it.
 pub fn flatPlainCallOpen(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
     _ = self;
-    if (compose.threadedComposerArg(f.params, args)) |c| {
+    if (compose.threadedComposerArgFor(f.fqn, f.params, args)) |c| {
         compose.pushComposer(c);
         return true;
     }
@@ -1446,7 +1446,7 @@ fn composableEval(
     // the body; run it directly and publish the threaded `$composer` argument as
     // the ambient composer so a `@Composable` property getter reached from this
     // body (compiled to the `__compose_currentComposer` intrinsic) reads it.
-    if (compose.threadedComposerArg(f.params, packed_args.items)) |c| {
+    if (compose.threadedComposerArgFor(f.fqn, f.params, packed_args.items)) |c| {
         compose.pushComposer(c);
         defer compose.popComposer();
         return ir.eval.evalWith(VmHost, allocator, module, f, packed_args, self);

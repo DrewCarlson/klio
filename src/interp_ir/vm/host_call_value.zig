@@ -222,7 +222,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
     var composer_pushed = false;
     if (host_call_func.composePluginEnabled()) {
-        if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+        if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
             compose.pushComposer(c);
             composer_pushed = true;
         }
@@ -1154,7 +1154,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // named-call path: a `@Composable` property getter reached from the
         // body reads it via `__compose_currentComposer`.
         if (host_call_func.composePluginEnabled()) {
-            if (compose.threadedComposerArg(func.params, call_args.items)) |c| {
+            if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
                 compose.pushComposer(c);
                 defer compose.popComposer();
                 return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
