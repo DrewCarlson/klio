@@ -6567,6 +6567,33 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // names a class.
     var is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
         cmg.class != null;
+    // An INAPPLICABLE constructor is not a candidate at all: Kotlin filters
+    // by applicability before scope rank, so `Point(it)` against `data class
+    // Point(x: Int, y: Int)` never means construction — the member/extension
+    // walk must run and bind the receiver's `MockViewValidator.Point`
+    // extension. The class-carrying ctor tail stays the fallback for calls
+    // nothing else serves, so a bindable secondary constructor is still
+    // reachable when the walk misses.
+    if (is_ctor_name) applicable: {
+        const cid = cmg.class.?;
+        if (cid.int() >= frame.module.classes.items.len) break :applicable;
+        const cls = &frame.module.classes.items[cid.int()];
+        var required: usize = 0;
+        var has_vararg = false;
+        for (cls.primary_params) |*p| {
+            if (p.is_vararg) {
+                has_vararg = true;
+                continue;
+            }
+            if (!p.has_default) required += 1;
+        }
+        const n = arg_values.len;
+        if (n >= required and (has_vararg or n <= cls.primary_params.len)) break :applicable;
+        if (comptime @hasDecl(H, "classSecondaryCtorCanBind")) {
+            if (host.classSecondaryCtorCanBind(cls.fqn, cls.name, n)) break :applicable;
+        }
+        is_ctor_name = false;
+    }
     // A capitalized name that is ALSO a method of the implicit receiver is a
     // nearer-scope member call, not a constructor (`Test(...)` inside a class
     // declaring `fun Test(...)` next to an imported `kotlin.test.Test`): run

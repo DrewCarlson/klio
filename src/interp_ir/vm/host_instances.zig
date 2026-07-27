@@ -144,6 +144,22 @@ fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const roo
     return g.get().secondary_ctors.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
+/// Whether any declared secondary constructor of the class can bind `n`
+/// arguments by count (required-without-defaults through total). Serves the
+/// dispatcher's ctor-applicability gate: a capitalized bare call whose class
+/// has no bindable constructor is not a construction.
+pub fn classSecondaryCtorCanBind(self: *VmHost, fqn: []const u8, name: []const u8, n: usize) bool {
+    const entries = secondaryCtors(self, if (fqn.len != 0) fqn else null, name);
+    for (entries) |e| {
+        var required: usize = 0;
+        for (e.default_arg_thunks) |d| {
+            if (d == null) required += 1;
+        }
+        if (n >= required and n <= e.param_count) return true;
+    }
+    return false;
+}
+
 /// Simple runtime type-name head of a value (`IntArray`, `Int`).
 fn valueTypeHead(v: Value) []const u8 {
     const fqn = v.typeFqn();

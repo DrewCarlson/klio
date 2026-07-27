@@ -340,6 +340,7 @@ pub const VmHost = struct {
     pub const qualifiedThis = host_call_member.qualifiedThis;
     pub const newInstance = host_instances.newInstance;
     pub const newInstanceNamed = host_instances.newInstanceNamed;
+    pub const classSecondaryCtorCanBind = host_instances.classSecondaryCtorCanBind;
     pub const buildObject = host_instances.buildObject;
     pub const getField = host_fields.getField;
     pub const getMemberField = host_fields.getMemberField;
