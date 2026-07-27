@@ -166,6 +166,7 @@ pub fn resetReceiverThreadLocals() void {
 /// anon-object instantiation.
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
+    host_call_member.resetStaticApplicabilityCache();
     ir.eval.resetSuspendLivenessCache();
     stdlib.resetEmptyCollectionSingletons();
     stdlib.resetEmptySequenceSingleton();

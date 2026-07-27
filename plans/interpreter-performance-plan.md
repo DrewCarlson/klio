@@ -367,6 +367,33 @@ lost): `ProgramImage` has no `gcTrace` (traced as a leaf — confirm every
 (regexp options attach) — the barrier covers the GC side, the
 immutability claim is stale.
 
+## Finalized-module dispatch scans (LANDED)
+
+With marking off the profile, the wall-capped compose benchmarks'
+dominant named costs became two linear scans on the finalized module,
+both now cached:
+
+- `Module.uniqueClassIdBySimpleName` / `staticBuiltinIdentity` (642/5000
+  samples on validatePotentialDeadlock): the lowering-phase
+  `unique_simple_cache` was gated OFF once `class_fqn_map` existed
+  (finalized modules dispatch from several threads and the lazy top-up
+  is not thread-safe), so every runtime call — extension-receiver
+  applicability under `getFieldInner`/`classIsOrExtends` — linear-scanned
+  the whole class list with double string compares. `buildClassIdMap`
+  (the single-threaded link step) now completes the cache eagerly, and
+  the finalized read path consults it lock-free while it still mirrors
+  the append-only class list (a post-finalize class addition falls back
+  to the scan).
+- `staticReceiverApplicable`'s candidate scan (143 samples): O(classes)
+  with per-entry hierarchy walks, depends only on (module, sn, pn) —
+  memoized in a thread-local verdict cache keyed by module identity +
+  class count + both names; cleared at the run boundary with the other
+  run-global caches.
+
+After both, the benchmark profile is diffuse interpreter work (no
+single dominant scan); the remaining wall-capped tests need raw
+interpreter speed (the flat-coverage / seam item), not another cache.
+
 ## What was already landed (kept, measured)
 
 - clocks/sleeps direct to libc (idle saturation eliminated; 81->48 s on the
