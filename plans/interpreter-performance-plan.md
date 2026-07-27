@@ -810,14 +810,25 @@ trim stands on its own. FURTHER: the tail's `cands=3` field IS
 invocations for the site score and pick #9405 (350) successfully; the
 ctor-decline branch does NOT fire (new ntrace print); yet ONE
 execution reaches the unresolved tail with no binder entry line at
-all. The leg has no pre-print return, so that execution diverges
-between the member passes and the overload leg — remaining suspects:
-a strict/lenient-pass `.Suspended` exit-and-resume路径 that re-enters
-dispatch differently, or the `resolved` variable set by a pass whose
-value then fails a later guard. Next: add a missTraceWant-gated print
-at the else-arm entry (before cmgGlobalRecord) and at each `resolved
-= v` assignment to see which pass serves/short-circuits the failing
-execution.
+all. RESOLVED — testProvideAllLocals PASSES (CompositionLocalTests
+31/31). Two final mechanisms, both in the binder:
+(1) applicability's positional scorer hard-refused a packed array at
+a MID-position vararg (`scoreArg` against the ELEMENT type → null →
+candidate dead). The flattened spread `CompositionLocalProvider(
+*provided, content, $composer, $changed)` reaches the scorer as four
+positionals with a whole Array first; that is exactly the pre-packed
+shape `packVarargArgs` passes through at dispatch, so the scorer now
+accepts an Array-classed argument at a vararg slot neutrally
+(counted unknown, no points) instead of refuting.
+(2) `callNamedOverload`'s compose pair completion ran only when the
+FULL-signature score was null. The pairless nested delegation
+`CompositionLocalProvider(*ctx…, content = content)` (2 spread
+elements + named content) produced a weak NON-null full score by
+letting the vararg absorb args into the `($composer, $changed)`
+territory — dispatching that binding put a ProvidedValue in
+`$composer` (surfaced as "virtual method slot is not linked" on
+startRestartGroup). The pair-reduced score now wins whenever it
+BEATS the full score, setting the pair-append flag.
 
 
 ## Compose fleet snapshot (post pass-threading fix)
@@ -829,11 +840,8 @@ BroadcastFrameClockTest 4/4. Remaining clusters:
 - CompositionTests 106/148 (42 failures)
 - MovableContentTests 16/44 (28 failures)
 - RecomposerTests 8/12 (4)
-- CompositionLocalTests 30/31 (testProvideAllLocals — see the traced
-  lead above: three binder invocations pick correctly, one execution
-  reaches the unresolved tail with NO binder entry and NO serve audit,
-  i.e. it diverges before the overload leg; next instrument the
-  else-arm entry directly)
+- CompositionLocalTests 31/31 GREEN (testProvideAllLocals fixed via
+  the two binder mechanisms above)
 
 MovableContentTests failure modes (28 total): 7× "Expected a Text,
 but none found"; 6× LabeledReturn (the old recorded cluster — an eval

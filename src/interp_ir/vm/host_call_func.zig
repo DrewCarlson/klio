@@ -2501,7 +2501,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         // body's re-entry) arrives WITHOUT the pair. With an ambient composer
         // available, score the user-visible params and complete the pair at
         // dispatch — the same completion callValue applies for closures.
-        if (pts == null and composePluginEnabled()) {
+        if (composePluginEnabled()) {
             if (sigViewOfFunc(self, eff, cand, shapes.len)) |sv| {
                 const p = sv.params;
                 if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and
@@ -2513,9 +2513,17 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                     if (sv2.defaults) |d| {
                         if (d.len >= 2) sv2.defaults = d[0 .. d.len - 2];
                     }
+                    // Pair-reduced scoring wins even over a non-null full
+                    // score: a pairless call whose args leak into the
+                    // ($composer, $changed) slots (a mid-vararg absorbing
+                    // them) can still produce a weak full score, and
+                    // dispatching that binding runs the body with a
+                    // non-composer in `$composer`.
                     if (applicability.applicable(&sv2, shapes, scope)) |sc2| {
-                        pts = sc2.points;
-                        cand_needs_pair = true;
+                        if (pts == null or sc2.points > pts.?) {
+                            pts = sc2.points;
+                            cand_needs_pair = true;
+                        }
                     }
                 }
             }
