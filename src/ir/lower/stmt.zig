@@ -575,13 +575,19 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             .absorb_return = true,
             .body_func = body_func,
         } });
+        // A same-named local PROPERTY owns the plain-name binding: the fun
+        // is reachable through its mangled overload cell and the overload
+        // registry, while bare `seen` reads stay on the var (Kotlin resolves
+        // the bare reference to the property; only a call picks the fun).
+        const name_is_property = self_cell == null and b.mutableHome(f.name.name) != null and
+            !b.isLocalFn(f.name.name);
         if (self_cell) |home| {
             try b.push(.{ .CellSet = .{ .cell = home, .value = dst } });
-        } else {
+        } else if (!name_is_property) {
             try b.bind(f.name.name, dst);
         }
-        try b.markLocalFn(f.name.name);
-        if (is_ext) {
+        if (!name_is_property) try b.markLocalFn(f.name.name);
+        if (is_ext and !name_is_property) {
             try b.markLocalExtFn(f.name.name);
         }
         // Record positional parameter type names (drop a leading `this`
@@ -620,8 +626,14 @@ fn localFnSelfCell(
     var self_refs = StringSet.init(b.allocator);
     defer self_refs.deinit();
     for (body.stmts) |*s| try collectPathIdentsStmt(s, &self_refs);
+    // Reuse an existing mutable home only when it belongs to a previous
+    // LOCAL FN of the name (a redeclaration/recursion cell). A same-named
+    // local PROPERTY keeps its own cell: `var seen = ...; fun seen(x) { seen
+    // = x }` assigns the var from the fun body, and storing the closure into
+    // the var's cell would clobber the property every bare `seen` read.
     if (b.mutableHome(f.name.name)) |home| {
-        return home;
+        if (b.isLocalFn(f.name.name)) return home;
+        return null;
     } else if (self_refs.contains(f.name.name)) {
         const null_v = try b.emitConst(.Null);
         const home = b.allocReg();

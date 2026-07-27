@@ -5740,10 +5740,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const bare = callee.Path.segments[0].name;
         var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
+            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} ovs={d}\n", .{ bare, ovs.len });
             if (try selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
+                if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                    std.debug.print("[lfn] {s} selected={s} cell={} outer={}\n", .{ bare, m, b.resolve(m) != null, b.knowsOuter(m) });
                 if (try lowerSelectedLocalOverloadCall(b, bare, m, args, ast_arg_names)) |r| return r;
-            }
-        }
+            } else if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} no-select\n", .{bare});
+        } else if (b.resolve(bare) != null and runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+            std.debug.print("[lfn] {s} no-registry\n", .{bare});
         // SELF-reference: a bare call to the enclosing local fn's own name
         // from inside its body — including generated nested lambdas (the
         // compose restart re-invoke) — binds the fn ITSELF through its
@@ -5776,8 +5782,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // rebinds the shared plain-name slot, so a by-name capture
             // runs the sibling. Multi-overload sets select above; an
             // inapplicable local keeps outward resolution.
+            // The plain name may also be bound to a same-named local
+            // PROPERTY (`var seen = ...; fun seen(x)`): the property owns
+            // the bare binding, so a CALL routes through the fn's mangled
+            // cell — Kotlin resolves `seen(x)` to the fun and `seen` to
+            // the var.
+            const plain_is_property = b.resolve(bare) != null and !b.isLocalFn(bare);
             if (decls.len == 1 and !local_fn_inapplicable and
-                b.resolve(bare) == null and
+                (b.resolve(bare) == null or plain_is_property) and
                 (b.resolve(decls[0].mangled) != null or b.knowsOuter(decls[0].mangled)))
             {
                 if (try lowerSelectedLocalOverloadCall(b, bare, decls[0].mangled, args, ast_arg_names)) |r| return r;
