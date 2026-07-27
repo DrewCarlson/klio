@@ -544,8 +544,16 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   head (none when it names a type parameter), and vararg-property /
   default-scope groundwork rides along.
 
-Remaining clusters: ResultTest (past
-`throwOnFailure`, assertion-level, 4), Random nextUBytes (4), thenBy
+- **Unsigned-array storage views — FIXED (4 tests: Random nextUBytes).**
+  `UByteArray.storage` (and siblings) copied the bytes into a fresh
+  signed buffer, so `Random.nextUBytes(array, from, to)` — which fills
+  `array.asByteArray()` in place — wrote into a copy. The view now
+  shares the backing cell with the signed kind carried on the Array
+  value's `prim` (the same view-kind mechanism `IntArray.asUIntArray()`
+  already used in the other direction).
+
+Remaining clusters (9): ResultTest (past
+`throwOnFailure`, assertion-level, 4), thenBy
 receiver above (2), StringTest.indexOfStringIgnoreCase (1),
 CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
 iterator on anon (1).

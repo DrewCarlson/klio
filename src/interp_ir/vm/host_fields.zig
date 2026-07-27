@@ -1308,20 +1308,19 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             else => {},
         }
     }
-    // `UByteArray.storage` etc. — the signed array over the same bytes. The
-    // `PrimBuf` carries its own kind, so reinterpret by copying the bytes into
-    // a fresh signed-kind buffer.
+    // `UByteArray.storage` etc. — the signed array over the SAME bytes.
+    // Kotlin's unsigned arrays are value classes over their signed storage,
+    // so writes through the view must land in the original (`Random.nextUBytes`
+    // fills `array.asByteArray()` in place). Share the backing cell and let
+    // the Array value's `prim` carry the signed VIEW kind — the accessors
+    // read/write through the view kind over identical byte layout, the same
+    // mechanism `IntArray.asUIntArray()` uses in the other direction.
     if (std.mem.eql(u8, name, "storage") and receiver.* == .Array) {
         const a = receiver.Array;
         if (a.prim) |k| {
             if (k.signedCounterpart()) |signed| {
                 if (a.storage == .scalars) {
-                    const g = a.storage.scalars.borrow();
-                    defer g.deinit();
-                    var pb = runtime.PrimBuf{ .kind = signed };
-                    try pb.bytes.appendSlice(allocator, g.get().bytes.items);
-                    const view = try ObjRef(runtime.PrimBuf).initOwned(allocator, pb);
-                    return ok(.{ .Array = .{ .storage = .{ .scalars = view }, .prim = signed } });
+                    return ok(.{ .Array = .{ .storage = .{ .scalars = a.storage.scalars.clone() }, .prim = signed } });
                 }
             }
         }
