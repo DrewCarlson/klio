@@ -611,9 +611,21 @@ The 40 baseline failures cluster into ~13 root causes. Landed this pass:
   now declines to splice any inline fn declared on a `Result` receiver,
   so every call reaches the runtime dispatch and the native intrinsics.
 
-Remaining baseline failure (1): CollectionTest.sortedByNullable — the
-local-extension-from-selector-closure layer (diagnosis + repro
-scratchpad localext.kt recorded above).
+- **sortedByNullable — FIXED (the final baseline failure).** Inside
+  `compareBy`'s spliced SAM lambda, `it` carries the stdlib fn's type
+  parameter `T` as its declared head; `localOverloadReceiverCouldApply`
+  ran a subtype check on that unknown head and DISPROVED the caller's
+  local `String.nonEmptyLength()` extension, dropping the local-callable
+  lowering and stranding the call on the runtime member walk. An actual
+  head that names no known classifier and carries no registered bound is
+  statically unresolvable and no longer disproves — the runtime receiver
+  decides.
+
+**THE STDLIB COMMONTEST SWEEP IS GREEN: 117 files, 0 failures.** The
+baseline went 40 → 0 over this effort. The remaining recorded opens are
+the two probe-discovered non-baseline items (lastIndexOf 3-arg lowering
+truncation; the thenBy-era notes absorbed above) and the compose
+per-class clusters tracked in the resolution plan.
 
 - **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
   An inline splice lowered an omitted parameter's DEFAULT expression in

@@ -11854,6 +11854,23 @@ fn localOverloadReceiverCouldApply(
     defer if (owned_bounds) |bounds| b.allocator.free(bounds);
     const actual_bounds: []const ir.ModuleRegistry.TypeParamBound =
         owned_bounds orelse &.{};
+    // An actual head that names NO known classifier and carries no bound
+    // here is a type parameter of a spliced/generic context (`it: T` inside
+    // `compareBy`'s SAM lambda, where T instantiates to the caller's
+    // element type) — statically unresolvable, so it must not DISPROVE the
+    // overload; the runtime receiver decides.
+    {
+        const head = typeHead(actual.name);
+        var bound_known = false;
+        for (actual_bounds) |tb| {
+            if (std.mem.eql(u8, tb.param, head)) bound_known = true;
+        }
+        if (!bound_known and b.module.classId(head) == null and
+            b.module.registry.class_super_names.get(head) == null)
+        {
+            return true;
+        }
+    }
     if (overload.receiver_has_type_params) {
         return b.module.staticGenericReceiverApplicable(
             b.allocator,
