@@ -357,6 +357,16 @@ pub fn spliceInlineLambda(
     // The lambda body is CALLER code: its bare calls resolve under the
     // hint that was active at the inline call site, not the spliced
     // body's own receiver hint.
+    // The spliced body's receiver-lambda-param MARKS are scoped to the
+    // inline fn's own names; inside the CALLER's lambda body the same
+    // simple name refers to a caller binding (`apply`'s `block: T.() -> Unit`
+    // param vs the test's captured composable `block`), and a leaked mark
+    // emits CallValueWithThis with the scope subject as receiver — the
+    // subject then rides the composable pair. Clear the marks for the
+    // caller body; restore after.
+    var saved_rlp = try b.receiverLambdaParamNames();
+    defer saved_rlp.deinit();
+    b.clearReceiverLambdaParams();
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
     if (receiver != null) {
@@ -369,6 +379,7 @@ pub fn spliceInlineLambda(
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     const v = try lowerBlock(b, &body);
+    try b.inheritReceiverLambdaParams(&saved_rlp);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
     b.lambda_splice_resolve = prev_splice;

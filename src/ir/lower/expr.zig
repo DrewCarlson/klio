@@ -11865,7 +11865,15 @@ fn localOverloadReceiverCouldApply(
         for (actual_bounds) |tb| {
             if (std.mem.eql(u8, tb.param, head)) bound_known = true;
         }
-        if (!bound_known and b.module.classId(head) == null and
+        // Builtin heads (`Nothing?`, primitives, `Any`, `String`, ...) are
+        // known classifiers even without a module class entry — they keep
+        // the full subtype judgment (a `Nothing?` actual must still refute
+        // a `String` receiver).
+        const builtin_head = isPrimitiveTypeName(head) or
+            std.mem.eql(u8, head, "Nothing") or std.mem.eql(u8, head, "Any") or
+            std.mem.eql(u8, head, "Unit") or std.mem.eql(u8, head, "String") or
+            std.mem.eql(u8, head, "CharSequence");
+        if (!builtin_head and !bound_known and b.module.classId(head) == null and
             b.module.registry.class_super_names.get(head) == null)
         {
             return true;

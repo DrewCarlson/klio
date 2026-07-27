@@ -1844,6 +1844,12 @@ pub const FuncBuilder = struct {
     pub fn receiverLambdaParamNames(self: *const FuncBuilder) Allocator.Error!StringSet {
         return cloneStringSet(self.allocator, &self.receiver_lambda_params);
     }
+    /// Drop every receiver-lambda-param mark (a spliced caller-lambda body
+    /// resolves the names against the caller's scope, where the inline fn's
+    /// marks do not apply).
+    pub fn clearReceiverLambdaParams(self: *FuncBuilder) void {
+        self.receiver_lambda_params.clearRetainingCapacity();
+    }
     /// Seed this builder's receiver-lambda-param set from an enclosing
     /// scope's. Copies the names; the caller keeps ownership of `names`.
     pub fn inheritReceiverLambdaParams(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {

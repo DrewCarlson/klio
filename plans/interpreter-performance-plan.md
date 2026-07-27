@@ -690,4 +690,22 @@ per-class clusters tracked in the resolution plan.
   emission (`CallValueWithThis` with the subject as recv and the
   enclosing pair as args), or `prepareClosureWithThisFlatCall`'s
   binding for a pair-only callee. Also harden `threadedComposerArg` to
-  require a Composer-typed instance once the origin is fixed.
+  require a Composer-typed instance once the origin is fixed.RESOLVED — the origin was a receiver-lambda-param MARK LEAK:
+  `apply`'s spliced param `block: T.() -> Unit` marks the name "block"
+  as a receiver-lambda param; the caller's lambda body spliced INTO the
+  apply body (`{ setContent { block() } }` where `block` is the test's
+  captured composable) saw the leaked mark and emitted its `block()`
+  as CallValueWithThis with the apply SUBJECT as receiver — the
+  Composition then rode into `invoke#5136(p1, c, changed)` as `p1` and
+  became `\$composer`. `spliceInlineLambda` now snapshots and CLEARS the
+  receiver-lambda-param marks around the caller body (restored after),
+  and the unknown-head applicability guard excludes builtin heads
+  (`Nothing?` still refutes). The deferredSubCompose cluster moved past
+  the misbind to a NEW frontier: "Expected changes but none were found"
+  — after `doInvalidate()`, the mock frame clock's recompose pass sees
+  no changes for the main composition (invalidation → recomposition
+  delivery), then the un-applied sub-composition trips
+  "Expected applyChanges() to have been called" on the second
+  doSubCompose. Next: trace the invalidate→recompose delivery in
+  compositionTest's mock clock (why the invalidated scope produces no
+  changes).
