@@ -872,6 +872,17 @@ scored against param `a: Boolean` and killed the candidate
 (selectLocalFnOverload / anyLocalFnOverloadApplicable / the third
 sibling walk now advance past bound slots). The local ext-fn call path
 also shifts arg names one slot right when it prepends the receiver.
+EVIDENCE for the current layer (frame-params at the `next` miss): the
+ext body frame is `<lambda> (4 params): this=Bool(true), a=Instance(the
+VALIDATOR), b=Bool, c=Bool` — the executed argument vector was [true,
+validator, false, false], i.e. the RECEIVER landed in slot 1 and the
+first named arg in `this`. No [cvt-instr] fires for a 3-arg
+CallValueWithThis and no CallMemberOrValue run-audit names Composition,
+so the EXECUTED lowering of `this.Composition(a = ..., ...)` is neither
+of the audited emissions — find the executing instruction (dump
+frame.cur op at the ext-body entry, or KLIO_TRACE_PATH the closure
+invocation) before theorizing further.
+
 NOW FAILING at the next layer: "unresolved global `next`" — the
 VALIDATOR ext (`fun MockViewValidator.Composition(a, b, c)`) invoked
 via `this.Composition(a = true, ...)` (member_or_local_exact_value →
