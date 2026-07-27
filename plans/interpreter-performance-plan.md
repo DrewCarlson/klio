@@ -831,6 +831,39 @@ startRestartGroup). The pair-reduced score now wins whenever it
 BEATS the full score, setting the pair-append flag.
 
 
+## Compose fleet snapshot (current)
+
+MovableContentTests 41/44; CompositionTests 123/148; probes all green
+(CompositionLocalTests 31/31, CompositionReusingTests 25/25,
+CompositionObserverTests 13/13, AbstractApplierTest 10/10,
+CompositionAndDerivedStateTests 17/17, EffectsTests 18/18); stdlib
+sweep 0 across every commit. Landed in this stretch beyond the entries
+above: (a) compound-assign on a read-only collection field goes
+plus+write-back; (b) closure-written vars declared in a SPLICED lambda
+body box (computeBoxedVars in spliceInlineLambda); (c) an
+arity-mismatched published overload re-ranks through the binder (and a
+renamed file-private duplicate finds its plain-named sibling); (d) a
+local class's MODULE parent chain initializes at construction
+($super$arg$<i> thunks + parent body-prop init maps).
+
+Remaining MovableContentTests (3): compositionLocalsShouldBeAvailable
+(ComposeRuntimeError "Missed recording an endGroup" during recompose of
+`if (x%2==0) content() else content()` under a provider),
+moveContent_subcompose ("Inserting a view named Row into a view which
+already has a parent" — applier double-insert on subcompose move),
+removeAndInsertWithMoveAway (infinite recomposition guard trips).
+movableContentInvalidatedWhileDeleted_linkComposer passes in-suite but
+is slow/flaky solo ("daemon task abandoned at run boundary").
+
+Remaining CompositionTests (25) census: 4x plain "exception", 2x
+"Expected children but none found", 2x Expected<9>/actual<7>, 2x
+Expected<1>/actual<2>, singles: Vm::call_member `Varargs` on
+CompositionTests.VarargConsumer; `SimulatedIf` on MockViewListValidator;
+`getValue` on kotlin.String; `value` on SnapshotMutableStateImpl;
+`assertTrue` on DefaultAsserter; composeNodeSetVsUpdate now a semantic
+assert ("node 0 initial composition value Expected <initial> actual
+<null>" — ComposeNode set-vs-update semantics). RecomposerTests 8/12.
+
 ## Compose fleet snapshot (post pass-threading fix)
 
 Green classes: EffectsTests 18/18, SnapshotStateObserverTests 30/30,
