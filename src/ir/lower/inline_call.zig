@@ -1058,12 +1058,16 @@ pub fn tryInlineCallWithTypeArgs(
             }
         }
     }
+    var slot_is_default = try b.allocator.alloc(bool, ordered.len);
+    defer b.allocator.free(slot_is_default);
+    for (slot_is_default) |*x| x.* = false;
     for (ordered, 0..) |*slot, i| {
         if (slot.* == null) {
             if (f.params[i].is_vararg) {
                 continue;
             } else if (f.params[i].default) |d| {
                 slot.* = d;
+                slot_is_default[i] = true;
             } else {
                 return null;
             }
@@ -1184,7 +1188,19 @@ pub fn tryInlineCallWithTypeArgs(
         if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
             b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
         }
-        const r = coerced orelse try lowerExpr(b, a);
+        // A default-filled slot is CALLEE code: Kotlin evaluates a default
+        // expression in the declaration's scope, where the extension
+        // receiver (and the already-bound earlier params) are visible —
+        // `endIndex: Int = length` on `CharSequence.substring` reads the
+        // receiver's `length`. Caller-supplied arguments keep the call
+        // site's scope (no callee `this`).
+        const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
+            try b.pushScope();
+            try b.bind("this", explicit_receiver.?);
+            const rr = coerced orelse try lowerExpr(b, a);
+            try b.popScope();
+            break :blk rr;
+        } else coerced orelse try lowerExpr(b, a);
         b.pending_lambda_arity = -1;
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the

@@ -535,4 +535,12 @@ Remaining clusters: MapTest.minus family (UnsupportedOperationException,
 `throwOnFailure`, assertion-level, 4), Random nextUBytes (4), thenBy
 receiver above (2), StringTest.indexOfStringIgnoreCase (1),
 CollectionTest.sortedByNullable Comparator invoke (1), GroupingTest
-iterator on anon (1), InstantIsoStrings `length` (2).
+iterator on anon (1).
+
+- **Inline default-expression scope — FIXED (2 tests: InstantIsoStrings).**
+  An inline splice lowered an omitted parameter's DEFAULT expression in
+  the caller's scope, so `endIndex: Int = length` on
+  `CharSequence.substring` failed as an unresolved global at the call
+  site. Default-filled slots now lower in a nested scope with the
+  callee's receiver bound as `this` (earlier params are already bound
+  progressively), matching Kotlin's declaration-scope evaluation.
