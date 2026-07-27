@@ -433,13 +433,24 @@ call (~130 samples), `runFlatLoop` entry/exit, and `_tlv_get_addr`
 boundary).
 
 Remaining per-call program (next items, in expected-value order):
-1. Frame/argument buffer reuse for the nested entry: a per-thread
-   free-list of frames or caller-provided arg storage, removing the two
-   ArrayList allocations + copies per call.
-2. Batch call-boundary threadlocal traffic into one context struct
-   (single TLV read per call instead of one per threadlocal).
-3. Per-JIT-site resolution memo (closure id → prepared template), so
-   repeat iterations skip the closure-table probe and param scan.
+1. Batch call-boundary threadlocal traffic: `_tlv_get_addr` is ~5-9% of
+   busy time on the lambda-call profile because eval's per-call state
+   lives in SEPARATE threadlocals (`frame_chain`, `active_chain`,
+   `active_chain_base`, `eval_depth`, ...) — each gets its own dyld TLV
+   lookup per access site (the compiler CSEs repeated reads of one
+   variable, not of siblings). Moving them into ONE threadlocal struct
+   lets a single address load per function serve all of them. Mechanical
+   but broad (dozens of use sites across eval.zig) — do it in a
+   dedicated pass with the sweep gate, not as a drive-by.
+2. Per-JIT-site resolution memo (closure id → prepared template), so
+   repeat iterations skip the closure-table probe and param scan
+   (~2% as measured; do after 1).
+
+NOT on the list: pooling the per-call args/captures ArrayLists — the
+params-buffer pool was already evaluated and closed in an earlier
+session (~3% ceiling against a 16-site cross-allocator audit risk);
+`Frame.deinit` frees them with the producer's allocator and the regs
+pool already covers the dominant buffer.
 
 ## What was already landed (kept, measured)
 
