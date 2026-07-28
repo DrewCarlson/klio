@@ -930,9 +930,18 @@ transcript: person prints as a Person instance, then the Text(...)
 statement itself raises call_member getValue on the String — the
 member read of a local-class param-property inside the transformed
 lambda routes through the DELEGATE probe with the field's VALUE as
-receiver. Next: dump the lowered content lambda (KLIO_DUMP_FN by id)
-and find which lowering path emits the getValue for `person?.name`
-under the pass transform. Also landed meanwhile: value-returning
+receiver. NARROWED FURTHER (dump #17735 with registers): there is NO
+getValue in the lambda at all — `person` is bound once to r5 (GetField
+value recv=r4 dst=r5) and no later instruction writes r5, yet block 7's
+`GetField car recv=r5` receives the STRING "Ford" (person.name's
+value!) and the runtime's delegate fallback then probes getValue on it.
+This is RUNTIME register corruption of r5 between block 0 and block 7,
+with the intervening work being the elvis PHI (r12→r17→r7), the Text
+CMG (dst=r22), and possibly a suspension/resume through
+collectAsState→produceState's coroutine machinery re-building the
+frame. Next: KLIO_RESUME_TRACE=1 to see whether the frame suspends and
+which frames re-run; if it does, inspect the resume path's register
+snapshot/restore for the content-lambda frame. Also landed meanwhile: value-returning
 composables now get their kotlinc replace-group (block + expr bodies,
 engine primitives rememberComposableLambda/key excluded) — reuse holds
 25/25.
