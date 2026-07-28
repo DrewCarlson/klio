@@ -919,10 +919,23 @@ skipping (composableWithUnstableParameters_skipped; @NonSkippable
 Composable now honored explicitly), testRemember_Forget_ForgetOn
 Remember (fourth name-shift emitter: explicit-receiver member form).
 REMAINING 11 CompositionTests: testInsertOnMultipleLevels (this-
-capture lowering gap, see NAME-CLASH below), subcomposition pair
+capture lowering gap, see NAME-CLASH below), subcomposition remainder
 (testModificationsPropagateToSubcomposition "expected changes but
-none" — write during recompose must invalidate the subcomposition
-next frame; testParentCompositionRecomposesFirst — secondSet runs
+none": the content lambda `content.value = { … }` is created inside a
+NON-composable local fn, so the pass never threads or wraps it — its
+type (`MutableState<@Composable () -> Unit>`) is what makes it
+composable, and klio has no expected-type propagation there. The
+reference wraps it in composableLambdaInstance whose invoke records
+`changed(this)`, so the swapped instance yields the UpdateValue change
+op. Bracketing RAW pair-wanting closures at the completion arm
+(startReplaceGroup(bodyId) + changed(instance)) was tried and REVERTED:
+it regressed CompositionTests 138→134, DerivedState 17→16, Reusing
+25→24 — klio's pair-tailed raw closures already stand in for
+reference-wrapped lambdas whose groups exist elsewhere, so the bracket
+double-groups. And this test's lambda has NO pair (n_params=0), so no
+completion fires anyway. Fix direction: expected-type propagation for
+value-position lambdas (MutableState/State type args, property declared
+types) so the pass threads + wraps them at creation; testParentCompositionRecomposesFirst — secondSet runs
 twice: klio recomposes the CHILD in wave 1, the parent's recompose then
 re-invalidates the child, alreadyComposed blocks its trailing re-add, so
 the leftover compositionInvalidations entry recomposes it AGAIN next
