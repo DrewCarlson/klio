@@ -11147,7 +11147,20 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                     const rty = &c.func.params[0].ty;
                     const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
                         std.mem.eql(u8, rty.name, "Companion");
-                    if (!is_companion_recv and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) {
+                    // The RUNTIME receiver proving the declared receiver type
+                    // outranks a mismatched static hint: an explicit
+                    // `this.SimulatedIf(...)` inside a headerless receiver
+                    // lambda carries the ENCLOSING scope's declared receiver
+                    // (CompositionTestScope) while the value is the lambda's
+                    // own MockViewListValidator — a proven subtype match must
+                    // not be refused on that stale evidence.
+                    const self_repick = blk: {
+                        const cf = ir.eval.currentFrameFunc() orelse break :blk false;
+                        break :blk cf.id.int() == c.fid.int();
+                    };
+                    const runtime_proves = !self_repick and
+                        committedExtReceiverProven(self, allocator, c.fid, receiver);
+                    if (!is_companion_recv and !runtime_proves and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) {
                         if (mtr) std.debug.print("[extfb]  fid={d} lenient static-recv-refuse dn={s}\n", .{ c.fid.int(), dn });
                         continue;
                     }
