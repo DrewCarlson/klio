@@ -917,8 +917,22 @@ vals declared MutableState<@Composable fn>/State<...> and wraps both
 the initial store's lambda arg and later .value = { } assignments in
 composableLambdaInstance (value-position typing through the State
 declaration). ONLY the 5 PausableCompositionTests remain in
-CompositionTests (resume-round batching: 9 pause consults finish in 7
-rounds; two background-thread tests; rememberObserverThrashing).
+CompositionTests. DECISIVE probe result (scratch copy
+.klio-local/scratch/PauseProbeTests.kt prints instead of asserting):
+klio's RECORDING is byte-identical to the expected string — the
+pause/resume content, ordering, and remember dispatch are all correct;
+only the ROUND COUNT differs (iteration 7 vs 9). Two rounds resume TWO
+pending sibling scopes together (the C+D pair from A:1's round, and
+the three C's from D:1's round batch differently) where the reference
+takes one scope per round. The divergence is in the
+pausedScopes→invalidScopes handoff / doCompose invalidation-visit
+batching, not in shouldExecute (9 consults, all pausing=true,
+resuming=false — matches). Next: probe the reference-side arithmetic —
+print the invalidScopes SIZE per resume round and compare against what
+one-scope-per-round would produce; then find why klio's
+performRecompose visits several pending scopes per pass where the
+reference defers. Two background-thread tests + rememberObserverThrashing
+ride on the same family.
 Plus MovableContentTests 2 (moveContent_subcompose double-insert,
 removeAndInsertWithMoveAway infinite recompose) and the deadlock/
 frame-clock flakes. Old:
