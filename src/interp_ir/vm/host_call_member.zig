@@ -2031,7 +2031,7 @@ fn cmgGlobalKey(self: *VmHost, receiver: *const Value, func_p: usize, name: []co
     // The arg-type signature keys the entry: a global miss on `f(String)` must
     // not skip the member dispatch of a sibling `f(Int)`. A non-primitive arg
     // yields no signature, so such a call is never cached.
-    const sig = methodArgSig(args) orelse return null;
+    const sig = methodArgSig(self, args) orelse return null;
     const g = receiver.Instance.borrow();
     defer g.deinit();
     const name_p = memberNameIdentity(self, name) orelse return null;
@@ -9264,6 +9264,7 @@ pub fn invokeVirtualMember(
 }
 
 fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args_in: []const Value) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(4);
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
@@ -9434,7 +9435,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 /// overloads a method-name resolution can depend on. Returns null for a
 /// non-primitive arg (or > 12 args), which means "do not cache this call" — the
 /// resolution then re-runs each time rather than risk a wrong cross-type hit.
-fn methodArgSig(args: []const Value) ?u64 {
+fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
     // Hash a per-arg type discriminator. Primitives contribute their tag;
@@ -9469,14 +9470,35 @@ fn methodArgSig(args: []const Value) ?u64 {
             // resolution is not a pure function of the value shape.
             .String => 14,
             .Unit => 15,
+            // A closure argument keys by its BODY identity (folded below):
+            // overload applicability consults the declared shape, a pure
+            // function of the body, never the captured values. Without a
+            // tag every call carrying a lambda had no key at all, and
+            // extension-heavy lambda-argument code re-ran the full
+            // extension walk per call.
+            .IrClosure => 16,
+            .Function => 17,
             else => return null,
         };
         h.update((&tag)[0..1]);
-        if (a.* == .Instance) {
-            const g = a.Instance.borrow();
-            const id = g.get().class.identity();
-            g.deinit();
-            h.update(std.mem.asBytes(&id));
+        switch (a.*) {
+            .Instance => |inst| {
+                const g = inst.borrow();
+                const id = g.get().class.identity();
+                g.deinit();
+                h.update(std.mem.asBytes(&id));
+            },
+            .IrClosure => |c| {
+                const info = self.closures.get(@intCast(c.id)) orelse return null;
+                h.update(std.mem.asBytes(&info.body_func));
+                const mp: usize = @intFromPtr(info.module);
+                h.update(std.mem.asBytes(&mp));
+            },
+            .Function => |f| {
+                const dp: usize = @intFromPtr(f.decl);
+                h.update(std.mem.asBytes(&dp));
+            },
+            else => {},
         }
     }
     const v = h.final();
@@ -9521,9 +9543,29 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
             break :blk h.final() | 1;
         },
         .Result => 0x5261 | 1,
+        // Runtime shapes whose extension resolution is fully fixed by the
+        // value's type tag, at exactly `typeFqn` granularity (prim kind for
+        // arrays, kind + step-refinement for ranges). Identities are forced
+        // ODD so they never collide with an aligned class-cell pointer.
+        .Array => |arr| blk: {
+            const k: usize = if (arr.prim) |pk| @as(usize, @intFromEnum(pk)) + 1 else 0;
+            break :blk (0xA100 + (k << 8)) | 1;
+        },
+        .Int => 0xA401 | 1,
+        .Long => 0xA411 | 1,
+        .Short => 0xA421 | 1,
+        .Byte => 0xA431 | 1,
+        .UInt => 0xA441 | 1,
+        .ULong => 0xA451 | 1,
+        .UShort => 0xA461 | 1,
+        .UByte => 0xA471 | 1,
+        .Double => 0xA481 | 1,
+        .Float => 0xA491 | 1,
+        .Bool => 0xA4A1 | 1,
+        .Char => 0xA4B1 | 1,
         else => return null,
     };
-    var sig = methodArgSig(args) orelse return null;
+    var sig = methodArgSig(self, args) orelse return null;
     if (static_recv != null or declared_recv != null) {
         var h = std.hash.Wyhash.init(0x517cc1b727220a95);
         if (static_recv) |s| h.update(s);
@@ -9903,6 +9945,7 @@ fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?FuncId {
 }
 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(6);
     // A declared lambda-taking overload the intrinsic surface cannot
     // express wins resolution; decline so the walk's extension fallback
     // runs its body (declaration decides, the registry only serves).
@@ -10868,7 +10911,42 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
     candidates.* = filtered;
 }
 
+/// Extension-fn resolution with scope-aware memoization. The winner (or a
+/// confirmed miss) is a pure function of (receiver identity, name, arg sig,
+/// static/declared scope, strict-probe bit) whenever no member-extension
+/// competes for the name — member-extension applicability depends on the
+/// enclosing-`this` chain, so `saw_member_ext` vetoes the store both ways.
+/// The strict bare-name probe folds a scope bit rather than being excluded:
+/// bare accessor calls inside engine methods took the full candidate walk on
+/// every single call (half of a recompose workload's runtime), and a walk
+/// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(3);
+    var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
+        instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv);
+    if (cache_key != null and strict_ext) {
+        cache_key.?.sig ^= 0xA5A5_5A5A_C0DE_F00D;
+        if (cache_key.?.sig == 0) cache_key.?.sig = 1;
+    }
+    if (cache_key) |k| {
+        if (extMethodCacheGet(self, k)) |fid| {
+            if (fid == METHOD_MISS) return null;
+            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+        }
+    }
+    var saw_member_ext = false;
+    const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, &saw_member_ext);
+    if (r == null and !saw_member_ext) {
+        if (cache_key) |k| extMethodCachePut(self, k, METHOD_MISS);
+    }
+    return r;
+}
+
+/// The full extension-candidate walk. `cache_key` is the scope-folded key the
+/// shell computed (null = uncacheable call); `saw_member_ext_out` reports
+/// whether any candidate was a member-extension, which makes the resolution
+/// context-dependent and vetoes both positive and negative memoization.
+fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8, cache_key: ?root_mod.ProgramImage.InstanceMethodKey, saw_member_ext_out: *bool) Allocator.Error!?EvalResult {
     const want = args.len + 1;
     if (missTraceWant(name)) {
         const rk: []const u8 = switch (receiver.*) {
@@ -10900,24 +10978,13 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     // The hot coroutine boundary (`fn.startCoroutineUninterceptedOrReturn`
     // lowered with declared receiver `Function1`) re-walked per call when
     // any declared scope disabled the key outright.
-    const cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
-        if (!strict_ext and static_recv == null)
-            instanceMethodKeyScoped(self, receiver, name, args, null, declared_recv)
-        else
-            null;
-    if (cache_key) |k| {
-        if (extMethodCacheGet(self, k)) |fid| {
-            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
-        }
-    }
-
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
 
     // Whether any candidate for this name is a member-extension (its
     // visibility/selection depends on the enclosing-`this` chain). When one
     // exists the resolution is context-dependent and must not be cached.
-    var saw_member_ext = false;
+    saw_member_ext_out.* = false;
 
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(allocator);
@@ -10992,7 +11059,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
                     continue;
                 }
             }
-            if (isMemberExt(mod, fid)) saw_member_ext = true;
+            if (isMemberExt(mod, fid)) saw_member_ext_out.* = true;
             if (privateFnHiddenHere(self, mod, fid)) {
                 if (mtrace) std.debug.print("[extfb]  fid={d} private-skip\n", .{fid.int()});
                 continue;
@@ -11440,7 +11507,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         // this name and the winner is itself top-level, so the (receiver
         // class, name, arg types) key fully determines the target. A future
         // call hits the fast path above and skips this whole resolution.
-        if (!pushed_owner and !saw_member_ext) {
+        if (!pushed_owner and !saw_member_ext_out.*) {
             if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);

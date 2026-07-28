@@ -910,6 +910,47 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
+THROUGHPUT CAMPAIGN — BREAKTHROUGH (2x, gates pending): the new
+KLIO_OP_PROF opcode sampler (SIGPROF sampling the eval loop's
+"currently executing opcode" threadlocal — immune to the linker's
+identical-code folding that blinded every PC-based profile) attributed
+54% of ALL runtime to route:member-ext-fallback: the extension-function
+candidate walk ran on EVERY call for most of the workload because the
+resolution memo had no key. Three causes, all fixed:
+(1) methodArgSig had no tag for closure arguments — ANY call carrying a
+lambda was uncacheable (all of Compose). Closures now key by body
+identity (arity/receiver/suspend are pure functions of the body — the
+same argument as the existing IrClosure-receiver case); .Function keys
+by decl pointer.
+(2) instanceMethodKeyScoped keyed only Instance/IrClosure/Result
+RECEIVERS — extension calls on IntArray receivers (the gap-buffer
+accessors, ~1.9M walks/run) were unkeyable. Arrays (prim kind folded)
+and the scalar primitives now synthesize odd identities.
+SOUNDNESS LIMIT (measured, not theorized): identities/tags for
+String / List / Set / Map / Sequence / Range were tried and REVERTED —
+each produced deterministic sweep regressions (String: trimStartAndEnd
+mis-trim via String-vs-CharSequence static overloads not always carried
+in declared_recv; List: UnsignedArraysTest `storage` reads; Range:
+CollectionTest `size`; array-элемент content: intersectShort/ByteArray).
+The walk's applicability inspects VALUE CONTENT for container shapes,
+so "typeFqn granularity" is NOT the full resolution input there. Only
+shapes whose applicability is a pure function of the tag (scalars,
+arrays by prim kind, closures by body) are keyable.
+(3) The strict bare-name probe and static-scoped calls disabled the key
+outright, and a walk MISS was never cached. extensionFnFallback is now
+a shell folding a strict-scope bit into the key, consulting the memo
+(METHOD_MISS sentinel for negative entries), and delegating to the
+walk; both positive and negative results memoize under the existing
+!saw_member_ext guard (member-extension applicability depends on the
+enclosing-this chain and still vetoes the store both ways).
+RESULT: ext-fallback 54% → 11% of samples; removeAndInsertWithMoveAway
+0.55s/it → 0.27s/it (Gap AND Link). New profile: member-ladder 19%,
+Call 14%, ext-fallback 11%, stdlib-dispatch 11%, GetField 9% — the
+next round targets the ladder preconditions (recvFnFieldInvoke /
+varargShadowedFieldInvoke probes) and the Call chain. The test still
+needs ~10x total against runTest's 10s budget; the instrument and the
+path are proven.
+
 THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
 ~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget
 gates markInvalidFromBackgroundThread, resumeOnBackgroundThread, and

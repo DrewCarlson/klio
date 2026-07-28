@@ -630,6 +630,97 @@ fn callStatsBump(fqn: []const u8) void {
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* += 1;
 }
+/// Host-route sub-tag names for the op profiler (see `runtime.prof.opRoute`).
+/// Order is the route index contract shared with the host dispatch stages.
+pub const op_route_names = [_][]const u8{
+    "route:member-arg-prep", // 0
+    "route:member-flat-prep", // 1
+    "route:member-ladder", // 2
+    "route:member-ext-fallback", // 3
+    "route:member-invoke-fid", // 4
+    "route:flat-activation", // 5
+    "route:member-stdlib-dispatch", // 6
+};
+
+/// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
+/// names and print the distribution. Lives here because only the IR layer
+/// can name `Inst` tags.
+pub fn opProfDump() void {
+    const counts = runtime.prof.opProfCounts() orelse return;
+    const Entry = struct { name: []const u8, n: u64 };
+    var list: [512]Entry = undefined;
+    var used: usize = 0;
+    var total: u64 = 0;
+    const n_tags = @typeInfo(@typeInfo(Inst).@"union".tag_type.?).@"enum".fields.len;
+    for (counts, 0..) |*slot, i| {
+        const n = slot.load(.monotonic);
+        if (n == 0) continue;
+        total += n;
+        const name: []const u8 = if (i == runtime.prof.OP_OUTSIDE)
+            "<outside-eval>"
+        else if (i < n_tags)
+            @tagName(@as(@typeInfo(Inst).@"union".tag_type.?, @enumFromInt(i)))
+        else if (i >= runtime.prof.OP_ROUTE_BASE and
+            i - runtime.prof.OP_ROUTE_BASE < op_route_names.len)
+            op_route_names[i - runtime.prof.OP_ROUTE_BASE]
+        else
+            "<unknown>";
+        list[used] = .{ .name = name, .n = n };
+        used += 1;
+    }
+    if (total == 0) return;
+    std.mem.sort(Entry, list[0..used], {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[op-prof] {d} samples by opcode:\n", .{total});
+    const ft: f64 = @floatFromInt(total);
+    for (list[0..used]) |e| {
+        const pct = 100.0 * @as(f64, @floatFromInt(e.n)) / ft;
+        if (pct < 0.3) break;
+        std.debug.print("[op-prof] {d:>6.2}%  {d:>9}  {s}\n", .{ pct, e.n, e.name });
+    }
+}
+
+/// Probe channel for the call census: host dispatch stages report the names
+/// that miss their caches, prefixed per stage in a second map.
+var probe_stats: ?std.StringHashMap(u64) = null;
+pub fn callStatsProbe(name: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (probe_stats == null) probe_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = probe_stats.?.getOrPut(name) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+pub fn probeStatsDump() void {
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    const stats = &(probe_stats orelse return);
+    const Entry = struct { fqn: []const u8, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, stats.count()) catch return;
+    defer list.deinit(std.heap.page_allocator);
+    var it = stats.iterator();
+    var total: u64 = 0;
+    while (it.next()) |e| {
+        list.appendAssumeCapacity(.{ .fqn = e.key_ptr.*, .n = e.value_ptr.* });
+        total += e.value_ptr.*;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[probe-stats] total={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| std.debug.print("[probe-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
+}
+
 pub fn callStatsDump() void {
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
@@ -4526,6 +4617,7 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// call runs native code -> `LoopTramp.call` -> `callFunc` and never reaches
 /// here. That path is served by outlining the trampoline's bulky sites.
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
+    if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
         .SuspendResumePoint => {
             // No runtime effect on its own.
@@ -5794,6 +5886,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     defer recv.release(allocator);
     const name_str = constStr(frame.module, cm.name) orelse
         return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
+    runtime.prof.opRoute(0);
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
@@ -5820,15 +5913,18 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // ladder's entry consults; anything else falls through to the ladder.
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
         if (flatEnabled() and argNamesAllNull(cm.arg_names)) {
+            runtime.prof.opRoute(1);
             if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
                 frame.flat_call = prep;
+                runtime.prof.opRoute(5);
                 return .flat_call;
             }
         }
     }
+    runtime.prof.opRoute(2);
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else

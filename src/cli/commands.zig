@@ -206,6 +206,7 @@ pub fn runModuleFiles(
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
+    runtime.prof.opProfMaybeStart();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, paths, features)) |code| return code;
@@ -469,6 +470,7 @@ pub fn runTestFiles(
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
+    runtime.prof.opProfMaybeStart();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
 
@@ -691,6 +693,8 @@ fn runTestsOnBuilt(
     });
     if (runtime.getenvSlice("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     ir.eval.callStatsDump();
+    ir.eval.probeStatsDump();
+    ir.eval.opProfDump();
     return if (report.failed > 0) 1 else 0;
 }
 
