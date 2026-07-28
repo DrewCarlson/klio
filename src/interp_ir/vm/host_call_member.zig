@@ -3670,6 +3670,7 @@ pub fn implicitReceiverForHead(self: *VmHost, allocator: Allocator, receiver: *c
 }
 
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(7);
     if (receiver.* != .Instance) return null;
     const head = recvFnPropHeadOf(self, receiver, name) orelse return null;
     const field_val: Value = blk: {
@@ -3703,6 +3704,7 @@ fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value
 }
 
 fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(8);
     if (receiver.* != .Instance) return null;
     const field_val: Value = blk: {
         const g = receiver.Instance.borrow();
@@ -9666,6 +9668,7 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    runtime.prof.opRoute(9);
     // Inline cache: memoize the (class, method-name, arg-type-signature) →
     // FuncId resolution. The signature captures the argument primitive types the
     // overload pick depends on, so a hit returns the same target the full walk
@@ -11944,6 +11947,7 @@ pub fn callMemberNamedDeclared(self: *VmHost, allocator: Allocator, receiver: *c
 }
 
 fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names_in: []const ?[]const u8, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    runtime.prof.opRoute(10);
     // Receiver-function-typed property invoked as a call (see
     // `recvFnFieldInvoke` on the static ladder): the stored lambda runs
     // with the owning instance as its receiver.

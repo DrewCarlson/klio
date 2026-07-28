@@ -944,12 +944,25 @@ walk; both positive and negative results memoize under the existing
 !saw_member_ext guard (member-extension applicability depends on the
 enclosing-this chain and still vetoes the store both ways).
 RESULT: ext-fallback 54% → 11% of samples; removeAndInsertWithMoveAway
-0.55s/it → 0.27s/it (Gap AND Link). New profile: member-ladder 19%,
-Call 14%, ext-fallback 11%, stdlib-dispatch 11%, GetField 9% — the
-next round targets the ladder preconditions (recvFnFieldInvoke /
-varargShadowedFieldInvoke probes) and the Call chain. The test still
-needs ~10x total against runTest's 10s budget; the instrument and the
-path are proven.
+0.55s/it → 0.27s/it (Gap AND Link). Post-2x profile with the ladder
+split into route sub-tags (markers 7-10 added): recv-fn-field 16%
+(recvFnPropHeadOf's supertype walk heads EVERY member-call ladder;
+a (class,name)-keyed memo was tried and REVERTED — its fast path
+(name-identity intern + two borrows + map get) costs as much as the
+1-2-hop walk it replaces, no wall change), Call 13.6%, <outside-eval>
+12.6%, stdlib-dispatch 10.5%, ext-fallback 9.6%, GetField 8.5%,
+vararg-shadow 2.9%, ir-method-walk 2.6%, flat-activation 2.4%.
+NEXT ROCK (from this distribution): frame machinery — <outside-eval> +
+Call + flat-activation ≈ 28% is call setup/teardown (Frame register
+slab alloc/free, args ArrayList builds, try_stack init, activation
+push/pop), best attacked with frame pooling / stack-allocated small
+frames, plus reordering recvFnFieldInvoke behind the instance-method
+cache probe (fn-typed props are rare; Kotlin resolves member functions
+ahead of property-invoke anyway). A per-call-site inline cache was
+also tried and reverted earlier — the flat path's per-call cost is
+already ~1% — so frame overhead, not resolution, is the remaining
+member-call cost. The stress tests need ~5x more against runTest's
+10s budget.
 
 THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
 ~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget

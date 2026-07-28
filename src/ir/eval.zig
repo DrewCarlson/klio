@@ -640,6 +640,10 @@ pub const op_route_names = [_][]const u8{
     "route:member-invoke-fid", // 4
     "route:flat-activation", // 5
     "route:member-stdlib-dispatch", // 6
+    "route:recv-fn-field", // 7
+    "route:vararg-shadow", // 8
+    "route:ir-method-walk", // 9
+    "route:member-named-inner", // 10
 };
 
 /// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
