@@ -842,23 +842,26 @@ fn typeStableFromMap(map: *const std.StringHashMap(Stability), t: *const TypeRef
 /// No registry (`active_stability == null`) keeps the legacy all-stable
 /// behavior for direct unit-test callers.
 fn fnIsSkippable(f: *const Function, in_class: bool, enclosing_class: ?[]const u8) bool {
-    const map = active_stability orelse return true;
-    if (f.receiver_type) |*rt| {
-        if (!typeStableFromMap(map, rt, f.type_params)) return false;
-    }
-    if (in_class) {
-        const ec = enclosing_class orelse return false;
-        switch (map.get(ec) orelse Stability.unstable) {
-            .unstable => return false,
-            else => {},
-        }
-    }
-    for (f.params) |*p| {
-        if (p.is_vararg) continue; // keeps its own always-recompose arm
-        if (isComposableLambdaParam(p)) continue;
-        if (!typeStableFromMap(map, &p.ty, f.type_params)) return false;
+    _ = in_class;
+    _ = enclosing_class;
+    // STRONG SKIPPING (the reference default): every restartable composable
+    // is skippable regardless of parameter stability — unstable parameters
+    // and receivers compare by INSTANCE (`changedInstance`, see the probe
+    // emission) while stable ones keep the structural `changed`. Only an
+    // explicit `@NonSkippableComposable` opts a function out.
+    for (f.annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "NonSkippableComposable")) return false;
     }
     return true;
+}
+
+/// The probe method for a parameter under strong skipping: structural
+/// `changed` for a stable type, identity `changedInstance` for an unstable
+/// one (a mutated model object with the same identity still skips).
+fn probeMethodFor(ty: *const ast.TypeRef, tps: []const ast.TypeParam) []const u8 {
+    const map = active_stability orelse return "changed";
+    return if (typeStableFromMap(map, ty, tps)) "changed" else "changedInstance";
 }
 
 /// Transform every `@Composable` top-level function in `decls` in place,
@@ -1162,9 +1165,13 @@ pub fn transformComposableFunction(
         };
         try out.append(a, .{ .Decl = .{ .Property = dirty_prop } });
         if (f.receiver_type != null or in_class) {
+            const recv_probe: []const u8 = if (f.receiver_type) |*rt|
+                probeMethodFor(rt, f.type_params)
+            else
+                "changedInstance";
             try out.append(a, dirtyOrProbe(b, b.callMember(
                 b.pathExpr(composer_param),
-                "changed",
+                recv_probe,
                 b.slice1(.{ .This = .{ .qualifier = null, .span = b.gen_span } }),
             )));
         }
@@ -1184,7 +1191,7 @@ pub fn transformComposableFunction(
             }
             const probe = dirtyOrProbe(b, b.callMember(
                 b.pathExpr(composer_param),
-                "changed",
+                probeMethodFor(&p.ty, f.type_params),
                 b.slice1(b.pathExpr(p.name.name)),
             ));
             if (p.default != null and f.body != null) {
@@ -4034,8 +4041,8 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     var body_stmts = [_]Stmt{};
     var ctx: u8 = 0;
 
-    // @Composable fun Show(m: Model) — restartable but NOT skippable:
-    // no $dirty, no changed() probe, shouldExecute(true, $changed and 1).
+    // @Composable fun Show(m: Model) — STRONG SKIPPING: the unstable param
+    // keeps the skip calculus but probes by IDENTITY (changedInstance).
     var unstable_params = [_]Param{.{
         .name = dummyIdent("m"),
         .ty = testTypeRef("Model"),
@@ -4049,16 +4056,14 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     const show = emptyFn("Show", &unstable_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     const out = try transformComposableFunction(a, &show, allComposable, &ctx, null, false, null, null);
     const stmts = out.body.?.Block.stmts;
-    // startRestartGroup + shouldExecute-if + endRestartGroup (no $dirty decl,
-    // no probes).
-    try testing.expectEqual(@as(usize, 3), stmts.len);
-    const cond = stmts[1].Expr.If.cond.Call;
-    try testing.expectEqualStrings("shouldExecute", cond.callee.Member.name.name);
-    try testing.expect(cond.args[0].BoolLit.value);
-    // The pause argument reads $changed (there is no $dirty).
-    try testing.expectEqualStrings(changed_param, cond.args[1].Call.callee.Member.receiver.Path.segments[0].name);
+    // startRestartGroup + $dirty + changedInstance probe + skip-if +
+    // endRestartGroup.
+    try testing.expectEqual(@as(usize, 5), stmts.len);
+    try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
+    const probe_call = stmts[2].Assign.value.Call.args[0].If.cond.Call;
+    try testing.expectEqualStrings("changedInstance", probe_call.callee.Member.name.name);
     // The restart re-call is still emitted.
-    try testing.expectEqualStrings("updateScope", stmts[2].Expr.Call.callee.Member.name.name);
+    try testing.expectEqualStrings("updateScope", stmts[4].Expr.Call.callee.Member.name.name);
 
     // @Composable fun ShowInt(x: Int) keeps the probe + $dirty calculus.
     var stable_params = [_]Param{.{
