@@ -13137,16 +13137,21 @@ test "selected composable parameters bind named and trailing lambdas exactly" {
     try testing.expectEqual(@as(usize, 4), selected.args.len);
     try testing.expect(selected.args[0] == .Call);
     try testing.expectEqual(@as(usize, 5), selected.args[0].Call.args.len);
-    const wrapped_top_bar = selected.args[0].Call.args[2];
+    // The memo wrap re-attaches the callee-derived label around the block.
+    const wrapped_top_bar_arg = selected.args[0].Call.args[2];
+    try testing.expect(wrapped_top_bar_arg == .Labeled);
+    const wrapped_top_bar = wrapped_top_bar_arg.Labeled.expr.*;
     try testing.expect(wrapped_top_bar == .Lambda);
     try testing.expectEqual(@as(usize, 2), wrapped_top_bar.Lambda.params.len);
     try testing.expectEqualStrings("$composer", wrapped_top_bar.Lambda.params[0].name);
     try testing.expectEqualStrings("$changed", wrapped_top_bar.Lambda.params[1].name);
-    try testing.expect(selected.args[1] == .Lambda);
-    try testing.expectEqual(@as(usize, 3), selected.args[1].Lambda.params.len);
-    try testing.expectEqualStrings("padding", selected.args[1].Lambda.params[0].name);
-    try testing.expectEqualStrings("$composer", selected.args[1].Lambda.params[1].name);
-    try testing.expectEqualStrings("$changed", selected.args[1].Lambda.params[2].name);
+    const content_arg = selected.args[1];
+    try testing.expect(content_arg == .Call);
+    const content_lam = content_arg.Call.args[2].Labeled.expr.*;
+    try testing.expectEqual(@as(usize, 3), content_lam.Lambda.params.len);
+    try testing.expectEqualStrings("padding", content_lam.Lambda.params[0].name);
+    try testing.expectEqualStrings("$composer", content_lam.Lambda.params[1].name);
+    try testing.expectEqualStrings("$changed", content_lam.Lambda.params[2].name);
 }
 
 test "member-or-global emission binds a composable trailing lambda by parameter" {

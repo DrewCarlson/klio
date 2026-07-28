@@ -2281,7 +2281,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
             std.debug.print("    {d}: {s}", .{ ii, @tagName(std.meta.activeTag(inst.*)) });
             switch (inst.*) {
                 .LoadGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
-                .GetField => |x| std.debug.print(" field={s}", .{constStr(module, x.field) orelse "?"}),
+                .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int() }),
                 .CallMember => |x| std.debug.print(" name={s} recv=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int() }),
