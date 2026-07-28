@@ -612,8 +612,19 @@ threadlocal var spin_check_counter: u64 = 0;
 
 /// Diagnostic: print the live frame chain (as the spin tracer does), for an
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
+/// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
+/// diagnostic path, and `getenvSlice` takes a global mutex per call. The env
+/// is set at launch; a mid-run change is not observed (benign data race:
+/// both racers store the same verdict).
+var err_trace_state: u8 = 0;
+pub fn errTraceOn() bool {
+    if (err_trace_state == 0)
+        err_trace_state = if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) 2 else 1;
+    return err_trace_state == 2;
+}
+
 pub fn dumpFrameChainForDiag() void {
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    if (!errTraceOn()) return;
     dumpCurrentFrameParamsForDiag();
     dumpFrameChainForDiagAlways();
 }

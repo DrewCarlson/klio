@@ -9908,19 +9908,27 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // runs its body (declaration decides, the registry only serves).
     if (declaredLambdaOverloadWins(self, name, args)) return null;
     const type_fqn = receiver.typeFqn();
-    // Resolution cache: for a non-`Instance`, non-array-builder receiver, the
-    // winning intrinsic (or "none") is a pure function of (type, name,
-    // args-empty), so memoize it and skip the per-call probe building + repeated
-    // `lookupIntrinsic` borrows. Instance receivers vary by `hostHasMember` per
-    // instance and are not cached; array builders use a different (no-prepend)
-    // dispatch and are excluded.
-    const cacheable = receiver.* != .Instance and !stdlib.isArrayBuilder(name) and
+    // Resolution cache: the winning intrinsic (or "none") is a pure function
+    // of (type, name, args-empty), so memoize it and skip the per-call probe
+    // building + repeated `lookupIntrinsic` borrows. A non-Instance receiver
+    // keys by its (static) type-fqn pointer. An Instance's typeFqn is not
+    // class-specific, so it keys by class-cell identity instead — the same
+    // identity `host_has_member_cache` uses, and everything the uncached body
+    // consults for an Instance (hostHasMember, the shadow probes) is a
+    // function of the class, not the individual instance. Array builders use
+    // a different (no-prepend) dispatch and are excluded.
+    const cacheable = !stdlib.isArrayBuilder(name) and
         !(try userToplevelExtNamedExists(self, allocator, receiver, name));
     if (cacheable) {
         const name_p = memberNameIdentity(self, name) orelse
             return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+        const type_p: usize = if (receiver.* == .Instance) blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        } else @intFromPtr(type_fqn.ptr);
         const key: root_mod.ProgramImage.MemberResolveKey = .{
-            .type_p = @intFromPtr(type_fqn.ptr),
+            .type_p = type_p,
             .name_p = name_p,
             .args_empty = args.len == 0,
         };

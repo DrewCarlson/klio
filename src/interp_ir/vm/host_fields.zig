@@ -1360,43 +1360,88 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // (a bare `min(x, y)` callee in a receiver context is the package
     // function, not a member of the implicit receiver).
     if (!probe_is_toplevel_fn and !stdlib.isBinaryMathFunction(name)) {
-        const probes = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
-            try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
-            try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}),
-            try std.fmt.allocPrint(allocator, "kotlin.math.{s}", .{name}),
-            try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}),
+        // The winning probe (or confirmed "none") is a pure function of
+        // (receiver type, name): memoize it on the program image so a hot
+        // property read skips the five allocPrint+lookupIntrinsic probes.
+        const cache_key: ?root.ProgramImage.MemberHasKey = blk: {
+            const pg = self.prog.borrowMut();
+            defer pg.deinit();
+            const tp = pg.get().memberNameIdentity(type_fqn) orelse break :blk null;
+            const np = pg.get().memberNameIdentity(name) orelse break :blk null;
+            break :blk .{ .class_p = tp, .name_p = np };
         };
-        defer for (probes) |p| allocator.free(p);
-        for (probes) |probe| {
-            // A bare UPPERCASE name read as a field is a companion/type
-            // reference (`Char` in value position inside a method); the
-            // root `kotlin.<Name>` binding for such a name is the type's
-            // CONSTRUCTOR/conversion intrinsic, never a property — invoking
-            // it with the receiver converts the receiver (Type error).
-            // Type-qualified constant probes (`kotlin.Int.MAX_VALUE`) stay.
-            if (name.len > 0 and std.ascii.isUpper(name[0])) {
-                const dot = std.mem.lastIndexOfScalar(u8, probe, '.') orelse 0;
-                if (std.mem.eql(u8, probe[0..dot], "kotlin")) continue;
+        var resolved: ?root.ProgramImage.MemberResolveEntry = null;
+        var have_verdict = false;
+        if (cache_key) |key| {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            if (pg.get().field_probe_cache.get(key)) |entry| {
+                have_verdict = true;
+                if (entry.func != null) resolved = entry;
             }
-            if (lookupIntrinsic(self, probe)) |func| {
-                const args = [_]Value{receiver.*};
-                const r = try dispatchIntrinsic(self, allocator, probe, func, &args);
-                // A strict member probe must not surface a `Type` error from an
-                // intrinsic that does not apply to this receiver — e.g. the
-                // `kotlin.math.absoluteValue` intrinsic dispatched on a
-                // StringBuilder (a `$sgetter$<owner>` read probed against a
-                // scope-function receiver). That is a probe miss, not a member
-                // whose accessor threw; report it as `.Unimplemented` so the
-                // resolver walks on to the enclosing receiver. Outside a probe
-                // the read was already bound to this receiver, so the error
-                // (a genuine wrong-type access) propagates as before.
-                if (member_probe and r == .err and r.err == .Type) {
-                    ir.eval.dumpFrameChainForDiag();
-                    return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, type_fqn }) });
+        }
+        if (!have_verdict) {
+            const probes = [_][]const u8{
+                try std.fmt.allocPrint(allocator, "{s}.{s}", .{ type_fqn, name }),
+                try std.fmt.allocPrint(allocator, "kotlin.collections.{s}", .{name}),
+                try std.fmt.allocPrint(allocator, "kotlin.text.{s}", .{name}),
+                try std.fmt.allocPrint(allocator, "kotlin.math.{s}", .{name}),
+                try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name}),
+            };
+            defer for (probes) |p| allocator.free(p);
+            var winner: ?struct { fqn: []const u8, func: StdlibFn } = null;
+            for (probes) |probe| {
+                // A bare UPPERCASE name read as a field is a companion/type
+                // reference (`Char` in value position inside a method); the
+                // root `kotlin.<Name>` binding for such a name is the type's
+                // CONSTRUCTOR/conversion intrinsic, never a property — invoking
+                // it with the receiver converts the receiver (Type error).
+                // Type-qualified constant probes (`kotlin.Int.MAX_VALUE`) stay.
+                if (name.len > 0 and std.ascii.isUpper(name[0])) {
+                    const dot = std.mem.lastIndexOfScalar(u8, probe, '.') orelse 0;
+                    if (std.mem.eql(u8, probe[0..dot], "kotlin")) continue;
                 }
-                return r;
+                if (lookupIntrinsic(self, probe)) |func| {
+                    winner = .{ .fqn = probe, .func = func };
+                    break;
+                }
             }
+            if (cache_key) |key| {
+                const pg = self.prog.borrowMut();
+                defer pg.deinit();
+                const cache = &pg.get().field_probe_cache;
+                if (!cache.contains(key)) {
+                    if (winner) |w| {
+                        const stored = cache.allocator.dupe(u8, w.fqn) catch null;
+                        if (stored) |sf| {
+                            cache.put(key, .{ .func = w.func, .fqn = sf }) catch cache.allocator.free(sf);
+                        }
+                    } else {
+                        cache.put(key, .{ .func = null, .fqn = "" }) catch {};
+                    }
+                }
+            }
+            if (winner) |w| resolved = .{ .func = w.func, .fqn = try allocator.dupe(u8, w.fqn) };
+            // The probes buffer frees on scope exit; `resolved.fqn` for the
+            // uncached-winner case is the request-lifetime dupe made above.
+        }
+        if (resolved) |entry| {
+            const args = [_]Value{receiver.*};
+            const r = try dispatchIntrinsic(self, allocator, entry.fqn, entry.func.?, &args);
+            // A strict member probe must not surface a `Type` error from an
+            // intrinsic that does not apply to this receiver — e.g. the
+            // `kotlin.math.absoluteValue` intrinsic dispatched on a
+            // StringBuilder (a `$sgetter$<owner>` read probed against a
+            // scope-function receiver). That is a probe miss, not a member
+            // whose accessor threw; report it as `.Unimplemented` so the
+            // resolver walks on to the enclosing receiver. Outside a probe
+            // the read was already bound to this receiver, so the error
+            // (a genuine wrong-type access) propagates as before.
+            if (member_probe and r == .err and r.err == .Type) {
+                ir.eval.dumpFrameChainForDiag();
+                return errRes(.{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, type_fqn }) });
+            }
+            return r;
         }
     }
     // Class-delegation forwarding for property reads. Forward only the
@@ -1707,7 +1752,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null)
+    if (ir.eval.errTraceOn())
         std.debug.print("[getfield-miss] name={s} recv={s}\n", .{ name, tf });
     ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::get_field `{s}` on `{s}`", .{ name, tf });

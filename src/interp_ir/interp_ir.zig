@@ -188,6 +188,12 @@ pub const ProgramImage = struct {
     /// is a pure function of the key). Method names are canonicalized through
     /// `member_names` before their pointer identity enters any dispatch cache.
     member_resolve_cache: std.AutoHashMap(MemberResolveKey, MemberResolveEntry),
+    /// Winning intrinsic (or confirmed "none") for `get_field`'s stdlib
+    /// property probe ladder, keyed by (receiver type-fqn identity, name
+    /// identity). The ladder builds five prefix FQNs and runs a
+    /// `lookupIntrinsic` per probe on EVERY non-stored-field property read of
+    /// a built-in receiver; the winner is a pure function of the key.
+    field_probe_cache: std.AutoHashMap(MemberHasKey, MemberResolveEntry),
     /// Program-lifetime canonical storage for method names used by the dispatch
     /// caches below. Most calls carry an IR-interned name, but a callable
     /// reference reads its name from a collected runtime String. Allocator reuse
@@ -349,6 +355,7 @@ pub const ProgramImage = struct {
             .any_member_globals = std.StringHashMap([]const u8).init(allocator),
             .resolved_linked = false,
             .member_resolve_cache = std.AutoHashMap(MemberResolveKey, MemberResolveEntry).init(allocator),
+            .field_probe_cache = std.AutoHashMap(MemberHasKey, MemberResolveEntry).init(allocator),
             .member_names = std.StringHashMap(void).init(allocator),
             .instance_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .runtime_virtual_cache = std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget).init(allocator),
@@ -393,6 +400,11 @@ pub const ProgramImage = struct {
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
         }
         self.member_resolve_cache.deinit();
+        {
+            var it = self.field_probe_cache.valueIterator();
+            while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
+        }
+        self.field_probe_cache.deinit();
         {
             var it = self.member_names.keyIterator();
             while (it.next()) |name| self.allocator.free(name.*);
