@@ -176,6 +176,17 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     }
 
     if (std.mem.eql(u8, ty.name, "KClass")) return value.* == .Class;
+    // `x is Enum<*>`: every enum entry is an instance of a class registered
+    // with `is_enum` (kotlin.Enum is its implicit supertype).
+    if (std.mem.eql(u8, ty.name, "Enum")) {
+        if (value.* == .Instance) {
+            const g = value.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            if (cg.get().is_enum) return true;
+        }
+    }
     if (std.mem.eql(u8, ty.name, "EnumEntries")) {
         return switch (value.*) {
             .List => |l| l.enum_entries,
