@@ -910,7 +910,33 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 133/148,
+CURRENT STANDING (post this stretch): CompositionTests 137/148,
+MovableContentTests 42/44, RecomposerTests 11/12. Since the 133
+snapshot: earlyComposableUnitReturn + test_returnConditionally_
+simulatedIf (NLR value-first + injector label + marker-block skip +
+runtime-receiver-proof override with self-repick guard), strong
+skipping (composableWithUnstableParameters_skipped; @NonSkippable
+Composable now honored explicitly), testRemember_Forget_ForgetOn
+Remember (fourth name-shift emitter: explicit-receiver member form).
+REMAINING 11 CompositionTests: testInsertOnMultipleLevels (this-
+capture lowering gap, see NAME-CLASH below), subcomposition pair
+(testModificationsPropagateToSubcomposition "expected changes but
+none" — write during recompose must invalidate the subcomposition
+next frame; testParentCompositionRecomposesFirst — secondSet runs
+twice, parent/child recompose ordering + dedup),
+test_returnConditionally_fromLambda_nonLocal (inline-chain NLR
+Start/end imbalance at initial composition), funInterface_isMemoized
+(kotlinc plain-lambda memoization: remember non-composable lambda
+args with stable captures — unimplemented feature),
+slotsAreUsedCorrectly_forEach (collectAsState slots collide across
+spliced-loop iterations after content shrinks; the non-restartable
+replace-group wrap matches kotlinc but regressed CompositionReusing
+25→23 and was reverted — the reuse machinery must learn the group
+first), PausableCompositionTests 5 (canPauseContent iteration 7 vs 9:
+two pause points missing — pause-point parity between klio's
+shouldExecute emission and the reference; plus two background-thread
+tests and rememberObserverThrashing). Old standing below:
+(was) CompositionTests 133/148,
 MovableContentTests 42/44, RecomposerTests 11/12 (validatePotentialDeadlock
 only; pausingTheFrameClock* remains an in-suite flake). Landed since the
 125 snapshot: loop replace-group bracketing (test_remember_in_a_loop),
