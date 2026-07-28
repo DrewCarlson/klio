@@ -943,9 +943,18 @@ recomposePaused resume only the first pending scope and requeue the
 rest (matching the observed reference arithmetic) and check the whole
 Pausable family. Two background-thread tests + rememberObserverThrashing
 ride on the same family.
-Plus MovableContentTests 2 (moveContent_subcompose double-insert,
-removeAndInsertWithMoveAway infinite recompose) and the deadlock/
-frame-clock flakes. Old:
+Plus MovableContentTests 2: moveContent_subcompose — "Inserting a
+view named Row into a view named Row which already has a parent named
+Row": when \`position\` moves the movable content from the main
+composition into a subcomposition, the DESTINATION inserts the
+content's node tree while the SOURCE composition never extracted it —
+the cross-composition exchange (Recomposer.movableContentReference /
+releaseMovableContent / insertMovableContentGuarded +
+deferredChanges) does not hand the nodes over; probe which side
+diverges by logging reportFreeMovableContent/releaseMovableContent and
+the insert path's node reuse in a position-flip run. And
+removeAndInsertWithMoveAway (infinite recompose, ~80s wall). Plus the
+deadlock/frame-clock threading flakes. Old:
 (was) CompositionTests 142/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since 141:
 testInsertOnMultipleLevels FIXED — the this-capture gap was actually an
