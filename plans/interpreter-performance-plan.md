@@ -955,14 +955,28 @@ so the release ops recorded for the deleted movable group never
 execute), movableContentStateReleased NEVER fires (state never
 available), and the destination's supposedly-FRESH compose (pairing
 second==null) still inserts the ORIGINAL still-parented Row instance.
-Two klio divergences to chase: (1) why main's recompose change list is
-empty when a movable group is deleted — the
-releaseMovableGroupAtCurrent/reportGroup ops should be IN it, making
-recompose() true and queueing main for apply; (2) why fresh-composed
-movable content reuses the source's node instances — node identity is
-leaking through the movable group's slot data into the fresh-compose
-path (likely the slot-preserving movable reference carrying node
-slots the destination's ComposeNode reuse path then adopts). And
+RESOLVED HYPOTHESIS (all probes consistent): the failure is at the
+MOVE frame, thrown INSIDE main's recompose before recompose() returns
+(zero [rc] Gap-recompose prints because the exception aborts first —
+the probe fires on return; verified live on testSimpleSkipping).
+Chain: position write re-runs main's invalidated content scope;
+`Subcompose { … }` should SKIP (its memoized content is unchanged and
+its own scope's requiresRecompose is false → dirty==0 && skipping),
+but klio RE-EXECUTES it — recreating the UNREMEMBERED
+`Composition(...)` + setContent (a fresh composition @5e9 appears in
+the [mv] trace next to the original @2fe/@3ce), whose initial insert
+re-inserts the still-parented movable nodes → "already has a parent".
+WHY Subcompose re-executes: its scope's requiresRecompose is TRUE —
+the `position` read that belongs to the INNER composition (made
+during the inline setContent → composeInitial while Subcompose was
+composing) is attributed to Subcompose's OUTER scope. Suspect klio's
+snapshot-read attribution uses the ambient composer / outer
+currentRecomposeScope during a nested inline composeInitial instead of
+the child composer's scope. NEXT: probe RecomposeScopeImpl
+observation recording during the inline setContent (print which scope
+records the position read in the initial frame); if the outer scope
+records it, fix the ambient-composer push (or read-observer scoping)
+around CompositionImpl.setContent's inline composeInitial. And
 removeAndInsertWithMoveAway (infinite recompose, ~80s wall). Plus the
 deadlock/frame-clock threading flakes. Old:
 (was) CompositionTests 142/148,
