@@ -1678,6 +1678,10 @@ const Walker = struct {
     /// Threaded scope only ($composer must be in scope); entry-point sinks
     /// in plain scope stay raw (invokeComposable wraps the root itself).
     fn wrapInComposableLambda(w: *Walker, arg: *Expr) void {
+        w.wrapInComposableLambdaLabeled(arg, null);
+    }
+
+    fn wrapInComposableLambdaLabeled(w: *Walker, arg: *Expr, label: ?[]const u8) void {
         const key = positionalKey(exprSpanOf(arg));
         // `rememberComposableLambda(key, tracked, block)` threaded with the
         // composer pair: `rememberComposableLambda(key, true, block, $composer,
@@ -1687,7 +1691,25 @@ const Walker = struct {
         const args = w.a.alloc(Expr, 5) catch @panic("oom");
         args[0] = w.b.intLit(key);
         args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
-        args[2] = arg.*;
+        // Wrapping re-parents the lambda under the memo call, which would
+        // strip its callee-derived implicit label — a `return@PWrap` inside
+        // then unwound past ComposableLambdaImpl.invoke and left the restart
+        // group open. Re-attach the label explicitly (`lbl@ { … }`).
+        if (label) |lb| {
+            if (arg.* == .Lambda) {
+                const inner = w.a.create(Expr) catch @panic("oom");
+                inner.* = arg.*;
+                args[2] = .{ .Labeled = .{
+                    .label = w.b.ident(lb),
+                    .expr = inner,
+                    .span = w.b.gen_span,
+                } };
+            } else {
+                args[2] = arg.*;
+            }
+        } else {
+            args[2] = arg.*;
+        }
         args[3] = w.composerRef();
         args[4] = w.b.intLit(0);
         arg.* = w.b.call(w.b.pathExprSegs(&remember_composable_lambda_path), args);
@@ -2264,7 +2286,7 @@ const Walker = struct {
                         if (w.thread and emit_lambda_memo and
                             !calleeInlinesLambda(name.?))
                         {
-                            w.wrapInComposableLambda(arg);
+                            w.wrapInComposableLambdaLabeled(arg, name.?);
                             // The wrapped argument is no longer a lambda:
                             // bind it by the sink's last-parameter name so a
                             // defaulted middle parameter cannot absorb it
@@ -2801,7 +2823,7 @@ pub fn transformResolvedComposableLambda(
     // where the reference (same remembered instance, equal write elided by
     // the snapshot policy) settles in one frame.
     if (emit_lambda_memo and !callee_inline) {
-        w.wrapInComposableLambda(arg);
+        w.wrapInComposableLambdaLabeled(arg, label);
     }
     return true;
 }
@@ -3436,7 +3458,7 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     try testing.expectEqual(@as(usize, 5), memo.args.len);
     // The threaded composer pair trails the (key, tracked, block) triple.
     try testing.expectEqualStrings(composer_param, memo.args[3].Path.segments[0].name);
-    const lam = memo.args[2].Lambda;
+    const lam = memo.args[2].Labeled.expr.Lambda;
     // The sink lambda had only the synthetic `it`; it is replaced by
     // ($composer, $changed), not appended after.
     try testing.expectEqual(@as(usize, 2), lam.params.len);
@@ -4079,7 +4101,7 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     // The sink lambda is memoized by TYPE (rememberComposableLambda(key,
     // tracked, block, $composer, 0)); the shaped lambda is the block arg.
     const wrapped = call.Call.args[0].Call;
-    const lam = wrapped.args[2].Lambda;
+    const lam = wrapped.args[2].Labeled.expr.Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
@@ -4159,7 +4181,7 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     // Memoized by TYPE: the content lambda rides inside
     // rememberComposableLambda(key, tracked, block, $composer, 0).
     const wrapped = call.args[call.args.len - 1].Call;
-    const lam = wrapped.args[2].Lambda;
+    const lam = wrapped.args[2].Labeled.expr.Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
