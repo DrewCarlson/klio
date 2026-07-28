@@ -949,21 +949,21 @@ subcomposition's scope).
 (compositionLocalsShouldBeAvailable), subcompose double-insert
 (moveContent_subcompose), infinite-recompose guard
 (removeAndInsertWithMoveAway).
-(5) NAME-CLASH remainder: testRemember_Forget_ForgetOnRemember — the
-validator `this.Composition(a = true, b = false, c = false)` executes
-the local ext lambda with vector [this=true, a=validator, b=false,
-c=false]: the receiver landed at INDEX 1 with the names shifted, i.e.
-some invoke route builds [args[0], recv, args[1:]] or binds shifted
-names over a receiver-prepended vector. Ruled out: the bare local-ext
-CallValue emitter (now null-shifts its names), lowerSelectedLocal
-OverloadCall (already shifts), and CallValue routes generally (no 3/4-
-arg [cvt-instr] fires for the call). The deferred `validate { }` block
-now lowers with its MockViewValidator receiver recorded
-(recordLambdaArgReceivers on the committed-candidate path), which
-fixed 2 of the call sites' overload selection; the remaining route is
-a member-form serve that reaches the ext closure without the shift —
-find WHICH host invoke binds it (not CallValue, not invokeMethodFuncId
-by NU trace).
+(5) NAME-CLASH: FIXED for testRemember_Forget_ForgetOnRemember — four
+emitters prepended the local-ext receiver as value slot 0 without
+null-shifting the arg-name list (bare, capture, mangled-cell, and
+explicit-receiver member forms); all shift now, and KLIO_THIS_TRAP=1
+prints any frame that binds a Bool/Int into a leading `this` param.
+REMAINING: testInsertOnMultipleLevels — `validateItem(number, numbers)`
+called from a destructuring-loop lambda that never captured `this`
+(dump #20412: caps=[items, validateItem], plain CallValue, runtime
+Null-pads and shifts). Runtime receiver-recovery heuristics (prepending
+the enclosing receiver when the first arg disproves the receiver type)
+fixed this case but misbound OTHER shapes (StringTest.commonSuffixWith
+default-omission; validateNumbers got a List receiver) — reverted. The
+root fix is LOWERING-side: a lambda whose body bare-calls a local ext
+fn must capture `this` (transitively through nested lambdas) so the
+capture arm can prepend the receiver statically.
 (6) COROUTINE-LIFECYCLE flakes: validatePotentialDeadlock +
 movableContentInvalidatedWhileDeleted_linkComposer ("daemon task
 abandoned at run boundary"), pausingTheFrameClock* (passes solo).
