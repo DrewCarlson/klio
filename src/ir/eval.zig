@@ -2223,7 +2223,27 @@ pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args
 /// every `host.method(...)` is a comptime-duck-typed direct call.
 pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value), host: *H) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
+    boolThisTrap(func, args.items);
     return evalWithCaptures(H, allocator, module, func, args, .empty, host);
+}
+
+/// `KLIO_THIS_TRAP=1`: print every frame entry that binds a Bool into a
+/// `this` parameter — the ext-receiver misbind signature — with the caller.
+pub fn boolThisTrap(func: *const Func, args: []const Value) void {
+    if (runtime.getenvSlice("KLIO_THIS_TRAP") == null) return;
+    if (func.params.len == 0 or args.len == 0) return;
+    if (!std.mem.eql(u8, func.params[0].name, "this")) return;
+    if (args[0] != .Bool and args[0] != .Int) return;
+    const cf = currentFrameFunc();
+    std.debug.print("[this-trap] fn={s}#{d} nargs={d} caller={s}#{d} vals:", .{
+        func.fqn,
+        func.id.int(),
+        args.len,
+        if (cf) |c| c.fqn else "<none>",
+        if (cf) |c| c.id.int() else 0,
+    });
+    for (args) |a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a))});
+    std.debug.print("\n", .{});
 }
 
 /// `KLIO_DUMP_FN=<name>`: print the named function's lowered instruction
@@ -2377,6 +2397,7 @@ pub fn evalWithCapturesChained(
     host: *H,
 ) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
+    boolThisTrap(func, args.items);
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);
@@ -2840,6 +2861,7 @@ fn snapshotSuspendedFrame(
 /// construction with the arg buffer transferred as params, GC chain push,
 /// lexical receiver-chain activation, context-parameter seeding).
 fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
+    boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
     const act = try allocator.create(Activation);
