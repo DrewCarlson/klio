@@ -910,8 +910,19 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 125/148,
-MovableContentTests 41/44, RecomposerTests 10/12
+CURRENT STANDING (post this stretch): CompositionTests 133/148,
+MovableContentTests 42/44, RecomposerTests 11/12 (validatePotentialDeadlock
+only; pausingTheFrameClock* remains an in-suite flake). Landed since the
+125 snapshot: loop replace-group bracketing (test_remember_in_a_loop),
+local fn/property namespace split (testRememberAddedAndRemovedInALoop),
+committed-id serve past a bounded candidate set + named pair completion
+across the defaults gap (testRestartOfDefaultFunctions,
+remember_defaultParamInRestartableFunction), local-class property
+machinery — init thunks see primary params, accessor `field` targets raw
+backing storage (composeNodeSetVsUpdate), `is Enum<*>` instance test
+(enumCompositeKey(s)ShouldBeStable), and lambda-body assign/decl scanning
+in branchHasComposable (testCompoundKeyHashCodeStaysTheSameAfter
+Recompositions + one MovableContent test)
 (+testMultipleRecompose via default-filled pair padding in closure
 calls), probes all green, sweep 0 on every commit. The remaining
 failures cluster into DEEP families:
