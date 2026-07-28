@@ -1235,8 +1235,6 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
             const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-            if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
-                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
             return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }
@@ -2116,9 +2114,7 @@ fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value
     if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
         const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
         const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-        if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
-                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
-            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+        return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
     }
     return null;
 }
@@ -2560,8 +2556,6 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         if (raw) |d| {
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-            if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
-                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
             return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }

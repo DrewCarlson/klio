@@ -6919,8 +6919,15 @@ fn anyLocalFnOverloadApplicable(
 ) Allocator.Error!bool {
     outer: for (ovs) |*ov| {
         if (ov.is_ext) {
-            const receiver = b.recvTypeRef() orelse return false;
-            if (!try localOverloadReceiverCouldApply(b, ov, receiver)) continue;
+            // A statically known receiver type adjudicates; a scope with a
+            // REACHABLE `this` but no threaded type (a nested lambda inside
+            // the local ext's own body) keeps the candidate UNPROVEN — only
+            // a genuinely receiver-less scope drops it.
+            if (b.recvTypeRef()) |receiver| {
+                if (!try localOverloadReceiverCouldApply(b, ov, receiver)) continue;
+            } else if (b.resolve("this") == null and !b.knowsOuter("this") and !b.capturesThisSlot()) {
+                return false;
+            }
         }
         if (args.len < ov.n_required and !ov.has_vararg) continue;
         if (args.len > ov.param_tys.len and !ov.has_vararg) continue;
