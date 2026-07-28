@@ -1282,31 +1282,107 @@ pub fn transformThreadedComposable(
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };
     const body = f.body orelse return signatureOnly(f, params);
+    // A non-restartable composable still owns a REPLACE GROUP (kotlinc wraps
+    // its body in startReplaceableGroup(key)/end): each invocation's slots
+    // live inside that group, so repeated calls in a spliced loop
+    // (`people.forEach { it.collectAsState() … }`) reconcile as same-key
+    // siblings instead of splatting slots into the caller and colliding when
+    // the iteration content changes. `@ReadOnlyComposable` and
+    // `@ExplicitGroupsComposable` bodies stay groupless (matching kotlinc),
+    // and inline composables splice into their caller.
+    const value_returning = (f.return_type != null and
+        !std.mem.eql(u8, f.return_type.?.name.name, "Unit")) or
+        (f.body != null and f.body.? == .Expr and f.return_type == null);
+    // Engine slot primitives manage their own slot/bracket protocol — the
+    // memo wrap (`rememberComposableLambda`) stores into the CALLER's group
+    // by design (a child group broke deactivateToEndGroup), and `key`'s
+    // movable bracket is emitted at the call site.
+    const grpwrap_excluded = std.mem.eql(u8, f.name.name, "rememberComposableLambda") or
+        std.mem.eql(u8, f.name.name, "key");
+    const wrap_group = value_returning and !f.is_inline and !isExplicitGroups(f) and
+        !isReadOnlyComposable(f) and !grpwrap_excluded;
+    if (wrap_group and dbg_groups) std.debug.print("[compose-pass] grpwrap {s}\n", .{f.name.name});
+    const group_key = positionalKey(f.span);
     switch (body) {
         .Block => |blk| {
-            const stmts = try a.alloc(Stmt, pp.prologue.len + blk.stmts.len);
-            @memcpy(stmts[0..pp.prologue.len], pp.prologue);
-            @memcpy(stmts[pp.prologue.len..], blk.stmts);
-            for (stmts) |*s| try w.walkStmt(s);
+            const extra: usize = if (wrap_group) 2 else 0;
+            const stmts = try a.alloc(Stmt, pp.prologue.len + blk.stmts.len + extra);
+            const off: usize = if (wrap_group) 1 else 0;
+            if (wrap_group) {
+                stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "startReplaceGroup", b.slice1(b.intLit(group_key))) };
+            }
+            @memcpy(stmts[off .. off + pp.prologue.len], pp.prologue);
+            @memcpy(stmts[off + pp.prologue.len .. off + pp.prologue.len + blk.stmts.len], blk.stmts);
+            for (stmts[off .. off + pp.prologue.len + blk.stmts.len]) |*s| try w.walkStmt(s);
+            if (wrap_group) {
+                stmts[stmts.len - 1] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "endReplaceGroup", try a.alloc(Expr, 0)) };
+                var inj = EpilogueInjector{ .a = a, .b = b, .fn_name = f.name.name, .value_params = &.{}, .has_restart = false, .replace_depth = 1 };
+                try inj.stmts(stmts[off .. off + pp.prologue.len + blk.stmts.len]);
+            }
             return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = blk.span } });
         },
         .Expr => |e| {
             var ne = e;
             try w.walkExpr(&ne);
-            if (pp.prologue.len == 0) return withBody(f, params, .{ .Expr = ne });
-            // A value-returning single-expression body gains the prologue as a
-            // block; the expression becomes an explicit `return`.
-            const stmts = try a.alloc(Stmt, pp.prologue.len + 1);
-            @memcpy(stmts[0..pp.prologue.len], pp.prologue);
-            for (stmts[0..pp.prologue.len]) |*s| try w.walkStmt(s);
-            stmts[pp.prologue.len] = .{ .Expr = .{ .Return = .{
-                .value = b.box(ne),
+            if (!wrap_group) {
+                if (pp.prologue.len == 0) return withBody(f, params, .{ .Expr = ne });
+                const stmts = try a.alloc(Stmt, pp.prologue.len + 1);
+                @memcpy(stmts[0..pp.prologue.len], pp.prologue);
+                for (stmts[0..pp.prologue.len]) |*s| try w.walkStmt(s);
+                stmts[pp.prologue.len] = .{ .Expr = .{ .Return = .{
+                    .value = b.box(ne),
+                    .label = null,
+                    .span = b.gen_span,
+                } } };
+                return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = f.span } });
+            }
+            // `{ start; <prologue>; val $grp$v = <expr>; end; return $grp$v }`
+            const result_name = try std.fmt.allocPrint(a, "$grp$v{x}", .{@as(u64, @bitCast(group_key))});
+            const result_prop = try a.create(ast.Property);
+            result_prop.* = .{
+                .mutable = false,
+                .name = b.ident(result_name),
+                .receiver_type = null,
+                .ty = null,
+                .init = ne,
+                .delegate = null,
+                .getter = null,
+                .setter = null,
+                .is_abstract = false,
+                .is_open = false,
+                .is_override = false,
+                .is_lateinit = false,
+                .is_const = false,
+                .is_inline = false,
+                .is_expect = false,
+                .is_actual = false,
+                .setter_visibility = null,
+                .visibility = .Public,
+                .annotations = &.{},
+                .span = b.gen_span,
+            };
+            const stmts = try a.alloc(Stmt, pp.prologue.len + 4);
+            stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "startReplaceGroup", b.slice1(b.intLit(group_key))) };
+            @memcpy(stmts[1 .. 1 + pp.prologue.len], pp.prologue);
+            for (stmts[1 .. 1 + pp.prologue.len]) |*s| try w.walkStmt(s);
+            stmts[1 + pp.prologue.len] = .{ .Decl = .{ .Property = result_prop } };
+            stmts[2 + pp.prologue.len] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "endReplaceGroup", try a.alloc(Expr, 0)) };
+            stmts[3 + pp.prologue.len] = .{ .Expr = .{ .Return = .{
+                .value = b.box(b.pathExpr(result_name)),
                 .label = null,
                 .span = b.gen_span,
             } } };
             return withBody(f, params, .{ .Block = .{ .stmts = stmts, .span = f.span } });
         },
     }
+}
+
+fn isReadOnlyComposable(f: *const Function) bool {
+    for (f.annotations) |ann| {
+        if (ann.path.len == 0) continue;
+        if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "ReadOnlyComposable")) return true;
+    }
+    return false;
 }
 
 /// Recursive in-place body transformer. Within a `@Composable` function body it
