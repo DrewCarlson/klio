@@ -928,14 +928,21 @@ re-invalidates the child, alreadyComposed blocks its trailing re-add, so
 the leftover compositionInvalidations entry recomposes it AGAIN next
 frame. The reference recomposes PARENT first (its apply re-invalidates
 the child before the child's own wave, so one recompose consumes both).
-The fix is ordering: when draining compositionInvalidations into
-toRecompose, parents must precede their children — the Recomposer's
-knownCompositions registration order (parent compositions register
-before their subcompositions) is the ordering key; sort the wave by it,
-or drain via knownCompositionsLocked() filtered by the invalidation
-set. Verified: MutableVector.removeIf and ScatterSet identity work
-correctly in isolation (scratch mvec.kt/scatter.kt), so it is purely
-arrival order.),
+REFUTED: a [rcm] probe shows the wave order IS parent-first
+([record parent, child], [wave parent, child]) and MutableVector.
+removeIf / ScatterSet identity are fine. The extra recompose therefore
+comes from a RE-invalidation after the child's wave-1 compose: the
+parent's deferred APPLY runs ComposableLambdaImpl.update(block) with a
+fresh content-closure instance, `_block != block` invalidates the
+child's scopes, and the next frame recomposes it again. NEXT PROBE:
+print in ComposableLambdaImpl.update whether the incoming block equals
+the stored one during this test, and compare against what identity the
+reference would see (kotlinc lambda instances are also fresh per run —
+so the reference's no-op must come from update NOT being reached, i.e.
+the child's content lambda IS remember-stable in the reference via the
+caller's rememberComposableLambda; check whether klio re-wraps the
+content in a NEW ComposableLambdaImpl each parent recompose instead of
+returning the remembered one).),
 test_returnConditionally_fromLambda_nonLocal (inline-chain NLR
 Start/end imbalance at initial composition), funInterface_isMemoized
 (kotlinc plain-lambda memoization: remember non-composable lambda
