@@ -910,6 +910,22 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
+REMAINING-RED CLASSIFICATION (measured with the coroutine-test timeout
+raised to 120-600s and the wall cap to 600s):
+- markInvalidFromBackgroundThread: PASSES in 27s — correct, purely
+  throughput-bound against the harness's 10s coroutine-test cap (~3x).
+- resumeOnBackgroundThread: PASSES in 256s — correct, throughput-bound
+  (~26x against the caps; 1000 nested W/Text under a background resume
+  loop).
+- validatePotentialDeadlock: round-probed — the repeat(10) advance
+  loop PROGRESSES at ~167s per round (each advanceTimeBy(5000) replays
+  thousands of virtual frames x a 200-Text recompose while the test's
+  two deliberate infinite invalidation loops churn), projecting ~1700s
+  total vs the 600s cap (~20x). Correct, purely throughput-bound —
+  NO deadlock and NO livelock remains anywhere in the family.
+These ride the CI ratchet's tolerated pool; greening the two
+throughput ones is the long-horizon interpreter-speed campaign below.
+
 removeAndInsertWithMoveAway FIXED (gates pending) — it was NEVER a
 throughput failure. With the coroutine-test timeout raised to 120s and
 the wall cap to 600s it still failed deterministically at Link
