@@ -927,11 +927,21 @@ the three C's from D:1's round batch differently) where the reference
 takes one scope per round. The divergence is in the
 pausedScopes→invalidScopes handoff / doCompose invalidation-visit
 batching, not in shouldExecute (9 consults, all pausing=true,
-resuming=false — matches). Next: probe the reference-side arithmetic —
-print the invalidScopes SIZE per resume round and compare against what
-one-scope-per-round would produce; then find why klio's
-performRecompose visits several pending scopes per pass where the
-reference defers. Two background-thread tests + rememberObserverThrashing
+resuming=false — matches). Round arithmetic measured ([pr] probe): klio rounds carry
+invalidScopes sizes [1,1,2,1,3] + initial = 7; one-scope-per-round
+over the same sets gives exactly 9 = the reference count. So the
+reference resumes ONE pending scope per recomposePaused round even
+when several are pending, while klio's performRecompose visits every
+invalidated scope in one pass. recordModificationsOf's
+`value is RecomposeScopeImpl -> invalidateForResult(null)` invalidates
+all, so the one-per-round behavior must come from the resume/change-
+list machinery (startResumingScope / endResumingScope ordering or an
+invalidation deferral for still-paused sibling scopes). Next: probe
+which scopes actually EXECUTE per round on the reference semantics —
+instrument scope.paused/resuming transitions per round, or make
+recomposePaused resume only the first pending scope and requeue the
+rest (matching the observed reference arithmetic) and check the whole
+Pausable family. Two background-thread tests + rememberObserverThrashing
 ride on the same family.
 Plus MovableContentTests 2 (moveContent_subcompose double-insert,
 removeAndInsertWithMoveAway infinite recompose) and the deadlock/
