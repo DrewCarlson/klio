@@ -7080,7 +7080,17 @@ fn lowerSelectedLocalExtCallWithReceiver(
     vals[0] = recv;
     for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
     const args_start = try packContiguous(b, vals);
-    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    // The receiver rides as slot 0: shift the arg-name list one slot right,
+    // or a named call (`this.Composition(a = true, ...)`) labels the RECEIVER
+    // "a" and every binding misaligns.
+    const shifted: []const ?[]const u8 = blk: {
+        if (ast_arg_names.len == 0) break :blk ast_arg_names;
+        const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+        sh[0] = null;
+        @memcpy(sh[1..], ast_arg_names);
+        break :blk sh;
+    };
+    const arg_names = try internArgNames(b.allocator, b.module, shifted);
     const dst = b.allocReg();
     try b.push(.{ .CallValue = .{
         .dst = dst,
@@ -7309,7 +7319,17 @@ fn lowerValueInvocation(
             vals[0] = recv;
             for (args, 0..) |*a, i| vals[i + 1] = try lowerExpr(b, a);
             const args_start = try packContiguous(b, vals);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            // The receiver rides as slot 0: shift the arg-name list one slot
+            // right, or a named call (`Composition(a = true, ...)`) labels
+            // the RECEIVER "a" and every binding misaligns.
+            const shifted: []const ?[]const u8 = blk: {
+                if (ast_arg_names.len == 0) break :blk ast_arg_names;
+                const sh = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+                sh[0] = null;
+                @memcpy(sh[1..], ast_arg_names);
+                break :blk sh;
+            };
+            const arg_names = try internArgNames(b.allocator, b.module, shifted);
             const dst = b.allocReg();
             try b.push(.{ .CallValue = .{
                 .dst = dst,
