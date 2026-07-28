@@ -2210,7 +2210,13 @@ const Walker = struct {
                         if (!w.thread and emit_lambda_memo and (is_mco or is_mcwro)) {
                             w.wrapInComposableLambdaInstance(arg);
                         }
-                        if (w.thread and emit_lambda_memo and w.branchHasComposable(arg) and
+                        // Wrap by TYPE, not content: the sink's parameter is
+                        // declared @Composable, so kotlinc memoizes the lambda
+                        // regardless of what its body does — an unwrapped
+                        // `TestSubcomposition { results += x }` passed a fresh
+                        // instance every parent recompose and re-invalidated
+                        // the subcomposition through rememberUpdatedState.
+                        if (w.thread and emit_lambda_memo and
                             !calleeInlinesLambda(name.?))
                         {
                             w.wrapInComposableLambda(arg);
@@ -2726,7 +2732,15 @@ pub fn transformResolvedComposableLambda(
         .thread = true,
     };
     try w.transformComposableLambda(lam, expected_params, label);
-    if (emit_lambda_memo and !callee_inline and w.branchHasComposable(arg)) {
+    // Wrap by TYPE, not content: the callee's parameter is declared
+    // @Composable, so kotlinc memoizes the lambda regardless of what its
+    // body does. A content-only heuristic left `TestSubcomposition {
+    // results += secondState }` unwrapped — every parent recompose then
+    // passed a FRESH instance, `rememberUpdatedState(content)` recorded a
+    // real state change, and the subcomposition recomposed a second time
+    // where the reference (same remembered instance, equal write elided by
+    // the snapshot policy) settles in one frame.
+    if (emit_lambda_memo and !callee_inline) {
         w.wrapInComposableLambda(arg);
     }
     return true;
