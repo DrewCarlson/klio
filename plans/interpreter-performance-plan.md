@@ -910,7 +910,18 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 137/148,
+CURRENT STANDING (post this stretch): CompositionTests 140/148,
+MovableContentTests 42/44, RecomposerTests 11/12. Since 137: sink
+lambdas memoized by declared TYPE with the implicit label re-attached
+inside the wrap (testParentCompositionRecomposesFirst,
+test_returnConditionally_fromLambda_nonLocal + kept the whole family
+green), and plain-lambda memoization — remember(captures) { lambda }
+for non-composable lambda args with capture-fact analysis
+(funInterface_isMemoized). REMAINING 8: testInsertOnMultipleLevels
+(this-capture), testModificationsPropagateToSubcomposition
+(value-position lambda typing), slotsAreUsedCorrectly_forEach,
+5 Pausable (resume-round batching + thread tests). Old standing:
+(was) CompositionTests 137/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since the 133
 snapshot: earlyComposableUnitReturn + test_returnConditionally_
 simulatedIf (NLR value-first + injector label + marker-block skip +
