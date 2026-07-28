@@ -910,7 +910,37 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 145/148,
+CURRENT STANDING (post this stretch): CompositionTests 146/148,
+MovableContentTests 43/44, RecomposerTests 11/12. Since 145:
+rememberObserverThrashing FIXED — the abandon machinery was already
+correct (right count, right dispatch); the WRONG NAMES came from an
+interpreter capture bug: an object literal built inside a lambda fills
+a field initialized from a captured mutable local with the local's
+SHARED CELL, so every later read (the RememberObserver's
+"Abandon($name)") saw the local's current value instead of the
+construction-time snapshot (probe: [Remember(B), Abandon(B)x3] vs the
+reference [Remember(B), Abandon(A)x2, Abandon(B)]; minimal repro
+objcap6.kt printed B/CC for an A/AB program). Fix in host_instances:
+snapshotCapture derefs .Cell values at the body-property field fill and
+the evalSuperArg direct path, so construction snapshots while methods
+keep reading the live cell (Kotlin capture-by-reference preserved).
+Verified: repros print A/AB, probe events match reference, test passes,
+zigcheck interp_ir 117/117, sweep 0/117, standalone CompositionTests
+146/148. REMAINING 2 (+2 elsewhere): all THROUGHPUT-bound stress tests —
+markInvalidFromBackgroundThread (1000 invalidate+resume rounds vs the
+10s runTest cap), resumeOnBackgroundThread (1000 nested W/Text +
+background resume loop vs the 90s wall cap), removeAndInsertWithMoveAway
+(200 move/delete iterations, constant ~0.6s/it, needs ~200s+ vs 90s),
+and the RecomposerTests deadlock/frame-clock flake family. The perf
+lead (10s sample of removeAndInsert): string-keyed dispatch dominates —
+mem.eqlBytes+wyhash+hashmap getIndex ~25%+ of interpreter self-time,
+lookupIntrinsic's 5-allocPrint probe ladder runs per field-access miss
+(getFieldInner ancestry), and member_resolve_cache EXCLUDES all
+.Instance receivers (the entire compose workload takes
+stdlibMemberDispatchUncached). Next: a (class fqn, name) resolution memo
+for the field-miss ladder + extending the member-resolve cache to
+Instance receivers keyed by class identity.
+(was) CompositionTests 145/148,
 MovableContentTests 43/44, RecomposerTests 11/12. Since 143:
 canPauseContent + canPauseReusableContent FIXED — the resume-round
 divergence was NEVER in the recomposePaused batching. Scope-identity

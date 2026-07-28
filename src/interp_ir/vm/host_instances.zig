@@ -3541,6 +3541,23 @@ fn findCapture(pairs: []const NameValue, name: []const u8) ?Value {
     return null;
 }
 
+/// A captured mutable local arrives as its shared cell. A field or super-arg
+/// initialized from it must SNAPSHOT the content at construction — storing the
+/// cell makes every later read see the local's current value (`val name = key`
+/// in an object literal built inside a lambda tracked `key` live).
+fn snapshotCapture(v: Value) Value {
+    switch (v) {
+        .Cell => |c| {
+            const g = c.borrow();
+            defer g.deinit();
+            const inner = g.get().*;
+            inner.retain();
+            return inner;
+        },
+        else => return v,
+    }
+}
+
 /// Is `expr` a bare one-segment name the captured scope can resolve
 /// directly — a captured local, or a field of the captured enclosing
 /// `this`? Exactly these are filled without a thunk at instance build;
@@ -4209,7 +4226,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 } else if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
                     const nm = init_expr.Path.segments[0].name;
                     if (findCapture(capture_pairs, nm)) |cv| {
-                        v = cv;
+                        v = snapshotCapture(cv);
                     } else if (findCapture(capture_pairs, "this")) |tv| {
                         if (tv == .Instance) {
                             const ig = tv.Instance.borrow();
@@ -4566,7 +4583,7 @@ fn evalSuperArg(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, capt
     if (try simpleLiteral(allocator, expr)) |v| return v;
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const nm = expr.Path.segments[0].name;
-        if (findCapture(capture_pairs, nm)) |v| return v;
+        if (findCapture(capture_pairs, nm)) |v| return snapshotCapture(v);
         // A bare class/interface name in value position resolves to its
         // companion object — e.g. the CEH factory's
         // `AbstractCoroutineContextElement(CoroutineExceptionHandler)` passes
