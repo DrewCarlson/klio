@@ -911,6 +911,36 @@ could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
 CURRENT STANDING (post this stretch): CompositionTests 143/148,
+MovableContentTests 43/44, RecomposerTests 11/12. Since 42/44:
+moveContent_subcompose FIXED — the read-attribution hypothesis was
+wrong (probes showed the childrenComposing guard works and no read ever
+landed on Subcompose's scope). The re-execution was a FRESH INSERT:
+upstream startRestartGroup == startReplaceGroup + scope, and replace
+groups delete-on-mismatch. `if (position == inMain) content()` with
+`content` a movableContentOf VAL got NO branch groups — the val wasn't
+classified composable ("P12 retired name-keyed factory classification"),
+so branchHasComposable missed the invoke and the conditional emitted
+neither the then-group bracket nor the synthesized empty else. On the
+move frame the stale then-group (holding the movable content) sat where
+Subcompose's restart group started; the replace path deleted it and
+fresh-inserted Subcompose (new scope, new unremembered Composition,
+double insert of the still-parented movable nodes). Fix in
+compose_pass: a `movable_vals` set (vals initialized from
+movableContentOf/movableContentWithReceiverOf) feeding ONLY the branch
+scan — classifying into composable_vals (pair threading) regressed
+invalidationsMoveWithContent into infinite recomposition, so the narrow
+set is deliberate. wrapStatementConditional also synthesizes the empty
+else itself now, `when` statements without an else arm gain a synthetic
+else group, and wrapBranchInReplaceGroup is idempotent (guards the
+already-wrapped synthetic else against double-wrapping, whose
+preserve_tail hoist would unbalance groups). Verified:
+moveContent_subcompose PASSES both composers, invalidationsMoveWithContent
+PASSES, sweep 0/117. removeAndInsertWithMoveAway is NO LONGER an
+infinite recompose — Gap phase passes all 100 move/delete iterations;
+it now fails on THROUGHPUT (~2.5 it/s Gap, ~1.2 it/s Link; Link alone
+projects ~85s against the 90s wall cap and runTest's 10s ceiling) —
+a performance problem, pace-decay measurement pending.
+(was) CompositionTests 143/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since 142:
 testModificationsPropagateToSubcomposition FIXED — the pass records
 vals declared MutableState<@Composable fn>/State<...> and wraps both

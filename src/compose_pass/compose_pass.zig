@@ -1440,6 +1440,13 @@ const Walker = struct {
     /// `$composer=`/`$changed=` args cannot bind it). Function calls keep
     /// the named pair for the defaulted-marker machinery.
     composable_vals: ?*std.StringHashMap(void) = null,
+    /// Vals initialized from `movableContentOf`/`movableContentWithReceiverOf`.
+    /// Their bare invokes compose (the factory returns a `@Composable` lambda)
+    /// but keep the runtime-completed call protocol, so the name feeds ONLY the
+    /// branch scan: an `if (…) content()` must still get branch groups and the
+    /// synthesized empty else, or a branch flip deletes the sibling group that
+    /// moves into its slot.
+    movable_vals: ?*std.StringHashMap(void) = null,
     /// Ambient mode: the scope is a `@Composable` property GETTER, which has
     /// no `$composer` param. Composer references resolve through the
     /// `__compose_currentComposer` host intrinsic instead.
@@ -1664,6 +1671,24 @@ const Walker = struct {
                     // value's protocol wants it.
                     break :blk false;
                 };
+                if (!holds_composable) {
+                    if (p.init) |*ini3| {
+                        if (ini3.* == .Call) {
+                            if (calleeSimpleName(ini3.Call.callee)) |cn| {
+                                if (std.mem.eql(u8, cn, "movableContentOf") or
+                                    std.mem.eql(u8, cn, "movableContentWithReceiverOf"))
+                                {
+                                    if (w.movable_vals == null) {
+                                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                                        set.* = std.StringHashMap(void).init(w.a);
+                                        w.movable_vals = set;
+                                    }
+                                    try w.movable_vals.?.put(p.name.name, {});
+                                }
+                            }
+                        }
+                    }
+                }
                 if (holds_composable) {
                     // The name joins BOTH sets: `locals` feeds every
                     // established consumer (nested transforms, branch
@@ -1884,7 +1909,8 @@ const Walker = struct {
                     const is_local = w.locals != null and w.locals.?.contains(nm);
                     const is_val = w.composable_vals != null and w.composable_vals.?.contains(nm);
                     const is_sink = w.sinks != null and w.sinks.?.contains(nm);
-                    if (is_lp or is_local or is_val or is_sink or w.oracle(w.oracle_ctx, nm)) return true;
+                    const is_movable = w.movable_vals != null and w.movable_vals.?.contains(nm);
+                    if (is_lp or is_local or is_val or is_sink or is_movable or w.oracle(w.oracle_ctx, nm)) return true;
                 }
                 if (w.branchHasComposable(c.callee)) return true;
                 for (c.args) |*a| if (w.branchHasComposable(a)) return true;
@@ -2002,16 +2028,43 @@ const Walker = struct {
                         } else {
                             w.wrapBranchBoxed(eb);
                         }
+                    } else {
+                        // A conditional whose false path emits no group leaves
+                        // a positional hole: on the false frame the stale
+                        // then-group sits where the next sibling's replace or
+                        // restart group starts, and the replace-on-mismatch
+                        // path deletes it and re-inserts everything after.
+                        // Emit an empty replaceable group for the false path,
+                        // as the Compose plugin does.
+                        f.else_branch = w.emptyReplaceGroupBlock(f.span);
                     }
                 }
             },
             .When => |*wh| {
                 var any = false;
+                var has_else = false;
                 for (wh.branches) |*br| {
                     if (w.branchHasComposable(&br.body)) any = true;
+                    for (br.patterns) |p| {
+                        if (p.kind == .Else) has_else = true;
+                    }
                 }
                 if (any) {
                     for (wh.branches) |*br| w.wrapBranchBoxed(&br.body);
+                    if (!has_else) {
+                        // Same positional hole as an else-less `if`: a when
+                        // statement matching no branch must still emit a group.
+                        const nb = w.a.alloc(ast.WhenBranch, wh.branches.len + 1) catch @panic("oom");
+                        @memcpy(nb[0..wh.branches.len], wh.branches);
+                        const pats = w.a.alloc(ast.WhenPattern, 1) catch @panic("oom");
+                        pats[0] = .{ .kind = .Else, .span = wh.span };
+                        nb[wh.branches.len] = .{
+                            .patterns = pats,
+                            .body = w.emptyReplaceGroupBlock(wh.span).*,
+                            .span = wh.span,
+                        };
+                        wh.branches = nb;
+                    }
                 }
             },
             else => {},
@@ -2159,6 +2212,19 @@ const Walker = struct {
         arg.* = w.b.call(w.b.pathExpr("remember"), rem_args);
     }
 
+    /// `{ $composer.startReplaceGroup(<span key>); $composer.endReplaceGroup() }`
+    /// — the group a conditional's untaken path must still occupy.
+    fn emptyReplaceGroupBlock(w: *Walker, sp: Span) *Expr {
+        const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
+        start_args[0] = w.b.intLit(positionalKey(sp));
+        const stmts = w.a.alloc(ast.Stmt, 2) catch @panic("oom");
+        stmts[0] = .{ .Expr = w.b.callMember(w.composerRef(), "startReplaceGroup", start_args) };
+        stmts[1] = .{ .Expr = w.b.callMember(w.composerRef(), "endReplaceGroup", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        const e = w.a.create(Expr) catch @panic("oom");
+        e.* = .{ .Block = .{ .stmts = stmts, .span = sp } };
+        return e;
+    }
+
     fn wrapBranchBoxed(w: *Walker, branch: *Expr) void {
         if (branch.* == .Block) {
             if (branch.Block.stmts.len != 0 and
@@ -2228,6 +2294,8 @@ const Walker = struct {
     fn wrapBranchInReplaceGroup(w: *Walker, branch: *Expr) void {
         if (branch.* != .Block) return;
         const blk = &branch.Block;
+        if (blk.stmts.len != 0 and
+            isComposerCallStmt(&blk.stmts[0], "startReplaceGroup")) return;
         const key = positionalKey(blk.span);
         if (dbg_groups) std.debug.print("[compose-pass] replace-group key={d} stmts={d}\n", .{ key, blk.stmts.len });
         const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
