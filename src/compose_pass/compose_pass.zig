@@ -2375,18 +2375,61 @@ const Walker = struct {
                 // A non-local `return@label` unwinds past composable calls whose
                 // groups were opened after the target scope started; close them
                 // first with `$composer.endToMarker($marker)`, mirroring the
-                // compiler's epilogue. Emitted as `{ endToMarker(m); <return> }`.
+                // compiler's epilogue. The return VALUE composes inside the
+                // still-open groups (`return@compose Text("true")`), so it
+                // evaluates into a temp BEFORE the marker close:
+                // `{ val $nlr$v = <value>; endToMarker(m); return $nlr$v }`.
                 if (w.thread) if (w.nlrReturnMarker(r.label)) |marker_var| {
-                    const ret_copy = try w.a.create(Expr);
-                    ret_copy.* = e.*;
-                    const stmts = try w.a.alloc(Stmt, 2);
-                    stmts[0] = .{ .Expr = w.b.callMember(
-                        w.composerRef(),
-                        "endToMarker",
-                        w.b.slice1(w.b.pathExpr(marker_var)),
-                    ) };
-                    stmts[1] = .{ .Expr = ret_copy.* };
-                    e.* = .{ .Block = .{ .stmts = stmts, .span = w.b.gen_span } };
+                    if (r.value) |rv| {
+                        const tmp_name = try std.fmt.allocPrint(w.a, "$nlr$v{x}", .{@intFromPtr(e)});
+                        const tmp_prop = try w.a.create(ast.Property);
+                        tmp_prop.* = .{
+                            .mutable = false,
+                            .name = w.b.ident(tmp_name),
+                            .receiver_type = null,
+                            .ty = null,
+                            .init = rv.*,
+                            .delegate = null,
+                            .getter = null,
+                            .setter = null,
+                            .is_abstract = false,
+                            .is_open = false,
+                            .is_override = false,
+                            .is_lateinit = false,
+                            .is_const = false,
+                            .is_inline = false,
+                            .is_expect = false,
+                            .is_actual = false,
+                            .setter_visibility = null,
+                            .visibility = .Public,
+                            .annotations = &.{},
+                            .span = w.b.gen_span,
+                        };
+                        var ret_copy = e.Return;
+                        const new_val = try w.a.create(Expr);
+                        new_val.* = w.b.pathExpr(tmp_name);
+                        ret_copy.value = new_val;
+                        const stmts = try w.a.alloc(Stmt, 3);
+                        stmts[0] = .{ .Decl = .{ .Property = tmp_prop } };
+                        stmts[1] = .{ .Expr = w.b.callMember(
+                            w.composerRef(),
+                            "endToMarker",
+                            w.b.slice1(w.b.pathExpr(marker_var)),
+                        ) };
+                        stmts[2] = .{ .Expr = .{ .Return = ret_copy } };
+                        e.* = .{ .Block = .{ .stmts = stmts, .span = w.b.gen_span } };
+                    } else {
+                        const ret_copy = try w.a.create(Expr);
+                        ret_copy.* = e.*;
+                        const stmts = try w.a.alloc(Stmt, 2);
+                        stmts[0] = .{ .Expr = w.b.callMember(
+                            w.composerRef(),
+                            "endToMarker",
+                            w.b.slice1(w.b.pathExpr(marker_var)),
+                        ) };
+                        stmts[1] = .{ .Expr = ret_copy.* };
+                        e.* = .{ .Block = .{ .stmts = stmts, .span = w.b.gen_span } };
+                    }
                 };
             },
             .Throw => |*t| try w.walkExpr(t.value),
@@ -2516,7 +2559,11 @@ const Walker = struct {
         // lambda's restart group belongs to ComposableLambdaImpl, so only
         // replace-groups close here.
         {
-            var inj = EpilogueInjector{ .a = w.a, .b = w.b, .fn_name = "", .value_params = &.{}, .has_restart = false };
+            // The lambda's own implicit label (`return@compose` inside the
+            // `compose { }` content) is a LOCAL return for the injector: it
+            // must close the replace-groups opened inside this body, exactly
+            // like a bare `return` in a fn body.
+            var inj = EpilogueInjector{ .a = w.a, .b = w.b, .fn_name = label orelse "", .value_params = &.{}, .has_restart = false };
             try inj.stmts(lam.body.stmts);
         }
     }
@@ -2757,6 +2804,13 @@ const EpilogueInjector = struct {
     }
 
     fn block(self: *EpilogueInjector, blk: *ast.Block) std.mem.Allocator.Error!void {
+        // A marker-close block the walker already emitted for a non-local
+        // return (`{ …; $composer.endToMarker(m); return@label }`) closes
+        // every open group down to the target scope itself — injecting
+        // per-bracket endReplaceGroup calls on top would double-close.
+        for (blk.stmts) |*st| {
+            if (isComposerCallStmt(st, "endToMarker")) return;
+        }
         // A branch block the walker wrapped opens a replace-group; a return
         // inside must close it too.
         const wrapped = blk.stmts.len != 0 and isComposerCallStmt(&blk.stmts[0], "startReplaceGroup");
