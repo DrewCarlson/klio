@@ -923,7 +923,19 @@ capture lowering gap, see NAME-CLASH below), subcomposition pair
 (testModificationsPropagateToSubcomposition "expected changes but
 none" — write during recompose must invalidate the subcomposition
 next frame; testParentCompositionRecomposesFirst — secondSet runs
-twice, parent/child recompose ordering + dedup),
+twice: klio recomposes the CHILD in wave 1, the parent's recompose then
+re-invalidates the child, alreadyComposed blocks its trailing re-add, so
+the leftover compositionInvalidations entry recomposes it AGAIN next
+frame. The reference recomposes PARENT first (its apply re-invalidates
+the child before the child's own wave, so one recompose consumes both).
+The fix is ordering: when draining compositionInvalidations into
+toRecompose, parents must precede their children — the Recomposer's
+knownCompositions registration order (parent compositions register
+before their subcompositions) is the ordering key; sort the wave by it,
+or drain via knownCompositionsLocked() filtered by the invalidation
+set. Verified: MutableVector.removeIf and ScatterSet identity work
+correctly in isolation (scratch mvec.kt/scatter.kt), so it is purely
+arrival order.),
 test_returnConditionally_fromLambda_nonLocal (inline-chain NLR
 Start/end imbalance at initial composition), funInterface_isMemoized
 (kotlinc plain-lambda memoization: remember non-composable lambda
