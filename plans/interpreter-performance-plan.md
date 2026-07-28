@@ -910,6 +910,32 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
+removeAndInsertWithMoveAway FIXED (gates pending) — it was NEVER a
+throughput failure. With the coroutine-test timeout raised to 120s and
+the wall cap to 600s it still failed deterministically at Link
+iteration 3.6 in 52s: "Potentially infinite recomposition". The [apw]
+probe showed the stuck hasPendingWork bit was snapshotInvalidations=1
+with the drain visibly running AFTER the failed check. The chain: the
+harness advance's sendApplyNotifications resumes the recomposer's
+workContinuation via Kotlin `Continuation.resumeWith` → the scheduler
+dispatches and runs it → the FINAL hop (KlioContinuation.resumeWith →
+coroutineResumeContinuation) tried the inline path WITHOUT the
+kotlin_resume_delivery flag, and after ~2048 chained resumes of the
+stress loop the per-turn inline budget (INLINE_TURN_BUDGET, reset only
+when the pump turns — it does not during an advance) was exhausted, so
+the resume was re-queued onto the pump's ready queue, which
+advanceTimeBy never drains. FIX: the kotlin_resume_delivery flag now
+spans the inline attempt, and a Kotlin-level resume is exempt from the
+per-turn cap (it is already ordered and budgeted by its dispatcher's
+own queue — upstream parity: a dispatched resume always executes when
+its dispatcher runs it; the nesting INLINE_CHAIN_BUDGET still applies,
+and native hand-off loops keep the cap). Also added: DriverWakeup.turns
++ a bounded two-turn wait on cross-thread Kotlin posts (dormant in this
+test, aimed at the background-thread family). Verified: 200/200
+iterations PASS on both composers. markInvalidFromBackgroundThread,
+resumeOnBackgroundThread, validatePotentialDeadlock still fail (their
+own multi-thread mechanisms — next).
+
 THROUGHPUT CAMPAIGN — BREAKTHROUGH (2x, gates pending): the new
 KLIO_OP_PROF opcode sampler (SIGPROF sampling the eval loop's
 "currently executing opcode" threadlocal — immune to the linker's

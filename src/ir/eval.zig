@@ -2165,8 +2165,30 @@ const Frame = struct {
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
         }
-        coerceIntArgsToLong(func, params.items);
-        coerceGenericIntPeersToLong(module, func, params.items);
+        // The coercion walks trigger only on specific declared param shapes;
+        // compute once per func which can ever apply (filled in place under
+        // the same benign-race convention as `fast_call`).
+        var plan = func.coerce_plan;
+        if (plan == 0) {
+            plan = 1;
+            for (func.params) |*p| {
+                if (!p.is_vararg and !p.ty.nullable and std.mem.eql(u8, p.ty.name, "Long")) {
+                    plan |= 2;
+                    break;
+                }
+            }
+            if (func.params.len >= 2) {
+                for (func.params) |*p| {
+                    if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
+                        plan |= 4;
+                        break;
+                    }
+                }
+            }
+            @constCast(func).coerce_plan = plan;
+        }
+        if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
+        if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         const regs = try acquireRegs(allocator, func.n_locals);
         return .{
             .module = module,

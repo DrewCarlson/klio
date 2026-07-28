@@ -1008,6 +1008,12 @@ pub const Func = struct {
     /// top-level user function a positional, exact-arity call dispatches straight
     /// to its body. See `eval`'s `.Call` fast path.
     fast_call: u16 = 0,
+    /// Which argument-coercion walks can ever apply to this func's declared
+    /// params, computed on first frame entry: bit0 = computed, bit1 = a
+    /// non-vararg `Long` param exists (Int->Long widening), bit2 = >=2 params
+    /// with a type-variable-typed one (generic Int/Long peer widening).
+    /// Filled in place under the same benign-race convention as `fast_call`.
+    coerce_plan: u8 = 0,
     /// Index of `"this"` in `capture_order`, cached on first use by
     /// `callerThisValue` (hot: every GetField in a lambda frame consults
     /// it). `-2` = not yet computed, `-1` = no `this` capture.

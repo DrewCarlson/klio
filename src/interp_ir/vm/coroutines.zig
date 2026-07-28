@@ -97,6 +97,14 @@ pub fn dumpSleepCounts() void {
 pub const DriverWakeup = struct {
     mailbox: SpinMutex = .{},
     mailbox_entries: std.ArrayList(MailboxEntry) = .empty,
+    /// Monotonic count of the owning drive loop's iterations. A Kotlin-level
+    /// cross-thread resume waits (bounded) for two turns after its post, so
+    /// the posted step has been drained AND run before the resumer proceeds —
+    /// the synchronous ordering a single-threaded JVM dispatcher gives
+    /// `Continuation.resumeWith` callers (a test-harness `advanceTimeBy`
+    /// otherwise checks `hasPendingWork` inside the 1ms drain-poll window and
+    /// reports an infinite recomposition that is really an in-flight one).
+    turns: std.atomic.Value(u64) = .init(0),
     /// Set under the mailbox lock by the owning driver's exit protocol.
     /// A closed mailbox rejects posts, so a racing resumer falls through
     /// to the persisted-continuation registry the driver populated
@@ -2285,6 +2293,7 @@ fn pumpLoop(
             var w = wakeup;
             w.deinit();
         }
+        _ = wakeup.cell.data.turns.fetchAdd(1, .release);
         const had_resume = try drainWakeupInto(a, &wakeup, coroTop().?);
         if (had_resume) {
             endStreak("mailbox");
@@ -2895,7 +2904,11 @@ pub fn coroutineResumeInline(self: *VmIntrinsicHost, slot: i64, value: Value, ou
     // caller and virtual time never advances. Past the budget the remaining steps
     // go back on the pump queue, which is where they ran before.
     if (inline_depth >= INLINE_CHAIN_BUDGET) return false;
-    if (inline_turn_resumes >= INLINE_TURN_BUDGET) return false;
+    // A Kotlin-level resume already ordered by its dispatcher's queue is
+    // exempt from the per-turn cap (see `coroutineResumeContinuation`) —
+    // matching upstream, where a dispatched resume always executes when its
+    // dispatcher runs it. Native hand-off loops keep the cap.
+    if (inline_turn_resumes >= INLINE_TURN_BUDGET and !kotlin_resume_delivery) return false;
     // Dispatcher FIFO on a `runBlocking` event loop: if the pump owning this
     // slot already has other ready coroutines queued, the inline shortcut would
     // jump ahead of them. Upstream's event-loop dispatcher runs queued resumes
@@ -3046,10 +3059,15 @@ pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Val
         std.debug.print("[resume-call] slot={d} resumer:\n", .{slot});
         ir.eval.dumpFrameChainForDiagAlways();
     }
-    if (try coroutineResumeInline(self, slot, value, out)) return;
+    // The flag spans the INLINE attempt too: a `Continuation.resumeWith`
+    // arriving from a dispatcher's own queue (a `runTest` scheduler event)
+    // is already ordered and budgeted by that dispatcher, so the pump's
+    // per-turn inline budget must not defer it to a ready queue the
+    // scheduler never drains. The nesting budget still applies.
     const prev = kotlin_resume_delivery;
     kotlin_resume_delivery = true;
     defer kotlin_resume_delivery = prev;
+    if (try coroutineResumeInline(self, slot, value, out)) return;
     return coroutineResumeExternal(self, slot, value, out);
 }
 
@@ -3138,12 +3156,29 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
         if (lookupSlotOwner(slot)) |w| {
             var ww = w;
             defer ww.deinit();
+            const turns0 = ww.cell.data.turns.load(.acquire);
             const posted = blk: {
                 const g = ww.borrowMut();
                 defer g.deinit();
                 break :blk try g.get().postResume(slot, value);
             };
-            if (posted) return;
+            if (posted) {
+                // A Kotlin `resumeWith` caller observes its resumption's
+                // effects before continuing on the JVM's single-threaded
+                // dispatchers; wait (bounded) for the owner to complete two
+                // drive turns past the post so the routed step has actually
+                // run. Timeout falls back to the fire-and-forget behavior.
+                if (pumpDiagEnabled()) std.debug.print("[sync] post slot={d} krd={} t0={d}\n", .{ slot, kotlin_resume_delivery, turns0 });
+                if (kotlin_resume_delivery) {
+                    var spins: u32 = 0;
+                    while (spins < 400) : (spins += 1) {
+                        if (ww.cell.data.turns.load(.acquire) >= turns0 + 2) break;
+                        sleepMillis(1);
+                    }
+                    if (pumpDiagEnabled()) std.debug.print("[sync] done slot={d} turns={d} spins={d}\n", .{ slot, ww.cell.data.turns.load(.acquire), spins });
+                }
+                return;
+            }
             // Mailbox closed: the owner just exited and persisted its
             // parked coroutines strictly before closing.
             if (PersistedParked.take(slot)) |pe| {
