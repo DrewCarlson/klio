@@ -949,8 +949,21 @@ subcomposition's scope).
 (compositionLocalsShouldBeAvailable), subcompose double-insert
 (moveContent_subcompose), infinite-recompose guard
 (removeAndInsertWithMoveAway).
-(5) NAME-CLASH remainder: testRemember_Forget_ForgetOnRemember — see
-the ext-receiver misbind evidence above.
+(5) NAME-CLASH remainder: testRemember_Forget_ForgetOnRemember — the
+validator `this.Composition(a = true, b = false, c = false)` executes
+the local ext lambda with vector [this=true, a=validator, b=false,
+c=false]: the receiver landed at INDEX 1 with the names shifted, i.e.
+some invoke route builds [args[0], recv, args[1:]] or binds shifted
+names over a receiver-prepended vector. Ruled out: the bare local-ext
+CallValue emitter (now null-shifts its names), lowerSelectedLocal
+OverloadCall (already shifts), and CallValue routes generally (no 3/4-
+arg [cvt-instr] fires for the call). The deferred `validate { }` block
+now lowers with its MockViewValidator receiver recorded
+(recordLambdaArgReceivers on the committed-candidate path), which
+fixed 2 of the call sites' overload selection; the remaining route is
+a member-form serve that reaches the ext closure without the shift —
+find WHICH host invoke binds it (not CallValue, not invokeMethodFuncId
+by NU trace).
 (6) COROUTINE-LIFECYCLE flakes: validatePotentialDeadlock +
 movableContentInvalidatedWhileDeleted_linkComposer ("daemon task
 abandoned at run boundary"), pausingTheFrameClock* (passes solo).
