@@ -3428,7 +3428,15 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
     const is_delegated = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
-        break :blk mg.get().registry.delegated_body_props.contains(.{ .a = cls_name, .b = prop_name });
+        const mod = mg.get();
+        if (mod.registry.delegated_body_props.contains(.{ .a = cls_name, .b = prop_name })) break :blk true;
+        if (mod.classId(cls_name)) |cid| {
+            if (cid.int() < mod.classes.items.len) {
+                const fqn = mod.classes.items[cid.int()].fqn;
+                if (mod.registry.delegated_body_props.contains(.{ .a = fqn, .b = prop_name })) break :blk true;
+            }
+        }
+        break :blk false;
     };
     if (!is_delegated) return v;
     // The delegate provides a `provideDelegate` operator when its OWN runtime

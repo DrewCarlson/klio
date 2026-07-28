@@ -2822,7 +2822,14 @@ fn buildModuleWithOverrides(
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
                 if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
             } else if (p.delegate) |delegate| {
-                try delegated_body_props.put(.{ .a = c.name.name, .b = p.name.name }, {});
+                // Register the delegation marker under the FQN; the bare
+                // simple name only when it IS the FQN (a local/packageless
+                // class). A simple-name alias for a packaged class let a
+                // foreign namesake intercept an unrelated class's field read
+                // (ModelViewTests' \`Person { var name by mutableStateOf }\`
+                // routed a local test \`Person(val name, ...)\`'s plain field
+                // through delegate getValue on the stored String).
+                try delegated_body_props.put(.{ .a = body_prop_cfqn, .b = p.name.name }, {});
                 const nm = try std.fmt.allocPrint(a, "__delegate_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerPropertyInitExpr(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, body_prop_param_types, delegate, nm, null);
                 try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);

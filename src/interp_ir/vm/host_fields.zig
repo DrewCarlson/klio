@@ -1235,6 +1235,8 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
             const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+            if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
+                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
             return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }
@@ -2114,7 +2116,9 @@ fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value
     if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
         const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
         const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-        return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+        if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
+                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
+            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
     }
     return null;
 }
@@ -2484,6 +2488,25 @@ fn runtimeClassDelegatesProp(inst: anytype, name: []const u8) bool {
     return false;
 }
 
+/// Whether (class, prop) is a registered `by`-delegated body property. The
+/// registry keys packaged classes by FQN (a bare simple-name alias let a
+/// foreign namesake intercept an unrelated class's field), so a simple-name
+/// hop also consults the class-index FQN.
+fn delegatedPropRegistered(self: *VmHost, cn: []const u8, prop: []const u8) bool {
+    const g = self.module.borrow();
+    defer g.deinit();
+    const mod = g.get();
+    if (mod.registry.delegated_body_props.contains(.{ .a = cn, .b = prop })) return true;
+    if (mod.classId(cn)) |cid| {
+        if (cid.int() < mod.classes.items.len) {
+            const fqn = mod.classes.items[cid.int()].fqn;
+            if (!std.mem.eql(u8, fqn, cn) and
+                mod.registry.delegated_body_props.contains(.{ .a = fqn, .b = prop })) return true;
+        }
+    }
+    return false;
+}
+
 fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
@@ -2509,19 +2532,22 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             g.deinit();
             if (none) break :blk false;
         }
-        var cur: ?[]const u8 = class_name;
+        // The receiver's OWN class adjudicates by its exact FQN only — a
+        // simple-name (or classId-resolved) probe would let a foreign
+        // namesake's delegated prop intercept this class's plain field.
+        if (blk2: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk2 g.get().registry.delegated_body_props.contains(.{ .a = cache_fqn, .b = name });
+        }) break :blk true;
+        var cur: ?[]const u8 = firstSupertype(self, class_name);
         var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);
         while (cur) |cn| {
             cur = null;
             if (containsStr(seen.items, cn)) break;
             try seen.append(allocator, cn);
-            {
-                const g = self.module.borrow();
-                const hit = g.get().registry.delegated_body_props.contains(.{ .a = cn, .b = name });
-                g.deinit();
-                if (hit) break :blk true;
-            }
+            if (delegatedPropRegistered(self, cn, name)) break :blk true;
             cur = firstSupertype(self, cn);
         }
         break :blk false;
@@ -2534,6 +2560,8 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         if (raw) |d| {
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+            if (runtime.getenvSlice("KLIO_THIS_TRAP") != null)
+                std.debug.print("[dgv] delegate-getValue name={s} recv={s} dval={s}\n", .{ name, receiver.typeFqn(), d.typeFqn() });
             return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
         }
     }
@@ -3276,12 +3304,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     cur = null;
                     if (containsStr(seen.items, cn)) break;
                     try seen.append(allocator, cn);
-                    {
-                        const g = self.module.borrow();
-                        const hit = g.get().registry.delegated_body_props.contains(.{ .a = cn, .b = real_name });
-                        g.deinit();
-                        if (hit) break :blk true;
-                    }
+                    if (delegatedPropRegistered(self, cn, real_name)) break :blk true;
                     cur = firstSupertype(self, cn);
                 }
                 break :blk false;
