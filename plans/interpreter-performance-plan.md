@@ -910,6 +910,39 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
+THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
+~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget
+gates markInvalidFromBackgroundThread, resumeOnBackgroundThread, and
+validatePotentialDeadlock — the CI itest is a pass-count ratchet at
+1210, so these ride in the not-yet-passing pool):
+- KLIO_CALL_STATS census (new knob, documented): ~7.4M interpreted
+  calls for 137 iterations (~54k/iteration), topped by one-line
+  accessors the JVM inlines (runtimeCheck 273k, SlotWriter.capacity
+  getter 265k, kotlin.let 201k, gapbuffer parentAnchor/dataAnchor
+  ~370k). Native bindings for the 7 hottest gap-buffer helpers
+  (parentAnchor/dataAnchor/groupSize/updates/hasObjectKey/countOneBits)
+  cut the call total by ~750k with NO wall change — small interpreted
+  calls average ~1µs; the time lives in the big bodies.
+- The (type,name) field-probe memo and extending member_resolve_cache to
+  Instance receivers (class-cell identity keys) removed the
+  lookupIntrinsic ladder from the profile — also no wall change.
+- KLIO_OPT=fast engages the loop JIT (758 [jit] events) and
+  KLIO_FUNC_JIT=1 the function tier: NEITHER moves the pace — the
+  composition workload's hot functions bail to host calls.
+- macOS `sample` attributes ~50% of interpreter self-time to one
+  <deduplicated_symbol> blob (linker-merged small generics) whose
+  parents are the member-dispatch ladder (callMemberNamedInner →
+  callMemberInnerStatic → irMethodWalk/extensionFnFallback →
+  resolveInstanceMethod → invokeMethodFuncId), plus eqlBytes/wyhash/
+  hashmap getIndex ≈25% — per-call resolution machinery, not leaf work.
+  KLIO_PROF is Linux-only and would symbolize the same merged blob.
+CONCLUSION: the lever is a per-call-site monomorphic inline cache on
+the CallMember instruction (atomic {class identity, resolved target}
+pair, relaxed loads, fall back to the full ladder on mismatch; new
+classes get new identities so no invalidation is needed), collapsing
+the repeated name-identity + hashmap resolution per call. Secondary:
+port KLIO_PROF to macOS (setitimer/SIGPROF exist) once symbols matter.
+
 CURRENT STANDING (post this stretch): CompositionTests 146/148,
 MovableContentTests 43/44, RecomposerTests 11/12. Since 145:
 rememberObserverThrashing FIXED — the abandon machinery was already

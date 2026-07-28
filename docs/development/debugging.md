@@ -185,6 +185,7 @@ variables override individual fields on top of it.
 | `KLIO_PROF` | set; value = sampling interval in microseconds (default 1000, floor 100) | Statistical SIGPROF profiler; prints a by-function sample histogram to stderr at the end of the run (Linux) | `[prof]` |
 | `KLIO_PROF_ALL` | set (needs `KLIO_PROF`) | Widens profiling to the whole process, including startup and image decode | `[prof]` |
 | `KLIO_PROF_CALLERS` | `<substr>` | After the histogram, folds the callers of every sampled leaf whose name contains the substring | `[prof]` |
+| `KLIO_CALL_STATS` | set | Counts every interpreted function invocation by FQN over the whole run; `klio test` prints the top entries after the summary. The workload census that separates "slow per call" from "more calls than the reference would make" (missed skipping, repeated recompose, un-inlined accessors) | `[call-stats]` |
 
 ```sh
 KLIO_PROF=500 KLIO_PROF_CALLERS=append ./zig-out/bin/klio run bench.kt

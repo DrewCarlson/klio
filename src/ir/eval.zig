@@ -612,6 +612,48 @@ threadlocal var spin_check_counter: u64 = 0;
 
 /// Diagnostic: print the live frame chain (as the spin tracer does), for an
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
+/// KLIO_CALL_STATS: per-function invocation counters over the whole run.
+/// `callStatsDump` prints the top entries — the workload census that
+/// separates "the interpreter is slow per call" from "the program runs more
+/// calls than the reference would" (missed skipping, repeated recompose).
+var call_stats_state: u8 = 0;
+var call_stats_mutex: runtime.SpinMutex = .{};
+var call_stats: ?std.StringHashMap(u64) = null;
+fn callStatsBump(fqn: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = call_stats.?.getOrPut(fqn) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+pub fn callStatsDump() void {
+    if (call_stats_state != 2) return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    const stats = &(call_stats orelse return);
+    const Entry = struct { fqn: []const u8, n: u64 };
+    var list = std.ArrayList(Entry).initCapacity(std.heap.page_allocator, stats.count()) catch return;
+    defer list.deinit(std.heap.page_allocator);
+    var it = stats.iterator();
+    var total: u64 = 0;
+    while (it.next()) |e| {
+        list.appendAssumeCapacity(.{ .fqn = e.key_ptr.*, .n = e.value_ptr.* });
+        total += e.value_ptr.*;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[call-stats] total={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 60);
+    for (list.items[0..top]) |e| std.debug.print("[call-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
+}
+
 /// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
 /// diagnostic path, and `getenvSlice` takes a global mutex per call. The env
 /// is set at launch; a mid-run change is not observed (benign data race:
@@ -2409,6 +2451,7 @@ pub fn evalWithCapturesChained(
 ) Allocator.Error!EvalResult {
     dumpFnIfRequested(module, func);
     boolThisTrap(func, args.items);
+    callStatsBump(func.fqn);
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
     var frame = try Frame.newWithCaptures(allocator, module, func, args, captures);

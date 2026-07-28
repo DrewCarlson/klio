@@ -47,7 +47,88 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     // The real androidx.compose.ui engine needs the same identity hash for its
     // node/coordinator caches; expose it under the ui package's own symbol.
     try b.register("androidx.compose.ui.internal.__composeui_identityHashCode", identityHashCode);
+    // Gap-buffer group-field accessors: one-line IntArray arithmetic the JVM
+    // inlines away entirely, but the interpreter pays a full frame per call —
+    // together they are the hottest functions in a recompose-heavy census.
+    // Layout mirrors SlotTable.kt: 5 ints per group
+    // (key, groupInfo, parentAnchor, size, dataAnchor).
+    try b.register("androidx.compose.runtime.composer.gapbuffer.parentAnchor", gapParentAnchor);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.updateParentAnchor", gapUpdateParentAnchor);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.dataAnchor", gapDataAnchor);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.updateDataAnchor", gapUpdateDataAnchor);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.groupSize", gapGroupSize);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.hasObjectKey", gapHasObjectKey);
+    try b.register("androidx.compose.runtime.composer.gapbuffer.countOneBits", gapCountOneBits);
     return b;
+}
+
+const group_fields_size: i64 = 5;
+const parent_anchor_offset: i64 = 2;
+const size_offset: i64 = 3;
+const data_anchor_offset: i64 = 4;
+const group_info_offset: i64 = 1;
+const object_key_mask: i32 = 0x2000_0000;
+
+fn asIndex(v: Value) ?i64 {
+    return switch (v) {
+        .Int => |i| @as(i64, i),
+        .Long => |i| i,
+        else => null,
+    };
+}
+
+/// `IntArray.<field>(address)` — read `this[address * 5 + offset]`. Falls to a
+/// Type error only on a shape the interpreted original could not run either.
+fn gapFieldGet(ctx: *CallCtx, offset: i64) Error!EvalResult {
+    if (ctx.args.len < 2 or ctx.args[0] != .Array) return .{ .err = .{ .Type = "IntArray group-field read" } };
+    const addr = asIndex(ctx.args[1]) orelse return .{ .err = .{ .Type = "IntArray group-field read" } };
+    const idx = addr * group_fields_size + offset;
+    const arr = ctx.args[0].Array;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= arr.len()) return .{ .err = .{ .Type = "IntArray group-field read" } };
+    return ok(arr.get(@intCast(idx)));
+}
+
+fn gapFieldSet(ctx: *CallCtx, offset: i64) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[0] != .Array) return .{ .err = .{ .Type = "IntArray group-field write" } };
+    const addr = asIndex(ctx.args[1]) orelse return .{ .err = .{ .Type = "IntArray group-field write" } };
+    const idx = addr * group_fields_size + offset;
+    const arr = ctx.args[0].Array;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= arr.len()) return .{ .err = .{ .Type = "IntArray group-field write" } };
+    arr.set(ctx.allocator, @intCast(idx), ctx.args[2]);
+    return ok(unit);
+}
+
+fn gapParentAnchor(ctx: *CallCtx) Error!EvalResult {
+    return gapFieldGet(ctx, parent_anchor_offset);
+}
+
+fn gapUpdateParentAnchor(ctx: *CallCtx) Error!EvalResult {
+    return gapFieldSet(ctx, parent_anchor_offset);
+}
+
+fn gapDataAnchor(ctx: *CallCtx) Error!EvalResult {
+    return gapFieldGet(ctx, data_anchor_offset);
+}
+
+fn gapUpdateDataAnchor(ctx: *CallCtx) Error!EvalResult {
+    return gapFieldSet(ctx, data_anchor_offset);
+}
+
+fn gapGroupSize(ctx: *CallCtx) Error!EvalResult {
+    return gapFieldGet(ctx, size_offset);
+}
+
+fn gapHasObjectKey(ctx: *CallCtx) Error!EvalResult {
+    const r = try gapFieldGet(ctx, group_info_offset);
+    if (r != .ok or r.ok != .Int) return .{ .err = .{ .Type = "IntArray group-field read" } };
+    return ok(.{ .Bool = (r.ok.Int & object_key_mask) != 0 });
+}
+
+/// `countOneBits(value: Int): Int` — plain popcount.
+fn gapCountOneBits(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 1) return .{ .err = .{ .Type = "countOneBits" } };
+    const v = asIndex(ctx.args[0]) orelse return .{ .err = .{ .Type = "countOneBits" } };
+    return ok(Value.newInt(@popCount(@as(u32, @bitCast(@as(i32, @truncate(v)))))));
 }
 
 /// `identityHashCode(instance: Any?): Int` — a stable per-object hash for the
@@ -126,7 +207,37 @@ test "hostBindings registers every compose symbol" {
     try testing.expect(b.resolve("androidx.compose.runtime.__compose_logError") != null);
     try testing.expect(b.resolve("androidx.compose.runtime.internal.__compose_currentThreadId") != null);
     try testing.expect(b.resolve("androidx.compose.ui.internal.__composeui_identityHashCode") != null);
-    try testing.expectEqual(@as(usize, 6), b.len());
+    try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.parentAnchor") != null);
+    try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.updateDataAnchor") != null);
+    try testing.expect(b.resolve("androidx.compose.runtime.composer.gapbuffer.countOneBits") != null);
+    try testing.expectEqual(@as(usize, 13), b.len());
+}
+
+test "gap-buffer field accessors read and write the 5-int group layout" {
+    var host: TestHost = .{};
+    // Two groups: fields [key, info, parentAnchor, size, dataAnchor].
+    var backing = [_]Value{
+        Value.newInt(11), Value.newInt(0x2000_0000), Value.newInt(-1), Value.newInt(4), Value.newInt(7),
+        Value.newInt(22), Value.newInt(0),           Value.newInt(0),  Value.newInt(1), Value.newInt(9),
+    };
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(testing.allocator, &backing);
+    const store = try runtime.ValueList.init(testing.allocator, list);
+    defer store.deinit();
+    const arr: Value = .{ .Array = .{ .storage = .{ .boxed = store }, .prim = null } };
+
+    var ctx1 = host.ctx(&.{ arr, Value.newInt(1) });
+    try testing.expectEqual(@as(i32, 1), (try gapGroupSize(&ctx1)).ok.Int);
+    try testing.expectEqual(@as(i32, 9), (try gapDataAnchor(&ctx1)).ok.Int);
+    var ctx0 = host.ctx(&.{ arr, Value.newInt(0) });
+    try testing.expectEqual(@as(i32, -1), (try gapParentAnchor(&ctx0)).ok.Int);
+    try testing.expect((try gapHasObjectKey(&ctx0)).ok.Bool);
+    try testing.expect(!(try gapHasObjectKey(&ctx1)).ok.Bool);
+    var ctx_set = host.ctx(&.{ arr, Value.newInt(1), Value.newInt(42) });
+    _ = try gapUpdateParentAnchor(&ctx_set);
+    try testing.expectEqual(@as(i32, 42), (try gapParentAnchor(&ctx1)).ok.Int);
+    var ctx_pc = host.ctx(&.{Value.newInt(0x2000_0001)});
+    try testing.expectEqual(@as(i32, 2), (try gapCountOneBits(&ctx_pc)).ok.Int);
 }
 
 test "nextStateId is strictly increasing" {
