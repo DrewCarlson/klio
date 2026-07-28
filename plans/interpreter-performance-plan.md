@@ -910,7 +910,19 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 142/148,
+CURRENT STANDING (post this stretch): CompositionTests 143/148,
+MovableContentTests 42/44, RecomposerTests 11/12. Since 142:
+testModificationsPropagateToSubcomposition FIXED — the pass records
+vals declared MutableState<@Composable fn>/State<...> and wraps both
+the initial store's lambda arg and later .value = { } assignments in
+composableLambdaInstance (value-position typing through the State
+declaration). ONLY the 5 PausableCompositionTests remain in
+CompositionTests (resume-round batching: 9 pause consults finish in 7
+rounds; two background-thread tests; rememberObserverThrashing).
+Plus MovableContentTests 2 (moveContent_subcompose double-insert,
+removeAndInsertWithMoveAway infinite recompose) and the deadlock/
+frame-clock flakes. Old:
+(was) CompositionTests 142/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since 141:
 testInsertOnMultipleLevels FIXED — the this-capture gap was actually an
 APPLICABILITY gate: anyLocalFnOverloadApplicable dropped ext siblings
