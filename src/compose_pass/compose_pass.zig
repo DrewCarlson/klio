@@ -319,6 +319,20 @@ fn isComposableFnType(t: *const ast.TypeRef) bool {
     return t.function != null and isComposable(t.annotations);
 }
 
+/// `MutableState<@Composable () -> Unit>` / `State<...>`: the composable
+/// arity of the state's type argument, or null when the type is not a
+/// composable-fn-holding state.
+fn stateOfComposableArity(t: *const ast.TypeRef) ?u8 {
+    const head = t.name.name;
+    if (!std.mem.eql(u8, head, "MutableState") and !std.mem.eql(u8, head, "State")) return null;
+    if (t.type_args.len != 1) return null;
+    const arg = &t.type_args[0];
+    if (arg.is_star) return null;
+    if (!isComposableFnType(&arg.ty)) return null;
+    const f = arg.ty.function orelse return null;
+    return @intCast(@min(f.params.len, 255));
+}
+
 /// Extension-receiver + context slot count of a composable function type
 /// (0 when not a composable function type).
 pub fn composableFunctionRecvSlots(t: *const ast.TypeRef) u8 {
@@ -1396,6 +1410,11 @@ const Walker = struct {
     oracle: ComposableOracle,
     oracle_ctx: *anyopaque,
     sinks: ?*const std.StringHashMap(void) = null,
+    /// Local vals declared `MutableState<@Composable fn>` / `State<...>`:
+    /// name -> the composable fn type's arity. A later `x.value = { … }`
+    /// assignment's lambda is a composable VALUE by that declared type and
+    /// wraps in composableLambdaInstance exactly like a typed val initializer.
+    composable_state_vals: ?*std.StringHashMap(u8) = null,
     /// Names of the enclosing function's `@Composable`-lambda-typed value
     /// parameters. A bare call to one (`content()` inside
     /// `CompositionLocalProvider`) invokes a plugin-lowered composable lambda,
@@ -1523,6 +1542,27 @@ const Walker = struct {
             },
             .Assign => |*asg| {
                 try w.walkExpr(&asg.target);
+                // `content.value = { … }` where `content` is a recorded
+                // `MutableState<@Composable fn>` val: the stored lambda is
+                // composable BY the state's declared type — thread it and
+                // wrap in composableLambdaInstance, exactly like a typed
+                // val initializer (the reference then sees a stable
+                // ComposableLambdaImpl whose invoke records changed(this),
+                // so a swapped content invalidates and produces changes).
+                if (asg.value == .Lambda and w.composable_state_vals != null and
+                    asg.target == .Member and
+                    std.mem.eql(u8, asg.target.Member.name.name, "value") and
+                    asg.target.Member.receiver.* == .Path and
+                    asg.target.Member.receiver.Path.segments.len == 1)
+                {
+                    if (w.composable_state_vals.?.get(asg.target.Member.receiver.Path.segments[0].name)) |arity| {
+                        try w.walkComposableValueExpr(&asg.value, arity);
+                        if (emit_lambda_memo and asg.value == .Lambda) {
+                            w.wrapInComposableLambdaInstance(&asg.value);
+                        }
+                        return;
+                    }
+                }
                 try w.walkExpr(&asg.value);
             },
             .DestructuringDecl => |*d| try w.walkExpr(&d.init),
@@ -1554,6 +1594,30 @@ const Walker = struct {
                         if (emit_lambda_memo and !w.thread and ini.* == .Lambda) {
                             w.wrapInComposableLambdaInstance(ini);
                         }
+                    } else if (p.ty != null and stateOfComposableArity(&p.ty.?) != null) {
+                        // `val content: MutableState<@Composable () -> Unit>
+                        // = mutableStateOf({ … })` — the STATE's type arg
+                        // makes every stored lambda composable. Record the
+                        // val for the assignment walk and wrap the initial
+                        // store's lambda argument.
+                        const arity = stateOfComposableArity(&p.ty.?).?;
+                        if (w.composable_state_vals == null) {
+                            const m = w.a.create(std.StringHashMap(u8)) catch @panic("oom");
+                            m.* = std.StringHashMap(u8).init(w.a);
+                            w.composable_state_vals = m;
+                        }
+                        w.composable_state_vals.?.put(p.name.name, arity) catch @panic("oom");
+                        if (ini.* == .Call) {
+                            for (ini.Call.args) |*arg| {
+                                if (arg.* == .Lambda) {
+                                    try w.walkComposableValueExpr(arg, arity);
+                                    if (emit_lambda_memo and arg.* == .Lambda) {
+                                        w.wrapInComposableLambdaInstance(arg);
+                                    }
+                                }
+                            }
+                        }
+                        try w.walkExpr(ini);
                     } else if (ini.* == .Lambda and isComposable(ini.Lambda.annotations)) {
                         // No declared type: the literal's own header is the
                         // arity, and a headerless literal is `() -> Unit`
