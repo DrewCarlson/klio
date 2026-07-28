@@ -1745,6 +1745,13 @@ const Walker = struct {
             .Lambda => |lam| {
                 for (lam.body.stmts) |*st| switch (st.*) {
                     .Expr => |*se| if (w.branchHasComposable(se)) return true,
+                    .Assign => |as| if (w.branchHasComposable(&as.value)) return true,
+                    .Decl => |d| switch (d) {
+                        .Property => |pp| {
+                            if (pp.init) |*ini| if (w.branchHasComposable(ini)) return true;
+                        },
+                        else => {},
+                    },
                     else => {},
                 };
                 return false;
