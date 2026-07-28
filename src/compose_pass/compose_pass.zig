@@ -904,6 +904,7 @@ fn transformDecl(
     switch (d.*) {
         .Function => |*f| {
             if (isComposable(f.annotations)) {
+                if (dbg_groups) std.debug.print("[compose-pass] decl {s} restartable={}\n", .{ f.name.name, isRestartableComposable(f) });
                 if (isRestartableComposable(f)) {
                     f.* = try transformComposableFunction(a, f, NameSetOracle.isComposableCall, oracle, sinks, in_class, null, enclosing_class);
                 } else {
@@ -1846,8 +1847,46 @@ const Walker = struct {
         w.wrapInComposableLambdaLabeled(arg, null);
     }
 
+    /// Bracket a ComposableLambdaImpl-invoked lambda body with the
+    /// restartable-but-not-skippable execute gate the plugin compiles into
+    /// composable lambdas:
+    ///   `if ($composer.shouldExecute(true, $changed and 1)) { <body> }
+    ///    else { $composer.skipToGroupEnd() }`
+    /// The impl's invoke supplies the restart group; without this gate the
+    /// body has no pause point, so a PausableComposition resumes a content
+    /// lambda's children in its parent's round instead of pausing at the
+    /// lambda (canPauseContent's 9-round reference arithmetic). `true` keeps
+    /// the execute decision identical to today — only the pause consult is
+    /// added.
+    fn wrapLambdaBodyInPausePoint(w: *Walker, lam: anytype) void {
+        if (!lambdaHasComposerParams(lam)) return;
+        if (lam.body.stmts.len == 1 and lam.body.stmts[0] == .Expr and
+            lam.body.stmts[0].Expr == .If)
+        {
+            const cond = lam.body.stmts[0].Expr.If.cond;
+            if (cond.* == .Call and cond.Call.callee.* == .Member and
+                std.mem.eql(u8, cond.Call.callee.Member.name.name, "shouldExecute")) return;
+        }
+        const se_args = w.a.alloc(Expr, 2) catch @panic("oom");
+        se_args[0] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
+        se_args[1] = w.b.callMember(w.b.pathExpr(changed_param), "and", w.b.slice1(w.b.intLit(1)));
+        const run_cond = w.b.callMember(w.b.pathExpr(composer_param), "shouldExecute", se_args);
+        const skip_stmts = w.a.alloc(ast.Stmt, 1) catch @panic("oom");
+        skip_stmts[0] = .{ .Expr = w.b.callMember(w.b.pathExpr(composer_param), "skipToGroupEnd", w.a.alloc(Expr, 0) catch @panic("oom")) };
+        const sp = lam.body.span;
+        const new_stmts = w.a.alloc(ast.Stmt, 1) catch @panic("oom");
+        new_stmts[0] = .{ .Expr = .{ .If = .{
+            .cond = w.b.box(run_cond),
+            .then_branch = w.b.box(.{ .Block = .{ .stmts = lam.body.stmts, .span = sp } }),
+            .else_branch = w.b.box(.{ .Block = .{ .stmts = skip_stmts, .span = w.b.gen_span } }),
+            .span = w.b.gen_span,
+        } } };
+        lam.body = .{ .stmts = new_stmts, .span = sp };
+    }
+
     fn wrapInComposableLambdaLabeled(w: *Walker, arg: *Expr, label: ?[]const u8) void {
         const key = positionalKey(exprSpanOf(arg));
+        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(&arg.Lambda);
         // `rememberComposableLambda(key, tracked, block)` threaded with the
         // composer pair: `rememberComposableLambda(key, true, block, $composer,
         // 0)`. It remembers the `ComposableLambdaImpl` in a slot of the current
@@ -1889,6 +1928,7 @@ const Walker = struct {
     /// breaks).
     fn wrapInComposableLambdaInstance(w: *Walker, arg: *Expr) void {
         const key = positionalKey(exprSpanOf(arg));
+        if (arg.* == .Lambda) w.wrapLambdaBodyInPausePoint(&arg.Lambda);
         const args = w.a.alloc(Expr, 3) catch @panic("oom");
         args[0] = w.b.intLit(key);
         args[1] = .{ .BoolLit = .{ .value = true, .span = w.b.gen_span } };
@@ -3673,8 +3713,11 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
     try testing.expect(!lam.implicit_it);
-    // Bare declaration calls stay source-shaped for the IR resolver.
-    const inner = lam.body.stmts[0].Expr.Call;
+    // The body sits inside the lambda's shouldExecute pause gate; bare
+    // declaration calls stay source-shaped for the IR resolver.
+    const gate = lam.body.stmts[0].Expr.If;
+    try testing.expectEqualStrings("shouldExecute", gate.cond.Call.callee.Member.name.name);
+    const inner = gate.then_branch.Block.stmts[0].Expr.Call;
     try testing.expectEqual(@as(usize, 1), inner.args.len);
 }
 

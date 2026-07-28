@@ -910,7 +910,35 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 143/148,
+CURRENT STANDING (post this stretch): CompositionTests 145/148,
+MovableContentTests 43/44, RecomposerTests 11/12. Since 143:
+canPauseContent + canPauseReusableContent FIXED — the resume-round
+divergence was NEVER in the recomposePaused batching. Scope-identity
+probes ([pz]/[se2]) showed klio's rounds pause A, B, Linear_B, C, D,
+Linear_D, 3×C — Linear pauses fine (its scope pauses BEFORE its body
+print) — but the CONTENT LAMBDAS (the `{ A() }`-style sinks invoked
+through ComposableLambdaImpl.invoke) never consult shouldExecute: the
+impl supplies the restart group but klio's transformComposableLambda
+emitted no execute gate in the body, so a resumed Linear ran its content
+lambda INLINE and the lambda's children paused in Linear's round.
+kotlinc compiles composable lambdas with their own skip calculus; the
+missing gate cost exactly the two lambda rounds (7 vs the reference 9;
+invokeComposable's `invoke(composer, 1)` keeps the ROOT content lambda
+gate-exempt via the flags-bit0 check, so no spurious 10th round). Fix:
+wrapLambdaBodyInPausePoint brackets rememberComposableLambda/
+composableLambdaInstance-wrapped lambda bodies with
+`if ($composer.shouldExecute(true, $changed and 1)) { body } else
+{ skipToGroupEnd() }` — the restartable-but-not-skippable form, so the
+execute decision is unchanged and only the pause consult is added.
+Verified: probe prints iteration=9 with a byte-identical recording on
+BOTH composers; PausableCompositionTests 22/25. Remaining 3:
+rememberObserverThrashing (discarded not-yet-applied remembers never
+dispatch onAbandoned — "Expected <2>, actual <0>" on the Abandon(A)
+count; abandon routing through the paused RememberEventDispatcher, not
+round arithmetic) and the two background-thread tests
+(markInvalidFromBackgroundThread 10s timeout, resumeOnBackgroundThread
+90s hang — threading family).
+(was) CompositionTests 143/148,
 MovableContentTests 43/44, RecomposerTests 11/12. Since 42/44:
 moveContent_subcompose FIXED — the read-attribution hypothesis was
 wrong (probes showed the childrenComposing guard works and no read ever
