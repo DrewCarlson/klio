@@ -1952,6 +1952,51 @@ const Walker = struct {
         }
     }
 
+    /// Wrap a plain lambda argument of a composable call in
+    /// `remember(<capture keys...>, { <lambda> })` — the strong-skipping
+    /// lambda memoization. Capture keys are the bare names the body reads
+    /// that are not declared inside it (call CALLEES excluded); an
+    /// over-approximate key (a stable global) only ever compares equal, so
+    /// it cannot break identity, while a missed key would — bail instead
+    /// when the body writes any bare name (a captured `var` the runtime
+    /// boxes; keying the cell is meaningless and kotlinc skips those too).
+    fn memoizePlainLambdaArg(w: *Walker, arg: *Expr, callee_name: []const u8) void {
+        if (arg.* != .Lambda) return;
+        const lam = &arg.Lambda;
+        var refs = std.StringHashMap(void).init(w.a);
+        defer refs.deinit();
+        var declared = std.StringHashMap(void).init(w.a);
+        defer declared.deinit();
+        var bad = false;
+        collectLambdaCaptureFacts(lam.body.stmts, &refs, &declared, &bad, callee_name);
+        if (bad) return;
+        var keys: std.ArrayList(Expr) = .empty;
+        var it = refs.keyIterator();
+        while (it.next()) |k| {
+            const nm = k.*;
+            if (declared.contains(nm)) continue;
+            if (std.mem.eql(u8, nm, "it") or std.mem.eql(u8, nm, "this")) continue;
+            for (lam.params) |*p| {
+                if (std.mem.eql(u8, p.name, nm)) break;
+            } else {
+                keys.append(w.a, w.b.pathExpr(nm)) catch @panic("oom");
+            }
+        }
+        const calc_stmts = w.a.alloc(Stmt, 1) catch @panic("oom");
+        calc_stmts[0] = .{ .Expr = arg.* };
+        const calc = Expr{ .Lambda = .{
+            .params = &.{},
+            .param_tys = &.{},
+            .body = .{ .stmts = calc_stmts, .span = lam.span },
+            .implicit_it = false,
+            .span = lam.span,
+        } };
+        const rem_args = w.a.alloc(Expr, keys.items.len + 1) catch @panic("oom");
+        @memcpy(rem_args[0..keys.items.len], keys.items);
+        rem_args[keys.items.len] = calc;
+        arg.* = w.b.call(w.b.pathExpr("remember"), rem_args);
+    }
+
     fn wrapBranchBoxed(w: *Walker, branch: *Expr) void {
         if (branch.* == .Block) {
             if (branch.Block.stmts.len != 0 and
@@ -2248,6 +2293,21 @@ const Walker = struct {
                         w.thread = false;
                         try w.walkExpr(arg);
                         w.thread = saved;
+                        // STRONG-SKIPPING LAMBDA MEMOIZATION: kotlinc wraps a
+                        // plain (non-composable) lambda argument of a
+                        // composable call in `remember(captures...) { lambda }`
+                        // so an unchanged re-execution passes the SAME
+                        // instance (funInterface_isMemoized asserts the
+                        // remembered SAM value is identical across a
+                        // recomposition). Skipped when the body returns to
+                        // the callee's implicit label — rewrapping would
+                        // re-parent the label.
+                        if (emit_lambda_memo and w.oracle(w.oracle_ctx, name.?) and
+                            w.sinks != null and !w.sinks.?.contains(name.?) and
+                            !plainMemoExcluded(name.?))
+                        {
+                            w.memoizePlainLambdaArg(arg, name.?);
+                        }
                     } else {
                         try w.walkExpr(arg);
                     }
@@ -2744,6 +2804,147 @@ pub fn transformResolvedComposableLambda(
         w.wrapInComposableLambda(arg);
     }
     return true;
+}
+
+/// Composable callees whose lambda argument is itself a memoization or
+/// effect CALCULATION: wrapping it in `remember` would nest memoization
+/// (remember-in-remember) or displace the effect protocol's own keying.
+fn plainMemoExcluded(name: []const u8) bool {
+    const excluded = [_][]const u8{
+        "remember",           "derivedStateOf",        "rememberSaveable",
+        "rememberUpdatedState", "produceState",        "LaunchedEffect",
+        "DisposableEffect",   "SideEffect",            "snapshotFlow",
+        "rememberCoroutineScope", "movableContentOf",  "movableContentWithReceiverOf",
+        "rememberComposableLambda", "composableLambda", "composableLambdaInstance",
+        "key",
+    };
+    for (excluded) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// Capture-fact walk for plain-lambda memoization: `refs` collects bare
+/// name reads (call callees excluded), `declared` the names bound inside,
+/// and `bad` flags shapes memoization must skip — a write to a captured
+/// bare name (a boxed `var` cell key is meaningless) or a labeled return
+/// to the callee's implicit label (rewrapping would re-parent it).
+fn collectLambdaCaptureFacts(stmts: []const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee_name: []const u8) void {
+    for (stmts) |*st| collectCaptureFactsStmt(st, refs, declared, bad, callee_name);
+}
+
+fn collectCaptureFactsStmt(st: *const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee: []const u8) void {
+    switch (st.*) {
+        .Expr => |*e| collectCaptureFactsExpr(e, refs, declared, bad, callee),
+        .Assign => |*a| {
+            if (a.target == .Path and a.target.Path.segments.len == 1) {
+                if (!declared.contains(a.target.Path.segments[0].name)) {
+                    bad.* = true;
+                    return;
+                }
+            } else {
+                collectCaptureFactsExpr(&a.target, refs, declared, bad, callee);
+            }
+            collectCaptureFactsExpr(&a.value, refs, declared, bad, callee);
+        },
+        .Decl => |*d| switch (d.*) {
+            .Property => |pp| {
+                if (pp.init) |*ini| collectCaptureFactsExpr(ini, refs, declared, bad, callee);
+                declared.put(pp.name.name, {}) catch {};
+            },
+            .Function => |*f| {
+                declared.put(f.name.name, {}) catch {};
+                if (f.body) |fb| switch (fb) {
+                    .Block => |blk| collectLambdaCaptureFacts(blk.stmts, refs, declared, bad, callee),
+                    .Expr => |*e| collectCaptureFactsExpr(e, refs, declared, bad, callee),
+                };
+            },
+            else => bad.* = true,
+        },
+        .DestructuringDecl => |*dd| {
+            collectCaptureFactsExpr(&dd.init, refs, declared, bad, callee);
+            for (dd.names) |nm| declared.put(nm.name, {}) catch {};
+        },
+    }
+}
+
+fn collectCaptureFactsExpr(e: *const Expr, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee: []const u8) void {
+    if (bad.*) return;
+    switch (e.*) {
+        .Path => |p| {
+            if (p.segments.len == 1) refs.put(p.segments[0].name, {}) catch {};
+        },
+        .Call => |c| {
+            // A simple-name callee is a function reference, not a value key.
+            if (!(c.callee.* == .Path and c.callee.Path.segments.len == 1)) {
+                collectCaptureFactsExpr(c.callee, refs, declared, bad, callee);
+            }
+            for (c.args) |*a| collectCaptureFactsExpr(a, refs, declared, bad, callee);
+        },
+        .Member => |m| collectCaptureFactsExpr(m.receiver, refs, declared, bad, callee),
+        .Index => |ix| {
+            collectCaptureFactsExpr(ix.receiver, refs, declared, bad, callee);
+            for (ix.args) |*a| collectCaptureFactsExpr(a, refs, declared, bad, callee);
+        },
+        .Binary => |bn| {
+            collectCaptureFactsExpr(bn.lhs, refs, declared, bad, callee);
+            collectCaptureFactsExpr(bn.rhs, refs, declared, bad, callee);
+        },
+        .Unary => |u| collectCaptureFactsExpr(u.expr, refs, declared, bad, callee),
+        .Postfix => |px| {
+            // `x++` writes its operand.
+            if (px.expr.* == .Path and px.expr.Path.segments.len == 1 and
+                !declared.contains(px.expr.Path.segments[0].name))
+            {
+                bad.* = true;
+                return;
+            }
+            collectCaptureFactsExpr(px.expr, refs, declared, bad, callee);
+        },
+        .If => |f| {
+            collectCaptureFactsExpr(f.cond, refs, declared, bad, callee);
+            collectCaptureFactsExpr(f.then_branch, refs, declared, bad, callee);
+            if (f.else_branch) |eb| collectCaptureFactsExpr(eb, refs, declared, bad, callee);
+        },
+        .When => |wh| {
+            if (wh.subject) |sub| collectCaptureFactsExpr(sub, refs, declared, bad, callee);
+            for (wh.branches) |*br| collectCaptureFactsExpr(&br.body, refs, declared, bad, callee);
+        },
+        .Block => |blk| collectLambdaCaptureFacts(blk.stmts, refs, declared, bad, callee),
+        .For => |fr| {
+            collectCaptureFactsExpr(fr.iter, refs, declared, bad, callee);
+            collectCaptureFactsExpr(fr.body, refs, declared, bad, callee);
+        },
+        .While => |wl| {
+            collectCaptureFactsExpr(wl.cond, refs, declared, bad, callee);
+            collectCaptureFactsExpr(wl.body, refs, declared, bad, callee);
+        },
+        .DoWhile => |dw| {
+            if (dw.body) |bd| collectCaptureFactsExpr(bd, refs, declared, bad, callee);
+            collectCaptureFactsExpr(dw.cond, refs, declared, bad, callee);
+        },
+        .Lambda => |lam| {
+            for (lam.params) |pn| declared.put(pn.name, {}) catch {};
+            collectLambdaCaptureFacts(lam.body.stmts, refs, declared, bad, callee);
+        },
+        .StringTemplate => |st2| for (st2.parts) |*part| switch (part.*) {
+            .Interp => |ie| collectCaptureFactsExpr(ie, refs, declared, bad, callee),
+            .ShortInterp => |idn| refs.put(idn.name, {}) catch {},
+            else => {},
+        },
+        .Return => |r| {
+            if (r.label) |lb| {
+                if (std.mem.eql(u8, lb.name, callee)) {
+                    bad.* = true;
+                    return;
+                }
+            }
+            if (r.value) |v| collectCaptureFactsExpr(v, refs, declared, bad, callee);
+        },
+        .IsCheck => |ic| collectCaptureFactsExpr(ic.expr, refs, declared, bad, callee),
+        .As => |asx| collectCaptureFactsExpr(asx.expr, refs, declared, bad, callee),
+        .Labeled => |l| collectCaptureFactsExpr(l.expr, refs, declared, bad, callee),
+        .IntLit, .FloatLit, .BoolLit, .CharLit, .NullLit, .This => {},
+        else => bad.* = true,
+    }
 }
 
 /// The span of an expression, for the memoization key. Falls back to a
@@ -3875,7 +4076,10 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     var ctx: u8 = 0;
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx, .sinks = &sinks, .thread = true };
     try w.walkExpr(&call);
-    const lam = call.Call.args[0].Lambda;
+    // The sink lambda is memoized by TYPE (rememberComposableLambda(key,
+    // tracked, block, $composer, 0)); the shaped lambda is the block arg.
+    const wrapped = call.Call.args[0].Call;
+    const lam = wrapped.args[2].Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
@@ -3952,7 +4156,10 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null, null);
     const call = wrappedBodyStmts(&out)[0].Expr.Call;
-    const lam = call.args[call.args.len - 1].Lambda;
+    // Memoized by TYPE: the content lambda rides inside
+    // rememberComposableLambda(key, tracked, block, $composer, 0).
+    const wrapped = call.args[call.args.len - 1].Call;
+    const lam = wrapped.args[2].Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
