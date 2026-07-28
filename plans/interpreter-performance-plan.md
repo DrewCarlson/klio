@@ -919,7 +919,23 @@ green), and plain-lambda memoization — remember(captures) { lambda }
 for non-composable lambda args with capture-fact analysis
 (funInterface_isMemoized). REMAINING 8: testInsertOnMultipleLevels
 (this-capture), testModificationsPropagateToSubcomposition
-(value-position lambda typing), slotsAreUsedCorrectly_forEach,
+(value-position lambda typing), slotsAreUsedCorrectly_forEach — NARROWED: not a loop/slot
+issue at all. The failure reproduces WITHOUT forEach ("getValue on
+kotlin.String" at INITIAL composition) with exactly: local classes
+declared in the test fn + a nullable smart-cast + `Text(person?.name
+?: "No person")` inside a THREADED content lambda; the same chain runs
+fine outside compose (klio-local, plugin on or off) and without the
+if/smart-cast. Repro shape preserved as FeProbeTests.noForEach in the
+transcript: person prints as a Person instance, then the Text(...)
+statement itself raises call_member getValue on the String — the
+member read of a local-class param-property inside the transformed
+lambda routes through the DELEGATE probe with the field's VALUE as
+receiver. Next: dump the lowered content lambda (KLIO_DUMP_FN by id)
+and find which lowering path emits the getValue for `person?.name`
+under the pass transform. Also landed meanwhile: value-returning
+composables now get their kotlinc replace-group (block + expr bodies,
+engine primitives rememberComposableLambda/key excluded) — reuse holds
+25/25.
 5 Pausable (resume-round batching + thread tests). Old standing:
 (was) CompositionTests 137/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since the 133
