@@ -830,12 +830,14 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 break :blk ag.get().contains(key);
             };
             if (!has) continue;
-            // A delegated property's thunk declares the primary params so the
-            // delegate expression can read plain ctor params; pass the args,
-            // filling omitted trailing params from their literal defaults.
+            // Both delegate and plain-initializer thunks declare the primary
+            // params so the expression can read plain ctor params — including
+            // one the property itself shadows (`class N(property: String) {
+            // var property = property }`). Pass the args, filling omitted
+            // trailing params from their literal defaults.
             var eff_args: std.ArrayList(Value) = .empty;
             defer eff_args.deinit(allocator);
-            if (is_delegate) {
+            {
                 const g = cls.borrow();
                 defer g.deinit();
                 const pps = g.get().primary_params;
@@ -851,7 +853,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     }
                 }
             }
-            const thunk_args: []const Value = if (is_delegate) eff_args.items else &.{};
+            const thunk_args: []const Value = eff_args.items;
             switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, thunk_args)) {
                 .ok => |rv| {
                     const ig = inst.borrowMut();

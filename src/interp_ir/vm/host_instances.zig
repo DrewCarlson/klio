@@ -3349,7 +3349,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                 break :hblk ag.get().contains(key);
                             };
                             if (has) {
-                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, &.{})) {
+                                switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, cls_args)) {
                                     .ok => |rv| break :blk rv,
                                     .err => |e| return .{ .err = e },
                                 }
