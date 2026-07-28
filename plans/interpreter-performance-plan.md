@@ -948,11 +948,21 @@ view named Row into a view named Row which already has a parent named
 Row": when \`position\` moves the movable content from the main
 composition into a subcomposition, the DESTINATION inserts the
 content's node tree while the SOURCE composition never extracted it —
-the cross-composition exchange (Recomposer.movableContentReference /
-releaseMovableContent / insertMovableContentGuarded +
-deferredChanges) does not hand the nodes over; probe which side
-diverges by logging reportFreeMovableContent/releaseMovableContent and
-the insert path's node reuse in a position-flip run. And
+MEASURED ([mv] probes): in the move frame, deletedMovableContent(main)
+and insertMovableContent(sub1) both fire, but ONLY sub1 applies —
+main (@26c) never enters toApply (its recompose reports empty changes,
+so the release ops recorded for the deleted movable group never
+execute), movableContentStateReleased NEVER fires (state never
+available), and the destination's supposedly-FRESH compose (pairing
+second==null) still inserts the ORIGINAL still-parented Row instance.
+Two klio divergences to chase: (1) why main's recompose change list is
+empty when a movable group is deleted — the
+releaseMovableGroupAtCurrent/reportGroup ops should be IN it, making
+recompose() true and queueing main for apply; (2) why fresh-composed
+movable content reuses the source's node instances — node identity is
+leaking through the movable group's slot data into the fresh-compose
+path (likely the slot-preserving movable reference carrying node
+slots the destination's ComposeNode reuse path then adopts). And
 removeAndInsertWithMoveAway (infinite recompose, ~80s wall). Plus the
 deadlock/frame-clock threading flakes. Old:
 (was) CompositionTests 142/148,
