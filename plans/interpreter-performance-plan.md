@@ -910,7 +910,18 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 141/148,
+CURRENT STANDING (post this stretch): CompositionTests 142/148,
+MovableContentTests 42/44, RecomposerTests 11/12. Since 141:
+testInsertOnMultipleLevels FIXED — the this-capture gap was actually an
+APPLICABILITY gate: anyLocalFnOverloadApplicable dropped ext siblings
+whenever recvTypeRef was null, even with a reachable this capture, so
+the call skipped every receiver-prepending route. Unproven now
+survives; only genuinely receiver-less scopes drop the candidate.
+REMAINING 6: testModificationsPropagateToSubcomposition
+(value-position lambda typing), 5 Pausable (resume-round batching +
+thread tests). Plus MovableContent 2 and validatePotentialDeadlock/
+pausingTheFrameClock flakes. Old:
+(was) CompositionTests 141/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since 140:
 slotsAreUsedCorrectly_forEach FIXED — never a loop/slot issue; the
 delegated_body_props registry's simple-name key let ModelViewTests'
