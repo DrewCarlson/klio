@@ -910,7 +910,19 @@ the static closure. Alternatively: newInstance's interface fallback
 could walk the scoped/enclosing envs for a callable of the name before
 throwing.
 
-CURRENT STANDING (post this stretch): CompositionTests 140/148,
+CURRENT STANDING (post this stretch): CompositionTests 141/148,
+MovableContentTests 42/44, RecomposerTests 11/12. Since 140:
+slotsAreUsedCorrectly_forEach FIXED — never a loop/slot issue; the
+delegated_body_props registry's simple-name key let ModelViewTests'
+packaged \`Person { var name by mutableStateOf }\` intercept the local
+test Person's plain \`name\` field read (delegate getValue on the stored
+String). Now keyed by FQN with exact-FQN adjudication for the
+receiver's own class. Value-returning composables also gained their
+kotlinc replace-group (engine primitives excluded, reuse 25/25).
+REMAINING 7: testInsertOnMultipleLevels (this-capture),
+testModificationsPropagateToSubcomposition (value-position lambda
+typing), 5 Pausable (resume-round batching + threads). Old:
+(was) CompositionTests 140/148,
 MovableContentTests 42/44, RecomposerTests 11/12. Since 137: sink
 lambdas memoized by declared TYPE with the implicit label re-attached
 inside the wrap (testParentCompositionRecomposesFirst,
