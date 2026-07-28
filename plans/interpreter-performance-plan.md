@@ -965,9 +965,15 @@ spliced-loop iterations after content shrinks; the non-restartable
 replace-group wrap matches kotlinc but regressed CompositionReusing
 25→23 and was reverted — the reuse machinery must learn the group
 first), PausableCompositionTests 5 (canPauseContent iteration 7 vs 9:
-two pause points missing — pause-point parity between klio's
-shouldExecute emission and the reference; plus two background-thread
-tests and rememberObserverThrashing). Old standing below:
+a GapComposer.shouldExecute probe shows NINE pause consults all
+pausing=true — the pause POINTS are correct; the divergence is the
+resume-tree round count (resumeTillComplete counts
+pausedComposition.resume() rounds; klio finishes in 7 where the
+reference needs 9), i.e. klio's composeInitialPaused/recomposePaused
+resumes more than one paused scope per round in two rounds. Compare
+the invalidScopes set handed back per round against the reference's
+one-scope-per-round chain; plus two background-thread tests and
+rememberObserverThrashing). Old standing below:
 (was) CompositionTests 133/148,
 MovableContentTests 42/44, RecomposerTests 11/12 (validatePotentialDeadlock
 only; pausingTheFrameClock* remains an in-suite flake). Landed since the
