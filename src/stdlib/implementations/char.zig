@@ -419,7 +419,7 @@ fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.All
         const msg = try std.fmt.allocPrint(allocator, "radix {d} is not in valid range 2..36", .{radix});
         return .{ .err = .{ .Thrown = .{ .Exception = .{
             .fqn = try runtime.strInit(allocator, "kotlin.IllegalArgumentException"),
-            .message = try runtime.strInitOwned(allocator, msg),
+            .message = .from(try runtime.strInitOwned(allocator, msg)),
             .cause = null,
         } } } };
     }
@@ -467,7 +467,7 @@ pub fn char_digit_to_int(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     );
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
-        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
     } } } };
 }
@@ -526,7 +526,7 @@ pub fn char_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 const msg = try std.fmt.allocPrint(ctx.allocator, "Invalid Char code: {d}", .{code});
                 return .{ .err = .{ .Thrown = .{ .Exception = .{
                     .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
-                    .message = try runtime.strInitOwned(ctx.allocator, msg),
+                    .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
                     .cause = null,
                 } } } };
             }
@@ -955,7 +955,7 @@ test "digitToInt throws for a non-digit" {
     try testing.expect(r.err == .Thrown);
     const exc = r.err.Thrown.Exception;
     {
-        const mg = exc.message.?.borrow();
+        const mg = exc.message.get().?.borrow();
         defer mg.deinit();
         try testing.expectEqualStrings(
             "Char \"Z\" is not a digit in the given radix=10",
@@ -967,7 +967,7 @@ test "digitToInt throws for a non-digit" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.?.deinit();
+    exc.message.get().?.deinit();
     exc.fqn.deinit();
 }
 
@@ -979,7 +979,7 @@ test "digitToInt throws for an out-of-range radix" {
     try testing.expect(r.err == .Thrown);
     const exc = r.err.Thrown.Exception;
     {
-        const mg = exc.message.?.borrow();
+        const mg = exc.message.get().?.borrow();
         defer mg.deinit();
         try testing.expectEqualStrings("radix 99 is not in valid range 2..36", mg.get().bytes);
     }
@@ -988,7 +988,7 @@ test "digitToInt throws for an out-of-range radix" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.?.deinit();
+    exc.message.get().?.deinit();
     exc.fqn.deinit();
 }
 

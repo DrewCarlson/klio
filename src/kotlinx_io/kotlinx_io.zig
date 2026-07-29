@@ -123,7 +123,7 @@ fn ioError(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Alloc
     const msg = try std.fmt.allocPrint(ctx.allocator, fmt, args);
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlinx.io.IOException"),
-        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
     } } } };
 }
@@ -468,7 +468,7 @@ fn freeValue(v: Value) void {
         .Exception => |e| {
             // The fqn is a string literal (not heap); only the message is.
             e.fqn.deinit();
-            if (e.message) |m| freeString(m);
+            if (e.message.get()) |m| freeString(m);
         },
         else => {},
     }

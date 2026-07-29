@@ -2260,7 +2260,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                                 const msg = try runtime.strInitOwned(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
                                 sg.deinit();
                                 cd.deinit();
-                                return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };
+                                return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = null } } } };
                             }
                         }
                         cd.deinit();

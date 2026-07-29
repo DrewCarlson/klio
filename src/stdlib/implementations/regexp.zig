@@ -62,7 +62,7 @@ fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]cons
         null;
     return .{ .Exception = .{
         .fqn = try runtime.strInitOwned(allocator, owned_fqn),
-        .message = msg_ref,
+        .message = .from(msg_ref),
         .cause = null,
     } };
 }

@@ -467,6 +467,37 @@ pub const BorrowMutError = error{AlreadyBorrowed};
 /// a plain pointer-sized value; copying the struct without going through
 /// `clone` does NOT bump the count, so copy only when you also `deinit`
 /// exactly once per logical owner.
+/// A nullable `ObjRef(T)` that is the size of a pointer.
+///
+/// `?ObjRef(T)` is NOT: Zig's null-pointer optimization applies to a bare
+/// `?*T`, not to an optional of a single-pointer STRUCT, so the plain
+/// optional carries a separate tag word and costs 16 bytes. Every optional
+/// handle inlined into a `Value` payload therefore doubled that payload's
+/// contribution to the union's width. Storing the nullable cell pointer
+/// directly recovers the optimization.
+pub fn OptRef(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        pub const Ref = ObjRef(T);
+
+        cell: ?*Ref.Cell = null,
+
+        pub inline fn from(r: ?Ref) Self {
+            return .{ .cell = if (r) |x| x.cell else null };
+        }
+
+        /// The handle, or null. Borrowing/retaining rules are the caller's,
+        /// exactly as with the plain optional this replaces.
+        pub inline fn get(self: Self) ?Ref {
+            return if (self.cell) |c| Ref{ .cell = c } else null;
+        }
+
+        pub inline fn isSome(self: Self) bool {
+            return self.cell != null;
+        }
+    };
+}
+
 pub fn ObjRef(comptime T: type) type {
     return struct {
         const Self = @This();

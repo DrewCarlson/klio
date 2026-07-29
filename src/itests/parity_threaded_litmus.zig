@@ -370,9 +370,12 @@ test "threaded_litmus_suite_is_complete" {
     }
 }
 
-// The eager pipeline is a fidelity upgrade, never a behavior change: the
-// same program produces byte-identical output with and without
-// KLIO_EAGER=1 (typeck ahead of lowering + the identity-channel records).
+// The eager pipeline is the only pipeline; there is no `KLIO_EAGER` to
+// toggle. What this still pins is the OUTPUT: the shapes that motivated the
+// channel (an overload picked by argument type, a shadowed identity pick, a
+// collection-plus-sequence mix) must produce exactly this text. Running the
+// program twice also pins determinism, which is what caught the span-keyed
+// param-shape channel aliasing synthesized nodes.
 test "eager pipeline output parity" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -406,7 +409,6 @@ test "eager pipeline output parity" {
 
     var env = std.process.Environ.Map.init(al);
     runtime.procEnvPutAllInto(al, &env);
-    _ = env.remove("KLIO_EAGER");
     const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
     const lazy = std.process.run(al, io, .{
         .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
@@ -414,7 +416,6 @@ test "eager pipeline output parity" {
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch return error.SpawnFailed;
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, lazy.term);
-    try env.put("KLIO_EAGER", "1");
     const eager = std.process.run(al, io, .{
         .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
         .environ_map = &env,

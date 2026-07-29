@@ -1473,7 +1473,7 @@ fn cloneSlice(allocator: std.mem.Allocator, ref: ValueSlice) std.mem.Allocator.E
 fn noSuchElement(allocator: std.mem.Allocator, message: []const u8) std.mem.Allocator.Error!RuntimeError {
     const fqn = try runtime.strInit(allocator, "kotlin.NoSuchElementException");
     const msg = try runtime.strInit(allocator, message);
-    return .{ .Thrown = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } };
+    return .{ .Thrown = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = null } } };
 }
 
 // ----- comparison / sort (faithful `compare_values`) -----
@@ -1887,7 +1887,7 @@ test "Map.Entry key and value accessors" {
     const entry: Value = .{ .MapEntry = .{
         .key = try Value.boxRef(h.allocator(), key),
         .value = try Value.boxRef(h.allocator(), val),
-        .backing = null,
+        .backing = .{},
     } };
     var args = [_]Value{entry};
     var ctx = h.ctx(&args);

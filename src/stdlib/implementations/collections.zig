@@ -87,9 +87,9 @@ fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 /// `make_list(items, mutable)` — wrap a slice of values into a `List`.
 /// A fresh structural-modification counter for a mutable list (so its
 /// iterators can fail-fast), or null for a read-only list.
-fn modCountFor(a: Allocator, mutable: bool) Error!?ObjRef(u64) {
-    if (!mutable) return null;
-    return try ObjRef(u64).init(a, 0);
+fn modCountFor(a: Allocator, mutable: bool) Error!runtime.OptRef(u64) {
+    if (!mutable) return .{};
+    return .from(try ObjRef(u64).init(a, 0));
 }
 
 /// A `List`/`Set` element count, or 0 for anything else — for the
@@ -103,18 +103,18 @@ fn listLenOf(v: *const Value) usize {
 }
 
 /// The shared `mod_count` of a `List`/`Set` value, if any.
-fn modCountOf(v: *const Value) ?ObjRef(u64) {
+fn modCountOf(v: *const Value) runtime.OptRef(u64) {
     return switch (v.*) {
         .List => |l| l.mod_count,
         .Set => |s| s.mod_count,
-        else => null,
+        else => .{},
     };
 }
 
 /// Increment a collection's `mod_count` (no-op when absent). Use directly for a
 /// structural op that does not change length (`trimToSize`/`ensureCapacity`).
 pub fn bumpModCount(v: *const Value) void {
-    if (modCountOf(v)) |mc| {
+    if (modCountOf(v).get()) |mc| {
         const g = mc.borrowMut();
         defer g.deinit();
         g.get().* +%= 1;
@@ -143,7 +143,7 @@ fn mapStructuralBump(entries: MapEntries, before: usize) void {
     const g = entries.borrowMut();
     defer g.deinit();
     if (g.get().pairs.items.len == before) return;
-    if (g.get().mod_count) |mc| {
+    if (g.get().mod_count.get()) |mc| {
         const mg = mc.borrowMut();
         defer mg.deinit();
         mg.get().* +%= 1;
@@ -156,16 +156,16 @@ fn mapStructuralBump(entries: MapEntries, before: usize) void {
 fn entriesCounterNow(entries: MapEntries) u64 {
     const g = entries.borrow();
     defer g.deinit();
-    const cell = g.get().mod_count orelse return 0;
+    const cell = g.get().mod_count.get() orelse return 0;
     const cg = cell.borrow();
     defer cg.deinit();
     return cg.get().*;
 }
 
-fn entriesModCountClone(entries: MapEntries) ?ObjRef(u64) {
+fn entriesModCountClone(entries: MapEntries) runtime.OptRef(u64) {
     const g = entries.borrow();
     defer g.deinit();
-    return if (g.get().mod_count) |mc| mc.clone() else null;
+    return if (g.get().mod_count.get()) |mc| .from(mc.clone()) else .{};
 }
 
 fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
@@ -342,7 +342,7 @@ fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Val
 fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Value {
     const fqn_ref = try runtime.strInit(a, fqn);
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(a, m) else null;
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
+    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
 }
 
 /// `Err(RuntimeError::Thrown(make_exception(...)))` as an EvalResult.
@@ -360,8 +360,8 @@ fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult 
 /// while the builder was live.
 pub const FROZEN_MOD_BIT: u64 = runtime.FROZEN_MOD_BIT;
 
-pub fn modCountFrozen(mc: ?ObjRef(u64)) bool {
-    const cell = mc orelse return false;
+pub fn modCountFrozen(mc: runtime.OptRef(u64)) bool {
+    const cell = mc.get() orelse return false;
     const g = cell.borrow();
     defer g.deinit();
     return (g.get().* & FROZEN_MOD_BIT) != 0;
@@ -859,7 +859,7 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
                 out[i] = .{ .MapEntry = .{
                     .key = try Value.boxRef(a, kv.key),
                     .value = try Value.boxRef(a, kv.value),
-                    .backing = null,
+                    .backing = .{},
                 } };
             }
             return .{ .items = out };
@@ -2328,7 +2328,7 @@ pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
             .mutable = false,
             .enum_entries = false,
             .backing = null,
-            .mod_count = null,
+            .mod_count = .{},
         } },
         .scalars => |buf| {
             const view_kind = arr.prim orelse blk: {
@@ -2350,7 +2350,7 @@ pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
                 .mutable = false,
                 .enum_entries = false,
                 .backing = backing.cell,
-                .mod_count = null,
+                .mod_count = .{},
             } };
         },
     }
@@ -3466,8 +3466,8 @@ fn syncSublistChain(a: Allocator, cell: *runtime.CollBackingRef.Cell, view_items
 }
 
 /// Current value of a shared structural counter (0 when uncounted).
-pub fn counterNowOf(mc: ?ObjRef(u64)) u64 {
-    const cell = mc orelse return 0;
+pub fn counterNowOf(mc: runtime.OptRef(u64)) u64 {
+    const cell = mc.get() orelse return 0;
     const g = cell.borrow();
     defer g.deinit();
     return g.get().*;
@@ -3495,12 +3495,12 @@ pub fn sublistComodGuard(a: Allocator, v: *const Value) Error!?EvalResult {
 pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     if (v.* != .MapEntry) return null;
     const me = &v.MapEntry;
-    const entries = me.backing orelse return null;
+    const entries = me.backing.get() orelse return null;
     var stale = false;
     {
         const g = entries.borrow();
         defer g.deinit();
-        if (g.get().mod_count) |cell| {
+        if (g.get().mod_count.get()) |cell| {
             const cg = cell.borrow();
             stale = cg.get().* != me.exp_mod;
             cg.deinit();
@@ -5005,7 +5005,7 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     // Share the root list's structural counter so a modification of the parent
     // (not through this view) is observed as a ConcurrentModification by this
     // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
-    const shared_mc = if (recv.List.mod_count) |mc| mc.clone() else try modCountFor(a, mutable);
+    const shared_mc = if (recv.List.mod_count.get()) |mc| runtime.OptRef(u64).from(mc.clone()) else try modCountFor(a, mutable);
     return ok(.{ .List = .{
         .items = try ValueList.init(a, window),
         .mutable = mutable,
@@ -5954,7 +5954,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
             try map_entries.append(a, .{ .MapEntry = .{
                 .key = try Value.boxRef(a, kv.key),
                 .value = try Value.boxRef(a, kv.value),
-                .backing = if (writable) entries else null,
+                .backing = if (writable) .from(entries) else .{},
                 .exp_mod = stamp,
             } });
         }

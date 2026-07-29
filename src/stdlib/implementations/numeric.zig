@@ -95,7 +95,7 @@ fn arityErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloc
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
-        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
+        .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
     } };
 }
@@ -1536,7 +1536,7 @@ test "int_to_string rejects out-of-range radix" {
                 const g = v.Exception.fqn.borrow();
                 defer g.deinit();
                 try testing.expectEqualStrings("kotlin.IllegalArgumentException", g.get().bytes);
-                const mg = v.Exception.message.?.borrow();
+                const mg = v.Exception.message.get().?.borrow();
                 defer mg.deinit();
                 try testing.expectEqualStrings("radix 1 was not in valid range 2..36", mg.get().bytes);
             },
