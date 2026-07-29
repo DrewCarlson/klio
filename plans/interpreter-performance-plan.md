@@ -1065,6 +1065,34 @@ reads and the KClass companion resolutions are the biggest remaining
 gf-slow entries; frame machinery (Call + outside-eval ≈ 20%) is still
 the structural rock.
 
+FOLLOW-UP ROUND (landed): thread-local L1 caches in front of the
+shared method/ext/stdlib-resolve maps (the program cell's reader-lock
+word ping-pongs between cores at millions of probes/s across two
+threads); a NAMED member-resolution memo — upstream SlotTable-style
+named-argument calls (`dataIndex(index = …)`: 600k/stress-test) ran
+the full class-hierarchy walk + overload scoring per call, now
+memoized under the positional key with the interned name-vector
+folded in (fills gated on no self-delegation filtering, served
+through the walk's own terminal with the guard re-checked); adaptive
+sub-millisecond backoff for the pump's wall-timer wait, the
+cross-thread resume two-turn wait, and the monitor-enter path (all
+were fixed 1ms cadences; `runtime.clockSleepMicros` added).
+markInvalidFromBackgroundThread 22.3 → 21.7s.
+
+WALL-INVARIANCE FINDING (resumeOnBackgroundThread, measured across 8
+experiment rounds): the test's ~116s wall is INVARIANT to every
+compute and latency change — CPU samples varied 101k→140k while wall
+held within 114-117s. The pump logs 75k `timer_wall` sleep rounds:
+the duration is REAL-TIME-PACED (the test's `repeat(100) { advance;
+delay(1) }` + background mutator/resume loops map to wall-mode
+timers), so interpreter speed does not move it. Greening it under
+the CI caps needs the wall→virtual clock mapping for compositionTest
+workloads — a separate campaign from per-call cost. The op-profiler
+lesson recorded the hard way: route tags STICK across nested native
+work and thread waits, so a hot route label can be a stale-tag
+artifact — cross-check with sample counts vs wall time (CPU-bound?)
+and the pump-sleep diag before believing any single tag.
+
 THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
 ~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget
 gates markInvalidFromBackgroundThread, resumeOnBackgroundThread, and

@@ -669,6 +669,9 @@ pub const op_route_names = [_][]const u8{
     "route:ltg-global", // 13
     "route:gf-slow", // 14
     "route:member-cache-probe", // 15
+    "route:member-post-stdlib", // 16
+    "route:member-positional", // 17
+    "route:member-miss-tail", // 18
 };
 
 /// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
