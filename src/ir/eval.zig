@@ -3372,12 +3372,13 @@ fn runFlatLoop(
     root_act: ?*Activation,
     host: *H,
 ) Allocator.Error!EvalResult {
+    const ev: *EvalTls = &evtls;
     var stack: std.ArrayList(*Activation) = .empty;
     defer stack.deinit(allocator);
     // On an allocation failure, unwind every open activation so no frame is
     // left dangling on the GC chain.
     errdefer while (stack.pop()) |act| {
-        evtls.eval_depth -= 1;
+        ev.eval_depth -= 1;
         teardownActivation(H, allocator, act, host);
         actFree(allocator, act);
     };
@@ -3396,7 +3397,7 @@ fn runFlatLoop(
         if (flat_site) |site| {
             // Same depth bound as the recursive path: an unbounded interpreted
             // recursion becomes a catchable StackOverflowError at the caller.
-            if (evtls.eval_depth >= maxEvalDepth()) {
+            if (ev.eval_depth >= maxEvalDepth()) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
                 runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
@@ -3404,15 +3405,15 @@ fn runFlatLoop(
                 ridx = site.ret_idx;
                 continue;
             }
-            evtls.eval_depth += 1;
+            ev.eval_depth += 1;
             const act = openActivation(H, allocator, f.module, site.req, host) catch |e| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 return e;
             };
             act.ret_block = site.ret_block;
             act.ret_idx = site.ret_idx;
             stack.append(allocator, act) catch |e| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 teardownActivation(H, allocator, act, host);
                 actFree(allocator, act);
                 return e;
@@ -3433,7 +3434,7 @@ fn runFlatLoop(
             var pd = pp.resume_reg;
             var barrier_hit = false;
             while (stack.pop()) |a| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 const is_barrier = a.suspend_barrier;
                 const is_root_pump = a.root_pump;
                 const scope_base = a.barrier_scope_base;
@@ -3498,7 +3499,7 @@ fn runFlatLoop(
         deliver: while (true) {
             if (stack.items.len == 0) return res;
             const act = stack.pop().?;
-            evtls.eval_depth -= 1;
+            ev.eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
             // A no-driver root's completion runs its pump to quiescence
             // (launched children, timers) before the caller sees the
