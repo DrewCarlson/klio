@@ -165,6 +165,9 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
     };
     // Frameless serve for the canonical getter shape on a claimed class.
     if (accessorFastGet(self, mptr, func, &receiver)) |r| return r;
+    // Frameless serve for the wider leaf-expression shape (a getter that
+    // combines a couple of stored reads with primitive arithmetic).
+    if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
     // Pin the receiver as a GC root across the getter's re-entrant evaluation.
     // A getter body allocates and hits safe points; the only handle to the
     // receiver here is this native local (the frame-chain walk cannot see it
@@ -466,6 +469,28 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
 /// Run a class property getter claimed by a `GetField` site memo.
 pub fn runFieldGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
     return evalGetterTagged(self, allocator, fid, receiver, "site-memo");
+}
+
+/// Whether the getter behind a claimed field-read route is itself a leaf
+/// expression. A leaf body only reads fields and does primitive arithmetic,
+/// so running one is repeatable — which is what lets the frameless leaf
+/// evaluator chain through a property whose backing is another property
+/// (`SlotWriter.size` reads `capacity`, which divides `groups.size`).
+pub fn fieldGetterIsLeaf(self: *VmHost, fid: FuncId) bool {
+    const mptr: *const Module = self.module.asPtr();
+    const f = mptr.funcById(fid) orelse return false;
+    return f.leafExprBody() and funcRunsItsBody(self, fid);
+}
+
+/// Whether calling `fid` really runs its lowered body. A symbol the link
+/// step settled onto a native binding, or one that redirects to a sibling
+/// declaration, resolves elsewhere — the frameless leaf evaluator must not
+/// interpret the body in either case.
+pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().resolvedNativeForm(fid) == null and
+        pg.get().resolvedRedirects(fid).len == 0;
 }
 
 /// Kotlin's implicit receivers stack. A bare name inside an object literal's
@@ -2459,28 +2484,77 @@ fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Err
 /// property (`private val Placeable.mainAxisSize` in each lazy item type)
 /// shares its (receiver, name) pair across owners, and only the
 /// declaration whose owner is in scope is the one kotlinc bound.
-fn ownerKeyedExtProp(self: *VmHost, allocator: Allocator, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    _ = self;
-    const lex = ir.eval.frameThisChainAlloc(allocator) catch return null;
-    defer allocator.free(lex);
-    for (lex) |v| {
+/// One `(owning class, receiver key, property name)` verdict. The registry
+/// and the class graph are both fixed once the program is loaded, so a class
+/// that does not own `name` for `recv_key` never starts owning it — the
+/// negative answer is as cacheable as the positive one.
+const OwnerKeyedSlot = struct { key: u64 = 0, fid: u32 = NO_FID, hit: bool = false };
+const NO_FID: u32 = std.math.maxInt(u32);
+threadlocal var owner_keyed_memo: [1024]OwnerKeyedSlot = @splat(.{});
+threadlocal var owner_keyed_memo_set: [1024]OwnerKeyedSlot = @splat(.{});
+
+fn ownerKeyedSlotKey(cls_ident: usize, recv_key: []const u8, name: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+    h.update(std.mem.asBytes(&cls_ident));
+    h.update(recv_key);
+    h.update(&[_]u8{0});
+    h.update(name);
+    const v = h.final();
+    return if (v == 0) 1 else v;
+}
+
+/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
+/// for one class on the lexical receiver tower.
+fn ownerKeyedForClass(cls: ObjRef(runtime.ClassDef), map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    var kb: [512]u8 = undefined;
+    const cg = cls.borrow();
+    defer cg.deinit();
+    const cd = cg.get();
+    if (ownerKeyedProbeOne(cd.fqn, kb[0..], map, recv_key, name)) |fid| return fid;
+    if (ownerKeyedProbeOne(cd.name, kb[0..], map, recv_key, name)) |fid| return fid;
+    for (cd.supertype_names) |sn| {
+        if (ownerKeyedProbeOne(sn, kb[0..], map, recv_key, name)) |fid| return fid;
+    }
+    return null;
+}
+
+fn ownerKeyedProbeOne(owner: []const u8, kb: []u8, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    if (std.fmt.bufPrint(kb, "{s}\x00{s}", .{ owner, recv_key })) |okey| {
+        return lookupPairFunc(map, okey, name);
+    } else |_| {
+        // A key longer than the inline buffer is vanishingly rare but must
+        // still resolve — the probe decides which declaration binds.
+        const heap = std.heap.page_allocator;
+        const okey = std.fmt.allocPrint(heap, "{s}\x00{s}", .{ owner, recv_key }) catch return null;
+        defer heap.free(okey);
+        return lookupPairFunc(map, okey, name);
+    }
+}
+
+/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
+/// for every class on the lexical receiver tower — a PRIVATE member-ext
+/// property (`private val Placeable.mainAxisSize` in each lazy item type)
+/// shares its (receiver, name) pair across owners, and only the
+/// declaration whose owner is in scope is the one kotlinc bound.
+fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    const memo: *[1024]OwnerKeyedSlot = if (setters) &owner_keyed_memo_set else &owner_keyed_memo;
+    var it = ir.eval.frameThisChainIter();
+    while (it.next()) |v| {
         if (v != .Instance) continue;
-        var names: std.ArrayList([]const u8) = .empty;
-        defer names.deinit(allocator);
-        {
+        const cls = blk: {
             const g = v.Instance.borrow();
             defer g.deinit();
-            const cg = g.get().class.borrow();
-            defer cg.deinit();
-            names.append(allocator, cg.get().fqn) catch return null;
-            names.append(allocator, cg.get().name) catch return null;
-            for (cg.get().supertype_names) |sn| names.append(allocator, sn) catch return null;
+            break :blk g.get().class;
+        };
+        const k = ownerKeyedSlotKey(cls.identity(), recv_key, name);
+        const slot = &memo[(k >> 7) % memo.len];
+        if (slot.key == k) {
+            if (!slot.hit) continue;
+            return FuncId.from(slot.fid);
         }
-        for (names.items) |owner| {
-            const okey = std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ owner, recv_key }) catch return null;
-            defer allocator.free(okey);
-            if (lookupPairFunc(map, okey, name)) |fid| return fid;
-        }
+        const found = ownerKeyedForClass(cls, map, recv_key, name);
+        slot.* = .{ .key = k, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+        if (found) |fid| return fid;
     }
     return null;
 }
@@ -2544,7 +2618,7 @@ fn resolveExtensionPropImpl(
         const pg = self.prog.borrow();
         defer pg.deinit();
         if (pg.get().owner_keyed_ext_names.contains(name)) {
-            if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+            if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
         }
         if (missTraceEnvCached()) |w| {
             if (std.mem.eql(u8, w, name))
@@ -2585,7 +2659,7 @@ fn resolveExtensionPropImpl(
                 const pg = self.prog.borrow();
                 defer pg.deinit();
                 if (pg.get().owner_keyed_ext_names.contains(name)) {
-                    if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), sup, name)) |fid| return fid;
+                    if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), sup, name)) |fid| return fid;
                 }
                 if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
             }

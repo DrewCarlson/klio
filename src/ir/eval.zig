@@ -161,6 +161,24 @@ const EvalTls = struct {
     frame_chain: ?*Frame = null,
     /// Innermost in-flight resume node chain (GC root seed).
     resuming: ?*ResumeFrames = null,
+
+    /// Free-list of frame register buffers (see `acquireRegs`).
+    regs_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    /// Lexical-origin override for file-private visibility (see
+    /// `RefSiteOverride`).
+    ref_site_override: ?RefSiteOverride = null,
+    /// A direct call the host prepared for the flat driver to pick up.
+    host_flat_armed: bool = false,
+    host_flat_req: ?FlatCallReq = null,
+    /// Free-list of flat activations (see `actAlloc`).
+    act_pool_len: usize = 0,
+    act_pool: [ACT_POOL_MAX]*Activation = undefined,
+    /// `KLIO_SPIN_TRACE` bookkeeping.
+    spin_last_dump: i64 = 0,
+    spin_check_counter: u64 = 0,
+    /// Free-list of enclosing-`this` chain buffers (see `chainAcquire`).
+    chain_pool: [CHAIN_POOL_MAX][]EnclosingEntry = undefined,
+    chain_pool_len: usize = 0,
 };
 /// Native-recursion depth for the whole-function JIT: a compiled body recursing
 /// into a compiled callee runs it frameless (no interpreter frame), so each level
@@ -244,6 +262,36 @@ pub fn currentFramePackage() ?[]const u8 {
 /// the current call stack. The member-extension owner walk consults it
 /// when the dynamic enclosing chain has no matching entry (a property
 /// read inside nested lambdas whose frames never pushed the chain).
+///
+/// The iterator form does the same walk, with the same adjacent-duplicate
+/// suppression, without building a slice: a consumer that only scans the
+/// tower pays no allocator traffic per property read.
+pub const ThisChainIter = struct {
+    cur: ?*Frame,
+    steps: usize = 0,
+    prev: ?Value = null,
+
+    pub fn next(self: *ThisChainIter) ?Value {
+        while (self.cur) |f| {
+            self.cur = f.gc_link;
+            if (self.steps > 256) return null;
+            self.steps += 1;
+            const v = callerThisValue(f) orelse continue;
+            if (self.prev) |p| {
+                if (p == .Instance and v == .Instance and
+                    ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
+            }
+            self.prev = v;
+            return v;
+        }
+        return null;
+    }
+};
+
+pub fn frameThisChainIter() ThisChainIter {
+    return .{ .cur = evtls.frame_chain };
+}
+
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
     var out: std.ArrayList(Value) = .empty;
     var cur = evtls.frame_chain;
@@ -280,12 +328,11 @@ pub fn nearestFramePackage() ?[]const u8 {
 /// candidate body run during dispatch executes in a DEEPER frame, so its
 /// own dispatches ignore the override and see their own files.
 pub const RefSiteOverride = struct { file: ir.FileId, frame: *const Frame };
-threadlocal var ref_site_override: ?RefSiteOverride = null;
 
 /// The active reference-site file, when the innermost frame is still the
 /// one the override was pushed under.
 pub fn refSiteFile() ?ir.FileId {
-    const o = ref_site_override orelse return null;
+    const o = evtls.ref_site_override orelse return null;
     const fr = evtls.frame_chain orelse return null;
     return if (fr == o.frame) o.file else null;
 }
@@ -294,13 +341,13 @@ pub fn refSiteFile() ?ir.FileId {
 /// Returns the previous override; the caller restores it via
 /// `popRefSiteFile` when its dispatch completes.
 pub fn pushRefSiteFile(file: ir.FileId) ?RefSiteOverride {
-    const prev = ref_site_override;
-    if (evtls.frame_chain) |fr| ref_site_override = .{ .file = file, .frame = fr };
+    const prev = evtls.ref_site_override;
+    if (evtls.frame_chain) |fr| evtls.ref_site_override = .{ .file = file, .frame = fr };
     return prev;
 }
 
 pub fn popRefSiteFile(prev: ?RefSiteOverride) void {
-    ref_site_override = prev;
+    evtls.ref_site_override = prev;
 }
 
 /// Simple name of the function the innermost active frame is executing.
@@ -320,7 +367,6 @@ pub fn currentFrameFunc() ?*const ir.Func {
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory
 /// is GC-owned and must not be hand-recycled; under the arena nothing is freed.
 /// Bounded so a deep-then-shallow call profile cannot retain buffers unboundedly.
-threadlocal var regs_pool: std.ArrayListUnmanaged([]Value) = .empty;
 const REGS_POOL_MAX: usize = 128;
 
 /// Take a zeroed (`.Unit`) register buffer of length `n`, reusing a pooled
@@ -341,10 +387,10 @@ inline fn regsAlloc(fallback: Allocator) Allocator {
 
 fn acquireRegs(allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
     const ra = regsAlloc(allocator);
-    if (regs_pool.items.len > 0) {
-        const buf = regs_pool.items[regs_pool.items.len - 1];
+    if (evtls.regs_pool.items.len > 0) {
+        const buf = evtls.regs_pool.items[evtls.regs_pool.items.len - 1];
         if (buf.len >= n) {
-            regs_pool.items.len -= 1;
+            evtls.regs_pool.items.len -= 1;
             var list: std.ArrayList(Value) = .{ .items = buf[0..0], .capacity = buf.len };
             list.appendNTimes(ra, .Unit, n) catch unreachable; // capacity already fits
             // Re-enters the traced set (see releaseRegs).
@@ -372,28 +418,28 @@ fn releaseRegs(allocator: Allocator, regs: *std.ArrayList(Value)) void {
     const ra = regsAlloc(allocator);
     const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
     const pool_ok = (gc_pool or (runtime.reclaimEnabled() and evtls.eval_depth > 0)) and
-        regs.capacity > 0 and regs_pool.items.len < REGS_POOL_MAX;
+        regs.capacity > 0 and evtls.regs_pool.items.len < REGS_POOL_MAX;
     if (pool_ok) {
         const buf = regs.allocatedSlice();
         regs.* = .empty;
         // Leaves the traced set (pooled, no live values) — shrink the
         // collector's external-live estimate to match.
         if (gc_pool and runtime.gc.external_accounting) runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
-        regs_pool.append(ra, buf) catch {
+        evtls.regs_pool.append(ra, buf) catch {
             ra.free(buf);
         };
         return;
     }
     regs.deinit(ra);
-    if (!gc_pool and evtls.eval_depth == 0 and regs_pool.items.len > 0) drainRegsPool(allocator);
+    if (!gc_pool and evtls.eval_depth == 0 and evtls.regs_pool.items.len > 0) drainRegsPool(allocator);
 }
 
 /// Free every pooled register buffer. Called when the outermost frame unwinds
 /// (never under the GC pool, whose libc buffers persist for the process).
 fn drainRegsPool(allocator: Allocator) void {
     const ra = regsAlloc(allocator);
-    for (regs_pool.items) |buf| ra.free(buf);
-    regs_pool.clearRetainingCapacity();
+    for (evtls.regs_pool.items) |buf| ra.free(buf);
+    evtls.regs_pool.clearRetainingCapacity();
 }
 
 /// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
@@ -497,9 +543,9 @@ pub fn gcUninstallFrameRoot() void {
         runtime.gc.unregisterThreadRoot(&frame_troot);
         frame_troot_inited = false;
     }
-    if (runtime.gc.gc_enabled and regs_pool.items.len > 0) {
+    if (runtime.gc.gc_enabled and evtls.regs_pool.items.len > 0) {
         drainRegsPool(std.heap.c_allocator);
-        regs_pool.deinit(std.heap.c_allocator);
+        evtls.regs_pool.deinit(std.heap.c_allocator);
     }
 }
 
@@ -607,8 +653,6 @@ pub fn dispatchCacheStable() bool {
 pub fn nowMonotonicMs() i64 {
     return @intCast(@divTrunc(runtime.clockMonotonicNanos(), std.time.ns_per_ms));
 }
-threadlocal var spin_last_dump: i64 = 0;
-threadlocal var spin_check_counter: u64 = 0;
 
 /// Diagnostic: print the live frame chain (as the spin tracer does), for an
 /// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
@@ -888,12 +932,12 @@ fn spinDumpMaybe() void {
     }
     const iv = spin_interval_s orelse return;
     const now: i64 = @intCast(runtime.clockMonotonicNanos() / std.time.ns_per_s);
-    if (spin_last_dump == 0) {
-        spin_last_dump = now;
+    if (evtls.spin_last_dump == 0) {
+        evtls.spin_last_dump = now;
         return;
     }
-    if (now - spin_last_dump < iv) return;
-    spin_last_dump = now;
+    if (now - evtls.spin_last_dump < iv) return;
+    evtls.spin_last_dump = now;
     std.debug.print("[spin] frame chain (innermost first):\n", .{});
     // Innermost frames' scalar registers — live loop state (probe offsets,
     // masks, bit groups) for a loop that never terminates.
@@ -1294,6 +1338,32 @@ fn chainAllocator() Allocator {
     return runtime.slab.allocator;
 }
 
+/// Per-thread free-list of enclosing-`this` chain buffers. Nearly every call
+/// seeds a chain of one or two entries and drops it again at teardown, so the
+/// buffer is recycled rather than round-tripped through the slab. The backing
+/// allocator is process-global, so a buffer is safe to hand to any later frame
+/// on this thread.
+const CHAIN_POOL_MAX: usize = 128;
+
+fn chainAcquire() std.ArrayList(EnclosingEntry) {
+    if (evtls.chain_pool_len > 0) {
+        evtls.chain_pool_len -= 1;
+        const buf = evtls.chain_pool[evtls.chain_pool_len];
+        return .{ .items = buf[0..0], .capacity = buf.len };
+    }
+    return .empty;
+}
+
+fn chainRelease(list: *std.ArrayList(EnclosingEntry)) void {
+    if (list.capacity > 0 and evtls.chain_pool_len < CHAIN_POOL_MAX) {
+        evtls.chain_pool[evtls.chain_pool_len] = list.allocatedSlice();
+        evtls.chain_pool_len += 1;
+        list.* = .empty;
+        return;
+    }
+    list.deinit(chainAllocator());
+}
+
 fn maxEvalDepth() usize {
     if (evtls.eval_depth_cap != 0) return evtls.eval_depth_cap;
     // `procEnvGetVar` reads the whole environment block into a scratch
@@ -1510,22 +1580,20 @@ fn nuTraceWant() ?[]const u8 {
 /// the slot, the host's terminal takes the arm (one-shot — inner calls see
 /// it disarmed), prepares the flat request instead of dispatching, and
 /// stashes it here; the arm consumes the stash and pushes the activation.
-threadlocal var host_flat_armed: bool = false;
-threadlocal var host_flat_req: ?FlatCallReq = null;
 pub fn armHostFlatReq() void {
-    host_flat_armed = true;
+    evtls.host_flat_armed = true;
 }
 pub fn takeHostFlatArm() bool {
-    const a = host_flat_armed;
-    host_flat_armed = false;
+    const a = evtls.host_flat_armed;
+    evtls.host_flat_armed = false;
     return a;
 }
 pub fn stashHostFlatReq(req: FlatCallReq) void {
-    host_flat_req = req;
+    evtls.host_flat_req = req;
 }
 fn takeHostFlatReq() ?FlatCallReq {
-    const r = host_flat_req;
-    host_flat_req = null;
+    const r = evtls.host_flat_req;
+    evtls.host_flat_req = null;
     return r;
 }
 
@@ -2248,7 +2316,7 @@ const Frame = struct {
             .regs = regs,
             .params = params,
             .captures = captures,
-            .enclosing_this = .empty,
+            .enclosing_this = chainAcquire(),
             .prev_chain = null,
             .prev_chain_base = 0,
             .module_arc = null,
@@ -2325,7 +2393,7 @@ const Frame = struct {
         releaseRegs(self.allocator, &self.regs);
         self.params.deinit(self.allocator);
         self.captures.deinit(self.allocator);
-        self.enclosing_this.deinit(chainAllocator());
+        chainRelease(&self.enclosing_this);
     }
 
     fn read(self: *const Frame, r: Reg) Value {
@@ -2436,6 +2504,293 @@ fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, params:
 pub fn eval(allocator: Allocator, module: *const Module, func: *const Func, args: std.ArrayList(Value)) Allocator.Error!EvalResult {
     var host = nullHost();
     return evalWith(NullHost, allocator, module, func, args, &host);
+}
+
+/// Whether `v` is a primitive the leaf evaluator may hand to `applyBinop`
+/// directly. Everything else (instances with operator overloads, strings,
+/// collections, cells) needs the full operator arm, so the leaf declines.
+fn leafPrimitive(v: *const Value) bool {
+    return switch (v.*) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => true,
+        else => false,
+    };
+}
+
+/// Serve a `leafExprBody` without building a frame.
+///
+/// A leaf body reads its arguments and some stored fields, combines them
+/// with primitive operators and returns — it opens no scope, dispatches
+/// nothing, and cannot suspend, so an activation, register buffer, GC frame
+/// link and receiver chain are all pure overhead. The property getters that
+/// dominate a composition workload (`capacity`, `size`, index arithmetic
+/// over a gap buffer) are exactly this shape and run millions of times.
+///
+/// Speculative: any instruction whose real semantics need the frame path —
+/// a field read that is not a claimed stored slot, an operator over a
+/// non-primitive — abandons the serve and returns null, and the caller runs
+/// the ordinary body. Nothing is mutated before that point, so abandoning is
+/// always safe.
+pub fn leafExprServe(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+) Allocator.Error!?EvalResult {
+    return leafExprServeAt(H, allocator, module, func, args, host, LEAF_MAX_DEPTH);
+}
+
+/// How far a leaf serve chains into other leaf callees. A gap-buffer read is
+/// typically three levels (`groupSize` -> `groupIndexToAddress` -> the array
+/// index helper); the bound keeps the native recursion trivially finite.
+const LEAF_MAX_DEPTH: u8 = 4;
+
+fn leafExprServeAt(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    depth: u8,
+) Allocator.Error!?EvalResult {
+    if (comptime !@hasDecl(H, "fieldSiteRoute")) return null;
+    const trace = leafTraceWant(func);
+    if (!func.leafExprBody()) {
+        if (trace) std.debug.print("[leaf] {s}: not a leaf body\n", .{func.name});
+        return null;
+    }
+    if (args.len != func.params.len) {
+        if (trace) std.debug.print("[leaf] {s}: arity {d} vs {d}\n", .{ func.name, args.len, func.params.len });
+        return null;
+    }
+    const reclaim = runtime.reclaimEnabled();
+    var regs: [ir.LEAF_MAX_REGS]Value = @splat(.Unit);
+    defer if (reclaim) {
+        for (&regs) |*v| v.release(allocator);
+    };
+    // The register file is a native local, invisible to the collector's frame
+    // walk. Pin the whole array for the serve's duration so a body that
+    // allocates (a chained getter, a boxed constant) cannot have its
+    // intermediates swept. No-op unless the tracing GC is on.
+    const ka = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(ka);
+    runtime.keepalivePushSlice(&regs);
+    const b = &func.blocks[0];
+    for (b.insts) |*inst| {
+        switch (inst.*) {
+            .Trace => {},
+            .LoadParam => |lp| {
+                const v = args[lp.idx];
+                if (!leafWrite(allocator, &regs, lp.dst, v, reclaim, true)) return null;
+            },
+            .Const => |c| {
+                const v = try constToValue(allocator, &module.consts.items[c.value.int()]);
+                if (!leafWrite(allocator, &regs, c.dst, v, reclaim, false)) return null;
+            },
+            .Move => |mv| {
+                const v = leafRead(&regs, mv.src) orelse return null;
+                if (!leafWrite(allocator, &regs, mv.dst, v, reclaim, true)) return null;
+            },
+            .Not => |n| {
+                const v = leafRead(&regs, n.src) orelse return null;
+                if (v != .Bool) return null;
+                if (!leafWrite(allocator, &regs, n.dst, .{ .Bool = !v.Bool }, reclaim, false)) return null;
+            },
+            .BinOp => |bo| {
+                const l = leafRead(&regs, bo.lhs) orelse return null;
+                const r = leafRead(&regs, bo.rhs) orelse return null;
+                if (!leafPrimitive(&l) or !leafPrimitive(&r)) return null;
+                const res = try applyBinop(allocator, bo.op, &l, &r);
+                if (res != .ok) return null;
+                if (!leafWrite(allocator, &regs, bo.dst, res.ok, reclaim, false)) return null;
+            },
+            .GetField => |gf| {
+                const recv = leafRead(&regs, gf.receiver) orelse return null;
+                const fname: []const u8 = switch (module.consts.items[gf.field.int()]) {
+                    .String => |s| s,
+                    else => return null,
+                };
+                if (builtinFieldFast(&recv, fname)) |bv| {
+                    if (!leafWrite(allocator, &regs, gf.dst, bv, reclaim, false)) return null;
+                    continue;
+                }
+                if (recv != .Instance) {
+                    if (trace) std.debug.print("[leaf] {s}: field receiver is {s}\n", .{ func.name, @tagName(recv) });
+                    return null;
+                }
+                const v = try leafStoredField(H, allocator, host, &inst.GetField, &recv, fname) orelse {
+                    if (trace) std.debug.print("[leaf] {s}: no stored-slot route for {s}\n", .{ func.name, fname });
+                    return null;
+                };
+                if (!leafWrite(allocator, &regs, gf.dst, v, reclaim, false)) return null;
+            },
+            .Index => |ix| {
+                const recv = leafRead(&regs, ix.receiver) orelse return null;
+                const idx = leafRead(&regs, ix.index) orelse return null;
+                const v = fastIndexGet(&recv, &idx) orelse {
+                    if (trace) std.debug.print("[leaf] {s}: index needs the slow get\n", .{func.name});
+                    return null;
+                };
+                if (!leafWrite(allocator, &regs, ix.dst, v, reclaim, false)) return null;
+            },
+            .Call => |c| {
+                if (depth == 0) return null;
+                if (comptime !@hasDecl(H, "funcRunsItsBody")) return null;
+                const callee = module.funcById(c.func) orelse return null;
+                if (!callee.leafExprBody()) {
+                    if (trace) std.debug.print("[leaf] {s}: callee {s} is not a leaf\n", .{ func.name, callee.name });
+                    return null;
+                }
+                // A symbol the link step settled onto a native binding, or one
+                // that redirects to a sibling declaration, does not run this
+                // body at all.
+                if (!host.funcRunsItsBody(c.func)) {
+                    if (trace) std.debug.print("[leaf] {s}: callee {s} resolves elsewhere\n", .{ func.name, callee.name });
+                    return null;
+                }
+                const base = c.args.int();
+                if (base + c.n_args > regs.len) return null;
+                const r = try leafExprServeAt(H, allocator, module, callee, regs[base .. base + c.n_args], host, depth - 1) orelse return null;
+                if (r != .ok) return null;
+                if (!leafWrite(allocator, &regs, c.dst, r.ok, reclaim, false)) return null;
+            },
+            else => |other| {
+                if (trace) std.debug.print("[leaf] {s}: unsupported {s}\n", .{ func.name, @tagName(other) });
+                return null;
+            },
+        }
+    }
+    const ret_reg = b.terminator.Return orelse return null;
+    const out = leafRead(&regs, ret_reg) orelse return null;
+    // The register file is released on the way out; the caller owns one
+    // reference to the result, exactly as a returning frame would hand over.
+    out.retain();
+    return EvalResult{ .ok = out };
+}
+
+/// `KLIO_LEAF_TRACE=<name>` — report why the frameless leaf serve declined
+/// for a named function.
+var leaf_trace_state: u8 = 0;
+var leaf_trace_want: []const u8 = "";
+fn leafTraceWant(func: *const Func) bool {
+    if (leaf_trace_state == 0) {
+        leaf_trace_want = runtime.getenvSlice("KLIO_LEAF_TRACE") orelse "";
+        leaf_trace_state = 1;
+    }
+    if (leaf_trace_want.len == 0) return false;
+    return std.mem.indexOf(u8, func.name, leaf_trace_want) != null;
+}
+
+/// The declared members of a builtin receiver that no user declaration can
+/// shadow and that the field ladder reaches only after some sixty name
+/// comparisons. Array length reads dominate the slow-ladder field census on a
+/// composition workload, so answer them without entering the ladder.
+fn builtinFieldFast(recv: *const Value, name: []const u8) ?Value {
+    switch (recv.*) {
+        .Array => |a| if (std.mem.eql(u8, name, "size")) {
+            return Value.newInt(@intCast(a.len()));
+        },
+        .String => |s| if (std.mem.eql(u8, name, "length")) {
+            const g = s.borrow();
+            defer g.deinit();
+            return Value.newInt(@intCast(g.get().u16_len));
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn leafRead(regs: *const [ir.LEAF_MAX_REGS]Value, r: Reg) ?Value {
+    const i = r.int();
+    if (i >= regs.len) return null;
+    return regs[i];
+}
+
+/// Store into the leaf register file with the same ownership rule a frame
+/// uses: the register owns one reference, the previous occupant loses one.
+/// `borrowed` marks a value the leaf does not yet own a reference to.
+fn leafWrite(allocator: Allocator, regs: *[ir.LEAF_MAX_REGS]Value, r: Reg, v: Value, reclaim: bool, borrowed: bool) bool {
+    const i = r.int();
+    if (i >= regs.len) return false;
+    if (reclaim) {
+        if (borrowed) v.retain();
+        const old = regs[i];
+        regs[i] = v;
+        old.release(allocator);
+    } else {
+        regs[i] = v;
+    }
+    return true;
+}
+
+/// The stored-slot read of one `GetField` in a leaf body, using the
+/// instruction's own claimed (class, slot) route — the same single-fill site
+/// memo the framed `GetField` arm fills and re-verifies by name. Null for a
+/// getter-routed, unclaimed, lateinit or delegated field, which the leaf
+/// cannot serve.
+fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype, recv: *const Value, fname: []const u8) Allocator.Error!?Value {
+    const claimed = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+    const cls: u64 = blk: {
+        const g = recv.Instance.borrow();
+        defer g.deinit();
+        break :blk @intCast(g.get().class.identity());
+    };
+    if (claimed == 0) {
+        // First execution claims the site for this class when the shared
+        // (class, name) memo already routes the read to a stored slot or to
+        // a getter that is itself a leaf.
+        if (host.fieldSiteRoute(recv, fname)) |route| {
+            const usable = switch (route.route & 3) {
+                1 => true,
+                2 => host.fieldGetterIsLeaf(@enumFromInt(route.route >> 2)),
+                else => false,
+            };
+            if (usable and
+                @cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, route.cls, .acq_rel, .monotonic) == null)
+            {
+                @atomicStore(u64, @constCast(&gf.site_route), route.route, .release);
+            }
+        }
+        return null;
+    }
+    if (claimed != cls) return null;
+    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    // A property whose backing is another leaf property chains through it:
+    // the callee is pure by construction, so re-running it if this serve is
+    // later abandoned observes nothing.
+    if (route & 3 == 2) {
+        if (!host.fieldGetterIsLeaf(@enumFromInt(route >> 2))) return null;
+        return switch (try host.runFieldGetter(allocator, @enumFromInt(route >> 2), recv.*)) {
+            .ok => |v| v,
+            .err => null,
+        };
+    }
+    if (route & 3 != 1) return null;
+    const idx: usize = @intCast(route >> 2);
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const fields = g.get().fields.items;
+    if (idx >= fields.len) return null;
+    const f = &fields[idx];
+    if (!std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
+    const v = f.value;
+    if (v == .Null or v == .Delegate) return null;
+    // Owned on the way out, matching the getter branch above: the register
+    // file this lands in releases what it holds.
+    v.retain();
+    return v;
+}
+
+/// A scoped `$sgetter$<owner>\u{1f}<prop>` site stores its slot under the
+/// bare property name; match the separator-guarded suffix so the drift guard
+/// stays exact.
+fn leafSgetterMatches(name: []const u8, field_name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "$sgetter$") and
+        name.len > field_name.len and
+        std.mem.endsWith(u8, name, field_name) and
+        name[name.len - field_name.len - 1] == '\u{1f}';
 }
 
 /// Run a function body, routing non-trivial dispatch (`CallValue` /
@@ -3090,8 +3445,6 @@ fn snapshotSuspendedFrame(
 /// refcounting/arena backends keep plain create/destroy. Entries are inert
 /// storage — no Values, nothing the GC must see.
 const ACT_POOL_MAX = 128;
-threadlocal var act_pool: [ACT_POOL_MAX]*Activation = undefined;
-threadlocal var act_pool_len: usize = 0;
 
 inline fn actPoolOn() bool {
     return !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
@@ -3099,9 +3452,9 @@ inline fn actPoolOn() bool {
 
 fn actAlloc(allocator: Allocator) Allocator.Error!*Activation {
     if (actPoolOn()) {
-        if (act_pool_len > 0) {
-            act_pool_len -= 1;
-            return act_pool[act_pool_len];
+        if (evtls.act_pool_len > 0) {
+            evtls.act_pool_len -= 1;
+            return evtls.act_pool[evtls.act_pool_len];
         }
         return std.heap.c_allocator.create(Activation);
     }
@@ -3110,9 +3463,9 @@ fn actAlloc(allocator: Allocator) Allocator.Error!*Activation {
 
 fn actFree(allocator: Allocator, act: *Activation) void {
     if (actPoolOn()) {
-        if (act_pool_len < ACT_POOL_MAX) {
-            act_pool[act_pool_len] = act;
-            act_pool_len += 1;
+        if (evtls.act_pool_len < ACT_POOL_MAX) {
+            evtls.act_pool[evtls.act_pool_len] = act;
+            evtls.act_pool_len += 1;
             return;
         }
         std.heap.c_allocator.destroy(act);
@@ -4071,8 +4424,8 @@ fn runFrameExec(
         }
         // Spin diagnostic (KLIO_SPIN_TRACE): cheap counter gate, then a
         // wall-clock check inside.
-        spin_check_counter +%= 1;
-        if (spin_check_counter & 0xFFFF == 0) {
+        evtls.spin_check_counter +%= 1;
+        if (evtls.spin_check_counter & 0xFFFF == 0) {
             spinDumpMaybe();
             const wall_dl = test_wall_deadline_ms.load(.monotonic);
             if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
@@ -5348,6 +5701,10 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     const recv = frame.read(gf.receiver);
     const name = constStr(frame.module, gf.field) orelse
         return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
+    if (builtinFieldFast(&recv, name)) |bv| {
+        try frame.write(gf.dst, bv);
+        return .cont;
+    }
     // Keep the executing function's receiver reachable as the
     // enclosing `this` while the field/property is resolved. Inside
     // a lambda the receiver rides the closure's captured `this`

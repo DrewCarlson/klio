@@ -22,6 +22,47 @@ const Env = env_mod.Env;
 
 const StdlibFn = @import("host.zig").StdlibFn;
 
+/// Scratch arena for the supertype walks below. The walk is bounded (64 steps
+/// over two `[]const u8` lists), so a fixed buffer covers it; keeping the
+/// buffer in thread-local storage instead of on the stack means the safety
+/// fill of an `undefined` stack array does not run on every call, which is
+/// what made object equality pay a 16 KiB `memset` per comparison.
+threadlocal var subtype_scratch: [16 * 1024]u8 align(16) = undefined;
+threadlocal var subtype_scratch_busy: bool = false;
+
+/// Direct-mapped per-class memo for `instanceImplementsMapEntry`. A class's
+/// `Map.Entry`-ness is fixed by its supertype graph, so one walk per class is
+/// enough no matter how many comparisons ask.
+const MapEntryMemoSlot = struct { key: usize = 0, val: bool = false };
+threadlocal var map_entry_memo: [512]MapEntryMemoSlot = @splat(.{});
+
+/// A borrowed allocator for one supertype walk. A nested walk (the buffer is
+/// already lent out) falls back to the page allocator rather than aliasing the
+/// lender's frontier.
+const SubtypeScratch = struct {
+    fba: std.heap.FixedBufferAllocator = undefined,
+    owned: bool = false,
+
+    fn acquire(self: *SubtypeScratch) std.mem.Allocator {
+        if (subtype_scratch_busy) {
+            self.owned = false;
+            return std.heap.page_allocator;
+        }
+        subtype_scratch_busy = true;
+        self.owned = true;
+        self.fba = std.heap.FixedBufferAllocator.init(&subtype_scratch);
+        return self.fba.allocator();
+    }
+
+    fn reset(self: *SubtypeScratch) void {
+        if (self.owned) self.fba.reset();
+    }
+
+    fn release(self: *SubtypeScratch) void {
+        if (self.owned) subtype_scratch_busy = false;
+    }
+};
+
 /// Backing of a `String`: the owned UTF-8 `bytes` plus metadata computed once at
 /// creation — `u16_len` (Kotlin `String.length`, in UTF-16 code units) and
 /// `ascii` (no byte ≥ 0x80). Because a Kotlin string is immutable, these never
@@ -726,20 +767,32 @@ pub const ArrayData = struct {
     /// boxed arrays). For packed arrays the scalars are boxed into the copy; the
     /// array stays packed.
     pub fn snapshot(self: ArrayData, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value {
+        return self.snapshotRange(allocator, 0, self.len());
+    }
+
+    /// `snapshot` of the half-open element range `[start, end)` only. A range
+    /// copy (`copyInto` of a slice out of a large backing array) pays for the
+    /// elements it moves rather than for the whole source.
+    pub fn snapshotRange(self: ArrayData, allocator: std.mem.Allocator, start: usize, end: usize) std.mem.Allocator.Error![]Value {
         switch (self.storage) {
             .boxed => |vl| {
                 const g = vl.borrow();
                 defer g.deinit();
-                return allocator.dupe(Value, g.get().items);
+                const items = g.get().items;
+                const lo = @min(start, items.len);
+                const hi = @min(end, items.len);
+                return allocator.dupe(Value, items[lo..@max(lo, hi)]);
             },
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
                 const view_kind = self.prim orelse g.get().kind;
                 const n = g.get().len();
-                const out = try allocator.alloc(Value, n);
-                var i: usize = 0;
-                while (i < n) : (i += 1) out[i] = g.get().getAs(i, view_kind);
+                const lo = @min(start, n);
+                const hi = @max(lo, @min(end, n));
+                const out = try allocator.alloc(Value, hi - lo);
+                var i: usize = lo;
+                while (i < hi) : (i += 1) out[i - lo] = g.get().getAs(i, view_kind);
                 return out;
             },
         }
@@ -2350,14 +2403,15 @@ pub const Value = union(enum) {
                 const inst = g.get();
                 const cg = inst.class.borrow();
                 defer cg.deinit();
-                // The subtype walk needs an allocator for its frontier; use a
-                // fixed buffer to avoid threading one through the predicate.
-                var buf: [16 * 1024]u8 = undefined;
-                var fba = std.heap.FixedBufferAllocator.init(&buf);
-                const a = fba.allocator();
+                // The subtype walk needs an allocator for its frontier; use the
+                // shared scratch buffer to avoid threading one through the
+                // predicate.
+                var scratch: SubtypeScratch = .{};
+                const a = scratch.acquire();
+                defer scratch.release();
                 if (cg.get().isSubtypeOf(a, name)) break :blk true;
                 if (lastDotSegment(name)) |simple| {
-                    fba.reset();
+                    scratch.reset();
                     if (cg.get().isSubtypeOf(a, simple)) break :blk true;
                 }
                 break :blk false;
@@ -2399,19 +2453,33 @@ pub const Value = union(enum) {
     /// so it participates in the `Map.Entry` equality contract (compare by
     /// key and value regardless of concrete type).
     fn instanceImplementsMapEntry(inst: ObjRef(InstanceData)) bool {
-        const g = inst.borrow();
-        defer g.deinit();
-        const cg = g.get().class.borrow();
+        const cls = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().class;
+        };
+        // The answer is a property of the class, not the instance, and the
+        // supertype graph is fixed once the class is registered. Every `==`
+        // between instances asks this question, so memoize it per class.
+        const key = cls.identity();
+        const slot = &map_entry_memo[(key >> 4) % map_entry_memo.len];
+        if (slot.key == key) return slot.val;
+        const cg = cls.borrow();
         defer cg.deinit();
-        var buf: [16 * 1024]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        const a = fba.allocator();
+        var scratch: SubtypeScratch = .{};
+        const a = scratch.acquire();
+        defer scratch.release();
         const candidates = [_][]const u8{ "Entry", "MutableEntry", "Map.Entry", "MutableMap.MutableEntry", "kotlin.collections.Map.Entry" };
+        var found = false;
         for (candidates) |name| {
-            fba.reset();
-            if (cg.get().isSubtypeOf(a, name)) return true;
+            scratch.reset();
+            if (cg.get().isSubtypeOf(a, name)) {
+                found = true;
+                break;
+            }
         }
-        return false;
+        slot.* = .{ .key = key, .val = found };
+        return found;
     }
 
     /// The `key`/`value` pair of any value that satisfies the `Map.Entry`

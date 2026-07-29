@@ -1045,6 +1045,8 @@ pub const Func = struct {
     /// baked value mismatches every live identity harmlessly.
     acc_cls: u64 = 0,
     acc_route: u64 = 0,
+    /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
+    leaf_state: u8 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
@@ -1174,7 +1176,57 @@ pub const Func = struct {
         @constCast(self).acc_state = 1;
         return null;
     }
+
+    /// Whether this body is a *leaf expression*: one block, no handlers, a
+    /// `Return` of a register, and nothing but parameter loads, constants,
+    /// stored-field reads, moves and primitive operators in between. Such a
+    /// body observes nothing beyond its arguments and the fields it reads,
+    /// so it can be evaluated without building a frame at all.
+    ///
+    /// The classification is a pure function of the lowered body; cache it
+    /// on first ask under the same benign-race convention as `acc_state`.
+    pub fn leafExprBody(self: *const Func) bool {
+        switch (self.leaf_state) {
+            1 => return false,
+            2 => return true,
+            else => {},
+        }
+        const verdict = self.classifyLeafExprBody();
+        @constCast(self).leaf_state = if (verdict) 2 else 1;
+        return verdict;
+    }
+
+    fn classifyLeafExprBody(self: *const Func) bool {
+        if (self.is_suspend or self.is_lambda or self.blocks.len != 1) return false;
+        if (self.n_locals > LEAF_MAX_REGS) return false;
+        const b = &self.blocks[0];
+        if (b.catches.len != 0 or b.insts.len > LEAF_MAX_INSTS) return false;
+        switch (b.terminator) {
+            .Return => |r| if (r == null) return false,
+            else => return false,
+        }
+        for (self.params) |*p| {
+            if (p.is_vararg or p.default != null) return false;
+        }
+        for (b.insts) |*inst| switch (inst.*) {
+            .Trace, .Const, .Move, .Not, .Index => {},
+            .LoadParam => |lp| if (lp.idx >= self.params.len) return false,
+            .BinOp => {},
+            .GetField => |gf| _ = gf,
+            // A call to another leaf keeps the whole chain frameless. The
+            // callee's own classification is checked when it is resolved,
+            // so only the call SHAPE is judged here.
+            .Call => |c| if (c.arg_names.len != 0 or c.type_args.len != 0) return false,
+            else => return false,
+        };
+        return true;
+    }
 };
+
+/// Bounds for `leafExprBody`. A leaf serve keeps its registers in a fixed
+/// stack array, so both the register count and the body length are capped.
+pub const LEAF_MAX_REGS: u32 = 16;
+pub const LEAF_MAX_INSTS: usize = 12;
 
 pub const Param = struct {
     name: []const u8,

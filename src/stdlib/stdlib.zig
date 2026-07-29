@@ -145,8 +145,16 @@ pub const ARRAY_BUILDERS = [_][]const u8{
 };
 
 pub fn isArrayBuilder(name: []const u8) bool {
+    // Consulted per member dispatch, so reject on length and final byte
+    // before any string compare — every builder is 7..14 bytes and ends in
+    // `f` (`intArrayOf`), `s` (`arrayOfNulls`) or `y` (`emptyArray`).
+    if (name.len < 7 or name.len > 14) return false;
+    switch (name[name.len - 1]) {
+        'f', 's', 'y' => {},
+        else => return false,
+    }
     for (ARRAY_BUILDERS) |b| {
-        if (std.mem.eql(u8, b, name)) return true;
+        if (b.len == name.len and std.mem.eql(u8, b, name)) return true;
     }
     return false;
 }

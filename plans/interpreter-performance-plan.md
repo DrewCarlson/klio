@@ -1671,3 +1671,129 @@ lost upstream, likely in the composable-typed PROPERTY invoke route
 the invoke-arity family first (single mechanism, four tests), then
 LabeledReturn (recorded old cluster), then the Text/View content-move
 assertions (likely one movable-content transplant defect).
+
+## Frameless leaf serve, and what the census showed
+
+Measuring with the ReleaseSafe harness was hiding the shape of the
+workload. Two facts reframed the whole effort:
+
+**The safety fill is ~2x on this workload.** Zig's `Allocator.free`
+memsets the whole block in safety builds, and `undefined` stack arrays
+are filled on entry. On `resumeOnBackgroundThread` that is the single
+largest line item: 35% of busy samples were `memset`, spread across
+frame teardown, register buffers and two 16 KiB `undefined` scratch
+buffers in `Value.isRuntimeType` / `instanceImplementsMapEntry` (the
+latter ran on every instance `==`). Same commit, same machine:
+
+| | ReleaseSafe | ReleaseFast |
+|---|---|---|
+| markInvalidFromBackgroundThread | 17.8s | 10.6s |
+| resumeOnBackgroundThread | 98.5s | 49.2s |
+
+Both numbers matter — the gate runs ReleaseSafe — but optimisation work
+has to be *measured* on ReleaseFast or the allocator's safety fill
+drowns the signal.
+
+**The workload is accessor-dominated.** `KLIO_CALL_STATS` on
+resumeOnBackgroundThread: 24.1M interpreted calls, and five entries were
+66% of them —
+
+```
+4388335 <gf>kotlin.IntArray.size
+4160400 __get_SlotWriter_capacity
+4068181 __get_SlotWriter_size
+2003007 gapbuffer.groupSize
+1209739 runtimeCheck
+```
+
+`__get_SlotWriter_capacity` lowers to `LoadParam; GetField; GetField;
+Const; BinOp; Return` — one block, no calls, no branches. Building an
+activation, a register buffer, a GC frame link and a receiver chain for
+that is all overhead.
+
+`Func.leafExprBody` classifies exactly that shape (single block, `Return`
+of a register, only parameter loads / constants / stored-field reads /
+indexing / moves / primitive operators / calls to other leaves), and
+`eval.leafExprServe` evaluates it in a fixed stack register file. It is
+speculative: any instruction whose real semantics need the frame path —
+a field read that is not a claimed stored slot, an operator over a
+non-primitive, a callee that resolves to a native binding — abandons the
+serve, and the caller runs the ordinary body. Nothing is mutated before
+that point, so abandoning is always safe. Field reads reuse the
+per-instruction `site_cls`/`site_route` claim the framed `GetField` arm
+already fills, and a property whose backing is another *leaf* property
+chains through it (`size` reads `capacity`, which divides `groups.size`).
+
+Result: **24.1M interpreted calls -> 11.0M**.
+
+Two traps worth recording:
+
+- The register file is a native local the collector's frame walk cannot
+  see. The first draft disabled the serve under `gc_enabled`, which
+  silently turned the whole optimisation off — the compose harness runs
+  with the tracing GC on, and the call census snapped straight back to
+  24M. The fix is one `keepalivePushSlice(&regs)` for the serve's
+  duration, which roots the array itself, so later writes are covered
+  with no per-write cost.
+- `KLIO_LEAF_TRACE=<name>` reports the decline reason. It found both
+  real gaps immediately: `groups.size` reached the leaf with an *Array*
+  receiver (fixed by `builtinFieldFast`, shared with the framed arm),
+  and `capacity` was a getter route rather than a stored slot (fixed by
+  the leaf-to-leaf getter chain).
+
+Alongside it, per-dispatch work that the census made obvious:
+`memberNameIdentity` interned a name string on every member dispatch —
+now a per-source-address memo confirmed by a byte compare, so an
+IR-owned name costs a compare instead of a hash plus a shared-map probe.
+`ownerKeyedExtProp` walked the lexical receiver tower and `allocPrint`ed
+a key per owner on every property read whose name is owner-keyed — now
+an allocation-free frame walk with a per-(class, receiver, name) memo.
+`instanceImplementsMapEntry` is memoized per class. The enclosing-`this`
+chain buffer is pooled per thread like the register buffer.
+
+Standing on ReleaseFast: rob 49.2s -> 44.5s, markInvalid 10.6s -> 9.2s.
+
+### What is left, and why the remaining gap is structural
+
+The profile after all of this is *flat* — no item above ~10%:
+
+```
+10.9%  eval.runFlatLoop        (the instruction loop)
+ 9.5%  _tlv_get_addr           (macOS dynamic TLS resolution)
+ 8.8%  eval.execInst
+ 4.7%  eval.execArmCallMember
+ 3.8%  eval.leafExprServe
+ 3.7%  slab.alloc
+ ~9%   string hashing + compares (dispatch cache keys)
+```
+
+`_tlv_get_addr` is macOS resolving a thread-local address, and LLVM
+cannot CSE it across an opaque call — so it is one call per
+threadlocal-access site per function, not per variable. Batching the
+evaluator's thread-locals into one `EvalTls` struct (already done, and
+extended here to the register pool, flat-call request, activation pool
+and spin counters) does not help as much as it should for that reason;
+the remaining fix is to thread `*EvalTls` explicitly through the frame
+lifecycle (a `tls` field on `Frame` covers `deinit` / `newWithCaptures` /
+`activateChain`, ~2%).
+
+The named remaining items, each measured:
+
+1. `Frame`-carried `*EvalTls` — ~2%.
+2. Per-instruction inline cache on `CallMember` (class identity + arg
+   kind tags -> FuncId), retiring the dispatch-key hashing — ~5%.
+3. Pooling `params` / `captures` like `regs` and the chain — ~3%.
+4. `CallMember` support in the leaf evaluator. `gapbuffer.groupSize`
+   (2.0M calls) is `groups.groupSize(groupIndexToAddress(index))` — the
+   `Call` half chains today, the `CallMember` half does not, so the
+   whole thing still builds a frame.
+5. Kotlin `inline fun` bodies that are not being spliced. `runtimeCheck`
+   (1.2M calls) and `debugRuntimeCheck` (205K) are `inline fun`s that
+   kotlinc erases entirely; ours lower to real functions with a lambda
+   parameter.
+
+These are each 3-6%. Reaching the 20s target for
+resumeOnBackgroundThread from 44.5s needs ~2.2x, so it needs most of
+this list plus a reduction in executed IR instructions — item 5 is the
+only one on the list that removes instructions rather than making them
+cheaper, which is why the inliner is the highest-leverage thing left.
