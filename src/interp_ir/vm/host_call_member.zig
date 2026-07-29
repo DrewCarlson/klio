@@ -9796,6 +9796,10 @@ inline fn tlPut(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.Progr
     cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = @as(u64, raw) + 1 };
 }
 
+/// Thread-local L1 for the named-binding permutation map.
+const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
+threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
+
 /// Thread-local L1 for the stdlib member-resolve cache. `state`: 0 empty,
 /// 1 confirmed-none, 2 resolved.
 const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, state: u8 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
@@ -12282,7 +12286,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
                 if (raw != METHOD_MISS) {
                     const fid: FuncId = @enumFromInt(raw);
                     if (!walkActive(fid, receiverIdent(receiver))) {
-                        if (try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names)) |r| return r;
+                        if (try serveNamedFid(self, allocator, receiver, fid, args, arg_names, k)) |r| return r;
                     }
                 }
             }
@@ -12855,6 +12859,146 @@ fn namedMethodKey(self: *VmHost, receiver: *const Value, name: []const u8, args:
     return k;
 }
 
+/// Compute the replayable arg→param permutation for a resolved NAMED call,
+/// following exactly the safe subset of `callFuncNamed`'s binding (named
+/// bind by parameter name, the trailing-lambda and compose-pair rules, the
+/// positional walk) over the user params (`f.params[1..]`; the walk binds
+/// the receiver at slot 0). Null when the shape needs the full binder —
+/// varargs, defaults, over/under-application, duplicate names. Every
+/// consulted fact is folded into the memo key (param list per fid, arg
+/// tags via the sig, name vector via the names hash), so the permutation
+/// is a pure function of the key.
+fn namedBindPerm(self: *VmHost, f: *const ir.Func, args: []const Value, arg_names: []const ?[]const u8) ?root_mod.ProgramImage.NamedPerm {
+    for (f.params) |*p| {
+        if (p.is_vararg) return null;
+    }
+    if (f.params.len == 0) return null;
+    const up = f.params[1..];
+    if (up.len > 15 or args.len != up.len) return null;
+    var src: [15]u8 = @splat(0xFF);
+    var used: [15]bool = @splat(false);
+    for (args, 0..) |_, i| {
+        if (i >= arg_names.len) continue;
+        const an = arg_names[i] orelse continue;
+        var bound = false;
+        for (up, 0..) |p, pos| {
+            if (applicability.paramNameMatchesArg(p.name, an)) {
+                if (src[pos] != 0xFF) return null;
+                src[pos] = @intCast(i);
+                used[i] = true;
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) return null;
+    }
+    var trailing: ?usize = null;
+    if (args.len > 0 and up.len > 0) {
+        const last = args.len - 1;
+        const last_named = last < arg_names.len and arg_names[last] != null;
+        const lp = up.len - 1;
+        if (!last_named and src[lp] == 0xFF and root_mod.isFunctionType(&up[lp].ty) and
+            vmhost.host_call_func.callableForTrailing(self, &args[last]))
+        {
+            src[lp] = @intCast(last);
+            used[last] = true;
+            trailing = last;
+        }
+        if (trailing == null and args.len >= 3 and up.len >= 3) {
+            const ci = args.len - 2;
+            const bi = args.len - 3;
+            const cn = if (ci < arg_names.len) arg_names[ci] else null;
+            const gn = if (last < arg_names.len) arg_names[last] else null;
+            const bn = if (bi < arg_names.len) arg_names[bi] else null;
+            const upos = up.len - 3;
+            if (cn != null and gn != null and bn == null and
+                std.mem.eql(u8, cn.?, "$composer") and
+                std.mem.eql(u8, gn.?, "$changed") and
+                std.mem.eql(u8, up[up.len - 2].name, "$composer") and
+                std.mem.eql(u8, up[up.len - 1].name, "$changed") and
+                src[upos] == 0xFF and
+                root_mod.isFunctionType(&up[upos].ty) and
+                vmhost.host_call_func.callableForTrailing(self, &args[bi]))
+            {
+                src[upos] = @intCast(bi);
+                used[bi] = true;
+                trailing = bi;
+            }
+        }
+    }
+    var positional_idx: usize = 0;
+    for (args, 0..) |_, i| {
+        if (used[i]) continue;
+        if (i < arg_names.len and arg_names[i] != null) continue;
+        while (positional_idx < up.len and src[positional_idx] != 0xFF) positional_idx += 1;
+        if (positional_idx >= up.len) return null;
+        src[positional_idx] = @intCast(i);
+        positional_idx += 1;
+    }
+    for (up, 0..) |_, pos| {
+        if (src[pos] == 0xFF) return null;
+    }
+    return .{ .n = @intCast(up.len), .src = src };
+}
+
+/// Serve a memoized named-member resolution: replay the cached binding
+/// permutation as a positional dispatch when one exists (or can be
+/// computed and cached), else run the full named terminal. The
+/// self-delegation guard brackets both dispatches, exactly as the walk's
+/// own terminal pushes it.
+fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value, arg_names: []const ?[]const u8, key: root_mod.ProgramImage.InstanceMethodKey) Allocator.Error!?EvalResult {
+    // Thread-local L1 over the perm map (same rationale as
+    // `tl_method_cache`: the shared reader lock's cache-line traffic).
+    var perm: ?root_mod.ProgramImage.NamedPerm = null;
+    const tslot = &tl_perm_cache[tlSlot(key)];
+    if (tslot.raw_plus != 0 and tslot.class_p == key.class_p and tslot.name_p == key.name_p and
+        tslot.sig == key.sig and tslot.n_args == key.n_args)
+    {
+        perm = tslot.perm;
+    }
+    if (perm == null) {
+        perm = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().named_perm_cache.get(key);
+        };
+        if (perm) |p| {
+            tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .perm = p };
+        }
+    }
+    if (perm == null) {
+        const computed: ?root_mod.ProgramImage.NamedPerm = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const f = mg.get().funcById(fid) orelse break :blk null;
+            break :blk namedBindPerm(self, f, args, arg_names);
+        };
+        const store = computed orelse root_mod.ProgramImage.NamedPerm{ .n = 0xFF, .src = @splat(0xFF) };
+        {
+            const pg = self.prog.borrowMut();
+            defer pg.deinit();
+            pg.get().named_perm_cache.put(key, store) catch {};
+        }
+        tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .perm = store };
+        perm = store;
+    }
+    if (perm.?.n != 0xFF) {
+        const p = perm.?;
+        var buf: [15]Value = undefined;
+        for (0..p.n) |k| buf[k] = args[p.src[k]];
+        const ident = receiverIdent(receiver);
+        const pushed = ident != 0 and walk_active_len < walk_active.len;
+        if (pushed) {
+            walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
+            walk_active_len += 1;
+        }
+        const r = try invokeMethodFuncId(self, allocator, receiver, fid, buf[0..p.n]);
+        if (pushed) walk_active_len -= 1;
+        if (r) |rr| return rr;
+    }
+    return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+}
+
 /// The named walk's invoke terminal, shared by the walk and its memo serve:
 /// `[receiver] ++ args` with a null-shifted name vector, the self-delegation
 /// guard pushed, dispatched through the named caller.
@@ -12899,7 +13043,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
             if (raw == METHOD_MISS) return null;
             const fid: FuncId = @enumFromInt(raw);
             if (!walkActive(fid, receiverIdent(receiver))) {
-                return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+                return try serveNamedFid(self, allocator, receiver, fid, args, arg_names orelse &.{}, k);
             }
         }
     }

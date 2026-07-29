@@ -1109,19 +1109,40 @@ speed), validatePotentialDeadlock still exceeds the 600s cap
 (virtual-time replay volume; the long-horizon multiplier). All three
 remain classified correct; they ride the CI ratchet's tolerated pool.
 
-WALL-INVARIANCE FINDING (resumeOnBackgroundThread, measured across 8
-experiment rounds): the test's ~116s wall is INVARIANT to every
-compute and latency change — CPU samples varied 101k→140k while wall
-held within 114-117s. The pump logs 75k `timer_wall` sleep rounds:
-the duration is REAL-TIME-PACED (the test's `repeat(100) { advance;
-delay(1) }` + background mutator/resume loops map to wall-mode
-timers), so interpreter speed does not move it. Greening it under
-the CI caps needs the wall→virtual clock mapping for compositionTest
-workloads — a separate campaign from per-call cost. The op-profiler
-lesson recorded the hard way: route tags STICK across nested native
-work and thread waits, so a hot route label can be a stale-tag
-artifact — cross-check with sample counts vs wall time (CPU-bound?)
-and the pump-sleep diag before believing any single tag.
+WALL-INVARIANCE FINDING — CORRECTED (resumeOnBackgroundThread): the
+earlier "real-time-paced, needs a clock-mapping campaign" reading was
+WRONG about the mechanism. Verified with a direct repro
+(`runTest { delay(10_000) }` completes in 1.24s real with
+virtual-elapsed=10000): runTest VIRTUAL TIME WORKS — upstream
+Delay.kt runs interpreted, `cont.context.delay` reaches the
+interpreted TestDispatcher's virtual scheduler, and the
+`withContext(Dispatchers.Default)` escape hatch maps to the pump's
+wall wheel exactly as upstream intends. The 75k `timer_wall` sleep
+rounds are the pump IDLING against runTest's single real-time
+WATCHDOG timer while the actual work — ~100 CPU-seconds of
+resume/recompose on the background Default workers — runs elsewhere;
+the wall time tracks WORKER COMPUTE, which is why latency/lock
+changes never moved it. The test is a pure interpreter-throughput
+benchmark on the worker path (upstream does the same work in ~1s).
+First confirmation: the named-binding permutation replay moved it
+116 → 106.5s. The durable profiler lessons stand: route tags STICK
+across nested native work and thread waits, so a hot label can be a
+stale-tag artifact; and a wall-invariant test under compute changes
+may simply mean the OPTIMIZED thread was not the critical path —
+check per-thread attribution before reclassifying.
+
+NAMED-PERM REPLAY (landed): for a memoized named member call the
+arg→param binding is itself a pure function of the memo key (the
+param list is fixed by the fid; arg tags ride the sig; the name
+vector rides the names hash; the trailing-lambda/compose-pair rules
+consult only tag-level callability), so the safe subset of
+`callFuncNamed`'s binding (no varargs, no defaults, fully applied,
+no duplicate names) is computed once and cached as a permutation.
+Later calls replay it as a POSITIONAL dispatch through
+`invokeMethodFuncId` (self-delegation guard bracketed) — no per-call
+slot vector, no named binder, flat-capable. Unreplayable shapes cache
+a negative verdict and keep the named path. A thread-local L1 fronts
+the perm map like the other dispatch caches.
 
 THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
 ~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget
