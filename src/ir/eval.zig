@@ -6101,9 +6101,18 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // pushed activation. The host consults the same caches the recursive
     // ladder's entry consults; anything else falls through to the ladder.
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
-        if (flatEnabled() and argNamesAllNull(cm.arg_names)) {
+        if (flatEnabled()) {
             runtime.prof.opRoute(1);
-            if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
+            const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
+                try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
+            else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
+                // A NAMED call whose binding permutation is already known
+                // replays it into declaration order and runs flat, exactly
+                // as the positional form does.
+                try host.prepareMemberFlatCallNamed(allocator, &recv, name_str, arg_values, names, static_recv, declared_recv)
+            else
+                null;
+            if (prep_opt) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;

@@ -3821,6 +3821,55 @@ fn varargShadowedFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *con
     return try callValueRec(self, allocator, &field_val, args);
 }
 
+/// Named-call flat prepare: replay a cached binding permutation (see
+/// `namedOrderKey`) to reorder the arguments into declaration order, then
+/// run the ordinary positional prepare on them. This is what lets a NAMED
+/// member call run as a pushed activation instead of a recursive host
+/// frame — the perm exists only because a prior call of this exact shape
+/// bound and dispatched that order, and the positional prepare re-resolves
+/// the target from the member cache with the reordered values, declining
+/// (to the recursive ladder) on any miss, vararg, or defaulted shape.
+pub fn prepareMemberFlatCallNamed(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+    arg_names: []const ?[]const u8,
+    static_recv: ?[]const u8,
+    declared_recv: ?[]const u8,
+) Allocator.Error!?ir.eval.FlatCallReq {
+    if (receiver.* != .Instance) return null;
+    if (args.len > 15) return null;
+    const k = namedOrderKey(self, receiver, name, args, arg_names) orelse return null;
+    var perm: ?root_mod.ProgramImage.NamedPerm = null;
+    const tslot = &tl_perm_cache[tlSlot(k)];
+    if (tslot.raw_plus != 0 and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
+        tslot.sig == k.sig and tslot.n_args == k.n_args)
+    {
+        perm = tslot.perm;
+    } else {
+        const shared: ?root_mod.ProgramImage.NamedPerm = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().named_perm_cache.get(k);
+        };
+        if (shared) |sp| {
+            tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = sp };
+            perm = sp;
+        }
+    }
+    const p = perm orelse return null;
+    if (p.n == 0xFF) return null;
+    var buf: [15]Value = undefined;
+    var m: usize = 0;
+    while (m < p.n and p.src[m] != 0xFE) : (m += 1) {
+        if (p.src[m] >= args.len) return null;
+        buf[m] = args[p.src[m]];
+    }
+    return prepareMemberFlatCall(self, allocator, receiver, name, buf[0..m], static_recv, declared_recv, true);
+}
+
 /// Resolve an all-positional member call into a ready flat-call request when
 /// the resolved-method (or resolved-extension) cache already names the
 /// target and the call is the fully-applied no-vararg shape — the exact
