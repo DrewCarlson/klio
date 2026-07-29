@@ -1404,6 +1404,21 @@ pub const PendingLocalDeclTypes = struct {
 };
 
 pub const Module = struct {
+    /// REQUIREMENT, not merely an observation: a `Module` may be written
+    /// only during single-threaded setup, before any interpreter thread
+    /// runs. Today the sole such writer is the class-id overlay built by
+    /// `linkProgramForms` at `Vm` init. Anything that needs to mutate a
+    /// module once execution has started must arrange its own
+    /// synchronisation — the cell no longer provides any.
+    ///
+    /// The reader lock this drops was guarding against a writer that cannot
+    /// exist concurrently, at a cost of a `cmpxchg` plus a `fetchSub` on
+    /// every borrow, and the module is borrowed on most dispatches. It was
+    /// never protecting the per-`Func` dispatch memos anyway: those are
+    /// written through `@constCast` under their own single-fill/atomic
+    /// discipline, deliberately outside the cell's borrow rules.
+    pub const objref_immutable = true;
+
     funcs: std.ArrayList(Func) = .empty,
     /// True when any declaration in this module has a `context(...)`
     /// parameter clause. Gates the per-frame receiver push that feeds the
