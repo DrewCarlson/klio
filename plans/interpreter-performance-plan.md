@@ -1079,6 +1079,16 @@ cross-thread resume two-turn wait, and the monitor-enter path (all
 were fixed 1ms cadences; `runtime.clockSleepMicros` added).
 markInvalidFromBackgroundThread 22.3 → 21.7s.
 
+STRESS-TEST STANDING after both rounds: CompositionTests 148/148 and
+MovableContentTests 44/44 under the harness caps (120s coroutine
+timeout / 600s wall). Against the CI gate caps (10s runTest / 90s
+wall): markInvalidFromBackgroundThread 28.7 → 21.7s (compute-bound,
+~2.2x to go), resumeOnBackgroundThread 256 → ~116s (real-time-paced —
+see below; the clock-mapping campaign is its lever, not per-call
+speed), validatePotentialDeadlock still exceeds the 600s cap
+(virtual-time replay volume; the long-horizon multiplier). All three
+remain classified correct; they ride the CI ratchet's tolerated pool.
+
 WALL-INVARIANCE FINDING (resumeOnBackgroundThread, measured across 8
 experiment rounds): the test's ~116s wall is INVARIANT to every
 compute and latency change — CPU samples varied 101k→140k while wall
