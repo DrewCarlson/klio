@@ -3618,8 +3618,27 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// The declared receiver-type head of a RECEIVER-function-typed property
 /// `name` on the receiver's class (or a superclass), or null when the
 /// property is not receiver-fn-typed.
+/// Per-thread gate for `recvFnPropHeadOf`: most modules declare ZERO
+/// receiver-function-typed properties, and the registry is fully populated
+/// before any dispatch runs, so one count check per (thread, module) skips
+/// the per-call supertype walk entirely.
+threadlocal var recv_fn_gate_mod: ?*const Module = null;
+threadlocal var recv_fn_gate_any: bool = true;
+
+fn recvFnPropsAny(self: *VmHost) bool {
+    const mp: *const Module = self.module.asPtr();
+    if (recv_fn_gate_mod == mp) return recv_fn_gate_any;
+    const g = self.module.borrow();
+    const any = g.get().registry.recv_fn_props.count() != 0;
+    g.deinit();
+    recv_fn_gate_mod = mp;
+    recv_fn_gate_any = any;
+    return any;
+}
+
 fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]const u8 {
     if (receiver.* != .Instance) return null;
+    if (!recvFnPropsAny(self)) return null;
     const mg = self.module.borrow();
     defer mg.deinit();
     const reg = &mg.get().registry;
@@ -3755,29 +3774,65 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     if (receiver.* == .IrClosure and std.mem.eql(u8, name, "invoke")) {
         return host_call_value.prepareClosureFlatCall(self, allocator, receiver, args);
     }
-    if (receiver.* != .Instance) return null;
-    // `recvFnFieldInvoke` / `varargShadowedFieldInvoke` / data-class `copy`
-    // run before the cache in the ladder; decline so they keep their
-    // precedence.
-    if (std.mem.eql(u8, name, "copy")) return null;
-    {
-        const g = receiver.Instance.borrow();
-        defer g.deinit();
-        if (g.get().get(name) != null) return null;
+    if (receiver.* != .Instance) {
+        // A non-Instance receiver keyable by identity (scalar, array,
+        // closure, Result) flat-serves its cached top-level-extension
+        // resolution: the ext cache only fills after every builtin/stdlib
+        // arm declined for the same key, so a hit proves the ladder tail —
+        // these calls (gap-buffer array accessors, coroutine-boundary
+        // closure extensions) otherwise walk the full ladder per call.
+        if (!allow_ext_cache) return null;
+        const k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv) orelse return null;
+        const raw = extMethodCacheGet(self, k) orelse return null;
+        if (raw == METHOD_MISS) return null;
+        return prepareFlatFromFid(self, allocator, receiver, args, @enumFromInt(raw));
     }
+    // Data-class `copy` runs before the cache in the ladder; decline so it
+    // keeps its precedence.
+    if (std.mem.eql(u8, name, "copy")) return null;
     const k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null) orelse return null;
     var fid: ?FuncId = null;
     if (instanceMethodCacheGetRaw(self, k)) |raw| {
         if (raw != METHOD_MISS) fid = @enumFromInt(raw);
     }
+    // A member-cache hit needs no stored-field shadow scan: when the walk
+    // filled the entry the ladder's field arms had declined this key, a
+    // vararg pick declines below (so `varargShadowedFieldInvoke` keeps its
+    // claim through the recursive path), and Kotlin resolves a member
+    // function ahead of any property/field-invoke convention anyway. The
+    // scan still guards the ext-cache branch — a member field outranks a
+    // top-level extension.
     if (fid == null) {
+        {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            if (g.get().get(name) != null) return null;
+        }
         // Same owner-independence guards the ext cache was populated under
-        // (and the strict/members-only probes never consult it).
+        // (and the strict/members-only probes never consult it). A
+        // scope-directed call probes under its scope-FOLDED key — the same
+        // key `extensionFnFallback` caches it under, so it can only be
+        // served what its own resolution stored.
         if (allow_ext_cache and static_recv == null and declared_recv == null) {
-            if (extMethodCacheGet(self, k)) |raw| fid = @enumFromInt(raw);
+            if (extMethodCacheGet(self, k)) |raw| {
+                if (raw != METHOD_MISS) fid = @enumFromInt(raw);
+            }
+        } else if (allow_ext_cache) {
+            if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k2| {
+                if (extMethodCacheGet(self, k2)) |raw| {
+                    if (raw != METHOD_MISS) fid = @enumFromInt(raw);
+                }
+            }
         }
     }
     const target = fid orelse return null;
+    return prepareFlatFromFid(self, allocator, receiver, args, target);
+}
+
+/// Shared flat-request tail: resolve `target`, admit only the fully-applied
+/// no-vararg shape, and build the `[receiver] ++ args` frame vector with the
+/// threaded-composer push the recursive invoker would perform.
+fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value, target: FuncId) Allocator.Error!?ir.eval.FlatCallReq {
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
@@ -3827,6 +3882,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // A function-typed property shadowed by a same-named vararg method: invoke
     // the property when the call's argument shape matches it (see the helper).
     if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+    runtime.prof.opRoute(15);
 
     // Fast path: a previously-resolved zero-arg user instance method bypasses the
     // whole probe ladder. The cache is only populated by `irMethodWalk` *after*
@@ -3852,13 +3908,39 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             // Member-miss that resolved to a top-level extension: dispatch it
             // here, before the whole builtin probe ladder, exactly as the
             // member fast path above does. Same owner-independence guards the
-            // cache was populated under.
+            // cache was populated under. A scope-directed call probes under
+            // its scope-FOLDED key — the same key `extensionFnFallback`
+            // caches it under, so it can only be served what its own
+            // resolution stored.
             if (!strict_ext and !no_ext and static_recv == null and declared_recv == null) {
                 if (extMethodCacheGet(self, k)) |fid| {
                     // A top-level extension's `param[0]` is its receiver, so the
                     // member invoker binds `[receiver] ++ args` correctly — and
                     // it builds the frame args in one allocation (no prepend
                     // scratch slice), matching the member fast path's speed.
+                    if (fid != METHOD_MISS) {
+                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+                    }
+                }
+            } else if (!strict_ext and !no_ext) {
+                if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k2| {
+                    if (extMethodCacheGet(self, k2)) |fid| {
+                        if (fid != METHOD_MISS) {
+                            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A non-Instance receiver keyable by identity (scalar, array, closure,
+    // Result) serves its cached top-level-extension resolution here too:
+    // the ext cache only fills after every arm between this probe and the
+    // fallback declined for the same key, so a hit proves the ladder tail.
+    if (receiver.* != .Instance and !strict_ext and !no_ext) {
+        if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k| {
+            if (extMethodCacheGet(self, k)) |fid| {
+                if (fid != METHOD_MISS) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                 }
             }
@@ -9271,6 +9353,13 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+    // Frameless serve for the canonical getter shape on a claimed class.
+    // Uses the module-owned func pointer so the shape/route memo persists.
+    if (args_in.len == 0) {
+        if (mod.funcById(fid)) |fp| {
+            if (vmhost.host_fields.accessorFastGet(self, mod, fp, receiver)) |r| return r;
+        }
+    }
     if (nuTraceEnv()) |want| {
         if (std.mem.eql(u8, want, f.name)) {
             std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} args=", .{ f.fqn, fid.int(), f.params.len, receiver.typeFqn() });
@@ -9480,6 +9569,23 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
             // extension walk per call.
             .IrClosure => 16,
             .Function => 17,
+            // A `Null` argument at a fixed position keys soundly: the walk
+            // scores an identical tag vector identically every time (its
+            // null-compat check consults only the PARAM's declared
+            // nullability), so the resolution is a pure function of the
+            // key. Excluding it made every nullable-trailing-arg call
+            // (`resumeCancellableWithInternal`'s `onCancellation = null`)
+            // re-walk per call.
+            .Null => 18,
+            // A PRIMITIVE array argument keys by its prim kind — the same
+            // granularity the receiver-identity case uses; an object array
+            // (erased element type) stays uncacheable.
+            .Array => 19,
+            // A `Result` argument is `kotlin.Result` at exactly typeFqn
+            // granularity (the payload type is erased), mirroring the
+            // receiver-identity case. The coroutine resume path passes one
+            // on every `resumeWith`-family call.
+            .Result => 20,
             else => return null,
         };
         h.update((&tag)[0..1]);
@@ -9489,6 +9595,10 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
                 const id = g.get().class.identity();
                 g.deinit();
                 h.update(std.mem.asBytes(&id));
+            },
+            .Array => |arr| {
+                const pk: u8 = if (arr.prim) |p| @as(u8, @intFromEnum(p)) + 1 else return null;
+                h.update((&pk)[0..1]);
             },
             .IrClosure => |c| {
                 const info = self.closures.get(@intCast(c.id)) orelse return null;
@@ -10937,10 +11047,32 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
         }
     }
+    // Chain-folded key: when a member-extension competes for the name the
+    // resolution is a pure function of (key, enclosing-chain shape) instead
+    // of the key alone. Folding the chain hash keys those calls too — but
+    // only PLAIN winners (a top-level pick, no owner push) and misses store
+    // under it; a member-extension winner needs its owner-instance push and
+    // stays walk-resolved.
+    const chain_key: ?root_mod.ProgramImage.InstanceMethodKey = blk: {
+        var ck = cache_key orelse break :blk null;
+        ck.sig ^= ir.eval.enclosingChainClassHash() *% 0x9E3779B97F4A7C15;
+        if (ck.sig == 0) ck.sig = 2;
+        break :blk ck;
+    };
+    if (chain_key) |k| {
+        if (extMethodCacheGet(self, k)) |fid| {
+            if (fid == METHOD_MISS) return null;
+            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+        }
+    }
     var saw_member_ext = false;
-    const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, &saw_member_ext);
-    if (r == null and !saw_member_ext) {
-        if (cache_key) |k| extMethodCachePut(self, k, METHOD_MISS);
+    const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
+    if (r == null) {
+        if (!saw_member_ext) {
+            if (cache_key) |k| extMethodCachePut(self, k, METHOD_MISS);
+        } else if (chain_key) |k| {
+            extMethodCachePut(self, k, METHOD_MISS);
+        }
     }
     return r;
 }
@@ -10949,7 +11081,8 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 /// shell computed (null = uncacheable call); `saw_member_ext_out` reports
 /// whether any candidate was a member-extension, which makes the resolution
 /// context-dependent and vetoes both positive and negative memoization.
-fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8, cache_key: ?root_mod.ProgramImage.InstanceMethodKey, saw_member_ext_out: *bool) Allocator.Error!?EvalResult {
+fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8, cache_key: ?root_mod.ProgramImage.InstanceMethodKey, chain_key: ?root_mod.ProgramImage.InstanceMethodKey, saw_member_ext_out: *bool) Allocator.Error!?EvalResult {
+    ir.eval.callStatsProbe(name);
     const want = args.len + 1;
     if (missTraceWant(name)) {
         const rk: []const u8 = switch (receiver.*) {
@@ -11508,10 +11641,17 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         }
         // Memoize an owner-independent pick: no member-extension competes for
         // this name and the winner is itself top-level, so the (receiver
-        // class, name, arg types) key fully determines the target. A future
-        // call hits the fast path above and skips this whole resolution.
-        if (!pushed_owner and !saw_member_ext_out.*) {
-            if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
+        // class, name, arg types) key fully determines the target. When a
+        // member-extension DID compete but lost to a top-level pick, the
+        // chain-folded key captures the full resolution input instead. A
+        // future call hits the fast path above and skips this whole
+        // resolution.
+        if (!pushed_owner) {
+            if (!saw_member_ext_out.*) {
+                if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
+            } else if (chain_key) |k| {
+                extMethodCachePut(self, k, @intFromEnum(c.fid));
+            }
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
         if (pushed_owner) ir.eval.popEnclosing();

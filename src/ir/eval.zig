@@ -630,6 +630,26 @@ fn callStatsBump(fqn: []const u8) void {
     if (!gop.found_existing) gop.value_ptr.* = 0;
     gop.value_ptr.* += 1;
 }
+/// KLIO_CALL_STATS census tap for slow-ladder GetField executions: keys are
+/// `<gf>Type.name`, so the dump separates the field-read workload from the
+/// call workload.
+fn gfStatsBump(recv: *const Value, name: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = call_stats.?.getOrPut(key) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += 1;
+}
+
 /// Host-route sub-tag names for the op profiler (see `runtime.prof.opRoute`).
 /// Order is the route index contract shared with the host dispatch stages.
 pub const op_route_names = [_][]const u8{
@@ -644,6 +664,11 @@ pub const op_route_names = [_][]const u8{
     "route:vararg-shadow", // 8
     "route:ir-method-walk", // 9
     "route:member-named-inner", // 10
+    "route:ltg-cands", // 11
+    "route:ltg-probe", // 12
+    "route:ltg-global", // 13
+    "route:gf-slow", // 14
+    "route:member-cache-probe", // 15
 };
 
 /// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
@@ -1185,6 +1210,30 @@ pub fn enclosingThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 
 /// The enclosing-`this` chain with subject tags, innermost first. Caller owns
 /// the returned slice.
+/// Fold the active enclosing-`this` chain's shape (entry kinds + receiver
+/// class identities) into a hash, without allocating. Used to key
+/// chain-dependent resolutions (member-extension applicability) in the
+/// extension cache: identical chain shapes resolve identically.
+pub fn enclosingChainClassHash() u64 {
+    var h = std.hash.Wyhash.init(0x8f14e45fceea167a);
+    if (evtls.active_chain) |chain| {
+        for (chain.items) |e| {
+            const kb: u8 = @intFromEnum(e.kind);
+            h.update((&kb)[0..1]);
+            var k: u64 = undefined;
+            if (e.v == .Instance) {
+                const g = e.v.Instance.borrow();
+                k = @intCast(g.get().class.identity());
+                g.deinit();
+            } else {
+                k = @as(u64, @intFromEnum(std.meta.activeTag(e.v))) +% 0x2b8c;
+            }
+            h.update(std.mem.asBytes(&k));
+        }
+    }
+    return h.final() | 1;
+}
+
 pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
     const chain = evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out = try allocator.alloc(EnclosingEntry, chain.items.len);
@@ -4716,7 +4765,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(nn.dst, v);
         },
-        .GetField => |gf| return execArmGetField(H, allocator, frame, gf, host),
+        .GetField => |*gf| return execArmGetField(H, allocator, frame, gf, host),
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
         .Call => |call| return execArmCall(H, allocator, frame, call, host),
@@ -4881,7 +4930,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(lc.dst, v);
         },
-        .LoadFromThisOrGlobal => |lt| return execArmLoadFromThisOrGlobal(H, allocator, frame, lt, host),
+        .LoadFromThisOrGlobal => |*lt| return execArmLoadFromThisOrGlobal(H, allocator, frame, lt, host),
         .Index => |ix| return execArmIndex(H, allocator, frame, ix, host),
         .IndexSet => |ixs| return execArmIndexSet(H, allocator, frame, ixs, host),
         .NewList => |nl| return execArmNewList(H, allocator, frame, nl, host),
@@ -5270,12 +5319,80 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             pushed_enclosing = true;
         }
     }
+    // Site memo: serve a stored-slot read or a class getter directly when
+    // the receiver's class is the one that claimed this site. The slot
+    // read re-verifies by name and declines the lateinit/delegate shapes,
+    // exactly as the (class, name) memo it mirrors.
+    if (comptime @hasDecl(H, "fieldSiteRoute")) {
+        if (recv == .Instance) {
+            const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+            if (w0 > 1) fast: {
+                var getter_fid: u64 = 0;
+                {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const b = g.get();
+                    if (w0 != @as(u64, @intCast(b.class.identity()))) break :fast;
+                    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+                    if (route == 0) break :fast;
+                    if (route & 3 == 1) {
+                        const idx: usize = @intCast(route >> 2);
+                        if (idx >= b.fields.items.len) break :fast;
+                        const f = &b.fields.items[idx];
+                        // A scoped `$sgetter$<owner>\u{1f}<prop>` site stores
+                        // its slot under the bare property name; the
+                        // separator-guarded suffix match keeps the index-drift
+                        // guard exact.
+                        if (!std.mem.eql(u8, f.name, name) and
+                            !(std.mem.startsWith(u8, name, "$sgetter$") and
+                                name.len > f.name.len and
+                                std.mem.endsWith(u8, name, f.name) and
+                                name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
+                        const v = f.value;
+                        if (v == .Null or v == .Delegate) break :fast;
+                        v.retain();
+                        if (pushed_enclosing) popEnclosing();
+                        try frame.write(gf.dst, v);
+                        return .cont;
+                    }
+                    if (route & 3 == 2) getter_fid = route >> 2;
+                }
+                if (getter_fid != 0) {
+                    const got_g = host.runFieldGetter(allocator, @enumFromInt(getter_fid), recv);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (try got_g) {
+                        .ok => |v| {
+                            v.retain();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
+        }
+    }
+    runtime.prof.opRoute(14);
+    gfStatsBump(&recv, name);
     const got = host.getField(allocator, &recv, name);
     if (pushed_enclosing) popEnclosing();
     switch (try got) {
         // host.getField returns a borrowed field value; the register owns its ref.
         .ok => |v| {
             v.retain();
+            if (comptime @hasDecl(H, "fieldSiteRoute")) {
+                if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
+                    var claim_cls: u64 = 1;
+                    var claim_route: u64 = 0;
+                    if (host.fieldSiteRoute(&recv, name)) |r| {
+                        claim_cls = r.cls;
+                        claim_route = r.route;
+                    }
+                    if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, claim_cls, .acq_rel, .monotonic) == null) {
+                        if (claim_route != 0) @atomicStore(u64, @constCast(&gf.site_route), claim_route, .release);
+                    }
+                }
+            }
             try frame.write(gf.dst, v);
         },
         .err => |e| return raiseStep(frame, e),
@@ -6465,6 +6582,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // `consult_param = true`: in a method / extension body the
         // implicit receiver is the frame's `this` *parameter*, not
         // a capture slot.
+        runtime.prof.opRoute(11);
         const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
         defer allocator.free(cands);
         const cands_keepalive = pinImplicitCandidates(cands);
@@ -6477,36 +6595,85 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // even when the member's value IS `Unit` (`var u: Unit`):
         // the strict probe reports misses as errors, never as a
         // spurious `Unit`.
-        for (cands) |c| {
-            switch (try host.getMemberField(allocator, &c.v, name_str)) {
-                .ok => |v| {
-                    orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
-                    resolved = v;
-                    break;
-                },
-                // Only the dispatch-miss sentinel (`Unimplemented`)
-                // means "this candidate has no such member" — discard
-                // its `Vm::get_field` message and walk to the next
-                // candidate / global tier. Any other error is a member
-                // that resolved and whose accessor actually ran: a
-                // throw from a delegated property's `getValue`
-                // (`NoSuchElementException` on a missing map key), a
-                // `CalleeFailed`, a `StackOverflow`. Those propagate —
-                // swallowing them would mask the throw and fall through
-                // to a spurious `unresolved global`.
-                .err => |e| {
-                    if (e == .Unimplemented) {
-                        freeMissErr(allocator, e);
-                    } else {
-                        return raiseStep(frame, e);
+        //
+        // The instruction's site memo short-circuits the walk when the
+        // candidate shape matches a prior execution: a member's presence
+        // on a candidate is a function of its class graph and stored
+        // field set, both folded into the shape word, so under an equal
+        // shape the recorded misses still miss and only the recorded
+        // winner (if any) needs its probe re-run.
+        runtime.prof.opRoute(12);
+        const shape = implicitSiteShape(cands);
+        var full_walk = true;
+        if (shape) |sh| {
+            const cached = @atomicLoad(u64, @constCast(&lt.site_cache), .monotonic);
+            if (cached != 0 and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
+                const verdict = cached & 3;
+                if (verdict == SITE_MISS) {
+                    full_walk = false;
+                } else if (verdict == SITE_WIN) {
+                    const w: usize = @intCast((cached >> 2) & 0xFF);
+                    if (w < cands.len) {
+                        switch (try host.getMemberField(allocator, &cands[w].v, name_str)) {
+                            .ok => |v| {
+                                orAudit("LoadFromThisOrGlobal", name_str, "member", cands[w].depth, &cands[w].v);
+                                resolved = v;
+                                full_walk = false;
+                            },
+                            .err => |e| {
+                                if (e == .Unimplemented) {
+                                    freeMissErr(allocator, e);
+                                } else {
+                                    return raiseStep(frame, e);
+                                }
+                            },
+                        }
                     }
-                },
+                }
+            }
+        }
+        if (full_walk and resolved == null) {
+            var winner: ?usize = null;
+            for (cands, 0..) |c, ci| {
+                switch (try host.getMemberField(allocator, &c.v, name_str)) {
+                    .ok => |v| {
+                        orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
+                        resolved = v;
+                        winner = ci;
+                        break;
+                    },
+                    // Only the dispatch-miss sentinel (`Unimplemented`)
+                    // means "this candidate has no such member" — discard
+                    // its `Vm::get_field` message and walk to the next
+                    // candidate / global tier. Any other error is a member
+                    // that resolved and whose accessor actually ran: a
+                    // throw from a delegated property's `getValue`
+                    // (`NoSuchElementException` on a missing map key), a
+                    // `CalleeFailed`, a `StackOverflow`. Those propagate —
+                    // swallowing them would mask the throw and fall through
+                    // to a spurious `unresolved global`.
+                    .err => |e| {
+                        if (e == .Unimplemented) {
+                            freeMissErr(allocator, e);
+                        } else {
+                            return raiseStep(frame, e);
+                        }
+                    },
+                }
+            }
+            if (shape) |sh| {
+                const entry: u64 = if (winner) |w|
+                    (if (w <= 0xFF) (sh & SITE_SHAPE_MASK) | (@as(u64, @intCast(w)) << 2) | SITE_WIN else 0)
+                else
+                    (sh & SITE_SHAPE_MASK) | SITE_MISS;
+                if (entry != 0) @atomicStore(u64, @constCast(&lt.site_cache), entry, .monotonic);
             }
         }
     }
     // The scope-qualified form carries the lexical owner only for
     // the getter reads above; the global fallback uses the bare
     // name.
+    runtime.prof.opRoute(13);
     const bare_name = stripScopeGetter(name_str);
     // A lowering-resolved identity binds that exact declaration;
     // the name string remains the unresolved-shape fallback. A
@@ -7580,6 +7747,38 @@ const ImplicitCandidate = struct {
     v: Value,
     depth: u16,
 };
+
+/// Low bits of a `site_cache` word: 2-bit verdict + 8-bit winner index;
+/// the rest is the shape hash.
+const SITE_SHAPE_MASK: u64 = ~@as(u64, 0x3FF);
+const SITE_MISS: u64 = 1;
+const SITE_WIN: u64 = 2;
+
+/// Fold the candidate list into a stable shape word for the bare-name
+/// site memo: an Instance contributes its class identity and stored
+/// field count (a dynamically defined field flips the shape), every
+/// other value contributes its tag. Null disables the memo for this
+/// execution — a candidate carrying lexical `this@` captures probes
+/// foreign receivers whose state the shape cannot cover.
+fn implicitSiteShape(cands: []const ImplicitCandidate) ?u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (cands) |c| {
+        var k: u64 = undefined;
+        if (c.v == .Instance) {
+            const g = c.v.Instance.borrow();
+            defer g.deinit();
+            const b = g.get();
+            if (b.anon_captures.len != 0) return null;
+            k = @as(u64, @intCast(b.class.identity())) ^ (@as(u64, b.fields.items.len) *% 0x9e3779b97f4a7c15);
+        } else {
+            k = @as(u64, @intFromEnum(std.meta.activeTag(c.v))) +% 0x51ed270b;
+        }
+        h = (h ^ k) *% 0x100000001b3;
+    }
+    // Zero means "no entry"; nudge a colliding shape off it.
+    if (h & SITE_SHAPE_MASK == 0) h = 0x400;
+    return h;
+}
 
 /// Candidate walks are assembled in host scratch memory, but probing a
 /// property/getter or member can re-enter interpreted code and collect. Keep

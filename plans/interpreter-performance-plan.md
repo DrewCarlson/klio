@@ -1006,6 +1006,65 @@ already ~1% — so frame overhead, not resolution, is the remaining
 member-call cost. The stress tests need ~5x more against runTest's
 10s budget.
 
+RESOLUTION-MEMO ROUND (landed): markInvalidFromBackgroundThread
+28.7s → 24.2s (~16%), sweep 0/117 + full compose battery green at
+every step. Benchmarked with new KLIO_OP_PROF sub-route markers
+(11-15: ltg-cands/ltg-probe/ltg-global/gf-slow/member-cache-probe)
+and a `<gf>Type.name` GetField census under KLIO_CALL_STATS. Stacked
+mechanisms, all verified by before/after profiles:
+1. LoadFromThisOrGlobal SITE MEMO — a packed u64 on the instruction
+   ({candidate shape hash, winner index, verdict}, atomic, benign-race
+   fill): the shape folds each implicit candidate's class identity and
+   stored-field count (a dynamic `define` flips it), candidates with
+   `this@` captures decline. Winner probes are self-verifying; a
+   MISS-ALL verdict skips every getMemberField probe straight to the
+   global tiers. route:ltg-probe 16.1% → 4.8%.
+2. GetField SITE CACHE — single-fill CAS pair on the instruction
+   (first resolving class claims `site_cls`, only the winner writes
+   `site_route`, so the pair never tears): serves plain stored slots
+   (name re-verified, lateinit/delegate decline) and class getters via
+   the (class, name) memo route. Plus: the `<class-companion-or-self>`
+   arm hoisted to the ladder top (670k reads/test waded the whole
+   prefix), and `$sgetter$` resolutions now FILL `field_read_cache`
+   under the full scoped name behind class-static safety gates (owner
+   ownership/declaration, no private-shadow keys, no owner getter for
+   the fallback copy) with a separator-guarded suffix match at the
+   serves. route:gf-slow 16% → 7.5%.
+3. Member ladder head: `recvFnPropsAny` threadlocal module gate before
+   the recv-fn-prop supertype walk (most modules declare zero);
+   `prepareMemberFlatCall` reordered — a member-cache hit skips the
+   stored-field shadow scan (the ladder serves the method anyway).
+   route:vararg-shadow's 5% turned out to be the cache-probe segment.
+4. Ext-cache coverage: flat-prep and the ladder head now probe under
+   scope-FOLDED keys (static/declared receivers) and for NON-Instance
+   keyable receivers (scalars, prim arrays, closures, Result) — the
+   cache only fills after every earlier arm declined for the same key,
+   so a hit proves the ladder tail.
+5. methodArgSig tags for `Null` (fixed-position null keys soundly —
+   the walk scores an identical tag vector identically), PRIMITIVE
+   arrays (by prim kind, object arrays stay out), and `Result`
+   (typeFqn-exact, erased payload). Walk census 72k → 17.7k per test;
+   `resumeCancellableWithInternal` (22k walks — its `Result` arg
+   killed the key) dropped to zero.
+6. Chain-folded ext key: `saw_member_ext` no longer vetoes memoization
+   outright — when a member-extension competes, the resolution keys
+   under sig ^ enclosingChainClassHash() (entry kinds + receiver class
+   identities, no allocation); only PLAIN winners and misses store
+   (a member-ext winner needs its owner push and stays walk-resolved).
+7. Frameless accessor serve: a func whose body is exactly
+   `LoadParam #0; GetField; return` (the canonical getter lowering,
+   detected once per func, benign-race cached) with a claimed receiver
+   class serves the stored slot directly in `invokeMethodFuncId` /
+   `evalGetterTagged` — no frame, no activation, no chain seeding.
+Remaining distribution (24.2s run): ext-fallback 13.7% (now mostly
+the post-fallback ladder TAIL riding the route-3 segment, plus
+uncacheable container receivers), Call 10.4%, outside-eval 9.8%,
+flat-prep 7.9%, gf-slow 7.5% (delegate/atomic-routed reads — real
+work), CMG 6.4%, NewInstance 5.4%. The `_state`/atomicfu delegate
+reads and the KClass companion resolutions are the biggest remaining
+gf-slow entries; frame machinery (Call + outside-eval ≈ 20%) is still
+the structural rock.
+
 THROUGHPUT CAMPAIGN EVIDENCE (removeAndInsertWithMoveAway, constant
 ~0.55s/iteration, needs ~2.5-3x to clear the 90s cap; the same budget
 gates markInvalidFromBackgroundThread, resumeOnBackgroundThread, and

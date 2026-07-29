@@ -163,6 +163,8 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
         return errRes(.{ .Type = msg });
     };
+    // Frameless serve for the canonical getter shape on a claimed class.
+    if (accessorFastGet(self, mptr, func, &receiver)) |r| return r;
     // Pin the receiver as a GC root across the getter's re-entrant evaluation.
     // A getter body allocates and hits safe points; the only handle to the
     // receiver here is this native local (the frame-chain walk cannot see it
@@ -330,6 +332,18 @@ fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) bool
     return false;
 }
 
+/// Whether stored-field `fname` is the property a scope-qualified
+/// `$sgetter$<owner>\u{1f}<prop>` read named: the full name ends with the
+/// separator + the field name. Used by the (class, name) memo and the
+/// GetField site memo so entries keyed by the FULL scoped name can serve a
+/// stored slot whose field is stored under the bare property name.
+pub fn sgetterNameMatches(full: []const u8, fname: []const u8) bool {
+    if (!std.mem.startsWith(u8, full, "$sgetter$")) return false;
+    if (full.len <= fname.len) return false;
+    if (!std.mem.endsWith(u8, full, fname)) return false;
+    return full[full.len - fname.len - 1] == '\u{1f}';
+}
+
 /// A discarded dispatch-miss message from a probe. Host miss messages are
 /// `allocPrint`-built with a `Vm::` prefix; static literals never carry one.
 fn freeMissErr(allocator: Allocator, e: EvalError) void {
@@ -344,6 +358,98 @@ threadlocal var anon_recv_depth: usize = 0;
 
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
+}
+
+pub const FieldSiteClaim = struct { cls: u64, route: u64 };
+
+/// Frameless accessor-getter serve: when `f`'s body is the canonical
+/// `LoadParam #0; GetField; return` shape and the receiver's class claimed
+/// the func's single-fill route as a plain stored slot, read the slot
+/// directly — no frame, no activation, no chain seeding. The slot serve is
+/// exactly what the (class, name) memo would return inside the frame's
+/// GetField, re-verified by name; lateinit/delegate shapes decline to the
+/// frame path, as does a getter-routed or unclaimed (class, name).
+pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, receiver: *const Value) ?EvalResult {
+    if (receiver.* != .Instance) return null;
+    const fc = f.accessorFieldConst() orelse return null;
+    const claimed = @atomicLoad(u64, @constCast(&f.acc_cls), .acquire);
+    if (claimed == 1) return null;
+    if (fc.int() >= mod.consts.items.len) return null;
+    const fname: []const u8 = switch (mod.consts.items[fc.int()]) {
+        .String => |s| s,
+        else => return null,
+    };
+    var cls: u64 = 0;
+    {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        cls = @intCast(g.get().class.identity());
+    }
+    if (claimed == 0) {
+        // First resolution claims the func for this class when the memo
+        // already routes the read to a stored slot; the claiming call
+        // itself still runs the frame path (the memo may not be filled
+        // until that run completes).
+        if (fieldSiteRoute(self, receiver, fname)) |r| {
+            if (r.route & 3 == 1) {
+                if (@cmpxchgStrong(u64, @constCast(&f.acc_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
+                    @atomicStore(u64, @constCast(&f.acc_route), r.route, .release);
+                }
+            } else {
+                _ = @cmpxchgStrong(u64, @constCast(&f.acc_cls), 0, 1, .acq_rel, .monotonic);
+            }
+        }
+        return null;
+    }
+    if (claimed != cls) return null;
+    const route = @atomicLoad(u64, @constCast(&f.acc_route), .acquire);
+    if (route == 0 or route & 3 != 1) return null;
+    const idx: usize = @intCast(route >> 2);
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    const fields = g.get().fields.items;
+    if (idx >= fields.len) return null;
+    const fld = &fields[idx];
+    if (!std.mem.eql(u8, fld.name, fname) and !sgetterNameMatches(fname, fld.name)) return null;
+    const v = fld.value;
+    if (v == .Null or v == .Delegate) return null;
+    v.retain();
+    return ok(v);
+}
+
+/// The packed field-read route a `GetField` instruction may claim for the
+/// receiver's class: {stored slot index | getter FuncId} + a 2-bit verdict,
+/// sourced from the (class, name) memo `getFieldInner` maintains — so a
+/// claim exists only for reads that resolved as a plain stored slot or a
+/// class getter, with every earlier ladder arm already declined. Null when
+/// the memo has no entry for the pair.
+pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
+    if (receiver.* != .Instance) return null;
+    if (std.mem.eql(u8, name, "coroutineContext")) return null;
+    const inst = receiver.Instance;
+    var cls: u64 = 0;
+    const fqn = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        cls = @intCast(g.get().class.identity());
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const hit = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().field_read_cache.get(.{ .a = fqn, .b = name });
+    } orelse return null;
+    const NONE = root.ProgramImage.FieldReadHit.NONE;
+    if (hit.getter != NONE) return .{ .cls = cls, .route = (@as(u64, hit.getter) << 2) | 2 };
+    if (hit.stored_idx != NONE) return .{ .cls = cls, .route = (@as(u64, hit.stored_idx) << 2) | 1 };
+    return null;
+}
+
+/// Run a class property getter claimed by a `GetField` site memo.
+pub fn runFieldGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
+    return evalGetterTagged(self, allocator, fid, receiver, "site-memo");
 }
 
 /// Kotlin's implicit receivers stack. A bare name inside an object literal's
@@ -531,6 +637,43 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try extensionPropRead(self, allocator, receiver, prop)) |v| return v;
         return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
     }
+    // A bare class/interface name used as a value resolves to its companion
+    // object, else the receiver unchanged. Hoisted ahead of the ladder: the
+    // sentinel is klio-synthetic, so no other arm can ever claim it, and
+    // class-value reads are hot enough (enum entries, companion calls) that
+    // wading the whole prefix per read showed up in profiles.
+    if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
+        if (receiver.* == .Class) {
+            const cls_name = blk: {
+                const g = receiver.Class.borrow();
+                defer g.deinit();
+                break :blk g.get().name;
+            };
+            const is_object = blk: {
+                const g = receiver.Class.borrow();
+                defer g.deinit();
+                break :blk g.get().is_object;
+            };
+            const comp_name: ?[]const u8 = blk: {
+                const g = self.module.borrow();
+                defer g.deinit();
+                break :blk g.get().registry.companion_singletons.get(cls_name);
+            };
+            if (comp_name) |cn| {
+                switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .err => |e| return errRes(e),
+                }
+            }
+            if (is_object) {
+                switch (try host_globals.ensureObjectSingleton(self, cls_name)) {
+                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .err => |e| return errRes(e),
+                }
+            }
+        }
+        return ok(receiver.*);
+    }
     // Field-read memo, consulted before the whole ladder: entries exist
     // ONLY for (class, name) pairs that previously fell through every
     // earlier arm and resolved in `instanceField` as a custom getter or
@@ -566,8 +709,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     const g = inst0.borrow();
                     defer g.deinit();
                     const fields = g.get().fields.items;
-                    if (h.stored_idx < fields.len and std.mem.eql(u8, fields[h.stored_idx].name, name)) {
-                        break :blk fields[h.stored_idx].value;
+                    if (h.stored_idx < fields.len) {
+                        const fname = fields[h.stored_idx].name;
+                        const val = fields[h.stored_idx].value;
+                        if (std.mem.eql(u8, fname, name)) break :blk val;
+                        // A scoped-name entry serves the bare-named slot,
+                        // but never the lateinit/delegate shapes — those
+                        // adjudicate by the bare property name, so the
+                        // ladder's own arms must decide them.
+                        if (sgetterNameMatches(name, fname) and val != .Null and val != .Delegate) {
+                            break :blk val;
+                        }
                     }
                     break :blk null;
                 };
@@ -830,7 +982,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     // computed getter and let the ordinary field path select
                     // the override's backing cell.
                     if (stored_here) {
-                        return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                        const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                        if (r == .ok and sgetterMemoSafe(self, className(receiver.Instance), rest, owner, prop)) {
+                            sgetterCopyMemo(self, receiver, prop, name);
+                        }
+                        return r;
                     }
                     const vfid = blk: {
                         const pg = self.prog.borrow();
@@ -852,6 +1008,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                             break :blk lookupPairFunc(pg.get().instance_prop_private, cn, prop) != null;
                         };
                         if (!foreign_private and fid.int() < mptr.funcCount()) {
+                            if (sgetterMemoSafe(self, className(receiver.Instance), rest, owner, prop)) {
+                                sgetterPutGetter(self, receiver, name, fid);
+                            }
                             return evalGetterTagged(self, allocator, fid, receiver.*, "virtual-walk");
                         }
                     }
@@ -903,12 +1062,37 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                                     return evalGetterTagged(self, allocator, fid, inst, "owner-enclosing");
                                 }
                             }
+                            // Memoizable only when a member PROBE would take
+                            // this same terminal: the receiver owns `owner`
+                            // under both the module walk and the value-level
+                            // runtime-type check (the probe's gate).
+                            if (recv_owns and receiver.isRuntimeType(owner) and
+                                sgetterMemoSafe(self, rcn2, rest, owner, prop))
+                            {
+                                sgetterPutGetter(self, receiver, name, fid);
+                            }
                         }
                         return evalGetterTagged(self, allocator, fid, receiver.*, "owner-lexical");
                     }
                 }
             }
-            return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+            {
+                const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                // Memoizable only when no lexical-owner getter exists at all
+                // (then both execution modes fall through to this recursion)
+                // and the class-static gates hold.
+                if (r == .ok and receiver.* == .Instance) {
+                    const no_owner_getter = blk: {
+                        const pg = self.prog.borrow();
+                        defer pg.deinit();
+                        break :blk lookupPairFunc(pg.get().instance_prop_getters, owner, prop) == null;
+                    };
+                    if (no_owner_getter and sgetterMemoSafe(self, className(receiver.Instance), rest, owner, prop)) {
+                        sgetterCopyMemo(self, receiver, prop, name);
+                    }
+                }
+                return r;
+            }
         }
     }
     // Suspend-implicit `coroutineContext` intrinsic: redirect a bare
@@ -956,40 +1140,6 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 .err => |e| return errRes(e),
             }
         }
-    }
-    // A bare class/interface name used as a value resolves to its
-    // companion object, else the receiver unchanged.
-    if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
-        if (receiver.* == .Class) {
-            const cls_name = blk: {
-                const g = receiver.Class.borrow();
-                defer g.deinit();
-                break :blk g.get().name;
-            };
-            const is_object = blk: {
-                const g = receiver.Class.borrow();
-                defer g.deinit();
-                break :blk g.get().is_object;
-            };
-            const comp_name: ?[]const u8 = blk: {
-                const g = self.module.borrow();
-                defer g.deinit();
-                break :blk g.get().registry.companion_singletons.get(cls_name);
-            };
-            if (comp_name) |cn| {
-                switch (try host_globals.ensureObjectSingleton(self, cn)) {
-                    .ok => |maybe| if (maybe) |s| return ok(s),
-                    .err => |e| return errRes(e),
-                }
-            }
-            if (is_object) {
-                switch (try host_globals.ensureObjectSingleton(self, cls_name)) {
-                    .ok => |maybe| if (maybe) |s| return ok(s),
-                    .err => |e| return errRes(e),
-                }
-            }
-        }
-        return ok(receiver.*);
     }
     // Value-class internal-field read on `kotlin.Result` /
     // `ChannelResult`: a bare `value`/`holder` read yields the payload.
@@ -2822,6 +2972,79 @@ fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root
     defer pg.deinit();
     if (pg.get().field_read_cache.count() >= 65536) return;
     pg.get().field_read_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
+}
+
+/// Whether a `$sgetter$` resolution for (receiver class, scoped name) is a
+/// pure function of the class — every execution mode (member probe or
+/// direct read) reaches the same terminal — so the (class, name) memo may
+/// serve it. Every consulted fact is class-static: the foreign-receiver
+/// probe reject must be inapplicable (the class owns `owner`, or `owner`
+/// does not declare the property), and no private-shadow cell may claim
+/// the read under either key.
+fn sgetterMemoSafe(self: *VmHost, rcn: []const u8, rest: []const u8, owner: []const u8, prop: []const u8) bool {
+    const owns = std.mem.eql(u8, rcn, owner) or blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().classIsOrExtends(rcn, owner);
+    };
+    const owner_declares_stored = classDeclaresStoredProp(self, owner, prop);
+    if (!owns) {
+        const owner_declares = owner_declares_stored or blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk lookupPairFunc(pg.get().body_prop_inits, owner, prop) != null or
+                lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
+                lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
+        };
+        if (owner_declares) return false;
+    }
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.private_shadow_props.getKey(rest) != null) return false;
+    }
+    if (!std.mem.eql(u8, rcn, owner) and !owner_declares_stored) {
+        var buf: [256]u8 = undefined;
+        const rk = std.fmt.bufPrint(&buf, "{s}\u{1f}{s}", .{ rcn, prop }) catch return false;
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.private_shadow_props.getKey(rk) != null) return false;
+    }
+    return true;
+}
+
+/// Record a `$sgetter$` getter terminal in the (class, name) memo under the
+/// FULL scoped name.
+fn sgetterPutGetter(self: *VmHost, receiver: *const Value, full_name: []const u8, fid: FuncId) void {
+    if (receiver.* != .Instance) return;
+    const fqn = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    fieldReadCachePut(self, fqn, full_name, .{ .getter = @intCast(fid.int()), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
+}
+
+/// After a `$sgetter$` terminal recursed on the bare property and resolved,
+/// mirror the bare-name memo entry under the FULL scoped name so later
+/// reads (and the GetField site memo) skip the arm's per-read walks.
+fn sgetterCopyMemo(self: *VmHost, receiver: *const Value, prop: []const u8, full_name: []const u8) void {
+    if (receiver.* != .Instance) return;
+    const fqn = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    const hit = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().field_read_cache.get(.{ .a = fqn, .b = prop });
+    } orelse return;
+    fieldReadCachePut(self, fqn, full_name, hit);
 }
 
 /// Whether a stored `.Null` in `name`'s slot means an uninitialized
