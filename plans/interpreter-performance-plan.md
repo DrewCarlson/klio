@@ -1797,3 +1797,118 @@ resumeOnBackgroundThread from 44.5s needs ~2.2x, so it needs most of
 this list plus a reduction in executed IR instructions — item 5 is the
 only one on the list that removes instructions rather than making them
 cheaper, which is why the inliner is the highest-leverage thing left.
+
+## Working the five increments: what each was actually worth
+
+The five items named at the end of the last round were each implemented and
+measured on ReleaseFast. Run-to-run variance on `resumeOnBackgroundThread`
+is about +/-0.6s, so anything under ~1.5% is not resolvable in one run;
+every number below is the median of three.
+
+The single most important measurement is not any of them. It is this:
+
+```
+45.64 real   45.29 user   0.77 sys
+```
+
+`resumeOnBackgroundThread` is ONE core, fully CPU-bound and serial. That
+kills two earlier hypotheses at once — it is not wall-clock-bound waiting
+on anything, and there is no parallelism left to exploit. It also sets the
+exchange rate honestly: to reach the 20s target from 44s, 55% of the
+interpreter's CPU has to go, and the profile has no item anywhere near that
+size.
+
+**Inline-fun splicing (1).** Not a bug and not a missing feature: KLIO's
+inliner splices only where semantics REQUIRE it (`is_suspend`, a non-local
+return in an argument lambda, a forwarded inline lambda, reified type
+parameters, member shadowing, a companion-super member). `bareInlineNeedsSplice`
+is the gate, and for `runtimeCheck(value) { "Check failed" }` none of them
+hold, so it emits a call — correctly. Splicing for PERFORMANCE would be a
+different feature with a much larger blast radius.
+
+The performance-equivalent was cheaper: `leafExprBody` now admits small
+MULTI-BLOCK bodies (`Goto`/`Branch`/`Return`, including a `Unit` return),
+and the walk abandons on the first instruction it cannot execute. A guard
+helper's taken path is a constant and a return, so `runtimeCheck` serves
+framelessly even though its untaken failure branch calls out. Adding the
+serve at `evalWithCapturesChained` — the one seam EVERY interpreted call
+passes through, whatever route resolved it — was what actually connected
+it: the getter and member entries never saw these calls at all.
+**11.0M interpreted calls -> 8.9M.** Wall: no resolvable change.
+
+**CallMember in the leaf (2).** Implemented, measured, REVERTED. Resolving
+a member from inside the leaf means running `prepareMemberFlatCall` and
+then discarding the request when the callee turns out to need a frame —
+paying the dispatch twice on every miss. `gapbuffer.groupSize` (2.0M calls)
+kept missing, and rob went 44.4s -> 45.7s. A speculative fast path that
+usually loses is a regression, not a win.
+
+**Thread-local threading (3).** `Frame` now carries `*EvalTls`, the
+register/chain/activation pools take it as a parameter, and `runFrameExec`
+binds it once instead of touching the threadlocal twice per instruction in
+the spin-diagnostic gate. `_tlv_get_addr` 9.6% -> 7.4% of busy. Wall: about
+0.3s, at the edge of resolvable.
+
+**Per-instruction inline cache on CallMember (4).** Implemented, measured,
+REVERTED. The premise was wrong: member resolution is ALREADY memoized per
+thread (`tl_method_cache`, `tl_ext_cache`, `tl_resolve_cache`,
+`tl_perm_cache`), so a site cache does not remove a lookup — it adds a
+second fingerprint alongside the one the thread-local path already
+computes. No gain, slightly negative.
+
+Worth recording the bug found while building it, because the shape recurs:
+the first design stored the fingerprint and the target `FuncId` in two
+separate atomics on the instruction. Instructions are shared across
+threads, so a reader could pair a published fingerprint with another
+thread's target and dispatch to the wrong declaration. A single-pointer
+publish of an immutable `{key, fid}` record is the sound form. Any future
+per-instruction cache has to publish atomically as one unit.
+
+**Allocation discipline (5).** The enclosing-`this` chain buffer is pooled
+per thread (landed with the previous commit). The leaf register file is now
+sized to the body's `n_locals` instead of always sixteen `Value`s — a
+384-byte initialisation per serve was costing about what the frame it
+replaced cost — and the collector pin is deferred to the first instruction
+that can actually reach a safe point, so a plain field-and-arithmetic
+accessor pays no keepalive traffic at all. `params`/`captures` are NOT
+pooled: unlike `regs`, the frame receives those buffers from the dispatch
+that built them, so pooling belongs at the construction sites, which are
+spread across the host.
+
+One trap caught only by running BOTH optimize modes: sizing the leaf
+register file to `n_locals` was measured on ReleaseFast, where `undefined`
+costs nothing — but on ReleaseSafe the same declaration is a 384-byte 0xAA
+fill per serve, and rob regressed 84.5s -> 91.6s while ReleaseFast showed
+an improvement. The register file now comes from a per-thread bank indexed
+by serve depth, so no build initialises it per call. This is the same
+safety-fill mechanism documented at the top of this round, reintroduced by
+a change whose whole point was to avoid it — the lesson is that any
+per-call buffer needs checking in the gate's optimize mode, not just the
+measuring one.
+
+Net for the round: 8.9M frames (from 11.0M), `_tlv_get_addr` 9.6% -> 7.4%.
+ReleaseSafe rob 84.5s -> 82.8s, markInvalid 15.7s -> 14.9s; ReleaseFast rob
+44.5s -> 44.4s.
+
+### The conclusion this forces
+
+Three separate CPU reductions in a row moved the wall by less than a
+second each, and the profile after them is flatter than before:
+
+```
+10.0%  eval.runFlatLoop      8.3%  eval.execInst      5.4%  execArmCallMember
+ 7.4%  _tlv_get_addr         5.5%  leafExprServeAt    2.9%  slab.alloc
+```
+
+There is no remaining item worth more than ~10%, and roughly 30% of the
+total is the instruction-dispatch skeleton itself (`runFlatLoop` +
+`execInst` + the arms). Removing ALL of the non-skeleton items on the list
+would not reach 20s.
+
+So the 20s target is not reachable by trimming this design further. It
+needs the execution strategy to change: either the Stage-3 `jit_loop`
+(today x86-64 only, and loop-shaped — neither matches an arm64 host or a
+call-heavy composition workload) extended to arm64 and to whole functions,
+or a closure/threaded-code compilation of the IR that retires the
+per-instruction switch. That is a build, not a tuning pass, and it should
+be planned as one rather than approached through more increments.

@@ -1196,37 +1196,43 @@ pub const Func = struct {
         return verdict;
     }
 
+    /// Structural admission only. Which INSTRUCTIONS a leaf serve can
+    /// actually execute is decided per instruction as it runs, because a
+    /// body may reach a value-returning path made entirely of leaf work
+    /// while an untaken branch does something the serve cannot do — the
+    /// guard shape `if (!ok) reportFailure(lazyMessage())` is the common
+    /// case, and its taken path is a constant and a return.
     fn classifyLeafExprBody(self: *const Func) bool {
-        if (self.is_suspend or self.is_lambda or self.blocks.len != 1) return false;
+        if (self.is_suspend or self.is_lambda) return false;
+        if (self.blocks.len == 0 or self.blocks.len > LEAF_MAX_BLOCKS) return false;
         if (self.n_locals > LEAF_MAX_REGS) return false;
-        const b = &self.blocks[0];
-        if (b.catches.len != 0 or b.insts.len > LEAF_MAX_INSTS) return false;
-        switch (b.terminator) {
-            .Return => |r| if (r == null) return false,
-            else => return false,
+        var total: usize = 0;
+        for (self.blocks) |*b| {
+            if (b.catches.len != 0) return false;
+            total += b.insts.len;
+            if (total > LEAF_MAX_INSTS) return false;
+            switch (b.terminator) {
+                // A `Return` with no register is a `Unit` return — the shape
+                // of every guard helper, which is exactly what this admits.
+                .Return, .Goto, .Branch => {},
+                else => return false,
+            }
         }
         for (self.params) |*p| {
             if (p.is_vararg or p.default != null) return false;
         }
-        for (b.insts) |*inst| switch (inst.*) {
-            .Trace, .Const, .Move, .Not, .Index => {},
-            .LoadParam => |lp| if (lp.idx >= self.params.len) return false,
-            .BinOp => {},
-            .GetField => |gf| _ = gf,
-            // A call to another leaf keeps the whole chain frameless. The
-            // callee's own classification is checked when it is resolved,
-            // so only the call SHAPE is judged here.
-            .Call => |c| if (c.arg_names.len != 0 or c.type_args.len != 0) return false,
-            else => return false,
-        };
         return true;
     }
 };
 
 /// Bounds for `leafExprBody`. A leaf serve keeps its registers in a fixed
-/// stack array, so both the register count and the body length are capped.
+/// stack array, so both the register count and the body length are capped;
+/// the block bound keeps a guard-shaped body admissible without admitting
+/// real control flow, and `LEAF_MAX_STEPS` bounds the walk itself.
 pub const LEAF_MAX_REGS: u32 = 16;
-pub const LEAF_MAX_INSTS: usize = 12;
+pub const LEAF_MAX_INSTS: usize = 32;
+pub const LEAF_MAX_BLOCKS: usize = 8;
+pub const LEAF_MAX_STEPS: usize = 64;
 
 pub const Param = struct {
     name: []const u8,
