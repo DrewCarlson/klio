@@ -92,7 +92,7 @@ fn initDebugLog(name: []const u8, e: EvalError) void {
                 const fg = ex.fqn.borrow();
                 defer fg.deinit();
                 std.debug.print("[init-debug] {s} FAILED: throw {s}", .{ name, fg.get().bytes });
-                if (ex.message) |m| {
+                if (ex.message.get()) |m| {
                     const mg = m.borrow();
                     defer mg.deinit();
                     std.debug.print(": {s}", .{mg.get().bytes});
@@ -121,7 +121,7 @@ fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!Eval
     const fqn = try runtime.strInit(allocator, FILE_INIT_FAILED_FQN);
     const msg = try runtime.strInit(allocator, FILE_INIT_FAILED_MSG);
     const cause_box = if (cause) |c| (try Value.boxRef(allocator, c)).cell else null;
-    return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = cause_box } } };
+    return .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = cause_box } } };
 }
 
 /// What the claim step decided for one gate pass.
@@ -1641,7 +1641,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
                 const fqn = try runtime.strInit(allocator, "kotlin.IllegalStateException");
                 const msg_text = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
                 const msg = try runtime.strInitOwned(allocator, msg_text);
-                return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = msg, .cause = null } } } };
+                return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = null } } } };
             }
         }
     }

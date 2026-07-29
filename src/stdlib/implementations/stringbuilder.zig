@@ -50,7 +50,7 @@ fn errResult(e: RuntimeError) EvalResult {
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     return .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
-        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
+        .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
     } };
 }
@@ -1144,7 +1144,7 @@ fn freeSb(v: Value, a: Allocator) void {
         },
         .Exception => |e| {
             e.fqn.deinit();
-            if (e.message) |m| {
+            if (e.message.get()) |m| {
                 m.deinit();
             }
         },

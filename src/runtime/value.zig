@@ -204,7 +204,7 @@ pub const MapStore = struct {
     /// map's `keys`/`values`/`entries` views. Shared (ObjRef handle) with every
     /// such view; the map's structural mutations bump it on a size change and a
     /// view iterator captures it. Null for a read-only map.
-    mod_count: ?ObjRef(u64) = null,
+    mod_count: objcell.OptRef(u64) = .{},
 
     /// Below this entry count, a linear scan beats a hash table (and avoids the
     /// table's allocation), so the index is not built.
@@ -214,7 +214,7 @@ pub const MapStore = struct {
         self.pairs.deinit(a);
         self.head.deinit(a);
         self.chain.deinit(a);
-        if (self.mod_count) |mc| mc.deinit();
+        if (self.mod_count.get()) |mc| mc.deinit();
     }
 
     /// GC teardown (no allocator-bound buffers escape the cell): free the same
@@ -226,7 +226,7 @@ pub const MapStore = struct {
     /// Out-edges: only the entry list owns `Value`s; the index is index-only.
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
         for (self.pairs.items) |*kv| kv.gcTrace(m);
-        if (self.mod_count) |mc| m.shade(&mc.cell.hdr);
+        if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
     }
 
     /// Hash for a key, consistent with `Value.structuralEqBoxed` (equal keys
@@ -1563,7 +1563,7 @@ pub const Value = union(enum) {
     /// A thrown value, modeled as a Kotlin Throwable.
     Exception: struct {
         fqn: StringRef,
-        message: ?StringRef,
+        message: objcell.OptRef(StringData) = .{},
         /// Stored as a bare nullable cell pointer (`?*ValueBox.Cell`, 8 bytes —
         /// `?ObjRef` is not null-optimized) and reconstructed as `ValueBox` at
         /// each use, keeping `Value` pinned at 64. Mirrors `List.backing`.
@@ -1607,7 +1607,7 @@ pub const Value = union(enum) {
         /// structural mutation (add/remove/clear/…) bumps it; an iterator
         /// captures it and throws `ConcurrentModificationException` when it
         /// changes underneath. Null for read-only lists / views.
-        mod_count: ?ObjRef(u64) = null,
+        mod_count: objcell.OptRef(u64) = .{},
     },
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
@@ -1621,7 +1621,7 @@ pub const Value = union(enum) {
         /// argument on the creating stdlib function; see `List`.
         declared_elem: ?[]const u8 = null,
         /// Structural-modification counter for fail-fast iteration; see `List`.
-        mod_count: ?ObjRef(u64) = null,
+        mod_count: objcell.OptRef(u64) = .{},
     },
     /// `kotlin.collections.Map` / `MutableMap`.
     Map: struct {
@@ -1642,7 +1642,7 @@ pub const Value = union(enum) {
         value: ValueBox,
         /// When set, the live map's entries: `setValue` writes through and
         /// reads resolve the live pair by key.
-        backing: ?MapEntries,
+        backing: objcell.OptRef(MapStore) = .{},
         /// The backing counter observed when this entry was handed out
         /// (creation or iterator `next()`). A later structural change to
         /// the map makes every member access throw
@@ -1685,7 +1685,7 @@ pub const Value = union(enum) {
         /// throw `ConcurrentModificationException` when it no longer matches the
         /// `exp_mod` the cursor captured; the iterator's own `add`/`remove`
         /// resync it. Null when the source had no `mod_count`.
-        mod_count: ?ObjRef(u64) = null,
+        mod_count: objcell.OptRef(u64) = .{},
         /// True only when the iterator shares a *mutable* collection's backing,
         /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
         /// the source. A snapshot iterator over a read-only collection (or an
@@ -1781,12 +1781,12 @@ pub const Value = union(enum) {
             .List => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
-                if (x.mod_count) |mc| visitor.visit(mc);
+                if (x.mod_count.get()) |mc| visitor.visit(mc);
             },
             .Set => |x| {
                 visitor.visit(x.items);
                 if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
-                if (x.mod_count) |mc| visitor.visit(mc);
+                if (x.mod_count.get()) |mc| visitor.visit(mc);
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| visitor.visit(vl),
@@ -1796,7 +1796,7 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.cursor);
-                if (x.mod_count) |mc| visitor.visit(mc);
+                if (x.mod_count.get()) |mc| visitor.visit(mc);
             },
             .RangeIter => |x| {
                 visitor.visit(x.cur);
@@ -1807,7 +1807,7 @@ pub const Value = union(enum) {
             .MatchGroup => |g| visitor.visit(g.value),
             .Exception => |e| {
                 visitor.visit(e.fqn);
-                if (e.message) |m| visitor.visit(m);
+                if (e.message.get()) |m| visitor.visit(m);
                 if (e.cause) |c| visitor.visit(ValueBox{ .cell = c });
                 if (e.stack) |s| visitor.visit(StackRef{ .cell = s });
                 if (e.suppressed) |sl| visitor.visit(ValueList{ .cell = sl });
@@ -1887,7 +1887,7 @@ pub const Value = union(enum) {
             },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
-            .MapEntry => |e| if (e.backing) |b| m.shade(&b.cell.hdr),
+            .MapEntry => |e| if (e.backing.get()) |b| m.shade(&b.cell.hdr),
             // Keep the side-table's canonical capture store + receiver chain for
             // this closure alive (the dup'd `captures` ValueSlice is already
             // shaded by `forEachChildCell` above). A closure no live value marks
@@ -1930,12 +1930,12 @@ pub const Value = union(enum) {
                 // Drop the view's owned `CollBacking` cell (the borrowed source
                 // it points at is owned elsewhere, not released here).
                 if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
-                if (x.mod_count) |mc| mc.deinit();
+                if (x.mod_count.get()) |mc| mc.deinit();
             },
             .Set => |x| {
                 releaseValueList(x.items, allocator);
                 if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
-                if (x.mod_count) |mc| mc.deinit();
+                if (x.mod_count.get()) |mc| mc.deinit();
             },
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| releaseValueList(vl, allocator),
@@ -1956,7 +1956,7 @@ pub const Value = union(enum) {
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.cursor.deinit();
-                if (x.mod_count) |mc| mc.deinit();
+                if (x.mod_count.get()) |mc| mc.deinit();
             },
             .RangeIter => |x| {
                 x.cur.deinit();
@@ -1967,7 +1967,7 @@ pub const Value = union(enum) {
             .MatchGroup => |g| g.value.deinit(),
             .Exception => |e| {
                 e.fqn.deinit();
-                if (e.message) |m| m.deinit();
+                if (e.message.get()) |m| m.deinit();
                 if (e.cause) |c| (ValueBox{ .cell = c }).deinit();
                 if (e.suppressed) |sl| (ValueList{ .cell = sl }).deinit();
             },
@@ -2737,7 +2737,7 @@ pub const Value = union(enum) {
             .Exception => |e| {
                 const fg = e.fqn.borrow();
                 defer fg.deinit();
-                if (e.message) |m| {
+                if (e.message.get()) |m| {
                     const mg = m.borrow();
                     defer mg.deinit();
                     try writer.print("{s}: {s}", .{ fg.get().bytes, mg.get().bytes });
@@ -2900,7 +2900,7 @@ pub const Value = union(enum) {
         if (self.* != .List) return false;
         const cell = self.List.backing orelse return false;
         if (cell.data != .sublist) return false;
-        const mc = self.List.mod_count orelse return false;
+        const mc = self.List.mod_count.get() orelse return false;
         const cur = blk: {
             const g = mc.borrow();
             defer g.deinit();

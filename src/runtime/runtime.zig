@@ -22,6 +22,7 @@ const alloc_track_mod = @import("alloc_track.zig");
 
 // objcell
 pub const ObjRef = objcell.ObjRef;
+pub const OptRef = objcell.OptRef;
 pub const ObjGuard = objcell.ObjGuard;
 pub const ObjGuardMut = objcell.ObjGuardMut;
 pub const ControlBlock = objcell.ControlBlock;

@@ -86,7 +86,7 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 fn throwExc(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalError {
     return .{ .Throw = .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
-        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
+        .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
     } } };
 }
@@ -4224,7 +4224,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             const msg = try std.fmt.allocPrint(allocator, "index: {d}, size: {d}", .{ idx, size });
             return .{ .err = .{ .Throw = .{ .Exception = .{
                 .fqn = try runtime.strInit(allocator, "kotlin.IndexOutOfBoundsException"),
-                .message = try runtime.strInitOwned(allocator, msg),
+                .message = .from(try runtime.strInitOwned(allocator, msg)),
                 .cause = null,
             } } } };
         }
@@ -4232,7 +4232,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (stdlib.implementations.collections.sublistViewStale(receiver)) {
             return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
         }
-        const cap = try captureModCount(allocator, receiver.List.mod_count);
+        const cap = try captureModCount(allocator, receiver.List.mod_count.get());
         // Share the backing list (not a snapshot) so a `MutableListIterator`'s
         // `set`/`add`/`remove` mutate the underlying list, matching Kotlin. The
         // iterator is mutable only when the source list is.
@@ -4240,7 +4240,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             .items = receiver.List.items.clone(),
             .cursor = try newCursor(allocator, start, cap.exp_mod),
             .prim = null,
-            .mod_count = cap.mod_count,
+            .mod_count = .from(cap.mod_count),
             .mutable = receiver.List.mutable and receiver.List.backing == null and
                 !stdlib.implementations.collections.modCountFrozen(receiver.List.mod_count),
         } } };
@@ -5825,15 +5825,15 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // also mutable (no read-only error; CME still fires on concurrent
             // map modification); only a genuinely read-only list snapshots.
             if (l.mutable and !stdlib.implementations.collections.modCountFrozen(l.mod_count)) {
-                const cap = try captureModCount(allocator, l.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
+                const cap = try captureModCount(allocator, l.mod_count.get());
+                return .{ .ok = .{ .Iterator = .{ .items = l.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count), .mutable = true } } };
             }
             // A snapshot iterator (immutable list, or a live map `values` view):
             // still capture `mod_count` so a concurrent structural change to the
             // source (the map) fails the iterator fast.
             const items = try cloneItemsList(allocator, l.items);
-            const cap = try captureModCount(allocator, l.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
+            const cap = try captureModCount(allocator, l.mod_count.get());
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count) } } };
         },
         .Set => |s| {
             // A mutable set shares its backing so `MutableIterator.remove()`
@@ -5843,21 +5843,21 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             // remove and reports CME on concurrent map modification); only a
             // genuinely read-only set yields a read-only iterator.
             if (s.mutable and !stdlib.implementations.collections.modCountFrozen(s.mod_count)) {
-                const cap = try captureModCount(allocator, s.mod_count);
-                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = true } } };
+                const cap = try captureModCount(allocator, s.mod_count.get());
+                return .{ .ok = .{ .Iterator = .{ .items = s.items.clone(), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count), .mutable = true } } };
             }
             // Snapshot iterator (immutable set, or a live map `keys`/`entries`
             // view): capture `mod_count` so a concurrent map mutation fails fast.
             const items = try cloneItemsList(allocator, s.items);
-            const cap = try captureModCount(allocator, s.mod_count);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count } } };
+            const cap = try captureModCount(allocator, s.mod_count.get());
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count) } } };
         },
         .Map => |m| {
             const g = m.entries.borrow();
             const src_mc = g.get().mod_count;
             const live = m.mutable and !stdlib.implementations.collections.modCountFrozen(src_mc);
             const stamp: u64 = blk: {
-                const cell = src_mc orelse break :blk 0;
+                const cell = src_mc.get() orelse break :blk 0;
                 const cg = cell.borrow();
                 defer cg.deinit();
                 break :blk cg.get().*;
@@ -5871,11 +5871,11 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 // A mutable map's iterator yields live entries: `setValue`
                 // writes through, and `MutableIterator.remove` deletes from the
                 // backing via this reference (the `items` list is a snapshot).
-                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (live) m.entries else null, .exp_mod = stamp } });
+                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (live) .from(m.entries) else .{}, .exp_mod = stamp } });
             }
             g.deinit();
-            const cap = try captureModCount(allocator, src_mc);
-            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = cap.mod_count, .mutable = live } } };
+            const cap = try captureModCount(allocator, src_mc.get());
+            return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count), .mutable = live } } };
         },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = .{ .cur = try ObjRef(i64).init(allocator, r.start), .end = r.end, .step = r.step, .kind = r.kind, .done = try ObjRef(bool).init(allocator, false) } } };
@@ -7274,10 +7274,10 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             // resolve the live pair so non-structural value updates show
             // through (JVM HashMap.Node semantics for reads, common-code
             // fail-fast semantics for structural changes).
-            if (me.backing) |entries| {
+            if (me.backing.get()) |entries| {
                 const g = entries.borrow();
                 var stale = false;
-                if (g.get().mod_count) |cell| {
+                if (g.get().mod_count.get()) |cell| {
                     const cg = cell.borrow();
                     stale = cg.get().* != me.exp_mod;
                     cg.deinit();
@@ -7311,14 +7311,14 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
             if (std.mem.eql(u8, name, "setValue")) {
                 // No backing = a read-only map's entry: mutation throws
                 // instead of silently succeeding on the snapshot.
-                if (me.backing == null) {
+                if (!me.backing.isSome()) {
                     return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
                 }
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
                 const prev = me.value.asPtr().*;
                 // host-returns-owned: the old value escapes as the result.
                 if (runtime.reclaimEnabled()) prev.retain();
-                if (me.backing) |entries| {
+                if (me.backing.get()) |entries| {
                     const g = entries.borrowMut();
                     defer g.deinit();
                     for (g.get().pairs.items) |*slot| {
@@ -7363,7 +7363,7 @@ fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Value,
 fn mapEntriesCounter(entries: runtime.MapEntries) u64 {
     const g = entries.borrow();
     defer g.deinit();
-    const cell = g.get().mod_count orelse return 0;
+    const cell = g.get().mod_count.get() orelse return 0;
     const cg = cell.borrow();
     defer cg.deinit();
     return cg.get().*;
@@ -7393,7 +7393,7 @@ fn newCursor(allocator: Allocator, start: usize, exp_mod: u64) Allocator.Error!O
 /// `ConcurrentModificationException` when the source mutated structurally since
 /// the iterator captured it (`null` when consistent or uncounted).
 fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResult {
-    const mc = it.mod_count orelse return null;
+    const mc = it.mod_count.get() orelse return null;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
@@ -7411,7 +7411,7 @@ fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResu
 /// After the iterator's OWN structural mutation, resync its expectation so the
 /// next `next`/`hasNext` does not flag its own change as concurrent.
 fn iteratorResyncMod(it: anytype) void {
-    const mc = it.mod_count orelse return;
+    const mc = it.mod_count.get() orelse return;
     const cur = blk: {
         const g = mc.borrow();
         defer g.deinit();
@@ -7426,7 +7426,7 @@ fn iteratorResyncMod(it: anytype) void {
 /// (it mutates `items` directly, bypassing the list intrinsics): bump the shared
 /// `mod_count` so OTHER iterators fail-fast, then resync this one's expectation.
 fn iteratorOwnStructuralMod(it: anytype) void {
-    if (it.mod_count) |mc| {
+    if (it.mod_count.get()) |mc| {
         const g = mc.borrowMut();
         g.get().* +%= 1;
         g.deinit();
@@ -7474,7 +7474,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         // out after an iterator-driven structural change stay readable while
         // earlier ones fail fast.
         if (v == .MapEntry) {
-            if (v.MapEntry.backing) |entries| {
+            if (v.MapEntry.backing.get()) |entries| {
                 v.MapEntry.exp_mod = mapEntriesCounter(entries);
             }
         }
@@ -7596,7 +7596,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
             // A map iterator's element is a live MapEntry over a snapshot list;
             // also delete the entry from the backing map (by key).
             if (removed == .MapEntry) {
-                if (removed.MapEntry.backing) |entries| {
+                if (removed.MapEntry.backing.get()) |entries| {
                     const eg = entries.borrowMut();
                     defer eg.deinit();
                     const key = removed.MapEntry.key.asPtr();

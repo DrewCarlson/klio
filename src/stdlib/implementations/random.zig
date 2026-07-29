@@ -138,7 +138,7 @@ pub fn random_next_bits(ctx: *CallCtx) Allocator.Error!EvalResult {
 fn badBound(allocator: Allocator, comptime which: []const u8) Allocator.Error!EvalResult {
     const e = Value{ .Exception = .{
         .fqn = try runtime.strInit(allocator, "kotlin.IllegalArgumentException"),
-        .message = try runtime.strInit(allocator, which ++ ": bound must be positive / from < until"),
+        .message = .from(try runtime.strInit(allocator, which ++ ": bound must be positive / from < until")),
         .cause = null,
     } };
     return .{ .err = .{ .Thrown = e } };

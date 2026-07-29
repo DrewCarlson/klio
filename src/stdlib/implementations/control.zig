@@ -35,7 +35,7 @@ fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
     const msg = try std.fmt.allocPrint(ctx.allocator, "capacity must be non-negative, but was {d}.", .{cap});
     return EvalResult{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
-        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
@@ -54,17 +54,17 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .backing = null,
         // The builder is a live `MutableList` the block iterates + mutates;
         // give it a structural counter so a concurrent iterator fails-fast.
-        .mod_count = try ObjRef(u64).init(ctx.allocator, 0),
+        .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
     } };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
             buildable.List.items.deinit();
-            if (buildable.List.mod_count) |mc| mc.deinit();
+            if (buildable.List.mod_count.get()) |mc| mc.deinit();
             return r;
         }
     }
-    if (buildable.List.mod_count) |mc| {
+    if (buildable.List.mod_count.get()) |mc| {
         // Freeze every live view sharing this counter (a subList leaked
         // out of the builder must reject mutation after build()).
         const g = mc.borrowMut();
@@ -105,17 +105,17 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .backing = null,
-        .mod_count = try ObjRef(u64).init(ctx.allocator, 0),
+        .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
     } };
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
             buildable.Set.items.deinit();
-            if (buildable.Set.mod_count) |mc| mc.deinit();
+            if (buildable.Set.mod_count.get()) |mc| mc.deinit();
             return r;
         }
     }
-    if (buildable.Set.mod_count) |mc| {
+    if (buildable.Set.mod_count.get()) |mc| {
         const g = mc.borrowMut();
         g.get().* |= collections.FROZEN_MOD_BIT;
         g.deinit();
@@ -146,7 +146,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // The builder is a live `MutableMap` the block can iterate (via keys/values/
     // entries) and mutate; give it a structural counter for fail-fast iteration.
     const buildable = Value{ .Map = .{
-        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = try ObjRef(u64).init(ctx.allocator, 0) }),
+        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)) }),
         .mutable = true,
     } };
     {
@@ -162,7 +162,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = buildable.Map.entries.borrow();
         const mc = g.get().mod_count;
         g.deinit();
-        if (mc) |cell| {
+        if (mc.get()) |cell| {
             const cg = cell.borrowMut();
             cg.get().* |= collections.FROZEN_MOD_BIT;
             cg.deinit();
@@ -221,7 +221,7 @@ pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
-        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
@@ -242,7 +242,7 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     } else try ctx.allocator.dupe(u8, "An operation is not implemented.");
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NotImplementedError"),
-        .message = try runtime.strInitOwned(ctx.allocator, msg),
+        .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
     } } } };
@@ -353,7 +353,7 @@ fn freeListResult(v: Value) void {
 
 fn freeException(e: anytype) void {
     e.fqn.deinit();
-    if (e.message) |m| {
+    if (e.message.get()) |m| {
         // The message cell owns its bytes (built via `initOwned`/`init`) and
         // frees them on the final `deinit`; do not free the bytes manually.
         m.deinit();
@@ -513,7 +513,7 @@ test "error throws IllegalStateException with the message string" {
     const fg = exc.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().bytes);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("boom", mg.get().bytes);
 }
@@ -529,7 +529,7 @@ test "error renders a non-string argument via display" {
     try testing.expect(r == .err);
     const exc = r.err.Thrown.Exception;
     defer freeException(exc);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("42", mg.get().bytes);
 }
@@ -550,7 +550,7 @@ test "TODO throws NotImplementedError with a message" {
     const fg = exc.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.NotImplementedError", fg.get().bytes);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("An operation is not implemented: later", mg.get().bytes);
 }
@@ -565,7 +565,7 @@ test "TODO without an argument uses the default message" {
     try testing.expect(r == .err);
     const exc = r.err.Thrown.Exception;
     defer freeException(exc);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("An operation is not implemented.", mg.get().bytes);
 }

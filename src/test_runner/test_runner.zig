@@ -365,7 +365,7 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
     }
     const ty: []const u8 = v.exceptionFqn() orelse "exception";
     const msg: ?[]const u8 = switch (v) {
-        .Exception => |e| if (e.message) |m| blk: {
+        .Exception => |e| if (e.message.get()) |m| blk: {
             const g = m.borrow();
             defer g.deinit();
             break :blk g.get().bytes;

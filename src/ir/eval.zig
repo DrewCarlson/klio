@@ -52,7 +52,7 @@ fn displayThrow(allocator: Allocator, v: *const Value) Allocator.Error![]u8 {
             const fg = e.fqn.borrow();
             defer fg.deinit();
             const fqn = fg.get().bytes;
-            if (e.message) |m| {
+            if (e.message.get()) |m| {
                 const mg = m.borrow();
                 defer mg.deinit();
                 return std.fmt.allocPrint(allocator, "{s}({s})", .{ fqn, mg.get().bytes });
@@ -1074,7 +1074,7 @@ fn appendThrowableHeader(allocator: Allocator, v: *const Value, out: *std.ArrayL
                 defer fg.deinit();
                 try out.appendSlice(allocator, fg.get().bytes);
             }
-            if (e.message) |m| {
+            if (e.message.get()) |m| {
                 const mg = m.borrow();
                 defer mg.deinit();
                 try out.appendSlice(allocator, ": ");
@@ -5319,7 +5319,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             if (v == .Null) {
                 const exc = Value{ .Exception = .{
                     .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
-                    .message = null,
+                    .message = .{},
                     .cause = null,
                 } };
                 return raiseStep(frame, .{ .Throw = exc });
@@ -6009,8 +6009,8 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
     // reference.invalidations += pair` builds a NEW list) — never the
     // in-place `plusAssign` (which the intrinsic guard would refuse).
     const is_collection = switch (cur) {
-        .List => |l| l.mutable and !modCountFrozenEval(l.mod_count),
-        .Set => |st| st.mutable and !modCountFrozenEval(st.mod_count),
+        .List => |l| l.mutable and !modCountFrozenEval(l.mod_count.get()),
+        .Set => |st| st.mutable and !modCountFrozenEval(st.mod_count.get()),
         .Map => |m| m.mutable,
         else => false,
     };
@@ -7036,7 +7036,7 @@ noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, c
         const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
         const exc = Value{ .Exception = .{
             .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
-            .message = try runtime.strInitOwned(allocator, msg),
+            .message = .from(try runtime.strInitOwned(allocator, msg)),
             .cause = null,
         } };
         return raiseStep(frame, .{ .Throw = exc });
@@ -8714,7 +8714,7 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
     if (!more) {
         const exc = Value{ .Exception = .{
             .fqn = runtime.strInit(allocator, "kotlin.NoSuchElementException") catch return null,
-            .message = runtime.strInit(allocator, "iterator exhausted") catch null,
+            .message = .from(runtime.strInit(allocator, "iterator exhausted") catch null),
             .cause = null,
         } };
         return errResult(.{ .Throw = exc });
@@ -9157,7 +9157,7 @@ fn utf16Cmp(left: []const u8, right: []const u8) std.math.Order {
 fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
     return .{ .Throw = .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, "kotlin.ArithmeticException"),
-        .message = try runtime.strInit(allocator, msg),
+        .message = .from(try runtime.strInit(allocator, msg)),
         .cause = null,
     } } };
 }

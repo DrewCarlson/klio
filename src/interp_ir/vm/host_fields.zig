@@ -1524,7 +1524,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 if (stdlib.implementations.collections.sublistViewStale(receiver)) {
                     return errRes(.{ .Throw = .{ .Exception = .{
                         .fqn = try runtime.strInit(allocator, "kotlin.ConcurrentModificationException"),
-                        .message = null,
+                        .message = .{},
                         .cause = null,
                     } } });
                 }
@@ -3154,7 +3154,7 @@ fn lateinitReadError(allocator: Allocator, name: []const u8) Allocator.Error!Eva
     const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
     return errRes(.{ .Throw = .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
-        .message = try runtime.strInitOwned(allocator, m),
+        .message = .from(try runtime.strInitOwned(allocator, m)),
         .cause = null,
     } } });
 }
@@ -3305,7 +3305,7 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
             const m = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
             return errRes(.{ .Throw = .{ .Exception = .{
                 .fqn = try runtime.strInit(allocator, "kotlin.IllegalStateException"),
-                .message = try runtime.strInitOwned(allocator, m),
+                .message = .from(try runtime.strInitOwned(allocator, m)),
                 .cause = null,
             } } });
         },

@@ -79,7 +79,7 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const msg = try std.fmt.allocPrint(ctx.allocator, "Step must be positive, was: {d}.", .{n});
             return .{ .err = .{ .Thrown = .{ .Exception = .{
                 .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
-                .message = try runtime.strInitOwned(ctx.allocator, msg),
+                .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
                 .cause = null,
             } } } };
         }
@@ -235,7 +235,7 @@ fn rangeViewEmpty(view: RangeView) bool {
 fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Thrown = .{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
-        .message = null,
+        .message = .{},
         .cause = null,
     } } } };
 }
@@ -299,7 +299,7 @@ pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (view.end == rangeKindMax(view.kind)) {
         return .{ .err = .{ .Thrown = .{ .Exception = .{
             .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
-            .message = try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, "Cannot return the exclusive upper bound of a range that includes MAX_VALUE.")),
+            .message = .from(try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, "Cannot return the exclusive upper bound of a range that includes MAX_VALUE."))),
             .cause = null,
         } } } };
     }
@@ -553,7 +553,7 @@ test "step throws on non-positive step" {
     // The message cell owns its bytes and frees them on the final drop;
     // just borrow to assert, then drop the two refcounted handles.
     {
-        const mg = exc.message.?.borrow();
+        const mg = exc.message.get().?.borrow();
         defer mg.deinit();
         try testing.expectEqualStrings("Step must be positive, was: 0.", mg.get().bytes);
     }
@@ -562,7 +562,7 @@ test "step throws on non-positive step" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.?.deinit();
+    exc.message.get().?.deinit();
     exc.fqn.deinit();
 }
 

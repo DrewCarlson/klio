@@ -46,7 +46,7 @@ fn errArity(msg: []const u8) EvalResult {
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     const fqn_ref = try runtime.strInitOwned(allocator, try allocator.dupe(u8, fqn));
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(allocator, m) else null;
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
+    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
 }
 
 fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalResult {

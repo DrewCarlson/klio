@@ -1909,7 +1909,7 @@ fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []const
     const msg = try std.fmt.allocPrint(allocator, fmt, .{name});
     return .{ .err = .{ .Throw = .{ .Exception = .{
         .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "kotlin.InstantiationError")),
-        .message = try runtime.strInitOwned(allocator, msg),
+        .message = .from(try runtime.strInitOwned(allocator, msg)),
         .cause = null,
     } } } };
 }

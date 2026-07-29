@@ -1761,7 +1761,7 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
     if (failed) {
         return .{ .err = .{ .Thrown = .{ .Exception = .{
             .fqn = try runtime.strInit(a, "kotlin.IllegalStateException"),
-            .message = try runtime.strInit(a, "Iterator has failed."),
+            .message = .from(try runtime.strInit(a, "Iterator has failed.")),
             .cause = null,
             .suppressed = (try runtime.ValueList.init(a, .empty)).cell,
         } } } };

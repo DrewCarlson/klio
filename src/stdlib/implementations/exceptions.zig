@@ -33,7 +33,7 @@ fn typeErr(msg: []const u8) EvalResult {
 pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     return .{ .Exception = .{
         .fqn = try runtime.strInit(allocator, fqn),
-        .message = if (message) |m| try runtime.strInit(allocator, m) else null,
+        .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
         // A shared suppressed list so `addSuppressed` (e.g. from `use`'s
         // close-while-failing path) records onto this throwable.
@@ -81,7 +81,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
 
     return ok(.{ .Exception = .{
         .fqn = try runtime.strInit(ctx.allocator, fqn),
-        .message = message,
+        .message = .from(message),
         .cause = if (cause) |c| c.cell else null,
         .identity = ctx.host.allocInstanceId(),
         // A shared list so `addSuppressed` on any value-copy is observed by
@@ -168,7 +168,7 @@ pub fn excn_cancellation(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const cbox = try Value.boxRef(a, cause);
         return ok(.{ .Exception = .{
             .fqn = try runtime.strInit(a, fqn),
-            .message = message,
+            .message = .from(message),
             .cause = cbox.cell,
             .identity = ctx.host.allocInstanceId(),
             .suppressed = (try ValueList.init(a, .empty)).cell,
@@ -194,7 +194,7 @@ pub fn throwable_message(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("message requires a Throwable receiver");
     }
     const message = ctx.args[0].Exception.message;
-    if (message) |m| {
+    if (message.get()) |m| {
         return ok(.{ .String = m.clone() });
     }
     return ok(.Null);
@@ -280,7 +280,7 @@ fn noopCtx(args: []const Value) CallCtx {
 
 fn freeException(exc: anytype) void {
     exc.fqn.deinit();
-    if (exc.message) |m| m.deinit();
+    if (exc.message.get()) |m| m.deinit();
     if (exc.cause) |c| (ValueBox{ .cell = c }).deinit();
     if (exc.suppressed) |s| (ValueList{ .cell = s }).deinit();
 }
@@ -289,7 +289,7 @@ fn freeException(exc: anytype) void {
 /// optional `message`, and the eagerly-allocated `suppressed` list.
 fn freeMade(v: Value) void {
     v.Exception.fqn.deinit();
-    if (v.Exception.message) |m| m.deinit();
+    if (v.Exception.message.get()) |m| m.deinit();
     if (v.Exception.suppressed) |s| (ValueList{ .cell = s }).deinit();
 }
 
@@ -302,7 +302,7 @@ test "build exception with no arguments" {
     const fg = exc.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().bytes);
-    try testing.expect(exc.message == null);
+    try testing.expect(!exc.message.isSome());
     try testing.expect(exc.cause == null);
 }
 
@@ -318,7 +318,7 @@ test "single string argument becomes the message" {
     const fg = exc.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("boom", mg.get().bytes);
     try testing.expect(exc.cause == null);
@@ -331,7 +331,7 @@ test "single null argument leaves the message empty" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    try testing.expect(exc.message == null);
+    try testing.expect(!exc.message.isSome());
     try testing.expect(exc.cause == null);
 }
 
@@ -342,7 +342,7 @@ test "single non-string argument is rendered into the message" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("42", mg.get().bytes);
 }
@@ -356,7 +356,7 @@ test "single throwable argument is treated as the cause" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    try testing.expect(exc.message == null);
+    try testing.expect(!exc.message.isSome());
     try testing.expect(exc.cause != null);
     const cause_box = ValueBox{ .cell = exc.cause.? };
     try testing.expect(cause_box.asPtr().* == .Exception);
@@ -376,7 +376,7 @@ test "message and cause arguments" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    const mg = exc.message.?.borrow();
+    const mg = exc.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("outer", mg.get().bytes);
     try testing.expect(exc.cause != null);
@@ -514,7 +514,7 @@ test "cause accessor returns the cause value" {
     const cause_box = try Value.boxRef(testing.allocator, cause);
     const outer = Value{ .Exception = .{
         .fqn = try runtime.strInit(testing.allocator, "kotlin.RuntimeException"),
-        .message = null,
+        .message = .{},
         .cause = cause_box.cell,
     } };
     defer {
@@ -556,7 +556,7 @@ test "make exception copies fqn and message into fresh handles" {
     const fg = exc.Exception.fqn.borrow();
     defer fg.deinit();
     try testing.expectEqualStrings("kotlin.Error", fg.get().bytes);
-    const mg = exc.Exception.message.?.borrow();
+    const mg = exc.Exception.message.get().?.borrow();
     defer mg.deinit();
     try testing.expectEqualStrings("oops", mg.get().bytes);
 }

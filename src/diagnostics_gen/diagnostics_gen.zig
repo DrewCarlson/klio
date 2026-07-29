@@ -237,7 +237,7 @@ pub fn mine(allocator: Allocator, io: Io, stdlib_root: []const u8) Allocator.Err
             try allocator.dupe(u8, m)
         else
             try allocator.dupe(u8, fac.name);
-        out[built] = .{ .name = name, .severity = fac.severity, .message = message };
+        out[built] = .{ .name = name, .severity = fac.severity, .message = .from(message };)
         built += 1;
     }
     std.mem.sort(Factory, out, {}, lessByFactoryName);
@@ -370,8 +370,8 @@ test "parses typical message line" {
 
 test "render emits factory consts and table" {
     const factories = [_]Factory{
-        .{ .name = "A_FACTORY", .severity = .Error, .message = "the {0} message" },
-        .{ .name = "B_FACTORY", .severity = .Warning, .message = "another" },
+        .{ .name = "A_FACTORY", .severity = .Error, .message = .from("the {0} message" }),
+        .{ .name = "B_FACTORY", .severity = .Warning, .message = .from("another" }),
     };
     const out = try render(testing.allocator, &factories);
     defer testing.allocator.free(out);
@@ -387,7 +387,7 @@ test "render emits factory consts and table" {
 
 test "render escapes backslashes in message templates" {
     const factories = [_]Factory{
-        .{ .name = "X", .severity = .Error, .message = "line\\nbreak" },
+        .{ .name = "X", .severity = .Error, .message = .from("line\\nbreak" }),
     };
     const out = try render(testing.allocator, &factories);
     defer testing.allocator.free(out);
