@@ -39,6 +39,15 @@ fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
+var pump_nosleep_state: u8 = 0;
+/// Cached `KLIO_PUMP_NOSLEEP` verdict; the wall-timer wait consults it per
+/// sleep round.
+fn pumpNoSleep() bool {
+    if (pump_nosleep_state == 0)
+        pump_nosleep_state = if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") != null) 2 else 1;
+    return pump_nosleep_state == 2;
+}
+
 /// Where pump wall-clock sleeps come from, counted when `KLIO_PUMP_DIAG` is
 /// set (`sleep_diag`) and dumped at process exit — the idle-tax attribution
 /// tool: a virtual-time test suite should spend ~0 here.
@@ -1257,7 +1266,7 @@ pub const CooperativeInterceptor = struct {
                     // round.
                     countSleep(.timer_wall);
                     wall_streak += 1;
-                    if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null) {
+                    if (!pumpNoSleep()) {
                         // Event wait toward the deadline: a cross-thread
                         // post rings the wakeup gate, so the pump reacts
                         // within microseconds without burning a core (a

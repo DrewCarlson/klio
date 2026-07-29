@@ -2451,8 +2451,12 @@ pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, f
 
 /// `KLIO_THIS_TRAP=1`: print every frame entry that binds a Bool into a
 /// `this` parameter — the ext-receiver misbind signature — with the caller.
+var bool_this_trap_state: u8 = 0;
 pub fn boolThisTrap(func: *const Func, args: []const Value) void {
-    if (runtime.getenvSlice("KLIO_THIS_TRAP") == null) return;
+    // Consulted per flat-call open: cache the env verdict once.
+    if (bool_this_trap_state == 0)
+        bool_this_trap_state = if (runtime.getenvSlice("KLIO_THIS_TRAP") != null) 2 else 1;
+    if (bool_this_trap_state != 2) return;
     if (func.params.len == 0 or args.len == 0) return;
     if (!std.mem.eql(u8, func.params[0].name, "this")) return;
     if (args[0] != .Bool and args[0] != .Int) return;

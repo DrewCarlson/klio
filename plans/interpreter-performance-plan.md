@@ -1131,6 +1131,20 @@ stale-tag artifact; and a wall-invariant test under compute changes
 may simply mean the OPTIMIZED thread was not the critical path —
 check per-thread attribution before reclassifying.
 
+NATIVE-SAMPLE GROUND TRUTH (recorded; the op-profiler's stale-tag
+blind spot required it): a mid-run `sample` of the resume stress test
+shows the EventGate threads parking correctly (the wait syscalls
+dominate idle thread leaves), and busy CPU split across the stdlib
+intrinsic BODIES (dispatchWithReceiver → dedup blob), Value
+retain/release machinery + Frame teardown loops, the interpreter loop
+itself, and ~10% of busy time in `_tlv_get_addr` — macOS dynamic
+threadlocal address resolution across the hot threadlocals (evtls
+state, the TL cache fronts, the profiler tag). Consolidating the hot
+threadlocals behind a single per-thread struct pointer is a recorded
+candidate. Per-call getenv reads found on hot paths (boolThisTrap per
+flat-call open, MISS_TRACE in the getter runner, PUMP_NOSLEEP per
+wall-wait round) are now cached — rob dipped under 100s.
+
 RELAXED MEMBER KEY (landed): container-typed ARGUMENTS made the
 strict instance-method key unbuildable, so those positional member
 calls re-ran the whole probe ladder per call. The member cache (only
