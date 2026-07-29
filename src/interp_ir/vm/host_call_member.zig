@@ -2208,18 +2208,63 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         else => return null,
     };
     var cls_name: []const u8 = undefined;
+    var cls_ident: usize = 0;
     {
         const g = inst.borrow();
+        cls_ident = g.get().class.identity();
         const cg = g.get().class.borrow();
         cls_name = cg.get().name;
         cg.deinit();
         g.deinit();
     }
     if (std.mem.indexOf(u8, cls_name, "$Companion$") != null) return null;
-    // Walk the full supertype graph (not just the first supertype): a
-    // class may list an interface before its superclass
-    // (`HeadersImpl : Headers, StringValuesImpl(...)`), and the companion
-    // holding `name` can sit on any ancestor — class or interface.
+    // The ordered ancestor-companion list is a pure function of the class
+    // (supertype graph + lexical enclosing chain + companion registry, all
+    // static); the walk that produced it per call was the dominant cost of
+    // every bare-name candidate build. Only the per-NAME membership check
+    // below stays dynamic. Most classes cache the empty list and return in
+    // two probes.
+    const cached: ?[]const []const u8 = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().companion_chain_cache.get(cls_ident);
+    };
+    if (cached) |chain| return companionChainProbe(self, chain, name);
+    var built = try companionChainBuild(self, allocator, cls_name);
+    defer built.deinit(allocator);
+    {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        const cache = &pg.get().companion_chain_cache;
+        if (!cache.contains(cls_ident)) {
+            if (pg.get().allocator.dupe([]const u8, built.items) catch null) |owned| {
+                cache.put(cls_ident, owned) catch pg.get().allocator.free(owned);
+            }
+        }
+    }
+    return companionChainProbe(self, built.items, name);
+}
+
+/// Probe the ordered ancestor-companion list for a singleton owning `name`.
+fn companionChainProbe(self: *VmHost, chain: []const []const u8, name: []const u8) Allocator.Error!?Value {
+    for (chain) |cn| {
+        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+            .ok => |maybe| maybe,
+            .err => return null,
+        };
+        if (singleton) |sv| {
+            if (sv == .Instance) return sv;
+        }
+    }
+    return null;
+}
+
+/// The BFS `companionWithMember` ran per call, producing the visit-ordered
+/// companion-singleton names of the class's ancestors (supertype graph +
+/// lexical enclosing classes).
+fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []const u8) Allocator.Error!std.ArrayList([]const u8) {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.ArrayList([]const u8) = .empty;
@@ -2242,15 +2287,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
             defer g.deinit();
             break :blk g.get().registry.companion_singletons.get(cname);
         };
-        if (comp_name) |cn| {
-            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
-                .ok => |maybe| maybe,
-                .err => return null,
-            };
-            if (singleton) |sv| {
-                if (sv == .Instance) return sv;
-            }
-        }
+        if (comp_name) |cn| try out.append(allocator, cn);
         {
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -2267,7 +2304,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
             if (sep > 0) try queue.append(allocator, cname[0..sep]);
         }
     }
-    return null;
+    return out;
 }
 
 // -------------------------------------------------------------------------
@@ -3621,16 +3658,38 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// Per-thread gate for `recvFnPropHeadOf`: most modules declare ZERO
 /// receiver-function-typed properties, and the registry is fully populated
 /// before any dispatch runs, so one count check per (thread, module) skips
-/// the per-call supertype walk entirely.
+/// the per-call supertype walk entirely. When props DO exist, two bit
+/// masks over the declared prop names' (length, first byte) signatures
+/// filter the overwhelming majority of member names without hashing —
+/// a false positive just runs the walk.
 threadlocal var recv_fn_gate_mod: ?*const Module = null;
 threadlocal var recv_fn_gate_any: bool = true;
+threadlocal var recv_fn_len_mask: u64 = ~@as(u64, 0);
+threadlocal var recv_fn_byte_mask: u64 = ~@as(u64, 0);
 
 fn recvFnPropsAny(self: *VmHost) bool {
     const mp: *const Module = self.module.asPtr();
     if (recv_fn_gate_mod == mp) return recv_fn_gate_any;
     const g = self.module.borrow();
-    const any = g.get().registry.recv_fn_props.count() != 0;
+    const reg = &g.get().registry;
+    const any = reg.recv_fn_props.count() != 0;
+    var lm: u64 = 0;
+    var bm: u64 = 0;
+    if (any) {
+        var it = reg.recv_fn_props.iterator();
+        while (it.next()) |e| {
+            const pn = e.key_ptr.b;
+            if (pn.len == 0) continue;
+            lm |= @as(u64, 1) << @intCast(@min(pn.len, 63));
+            bm |= @as(u64, 1) << @intCast(pn[0] & 63);
+            if (runtime.getenvSlice("KLIO_RFP_DUMP") != null) {
+                std.debug.print("[rfp] {s}.{s}\n", .{ e.key_ptr.a, pn });
+            }
+        }
+    }
     g.deinit();
+    recv_fn_len_mask = lm;
+    recv_fn_byte_mask = bm;
     recv_fn_gate_mod = mp;
     recv_fn_gate_any = any;
     return any;
@@ -3639,6 +3698,9 @@ fn recvFnPropsAny(self: *VmHost) bool {
 fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]const u8 {
     if (receiver.* != .Instance) return null;
     if (!recvFnPropsAny(self)) return null;
+    if (name.len == 0) return null;
+    if ((recv_fn_len_mask >> @intCast(@min(name.len, 63))) & 1 == 0) return null;
+    if ((recv_fn_byte_mask >> @intCast(name[0] & 63)) & 1 == 0) return null;
     const mg = self.module.borrow();
     defer mg.deinit();
     const reg = &mg.get().registry;
@@ -3689,9 +3751,9 @@ pub fn implicitReceiverForHead(self: *VmHost, allocator: Allocator, receiver: *c
 }
 
 fn recvFnFieldInvoke(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    runtime.prof.opRoute(7);
     if (receiver.* != .Instance) return null;
     const head = recvFnPropHeadOf(self, receiver, name) orelse return null;
+    runtime.prof.opRoute(7);
     const field_val: Value = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
@@ -4652,6 +4714,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // Stdlib member dispatch (type-FQN + package extension probes).
     if (try stdlibMemberDispatch(self, allocator, receiver, name, args)) |r| return r;
+    runtime.prof.opRoute(16);
 
     // Class-delegation pre-pass.
     if (receiver.* == .Instance) {
@@ -9702,10 +9765,60 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
 /// a pure function of the key (classes are static).
 const METHOD_MISS: u32 = std.math.maxInt(u32);
 
+/// Thread-local L1 in front of the shared method-resolution caches. The
+/// shared maps live behind the program cell's reader lock, whose atomic
+/// state word ping-pongs between cores on every borrow — at millions of
+/// probes per second across two threads that coherence traffic dominated
+/// the background-thread stress profiles. Entries mirror the shared maps
+/// (which are add-only and never re-map a key to a different target), so a
+/// stale or evicted slot just falls through to the shared probe.
+const TL_METHOD_CACHE_SIZE = 2048;
+const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0 };
+threadlocal var tl_method_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
+threadlocal var tl_ext_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
+
+inline fn tlSlot(key: root_mod.ProgramImage.InstanceMethodKey) usize {
+    const h = key.sig ^ (@as(u64, @intCast(key.class_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p));
+    return @intCast((h ^ (h >> 17)) & (TL_METHOD_CACHE_SIZE - 1));
+}
+
+inline fn tlGet(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
+    const e = &cache[tlSlot(key)];
+    if (e.raw_plus != 0 and e.class_p == key.class_p and e.name_p == key.name_p and
+        e.sig == key.sig and e.n_args == key.n_args)
+    {
+        return @intCast(e.raw_plus - 1);
+    }
+    return null;
+}
+
+inline fn tlPut(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
+    cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = @as(u64, raw) + 1 };
+}
+
+/// Thread-local L1 for the named-binding permutation map.
+const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
+threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
+
+/// Thread-local L1 for the stdlib member-resolve cache. `state`: 0 empty,
+/// 1 confirmed-none, 2 resolved.
+const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, state: u8 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
+threadlocal var tl_resolve_cache: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{});
+
+inline fn tlResolveSlot(key: root_mod.ProgramImage.MemberResolveKey) usize {
+    const h = (@as(u64, @intCast(key.type_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p)) ^ @intFromBool(key.args_empty);
+    return @intCast((h ^ (h >> 17)) & (TL_METHOD_CACHE_SIZE - 1));
+}
+
 fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    const pg = self.prog.borrow();
-    defer pg.deinit();
-    return pg.get().instance_method_cache.get(key);
+    if (tlGet(&tl_method_cache, key)) |raw| return raw;
+    const raw: ?u32 = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().instance_method_cache.get(key);
+    };
+    if (raw) |r| tlPut(&tl_method_cache, key, r);
+    return raw;
 }
 
 fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
@@ -9716,9 +9829,14 @@ fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    const pg = self.prog.borrow();
-    defer pg.deinit();
-    return pg.get().ext_method_cache.get(key);
+    if (tlGet(&tl_ext_cache, key)) |raw| return raw;
+    const raw: ?u32 = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().ext_method_cache.get(key);
+    };
+    if (raw) |r| tlPut(&tl_ext_cache, key, r);
+    return raw;
 }
 
 fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
@@ -10088,12 +10206,29 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             .name_p = name_p,
             .args_empty = args.len == 0,
         };
+        // Thread-local L1 (see `tl_method_cache`): a hit avoids the shared
+        // program cell's reader lock and its cross-core coherence traffic.
+        {
+            const e = &tl_resolve_cache[tlResolveSlot(key)];
+            if (e.state != 0 and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
+                if (e.state == 1) return null;
+                return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
+            }
+        }
         const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
             const pg = self.prog.borrow();
             defer pg.deinit();
             break :blk pg.get().member_resolve_cache.get(key);
         };
         if (hit) |entry| {
+            tl_resolve_cache[tlResolveSlot(key)] = .{
+                .type_p = key.type_p,
+                .name_p = key.name_p,
+                .args_empty = key.args_empty,
+                .state = if (entry.func == null) 1 else 2,
+                .func = entry.func,
+                .fqn = entry.fqn,
+            };
             const func = entry.func orelse return null;
             return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
         }
@@ -12140,8 +12275,27 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv, no_ext, declared_recv);
     }
 
+    // Named member-resolution memo: a prior walk pick for this exact
+    // (class, name, arg shape, name vector) serves directly — the walk's
+    // own terminal, with the self-delegation guard consulted at serve
+    // time. The entry can only exist because every earlier named arm
+    // declined the same shape when it was filled.
+    if (any_named and receiver.* == .Instance) {
+        if (namedMethodKey(self, receiver, name, args, arg_names)) |k| {
+            if (extMethodCacheGet(self, k)) |raw| {
+                if (raw != METHOD_MISS) {
+                    const fid: FuncId = @enumFromInt(raw);
+                    if (!walkActive(fid, receiverIdent(receiver))) {
+                        if (try serveNamedFid(self, allocator, receiver, fid, args, arg_names, k)) |r| return r;
+                    }
+                }
+            }
+        }
+    }
+
     // Stdlib intrinsic dispatch with named args.
     if (any_named) {
+        ir.eval.callStatsProbe(name);
         if (try stdlibNamedDispatch(self, allocator, receiver, name, args, arg_names)) |r| return r;
         // Pack-installed host bindings take their arguments positionally; a
         // named call reaches them only after being put back in declaration
@@ -12204,8 +12358,10 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     }
 
     // Positional dispatch first.
+    runtime.prof.opRoute(17);
     const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv);
     if (!(primary == .err and primary.err == .Unimplemented)) return primary;
+    runtime.prof.opRoute(18);
 
     // Class-hierarchy method walk for a class-qualified lowered name.
     if (receiver.* == .Instance) {
@@ -12687,7 +12843,210 @@ fn walkActive(fid: FuncId, ident: usize) bool {
     return false;
 }
 
+/// Cache key for a NAMED member resolution: the positional key with the
+/// arg-name vector folded in (names are module-interned, so pointer
+/// identity keys them) and a salt so entries never collide with the
+/// positional/extension entries sharing the map.
+fn namedMethodKey(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
+    var k = instanceMethodKeyScoped(self, receiver, name, args, null, null) orelse return null;
+    var h = std.hash.Wyhash.init(0x6a09e667f3bcc909);
+    for (arg_names) |n| {
+        const p: usize = if (n) |nn| @intFromPtr(nn.ptr) else 1;
+        h.update(std.mem.asBytes(&p));
+    }
+    k.sig ^= h.final() ^ 0x517c_c1b7_2722_0a95;
+    if (k.sig == 0) k.sig = 3;
+    return k;
+}
+
+/// Compute the replayable arg→param permutation for a resolved NAMED call,
+/// following exactly the safe subset of `callFuncNamed`'s binding (named
+/// bind by parameter name, the trailing-lambda and compose-pair rules, the
+/// positional walk) over the user params (`f.params[1..]`; the walk binds
+/// the receiver at slot 0). Null when the shape needs the full binder —
+/// varargs, defaults, over/under-application, duplicate names. Every
+/// consulted fact is folded into the memo key (param list per fid, arg
+/// tags via the sig, name vector via the names hash), so the permutation
+/// is a pure function of the key.
+fn namedBindPerm(self: *VmHost, f: *const ir.Func, args: []const Value, arg_names: []const ?[]const u8) ?root_mod.ProgramImage.NamedPerm {
+    for (f.params) |*p| {
+        if (p.is_vararg) return null;
+    }
+    if (f.params.len == 0) return null;
+    const up = f.params[1..];
+    if (up.len > 15 or args.len != up.len) return null;
+    var src: [15]u8 = @splat(0xFF);
+    var used: [15]bool = @splat(false);
+    for (args, 0..) |_, i| {
+        if (i >= arg_names.len) continue;
+        const an = arg_names[i] orelse continue;
+        var bound = false;
+        for (up, 0..) |p, pos| {
+            if (applicability.paramNameMatchesArg(p.name, an)) {
+                if (src[pos] != 0xFF) return null;
+                src[pos] = @intCast(i);
+                used[i] = true;
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) return null;
+    }
+    var trailing: ?usize = null;
+    if (args.len > 0 and up.len > 0) {
+        const last = args.len - 1;
+        const last_named = last < arg_names.len and arg_names[last] != null;
+        const lp = up.len - 1;
+        if (!last_named and src[lp] == 0xFF and root_mod.isFunctionType(&up[lp].ty) and
+            vmhost.host_call_func.callableForTrailing(self, &args[last]))
+        {
+            src[lp] = @intCast(last);
+            used[last] = true;
+            trailing = last;
+        }
+        if (trailing == null and args.len >= 3 and up.len >= 3) {
+            const ci = args.len - 2;
+            const bi = args.len - 3;
+            const cn = if (ci < arg_names.len) arg_names[ci] else null;
+            const gn = if (last < arg_names.len) arg_names[last] else null;
+            const bn = if (bi < arg_names.len) arg_names[bi] else null;
+            const upos = up.len - 3;
+            if (cn != null and gn != null and bn == null and
+                std.mem.eql(u8, cn.?, "$composer") and
+                std.mem.eql(u8, gn.?, "$changed") and
+                std.mem.eql(u8, up[up.len - 2].name, "$composer") and
+                std.mem.eql(u8, up[up.len - 1].name, "$changed") and
+                src[upos] == 0xFF and
+                root_mod.isFunctionType(&up[upos].ty) and
+                vmhost.host_call_func.callableForTrailing(self, &args[bi]))
+            {
+                src[upos] = @intCast(bi);
+                used[bi] = true;
+                trailing = bi;
+            }
+        }
+    }
+    var positional_idx: usize = 0;
+    for (args, 0..) |_, i| {
+        if (used[i]) continue;
+        if (i < arg_names.len and arg_names[i] != null) continue;
+        while (positional_idx < up.len and src[positional_idx] != 0xFF) positional_idx += 1;
+        if (positional_idx >= up.len) return null;
+        src[positional_idx] = @intCast(i);
+        positional_idx += 1;
+    }
+    for (up, 0..) |_, pos| {
+        if (src[pos] == 0xFF) return null;
+    }
+    return .{ .n = @intCast(up.len), .src = src };
+}
+
+/// Serve a memoized named-member resolution: replay the cached binding
+/// permutation as a positional dispatch when one exists (or can be
+/// computed and cached), else run the full named terminal. The
+/// self-delegation guard brackets both dispatches, exactly as the walk's
+/// own terminal pushes it.
+fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value, arg_names: []const ?[]const u8, key: root_mod.ProgramImage.InstanceMethodKey) Allocator.Error!?EvalResult {
+    // Thread-local L1 over the perm map (same rationale as
+    // `tl_method_cache`: the shared reader lock's cache-line traffic).
+    var perm: ?root_mod.ProgramImage.NamedPerm = null;
+    const tslot = &tl_perm_cache[tlSlot(key)];
+    if (tslot.raw_plus != 0 and tslot.class_p == key.class_p and tslot.name_p == key.name_p and
+        tslot.sig == key.sig and tslot.n_args == key.n_args)
+    {
+        perm = tslot.perm;
+    }
+    if (perm == null) {
+        perm = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().named_perm_cache.get(key);
+        };
+        if (perm) |p| {
+            tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .perm = p };
+        }
+    }
+    if (perm == null) {
+        const computed: ?root_mod.ProgramImage.NamedPerm = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const f = mg.get().funcById(fid) orelse break :blk null;
+            break :blk namedBindPerm(self, f, args, arg_names);
+        };
+        const store = computed orelse root_mod.ProgramImage.NamedPerm{ .n = 0xFF, .src = @splat(0xFF) };
+        {
+            const pg = self.prog.borrowMut();
+            defer pg.deinit();
+            pg.get().named_perm_cache.put(key, store) catch {};
+        }
+        tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .perm = store };
+        perm = store;
+    }
+    if (perm.?.n != 0xFF) {
+        const p = perm.?;
+        var buf: [15]Value = undefined;
+        for (0..p.n) |k| buf[k] = args[p.src[k]];
+        const ident = receiverIdent(receiver);
+        const pushed = ident != 0 and walk_active_len < walk_active.len;
+        if (pushed) {
+            walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
+            walk_active_len += 1;
+        }
+        const r = try invokeMethodFuncId(self, allocator, receiver, fid, buf[0..p.n]);
+        if (pushed) walk_active_len -= 1;
+        if (r) |rr| return rr;
+    }
+    return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+}
+
+/// The named walk's invoke terminal, shared by the walk and its memo serve:
+/// `[receiver] ++ args` with a null-shifted name vector, the self-delegation
+/// guard pushed, dispatched through the named caller.
+fn invokeMethodNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
+    const all = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all);
+    var names = try allocator.alloc(?[]const u8, all.len);
+    defer if (runtime.freeScratch()) allocator.free(names);
+    names[0] = null;
+    if (arg_names) |an| {
+        for (an, 0..) |n, i| {
+            if (i + 1 < names.len) names[i + 1] = n;
+        }
+        var k = an.len + 1;
+        while (k < names.len) : (k += 1) names[k] = null;
+    } else {
+        var k: usize = 1;
+        while (k < names.len) : (k += 1) names[k] = null;
+    }
+    const mg = self.module.borrow();
+    const mod = mg.get();
+    const ident = receiverIdent(receiver);
+    const pushed = ident != 0 and walk_active_len < walk_active.len;
+    if (pushed) {
+        walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
+        walk_active_len += 1;
+    }
+    const r = try callFuncNamedRec(self, allocator, mod, fid, all, names);
+    if (pushed) walk_active_len -= 1;
+    mg.deinit();
+    return r;
+}
+
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
+    // Memo serve for both the named path and the positional fallback: a
+    // prior completed walk's pick (or confirmed miss) short-circuits the
+    // whole hierarchy traversal. The self-delegation guard is re-checked
+    // at serve time; an active entry declines to the full walk, whose
+    // fills are vetoed while the guard filters.
+    if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+        if (extMethodCacheGet(self, k)) |raw| {
+            if (raw == METHOD_MISS) return null;
+            const fid: FuncId = @enumFromInt(raw);
+            if (!walkActive(fid, receiverIdent(receiver))) {
+                return try serveNamedFid(self, allocator, receiver, fid, args, arg_names orelse &.{}, k);
+            }
+        }
+    }
     const inst = receiver.Instance;
     var start_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
@@ -12714,6 +13073,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     };
     try queue.append(allocator, .{ .cid = start_cid, .name = start_name });
     var method_fid: ?FuncId = null;
+    var walk_active_skipped = false;
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const item = queue.items[head];
@@ -12800,7 +13160,10 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                             // receiver: re-selecting it is the self-delegation
                             // loop described on `walk_active`. Decline, so the
                             // ladder reaches the class-delegate forward.
-                            if (walkActive(fid, receiverIdent(receiver))) continue;
+                            if (walkActive(fid, receiverIdent(receiver))) {
+                                walk_active_skipped = true;
+                                continue;
+                            }
                             if (memberApplicableForWalkNamed(self, &f, args, arg_names)) {
                                 const sc = (try scoreNamedMemberCandidate(self, allocator, &f, args, arg_names)) orelse continue;
                                 // Argument types decide first; a tie goes to the
@@ -12844,33 +13207,25 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
         }
     }
     if (method_fid) |fid| {
-        const all = try prependReceiver(allocator, receiver, args);
-        defer if (runtime.freeScratch()) allocator.free(all);
-        var names = try allocator.alloc(?[]const u8, all.len);
-        defer if (runtime.freeScratch()) allocator.free(names);
-        names[0] = null;
-        if (arg_names) |an| {
-            for (an, 0..) |n, i| {
-                if (i + 1 < names.len) names[i + 1] = n;
+        // Memoize the pick so later named calls of this exact shape skip
+        // the hierarchy walk and the overload scoring; the serve replays
+        // this same terminal (self-delegation guard included). Only a
+        // non-active resolution memoizes — an entry picked while the
+        // `walk_active` guard filtered a candidate is context-dependent.
+        if (!walk_active_skipped) {
+            if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+                extMethodCachePut(self, k, @intFromEnum(fid));
             }
-            var k = an.len + 1;
-            while (k < names.len) : (k += 1) names[k] = null;
-        } else {
-            var k: usize = 1;
-            while (k < names.len) : (k += 1) names[k] = null;
         }
-        const mg = self.module.borrow();
-        const mod = mg.get();
-        const ident = receiverIdent(receiver);
-        const pushed = ident != 0 and walk_active_len < walk_active.len;
-        if (pushed) {
-            walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
-            walk_active_len += 1;
+        return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+    }
+    // A completed walk with no applicable method is a stable verdict for
+    // this (class, name, shape) too; memoize the miss so the ladder's
+    // fallback stops re-walking the hierarchy per call.
+    if (!walk_active_skipped) {
+        if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+            extMethodCachePut(self, k, METHOD_MISS);
         }
-        const r = try callFuncNamedRec(self, allocator, mod, fid, all, names);
-        if (pushed) walk_active_len -= 1;
-        mg.deinit();
-        return r;
     }
     return null;
 }

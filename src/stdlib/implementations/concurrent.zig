@@ -95,8 +95,14 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
             rounds +|= 1;
             if (rounds <= 64) {
                 std.atomic.spinLoopHint();
-            } else if (rounds <= 128) {
+            } else if (rounds <= 256) {
                 std.Thread.yield() catch {};
+            } else if (rounds <= 2048) {
+                // Short monitor sections release within microseconds; a
+                // 100µs park keeps the handoff latency an order of
+                // magnitude under the old 1ms cadence without the pure
+                // spin/yield saturation the long tail below guards.
+                runtime.clockSleepMicros(100);
             } else {
                 runtime.clockSleepMillis(1);
             }

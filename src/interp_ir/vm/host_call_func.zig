@@ -1763,7 +1763,7 @@ pub fn callFuncIndexed(
 
 /// A value the trailing-callable rule may bind: a closure/function, or a
 /// memo-wrapped composable lambda (an Instance with a block arity).
-fn callableForTrailing(self: *VmHost, v: *const Value) bool {
+pub fn callableForTrailing(self: *VmHost, v: *const Value) bool {
     if (valueIsCallable(v)) return true;
     return v.* == .Instance and composableLambdaBlockArity(self, v) != null;
 }

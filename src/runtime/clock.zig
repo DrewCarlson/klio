@@ -109,6 +109,21 @@ pub fn sleepMillis(ms: i64) void {
     }
 }
 
+/// Block the calling thread for `us` microseconds — the fine-grained
+/// variant of `sleepMillis` for sub-millisecond wait cadences (the pump's
+/// adaptive wall-timer backoff). Same GC blocking-safe bracket; no
+/// abandonment slicing (the callers' own loops re-check between slices).
+pub fn sleepMicros(us: i64) void {
+    if (us <= 0) return;
+    gc.enterBlockingSafe();
+    defer gc.exitBlockingSafe();
+    if (cSleepNs(@as(u64, @intCast(us)) * 1_000)) return;
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMicroseconds(@intCast(us)), .awake) catch {};
+}
+
 const testing = std.testing;
 
 test "wallMillis is positive" {

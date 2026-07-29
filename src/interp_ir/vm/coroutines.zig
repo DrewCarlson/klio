@@ -1243,8 +1243,25 @@ pub const CooperativeInterceptor = struct {
                     // round.
                     countSleep(.timer_wall);
                     wall_streak += 1;
-                    if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null)
-                        sleepMillis(@min(@as(u64, @intCast(wait)), 1));
+                    if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null) {
+                        // Adaptive wait toward the deadline: spin briefly,
+                        // then yield, then park in 100µs slices — a
+                        // cross-thread post is noticed within microseconds
+                        // for fast handoffs instead of at the old fixed
+                        // 1ms poll cadence (75k one-millisecond slices per
+                        // background-thread stress test were the dominant
+                        // wall cost). `wall_streak` resets on every
+                        // progress point, so a genuinely idle pump still
+                        // degrades to cheap parked sleeps, and the
+                        // mailbox drain between slices is unchanged.
+                        if (wall_streak <= 64) {
+                            std.atomic.spinLoopHint();
+                        } else if (wall_streak <= 512) {
+                            std.Thread.yield() catch {};
+                        } else {
+                            runtime.clockSleepMicros(100);
+                        }
+                    }
                     if (self.nowMillis() < t) return .waiting;
                     endStreak("timer-deadline-reached");
                 }
@@ -3170,10 +3187,23 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
                 // run. Timeout falls back to the fire-and-forget behavior.
                 if (pumpDiagEnabled()) std.debug.print("[sync] post slot={d} krd={} t0={d}\n", .{ slot, kotlin_resume_delivery, turns0 });
                 if (kotlin_resume_delivery) {
+                    // Adaptive: the owner pump normally turns within
+                    // microseconds, so spin/yield first and only then
+                    // park in 100µs slices — the fixed 1ms cadence put a
+                    // millisecond on the critical path of EVERY
+                    // cross-thread Kotlin resume (the background-thread
+                    // stress tests are little else). The overall bound
+                    // stays ~400ms.
                     var spins: u32 = 0;
-                    while (spins < 400) : (spins += 1) {
+                    while (spins < 4600) : (spins += 1) {
                         if (ww.cell.data.turns.load(.acquire) >= turns0 + 2) break;
-                        sleepMillis(1);
+                        if (spins < 200) {
+                            std.atomic.spinLoopHint();
+                        } else if (spins < 600) {
+                            std.Thread.yield() catch {};
+                        } else {
+                            runtime.clockSleepMicros(100);
+                        }
                     }
                     if (pumpDiagEnabled()) std.debug.print("[sync] done slot={d} turns={d} spins={d}\n", .{ slot, ww.cell.data.turns.load(.acquire), spins });
                 }

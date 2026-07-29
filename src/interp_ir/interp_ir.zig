@@ -235,6 +235,17 @@ pub const ProgramImage = struct {
     /// is a cached "no intrinsic" so the next call skips the probe and falls
     /// straight through. The duped `fqn` is owned by this image.
     instance_intrinsic_cache: std.AutoHashMap(InstanceMethodKey, MemberResolveEntry),
+    /// Per-class ordered list of ancestor companion-singleton names (BFS over
+    /// the supertype graph + lexical enclosing classes, exactly the walk
+    /// `companionWithMember` performed per call). The graph and the companion
+    /// registry are static, so the list is a pure function of the class; the
+    /// per-name membership check stays dynamic at the call. Name slices are
+    /// program-lifetime registry strings; only the spine is owned here.
+    companion_chain_cache: std.AutoHashMap(usize, []const []const u8),
+    /// Named-argument binding permutations for memoized named member calls
+    /// (see `NamedPerm`); keyed by the same salted key as the resolution
+    /// entry, so a hit replays the binding as a positional dispatch.
+    named_perm_cache: std.AutoHashMap(InstanceMethodKey, NamedPerm),
     /// `hostHasMember(class, name)` decides member-vs-global for a bare call;
     /// it walks the class hierarchy (heap-allocating a seen-set + queue) every
     /// call. The answer is a pure function of `(class identity, name pointer)`,
@@ -282,6 +293,11 @@ pub const ProgramImage = struct {
         side_func: AnonMethodEntry,
     };
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
+    /// Replayable named-argument binding for a memoized named member call:
+    /// `src[k]` is the caller arg index feeding user-param `k` (receiver
+    /// excluded). `n == 0xFF` is the negative verdict — the shape needs the
+    /// full named binder (defaults, varargs, over/under-application).
+    pub const NamedPerm = struct { n: u8, src: [15]u8 };
     pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
     pub const FuncOwnerKey = struct { module_p: usize, func_p: u32 };
@@ -361,6 +377,8 @@ pub const ProgramImage = struct {
             .runtime_virtual_cache = std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget).init(allocator),
             .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
+            .companion_chain_cache = std.AutoHashMap(usize, []const []const u8).init(allocator),
+            .named_perm_cache = std.AutoHashMap(InstanceMethodKey, NamedPerm).init(allocator),
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
@@ -418,6 +436,12 @@ pub const ProgramImage = struct {
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
         }
         self.instance_intrinsic_cache.deinit();
+        {
+            var it = self.companion_chain_cache.valueIterator();
+            while (it.next()) |chain| if (chain.len != 0) self.allocator.free(chain.*);
+        }
+        self.companion_chain_cache.deinit();
+        self.named_perm_cache.deinit();
         self.host_has_member_cache.deinit();
         self.cmg_global_cache.deinit();
         self.overload_cache.deinit();
