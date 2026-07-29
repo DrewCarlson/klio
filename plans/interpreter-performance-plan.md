@@ -1079,6 +1079,16 @@ cross-thread resume two-turn wait, and the monitor-enter path (all
 were fixed 1ms cadences; `runtime.clockSleepMicros` added).
 markInvalidFromBackgroundThread 22.3 → 21.7s.
 
+FRAME-MACHINERY ROUND (landed): a per-thread Activation freelist —
+every direct interpreted call paid an allocator create/destroy for
+the ~300-byte activation struct (route:flat-activation was 12.8% on
+the resume stress profile) — and the positional-fallback member walk
+now serves and fills the named-resolution memo INCLUDING confirmed
+misses (route:member-miss-tail 6.4% → 5.3%; a member dispatch MISS
+re-walked the class hierarchy per call before this).
+markInvalidFromBackgroundThread 21.7 → 19.6s (28.7s at the campaign
+start — 1.46x cumulative); all gates green at the commit.
+
 STRESS-TEST STANDING after both rounds: CompositionTests 148/148 and
 MovableContentTests 44/44 under the harness caps (120s coroutine
 timeout / 600s wall). Against the CI gate caps (10s runTest / 90s

@@ -12852,6 +12852,20 @@ fn invokeMethodNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Va
 }
 
 fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
+    // Memo serve for both the named path and the positional fallback: a
+    // prior completed walk's pick (or confirmed miss) short-circuits the
+    // whole hierarchy traversal. The self-delegation guard is re-checked
+    // at serve time; an active entry declines to the full walk, whose
+    // fills are vetoed while the guard filters.
+    if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+        if (extMethodCacheGet(self, k)) |raw| {
+            if (raw == METHOD_MISS) return null;
+            const fid: FuncId = @enumFromInt(raw);
+            if (!walkActive(fid, receiverIdent(receiver))) {
+                return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+            }
+        }
+    }
     const inst = receiver.Instance;
     var start_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
@@ -13017,14 +13031,20 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
         // this same terminal (self-delegation guard included). Only a
         // non-active resolution memoizes — an entry picked while the
         // `walk_active` guard filtered a candidate is context-dependent.
-        if (arg_names) |an| {
-            if (!walk_active_skipped) {
-                if (namedMethodKey(self, receiver, name, args, an)) |k| {
-                    extMethodCachePut(self, k, @intFromEnum(fid));
-                }
+        if (!walk_active_skipped) {
+            if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+                extMethodCachePut(self, k, @intFromEnum(fid));
             }
         }
         return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
+    }
+    // A completed walk with no applicable method is a stable verdict for
+    // this (class, name, shape) too; memoize the miss so the ladder's
+    // fallback stops re-walking the hierarchy per call.
+    if (!walk_active_skipped) {
+        if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+            extMethodCachePut(self, k, METHOD_MISS);
+        }
     }
     return null;
 }

@@ -3079,6 +3079,44 @@ fn snapshotSuspendedFrame(
     frame.pending_finally = .{};
 }
 
+/// Per-thread activation freelist. Direct interpreted calls open one
+/// activation each; without the pool every call paid an allocator
+/// create/destroy for a ~300-byte struct. Pooled only under the tracing GC
+/// (whose stable `c_allocator` backing the regs pool also uses); the
+/// refcounting/arena backends keep plain create/destroy. Entries are inert
+/// storage — no Values, nothing the GC must see.
+const ACT_POOL_MAX = 128;
+threadlocal var act_pool: [ACT_POOL_MAX]*Activation = undefined;
+threadlocal var act_pool_len: usize = 0;
+
+inline fn actPoolOn() bool {
+    return !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
+}
+
+fn actAlloc(allocator: Allocator) Allocator.Error!*Activation {
+    if (actPoolOn()) {
+        if (act_pool_len > 0) {
+            act_pool_len -= 1;
+            return act_pool[act_pool_len];
+        }
+        return std.heap.c_allocator.create(Activation);
+    }
+    return allocator.create(Activation);
+}
+
+fn actFree(allocator: Allocator, act: *Activation) void {
+    if (actPoolOn()) {
+        if (act_pool_len < ACT_POOL_MAX) {
+            act_pool[act_pool_len] = act;
+            act_pool_len += 1;
+            return;
+        }
+        std.heap.c_allocator.destroy(act);
+        return;
+    }
+    allocator.destroy(act);
+}
+
 /// Open a flat activation for a direct interpreted call: the same entry
 /// sequence `evalWithCapturesChained` performs for a recursive call (frame
 /// construction with the arg buffer transferred as params, GC chain push,
@@ -3087,8 +3125,8 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
     boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
-    const act = try allocator.create(Activation);
-    errdefer allocator.destroy(act);
+    const act = try actAlloc(allocator);
+    errdefer actFree(allocator, act);
     act.* = .{
         .frame = try Frame.newWithCaptures(allocator, module, req.func, req.args, req.captures),
         .try_stack = .empty,
@@ -3234,7 +3272,7 @@ fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
         if (runtime.reclaimEnabled()) ka.release(allocator);
     }
     if (act.type_args.len > 0) allocator.free(act.type_args);
-    allocator.destroy(act);
+    actFree(allocator, act);
 }
 
 /// Reinstall a live-parked activation and run it to its next completion or
@@ -3263,7 +3301,7 @@ fn resumeLiveActivation(
     if (res == .err and res.err == .Suspended) return res;
     const out = frameBoundary(act.frame.func, res);
     teardownActivation(H, allocator, act, host);
-    allocator.destroy(act);
+    actFree(allocator, act);
     return out;
 }
 
@@ -3337,7 +3375,7 @@ fn runFlatLoop(
     errdefer while (stack.pop()) |act| {
         evtls.eval_depth -= 1;
         teardownActivation(H, allocator, act, host);
-        allocator.destroy(act);
+        actFree(allocator, act);
     };
     var cur = cur_in;
     var ridx = resume_idx_in;
@@ -3372,7 +3410,7 @@ fn runFlatLoop(
             stack.append(allocator, act) catch |e| {
                 evtls.eval_depth -= 1;
                 teardownActivation(H, allocator, act, host);
-                allocator.destroy(act);
+                actFree(allocator, act);
                 return e;
             };
             cur = site.req.func.entry;
@@ -3473,7 +3511,7 @@ fn runFlatLoop(
             const rix = act.ret_idx;
             const rd = act.ret_dst;
             teardownActivation(H, allocator, act, host);
-            allocator.destroy(act);
+            actFree(allocator, act);
             const pf: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
             switch (res) {
                 .ok => |v| {
