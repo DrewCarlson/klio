@@ -171,7 +171,7 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
     // until the new frame's params are installed), so a collection mid-getter
     // would otherwise sweep it — and everything transitively reachable through
     // it, which the getter is about to read.
-    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+    if (missTraceEnvCached()) |w| {
         if (std.mem.indexOf(u8, func.name, w) != null) {
             const rc: []const u8 = if (receiver == .Instance) className(receiver.Instance) else receiver.typeFqn();
             std.debug.print("[getter] {s}#{d} recv={s} site={s}\n", .{ func.name, fid.int(), rc, site });
@@ -342,6 +342,22 @@ pub fn sgetterNameMatches(full: []const u8, fname: []const u8) bool {
     if (full.len <= fname.len) return false;
     if (!std.mem.endsWith(u8, full, fname)) return false;
     return full[full.len - fname.len - 1] == '\u{1f}';
+}
+
+var miss_trace_state: u8 = 0;
+var miss_trace_want: []const u8 = "";
+/// Cached KLIO_MISS_TRACE value; consulted on per-call paths (the getter
+/// runner, the field ladder), where a raw getenv is a spinlock + probe.
+fn missTraceEnvCached() ?[]const u8 {
+    if (miss_trace_state == 0) {
+        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+            miss_trace_want = w;
+            miss_trace_state = 2;
+        } else {
+            miss_trace_state = 1;
+        }
+    }
+    return if (miss_trace_state == 2) miss_trace_want else null;
 }
 
 /// A discarded dispatch-miss message from a probe. Host miss messages are
@@ -902,7 +918,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         lookupPairFunc(pg.get().instance_prop_getters, owner, prop) != null or
                         lookupPairFunc(pg.get().instance_prop_private, owner, prop) != null;
                 };
-                if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                if (missTraceEnvCached()) |w| {
                     if (std.mem.eql(u8, w, prop)) {
                         std.debug.print("[sgp] owner={s} prop={s} rcn={s} owns={} owner_declares={}\n", .{ owner, prop, rcn, owns, owner_declares });
                     }
@@ -2530,7 +2546,7 @@ fn resolveExtensionPropImpl(
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(self, allocator, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
         }
-        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (missTraceEnvCached()) |w| {
             if (std.mem.eql(u8, w, name))
                 std.debug.print("[extprop-walk] try=({s},{s})\n", .{ recv_simple, name });
         }
@@ -3806,7 +3822,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         return .{ .ok = {} };
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
-    if (runtime.getenvSlice("KLIO_MISS_TRACE") != null) {
+    if (missTraceEnvCached() != null) {
         std.debug.print("[setfield-miss] `{s}` on `{s}` span={any}\n", .{ name, tf, ir.eval.currentCallSiteSpan() });
         ir.eval.debugPrintFrames();
     }

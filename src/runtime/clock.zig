@@ -109,6 +109,52 @@ pub fn sleepMillis(ms: i64) void {
     }
 }
 
+/// Cross-thread event gate: an epoch counter with a libc condvar, so a
+/// waiter parks until the epoch moves (or a timeout) instead of polling.
+/// `ring` bumps the epoch under the gate mutex and broadcasts; `waitFrom`
+/// parks only while the epoch still equals the `seen` snapshot the caller
+/// took BEFORE its final emptiness check, which closes the post-then-wait
+/// race. Without libc the wait degrades to a bounded micro-sleep. Waits
+/// are bracketed GC blocking-safe, exactly like sleeps.
+pub const EventGate = struct {
+    mutex: std.c.pthread_mutex_t = .{},
+    cond: std.c.pthread_cond_t = .{},
+    epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn epochNow(self: *EventGate) u64 {
+        return self.epoch.load(.acquire);
+    }
+
+    pub fn ring(self: *EventGate) void {
+        if (comptime !builtin.link_libc) {
+            _ = self.epoch.fetchAdd(1, .release);
+            return;
+        }
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.epoch.fetchAdd(1, .release);
+        _ = std.c.pthread_cond_broadcast(&self.cond);
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    pub fn waitFrom(self: *EventGate, seen: u64, timeout_us: u64) void {
+        if (comptime !builtin.link_libc) {
+            sleepMicros(@intCast(@min(timeout_us, 1_000)));
+            return;
+        }
+        gc.enterBlockingSafe();
+        defer gc.exitBlockingSafe();
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        if (self.epoch.load(.acquire) != seen) return;
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts);
+        const add_ns: i128 = @as(i128, ts.nsec) + @as(i128, timeout_us) * 1_000;
+        ts.sec += @intCast(@divFloor(add_ns, 1_000_000_000));
+        ts.nsec = @intCast(@mod(add_ns, 1_000_000_000));
+        _ = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts);
+    }
+};
+
 /// Block the calling thread for `us` microseconds — the fine-grained
 /// variant of `sleepMillis` for sub-millisecond wait cadences (the pump's
 /// adaptive wall-timer backoff). Same GC blocking-safe bracket; no

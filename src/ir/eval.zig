@@ -2451,8 +2451,12 @@ pub fn evalWith(comptime H: type, allocator: Allocator, module: *const Module, f
 
 /// `KLIO_THIS_TRAP=1`: print every frame entry that binds a Bool into a
 /// `this` parameter — the ext-receiver misbind signature — with the caller.
+var bool_this_trap_state: u8 = 0;
 pub fn boolThisTrap(func: *const Func, args: []const Value) void {
-    if (runtime.getenvSlice("KLIO_THIS_TRAP") == null) return;
+    // Consulted per flat-call open: cache the env verdict once.
+    if (bool_this_trap_state == 0)
+        bool_this_trap_state = if (runtime.getenvSlice("KLIO_THIS_TRAP") != null) 2 else 1;
+    if (bool_this_trap_state != 2) return;
     if (func.params.len == 0 or args.len == 0) return;
     if (!std.mem.eql(u8, func.params[0].name, "this")) return;
     if (args[0] != .Bool and args[0] != .Int) return;
@@ -3368,12 +3372,13 @@ fn runFlatLoop(
     root_act: ?*Activation,
     host: *H,
 ) Allocator.Error!EvalResult {
+    const ev: *EvalTls = &evtls;
     var stack: std.ArrayList(*Activation) = .empty;
     defer stack.deinit(allocator);
     // On an allocation failure, unwind every open activation so no frame is
     // left dangling on the GC chain.
     errdefer while (stack.pop()) |act| {
-        evtls.eval_depth -= 1;
+        ev.eval_depth -= 1;
         teardownActivation(H, allocator, act, host);
         actFree(allocator, act);
     };
@@ -3392,7 +3397,7 @@ fn runFlatLoop(
         if (flat_site) |site| {
             // Same depth bound as the recursive path: an unbounded interpreted
             // recursion becomes a catchable StackOverflowError at the caller.
-            if (evtls.eval_depth >= maxEvalDepth()) {
+            if (ev.eval_depth >= maxEvalDepth()) {
                 dumpFrameChainForDiag();
                 discardFlatReq(H, allocator, site.req, host);
                 runwind = .{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" };
@@ -3400,15 +3405,15 @@ fn runFlatLoop(
                 ridx = site.ret_idx;
                 continue;
             }
-            evtls.eval_depth += 1;
+            ev.eval_depth += 1;
             const act = openActivation(H, allocator, f.module, site.req, host) catch |e| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 return e;
             };
             act.ret_block = site.ret_block;
             act.ret_idx = site.ret_idx;
             stack.append(allocator, act) catch |e| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 teardownActivation(H, allocator, act, host);
                 actFree(allocator, act);
                 return e;
@@ -3429,7 +3434,7 @@ fn runFlatLoop(
             var pd = pp.resume_reg;
             var barrier_hit = false;
             while (stack.pop()) |a| {
-                evtls.eval_depth -= 1;
+                ev.eval_depth -= 1;
                 const is_barrier = a.suspend_barrier;
                 const is_root_pump = a.root_pump;
                 const scope_base = a.barrier_scope_base;
@@ -3494,7 +3499,7 @@ fn runFlatLoop(
         deliver: while (true) {
             if (stack.items.len == 0) return res;
             const act = stack.pop().?;
-            evtls.eval_depth -= 1;
+            ev.eval_depth -= 1;
             res = frameBoundary(act.frame.func, res);
             // A no-driver root's completion runs its pump to quiescence
             // (launched children, timers) before the caller sees the
@@ -6096,9 +6101,18 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // pushed activation. The host consults the same caches the recursive
     // ladder's entry consults; anything else falls through to the ladder.
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
-        if (flatEnabled() and argNamesAllNull(cm.arg_names)) {
+        if (flatEnabled()) {
             runtime.prof.opRoute(1);
-            if (try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)) |prep0| {
+            const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
+                try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
+            else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
+                // A NAMED call whose binding permutation is already known
+                // replays it into declaration order and runs flat, exactly
+                // as the positional form does.
+                try host.prepareMemberFlatCallNamed(allocator, &recv, name_str, arg_values, names, static_recv, declared_recv)
+            else
+                null;
+            if (prep_opt) |prep0| {
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
