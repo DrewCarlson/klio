@@ -235,6 +235,13 @@ pub const ProgramImage = struct {
     /// is a cached "no intrinsic" so the next call skips the probe and falls
     /// straight through. The duped `fqn` is owned by this image.
     instance_intrinsic_cache: std.AutoHashMap(InstanceMethodKey, MemberResolveEntry),
+    /// Per-class ordered list of ancestor companion-singleton names (BFS over
+    /// the supertype graph + lexical enclosing classes, exactly the walk
+    /// `companionWithMember` performed per call). The graph and the companion
+    /// registry are static, so the list is a pure function of the class; the
+    /// per-name membership check stays dynamic at the call. Name slices are
+    /// program-lifetime registry strings; only the spine is owned here.
+    companion_chain_cache: std.AutoHashMap(usize, []const []const u8),
     /// `hostHasMember(class, name)` decides member-vs-global for a bare call;
     /// it walks the class hierarchy (heap-allocating a seen-set + queue) every
     /// call. The answer is a pure function of `(class identity, name pointer)`,
@@ -361,6 +368,7 @@ pub const ProgramImage = struct {
             .runtime_virtual_cache = std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget).init(allocator),
             .ext_method_cache = std.AutoHashMap(InstanceMethodKey, u32).init(allocator),
             .instance_intrinsic_cache = std.AutoHashMap(InstanceMethodKey, MemberResolveEntry).init(allocator),
+            .companion_chain_cache = std.AutoHashMap(usize, []const []const u8).init(allocator),
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
@@ -418,6 +426,11 @@ pub const ProgramImage = struct {
             while (it.next()) |e| if (e.fqn.len != 0) self.allocator.free(e.fqn);
         }
         self.instance_intrinsic_cache.deinit();
+        {
+            var it = self.companion_chain_cache.valueIterator();
+            while (it.next()) |chain| if (chain.len != 0) self.allocator.free(chain.*);
+        }
+        self.companion_chain_cache.deinit();
         self.host_has_member_cache.deinit();
         self.cmg_global_cache.deinit();
         self.overload_cache.deinit();

@@ -2208,18 +2208,63 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         else => return null,
     };
     var cls_name: []const u8 = undefined;
+    var cls_ident: usize = 0;
     {
         const g = inst.borrow();
+        cls_ident = g.get().class.identity();
         const cg = g.get().class.borrow();
         cls_name = cg.get().name;
         cg.deinit();
         g.deinit();
     }
     if (std.mem.indexOf(u8, cls_name, "$Companion$") != null) return null;
-    // Walk the full supertype graph (not just the first supertype): a
-    // class may list an interface before its superclass
-    // (`HeadersImpl : Headers, StringValuesImpl(...)`), and the companion
-    // holding `name` can sit on any ancestor — class or interface.
+    // The ordered ancestor-companion list is a pure function of the class
+    // (supertype graph + lexical enclosing chain + companion registry, all
+    // static); the walk that produced it per call was the dominant cost of
+    // every bare-name candidate build. Only the per-NAME membership check
+    // below stays dynamic. Most classes cache the empty list and return in
+    // two probes.
+    const cached: ?[]const []const u8 = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().companion_chain_cache.get(cls_ident);
+    };
+    if (cached) |chain| return companionChainProbe(self, chain, name);
+    var built = try companionChainBuild(self, allocator, cls_name);
+    defer built.deinit(allocator);
+    {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        const cache = &pg.get().companion_chain_cache;
+        if (!cache.contains(cls_ident)) {
+            if (pg.get().allocator.dupe([]const u8, built.items) catch null) |owned| {
+                cache.put(cls_ident, owned) catch pg.get().allocator.free(owned);
+            }
+        }
+    }
+    return companionChainProbe(self, built.items, name);
+}
+
+/// Probe the ordered ancestor-companion list for a singleton owning `name`.
+fn companionChainProbe(self: *VmHost, chain: []const []const u8, name: []const u8) Allocator.Error!?Value {
+    for (chain) |cn| {
+        const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+            .ok => |maybe| maybe,
+            .err => return null,
+        };
+        if (singleton) |sv| {
+            if (sv == .Instance) return sv;
+        }
+    }
+    return null;
+}
+
+/// The BFS `companionWithMember` ran per call, producing the visit-ordered
+/// companion-singleton names of the class's ancestors (supertype graph +
+/// lexical enclosing classes).
+fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []const u8) Allocator.Error!std.ArrayList([]const u8) {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.ArrayList([]const u8) = .empty;
@@ -2242,15 +2287,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
             defer g.deinit();
             break :blk g.get().registry.companion_singletons.get(cname);
         };
-        if (comp_name) |cn| {
-            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
-                .ok => |maybe| maybe,
-                .err => return null,
-            };
-            if (singleton) |sv| {
-                if (sv == .Instance) return sv;
-            }
-        }
+        if (comp_name) |cn| try out.append(allocator, cn);
         {
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -2267,7 +2304,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
             if (sep > 0) try queue.append(allocator, cname[0..sep]);
         }
     }
-    return null;
+    return out;
 }
 
 // -------------------------------------------------------------------------

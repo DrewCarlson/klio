@@ -1079,6 +1079,16 @@ cross-thread resume two-turn wait, and the monitor-enter path (all
 were fixed 1ms cadences; `runtime.clockSleepMicros` added).
 markInvalidFromBackgroundThread 22.3 → 21.7s.
 
+COMPANION-CHAIN CACHE (landed): the bare-name candidate build ran a
+full supertype-graph + enclosing-class BFS with two ArrayList
+allocations per implicit-receiver candidate per load
+(`companionWithMember`), searching for ancestor companions. The
+visit-ordered companion-name list is a pure function of the class
+(graph + registry static), now cached per class identity on the
+program image with the per-name membership check kept dynamic at the
+call. markInvalidFromBackgroundThread 19.6 → 18.5s; route:ltg-cands
+dropped off the profile entirely and CallMemberOrGlobal fell a third.
+
 FRAME-MACHINERY ROUND (landed): a per-thread Activation freelist —
 every direct interpreted call paid an allocator create/destroy for
 the ~300-byte activation struct (route:flat-activation was 12.8% on
