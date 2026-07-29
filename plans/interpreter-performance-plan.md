@@ -1131,6 +1131,27 @@ stale-tag artifact; and a wall-invariant test under compute changes
 may simply mean the OPTIMIZED thread was not the critical path —
 check per-thread attribution before reclassifying.
 
+RELAXED MEMBER KEY (landed): container-typed ARGUMENTS made the
+strict instance-method key unbuildable, so those positional member
+calls re-ran the whole probe ladder per call. The member cache (only
+— extension caches stay strict) now falls back to an arg-side RELAXED
+key with container-kind tags: Kotlin erasure forbids member overloads
+differing only by a generic element type, so kind granularity fully
+discriminates any declarable member overload set; receiver keying is
+untouched (receiver-side relaxation is where the measured regressions
+lived). Wired at irMethodWalk (probe + fill, misses included), the
+ladder head, and the flat prepare. Effect on the resume stress test:
+total CPU −25% again, route:flat-activation 14.6k → 2.2k samples
+(cache hits now flat-serve), GetField off the profile; wall 102 →
+100.2s. NEXT ROCK for the serialized pump path: the ~53% of CPU
+still under the two stale-attribution tags is host-side per-call
+machinery of the RECURSIVE `invokeMethodFuncId` terminal — ladder-
+and memo-served member invokes build full recursive frames instead of
+flat activations. Flattening that terminal (route the cached-fid
+invoke through the flat driver like `prepareMemberFlatCall` already
+does at the exec arm) is the Stage-1 continuation with the largest
+remaining share.
+
 NAMED-DISPATCH COMPLETION + EVENT GATE (landed): the perm machinery
 extended with (1) an ORDER key that folds NO arg-type signature —
 binding order depends only on names, positions and per-arg

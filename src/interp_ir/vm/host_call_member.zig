@@ -3852,7 +3852,9 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     // Data-class `copy` runs before the cache in the ladder; decline so it
     // keeps its precedence.
     if (std.mem.eql(u8, name, "copy")) return null;
-    const k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null) orelse return null;
+    const strict_k = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
+    const k = strict_k orelse
+        (instanceMethodKeyRelaxed(self, receiver, name, args, static_recv) orelse return null);
     var fid: ?FuncId = null;
     if (instanceMethodCacheGetRaw(self, k)) |raw| {
         if (raw != METHOD_MISS) fid = @enumFromInt(raw);
@@ -3874,10 +3876,13 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
         // (and the strict/members-only probes never consult it). A
         // scope-directed call probes under its scope-FOLDED key — the same
         // key `extensionFnFallback` caches it under, so it can only be
-        // served what its own resolution stored.
+        // served what its own resolution stored. The RELAXED member key
+        // never touches the extension caches.
         if (allow_ext_cache and static_recv == null and declared_recv == null) {
-            if (extMethodCacheGet(self, k)) |raw| {
-                if (raw != METHOD_MISS) fid = @enumFromInt(raw);
+            if (strict_k) |sk| {
+                if (extMethodCacheGet(self, sk)) |raw| {
+                    if (raw != METHOD_MISS) fid = @enumFromInt(raw);
+                }
             }
         } else if (allow_ext_cache) {
             if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k2| {
@@ -3959,7 +3964,20 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // never depends on it (it only directs the extension fallback, which the
     // ext-cache probe below guards separately).
     if (receiver.* == .Instance) {
-        if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, null)) |k| {
+        const head_strict = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
+        if (head_strict == null) {
+            // Container-typed args: probe the member cache under the
+            // RELAXED key (fills come from `irMethodWalk`); the extension
+            // caches stay strict-key-only below.
+            if (instanceMethodKeyRelaxed(self, receiver, name, args, static_recv)) |rk| {
+                if (instanceMethodCacheGetRaw(self, rk)) |raw| {
+                    if (raw != METHOD_MISS) {
+                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                    }
+                }
+            }
+        }
+        if (head_strict) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
@@ -9646,6 +9664,21 @@ fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
     return if (v == 0) 1 else v;
 }
 
+/// Arg-side RELAXED variant of `instanceMethodKeyScoped` for the MEMBER
+/// cache only: receiver keying rules are identical (identity-keyable
+/// receivers only — receiver-side relaxation is where the measured
+/// regressions lived), but the arg signature uses container-kind tags
+/// (see `methodArgSigRelaxed`), which fully discriminate any declarable
+/// member overload set under Kotlin erasure. Salted apart from strict
+/// entries. The extension caches never use this key.
+fn instanceMethodKeyRelaxed(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
+    var k = instanceMethodKeyScoped(self, receiver, name, &.{}, static_recv, null) orelse return null;
+    k.n_args = @intCast(args.len);
+    k.sig = (k.sig ^ methodArgSigRelaxed(self, args)) *% 0x9E3779B97F4A7C15 ^ 0x00C0_FFEE_D00D_5EED;
+    if (k.sig == 0) k.sig = 11;
+    return k;
+}
+
 fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
@@ -9967,7 +10000,11 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // `instanceMethodKeyScoped`): its resolution depends on the static receiver
     // type, so it caches apart from the ordinary call's entry — never served
     // one, never serves one.
-    const key = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
+    const strict_key = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
+    // A container-typed argument makes the strict signature unbuildable;
+    // the RELAXED key (kind tags — see `instanceMethodKeyRelaxed`) keys the
+    // member resolution then, so those calls stop re-walking per call.
+    const key = strict_key orelse instanceMethodKeyRelaxed(self, receiver, name, args, static_recv);
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
