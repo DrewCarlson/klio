@@ -5496,6 +5496,7 @@ fn instanceBindingNamedProbe(
     const slots = try allocator.alloc(?Value, params.len);
     defer if (runtime.freeScratch()) allocator.free(slots);
     for (slots) |*s| s.* = null;
+    var src: [15]u8 = @splat(0xFF);
     var next_positional: usize = 0;
     for (args, 0..) |a, i| {
         const supplied: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
@@ -5505,6 +5506,7 @@ fn instanceBindingNamedProbe(
                 if (!std.mem.eql(u8, pn, an)) continue;
                 if (slots[pos] != null) return null;
                 slots[pos] = a;
+                if (pos < 15) src[pos] = @intCast(@min(i, 0xFE));
                 placed = true;
                 break;
             }
@@ -5513,6 +5515,7 @@ fn instanceBindingNamedProbe(
             while (next_positional < slots.len and slots[next_positional] != null) next_positional += 1;
             if (next_positional >= slots.len) return null;
             slots[next_positional] = a;
+            if (next_positional < 15) src[next_positional] = @intCast(@min(i, 0xFE));
             next_positional += 1;
         }
     }
@@ -5522,6 +5525,22 @@ fn instanceBindingNamedProbe(
     for (slots) |s| {
         const v = s orelse return null;
         try filled.append(allocator, v);
+    }
+    // The reorder is a pure function of (class, name, arg shape, name
+    // vector); memoize it so later calls of this shape rewrite to a
+    // POSITIONAL dispatch up front and skip the whole named ladder
+    // (the stdlib named probes, the per-call param-name walk, and this
+    // slot binding).
+    if (params.len <= 15 and args.len == params.len and args.len <= 15) {
+        if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
+            const perm = root_mod.ProgramImage.NamedPerm{ .n = @intCast(params.len), .src = src };
+            {
+                const pg = self.prog.borrowMut();
+                defer pg.deinit();
+                pg.get().named_perm_cache.put(k, perm) catch {};
+            }
+            tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = perm };
+        }
     }
     return instanceBindingProbe(self, allocator, receiver, name, filled.items);
 }
@@ -9589,6 +9608,44 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
 /// overloads a method-name resolution can depend on. Returns null for a
 /// non-primitive arg (or > 12 args), which means "do not cache this call" — the
 /// resolution then re-runs each time rather than risk a wrong cross-type hit.
+/// Relaxed argument signature for the NAMED member-walk memo: never null.
+/// Where the strict signature declines container shapes (their extension
+/// applicability inspects value content), member OVERLOADS cannot differ
+/// only by a generic element type (Kotlin erasure forbids it), so a
+/// container KIND tag discriminates every declarable member overload set.
+/// Instances still fold class identity; closures fold body identity.
+fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
+    var h = std.hash.Wyhash.init(0x452821e638d01377 +% args.len);
+    for (args) |*a| {
+        const tag: u8 = @intFromEnum(std.meta.activeTag(a.*));
+        h.update((&tag)[0..1]);
+        switch (a.*) {
+            .Instance => |inst| {
+                const g = inst.borrow();
+                const id = g.get().class.identity();
+                g.deinit();
+                h.update(std.mem.asBytes(&id));
+            },
+            .IrClosure => |c| {
+                if (self.closures.get(@intCast(c.id))) |info| {
+                    h.update(std.mem.asBytes(&info.body_func));
+                }
+            },
+            .Function => |f| {
+                const dp: usize = @intFromPtr(f.decl);
+                h.update(std.mem.asBytes(&dp));
+            },
+            .Array => |arr| {
+                const pk: u8 = if (arr.prim) |p| @as(u8, @intFromEnum(p)) + 1 else 0;
+                h.update((&pk)[0..1]);
+            },
+            else => {},
+        }
+    }
+    const v = h.final();
+    return if (v == 0) 1 else v;
+}
+
 fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
@@ -12275,6 +12332,58 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         return try callMemberInnerStatic(self, allocator, receiver, name, &filled, strict_ext, static_recv, no_ext, declared_recv);
     }
 
+    // Unified named→positional rewrite: a cached binding permutation for
+    // this exact (class, name, arg shape, name vector) reorders the args
+    // once and enters the POSITIONAL ladder — every positional fast path
+    // (member cache, native bindings, ext cache) then applies. The perm
+    // can only exist because a prior call of this shape resolved through
+    // a terminal whose earlier named arms had declined it.
+    if (any_named and receiver.* == .Instance) {
+        if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
+            const tslot = &tl_perm_cache[tlSlot(k)];
+            var perm: ?root_mod.ProgramImage.NamedPerm = null;
+            if (tslot.raw_plus != 0 and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
+                tslot.sig == k.sig and tslot.n_args == k.n_args)
+            {
+                perm = tslot.perm;
+            } else {
+                const shared: ?root_mod.ProgramImage.NamedPerm = blk: {
+                    const pg = self.prog.borrow();
+                    defer pg.deinit();
+                    break :blk pg.get().named_perm_cache.get(k);
+                };
+                if (shared) |p| {
+                    tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = p };
+                    perm = p;
+                }
+            }
+            if (perm) |p| {
+                if (p.n != 0xFF and p.n <= args.len) {
+                    var ok = true;
+                    var buf: [15]Value = undefined;
+                    for (0..p.n) |pi| {
+                        if (p.src[pi] >= args.len) {
+                            ok = false;
+                            break;
+                        }
+                        buf[pi] = args[p.src[pi]];
+                    }
+                    if (ok) {
+                        const r = try callMemberInnerStatic(self, allocator, receiver, name, buf[0..p.n], strict_ext, static_recv, no_ext, declared_recv);
+                        // A positional-ladder MISS keeps the named ladder's
+                        // own fallbacks (the hierarchy walk, the compose
+                        // invoke completion) exactly as before the rewrite.
+                        if (!(r == .err and r.err == .Unimplemented)) {
+                            ir.eval.callStatsProbe("<named-perm-hit>");
+                            return r;
+                        }
+                        freeDispatchMiss(allocator, r);
+                    }
+                }
+            }
+        }
+    }
+
     // Named member-resolution memo: a prior walk pick for this exact
     // (class, name, arg shape, name vector) serves directly — the walk's
     // own terminal, with the self-delegation guard consulted at serve
@@ -12286,7 +12395,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
                 if (raw != METHOD_MISS) {
                     const fid: FuncId = @enumFromInt(raw);
                     if (!walkActive(fid, receiverIdent(receiver))) {
-                        if (try serveNamedFid(self, allocator, receiver, fid, args, arg_names, k)) |r| return r;
+                        if (try serveNamedFid(self, allocator, receiver, name, fid, args, arg_names)) |r| return r;
                     }
                 }
             }
@@ -12296,16 +12405,25 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Stdlib intrinsic dispatch with named args.
     if (any_named) {
         ir.eval.callStatsProbe(name);
-        if (try stdlibNamedDispatch(self, allocator, receiver, name, args, arg_names)) |r| return r;
+        if (try stdlibNamedDispatch(self, allocator, receiver, name, args, arg_names)) |r| {
+            ir.eval.callStatsProbe("<named-stdlib-hit>");
+            return r;
+        }
         // Pack-installed host bindings take their arguments positionally; a
         // named call reaches them only after being put back in declaration
         // order.
-        if (try instanceBindingNamedProbe(self, allocator, receiver, name, args, arg_names)) |r| return r;
+        if (try instanceBindingNamedProbe(self, allocator, receiver, name, args, arg_names)) |r| {
+            ir.eval.callStatsProbe("<named-binding-hit>");
+            return r;
+        }
     }
 
     // User extension / member fn with named args.
     if (any_named) {
-        if (try userMethodNamed(self, allocator, receiver, name, args, arg_names)) |r| return r;
+        if (try userMethodNamed(self, allocator, receiver, name, args, arg_names)) |r| {
+            ir.eval.callStatsProbe("<named-user-hit>");
+            return r;
+        }
     }
 
     // Nested-class construction on a class receiver with named arguments
@@ -12360,7 +12478,30 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Positional dispatch first.
     runtime.prof.opRoute(17);
     const primary = try callMemberInnerStatic(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv);
-    if (!(primary == .err and primary.err == .Unimplemented)) return primary;
+    if (!(primary == .err and primary.err == .Unimplemented)) {
+        // A NAMED call served by the positional fallback in its given
+        // order: memoize the identity permutation so later calls of this
+        // shape take the unified rewrite up front and skip the whole
+        // named ladder (whose every arm just declined).
+        if (any_named) ir.eval.callStatsProbe("<named-pos-hit>");
+        // Any non-miss outcome (including thrown control flow — the
+        // pausable machinery completes composable calls via throws)
+        // proves the positional dispatch bound this order.
+        if (any_named and receiver.* == .Instance and args.len <= 15) {
+            if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
+                var src: [15]u8 = @splat(0xFF);
+                for (0..args.len) |i| src[i] = @intCast(i);
+                const perm = root_mod.ProgramImage.NamedPerm{ .n = @intCast(args.len), .src = src };
+                {
+                    const pg = self.prog.borrowMut();
+                    defer pg.deinit();
+                    pg.get().named_perm_cache.put(k, perm) catch {};
+                }
+                tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = perm };
+            }
+        }
+        return primary;
+    }
     runtime.prof.opRoute(18);
 
     // Class-hierarchy method walk for a class-qualified lowered name.
@@ -12374,6 +12515,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
             return r;
         }
     }
+    if (any_named) ir.eval.callStatsProbe("<named-miss>");
     // Compose ABI completion on the explicit `.invoke()` route — same
     // completion `callMember` applies (the two entries do not share a
     // miss tail).
@@ -12843,6 +12985,57 @@ fn walkActive(fid: FuncId, ident: usize) bool {
     return false;
 }
 
+/// ORDER key for the named-binding permutation map: unlike the resolution
+/// key it folds NO arg-type signature — the binding ORDER is a pure
+/// function of (class, name, arg count, name vector, per-arg callability):
+/// names and positions drive the slot binding, and callability is the only
+/// value property the trailing-lambda/compose-pair rules consult. The perm
+/// serve REWRITES to a positional dispatch that re-resolves with the real
+/// values, so overload selection never rides this key. This keys shapes
+/// whose container-typed args make the full signature unbuildable — the
+/// bulk of the named traffic.
+fn namedOrderKey(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
+    var k = instanceMethodKeyScoped(self, receiver, name, &.{}, null, null) orelse return null;
+    k.n_args = @intCast(args.len);
+    var h = std.hash.Wyhash.init(0x1f83d9abfb41bd6b);
+    for (args, 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        var tag: u8 = 3;
+        if (nm != null) {
+            tag = 1;
+        } else if (vmhost.host_call_func.callableForTrailing(self, a)) {
+            tag = 2;
+        }
+        h.update((&tag)[0..1]);
+        const p: usize = if (nm) |n| @intFromPtr(n.ptr) else 0;
+        h.update(std.mem.asBytes(&p));
+    }
+    k.sig = h.final() ^ 0x0DDB_A11C_0FFE_E000;
+    if (k.sig == 0) k.sig = 7;
+    return k;
+}
+
+/// WALK key for the named hierarchy-walk memo: class/name identity plus
+/// the RELAXED arg signature (see `methodArgSigRelaxed` — container kinds,
+/// never null) and the name vector. Member overload sets are fully
+/// discriminated at erasure granularity by the relaxed tags, so the pick
+/// is a pure function of this key wherever the strict key would simply
+/// have been unbuildable.
+fn namedWalkKey(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
+    var k = instanceMethodKeyScoped(self, receiver, name, &.{}, null, null) orelse return null;
+    k.n_args = @intCast(args.len);
+    var h = std.hash.Wyhash.init(0xbe5466cf34e90c6c);
+    const rs = methodArgSigRelaxed(self, args);
+    h.update(std.mem.asBytes(&rs));
+    for (arg_names) |n| {
+        const pp: usize = if (n) |nn| @intFromPtr(nn.ptr) else 1;
+        h.update(std.mem.asBytes(&pp));
+    }
+    k.sig = h.final() ^ 0xFACE_0FF5_1DE0_0DD5;
+    if (k.sig == 0) k.sig = 9;
+    return k;
+}
+
 /// Cache key for a NAMED member resolution: the positional key with the
 /// arg-name vector folded in (names are module-interned, so pointer
 /// identity keys them) and a salt so entries never collide with the
@@ -12935,8 +13128,17 @@ fn namedBindPerm(self: *VmHost, f: *const ir.Func, args: []const Value, arg_name
         src[positional_idx] = @intCast(i);
         positional_idx += 1;
     }
+    var seen_gap = false;
     for (up, 0..) |_, pos| {
-        if (src[pos] == 0xFF) return null;
+        if (src[pos] == 0xFF) {
+            // A TRAILING unfilled param defaults at invocation (the
+            // positional invoker's binding fills it); an interior gap
+            // cannot be expressed positionally and keeps the named path.
+            src[pos] = 0xFE;
+            seen_gap = true;
+        } else if (seen_gap) {
+            return null;
+        }
     }
     return .{ .n = @intCast(up.len), .src = src };
 }
@@ -12946,7 +13148,11 @@ fn namedBindPerm(self: *VmHost, f: *const ir.Func, args: []const Value, arg_name
 /// computed and cached), else run the full named terminal. The
 /// self-delegation guard brackets both dispatches, exactly as the walk's
 /// own terminal pushes it.
-fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value, arg_names: []const ?[]const u8, key: root_mod.ProgramImage.InstanceMethodKey) Allocator.Error!?EvalResult {
+fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, fid: FuncId, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
+    // Perm entries live under the ORDER key (see `namedOrderKey`), shared
+    // with the unified rewrite's probe.
+    const key = namedOrderKey(self, receiver, name, args, arg_names) orelse
+        return try invokeMethodNamedFid(self, allocator, receiver, fid, args, arg_names);
     // Thread-local L1 over the perm map (same rationale as
     // `tl_method_cache`: the shared reader lock's cache-line traffic).
     var perm: ?root_mod.ProgramImage.NamedPerm = null;
@@ -12985,14 +13191,15 @@ fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fi
     if (perm.?.n != 0xFF) {
         const p = perm.?;
         var buf: [15]Value = undefined;
-        for (0..p.n) |k| buf[k] = args[p.src[k]];
+        var m: usize = 0;
+        while (m < p.n and p.src[m] != 0xFE) : (m += 1) buf[m] = args[p.src[m]];
         const ident = receiverIdent(receiver);
         const pushed = ident != 0 and walk_active_len < walk_active.len;
         if (pushed) {
             walk_active[walk_active_len] = .{ .fid = @intCast(fid.int()), .ident = ident };
             walk_active_len += 1;
         }
-        const r = try invokeMethodFuncId(self, allocator, receiver, fid, buf[0..p.n]);
+        const r = try invokeMethodFuncId(self, allocator, receiver, fid, buf[0..m]);
         if (pushed) walk_active_len -= 1;
         if (r) |rr| return rr;
     }
@@ -13038,12 +13245,12 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     // whole hierarchy traversal. The self-delegation guard is re-checked
     // at serve time; an active entry declines to the full walk, whose
     // fills are vetoed while the guard filters.
-    if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+    if (namedWalkKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
         if (extMethodCacheGet(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
             const fid: FuncId = @enumFromInt(raw);
             if (!walkActive(fid, receiverIdent(receiver))) {
-                return try serveNamedFid(self, allocator, receiver, fid, args, arg_names orelse &.{}, k);
+                return try serveNamedFid(self, allocator, receiver, name, fid, args, arg_names orelse &.{});
             }
         }
     }
@@ -13213,7 +13420,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
         // non-active resolution memoizes — an entry picked while the
         // `walk_active` guard filtered a candidate is context-dependent.
         if (!walk_active_skipped) {
-            if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+            if (namedWalkKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
                 extMethodCachePut(self, k, @intFromEnum(fid));
             }
         }
@@ -13223,7 +13430,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
     // this (class, name, shape) too; memoize the miss so the ladder's
     // fallback stops re-walking the hierarchy per call.
     if (!walk_active_skipped) {
-        if (namedMethodKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
+        if (namedWalkKey(self, receiver, name, args, arg_names orelse &.{})) |k| {
             extMethodCachePut(self, k, METHOD_MISS);
         }
     }

@@ -175,6 +175,7 @@ pub const ClockWallTime = clock_mod.WallTime;
 pub const clockMonotonicNanos = clock_mod.monotonicNanos;
 pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
+pub const EventGate = clock_mod.EventGate;
 
 // float_fmt
 pub const floatToString = float_fmt_mod.floatToString;

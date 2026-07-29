@@ -111,6 +111,10 @@ pub const DriverWakeup = struct {
     /// strictly before closing — no resume can land in a mailbox nobody
     /// will ever drain again.
     mailbox_closed: bool = false,
+    /// Cross-thread event gate: rung on every mailbox post and every pump
+    /// turn, so the pump's timer waits and a resumer's turn-ack wait park
+    /// on the condvar instead of polling at a fixed cadence.
+    gate: runtime.EventGate = .{},
     pending_workers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     owned_slots: SpinMutex = .{},
     owned_slot_set: std.ArrayList(i64) = .empty,
@@ -148,11 +152,21 @@ pub const DriverWakeup = struct {
     /// `false` when the mailbox is already closed (the driver exited);
     /// the caller must route the resume through the persisted registry.
     pub fn postResume(self: *DriverWakeup, slot: i64, value: Value) Allocator.Error!bool {
+        {
+            self.mailbox.lock();
+            defer self.mailbox.unlock();
+            if (self.mailbox_closed) return false;
+            try self.mailbox_entries.append(self.allocator, .{ .slot = slot, .value = value });
+        }
+        self.gate.ring();
+        return true;
+    }
+
+    /// Whether the mailbox currently holds undelivered entries.
+    pub fn mailboxNonEmpty(self: *DriverWakeup) bool {
         self.mailbox.lock();
         defer self.mailbox.unlock();
-        if (self.mailbox_closed) return false;
-        try self.mailbox_entries.append(self.allocator, .{ .slot = slot, .value = value });
-        return true;
+        return self.mailbox_entries.items.len != 0;
     }
 
     /// Take everything queued in the mailbox.
@@ -1244,22 +1258,31 @@ pub const CooperativeInterceptor = struct {
                     countSleep(.timer_wall);
                     wall_streak += 1;
                     if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") == null) {
-                        // Adaptive wait toward the deadline: spin briefly,
-                        // then yield, then park in 100µs slices — a
-                        // cross-thread post is noticed within microseconds
-                        // for fast handoffs instead of at the old fixed
-                        // 1ms poll cadence (75k one-millisecond slices per
-                        // background-thread stress test were the dominant
-                        // wall cost). `wall_streak` resets on every
-                        // progress point, so a genuinely idle pump still
-                        // degrades to cheap parked sleeps, and the
-                        // mailbox drain between slices is unchanged.
+                        // Event wait toward the deadline: a cross-thread
+                        // post rings the wakeup gate, so the pump reacts
+                        // within microseconds without burning a core (a
+                        // pure spin here starves the posting workers; the
+                        // old fixed poll put 1ms — later 100µs — on every
+                        // handoff). A short spin phase serves back-to-back
+                        // handoffs without the syscall.
                         if (wall_streak <= 64) {
                             std.atomic.spinLoopHint();
-                        } else if (wall_streak <= 512) {
-                            std.Thread.yield() catch {};
                         } else {
-                            runtime.clockSleepMicros(100);
+                            const gp: *runtime.EventGate = blk: {
+                                const w = self.wakeup.borrowMut();
+                                defer w.deinit();
+                                break :blk &w.get().gate;
+                            };
+                            const seen = gp.epochNow();
+                            const nonempty = blk: {
+                                const w = self.wakeup.borrowMut();
+                                defer w.deinit();
+                                break :blk w.get().mailboxNonEmpty();
+                            };
+                            if (!nonempty) {
+                                const cap_us: u64 = @min(@as(u64, @intCast(wait)) * 1_000, 2_000);
+                                gp.waitFrom(seen, cap_us);
+                            }
                         }
                     }
                     if (self.nowMillis() < t) return .waiting;
@@ -2311,6 +2334,7 @@ fn pumpLoop(
             w.deinit();
         }
         _ = wakeup.cell.data.turns.fetchAdd(1, .release);
+        wakeup.cell.data.gate.ring();
         const had_resume = try drainWakeupInto(a, &wakeup, coroTop().?);
         if (had_resume) {
             endStreak("mailbox");
@@ -3199,10 +3223,12 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
                         if (ww.cell.data.turns.load(.acquire) >= turns0 + 2) break;
                         if (spins < 200) {
                             std.atomic.spinLoopHint();
-                        } else if (spins < 600) {
-                            std.Thread.yield() catch {};
                         } else {
-                            runtime.clockSleepMicros(100);
+                            // The pump rings its gate every turn; park on
+                            // it instead of polling.
+                            const seen = ww.cell.data.gate.epochNow();
+                            if (ww.cell.data.turns.load(.acquire) >= turns0 + 2) break;
+                            ww.cell.data.gate.waitFrom(seen, 100);
                         }
                     }
                     if (pumpDiagEnabled()) std.debug.print("[sync] done slot={d} turns={d} spins={d}\n", .{ slot, ww.cell.data.turns.load(.acquire), spins });

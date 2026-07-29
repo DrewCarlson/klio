@@ -1131,6 +1131,28 @@ stale-tag artifact; and a wall-invariant test under compute changes
 may simply mean the OPTIMIZED thread was not the critical path —
 check per-thread attribution before reclassifying.
 
+NAMED-DISPATCH COMPLETION + EVENT GATE (landed): the perm machinery
+extended with (1) an ORDER key that folds NO arg-type signature —
+binding order depends only on names, positions and per-arg
+callability, and the serve re-resolves positionally with the real
+values, so container-typed args (which make the strict signature
+unbuildable — the bulk of the named traffic) key fine; (2) a RELAXED
+walk key for the named hierarchy-walk memo (container KIND tags —
+member overloads cannot differ only by a generic element type under
+Kotlin erasure); (3) identity perms filled when the positional
+fallback serves a named call in its given order; (4) perms with
+TRAILING default gaps, served through the positional invoker whose
+binding fills the defaults (interior gaps keep the named path); and
+(5) `runtime.EventGate` — an epoch + libc condvar the DriverWakeup
+rings on every mailbox post and pump turn, so the pump's wall-timer
+wait and a resumer's two-turn ack park on the condvar instead of
+polling (a pure spin experiment STARVED the workers: 355s).
+markInvalidFromBackgroundThread 18.5 → 17.8s (1.62x cumulative).
+resumeOnBackgroundThread sits at ~102s: its floor is the pump
+SERIALLY EXECUTING each posted resume step (drain → run → ack), i.e.
+per-call compute on the pump thread — it tracks the general
+interpreter-speed campaign, not wait tuning.
+
 NAMED-PERM REPLAY (landed): for a memoized named member call the
 arg→param binding is itself a pure function of the memo key (the
 param list is fixed by the fid; arg tags ride the sig; the name
