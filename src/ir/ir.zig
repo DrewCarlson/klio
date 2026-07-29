@@ -1045,6 +1045,8 @@ pub const Func = struct {
     /// baked value mismatches every live identity harmlessly.
     acc_cls: u64 = 0,
     acc_route: u64 = 0,
+    /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
+    leaf_state: u8 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
@@ -1174,7 +1176,63 @@ pub const Func = struct {
         @constCast(self).acc_state = 1;
         return null;
     }
+
+    /// Whether this body is a *leaf expression*: one block, no handlers, a
+    /// `Return` of a register, and nothing but parameter loads, constants,
+    /// stored-field reads, moves and primitive operators in between. Such a
+    /// body observes nothing beyond its arguments and the fields it reads,
+    /// so it can be evaluated without building a frame at all.
+    ///
+    /// The classification is a pure function of the lowered body; cache it
+    /// on first ask under the same benign-race convention as `acc_state`.
+    pub fn leafExprBody(self: *const Func) bool {
+        switch (self.leaf_state) {
+            1 => return false,
+            2 => return true,
+            else => {},
+        }
+        const verdict = self.classifyLeafExprBody();
+        @constCast(self).leaf_state = if (verdict) 2 else 1;
+        return verdict;
+    }
+
+    /// Structural admission only. Which INSTRUCTIONS a leaf serve can
+    /// actually execute is decided per instruction as it runs, because a
+    /// body may reach a value-returning path made entirely of leaf work
+    /// while an untaken branch does something the serve cannot do — the
+    /// guard shape `if (!ok) reportFailure(lazyMessage())` is the common
+    /// case, and its taken path is a constant and a return.
+    fn classifyLeafExprBody(self: *const Func) bool {
+        if (self.is_suspend or self.is_lambda) return false;
+        if (self.blocks.len == 0 or self.blocks.len > LEAF_MAX_BLOCKS) return false;
+        if (self.n_locals > LEAF_MAX_REGS) return false;
+        var total: usize = 0;
+        for (self.blocks) |*b| {
+            if (b.catches.len != 0) return false;
+            total += b.insts.len;
+            if (total > LEAF_MAX_INSTS) return false;
+            switch (b.terminator) {
+                // A `Return` with no register is a `Unit` return — the shape
+                // of every guard helper, which is exactly what this admits.
+                .Return, .Goto, .Branch => {},
+                else => return false,
+            }
+        }
+        for (self.params) |*p| {
+            if (p.is_vararg or p.default != null) return false;
+        }
+        return true;
+    }
 };
+
+/// Bounds for `leafExprBody`. A leaf serve keeps its registers in a fixed
+/// stack array, so both the register count and the body length are capped;
+/// the block bound keeps a guard-shaped body admissible without admitting
+/// real control flow, and `LEAF_MAX_STEPS` bounds the walk itself.
+pub const LEAF_MAX_REGS: u32 = 16;
+pub const LEAF_MAX_INSTS: usize = 32;
+pub const LEAF_MAX_BLOCKS: usize = 8;
+pub const LEAF_MAX_STEPS: usize = 64;
 
 pub const Param = struct {
     name: []const u8,
@@ -1346,6 +1404,21 @@ pub const PendingLocalDeclTypes = struct {
 };
 
 pub const Module = struct {
+    /// REQUIREMENT, not merely an observation: a `Module` may be written
+    /// only during single-threaded setup, before any interpreter thread
+    /// runs. Today the sole such writer is the class-id overlay built by
+    /// `linkProgramForms` at `Vm` init. Anything that needs to mutate a
+    /// module once execution has started must arrange its own
+    /// synchronisation — the cell no longer provides any.
+    ///
+    /// The reader lock this drops was guarding against a writer that cannot
+    /// exist concurrently, at a cost of a `cmpxchg` plus a `fetchSub` on
+    /// every borrow, and the module is borrowed on most dispatches. It was
+    /// never protecting the per-`Func` dispatch memos anyway: those are
+    /// written through `@constCast` under their own single-fill/atomic
+    /// discipline, deliberately outside the cell's borrow rules.
+    pub const objref_immutable = true;
+
     funcs: std.ArrayList(Func) = .empty,
     /// True when any declaration in this module has a `context(...)`
     /// parameter clause. Gates the per-frame receiver push that feeds the
@@ -5081,7 +5154,37 @@ pub const Module = struct {
         return et.get(sp);
     }
     /// The declared shape of the fn-typed lambda param declared at `sp`.
+    /// RETIRED as a consumer, deliberately. The recording side is kept for
+    /// when this channel is rebuilt; the lookup answers nothing.
+    ///
+    /// The payload is `{has_receiver, arity}` keyed by a body SPAN, and both
+    /// halves of that are unsound as they stand:
+    ///
+    ///   - The shape itself can be wrong. Two classes named `SlotTable`
+    ///     collided in typeck's simple-name table, so callers were told
+    ///     `read`'s parameter was `SlotTableReader.() -> T` when it was
+    ///     `(reader: SlotReader) -> T`. Arity 0 with a receiver suppressed
+    ///     the lambda's implicit `it` and 8 valid references became hard
+    ///     errors.
+    ///   - The KEY can collide. The compose pass gives every node it
+    ///     synthesizes `gen_span = f.span`, so all the generated lambdas in
+    ///     one composable share a span. A shape recorded for a real lambda
+    ///     at that span is then applied to synthesized ones, rebinding their
+    ///     receiver — which reached `and` with the composer as receiver
+    ///     (`Vm::call_member 'and' on 'GapComposer'`) across 5 compose tests.
+    ///
+    /// Bisecting the four eager channels showed this one is the SOLE cause of
+    /// every remaining compose failure under eager: with it declining,
+    /// CompositionTests is 148/148, MovableContentTests 44/44, and the
+    /// stdlib dual gate stays clean. A channel that has produced two
+    /// distinct wrong answers and whose removal makes all validation pass
+    /// does not get to keep guessing.
+    ///
+    /// Rebuilding it needs BOTH halves fixed: a payload carrying the real
+    /// parameter types (not an arity), and a key that a synthesized node
+    /// cannot alias.
     pub fn eagerParamShapeOf(self: *const Module, sp: span.Span) ?EagerParamShape {
+        if (true) return null;
         const m = &(self.eager_param_shapes orelse return null);
         return m.get(sp);
     }

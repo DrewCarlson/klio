@@ -1992,13 +1992,34 @@ fn receiverImplementsOwnerIdentity(
 // `hostHasMember`.
 // -------------------------------------------------------------------------
 
+/// One remembered `name slice -> canonical string` mapping. The canonical
+/// string is program-lifetime, so `canon` stays valid; `src` is only a hint
+/// and every hit is confirmed by comparing bytes, which keeps the entry sound
+/// even if a transient string is freed and its address reused.
+const NameIdSlot = struct { src: usize = 0, canon: []const u8 = &.{} };
+threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
+
 /// Canonical pointer identity for a dispatch-cache method name. Runtime
 /// callable references carry collected String storage, so their raw byte
 /// address must never enter a program-lifetime cache key.
+///
+/// Almost every caller passes a name slice straight out of the IR, whose
+/// address is stable for the life of the program — so the mapping is
+/// remembered per source address and confirmed with a byte compare, which
+/// takes the interning hash + shared-map probe off the dispatch path.
 fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
-    const pg = self.prog.borrowMut();
-    defer pg.deinit();
-    return pg.get().memberNameIdentity(name);
+    const src = @intFromPtr(name.ptr);
+    const slot = &name_id_cache[(src >> 3) % name_id_cache.len];
+    if (slot.src == src and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
+        return @intFromPtr(slot.canon.ptr);
+    }
+    const id = blk: {
+        const pg = self.prog.borrowMut();
+        defer pg.deinit();
+        break :blk pg.get().memberNameIdentity(name) orelse return null;
+    };
+    slot.* = .{ .src = src, .canon = @as([*]const u8, @ptrFromInt(id))[0..name.len] };
+    return id;
 }
 
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
@@ -9507,6 +9528,19 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     if (args_in.len == 0) {
         if (mod.funcById(fid)) |fp| {
             if (vmhost.host_fields.accessorFastGet(self, mod, fp, receiver)) |r| return r;
+        }
+    }
+    // The wider leaf-expression shape: a body that only reads its arguments
+    // and stored fields and combines them with primitive operators runs
+    // without a frame.
+    if (mod.funcById(fid)) |fp| {
+        if (fp.has_receiver_param and args_in.len + 1 == fp.params.len and
+            args_in.len < ir.LEAF_MAX_REGS)
+        {
+            var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
+            argbuf[0] = receiver.*;
+            for (args_in, 0..) |a, i| argbuf[i + 1] = a;
+            if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
         }
     }
     if (nuTraceEnv()) |want| {

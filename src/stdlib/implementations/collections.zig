@@ -7392,11 +7392,10 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
     if (dest_offset < 0 or dest_offset + count > dest_len) {
         return indexOob(a, try fmt(a, "copyInto: destination range [{d}, {d}) out of bounds for length {d}", .{ dest_offset, dest_offset + count, dest_len }));
     }
-    const snap = try src_arr.snapshot(a);
+    const sub = try src_arr.snapshotRange(a, @intCast(start), @intCast(end));
     // The snapshot bridges src->dest; free the spine on exit (`set` retains into
     // the destination under a reclaiming backend).
-    defer if (runtime.freeScratch()) a.free(snap);
-    const sub = snap[@intCast(start)..@intCast(end)];
+    defer if (runtime.freeScratch()) a.free(sub);
     const base: usize = @intCast(dest_offset);
     for (sub, 0..) |v, i| dest_arr.set(a, base + i, v);
     return ok(dest_val);
@@ -7423,9 +7422,10 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
     const cur = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(cur);
     var out: std.ArrayList(Value) = .empty;
+    try out.ensureTotalCapacityPrecise(a, n);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        try out.append(a, if (i < cur.len) cur[i] else default);
+        out.appendAssumeCapacity(if (i < cur.len) cur[i] else default);
     }
     return ok(try makeArrayBorrowed(a, out, prim));
 }
