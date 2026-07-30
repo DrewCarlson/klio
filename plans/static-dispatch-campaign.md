@@ -307,7 +307,37 @@ It also fails with NO sibling support files at all — `klio-harness test` on
 `ComparisonDSL.kt` / `testUtils.kt`, which do emit conflicting-overload errors in
 other file sets.
 
-Bisection started and the poison is LOCATED TO A RANGE. The first 45 lines —
+Bisection COMPLETE at the range level. Cutting the class body at `@Test`
+boundaries and closing the brace:
+
+    lines 1-145  ->  4 tests,  4 passed
+    lines 1-248  ->  6 tests,  6 passed
+    lines 1-398  -> 19 tests, 19 passed
+    lines 1-475  -> 20 tests, 19 passed, 1 FAILED
+    whole file   -> 21 tests,  0 passed, 21 FAILED
+
+So there are TWO separate problems, which is why every single-cause hypothesis
+failed:
+
+  1. Lines 399-475 add ONE failing test,
+     `testV7UuidGenerationForNonMonotonicClock`. That one loops on a clock until
+     a counter is small enough — a plausible genuine timing/logic failure and
+     the likely reason this file looked intermittent all session.
+  2. Lines 476-505 flip the file from 1 failure to ALL 21 unresolved. That range
+     holds `testV7GenerateUnordered` plus the nested
+     `private class NonMonotonicClock : Clock`.
+
+The nested class is NOT the cause on its own — a standalone file with exactly
+that class (including `Clock.System.now()`, an `override fun now()`, and a
+defaulted-parameter method) compiles and passes. So the trigger is in
+`testV7GenerateUnordered`'s body, and the first thing to check is
+`Uuid.generateV7NonMonotonicAt(...)` and `Instant.fromEpochMilliseconds(...)`:
+an unresolved MEMBER there poisoning whole-file resolution would explain why
+`assertEquals` reports unresolved in every other test.
+
+Older text, kept because its exclusions are still valid:
+
+ The first 45 lines —
 package, all imports, every property including the two `Uuid` member-extension
 properties, and the first `assertEquals` of `fromLongs` — compile and PASS when
 closed off as their own file. The whole file fails. So the poisoning declaration
