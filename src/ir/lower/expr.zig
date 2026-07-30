@@ -11656,6 +11656,34 @@ pub const NoRecvCall = enum(u8) {
 };
 pub var lm_norecv_call: [5]u64 = @splat(0);
 
+/// Breakdown of the `resolver_declined` bucket — sites where lowering DID have
+/// a receiver type and the resolver still refused to name a declaration. It is
+/// the second-largest bucket and, unlike `no_receiver_type`, needs nothing from
+/// typeck, so it is the cheapest remaining coverage to reason about.
+pub const DeclineKind = enum(u8) {
+    /// The resolver identified the declaration but withheld a dispatch
+    /// commitment. The identity is already proven here.
+    target_known_deferred,
+    /// A visible member accepts the call shape but more than one could.
+    ambiguous_applicable,
+    /// No visible member accepts the shape at all.
+    not_applicable,
+    /// A target id that no longer resolves to a function.
+    target_unresolvable,
+};
+pub var lm_decline: [4]u64 = @splat(0);
+
+pub fn lowerDeclineDump() void {
+    var total: u64 = 0;
+    for (lm_decline) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[decline] total={d}\n", .{total});
+    inline for (@typeInfo(DeclineKind).@"enum".fields) |f| {
+        const n = lm_decline[f.value];
+        if (n != 0) std.debug.print("[decline] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
 /// Classify a `Call` expression against the strict condition a return-type
 /// channel would need: the name must identify one function whose declared
 /// return type is not one of its own type parameters.
@@ -11823,8 +11851,24 @@ fn lowerResolvedMemberCall(
     }
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
-    if (resolved.dispatch == .deferred) { lmNote(.resolver_declined); return .deferred; }
-    var target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
+    if (resolved.dispatch == .deferred) {
+        lmNote(.resolver_declined);
+        if (norecvCensusOn()) {
+            const k: DeclineKind = if (resolved.target != null)
+                .target_known_deferred
+            else if (resolved.applicable)
+                .ambiguous_applicable
+            else
+                .not_applicable;
+            lm_decline[@intFromEnum(k)] += 1;
+        }
+        return .deferred;
+    }
+    var target = b.module.funcById(func_id) orelse {
+        lmNote(.resolver_declined);
+        if (norecvCensusOn()) lm_decline[@intFromEnum(DeclineKind.target_unresolvable)] += 1;
+        return .deferred;
+    };
     const has_spread = anySpread(args);
     if (resolved.dispatch == .direct and has_spread) { lmNote(.resolver_declined); return .deferred; }
     if (resolved.dispatch == .virtual) {

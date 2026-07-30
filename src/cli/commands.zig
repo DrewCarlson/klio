@@ -701,6 +701,7 @@ fn runTestsOnBuilt(
     if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
+        ir.lower.expr.lowerDeclineDump();
     }
     ir.eval.probeStatsDump();
     ir.eval.opProfDump();

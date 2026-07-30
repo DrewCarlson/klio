@@ -583,6 +583,47 @@ put the read in an inner class, which was never the trigger. The trigger is a
 bare name inside an inline receiver-lambda whose receiver is statically typed,
 referring to a member of the ENCLOSING class.
 
+### The largest remaining lever needs no typeck: 834 already-identified targets
+
+`resolver_declined` is the second-largest bucket (1,934 sites, 19.5%) and had
+never been broken down. Unlike `no_receiver_type` it needs NOTHING from typeck —
+lowering already has the receiver type at every one of these sites. Split by
+what the resolver returned (`[decline]`, same `KLIO_DISPATCH_STATS` gate):
+
+    834  100.00%  target_known_deferred
+
+Every single one. The resolver has already IDENTIFIED the declaration and only
+withholds the dispatch commitment. Nothing is ambiguous and nothing is
+inapplicable. (The count is of sites reaching the post-target path; the rest
+return earlier, at `resolved.target orelse ...`.)
+
+They all come from one line in `resolveMemberCall`:
+
+    if (unknown_count == 1) {
+        return .{ .target = unknown, .dispatch = .deferred, .applicable = true };
+    }
+
+Exactly one candidate exists, but an argument's type is unknown so its
+applicability is unproven, and the resolver names the target as expected-type
+metadata for the arguments while refusing to dispatch through it.
+
+Set that against the coverage numbers: `bound_virtual` is **9**. There are 834
+sites with a proven declaration identity that emit no static binding at all,
+against 9 that emit a virtual slot. A virtual slot IS static dispatch — it is a
+numeric method index, no runtime name lookup — and it is the correct emission
+for a known-but-overridable declaration.
+
+So the question to answer next is narrow and well-posed: when exactly one
+candidate of that name is visible and the only doubt is an argument's type, is a
+`CallVirtual` slot sound? The risk to rule out is a call that should have bound
+an EXTENSION instead of the member — which is exactly what `unknown_count`
+protects against today. Answer that and up to 834 sites move from dynamic to
+static in one change, with no typeck work at all.
+
+This bucket is a better next target than the generic-element-type project. That
+project is still the answer for the 68% `no_receiver_type` mass, but this one is
+a fifth of the sites, is fully diagnosed, and depends on nothing.
+
 ### Why re-widening is blocked (superseded theory below — read this first)
 
 Ruled out by experiment: it is NOT instantiation-dependent recordings.
