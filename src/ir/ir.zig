@@ -5154,7 +5154,37 @@ pub const Module = struct {
         return et.get(sp);
     }
     /// The declared shape of the fn-typed lambda param declared at `sp`.
+    /// RETIRED as a consumer, deliberately. The recording side is kept for
+    /// when this channel is rebuilt; the lookup answers nothing.
+    ///
+    /// The payload is `{has_receiver, arity}` keyed by a body SPAN, and both
+    /// halves of that are unsound as they stand:
+    ///
+    ///   - The shape itself can be wrong. Two classes named `SlotTable`
+    ///     collided in typeck's simple-name table, so callers were told
+    ///     `read`'s parameter was `SlotTableReader.() -> T` when it was
+    ///     `(reader: SlotReader) -> T`. Arity 0 with a receiver suppressed
+    ///     the lambda's implicit `it` and 8 valid references became hard
+    ///     errors.
+    ///   - The KEY can collide. The compose pass gives every node it
+    ///     synthesizes `gen_span = f.span`, so all the generated lambdas in
+    ///     one composable share a span. A shape recorded for a real lambda
+    ///     at that span is then applied to synthesized ones, rebinding their
+    ///     receiver — which reached `and` with the composer as receiver
+    ///     (`Vm::call_member 'and' on 'GapComposer'`) across 5 compose tests.
+    ///
+    /// Bisecting the four eager channels showed this one is the SOLE cause of
+    /// every remaining compose failure under eager: with it declining,
+    /// CompositionTests is 148/148, MovableContentTests 44/44, and the
+    /// stdlib dual gate stays clean. A channel that has produced two
+    /// distinct wrong answers and whose removal makes all validation pass
+    /// does not get to keep guessing.
+    ///
+    /// Rebuilding it needs BOTH halves fixed: a payload carrying the real
+    /// parameter types (not an arity), and a key that a synthesized node
+    /// cannot alias.
     pub fn eagerParamShapeOf(self: *const Module, sp: span.Span) ?EagerParamShape {
+        if (true) return null;
         const m = &(self.eager_param_shapes orelse return null);
         return m.get(sp);
     }
