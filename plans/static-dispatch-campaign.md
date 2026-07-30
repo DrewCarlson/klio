@@ -348,8 +348,38 @@ also passes, 21/21.
 Then the ORIGINAL file at its original path passed too, 21/21, on the very next
 run.
 
-**So the failure is intermittent, and none of the structural analysis above
-applies.** An intermediate conclusion that it was path-dependent (the copy passed
+**CORRECTION: it is NOT intermittent. It is deterministic on the FILE SET.**
+
+    UuidTest.kt alone                         -> 8 runs, 21/21 pass every time
+    the sweep's full child argv (8 support
+    files + UuidTest.kt)                      -> 4 runs, 0/21 pass every time
+
+Both are reproducible on demand. The earlier "intermittent" reading came from
+comparing a standalone run against a sweep run without noticing the file set
+differed, and the "path-dependent" reading before it was the same mistake — the
+copy was run alone, the original was run with siblings.
+
+Pairs do not reproduce it: `PlatformActuals.kt + UuidTest.kt` passes, and
+`testUtils.kt + UuidTest.kt` passes. `--only-file=` is not the trigger either
+(the same pair passes with and without it). So it takes some larger combination
+of the eight support files.
+
+That makes the next step a bisect of the FILE LIST, not of the source:
+
+    tests/stdlib_commontest_actuals/PlatformActuals.kt
+    tests/stdlib_commontest_actuals/EncodingActuals.kt
+    tests/stdlib_commontest_actuals/JsCollectionFactories.kt
+    kotlin/libraries/stdlib/test/collections/CollectionBehaviors.kt
+    kotlin/libraries/stdlib/test/collections/ComparisonDSL.kt
+    kotlin/libraries/stdlib/test/testUtils.kt
+    kotlin/libraries/stdlib/test/time/DurationTestUtils.kt
+
+Halve that list. Note `ComparisonDSL.kt` and `testUtils.kt` are already known to
+emit conflicting-overload errors in other file sets, which makes them the first
+place to look.
+
+Everything below about cutting the SOURCE is superseded — those cuts all passed
+because they were run standalone. An intermediate conclusion that it was path-dependent (the copy passed
 while the original failed) was wrong; that was the same flakiness sampled twice.
 Every "cut X and it passes" result in this section is therefore uninformative —
 they were passing runs, not passing configurations.
