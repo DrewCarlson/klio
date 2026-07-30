@@ -392,21 +392,29 @@ specific things, both measured:
         declaration when it matches. So the bug is NOT missing machinery, and not
         merging either.
 
-        That leaves two specific candidates, and they are cheap to distinguish:
+        BOTH candidates are ruled out, and the linker is exonerated. A probe
+        over `decl_sigs` at link time shows:
 
-        a. `overridesSlot` returns false for an interface-to-interface override
-           (`Element.minusKey` over `CoroutineContext.minusKey`), so the slot is
-           never re-pointed.
-        b. `Element.minusKey` never appears in `decl_sigs` with
-           `enclosing_class == Element`, so it is not in `own_methods` and the
-           loop never considers it. Note the loop also skips
-           `visibility == .Private` and anything whose `kind` is not
-           `instance_method` — an interface member with a default body is worth
-           checking against both filters.
+            fid=124 kotlin.coroutines.CoroutineContext.Element.minusKey
+                    owner=…Element  is_override=true  nparams=2
+            fid=128 kotlin.coroutines.CoroutineContext.minusKey
+                    owner=…CoroutineContext  is_override=false  nparams=2
 
-        Check (b) first: it is a single lookup, and the same filter would explain
-        why `Comparator.compare` — which has no intermediate overriding interface
-        and so needs no re-pointing — works fine.
+        `Element.minusKey` IS in `decl_sigs` under `Element`, as a public
+        `instance_method`, so it reaches `own_methods`. And every precondition
+        `overridesSlot` checks holds — `is_override` true, same name, same kind,
+        same parameter count. So linking `Element` should re-point slot 128 to
+        fid 124, and a concrete class implementing `Element` should inherit that
+        mapping.
+
+        Which means the regression is probably NOT a linking failure at all. Do
+        not audit `linkMethodClass` further on this evidence. The next step is to
+        observe what slot 128 actually resolves to for a
+        `DerivedElementWithOldKey` receiver AT RUNTIME — `methodSlotTarget` for
+        that (class, slot) pair — and compare it against fid 124. If it is 124,
+        the dispatch is right and the fault is elsewhere in the promotion; if it
+        is 128, the re-pointing did not survive into `method_dispatch` and the
+        question becomes which of the two loops dropped it.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
