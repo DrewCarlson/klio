@@ -307,9 +307,27 @@ It also fails with NO sibling support files at all — `klio-harness test` on
 `ComparisonDSL.kt` / `testUtils.kt`, which do emit conflicting-overload errors in
 other file sets.
 
-The remaining approach is mechanical: bisect `UuidTest.kt` itself by halving its
-body until the smallest failing file is found. Every structural feature guessed
-at from the outside has now been wrong, so stop guessing and halve the file.
+Bisection started and the poison is LOCATED TO A RANGE. The first 45 lines —
+package, all imports, every property including the two `Uuid` member-extension
+properties, and the first `assertEquals` of `fromLongs` — compile and PASS when
+closed off as their own file. The whole file fails. So the poisoning declaration
+is after line 45, and it makes `assertEquals` unresolvable in bodies that appear
+BEFORE it, which points at a module-level resolution table being corrupted rather
+than at ordinary scoping.
+
+Candidate declarations in the remaining range, in the order worth testing:
+
+  - line 148, a LOCAL function named `test` inside `parse()`, with defaulted
+    parameters and a function-typed parameter:
+    `fun test(hexDash: String? = null, hex: String? = null, check: (parse: () -> Uuid) -> Unit)`.
+    A local named `test` in a test file is exactly the kind of collision that
+    has produced conflicting-overload errors elsewhere in this suite.
+  - line 142, a member extension function `private fun String.mixedcase()`.
+  - lines 128-129, `UByteArray(32) { it.toUByte() }` — an unsigned ARRAY
+    constructor with a lambda, which touches the same host-primitive types the
+    inventory flags as having no IR class.
+
+Continue by halving the range 46-505, not by guessing among these.
 
 Anyone gating on the sweep should treat these as a known baseline failure until
 diagnosed, and should NOT attribute them to a dispatch change without bisecting
