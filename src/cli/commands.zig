@@ -702,6 +702,7 @@ fn runTestsOnBuilt(
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
         ir.lower.expr.lowerDeclineDump();
+        ir.lower.expr.lowerNoClassDump();
     }
     ir.eval.probeStatsDump();
     ir.eval.opProfDump();

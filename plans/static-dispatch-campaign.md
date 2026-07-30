@@ -229,6 +229,126 @@ get `plusCollectionInference` / `countEach` right as the first two
 regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
+
+## Inventory: everything that is still not statically bound
+
+The end goal is FULL static dispatch — a bytecode VM and a Kotlin-to-C
+transpiler both need every call site to name its target at compile time, with
+the only permitted exceptions being language features deliberately omitted
+(advanced reflection and anything else that is dynamic by definition). This
+section is the running ledger of what remains, so the tail can be worked through
+deliberately instead of rediscovered.
+
+Current census (`KLIO_DISPATCH_STATS`, collections/comparisons file set):
+
+    total 9,755 member call sites
+      274   2.81%  bound_static     <- direct FuncId call
+        9   0.09%  bound_virtual    <- method slot, no name lookup
+    ------------------------------
+    6,720  68.89%  no_receiver_type
+    1,862  19.09%  resolver_declined
+      747   7.66%  no_class_id
+      143   1.47%  nullable_or_generic
+
+Statically bound: 283 of 9,755 (2.9%). Every other line below is work.
+
+### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
+
+Broken down by receiver shape and, for the dominant `Path` shape, by what kind
+of name it is:
+
+    4,317  Path      of which  3,513  a live local with no recorded type
+                                 356  unknown
+                                 283  captured
+                                 161  an enclosing class member
+    1,709  Call      (a call result)
+      286  Binary
+      256  Member
+      (Index/Unary/Postfix/This/ObjectExpr under 1.5% combined)
+
+Of the 3,513 untyped locals, 2,499 have an initializer whose type cannot be
+derived and 1,014 have no initializer recorded at all (loop variable, lambda
+parameter, destructured component). Catch parameters USED to be in that last
+group and are now typed.
+
+The blocker is generic containers: typeck does not know an `Array`'s or a
+`List`'s element type at ~3,800 sites, and a head without arguments is worse
+than no answer (it disproves candidates a null receiver type would have
+reached). This is the one bucket that genuinely requires a typeck project —
+substituting type arguments through call sites and propagating them from
+declarations. Everything else below does not.
+
+### 2. `resolver_declined` — 1,862 (19.1%). Needs no typeck.
+
+Every deferral reaching the post-target path is `target_known_deferred`: the
+resolver has ALREADY identified the declaration and withholds only the dispatch
+commitment, because an argument's type is unknown so applicability is unproven.
+
+78 of these are now bound (see the entry above). The rest are held back by two
+specific things, both measured:
+
+  - **Interface receivers.** Allowing them binds a further 174 sites
+    (`bound_virtual` 9 -> 183) and the stdlib sweep fails: an interface-typed
+    receiver can hold a host-backed value (`Sequence` is a generator, not an
+    `Instance`) and the method slot raises "virtual call receiver is not an
+    instance". Making that arm fall back to name-based dispatch was tried and
+    regresses `ContinuationInterceptorKeyTest` — dispatching by NAME is not
+    equivalent to dispatching by slot when a subclass overrides `key`. The
+    correct fix is to give host-backed interface values a vtable path, not to
+    fall back by name.
+  - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
+    rule out an extension. Tightening that query (it answers yes for any
+    generic-receiver extension) would convert more.
+
+### 3. `no_class_id` — 747 (7.7%). Mostly type parameters, now partly solved.
+
+Was 915. All of them were a bare head naming no class, and the heads are
+overwhelmingly TYPE PARAMETERS:
+
+    341 C    182 M    132 A    100 T    14 R      <- type parameters (769)
+     22 UInt  18 UShort  18 ULong  18 UByte
+     16 UByteArray  13 ULongArray  13 UIntArray  12 UShortArray   <- unsigned (~146)
+
+Resolving a type-parameter receiver through its declared upper bound (Kotlin's
+own rule) moves 168 sites out of this bucket. They land in `resolver_declined`
+rather than binding, because their bounds are interfaces — so this bucket is now
+gated on the interface work in section 2, not on anything of its own.
+
+The unsigned types (`UInt`, `ULongArray`, …) are a separate, small, and probably
+easy item: they are value classes that do not register a ClassId.
+
+### 4. `nullable_or_generic` — 143 (1.5%).
+
+A nullable receiver type is refused outright. `a?.f()` still has a static target
+on the non-null branch, so most of this should be reachable by binding the
+call inside the null check rather than declining the whole site.
+
+### 5. Known to be dynamic by design
+
+Not counted as failures, but they must be enumerated before "full" means
+anything:
+
+  - `CallMemberOrGlobal` — a bare call in a receiver context that could be
+    either a member or a top-level function.
+  - `LoadFromThisOrGlobal` / `StoreToThisOrGlobal` — the bare-name read/write
+    walks over implicit receivers.
+  - Host-backed members: everything `host_call_member.zig` intercepts by NAME
+    (`stackTraceToString`, `addSuppressed`, collection builtins). A transpiler
+    needs these bound to concrete host symbols rather than matched by string.
+  - `invoke` on a function value, and SAM conversion.
+  - Reflection (`::member`, `KClass`) — the one category intended to stay
+    dynamic and to be omitted where it cannot be.
+
+### Ordering for the sweep
+
+1. Interface receivers with host-backed values (section 2) — unlocks 174
+   directly plus the 168 that section 3 already moved.
+2. Unsigned value classes registering a ClassId (section 3) — ~146.
+3. Nullable receivers (section 4) — ~143.
+4. Tighten `extCouldApply` (section 2).
+5. The typeck generic-argument project (section 1) — the 68%, and by far the
+   largest single piece.
+
 ### Measured: what is actually missing is a call's return type
 
 The widening argument above ends at "typeck's generic inference is the

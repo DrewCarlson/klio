@@ -1950,6 +1950,14 @@ pub const FuncBuilder = struct {
         try self.owned_type_param_names.append(self.allocator, text);
         return text;
     }
+    /// The declared upper bound of type parameter `name`, when the enclosing
+    /// declaration gives one. A member call on a value typed by a type
+    /// parameter resolves against that bound in Kotlin, so this is what lets
+    /// such a receiver name a class at all.
+    pub fn typeParamBound(self: *const FuncBuilder, name: []const u8) ?ir.ModuleRegistry.TypeParamBound {
+        return self.type_param_bounds.get(name);
+    }
+
     pub fn typeParamBoundsSlice(
         self: *const FuncBuilder,
     ) Allocator.Error!?[]const ir.ModuleRegistry.TypeParamBound {

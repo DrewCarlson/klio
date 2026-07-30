@@ -11673,6 +11673,30 @@ pub const DeclineKind = enum(u8) {
 };
 pub var lm_decline: [4]u64 = @splat(0);
 
+/// Breakdown of `no_class_id` — lowering HAS a receiver type and cannot map its
+/// head to a declared class. Nothing here needs typeck; it is name resolution.
+pub const NoClassKind = enum(u8) {
+    /// A dotted name that `classIdByFqn` does not know.
+    fqn_unknown,
+    /// A bare head that no class declares.
+    simple_unknown,
+    /// A bare head that SEVERAL classes declare, so the simple-name lookup
+    /// refuses to pick — the ambiguity a fully qualified answer would settle.
+    simple_ambiguous,
+};
+pub var lm_noclass: [3]u64 = @splat(0);
+
+pub fn lowerNoClassDump() void {
+    var total: u64 = 0;
+    for (lm_noclass) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[no-class] total={d}\n", .{total});
+    inline for (@typeInfo(NoClassKind).@"enum".fields) |f| {
+        const n = lm_noclass[f.value];
+        if (n != 0) std.debug.print("[no-class] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
 pub fn lowerDeclineDump() void {
     var total: u64 = 0;
     for (lm_decline) |n| total += n;
@@ -11791,12 +11815,42 @@ fn lowerResolvedMemberCall(
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
-    const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head);
+    // A receiver typed by a TYPE PARAMETER names no class, and that was the
+    // whole of the `no_class_id` bucket — `C`, `M`, `A`, `T`, `R` accounted for
+    // 769 of 915 sites. Kotlin resolves a member call on such a value against
+    // the parameter's declared upper bound, so resolve the head through it.
+    // Only a `complete` bound is used: an incomplete record dropped
+    // intersection or structural information and cannot stand in for the type.
+    if (owner_id == null) {
+        if (b.typeParamBound(head)) |tpb| {
+            if (tpb.complete) {
+                var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
+                if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
+                owner_id = if (std.mem.indexOfScalar(u8, bound_identity, '.') != null)
+                    b.module.classIdByFqn(bound_identity)
+                else
+                    b.module.uniqueClassIdBySimpleName(typeHead(bound_identity));
+            }
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
+        if (norecvCensusOn()) {
+            const k: NoClassKind = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                .fqn_unknown
+            else if (b.module.classId(head) != null)
+                .simple_ambiguous
+            else
+                .simple_unknown;
+            lm_noclass[@intFromEnum(k)] += 1;
+            if (runtime.getenvSlice("KLIO_NOCLASS_HEADS") != null) {
+                std.debug.print("[no-class-head] {s}\n", .{head});
+            }
+        }
         return .none;
     };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
