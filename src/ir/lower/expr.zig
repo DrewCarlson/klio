@@ -7706,11 +7706,28 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // legitimate declared-wider-vs-inferred-narrower class.
     if (lazy_ans == null) {
         if (b.module.eagerTypeOf(arg.span())) |th| {
-            if (typeheadAuditOn()) {
-                const sp = arg.span();
-                std.debug.print("[TYPEHEAD-FILL] f{d}:{d} typeck={s}{s}\n", .{ sp.file.int(), sp.start, th.name, if (th.nullable) @as([]const u8, "?") else "" });
+            // `EagerTypeHead` carries a head and nullability, no type
+            // ARGUMENTS. For a generic type that makes the answer worse than
+            // none: extension selection needs the element type to choose
+            // between `Iterable<T>.minOrNull` (total order) and
+            // `Iterable<Double>.minOrNull` (IEEE), and a head-only `List`
+            // disproves the generic candidate that a null receiver type would
+            // have found by the broader walk. Measured: with the head,
+            // `minOrNull` on Array/List/Sequence resolves to target=null and
+            // falls to runtime dispatch, which picks the IEEE overload and
+            // returns NaN where 0.0 is correct.
+            if (headDeclaresTypeParams(b, th.name)) {
+                if (typeheadAuditOn()) {
+                    const sp = arg.span();
+                    std.debug.print("[TYPEHEAD-SKIP] f{d}:{d} generic head {s} has no args\n", .{ sp.file.int(), sp.start, th.name });
+                }
+            } else {
+                if (typeheadAuditOn()) {
+                    const sp = arg.span();
+                    std.debug.print("[TYPEHEAD-FILL] f{d}:{d} typeck={s}{s}\n", .{ sp.file.int(), sp.start, th.name, if (th.nullable) @as([]const u8, "?") else "" });
+                }
+                lazy_ans = .{ .name = th.name, .nullable = th.nullable, .args = &.{} };
             }
-            lazy_ans = .{ .name = th.name, .nullable = th.nullable, .args = &.{} };
         }
     }
     if (typeheadAuditOn()) {
@@ -7738,6 +7755,33 @@ fn typeheadAuditOn() bool {
     const on = runtime.getenvSlice("KLIO_TYPEHEAD_AUDIT") != null;
     S.cached = on;
     return on;
+}
+
+/// Whether the class named by an eager type HEAD declares type parameters,
+/// in which case a head without arguments is incomplete evidence. Builtin
+/// container heads are listed explicitly: they are not user classes, so the
+/// class table cannot answer for them.
+fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
+    const generic_builtins = [_][]const u8{
+        "Array",       "List",     "MutableList", "Set",      "MutableSet",
+        "Map",         "MutableMap", "Collection", "MutableCollection",
+        "Iterable",    "MutableIterable", "Sequence", "Iterator",
+        "MutableIterator", "Comparable", "Comparator", "Pair", "Triple",
+        "Lazy",        "Result",   "Map.Entry",   "MutableMap.MutableEntry",
+    };
+    for (generic_builtins) |g| {
+        if (std.mem.eql(u8, g, head)) return true;
+    }
+    const cid = if (std.mem.indexOfScalar(u8, head, '.') != null)
+        b.module.classIdByFqn(head)
+    else
+        b.module.uniqueClassIdBySimpleName(head);
+    if (cid) |id| {
+        if (id.int() < b.module.classes.items.len) {
+            return b.module.classes.items[id.int()].type_params.len != 0;
+        }
+    }
+    return false;
 }
 
 fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
