@@ -560,3 +560,29 @@ a performance change, unless a fresh measurement says otherwise.
 (executed call forms and member sub-tails) and `[lower-sites]` (static-gate
 coverage per call site). Both are free when off — rob measures 43.3-43.7s
 with them compiled in against a 43.8-44.2s baseline.
+
+### Open bug found alongside this work: a later local captures an earlier bare write
+
+Independent of the receiver-lambda write fix, and on a path that fix does not
+touch:
+
+    class Slot { var value: String = "empty" }
+    fun main() {
+        val a = Slot()
+        with(a) { value = "written" }
+        println(a.value)          // prints `empty`, kotlinc prints `written`
+        var value = "local"
+        println(value)
+    }
+
+A local declared LATER in the block is already visible to `b.resolve` when the
+earlier bare-name write is lowered, so the write takes the rebind arm and
+targets the not-yet-declared local instead of the receiver's property. Local
+declarations are hoisted for register allocation without carrying their
+declaration POSITION, so name resolution inside the block cannot tell "declared
+above" from "declared below".
+
+This is the same defect shape as the rest of this document: an answer given from
+information that does not identify what is being asked about — here the scope
+query knows the name but not the point in the block. It is a silent wrong
+answer, not an error, and it is worth fixing next.

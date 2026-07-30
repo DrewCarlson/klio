@@ -611,6 +611,16 @@ pub const Inst = union(enum) {
         this_idx: u16,
         name: ConstId,
         value: Reg,
+        /// Statically known innermost implicit receiver, when lowering has it
+        /// in a register. An inline extension's spliced body binds its
+        /// receiver as an ordinary register of the CALLER's frame, so the
+        /// capture slot `this_idx` names is never populated and the walk below
+        /// cannot see the receiver at all — a bare-name write inside
+        /// `x.apply { … }` fell through to the global and was silently lost.
+        /// Tried FIRST (it is the innermost receiver) and still subject to the
+        /// same ownership check, so a receiver that does not declare the
+        /// property falls through exactly as before.
+        recv: ?Reg = null,
     },
     /// Call a bare-name function inside a lambda body that may be
     /// invoked with a this-receiver. If the captured this is an

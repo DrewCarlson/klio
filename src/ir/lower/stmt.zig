@@ -1089,6 +1089,12 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                     .this_idx = this_idx,
                     .name = name_c,
                     .value = combined,
+                    // Hand over the receiver register when lowering has one:
+                    // in a spliced inline body it is the only way the runtime
+                    // can reach the receiver. Ownership is still checked at
+                    // run time, so passing it can never capture a write the
+                    // receiver does not declare.
+                    .recv = b.resolve("this"),
                 } });
             } else {
                 // Top-level binding: route through StoreGlobal so
