@@ -1036,7 +1036,25 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 return;
             }
             const seg = p.segments[0].name;
-            if (b.isBoxed(seg)) {
+            // The boxed set is computed for the whole body and carries no
+            // declaration POSITION, so a name is "boxed" even at sites that
+            // precede its `var`. Require the name to actually be in scope as a
+            // local here — bound in this frame, or a capture from an enclosing
+            // one. Without that, a bare write in a receiver lambda that merely
+            // shares a name with a `var` declared FURTHER DOWN wrote that
+            // local's cell instead of the receiver's property, and the later
+            // declaration then overwrote it:
+            //
+            //     with(slot) { value = "written" }   // lost
+            //     var value = "local"
+            //
+            // `knowsOuter` is what keeps genuine captures on the cell path: a
+            // lambda nested in a property getter reaches its capture only
+            // through the cell, so `resolve` is null there even though the
+            // write must still go to it.
+            const boxed_in_scope = b.isBoxed(seg) and
+                (b.resolve(seg) != null or b.knowsOuter(seg));
+            if (boxed_in_scope) {
                 // A captured-and-written outer var is boxed into a shared
                 // `Value.Cell` at its binding site (var decl, function /
                 // lambda parameter, or inline-splice parameter), so the

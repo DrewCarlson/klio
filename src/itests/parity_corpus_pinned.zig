@@ -1133,3 +1133,15 @@ test "bare_write_receiver_lacks_property" {
         \\
     );
 }
+
+test "bare_write_var_declared_later" {
+    try check("bare_write_var_declared_later",
+        \\applied
+        \\run!
+        \\through-run
+        \\through-with
+        \\captured
+        \\top-level
+        \\
+    );
+}

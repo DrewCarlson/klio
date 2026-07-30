@@ -561,7 +561,7 @@ a performance change, unless a fresh measurement says otherwise.
 coverage per call site). Both are free when off — rob measures 43.3-43.7s
 with them compiled in against a 43.8-44.2s baseline.
 
-### Open bug found alongside this work: a later local captures an earlier bare write
+### Fixed alongside this work: a later local captured an earlier bare write
 
 Independent of the receiver-lambda write fix, and on a path that fix does not
 touch:
@@ -585,4 +585,15 @@ above" from "declared below".
 This is the same defect shape as the rest of this document: an answer given from
 information that does not identify what is being asked about — here the scope
 query knows the name but not the point in the block. It is a silent wrong
-answer, not an error, and it is worth fixing next.
+answer, not an error.
+
+FIXED. The mechanism was the captured-var analysis, which records which names
+need a shared cell for the whole body and carries no declaration position, so
+`isBoxed` answered yes at sites that PRECEDE the `var`. The write took the cell
+path and the later declaration then overwrote it. Trying to add ordering to the
+analysis is the wrong place: the name really is boxed, because a later
+reference really does capture it — only the earlier sites are wrong. The fix is
+at the use site, which requires the name to be in scope as a local (bound in
+this frame, or a capture from an enclosing one) before the cell path applies.
+Pinned by `bare_write_var_declared_later`, which exercises both directions in
+one program.
