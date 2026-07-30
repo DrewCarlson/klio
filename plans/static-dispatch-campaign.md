@@ -284,8 +284,16 @@ PRIMITIVES with no IR class (see the unsigned entry in the inventory —
 `staticBuiltinConcrete`). A ULong-typed property whose type never resolves would
 plausibly poison resolution for the declarations around it.
 
-That is a hypothesis, not a finding. Test it by checking whether the ULong
-constants resolve before assuming anything about `assertEquals`.
+DISPROVEN. A twelve-line test class with two `uL` literal properties, a derived
+`String` property, and an `assertEquals` in a `@Test` resolves and runs fine —
+`assertEquals` is found, and the ULong values are computed correctly
+(`0xa716446655440000uL` yields 12039885860129472512, which is right). Unsigned
+properties do not poison resolution.
+
+So `UuidTest` remains undiagnosed, with four causes now excluded: the image
+cache, the star import, a missing `Uuid.kt` source, and the ULong constants.
+What is left untested is the `Uuid` class itself — `Uuid.fromULongs(...)` at
+class-property scope, a `private constructor`, and the companion factories.
 
 Anyone gating on the sweep should treat these as a known baseline failure until
 diagnosed, and should NOT attribute them to a dispatch change without bisecting
