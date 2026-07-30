@@ -193,10 +193,41 @@ a generic receiver a head-only answer is worse than none, so lowering must
 DECLINE it, which removes exactly the container receivers that dominate
 real code.
 
-So the build-out is: widen `EagerTypeHead` to carry a full type (generic
-arguments included), then re-measure `[lower-sites]`. The
-`no_receiver_type` bucket is the whole campaign; every later phase is
-gated on it falling.
+So the obvious build-out is to widen `EagerTypeHead` to carry a full type,
+generic arguments included. **That was tried and REVERTED, and the result
+relocates the whole problem.**
+
+The widening itself worked: `EagerTypeHead` carried nested arguments, with
+an `args_complete` flag distinguishing "no arguments" from "arguments
+unknown", so the blanket decline-all-generics rule became the precise one.
+Then the audit counted what it actually delivered:
+
+    fills (eager supplied a usable type):   311   — ALL non-generic (String)
+    skips (arguments unknown):            3,800   — Array, Continuation,
+                                                    CancellableContinuationImpl, ...
+
+Zero generic fills. `no_receiver_type` did not move (72.25%). And two
+stdlib tests REGRESSED, because where typeck did supply arguments they
+were wrong:
+
+    CollectionTest.plusCollectionInference   Expected <[[s], [a]]>, actual <[[s], a]>
+    GroupingTest.countEach                   expected a Grouping receiver
+
+The first picked `plus(element)` over `plus(collection)`; the second lost a
+`Grouping` receiver. Both are the hazard `argDeclTypeRef`'s own comment
+warned about, now realized: with full arguments, typeck's WRONG arguments
+get trusted. Net: zero measurable gain, two regressions. Reverted.
+
+**The transport is not the bottleneck. Typeck's generic inference is.**
+It does not know an `Array`'s element type at 3,800 sites, and where it
+does claim to know, it is sometimes wrong. Widening the channel only
+changes which of those two failures you get.
+
+So the real Phase 1 is a typeck project, not a plumbing one: substitute
+type arguments through call sites, propagate them from declarations, and
+get `plusCollectionInference` / `countEach` right as the first two
+regression tests for it. Only then does re-widening the channel pay, and
+only then can `no_receiver_type` fall.
 
 ### Eager mode is NOT yet ready to become the only mode
 
