@@ -108,9 +108,10 @@ sweep scripts grep; see
 | `KLIO_RECVHEAD_AUDIT` | set | Whether the type checker's recorded receiver-lambda head can answer the membership walk | `[RECVHEAD-AUDIT]` |
 | `KLIO_TYPEHEAD_AUDIT` | set | The type checker's per-argument type head vs the AST-derived declared type (fills and disagreements) | `[TYPEHEAD-FILL]`, `[TYPEHEAD-AUDIT]` |
 
-`scripts/commontest-sweep.py --eager both` drives `KLIO_EAGER` for
-you: it runs the corpus with the variable unset and set to `1` and
-reports any divergence between the two modes.
+`scripts/commontest-sweep.py` accepts `--eager` for compatibility and
+ignores it: there is only one pipeline, so `both` just runs the corpus
+twice and reports any run-to-run divergence (useful for catching
+nondeterminism, not modes).
 
 ## Errors, throws, and hangs
 
