@@ -11918,15 +11918,15 @@ fn lowerResolvedMemberCall(
     // and the member's identity is sufficient.
     //
     // Restricted to a receiver whose values are real interpreted instances. A
-    // stub or value class is host-backed, and an INTERFACE receiver can hold a
-    // host-backed value too (a `Sequence` is a generator, not an `Instance`);
-    // dispatching either through a method slot raises "virtual call receiver is
-    // not an instance".
+    // stub or value class is host-backed and has no vtable to index. An
+    // INTERFACE receiver is allowed: it can hold a host-backed value (a
+    // `Sequence` is a generator, not an `Instance`), and `invokeVirtualMember`
+    // resolves the slot against such a value's runtime class instead of
+    // requiring an `Instance`.
     if (resolved.dispatch == .deferred and resolved.target != null and
         static_owner.int() < b.module.classes.items.len and
         !b.module.classes.items[static_owner.int()].is_stub and
         !b.module.classes.items[static_owner.int()].is_value and
-        !b.module.classes.items[static_owner.int()].is_interface and
         !b.module.extCouldApply(b.allocator, head, name.name))
     {
         // Ask the resolver's own direct-vs-virtual rule rather than assuming

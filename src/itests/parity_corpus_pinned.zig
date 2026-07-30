@@ -1158,6 +1158,16 @@ test "catch_param_static_type" {
     );
 }
 
+test "override_param_type_from_enclosing_scope" {
+    try check("override_param_type_from_enclosing_scope",
+        \\tagged-empty
+        \\tagged-kept
+        \\tagged-empty
+        \\tagged-empty
+        \\
+    );
+}
+
 test "init_lambda_encloses_instance" {
     try check("init_lambda_encloses_instance",
         \\T/prop T/init

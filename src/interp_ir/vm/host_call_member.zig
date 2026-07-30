@@ -9403,6 +9403,47 @@ pub fn invokeVirtualMember(
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
+        // A virtual slot names an interface member, and an interface-typed value
+        // need not be an interpreted `Instance`: a `Sequence` is a host-backed
+        // generator, a `CharSequence` can be a string. Keep slot semantics by
+        // resolving the slot against the value's RUNTIME class rather than
+        // rejecting the receiver, and fall back to the member's name only when
+        // that class implements it natively and there is no body to enter.
+        const NonInstanceTarget = struct { target: ?FuncId, name: ?[]const u8 };
+        const noinst: NonInstanceTarget = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const root = FuncId.from(slot.int());
+            const mname: ?[]const u8 = if (module.funcById(root)) |f| f.name else null;
+            const runtime_class = module.classIdByFqn(receiver.typeFqn()) orelse
+                break :blk .{ .target = null, .name = mname };
+            const target = module.methodSlotTarget(runtime_class, slot) orelse
+                break :blk .{ .target = null, .name = mname };
+            if (!virtualTargetExecutable(module, target))
+                break :blk .{ .target = null, .name = mname };
+            break :blk .{ .target = target, .name = mname };
+        };
+        if (noinst.target) |target| {
+            if (arg_params) |params| {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                return callFuncIndexedRec(
+                    self,
+                    allocator,
+                    mg.get(),
+                    target,
+                    FuncId.from(slot.int()),
+                    receiver,
+                    args,
+                    params,
+                );
+            }
+            if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
+        }
+        if (noinst.name) |mname| {
+            return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
+        }
         if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
             const mg = self.module.borrow();
             defer mg.deinit();

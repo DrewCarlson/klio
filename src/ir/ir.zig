@@ -4608,21 +4608,52 @@ pub const Module = struct {
         return null;
     }
 
+    /// `KLIO_OVERRIDES_TRACE=1`: report why `overridesSlot` rejected a
+    /// candidate. Called once per (own method, inherited slot) pair, so the
+    /// lookup is resolved once rather than per call.
+    fn overridesTraceOn() bool {
+        const S = struct {
+            var known: ?bool = null;
+        };
+        if (S.known) |k| return k;
+        const k = std.c.getenv("KLIO_OVERRIDES_TRACE") != null;
+        S.known = k;
+        return k;
+    }
+
+    /// Class declared directly inside `scope`, matched on the full
+    /// `scope.name` FQN rather than on a simple name, so an unrelated class
+    /// sharing the simple name cannot answer.
+    fn classIdDeclaredIn(self: *const Module, scope: []const u8, name: []const u8) ?ClassId {
+        for (self.classes.items) |class| {
+            if (class.fqn.len != scope.len + name.len + 1) continue;
+            if (std.mem.startsWith(u8, class.fqn, scope) and
+                class.fqn[scope.len] == '.' and
+                std.mem.eql(u8, class.fqn[scope.len + 1 ..], name))
+            {
+                return class.id;
+            }
+        }
+        return null;
+    }
+
     fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?ClassId {
         if (self.classIdByFqn(name) orelse self.classIdByQualifiedSuffix(name)) |id| return id;
         const sig = self.decl_sigs.get(fid.int()) orelse return null;
         const owner = sig.enclosing_class orelse return null;
         if (self.classIdNestedIn(owner, applicability.simpleName(name))) |id| return id;
         if (owner.int() >= self.classes.items.len) return null;
-        const owner_fqn = self.classes.items[owner.int()].fqn;
-        for (self.classes.items) |class| {
-            if (class.fqn.len != owner_fqn.len + name.len + 1) continue;
-            if (std.mem.startsWith(u8, class.fqn, owner_fqn) and
-                class.fqn[owner_fqn.len] == '.' and
-                std.mem.eql(u8, class.fqn[owner_fqn.len + 1 ..], name))
-            {
-                return class.id;
-            }
+        // An unqualified classifier written inside a nested class resolves in
+        // the enclosing classes' scopes too, so widen outwards along the
+        // owner's FQN instead of stopping at the owner itself. `Key` written
+        // in `CoroutineContext.Element` names `CoroutineContext.Key`; without
+        // this walk the two spellings of one parameter type compare unequal
+        // and an override goes unrecognised.
+        var scope = self.classes.items[owner.int()].fqn;
+        while (true) {
+            if (self.classIdDeclaredIn(scope, name)) |id| return id;
+            const dot = std.mem.lastIndexOfScalar(u8, scope, '.') orelse break;
+            scope = scope[0..dot];
         }
         return null;
     }
@@ -4681,14 +4712,33 @@ pub const Module = struct {
         candidate: FuncId,
         base: FuncId,
     ) Allocator.Error!bool {
+        const dbg = overridesTraceOn();
         const candidate_func = self.funcById(candidate) orelse return false;
         const base_func = self.funcById(base) orelse return false;
+        if (dbg) std.debug.print("[ovr] cand={d} base={d} name={s}/{s} is_override={}\n", .{
+            candidate.int(), base.int(), candidate_func.name, base_func.name, candidate_func.is_override,
+        });
         if (!candidate_func.is_override or !std.mem.eql(u8, candidate_func.name, base_func.name)) return false;
-        const candidate_sig = self.decl_sigs.get(candidate.int()) orelse return false;
-        const base_sig = self.decl_sigs.get(base.int()) orelse return false;
-        if (candidate_sig.kind != .instance_method or base_sig.kind != .instance_method) return false;
-        if (candidate_sig.is_suspend != base_sig.is_suspend or candidate_sig.sig.len != base_sig.sig.len) return false;
-        const base_owner = base_sig.enclosing_class orelse return false;
+        const candidate_sig = self.decl_sigs.get(candidate.int()) orelse {
+            if (dbg) std.debug.print("[ovr]   no candidate sig\n", .{});
+            return false;
+        };
+        const base_sig = self.decl_sigs.get(base.int()) orelse {
+            if (dbg) std.debug.print("[ovr]   no base sig\n", .{});
+            return false;
+        };
+        if (candidate_sig.kind != .instance_method or base_sig.kind != .instance_method) {
+            if (dbg) std.debug.print("[ovr]   kind {s}/{s}\n", .{ @tagName(candidate_sig.kind), @tagName(base_sig.kind) });
+            return false;
+        }
+        if (candidate_sig.is_suspend != base_sig.is_suspend or candidate_sig.sig.len != base_sig.sig.len) {
+            if (dbg) std.debug.print("[ovr]   siglen {d}/{d}\n", .{ candidate_sig.sig.len, base_sig.sig.len });
+            return false;
+        }
+        const base_owner = base_sig.enclosing_class orelse {
+            if (dbg) std.debug.print("[ovr]   no base owner\n", .{});
+            return false;
+        };
 
         const owner_class = &self.classes.items[owner.int()];
         const identity = try allocator.alloc(TypeBinding, owner_class.type_params.len * 2);
@@ -4706,11 +4756,20 @@ pub const Module = struct {
             identity[i * 2] = .{ .name = param, .ty = identity_ty };
             identity[i * 2 + 1] = .{ .name = identity_name, .ty = identity_ty };
         }
-        const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse return false;
+        const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse {
+            if (dbg) std.debug.print("[ovr]   no ancestor bindings owner={s} base_owner={s}\n", .{
+                self.classes.items[owner.int()].fqn, self.classes.items[base_owner.int()].fqn,
+            });
+            return false;
+        };
         for (candidate_sig.sig, base_sig.sig) |candidate_ty, raw_base_ty| {
             const base_ty = try substituteType(allocator, raw_base_ty, bindings);
-            if (!self.overrideTypeEql(candidate, base, candidate_ty, base_ty)) return false;
+            if (!self.overrideTypeEql(candidate, base, candidate_ty, base_ty)) {
+                if (dbg) std.debug.print("[ovr]   type mismatch {s} vs {s}\n", .{ candidate_ty.name, base_ty.name });
+                return false;
+            }
         }
+        if (dbg) std.debug.print("[ovr]   OK\n", .{});
         return true;
     }
 
@@ -4730,6 +4789,17 @@ pub const Module = struct {
         if (existing.int() == incoming.int()) return;
 
         gop.value_ptr.* = try self.preferredMethodSlotTarget(allocator, existing, incoming);
+        if (std.c.getenv("KLIO_SLOT_TRACE")) |want| {
+            const w = std.mem.span(want);
+            const chosen = gop.value_ptr.*;
+            const en = if (self.funcById(existing)) |f| f.name else "?";
+            if (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, en)) {
+                std.debug.print(
+                    "[slot-merge] slot={d} existing={d} incoming={d} -> {d} ({s})\n",
+                    .{ slot, existing.int(), incoming.int(), chosen.int(), en },
+                );
+            }
+        }
     }
 
     /// Choose the more-specific implementation of one inherited virtual slot.
@@ -4840,6 +4910,20 @@ pub const Module = struct {
                     methodDispatchKey(ClassId.from(@intCast(raw_cid)), MethodSlotId.from(entry.key_ptr.*)),
                     entry.value_ptr.*,
                 );
+                if (std.c.getenv("KLIO_SLOT_DUMP")) |want| {
+                    const w = std.mem.span(want);
+                    const fid = entry.value_ptr.*;
+                    const fname = if (self.funcById(fid)) |f| f.name else "?";
+                    if (std.mem.eql(u8, w, fname)) {
+                        const owner = if (self.decl_sigs.get(fid.int())) |s| s.enclosing_class else null;
+                        std.debug.print("[slot-dump] class={s} slot={d} -> fid={d} owner={s}\n", .{
+                            self.classes.items[raw_cid].fqn,
+                            entry.key_ptr.*,
+                            fid.int(),
+                            if (owner) |o| self.classes.items[o.int()].fqn else "?",
+                        });
+                    }
+                }
             }
         }
     }
