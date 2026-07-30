@@ -75,6 +75,10 @@ pub const TypeCheck = struct {
     /// entry. Spans not in this map were either skipped or assigned
     /// `Type.Unresolved`.
     types: std.AutoHashMap(Span, Type),
+    /// Spans whose recorded type is only valid for one generic
+    /// instantiation; see `Checker.generic_body_depth`. Consumers that feed
+    /// lowering must skip these.
+    types_instantiation_dependent: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
     /// CFGs built during type checking, keyed by the source span of the
     /// owning function. Populated for every function body the checker
@@ -130,6 +134,7 @@ pub fn typecheck(
     );
     return .{
         .types = tc.types,
+        .types_instantiation_dependent = tc.types_instantiation_dependent,
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
@@ -243,6 +248,7 @@ pub fn typecheckModule(
     );
     return .{
         .types = tc.types,
+        .types_instantiation_dependent = tc.types_instantiation_dependent,
         .diagnostics = tc.diagnostics,
         .cfgs = tc.cfgs,
         .resolved_calls = tc.resolved_calls,
@@ -826,6 +832,24 @@ pub const Checker = struct {
     lowerings: std.AutoHashMap(Span, *Lowered),
     /// Stack of currently-active function spans.
     cfg_fn_stack: std.ArrayList(Span),
+    /// Nesting depth of function bodies that declare TYPE PARAMETERS.
+    ///
+    /// A generic body is resolved once, against its type parameters — never
+    /// against one call site's instantiation. `plusElement` is
+    /// `return plus(element)` where `element: T`, and Kotlin matches
+    /// `plus(element: T)` exactly; substitute `T = List<String>` and
+    /// `plus(elements: Iterable<T>)` also becomes applicable and
+    /// CONCATENATES. So a type recorded inside such a body is only true for
+    /// the instantiation that happened to be checked last, and handing it to
+    /// lowering changes which overload wins.
+    ///
+    /// Types recorded at depth > 0 are therefore excluded from the eager
+    /// evidence channel (`types_instantiation_dependent`). Lowering compiles
+    /// the body once, so per-instantiation evidence would need lowering to
+    /// ask with an instantiation in hand — a larger design than this.
+    generic_body_depth: usize,
+    /// Spans whose recorded type depends on a generic instantiation.
+    types_instantiation_dependent: std.AutoHashMap(Span, void),
     /// Active multi-call inference session, if any.
     inference_session: ?InferenceSession,
     /// Set while typing a call whose callee is annotated `@BuilderInference`.

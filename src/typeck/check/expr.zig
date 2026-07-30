@@ -66,6 +66,9 @@ fn emitWarn(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allocat
 /// Record the inferred type at `sp`, freeing any prior entry so repeated
 /// checks of the same span don't leak. The map owns the stored value.
 fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
+    if (self.generic_body_depth != 0) {
+        try self.types_instantiation_dependent.put(sp, {});
+    }
     const owned = try ty.clone(self.allocator);
     const gop = try self.types.getOrPut(sp);
     if (gop.found_existing) gop.value_ptr.deinit(self.allocator);

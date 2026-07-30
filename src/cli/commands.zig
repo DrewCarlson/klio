@@ -561,6 +561,10 @@ pub fn runTestFiles(
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    // Reachable during LOWERING, not just during the run: lowering-time
+    // diagnostics resolve a span to a file and line through this map, and
+    // `runTestsOnBuilt` re-installs it for the run itself.
+    span.active_map = &map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
@@ -694,7 +698,10 @@ fn runTestsOnBuilt(
     if (runtime.getenvSlice("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     ir.eval.callStatsDump();
     ir.eval.dispatchStatsDump();
-    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) ir.lower.expr.lowerSitesDump();
+    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) {
+        ir.lower.expr.lowerSitesDump();
+        ir.lower.expr.lowerNoRecvDump();
+    }
     ir.eval.probeStatsDump();
     ir.eval.opProfDump();
     return if (report.failed > 0) 1 else 0;
@@ -813,11 +820,17 @@ pub fn computeEagerCalls(
     var tit = tc.types.iterator();
     var tn: usize = 0;
     while (tit.next()) |e| {
+        // A type recorded inside a generic body is true only for the
+        // instantiation typeck happened to check last. Handing it to lowering
+        // changes which overload wins — `plusElement`'s `return plus(element)`
+        // matches `plus(element: T)` against `T`, but against
+        // `List<String>` the concatenating `plus(Iterable<T>)` also applies.
+        if (tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
         const head = eagerHeadOf(e.value_ptr, false) orelse continue;
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    if (audit) std.debug.print("[EAGER] {d} type heads recorded\n", .{tn});
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent)\n", .{ tn, tc.types_instantiation_dependent.count() });
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     var rit = tc.lambda_recv_heads.iterator();
@@ -862,6 +875,9 @@ fn runBuilt(
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    // See the note in the test path: the map is installed before lowering so
+    // lowering-time diagnostics can name a file and line.
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
     return runBuiltModule(gpa, built, bindings, map, no_main_msg);
 }

@@ -95,6 +95,8 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .dsl_receiver_stack = .empty,
         .cfgs = std.AutoHashMap(root.Span, root.Cfg).init(allocator),
         .lowerings = std.AutoHashMap(root.Span, *root.Lowered).init(allocator),
+        .generic_body_depth = 0,
+        .types_instantiation_dependent = std.AutoHashMap(root.Span, void).init(allocator),
         .cfg_fn_stack = .empty,
         .inference_session = null,
         .builder_inference_active = false,

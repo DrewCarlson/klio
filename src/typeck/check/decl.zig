@@ -951,6 +951,13 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
     low.* = lowered;
     try self.lowerings.put(f.span, low);
     try self.cfg_fn_stack.append(self.allocator, f.span);
+    // See `generic_body_depth`: types recorded inside a generic body are
+    // only true for one instantiation, so they must not reach lowering.
+    const generic_body = f.type_params.len != 0;
+    if (generic_body) self.generic_body_depth += 1;
+    defer if (generic_body) {
+        self.generic_body_depth -= 1;
+    };
 
     switch (body.*) {
         .Block => |*b| {
