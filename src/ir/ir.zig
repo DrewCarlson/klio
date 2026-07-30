@@ -1604,7 +1604,7 @@ pub const Module = struct {
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
     /// The eager pipeline's per-call resolution: `Span(callee) ->
     /// Span(decl)` converted from typeck's records by the driver
-    /// (`KLIO_EAGER=1`). Lowering composes it with `func_by_decl_span`;
+    /// Lowering composes it with `func_by_decl_span`;
     /// absent spans keep the lazy path.
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
     /// Typeck's per-expression type heads (the E2.1 evidence seam).

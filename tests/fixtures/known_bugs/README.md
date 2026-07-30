@@ -11,4 +11,4 @@ with its output pinned, and the plan entry is updated.
 
 | File | Defect |
 |------|--------|
-| `catch_param_type_drops_cause.kt` | Recording a catch parameter's declared type drops the `Caused by:` chain from `stackTraceToString()` (`MISSING <Root cause>`). Passes as-is; fails once the catch parameter's type is recorded at its binding. See the static-dispatch campaign plan. |
+| `catch_param_type_drops_cause.kt` | A bodyless `expect` admitted only because it carries a host symbol is lowered as an interpreted call, so `Throwable.stackTraceToString()` enters an empty frame instead of klio's host renderer and drops the `Caused by:` chain. Prints `true` as-is; prints `false` once a catch parameter's declared type is recorded, which is what makes the receiver statically typed. See the static-dispatch campaign plan. |

@@ -344,69 +344,59 @@ channel's gain was never measured at all. Measure against the same binary
 before any number justifies the work — the same discipline the verification
 playbook demands for timings applies to counters.
 
-### Open: typing a catch parameter regresses one exception test, mechanism unknown
+### The blocker, root-caused: a bodyless `expect` is lowered as an interpreted call
 
-Recording a catch parameter's declared type is unarguable — it is always written
-in the source — and it binds calls that bound nothing before (`bound_static`
-46 -> 47 on a probe whose handler calls a method on the exception; no change on
-the collections file set, which never calls methods on a catch parameter). It is
-two lines at the handler's `bind` in `lowerTry`.
+Recording a catch parameter's declared type is the smallest possible increment
+here — the type is always written in the source, so it is not a heuristic — and
+it binds calls that bound nothing before (`bound_static` 46 -> 47 on a probe
+whose handler calls a method on the exception; no movement on the collections
+file set, which never calls a method on a catch parameter). It is two lines at
+the handler's `bind` in `lowerTry`.
 
-It is NOT committed, because it makes `ExceptionTest.exceptionDetailedTrace`
-fail. The mechanism is NOT yet identified, and an earlier version of this entry
-asserted one that turned out to be wrong. Recording what was ruled out, so the
-next attempt does not repeat it:
+It is not committed, because it makes `ExceptionTest.exceptionDetailedTrace`
+fail, and that failure is now root-caused. Minimal reproduction, six lines, in
+`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`:
 
-- NOT lost `addSuppressed`. With `e` typed `Throwable`,
-  `e.apply { addSuppressed(x) }` still records: `e.suppressedExceptions.size`
-  is 1 both with and without the change.
-- NOT the rendering of cause/suppressed sections. A reduction with a nested
-  `try`, a cause, and suppressed exceptions on both levels produces a
-  BYTE-IDENTICAL `stackTraceToString()` with and without the change.
-- The bare call inside the spliced `apply` body does resolve to a bodyless
-  declaration, which is worth knowing on its own:
+    val e = try {
+        try { throw IllegalStateException("Root cause") }
+        catch (e: Throwable) { throw RuntimeException("Induced", e) }
+    } catch (e: Throwable) { e }
+    // e.cause is correct; "Root cause" is ABSENT from e.stackTraceToString()
 
-      [bare] addSuppressed -> kotlin.addSuppressed#4961 params=2 ext=true
-             form=CallMemberOrGlobal recv_ty=Throwable
-      [bare-candidate] kotlin.addSuppressed#4961 pkg=kotlin file=null params=2 body=false
-      [KLIO_OR_AUDIT] run inst=CallMemberOrGlobal name=addSuppressed
-             arm=member depth=0 recv=kotlin.Throwable
+`e.cause` is right — only the rendering drops the `Caused by:` chain, which is
+why this is quiet. With the receiver typed, the call binds
+`kotlin.stackTraceToString#5562`, the bodyless `expect` in
+`common/src/kotlin/ExceptionsH.kt:144` whose actuals are all platform files klio
+never compiles, and that frame is ENTERED:
 
-  `addSuppressed` is an `expect` whose actuals are platform files klio does not
-  compile, and klio implements it as a host member. The rows are real, but they
-  do NOT explain the failure — the effect lands correctly anyway. Whatever the
-  member arm does here reaches the host implementation.
+    [fn-entry] kotlin.stackTraceToString#5562: this=Exception
 
-**What actually goes missing: the CAUSE.** Getting the assertion to name the
-absent value (the sweep only prints its "Expected top level trace:" prefix)
-gives `MISSING <Root cause>` — the `Caused by:` chain is dropped from the
-rendered trace. Everything else the test asserts is present.
+Extension resolution admits the candidate because it carries a host symbol —
+`if (!has_source_body and !has_host_symbol) continue` is what would otherwise
+drop it — and then lowering emits an ordinary interpreted `Call` to a function
+with no body rather than the host invocation. klio's real implementation is
+`throwableStackMember` in `host_call_member.zig`, which renders cause and
+suppressed through `formatThrowable`, and it never runs. Without a receiver type
+the call stays dynamic and reaches it.
 
-A standalone failing program is checked in at
-`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`: the upstream test
-body verbatim, with the assertion changed to report which value is missing. It
-passes on the current tree and fails with catch-parameter typing applied. Start
-from that, not from a sweep row.
+**So the rule to establish is: a declaration admitted only because it has a host
+symbol must be lowered to that host invocation, never to an interpreted call.**
+This is the third instance of one family — `Func.return_ty`'s `Unit` placeholder
+and this one both come from a declaration that exists while implementing
+nothing, read as though it implements something. It is very likely the same
+reason the return-type channel broke compose, since that channel's whole effect
+is to make more receivers statically typed.
 
-Also ruled out, each as its own program that PASSES with the change applied:
+Fix that first. Then the catch-parameter typing lands as its first beneficiary,
+and the return-type channel becomes re-testable.
 
-- a cause taken from a typed LOCAL — `val t: Throwable = …;
-  RuntimeException("w", t)` keeps its cause;
-- a cause taken directly from a catch parameter —
-  `try { … } catch (e: Throwable) { RuntimeException("w", e) }` keeps its cause
-  and renders `root` in the trace.
-
-So the trigger is not "a `Throwable`-typed argument reaches a constructor". The
-only structural difference left between the passing probes and the failing
-program is that the failing one wraps the throw in LOCAL functions (`root`
-returning `Nothing`, `suppressedError`, `induced`) and rethrows from inside
-`induced`'s own catch. That is where to look.
-
-The broader lesson does stand, and it has now cost two attempts: supplying more
-static type information keeps turning a latent wrong answer into a visible
-failure, and each time the failure is somewhere other than the code that
-supplied the type. Budget for that, and reduce to a standalone program before
-theorising — a plausible-looking trace row is not a mechanism.
+Ruled out along the way, each as its own program that passes WITH the change
+applied, so nobody repeats them: lost `addSuppressed`
+(`e.suppressedExceptions.size` is 1 either way); a cause from a `Throwable`-typed
+LOCAL; a cause taken directly from a catch parameter; and the cause/suppressed
+rendering of a nested try, which is byte-identical. An earlier version of this
+entry blamed `addSuppressed` and was wrong — the trace rows quoted for it were
+real but explained nothing, because the effect landed anyway.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 
