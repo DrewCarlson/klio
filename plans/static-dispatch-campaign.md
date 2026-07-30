@@ -367,6 +367,23 @@ specific things, both measured:
         Note for the next attempt: `Comparator.compare` (slot 155) is bound at
         11 further sites in the same run and does NOT regress, so interface
         rooting is not uniformly broken. Compare those two cases first.
+
+        The distinguishing feature is almost certainly an intermediate
+        overriding interface. `Comparator.compare` has ONE declaration and no
+        interface between it and its implementations. `minusKey` is declared on
+        `CoroutineContext` and overridden by `CoroutineContext.Element`, which
+        is itself an interface, and the concrete classes implement `Element`.
+        A slot is identified by its root declaration's `FuncId`
+        (`FuncId.from(slot.int())` throughout the virtual-call arm), so the
+        question to settle is whether `Element.minusKey` registers under
+        `CoroutineContext.minusKey`'s slot or gets one of its own. If the
+        latter, a call rooted at the base slot can never reach the override, and
+        that is the bug.
+
+        `linkMethodClass` / `mergeInheritedMethod` / `preferredMethodSlotTarget`
+        look correct for choosing between two implementations of ONE slot, so
+        suspicion falls on slot ASSIGNMENT rather than merging — dump the slot
+        ids for both `minusKey` declarations before editing any of them.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
