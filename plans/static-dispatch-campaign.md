@@ -538,11 +538,37 @@ instance as their `this` PARAMETER (`try all.append(allocator, inst_value.*)`)
 but never push it as an enclosing receiver, so any lambda created inside one
 snapshots a chain without it.
 
-So the fix is to give those thunks the same treatment the delegate thunk
-already has. Do it for the property-initializer and init-block sites
-specifically, NOT inside `evalThunk` — an ordinary method already seeds its own
-receiver and would end up with a duplicate entry. This wants the full gate: the
-receiver chain is consulted by every bare name in the interpreter.
+**FIXED.** Both the property-initializer and the init-block thunk now push the
+instance with `pushEnclosing`/`popEnclosing`, exactly as the delegate thunk did.
+Not inside `evalThunk` — an ordinary method already seeds its own receiver and
+would gain a duplicate entry. Pinned by
+`tests/fixtures/parity_corpus/init_lambda_encloses_instance.kt`, twenty lines
+that fail without it with `unresolved global tag`, the same symptom compose
+showed.
+
+### And the verdict on the return-type channel: green, and worth nothing
+
+With that fix in place the channel finally passes everything — stdlib sweep
+117/0, every compose suite. So the four-attempt chase ended by fixing a real
+interpreter bug, which is the useful outcome.
+
+The channel itself is NOT landed, because with it green the census can finally
+be read honestly, and it says:
+
+    bound_static 196   (identical to the tree without the channel)
+
+Zero. That is the same answer the original widening audit gave — 311 fills, all
+non-generic, 3,800 skips — arrived at from the opposite direction. A call's
+declared return type is concrete often enough to be worth measuring and not
+often enough to move the number, because the receivers that matter are generic
+containers whose element type the declaration does not fix.
+
+So the channel is closed as a direction. What it produced was not static
+dispatch coverage but four latent interpreter bugs, three of them now fixed. The
+remaining `no_receiver_type` mass needs the element type of generic containers,
+which is a typeck project, not a lowering one — the conclusion this document
+reached earlier and which the channel work has now confirmed by exhausting the
+alternative.
 
 That makes this the third instance of one family, exactly as predicted earlier
 in this document: an implicit receiver that exists and that the runtime walk

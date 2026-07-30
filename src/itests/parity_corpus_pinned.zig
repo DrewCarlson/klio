@@ -1157,3 +1157,10 @@ test "catch_param_static_type" {
         \\
     );
 }
+
+test "init_lambda_encloses_instance" {
+    try check("init_lambda_encloses_instance",
+        \\T/prop T/init
+        \\
+    );
+}
