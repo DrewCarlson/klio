@@ -748,17 +748,23 @@ fn collectKtDir(
 /// Vm, register installed bindings, and run `main`. `map` locates
 /// lowering diagnostics (file:line) in the parsed sources.
 
-/// The eager pipeline (`KLIO_EAGER=1`): run resolver + typeck over the
-/// program the way `klio check` does and convert the recorded overload
-/// picks into the span-pair map lowering composes with its own
-/// declaration identities. Fallback-safe by design — any failure returns
-/// null and the run stays lazy (`KLIO_EAGER_AUDIT=1` logs the skip).
+/// The eager pipeline, now the ONLY pipeline: run resolver + typeck over
+/// the program the way `klio check` does and convert the recorded overload
+/// picks into the span-pair map lowering composes with its own declaration
+/// identities. Fallback-safe by design — any failure returns null and
+/// lowering proceeds on AST evidence alone (`KLIO_EAGER_AUDIT=1` logs the
+/// skip), so a program that defeats typeck still runs.
+///
+/// There is no opt-out. It was behind `KLIO_EAGER` while the channels were
+/// unsound; validation is now identical with and without the evidence
+/// (`commontest-sweep.py --eager both` reported ON/OFF identical across
+/// all 117 stdlib files, and every compose suite is green under it), so the
+/// gate and the second code path are gone.
 pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
     native_fqns: []const []const u8,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
-    if (runtime.getenvSlice("KLIO_EAGER") == null) return null;
     const audit = runtime.getenvSlice("KLIO_EAGER_AUDIT") != null;
     const r = resolver.resolveModuleWithNatives(gpa, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});

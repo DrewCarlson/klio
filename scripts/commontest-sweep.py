@@ -174,10 +174,6 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     argv.append(target)
     argv = ["nice", "-n", "10"] + argv
     env = dict(os.environ, HOME=CHILD_HOME)
-    if eager:
-        env["KLIO_EAGER"] = "1"
-    else:
-        env.pop("KLIO_EAGER", None)
     if os.environ.get("KLIO_SWEEP_DEBUG"):
         print("ARGV", "\n".join(argv), file=sys.stderr)
     try:
@@ -250,10 +246,6 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
     if TEST_FILTER:
         argv.append(f"--filter={TEST_FILTER}")
     env = dict(os.environ, HOME=CHILD_HOME)
-    if eager:
-        env["KLIO_EAGER"] = "1"
-    else:
-        env.pop("KLIO_EAGER", None)
     if os.environ.get("KLIO_SWEEP_DEBUG"):
         print("ARGV", "\n".join(argv), file=sys.stderr)
     t0 = time.monotonic()
@@ -336,7 +328,8 @@ def main():
     ap.add_argument("--filter", default=None, help="substring match on target path")
     ap.add_argument("--test-filter", default=None, help="comma-separated test-name filter passed to klio test")
     ap.add_argument("--passes", action="store_true", help="also print per-file pass counts")
-    ap.add_argument("--eager", choices=["off", "on", "both"], default="off")
+    ap.add_argument("--eager", choices=["off", "on", "both"], default="off",
+                    help="accepted and ignored; eager is the only pipeline")
     ap.add_argument("--jobs", type=int, default=default_jobs())
     ap.add_argument("--home", default=None, help="child HOME (pack install scratch)")
     ap.add_argument("--no-batch", action="store_true",
@@ -365,7 +358,9 @@ def main():
         results = sweep(args.binary, matched, targets, support, provider, texts, eager,
                         args.jobs, batch=not args.no_batch)
         per_mode[eager] = results
-        label = "eager-on" if eager else "eager-off"
+        # Eager is the only pipeline; the mode loop is kept so an existing
+        # `--eager both` invocation still works (it just runs twice).
+        label = "run"
         lines = render(results, args.passes)
         total_fails = sum(len(f) for _, f in results.values())
         print(f"== {label}: {len(matched)} files, {total_fails} failures")
@@ -381,11 +376,11 @@ def main():
             if pa != pb or [n for n, _ in fa] != [n for n, _ in fb]:
                 divergent.append(f"{t}: off={pa} passed/{len(fa)} failed, on={pb} passed/{len(fb)} failed")
         if divergent:
-            print(f"== EAGER DIVERGENCE ({len(divergent)} files)")
+            print(f"== RUN-TO-RUN DIVERGENCE ({len(divergent)} files)")
             for d in divergent:
                 print(d)
             return 1
-        print("== eager ON/OFF identical")
+        print("== runs identical")
     return 0
 
 
