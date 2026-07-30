@@ -291,11 +291,30 @@ specific things, both measured:
     (`bound_virtual` 9 -> 183) and the stdlib sweep fails: an interface-typed
     receiver can hold a host-backed value (`Sequence` is a generator, not an
     `Instance`) and the method slot raises "virtual call receiver is not an
-    instance". Making that arm fall back to name-based dispatch was tried and
-    regresses `ContinuationInterceptorKeyTest` — dispatching by NAME is not
-    equivalent to dispatching by slot when a subclass overrides `key`. The
-    correct fix is to give host-backed interface values a vtable path, not to
-    fall back by name.
+    instance".
+
+    Three fixes have been tried at that arm, and the third is close. Recorded
+    with what each proved:
+
+    a. Fall back to name-based dispatch (`callMember`). Fixes the Sequence
+       tests, regresses `ContinuationInterceptorKeyTest` — dispatch by NAME is
+       not equivalent to dispatch by SLOT when a subclass overrides `key`.
+    b. Resolve the slot against the value's RUNTIME type
+       (`classIdByFqn(receiver.typeFqn())` + `methodSlotTarget`) and invoke
+       that. Correct in principle and keeps slot semantics, but the target it
+       finds has no body — the member is implemented natively for that value —
+       so it fails with "virtual method target is not executable".
+    c. (b) first, falling back to (a) only when the slot target has no body.
+       **The Sequence tests pass**; `ContinuationInterceptorKeyTest` still
+       fails, because `key`'s slot target also has no body and so reaches the
+       name fallback, which loses the override.
+
+    So the remaining blocker is precise: a bodyless slot target needs a
+    dispatch route that preserves overrides. Name lookup does not. The likely
+    answer is to walk the runtime class's supertype chain for the first
+    OVERRIDING declaration with a body, rather than falling back to a name — the
+    same information `runtimeVirtualTarget` already computes for instances, but
+    reached from a host-backed value's type. Start there, not from (a).
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
