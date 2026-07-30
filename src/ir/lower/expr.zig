@@ -955,6 +955,7 @@ fn lowerResolvedBinaryOperator(
         &.{},
         &.{},
         declared_lhs_ty,
+        .{},
     )) {
         .lowered => |reg| return reg,
         .deferred => return null,
@@ -2589,6 +2590,16 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (finally_entry) |fin| b.protectCatchWithFinally(h.blk, fin, finally_done.?);
         try b.pushScope();
         try b.bind(h.c.binding.name, h.exc);
+        // A catch parameter's type is always written in the source, so it is
+        // static evidence for every member call on it in the handler. Binding
+        // the register without recording the type left those calls with no
+        // receiver type — the largest single reason static member dispatch
+        // declines is locals lowering has in scope but has no type for.
+        try b.setLocalDeclTypeOwned(
+            h.c.binding.name,
+            try decl_mod.loweredTypeRef(b.allocator, &h.c.ty, true),
+        );
+        if (h.c.ty.nullable) try b.setLocalDeclNullable(h.c.binding.name);
         const v = try lowerBlock(b, &h.c.body);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         try b.popScope();
@@ -4876,6 +4887,34 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         try b.push(.{ .Move = .{ .dst = dst, .src = n } });
         b.terminate(.{ .Goto = join });
         b.switchTo(else_b);
+        // On this branch the receiver is proven non-null, so its declared
+        // nullability no longer disqualifies a member. Bind statically when
+        // the declaration is provable; the receiver is already in a register,
+        // so hand it over rather than let it be evaluated a second time.
+        const declared_from_expr = argDeclTypeRef(b, receiver);
+        var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
+            try staticCallReturnTypeRef(b, receiver)
+        else
+            null;
+        defer if (inferred_ty) |*t| t.deinit(b.allocator);
+        switch (try lowerResolvedMemberCall(
+            b,
+            receiver,
+            name,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            declared_from_expr orelse inferred_ty,
+            .{ .reg = recv, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+                b.terminate(.{ .Goto = join });
+                b.switchTo(join);
+                return dst;
+            },
+            .deferred, .none => {},
+        }
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
@@ -4916,6 +4955,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 ast_arg_names,
                 ast_type_args,
                 argDeclTypeRef(b, member.receiver),
+                .{},
             )) {
                 .lowered => |reg| return reg,
                 .deferred, .none => {},
@@ -11646,6 +11686,109 @@ pub const NoRecvCall = enum(u8) {
 };
 pub var lm_norecv_call: [5]u64 = @splat(0);
 
+/// Breakdown of the `resolver_declined` bucket — sites where lowering DID have
+/// a receiver type and the resolver still refused to name a declaration. It is
+/// the second-largest bucket and, unlike `no_receiver_type`, needs nothing from
+/// typeck, so it is the cheapest remaining coverage to reason about.
+pub const DeclineKind = enum(u8) {
+    /// The resolver identified the declaration but withheld a dispatch
+    /// commitment. The identity is already proven here.
+    target_known_deferred,
+    /// A visible member accepts the call shape but more than one could.
+    ambiguous_applicable,
+    /// No visible member accepts the shape at all.
+    not_applicable,
+    /// A target id that no longer resolves to a function.
+    target_unresolvable,
+    /// A direct call carrying a `*spread` argument.
+    direct_spread,
+    /// A virtual slot on a `value class` owner.
+    virtual_owner_value,
+    /// A virtual slot on a stub (host-backed declaration-only) owner.
+    virtual_owner_stub,
+    /// A virtual call carrying an explicit type-argument list.
+    virtual_type_args,
+    /// A virtual slot whose owner declares a non-instance receiver ABI.
+    virtual_owner_abi,
+    /// A virtual target declaring no receiver parameter.
+    virtual_no_receiver_param,
+    /// A named or vararg argument list that could not be mapped onto the
+    /// target's parameters.
+    arg_mapping_failed,
+};
+pub var lm_decline: [11]u64 = @splat(0);
+
+fn declineNote(k: DeclineKind) void {
+    lmNote(.resolver_declined);
+    if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
+}
+
+/// Why a `target_known_deferred` site did NOT get promoted to a real dispatch.
+/// The identity is proven at every one of these; each variant names the
+/// conservatism that still holds it back.
+pub const PromoBlock = enum(u8) {
+    /// A stub or value receiver class: host-backed, with no vtable to index.
+    receiver_not_instance,
+    /// An extension whose receiver is a TYPE PARAMETER declares this name, so
+    /// the index cannot say which receivers it serves. The blunt one.
+    ext_generic_receiver,
+    /// An extension on the receiver's own head declares this name.
+    ext_own_head,
+    /// An extension on a builtin supertype of the receiver.
+    ext_builtin_super,
+    /// An extension on a declared supertype of the receiver.
+    ext_declared_super,
+    /// The extension index could not be rebuilt.
+    ext_index_stale,
+};
+pub var lm_promo: [6]u64 = @splat(0);
+
+pub fn lowerPromoDump() void {
+    var total: u64 = 0;
+    for (lm_promo) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[promo-blocked] total={d}\n", .{total});
+    inline for (@typeInfo(PromoBlock).@"enum".fields) |f| {
+        const n = lm_promo[f.value];
+        if (n != 0) std.debug.print("[promo-blocked] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
+/// Breakdown of `no_class_id` — lowering HAS a receiver type and cannot map its
+/// head to a declared class. Nothing here needs typeck; it is name resolution.
+pub const NoClassKind = enum(u8) {
+    /// A dotted name that `classIdByFqn` does not know.
+    fqn_unknown,
+    /// A bare head that no class declares.
+    simple_unknown,
+    /// A bare head that SEVERAL classes declare, so the simple-name lookup
+    /// refuses to pick — the ambiguity a fully qualified answer would settle.
+    simple_ambiguous,
+};
+pub var lm_noclass: [3]u64 = @splat(0);
+
+pub fn lowerNoClassDump() void {
+    var total: u64 = 0;
+    for (lm_noclass) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[no-class] total={d}\n", .{total});
+    inline for (@typeInfo(NoClassKind).@"enum".fields) |f| {
+        const n = lm_noclass[f.value];
+        if (n != 0) std.debug.print("[no-class] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
+pub fn lowerDeclineDump() void {
+    var total: u64 = 0;
+    for (lm_decline) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[decline] total={d}\n", .{total});
+    inline for (@typeInfo(DeclineKind).@"enum".fields) |f| {
+        const n = lm_decline[f.value];
+        if (n != 0) std.debug.print("[decline] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
 /// Classify a `Call` expression against the strict condition a return-type
 /// channel would need: the name must identify one function whose declared
 /// return type is not one of its own type parameters.
@@ -11705,6 +11848,16 @@ pub fn lowerSitesDump() void {
     }
 }
 
+/// How a caller has already constrained the receiver of a member call.
+const ReceiverState = struct {
+    /// The receiver, already lowered. A safe call evaluates it once to test it
+    /// for null, so re-lowering it here would evaluate it twice.
+    reg: ?Reg = null,
+    /// The receiver cannot be null at this point regardless of its declared
+    /// type, so a nullable declared type does not disqualify a member.
+    non_null: bool = false,
+};
+
 fn lowerResolvedMemberCall(
     b: *FuncBuilder,
     receiver: *const Expr,
@@ -11713,6 +11866,7 @@ fn lowerResolvedMemberCall(
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
     declared_ty: ?TypeRef,
+    recv_state: ReceiverState,
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     const ty = declared_ty orelse {
@@ -11746,19 +11900,58 @@ fn lowerResolvedMemberCall(
         }
         return .none;
     };
-    if (ty.nullable) {
+    // A nullable receiver keeps a member call off the static path, because an
+    // extension declared on `T?` outranks a member there — `x.f()` on a
+    // nullable `x` is only legal when such an extension exists. A SAFE call is
+    // different: its member runs on the non-null branch, which is exactly the
+    // receiver a member declaration expects.
+    if (ty.nullable and !recv_state.non_null) {
         lmNote(.nullable_or_generic);
         return .none;
     }
+    const recv_ty = if (ty.nullable)
+        TypeRef{ .name = std.mem.trimEnd(u8, ty.name, "?"), .nullable = false, .args = ty.args }
+    else
+        ty;
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
-    const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head);
+    // A receiver typed by a TYPE PARAMETER names no class, and that was the
+    // whole of the `no_class_id` bucket — `C`, `M`, `A`, `T`, `R` accounted for
+    // 769 of 915 sites. Kotlin resolves a member call on such a value against
+    // the parameter's declared upper bound, so resolve the head through it.
+    // Only a `complete` bound is used: an incomplete record dropped
+    // intersection or structural information and cannot stand in for the type.
+    if (owner_id == null) {
+        if (b.typeParamBound(head)) |tpb| {
+            if (tpb.complete) {
+                var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
+                if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
+                owner_id = if (std.mem.indexOfScalar(u8, bound_identity, '.') != null)
+                    b.module.classIdByFqn(bound_identity)
+                else
+                    b.module.uniqueClassIdBySimpleName(typeHead(bound_identity));
+            }
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
+        if (norecvCensusOn()) {
+            const k: NoClassKind = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                .fqn_unknown
+            else if (b.module.classId(head) != null)
+                .simple_ambiguous
+            else
+                .simple_unknown;
+            lm_noclass[@intFromEnum(k)] += 1;
+            if (runtime.getenvSlice("KLIO_NOCLASS_HEADS") != null) {
+                std.debug.print("[no-class-head] {s}\n", .{head});
+            }
+        }
         return .none;
     };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
@@ -11785,11 +11978,11 @@ fn lowerResolvedMemberCall(
         null;
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
-    const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
+    var resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
         .caller_file = name.span.file,
         .lexical_owner = lexical_owner,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
-        .receiver_type = ty,
+        .receiver_type = recv_ty,
     });
     if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
         if (std.mem.eql(u8, wanted, name.name)) {
@@ -11813,10 +12006,81 @@ fn lowerResolvedMemberCall(
     }
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
-    if (resolved.dispatch == .deferred) { lmNote(.resolver_declined); return .deferred; }
-    var target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
+    // The resolver identifies a single candidate but withholds dispatch when an
+    // argument's type is unknown, so its applicability is unproven. Measured,
+    // that is EVERY deferral reaching this point — sites with a fully proven
+    // declaration identity that emitted no static binding at all.
+    //
+    // The identity is not in doubt there; only whether Kotlin would pick this
+    // member. The one thing that beats an applicable member is an EXTENSION of
+    // the same name, so ask exactly that. `extCouldApply` is chain-aware and
+    // conservative — a generic-receiver extension, a supertype's extension, or a
+    // stale index all answer yes — so a `false` means nothing else could bind
+    // and the member's identity is sufficient.
+    //
+    // Restricted to a receiver whose values are real interpreted instances. A
+    // stub or value class is host-backed and has no vtable to index. An
+    // INTERFACE receiver is allowed: it can hold a host-backed value (a
+    // `Sequence` is a generator, not an `Instance`), and `invokeVirtualMember`
+    // resolves the slot against such a value's runtime class instead of
+    // requiring an `Instance`.
+    const promo_blocked_by_class = resolved.dispatch == .deferred and resolved.target != null and
+        (static_owner.int() >= b.module.classes.items.len or
+            b.module.classes.items[static_owner.int()].is_stub or
+            b.module.classes.items[static_owner.int()].is_value);
+    const promo_ext_why: ir.Module.ExtCouldApplyWhy =
+        if (resolved.dispatch == .deferred and resolved.target != null and !promo_blocked_by_class)
+            b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
+        else
+            .none;
+    if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
+        if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
+            std.debug.print("[promo-ext] {s}.{s} nargs={d} why={s}\n", .{
+                head, name.name, args.len, @tagName(promo_ext_why),
+            });
+        }
+        if (promo_blocked_by_class) {
+            lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
+        } else switch (promo_ext_why) {
+            .none => {},
+            .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
+            .generic_receiver => lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
+            .own_head => lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
+            .builtin_super => lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
+            .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
+        }
+    }
+    if (!promo_blocked_by_class and promo_ext_why == .none and
+        resolved.dispatch == .deferred and resolved.target != null)
+    {
+        // Ask the resolver's own direct-vs-virtual rule rather than assuming
+        // virtual: a final or private method has no vtable slot, and a virtual
+        // emission for one fails at runtime even when the receiver's class is
+        // exactly the declaring class.
+        if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
+            resolved.dispatch = d;
+        }
+    }
+    if (resolved.dispatch == .deferred) {
+        lmNote(.resolver_declined);
+        if (norecvCensusOn()) {
+            const k: DeclineKind = if (resolved.target != null)
+                .target_known_deferred
+            else if (resolved.applicable)
+                .ambiguous_applicable
+            else
+                .not_applicable;
+            lm_decline[@intFromEnum(k)] += 1;
+        }
+        return .deferred;
+    }
+    var target = b.module.funcById(func_id) orelse {
+        lmNote(.resolver_declined);
+        if (norecvCensusOn()) lm_decline[@intFromEnum(DeclineKind.target_unresolvable)] += 1;
+        return .deferred;
+    };
     const has_spread = anySpread(args);
-    if (resolved.dispatch == .direct and has_spread) { lmNote(.resolver_declined); return .deferred; }
+    if (resolved.dispatch == .direct and has_spread) { declineNote(.direct_spread); return .deferred; }
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Numeric virtual slots operate on `Value.Instance`. Classifier ABI
@@ -11824,8 +12088,33 @@ fn lowerResolvedMemberCall(
         // while source-backed stdlib classes use the same static ABI as user
         // classes. Named, defaulted, and vararg interface calls bind against
         // the numeric declaration ABI.
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
-            owner.receiver_abi != .instance) { lmNote(.resolver_declined); return .deferred; }
+        // A `specialized` classifier's values are host-represented, so a slot
+        // cannot index a vtable on them. It is still the right EMISSION:
+        // `invokeVirtualMember` resolves the slot against an interpreted
+        // receiver's own class (honouring a user subtype's override) and
+        // falls back to the member's name only for a host-backed value, which
+        // is what the site did unconditionally before.
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0)
+        {
+            declineNote(if (owner.is_value)
+                .virtual_owner_value
+            else if (owner.is_stub)
+                .virtual_owner_stub
+            else
+                .virtual_type_args);
+            if (runtime.getenvSlice("KLIO_VABI_NAMES") != null) {
+                const t = b.module.funcById(func_id);
+                const sig = b.module.decl_sigs.get(func_id.int());
+                std.debug.print("[vabi] {s}.{s} abi={s} has_body={} nblocks={d}\n", .{
+                    owner.fqn,
+                    name.name,
+                    @tagName(owner.receiver_abi),
+                    if (sig) |sg| sg.has_body else false,
+                    if (t) |tf| tf.blocks.len else 0,
+                });
+            }
+            return .deferred;
+        }
     }
 
     try recordLambdaArgReceivers(b, target, args, ast_arg_names, ast_type_args, 1);
@@ -11849,16 +12138,16 @@ fn lowerResolvedMemberCall(
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
 
-    const recv_reg = try lowerReceiver(b, receiver);
+    const recv_reg = recv_state.reg orelse try lowerReceiver(b, receiver);
     // Lowering the receiver expression can append functions (a lambda in the
     // receiver lowers into the module's func table) and reallocate it,
     // invalidating `target`; re-fetch the pointer before reading it again.
-    target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
+    target = b.module.funcById(func_id) orelse { declineNote(.target_unresolvable); return .deferred; };
     if (resolved.dispatch == .virtual) {
         // A virtual target without even a receiver param cannot be bound
         // here on any path (the named/vararg mapping below already deferred
         // it); defer before the receiver-skipping scans slice params[1..].
-        if (target.params.len == 0) { lmNote(.resolver_declined); return .deferred; }
+        if (target.params.len == 0) { declineNote(.virtual_no_receiver_param); return .deferred; }
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -11866,10 +12155,10 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { lmNote(.resolver_declined); return .deferred; };
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { declineNote(.arg_mapping_failed); return .deferred; };
             defer b.allocator.free(mapped);
             for (mapped) |param| if (param == null) {
-                lmNote(.resolver_declined);
+                declineNote(.arg_mapping_failed);
                 return .deferred;
             };
             const indices = try b.allocator.alloc(u32, mapped.len);
@@ -12212,12 +12501,13 @@ fn staticReceiverHasNoCompetingCallable(
     b: *FuncBuilder,
     receiver_ty: ?TypeRef,
     name: []const u8,
+    argc: usize,
 ) bool {
     const ty = receiver_ty orelse return false;
     const head = typeHead(ty.name);
     const hierarchy = b.module.registry.hierarchy_shadow_names.get(head) orelse return false;
     if (!hierarchy.complete or hierarchy.names.contains(name)) return false;
-    return !b.module.extCouldApply(b.allocator, head, name);
+    return !b.module.extCouldApply(b.allocator, head, name, argc);
 }
 
 fn localOverloadReceiverCouldApply(
@@ -12351,6 +12641,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         ast_arg_names,
         ast_type_args,
         declared_ty,
+        .{},
     );
     switch (static_member) {
         .lowered => |reg| return reg,
@@ -12429,7 +12720,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const callable_shape_known = callable_takes_receiver or
             (b.isLocalFn(name.name) and !b.isLocalExtFn(name.name));
         if (callable_takes_receiver and
-            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
+            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name, args.len)))
         {
             orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
             try b.push(.{ .CallValueWithThis = .{
@@ -12501,6 +12792,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             source_names,
             ast_type_args,
             declared_ty,
+            .{},
         );
         switch (source_member) {
             .lowered => |reg| return reg,
@@ -14919,11 +15211,16 @@ test "shared member resolution selects overloads and dispatch forms" {
         &.{},
         &.{},
         .{ .name = "Owner", .nullable = false, .args = &.{} },
+        .{},
     );
     try testing.expect(lowered_virtual == .lowered);
     const virtual_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
     try testing.expect(virtual_inst == .CallVirtual);
     try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), virtual_inst.CallVirtual.slot);
+    // A `specialized` classifier's values are host-represented, and a virtual
+    // slot is still the right emission for one: `invokeVirtualMember` resolves
+    // it against an interpreted receiver's own class and falls back to the
+    // member's name for a host-backed value.
     m.classes.items[owner.int()].receiver_abi = .specialized;
     try testing.expect((try lowerResolvedMemberCall(
         &b,
@@ -14933,7 +15230,10 @@ test "shared member resolution selects overloads and dispatch forms" {
         &.{},
         &.{},
         .{ .name = "Owner", .nullable = false, .args = &.{} },
-    )) == .deferred);
+        .{},
+    )) == .lowered);
+    const specialized_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
+    try testing.expect(specialized_inst == .CallVirtual);
     m.classes.items[owner.int()].receiver_abi = .instance;
     m.classes.items[owner.int()].is_open = false;
     m.classes.items[owner.int()].is_stub = true;

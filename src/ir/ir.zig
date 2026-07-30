@@ -1615,8 +1615,8 @@ pub const Module = struct {
     /// that apply to every head. Rebuilt lazily when the declaration index
     /// has grown. Answers the E4c membership question the hierarchy sets
     /// cannot: could ANY extension named N serve receiver head H?
-    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
-    generic_ext_names: ?std.StringHashMap(void) = null,
+    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(ExtArity)) = null,
+    generic_ext_names: ?std.StringHashMap(ExtArity) = null,
     ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
@@ -4039,6 +4039,32 @@ pub const Module = struct {
         return .{ .target = target, .dispatch = .virtual, .applicable = true };
     }
 
+    /// The `direct` vs `virtual` choice for an already-identified target,
+    /// factored out of `resolveMemberCall` so a caller that promotes a
+    /// deferred-but-identified resolution reaches the SAME answer instead of
+    /// assuming `virtual`. Assuming virtual is wrong for a final or private
+    /// method: it has no vtable slot at all, and the call fails at runtime with
+    /// "virtual method slot is not linked for receiver class" even when the
+    /// receiver's class is exactly the declaring one.
+    pub fn dispatchForTarget(self: *const Module, owner: ClassId, target: FuncId) ?MemberDispatch {
+        if (owner.int() >= self.classes.items.len) return null;
+        const class = &self.classes.items[owner.int()];
+        const ds = self.decl_sigs.get(target.int()) orelse return null;
+        if (!ds.has_body) return .virtual;
+        if (ds.visibility == .Private) return .direct;
+        const f = self.funcById(target) orelse return null;
+        if (class.is_stub or class.is_value) return .virtual;
+        const declaring_class = if (ds.enclosing_class) |decl_owner|
+            (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
+        else
+            null;
+        const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
+        if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
+            return .direct;
+        }
+        return .virtual;
+    }
+
     fn methodIsFinal(f: *const Func) bool {
         if (f.is_open) return false;
         if (f.is_override and !f.is_final) return false;
@@ -4582,21 +4608,52 @@ pub const Module = struct {
         return null;
     }
 
+    /// `KLIO_OVERRIDES_TRACE=1`: report why `overridesSlot` rejected a
+    /// candidate. Called once per (own method, inherited slot) pair, so the
+    /// lookup is resolved once rather than per call.
+    fn overridesTraceOn() bool {
+        const S = struct {
+            var known: ?bool = null;
+        };
+        if (S.known) |k| return k;
+        const k = std.c.getenv("KLIO_OVERRIDES_TRACE") != null;
+        S.known = k;
+        return k;
+    }
+
+    /// Class declared directly inside `scope`, matched on the full
+    /// `scope.name` FQN rather than on a simple name, so an unrelated class
+    /// sharing the simple name cannot answer.
+    fn classIdDeclaredIn(self: *const Module, scope: []const u8, name: []const u8) ?ClassId {
+        for (self.classes.items) |class| {
+            if (class.fqn.len != scope.len + name.len + 1) continue;
+            if (std.mem.startsWith(u8, class.fqn, scope) and
+                class.fqn[scope.len] == '.' and
+                std.mem.eql(u8, class.fqn[scope.len + 1 ..], name))
+            {
+                return class.id;
+            }
+        }
+        return null;
+    }
+
     fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?ClassId {
         if (self.classIdByFqn(name) orelse self.classIdByQualifiedSuffix(name)) |id| return id;
         const sig = self.decl_sigs.get(fid.int()) orelse return null;
         const owner = sig.enclosing_class orelse return null;
         if (self.classIdNestedIn(owner, applicability.simpleName(name))) |id| return id;
         if (owner.int() >= self.classes.items.len) return null;
-        const owner_fqn = self.classes.items[owner.int()].fqn;
-        for (self.classes.items) |class| {
-            if (class.fqn.len != owner_fqn.len + name.len + 1) continue;
-            if (std.mem.startsWith(u8, class.fqn, owner_fqn) and
-                class.fqn[owner_fqn.len] == '.' and
-                std.mem.eql(u8, class.fqn[owner_fqn.len + 1 ..], name))
-            {
-                return class.id;
-            }
+        // An unqualified classifier written inside a nested class resolves in
+        // the enclosing classes' scopes too, so widen outwards along the
+        // owner's FQN instead of stopping at the owner itself. `Key` written
+        // in `CoroutineContext.Element` names `CoroutineContext.Key`; without
+        // this walk the two spellings of one parameter type compare unequal
+        // and an override goes unrecognised.
+        var scope = self.classes.items[owner.int()].fqn;
+        while (true) {
+            if (self.classIdDeclaredIn(scope, name)) |id| return id;
+            const dot = std.mem.lastIndexOfScalar(u8, scope, '.') orelse break;
+            scope = scope[0..dot];
         }
         return null;
     }
@@ -4655,14 +4712,33 @@ pub const Module = struct {
         candidate: FuncId,
         base: FuncId,
     ) Allocator.Error!bool {
+        const dbg = overridesTraceOn();
         const candidate_func = self.funcById(candidate) orelse return false;
         const base_func = self.funcById(base) orelse return false;
+        if (dbg) std.debug.print("[ovr] cand={d} base={d} name={s}/{s} is_override={}\n", .{
+            candidate.int(), base.int(), candidate_func.name, base_func.name, candidate_func.is_override,
+        });
         if (!candidate_func.is_override or !std.mem.eql(u8, candidate_func.name, base_func.name)) return false;
-        const candidate_sig = self.decl_sigs.get(candidate.int()) orelse return false;
-        const base_sig = self.decl_sigs.get(base.int()) orelse return false;
-        if (candidate_sig.kind != .instance_method or base_sig.kind != .instance_method) return false;
-        if (candidate_sig.is_suspend != base_sig.is_suspend or candidate_sig.sig.len != base_sig.sig.len) return false;
-        const base_owner = base_sig.enclosing_class orelse return false;
+        const candidate_sig = self.decl_sigs.get(candidate.int()) orelse {
+            if (dbg) std.debug.print("[ovr]   no candidate sig\n", .{});
+            return false;
+        };
+        const base_sig = self.decl_sigs.get(base.int()) orelse {
+            if (dbg) std.debug.print("[ovr]   no base sig\n", .{});
+            return false;
+        };
+        if (candidate_sig.kind != .instance_method or base_sig.kind != .instance_method) {
+            if (dbg) std.debug.print("[ovr]   kind {s}/{s}\n", .{ @tagName(candidate_sig.kind), @tagName(base_sig.kind) });
+            return false;
+        }
+        if (candidate_sig.is_suspend != base_sig.is_suspend or candidate_sig.sig.len != base_sig.sig.len) {
+            if (dbg) std.debug.print("[ovr]   siglen {d}/{d}\n", .{ candidate_sig.sig.len, base_sig.sig.len });
+            return false;
+        }
+        const base_owner = base_sig.enclosing_class orelse {
+            if (dbg) std.debug.print("[ovr]   no base owner\n", .{});
+            return false;
+        };
 
         const owner_class = &self.classes.items[owner.int()];
         const identity = try allocator.alloc(TypeBinding, owner_class.type_params.len * 2);
@@ -4680,11 +4756,20 @@ pub const Module = struct {
             identity[i * 2] = .{ .name = param, .ty = identity_ty };
             identity[i * 2 + 1] = .{ .name = identity_name, .ty = identity_ty };
         }
-        const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse return false;
+        const bindings = (try self.ancestorBindings(allocator, owner, base_owner, identity, 0)) orelse {
+            if (dbg) std.debug.print("[ovr]   no ancestor bindings owner={s} base_owner={s}\n", .{
+                self.classes.items[owner.int()].fqn, self.classes.items[base_owner.int()].fqn,
+            });
+            return false;
+        };
         for (candidate_sig.sig, base_sig.sig) |candidate_ty, raw_base_ty| {
             const base_ty = try substituteType(allocator, raw_base_ty, bindings);
-            if (!self.overrideTypeEql(candidate, base, candidate_ty, base_ty)) return false;
+            if (!self.overrideTypeEql(candidate, base, candidate_ty, base_ty)) {
+                if (dbg) std.debug.print("[ovr]   type mismatch {s} vs {s}\n", .{ candidate_ty.name, base_ty.name });
+                return false;
+            }
         }
+        if (dbg) std.debug.print("[ovr]   OK\n", .{});
         return true;
     }
 
@@ -4704,6 +4789,17 @@ pub const Module = struct {
         if (existing.int() == incoming.int()) return;
 
         gop.value_ptr.* = try self.preferredMethodSlotTarget(allocator, existing, incoming);
+        if (std.c.getenv("KLIO_SLOT_TRACE")) |want| {
+            const w = std.mem.span(want);
+            const chosen = gop.value_ptr.*;
+            const en = if (self.funcById(existing)) |f| f.name else "?";
+            if (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, en)) {
+                std.debug.print(
+                    "[slot-merge] slot={d} existing={d} incoming={d} -> {d} ({s})\n",
+                    .{ slot, existing.int(), incoming.int(), chosen.int(), en },
+                );
+            }
+        }
     }
 
     /// Choose the more-specific implementation of one inherited virtual slot.
@@ -4814,6 +4910,20 @@ pub const Module = struct {
                     methodDispatchKey(ClassId.from(@intCast(raw_cid)), MethodSlotId.from(entry.key_ptr.*)),
                     entry.value_ptr.*,
                 );
+                if (std.c.getenv("KLIO_SLOT_DUMP")) |want| {
+                    const w = std.mem.span(want);
+                    const fid = entry.value_ptr.*;
+                    const fname = if (self.funcById(fid)) |f| f.name else "?";
+                    if (std.mem.eql(u8, w, fname)) {
+                        const owner = if (self.decl_sigs.get(fid.int())) |s| s.enclosing_class else null;
+                        std.debug.print("[slot-dump] class={s} slot={d} -> fid={d} owner={s}\n", .{
+                            self.classes.items[raw_cid].fqn,
+                            entry.key_ptr.*,
+                            fid.int(),
+                            if (owner) |o| self.classes.items[o.int()].fqn else "?",
+                        });
+                    }
+                }
             }
         }
     }
@@ -5209,28 +5319,81 @@ pub const Module = struct {
     /// table are consulted, and generic-receiver extensions answer true
     /// for every head. Conservative on staleness: the index rebuilds when
     /// the declaration index has grown since the last build.
-    pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
-        if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
-            self.rebuildExtIndex(allocator) catch return true;
+    /// Which part of `extCouldApply` answered yes. Diagnostic only: the answer
+    /// is a single bit, but the campaign needs to know WHICH conservatism is
+    /// holding a site back before it can be tightened.
+    pub const ExtCouldApplyWhy = enum { none, index_stale, generic_receiver, own_head, builtin_super, declared_super };
+
+    /// Merged value-argument counts the extensions of one name on one receiver
+    /// head can accept. An extension whose declaration cannot take this call's
+    /// argument count is not a candidate for it and so cannot shadow a member.
+    pub const ExtArity = struct {
+        min: u32 = 0,
+        max: u32 = std.math.maxInt(u32),
+
+        fn accepts(self: ExtArity, argc: usize) bool {
+            return argc >= self.min and argc <= self.max;
         }
-        if (self.generic_ext_names.?.contains(name)) return true;
+
+        fn merge(self: ExtArity, other: ExtArity) ExtArity {
+            return .{
+                .min = @min(self.min, other.min),
+                .max = @max(self.max, other.max),
+            };
+        }
+    };
+
+    pub fn extCouldApply(
+        self: *Module,
+        allocator: Allocator,
+        head: []const u8,
+        name: []const u8,
+        argc: usize,
+    ) bool {
+        return self.extCouldApplyWhy(allocator, head, name, argc) != .none;
+    }
+
+    pub fn extCouldApplyWhy(
+        self: *Module,
+        allocator: Allocator,
+        head: []const u8,
+        name: []const u8,
+        argc: usize,
+    ) ExtCouldApplyWhy {
+        if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
+            self.rebuildExtIndex(allocator) catch return .index_stale;
+        }
+        if (self.generic_ext_names.?.get(name)) |arity| {
+            if (arity.accepts(argc)) return .generic_receiver;
+        }
         const idx = &self.ext_names_by_recv_head.?;
         if (idx.get(head)) |set| {
-            if (set.contains(name)) return true;
+            if (set.get(name)) |arity| {
+                if (arity.accepts(argc)) return .own_head;
+            }
         }
         for (applicability.builtinSupersOf(head)) |sup| {
             if (idx.get(sup)) |set| {
-                if (set.contains(name)) return true;
+                if (set.get(name)) |arity| {
+                    if (arity.accepts(argc)) return .builtin_super;
+                }
             }
         }
         if (self.registry.class_super_names.get(head)) |chain| {
             for (chain) |sup| {
                 if (idx.get(sup)) |set| {
-                    if (set.contains(name)) return true;
+                    if (set.get(name)) |arity| {
+                        if (arity.accepts(argc)) return .declared_super;
+                    }
                 }
             }
         }
-        return false;
+        return .none;
+    }
+
+    fn mergeExtArity(map: *std.StringHashMap(ExtArity), name: []const u8, arity: ExtArity) Allocator.Error!void {
+        const gop = try map.getOrPut(name);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.merge(arity) else arity;
     }
 
     fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
@@ -5240,8 +5403,8 @@ pub const Module = struct {
             m.deinit();
         }
         if (self.generic_ext_names) |*m| m.deinit();
-        var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
-        var gen = std.StringHashMap(void).init(allocator);
+        var idx = std.StringHashMap(std.StringHashMap(ExtArity)).init(allocator);
+        var gen = std.StringHashMap(ExtArity).init(allocator);
         for (self.func_index.items) |entry| {
             const ds = self.decl_sigs.get(entry.id.int());
             const f = if (ds == null) self.funcById(entry.id) else null;
@@ -5256,15 +5419,21 @@ pub const Module = struct {
                 null;
             const raw_head = (receiver_ty orelse continue).name;
             const head = staticTypeHead(raw_head);
+            // A declaration without a recorded signature contributes no arity
+            // bound, so it keeps the conservative answer for its name.
+            const arity: ExtArity = if (ds) |sig| .{
+                .min = sig.arity.required,
+                .max = if (sig.arity.has_vararg) std.math.maxInt(u32) else sig.arity.total,
+            } else .{};
             if (self.funcTypeParamIndex(entry.id, head) != null or
                 (head.len <= 2 and headAllUpper(head)))
             {
-                try gen.put(entry.name, {});
+                try mergeExtArity(&gen, entry.name, arity);
                 continue;
             }
             const gop = try idx.getOrPut(head);
-            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-            try gop.value_ptr.put(entry.name, {});
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(ExtArity).init(allocator);
+            try mergeExtArity(gop.value_ptr, entry.name, arity);
         }
         self.ext_names_by_recv_head = idx;
         self.generic_ext_names = gen;
@@ -6766,6 +6935,18 @@ pub const Module = struct {
     /// set for `name` (the remaining host-only/incomplete-header boundary); a
     /// non-null slice is bounded by Kotlin visibility, and may be empty when
     /// rankable declarations exist but none are visible from this site.
+    /// `KLIO_BCC_WHY=1`: report why the scoped bare-call candidate set came
+    /// back empty. Resolved once — this runs per lowered call site.
+    fn bccWhyOn() bool {
+        const S = struct {
+            var known: ?bool = null;
+        };
+        if (S.known) |k| return k;
+        const k = std.c.getenv("KLIO_BCC_WHY") != null;
+        S.known = k;
+        return k;
+    }
+
     pub fn boundedCallCandidates(
         self: *const Module,
         alloc: std.mem.Allocator,
@@ -6776,7 +6957,11 @@ pub const Module = struct {
     ) std.mem.Allocator.Error!?[]const FuncId {
         const candidates = try self.bareCallCandidates(alloc, name, caller_file);
         defer alloc.free(candidates);
-        if (candidates.len == 0) return null;
+        const dbg = bccWhyOn();
+        if (candidates.len == 0) {
+            if (dbg) std.debug.print("[bcc] {s} no-candidates\n", .{name});
+            return null;
+        }
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         const first_tier = self.lowestVisibleGlobalTier(
             name,
@@ -6784,8 +6969,12 @@ pub const Module = struct {
             caller_pkg,
             caller_file,
         );
-        if (first_tier == 255) return null;
+        if (first_tier == 255) {
+            if (dbg) std.debug.print("[bcc] {s} no-visible-tier n={d}\n", .{ name, candidates.len });
+            return null;
+        }
         if (first_tier >= other_package_tier) {
+            if (dbg) std.debug.print("[bcc] {s} other-package-tier n={d}\n", .{ name, candidates.len });
             return try alloc.alloc(FuncId, 0);
         }
         var list: std.ArrayList(FuncId) = .empty;
@@ -6798,6 +6987,7 @@ pub const Module = struct {
             if (self.globalArityCanBind(id, f, user_arg_count)) any_arity_match = true;
         }
         if (!any_arity_match) {
+            if (dbg) std.debug.print("[bcc] {s} no-arity-match n={d} kept={d}\n", .{ name, candidates.len, list.items.len });
             list.deinit(alloc);
             return null;
         }
@@ -8900,9 +9090,12 @@ test "extension candidate index uses declaration metadata for bodyless headers" 
         .has_body = true,
     });
 
-    try testing.expect(m.extCouldApply(a, "IntArray", "min"));
-    try testing.expect(!m.extCouldApply(a, "String", "min"));
-    try testing.expect(!m.extCouldApply(a, "IntArray", "max"));
+    try testing.expect(m.extCouldApply(a, "IntArray", "min", 0));
+    try testing.expect(!m.extCouldApply(a, "String", "min", 0));
+    try testing.expect(!m.extCouldApply(a, "IntArray", "max", 0));
+    // The extension declares no value parameters, so a one-argument call
+    // cannot select it and it cannot shadow a member of that name.
+    try testing.expect(!m.extCouldApply(a, "IntArray", "min", 1));
 }
 
 test "member resolution uses declaration-owner visibility" {

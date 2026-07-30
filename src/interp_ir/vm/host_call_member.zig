@@ -3636,7 +3636,7 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
     return cg.get().name;
 }
 
-pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8) bool {
+pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, argc: usize) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
     defer g.deinit();
@@ -3652,7 +3652,7 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
         }
         // extCouldApply rebuilds its lazy index when the func table has
         // grown; VM execution is single-threaded, so the cast is sound.
-        if (@constCast(m).extCouldApply(allocator, cls_name, name)) return true;
+        if (@constCast(m).extCouldApply(allocator, cls_name, name, argc)) return true;
     }
     const def = g.get().class.clone();
     defer def.deinit();
@@ -9403,6 +9403,47 @@ pub fn invokeVirtualMember(
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
+        // A virtual slot names an interface member, and an interface-typed value
+        // need not be an interpreted `Instance`: a `Sequence` is a host-backed
+        // generator, a `CharSequence` can be a string. Keep slot semantics by
+        // resolving the slot against the value's RUNTIME class rather than
+        // rejecting the receiver, and fall back to the member's name only when
+        // that class implements it natively and there is no body to enter.
+        const NonInstanceTarget = struct { target: ?FuncId, name: ?[]const u8 };
+        const noinst: NonInstanceTarget = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const root = FuncId.from(slot.int());
+            const mname: ?[]const u8 = if (module.funcById(root)) |f| f.name else null;
+            const runtime_class = module.classIdByFqn(receiver.typeFqn()) orelse
+                break :blk .{ .target = null, .name = mname };
+            const target = module.methodSlotTarget(runtime_class, slot) orelse
+                break :blk .{ .target = null, .name = mname };
+            if (!virtualTargetExecutable(module, target))
+                break :blk .{ .target = null, .name = mname };
+            break :blk .{ .target = target, .name = mname };
+        };
+        if (noinst.target) |target| {
+            if (arg_params) |params| {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                return callFuncIndexedRec(
+                    self,
+                    allocator,
+                    mg.get(),
+                    target,
+                    FuncId.from(slot.int()),
+                    receiver,
+                    args,
+                    params,
+                );
+            }
+            if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
+        }
+        if (noinst.name) |mname| {
+            return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
+        }
         if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
             const mg = self.module.borrow();
             defer mg.deinit();
@@ -9436,14 +9477,21 @@ pub fn invokeVirtualMember(
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
+    // A slot is a static hint, not a guarantee that the runtime can honour it.
+    // When the receiver's class has no entry for it, or the entry names a
+    // declaration with nothing to execute, dispatch by the member's name — the
+    // same result the site produced before it was bound, rather than a failure.
+    const slot_name: ?[]const u8 = if (module.funcById(FuncId.from(slot.int()))) |f| f.name else null;
     var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
         .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse {
             virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "receiver class");
+            if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
             return .{ .err = .{ .Type = "virtual method slot is not linked for receiver class" } };
         }).int() }
     else
         (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse {
             virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "runtime class");
+            if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
             return .{ .err = .{ .Type = "virtual method slot is not linked for runtime class" } };
         };
     // A runtime-defined or anonymous class can share the source interface's
@@ -9470,6 +9518,22 @@ pub fn invokeVirtualMember(
         );
     }
     const target = FuncId.from(linked.main_func);
+
+    // The slot resolved, but to a declaration with nothing behind it: no
+    // body, no linked host symbol, and no SAM callable on the instance.
+    // Dispatch by name rather than entering an empty frame.
+    if (!virtualTargetExecutable(module, target) and
+        host_call_func.resolvedNativeForm(self, target) == null)
+    {
+        const sam = blk: {
+            const instance = receiver.Instance.borrow();
+            defer instance.deinit();
+            break :blk instance.get().get("__sam_target__");
+        };
+        if (sam == null) {
+            if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+        }
+    }
 
     if (arg_params) |params| {
         const sig = module.decl_sigs.get(target.int());
@@ -9505,8 +9569,11 @@ pub fn invokeVirtualMember(
         }
     }
 
-    if (!any_named) return (try invokeMethodFuncId(self, allocator, receiver, target, args)) orelse
-        .{ .err = .{ .Type = "virtual method target is not executable" } };
+    if (!any_named) {
+        if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
+        if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+        return .{ .err = .{ .Type = "virtual method target is not executable" } };
+    }
 
     const all = try prependReceiver(allocator, receiver, args);
     defer if (runtime.freeScratch()) allocator.free(all);
@@ -9524,6 +9591,14 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
+    // A bodyless declaration linked to a host symbol runs as that intrinsic,
+    // not as an empty frame. Every fast path below enters a frame directly, so
+    // route it through the general call path, which consults the linkage.
+    if (!f.hasBody() and host_call_func.resolvedNativeForm(self, fid) != null) {
+        const all = try prependReceiver(allocator, receiver, args_in);
+        defer if (runtime.freeScratch()) allocator.free(all);
+        return try callFuncRec(self, allocator, mod, fid, all);
+    }
     // Frameless serve for the canonical getter shape on a claimed class.
     // Uses the module-owned func pointer so the shape/route memo persists.
     if (args_in.len == 0) {

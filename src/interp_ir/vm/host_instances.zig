@@ -1262,6 +1262,12 @@ fn runInitBlocksAt(
         switch (fr) {
             .err => {},
             .ok => |f| {
+                // See the body-prop-init note: an `init { }` block is class-body
+                // scope too, so a lambda created inside it must snapshot the
+                // instance as an enclosing receiver.
+                var encl_v = inst_value.*;
+                ir.eval.pushEnclosing(&encl_v);
+                defer ir.eval.popEnclosing();
                 var all: std.ArrayList(Value) = .empty;
                 defer all.deinit(self.allocator);
                 try all.append(self.allocator, inst_value.*);
@@ -3315,6 +3321,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     switch (fr) {
                         .err => |e| return .{ .err = e },
                         .ok => |func| {
+                            // The initializer runs in the class body's
+                            // scope, so a lambda created inside it must see
+                            // the instance as an enclosing receiver — a
+                            // closure snapshots the chain at creation, and
+                            // without this a bare name inside
+                            // `Job(..).apply { invokeOnCompletion { stateLock } }`
+                            // saw only the `apply` receiver and fell through to
+                            // the global. Same treatment the class DELEGATE
+                            // thunk already gets below; the instance is passed
+                            // as the thunk's `this` PARAMETER, which is not the
+                            // same as being on the enclosing chain.
+                            var encl_v = inst_value;
+                            ir.eval.pushEnclosing(&encl_v);
+                            defer ir.eval.popEnclosing();
                             var all: std.ArrayList(Value) = .empty;
                             defer all.deinit(allocator);
                             try all.append(allocator, inst_value);

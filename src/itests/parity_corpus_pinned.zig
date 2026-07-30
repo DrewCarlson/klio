@@ -1145,3 +1145,59 @@ test "bare_write_var_declared_later" {
         \\
     );
 }
+
+test "catch_param_static_type" {
+    try check("catch_param_static_type",
+        \\cause=Root cause
+        \\renders-cause=true
+        \\renders-suppressed=true
+        \\renders-outer-suppressed=true
+        \\suppressed-count=1
+        \\boom:x
+        \\
+    );
+}
+
+test "host_backed_receiver_virtual_slot" {
+    try check("host_backed_receiver_virtual_slot",
+        \\10,20,30,
+        \\2,1,0,
+        \\a1true
+        \\w|x|y
+        \\3
+        \\43
+        \\7
+        \\true
+        \\
+    );
+}
+
+test "safe_call_binds_on_non_null_branch" {
+    try check("safe_call_binds_on_non_null_branch",
+        \\node:a!
+        \\null
+        \\evaluations=2
+        \\inner:a
+        \\null
+        \\evaluations=4
+        \\node:z?
+        \\
+    );
+}
+
+test "override_param_type_from_enclosing_scope" {
+    try check("override_param_type_from_enclosing_scope",
+        \\tagged-empty
+        \\tagged-kept
+        \\tagged-empty
+        \\tagged-empty
+        \\
+    );
+}
+
+test "init_lambda_encloses_instance" {
+    try check("init_lambda_encloses_instance",
+        \\T/prop T/init
+        \\
+    );
+}
