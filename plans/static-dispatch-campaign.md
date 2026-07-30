@@ -230,6 +230,33 @@ regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
 
+## Scratch homes in /tmp are the single biggest source of false regressions
+
+Two of them, both found in the same session, both of which had already cost
+real diagnosis time inside the interpreter:
+
+  - `/tmp/klio_itest_stdlibtest_home` — the commontest sweep's home. Without
+    the kotlin.test pack every test in every file reports `unresolved global
+    assertEquals`. `scripts/commontest-sweep.py` now installs it and refuses to
+    sweep when it cannot find one.
+  - `/tmp/klio_itest_compose_plugin_home` — the compose home. It needs FIVE
+    packs (atomicfu, kotlin.test, coroutines, androidx.collection, the runtime
+    engine) in dependency order; with only some installed the run reports
+    `unresolved reference runTest` and `unresolved reference atomic` from a
+    pack's own klioMain sources. `scripts/compose-install-packs.sh` rebuilds
+    and installs all five.
+
+The shape to recognise: a failure reported by EVERY test, or an unresolved
+reference to a name that obviously exists, is evidence about the environment.
+Check the home's `packs/` before forming any hypothesis about the compiler.
+Both of these presented as compiler bugs and neither was.
+
+Also fixed: `scripts/compose-test.sh` baked `kotlinx_coroutines_test_default_timeout=10s`
+and ignored an outer value, so the two background-thread tests
+(`markInvalidFromBackgroundThread`, `resumeOnBackgroundThread`, which need
+~15s and ~47s) always failed and were reported as a regression once already.
+It now honours an outer override.
+
 ## RESOLVED: `unresolved global assertEquals` was a missing pack, not the interpreter
 
 The sweep intermittently reported whole files failing every case with
@@ -312,180 +339,66 @@ reached). This is the one bucket that genuinely requires a typeck project —
 substituting type arguments through call sites and propagating them from
 declarations. Everything else below does not.
 
-### 2. `resolver_declined` — 1,862 (19.1%). Needs no typeck.
+### 2. `resolver_declined` — needs no typeck. Interface receivers LANDED.
 
 Every deferral reaching the post-target path is `target_known_deferred`: the
 resolver has ALREADY identified the declaration and withholds only the dispatch
 commitment, because an argument's type is unknown so applicability is unproven.
 
-78 of these are now bound (see the entry above). The rest are held back by two
-specific things, both measured:
+Promoting those to a real dispatch, guarded by `extCouldApply`, landed first for
+class receivers. Interface receivers are now included too, and the whole
+`ContinuationInterceptorKeyTest` investigation resolved into a single linker
+bug that had nothing to do with the promotion:
 
-  - **Interface receivers.** Allowing them binds a further 174 sites
-    (`bound_virtual` 9 -> 183) and the stdlib sweep fails: an interface-typed
-    receiver can hold a host-backed value (`Sequence` is a generator, not an
-    `Instance`) and the method slot raises "virtual call receiver is not an
-    instance".
+**The virtual-slot linker resolved an unqualified parameter type only against
+the owner class itself.** A classifier written without a qualifier inside a
+nested class names the ENCLOSING class's member, so `Key` in
+`CoroutineContext.Element` is `CoroutineContext.Key`. `overridesSlot` compares
+an override's parameter types against the base declaration's, so
+`ContinuationInterceptor.minusKey(key: CoroutineContext.Key<*>)` and
+`CoroutineContext.Element.minusKey(key: Key<*>)` compared unequal, the override
+went unrecognised, and `preferredMethodSlotTarget` kept the base. Measured:
 
-    Three fixes have been tried at that arm, and the third is close. Recorded
-    with what each proved:
+    [slot-merge] slot=128 existing=124 incoming=153 -> 124 (minusKey)
+    [ovr] cand=153 base=124 name=minusKey/minusKey is_override=true
+    [ovr]   type mismatch Key vs Key      <- the two spellings of one type
 
-    a. Fall back to name-based dispatch (`callMember`). Fixes the Sequence
-       tests, regresses `ContinuationInterceptorKeyTest` — dispatch by NAME is
-       not equivalent to dispatch by SLOT when a subclass overrides `key`.
-    b. Resolve the slot against the value's RUNTIME type
-       (`classIdByFqn(receiver.typeFqn())` + `methodSlotTarget`) and invoke
-       that. Correct in principle and keeps slot semantics, but the target it
-       finds has no body — the member is implemented natively for that value —
-       so it fails with "virtual method target is not executable".
-    c. (b) first, falling back to (a) only when the slot target has no body.
-       **The Sequence tests pass**; `ContinuationInterceptorKeyTest` still
-       fails, because `key`'s slot target also has no body and so reaches the
-       name fallback, which loses the override.
+    before:  DerivedElementWithOldKey slot=128 -> fid=124 Element.minusKey
+             CustomInterceptor        slot=128 -> fid=153 ContinuationInterceptor.minusKey
+    after:   every class implementing ContinuationInterceptor -> fid=153
 
-    A correction on (c), and it moves where to look. The classes in
-    `ContinuationInterceptorKeyTest` — `DerivedElementWithOldKey`,
-    `DerivedElementWithPolyKey` — are INTERPRETED classes, so their receivers
-    are `Instance` values and never reach the non-instance branch at all. That
-    failure therefore does NOT come from the runtime fallback; it comes from the
-    LOWERING promotion binding an interface member whose override must still be
-    selected at run time.
+`CustomInterceptor` was right all along because it implements
+`ContinuationInterceptor` directly, with no intermediate class contributing a
+competing inherited entry — which is why `Comparator.compare` never regressed
+and looked like a counterexample.
 
-    So the two halves are independent:
+`overrideTypeClassId` now widens outwards along the owner's FQN, matching on
+the full `scope.name` so a class sharing only the simple name cannot answer.
+The bug was latent before the promotion: without a static virtual binding the
+call dispatched by NAME at run time, which walks the receiver's own hierarchy
+and finds the override anyway.
 
-      - The host-backed half is solved by (b)+(c): resolve the slot against the
-        value's runtime type, fall back only when that target is bodyless. The
-        Sequence tests pass under it.
-      - The interpreted half is a promotion bug, but NOT the obvious one.
-        `dispatchForTarget` mirrors the resolver's order — `!has_body` ->
-        virtual, `Private` -> direct, stub/value -> virtual, then
-        `!class.is_interface and …` -> direct, else virtual — so an
-        interface-declared member returns `.virtual`, never `.direct`. The
-        promotion is emitting a virtual slot, which is the correct FORM.
+The host-backed half is handled where the plan predicted. An interface-typed
+value need not be an interpreted `Instance` — a `Sequence` is a generator — so
+`invokeVirtualMember` resolves the slot against the value's runtime class and
+falls back to the member's name only when that class implements it natively
+and there is no body to enter.
 
-        And the slot hypothesis is wrong too. `KLIO_EMIT_TRACE=key` on the
-        failing file with the promotion enabled emits NOTHING for `key` — it is
-        never statically bound at all, so neither a mis-rooted slot nor a
-        property read reaching a method slot can be the cause.
+Measured A/B on one pinned file set (`scripts/dispatch-census.sh`, one build,
+one command each way — the pinned set exists because an earlier round compared
+counts taken on different file sets and read a gain that was never there):
 
-        Three hypotheses have now been ruled out by measurement rather than
-        argument: the runtime name-fallback (those receivers are interpreted
-        `Instance` values that never reach that branch), `dispatchForTarget`
-        answering `.direct` (it answers `.virtual` for an interface member), and
-        `key` itself being bound (it is not bound).
+    interfaces excluded:  bound_static 144  bound_virtual   6   declined 1670
+    interfaces included:  bound_static  72  bound_virtual  88   declined  766
 
-        **CAUSE FOUND, by the diff rather than a fourth hypothesis.**
-        `KLIO_EMIT_TRACE` now accepts `*` and covers `CallVirtual`, and the
-        promotion's new emissions in that file are:
+`[decline] target_known_deferred` falls 386 -> 93 on that set. Full stdlib
+sweep 117 files / 0 failures, compose 148/148.
 
-            [emit] CallVirtual root=kotlin.coroutines.CoroutineContext.minusKey
-                   slot=128 in_fn=testKeyIsNotOverridden
-            [emit] CallVirtual root=kotlin.coroutines.CoroutineContext.minusKey
-                   slot=128 in_fn=testKeyIsOverridden
-
-        It is `minusKey`, not `key`. The slot is rooted at the INTERFACE
-        declaration `CoroutineContext.minusKey`, while the receiver is an
-        `Element` and `Element.minusKey` overrides it. The static type
-        (`CoroutineContext`) is a supertype of the declaration that must
-        actually run, so dispatching through a slot rooted at the supertype
-        returns the base behaviour and the element is never removed — exactly
-        the observed `Expected <EmptyCoroutineContext>, actual
-        <DerivedElementWithOldKey>`.
-
-        So the fix is about slot ROOTING: when the promotion binds a member
-        declared on an interface, the slot must be rooted so the runtime walk
-        reaches the receiver's own override. The shape was guessed correctly two
-        hypotheses ago but attributed to the wrong member, which is why the
-        diff — not the reasoning — is what produced it.
-
-        Note for the next attempt: `Comparator.compare` (slot 155) is bound at
-        11 further sites in the same run and does NOT regress, so interface
-        rooting is not uniformly broken. Compare those two cases first.
-
-        The distinguishing feature is almost certainly an intermediate
-        overriding interface. `Comparator.compare` has ONE declaration and no
-        interface between it and its implementations. `minusKey` is declared on
-        `CoroutineContext` and overridden by `CoroutineContext.Element`, which
-        is itself an interface, and the concrete classes implement `Element`.
-        A slot is identified by its root declaration's `FuncId`
-        (`FuncId.from(slot.int())` throughout the virtual-call arm), so the
-        question to settle is whether `Element.minusKey` registers under
-        `CoroutineContext.minusKey`'s slot or gets one of its own. If the
-        latter, a call rooted at the base slot can never reach the override, and
-        that is the bug.
-
-        Slot identity is settled: lowering emits
-        `.slot = MethodSlotId.fromFunc(func_id)`, so the slot IS the resolved
-        target's `FuncId` verbatim. A call rooted at `CoroutineContext.minusKey`
-        therefore needs the CONCRETE class's dispatch table to map that exact fid
-        to `Element`'s override.
-
-        And the re-pointing mechanism for that already exists. In
-        `linkMethodClass`'s own-methods loop, every inherited slot is tested with
-        `overridesSlot(cid, fid, base)` and re-pointed to the overriding
-        declaration when it matches. So the bug is NOT missing machinery, and not
-        merging either.
-
-        BOTH candidates are ruled out, and the linker is exonerated. A probe
-        over `decl_sigs` at link time shows:
-
-            fid=124 kotlin.coroutines.CoroutineContext.Element.minusKey
-                    owner=…Element  is_override=true  nparams=2
-            fid=128 kotlin.coroutines.CoroutineContext.minusKey
-                    owner=…CoroutineContext  is_override=false  nparams=2
-
-        `Element.minusKey` IS in `decl_sigs` under `Element`, as a public
-        `instance_method`, so it reaches `own_methods`. And every precondition
-        `overridesSlot` checks holds — `is_override` true, same name, same kind,
-        same parameter count. So linking `Element` should re-point slot 128 to
-        fid 124, and a concrete class implementing `Element` should inherit that
-        mapping.
-
-        And dumping the built table settles it — the dispatch is CORRECT:
-
-            [slot-dump] class=…DerivedElementWithOldKey  slot=128
-                        -> fid=124 CoroutineContext.Element.minusKey
-            [slot-dump] class=…DerivedElementWithPolyKey slot=128 -> fid=124
-            [slot-dump] class=…CustomInterceptor         slot=128 -> fid=153
-
-        Every concrete class maps slot 128 to the right override. So slot
-        rooting, slot linking and slot dispatch are all exonerated, and binding
-        `minusKey` at slot 128 would have dispatched correctly.
-
-        **The fault is in the BODY of `Element.minusKey`, not in the call to
-        it.** That body is
-
-            if (key == this.key) EmptyCoroutineContext else this
-
-        and `key` is a PROPERTY that `DerivedElementWithPolyKey` overrides. The
-        promotion changes lowering for the whole program, stdlib included, so the
-        `this.key` read inside that stdlib body is itself a candidate: bound
-        against `Element` it returns the base property instead of dispatching to
-        the override, the comparison fails, and the element is never removed —
-        matching the assertion exactly.
-
-        Check that next: trace what `this.key` lowers to inside
-        `CoroutineContext.Element.minusKey` with and without the promotion.
-
-        TWO TRAPS make `KLIO_EMIT_TRACE` unreliable for this, and both have
-        already produced a wrong conclusion in this campaign:
-
-        1. It covers `Call`/`CallVirtual`/`CallMember` only. A property read
-           lowers to `GetField`, which it does not report. Extending it to
-           `GetField` is a few lines and was verified to work.
-        2. **It only reports on a COLD run.** The second invocation of the same
-           file emitted ZERO rows where the first emitted hundreds, because the
-           module came from the image cache and no lowering happened at all.
-
-        Trap 2 retroactively invalidates the earlier inference that "`key` is
-        never statically bound" — that run may simply have been warm. Any
-        conclusion drawn from this trace's SILENCE is worthless unless the cache
-        was cleared first. Clear it between runs, and confirm the trace produces
-        rows for a known-bound name in the same run before reading anything into
-        an absence.
-  - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
-    rule out an extension. Tightening that query (it answers yes for any
-    generic-receiver extension) would convert more.
+Still open in this bucket: **the rest of the `unknown_count == 1` set**, where
+`extCouldApply` cannot rule out an extension. It answers yes for any
+generic-receiver extension, and it is what keeps the fixture's original
+`remove` spelling on the dynamic path (the stdlib has `remove` extensions).
+Tightening that query is the next conversion here.
 
 ### 3. `no_class_id` — 747 (7.7%). Mostly type parameters, now partly solved.
 
