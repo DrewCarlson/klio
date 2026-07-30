@@ -12022,6 +12022,8 @@ fn resolveExtensionCallForArgs(
         .call_name = name.name,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
     };
+    // Diagnostic only; see `applicability.trace_call_span`.
+    if (applicability.extKeyTraceEnabled()) applicability.trace_call_span = name.span;
     var resolution = b.module.resolveExtensionCall(
         name.name,
         recv_ty,
