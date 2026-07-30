@@ -253,6 +253,24 @@ Two things make it confusing to encounter, so they are recorded here:
     v7 timestamp path throws during shared setup and the unresolved-global
     message is a cascade from that rather than the cause.
 
+Ruled out so far, so the next attempt does not repeat them:
+
+  - The image cache. Deleting `~/.klio/cache` in the sweep's child home (56 MB
+    of `stdlib-*.klio-image`) and re-running changes nothing. Worth ruling out
+    explicitly because a stale cached module WOULD produce exactly this symptom,
+    and the cache is known to serve warm modules without lowering at all.
+  - The star import. `UuidTest.kt` uses `import kotlin.test.*` where its passing
+    sibling `DurationTestUtils.kt` uses an explicit
+    `import kotlin.test.assertEquals`, which looks like the obvious difference —
+    but 115 files under `test/` use the star form and pass.
+  - A missing source. Unlike `UInt.kt`, `src/kotlin/uuid/Uuid.kt` IS in
+    `stdlib_sources.zig`, along with `ExperimentalUuidApi.kt` and a
+    `kotlin-uuid/UuidActuals.kt`.
+
+All 21 tests in the file fail, not a subset, which points at the whole file
+failing to resolve rather than at any individual case. No lowering diagnostic is
+printed. Start by finding out whether the file lowers at all.
+
 Anyone gating on the sweep should treat these as a known baseline failure until
 diagnosed, and should NOT attribute them to a dispatch change without bisecting
 first.
