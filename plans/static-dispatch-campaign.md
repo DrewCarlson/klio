@@ -303,6 +303,48 @@ significant piece of design, because lowering compiles such a body once.
 almost certainly the same shape — a `Grouping<T, K>` receiver inside a
 generic body.
 
+### Five falsified theories, and what the probe still cannot see
+
+The `plusCollectionInference` regression resisted five successive
+diagnoses. Recorded so none is retried:
+
+1. *Instantiation-dependent recordings.* Excluding all 29,517 of them
+   (`generic_body_depth`) left both regressions failing.
+2. *Unbound splice parameter type.* `KLIO_SPLICE_TRACE` shows
+   `plusElement entered, params=1` and `bound element: T` — it splices and
+   the binding happens.
+3. *`argDeclTypeRef` answering wrongly.* `KLIO_ARGTY_TRACE` shows
+   `element -> T args=0 splice_ty=true` — the argument resolves correctly.
+4. *`param_spec` rewarding an unproven concrete parameter.* Gating it on the
+   argument's head being a type parameter was implemented, compiled, passed
+   233 ir tests, and changed neither regression. Reverted.
+5. *The splice substituting the caller's argument expression.*
+   `KLIO_EXTKEY_TRACE` shows the spliced body's call as
+   `recv=Collection args=T` picking fid 2837 `plus(element: T)` correctly at
+   score 100105 against 100015. And no `recv=List<List<...>>` row exists
+   anywhere, so the caller's `List<List<String>>` never reaches a `plus`
+   receiver.
+
+Where that leaves it: every `plus` ranking row dumped is individually
+DEFENSIBLE. `recv=Collection args=T` picks the element overload;
+`recv=List<String> args=List<String>` picks the Iterable overload, which is
+correct for the `listOf("a") + listOf("b")` calls elsewhere in the file. The
+failing call cannot be identified from receiver/argument type shapes because
+several sites share a shape.
+
+The blocking instrumentation gap: `ApplicabilityScope` carries no call
+SPAN, so an `[extkey]` row cannot be tied to a source line. Threading a span
+through the scope (diagnostic-only, no behavior) is the prerequisite for
+going further — with it, the failing line's candidate set and key comparison
+can be read directly instead of inferred from shapes. That is a small,
+well-defined task and it should be the next thing done.
+
+Cost note for whoever picks this up: five theories, each a full
+build-and-validate cycle, all falsified. The probes that produced facts
+(`KLIO_SPLICE_TRACE`, `KLIO_ARGTY_TRACE`, `KLIO_EXTKEY_TRACE`) were worth
+more than any of the reasoning that motivated them. Build the span-labelled
+dump before forming a sixth theory.
+
 ### The inference work list
 
 The work list, ranked by how often typeck could not name a type's

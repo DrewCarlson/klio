@@ -1237,8 +1237,21 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     // that differs is the one that decides; reading it beats guessing which
     // term dominates.
     if (extKeyTraceWanted(sig.fid)) {
-        std.debug.print("[extkey] fid={d} params={d} key={any}\n", .{ if (sig.fid) |f| f.int() else 0, params.len, key });
-        for (params, 0..) |*pp, pi| std.debug.print("[extkey]   p{d}: {s}\n", .{ pi, pp.ty.name });
+        std.debug.print("[extkey] fid={d} key={any} recv=", .{ if (sig.fid) |f| f.int() else 0, key });
+        if (recv) |r| {
+            if (r.ty) |t| {
+                if (t.args.len > 0) std.debug.print("{s}<{s}>", .{ t.name, t.args[0].name }) else std.debug.print("{s}", .{t.name});
+            } else std.debug.print("?", .{});
+        } else std.debug.print("-", .{});
+        std.debug.print(" args=", .{});
+        for (args) |*aa| {
+            if (aa.ty) |t| {
+                if (t.args.len > 0) std.debug.print("{s}<{s}> ", .{ t.name, t.args[0].name }) else std.debug.print("{s} ", .{t.name});
+            } else std.debug.print("? ", .{});
+        }
+        std.debug.print("| params=", .{});
+        for (params) |*pp| std.debug.print("{s} ", .{pp.ty.name});
+        std.debug.print("\n", .{});
     }
     return .{
         .points = score,
