@@ -340,12 +340,33 @@ specific things, both measured:
         answering `.direct` (it answers `.virtual` for an interface member), and
         `key` itself being bound (it is not bound).
 
-        What IS newly bound in that file is unmeasured. The next step is
-        mechanical, not analytical: capture `KLIO_EMIT_TRACE` output for the
-        whole file with and without the promotion and DIFF them. The member that
-        appears only in the second run is the one to look at. Do not form a
-        fourth hypothesis first — the three above each cost a build-and-run and
-        each was wrong.
+        **CAUSE FOUND, by the diff rather than a fourth hypothesis.**
+        `KLIO_EMIT_TRACE` now accepts `*` and covers `CallVirtual`, and the
+        promotion's new emissions in that file are:
+
+            [emit] CallVirtual root=kotlin.coroutines.CoroutineContext.minusKey
+                   slot=128 in_fn=testKeyIsNotOverridden
+            [emit] CallVirtual root=kotlin.coroutines.CoroutineContext.minusKey
+                   slot=128 in_fn=testKeyIsOverridden
+
+        It is `minusKey`, not `key`. The slot is rooted at the INTERFACE
+        declaration `CoroutineContext.minusKey`, while the receiver is an
+        `Element` and `Element.minusKey` overrides it. The static type
+        (`CoroutineContext`) is a supertype of the declaration that must
+        actually run, so dispatching through a slot rooted at the supertype
+        returns the base behaviour and the element is never removed — exactly
+        the observed `Expected <EmptyCoroutineContext>, actual
+        <DerivedElementWithOldKey>`.
+
+        So the fix is about slot ROOTING: when the promotion binds a member
+        declared on an interface, the slot must be rooted so the runtime walk
+        reaches the receiver's own override. The shape was guessed correctly two
+        hypotheses ago but attributed to the wrong member, which is why the
+        diff — not the reasoning — is what produced it.
+
+        Note for the next attempt: `Comparator.compare` (slot 155) is bound at
+        11 further sites in the same run and does NOT regress, so interface
+        rooting is not uniformly broken. Compare those two cases first.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.

@@ -2298,7 +2298,13 @@ pub const FuncBuilder = struct {
             switch (inst) {
                 .Call => |c| {
                     if (self.module.funcById(c.func)) |f| {
-                        if (std.mem.eql(u8, f.name, want)) std.debug.print("[emit] Call fqn={s} fid={d} in_fn={s}\n", .{ f.fqn, c.func.int(), currentRealFn() orelse "-" });
+                        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, f.name, want)) std.debug.print("[emit] Call fqn={s} fid={d} in_fn={s}\n", .{ f.fqn, c.func.int(), currentRealFn() orelse "-" });
+                    }
+                },
+                .CallVirtual => |c| {
+                    if (self.module.funcById(FuncId.from(c.slot.int()))) |f| {
+                        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, f.name, want))
+                            std.debug.print("[emit] CallVirtual root={s} slot={d} in_fn={s}\n", .{ f.fqn, c.slot.int(), currentRealFn() orelse "-" });
                     }
                 },
                 .CallMember => |c| {
