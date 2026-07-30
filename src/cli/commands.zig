@@ -813,11 +813,17 @@ pub fn computeEagerCalls(
     var tit = tc.types.iterator();
     var tn: usize = 0;
     while (tit.next()) |e| {
+        // A type recorded inside a generic body is true only for the
+        // instantiation typeck happened to check last. Handing it to lowering
+        // changes which overload wins — `plusElement`'s `return plus(element)`
+        // matches `plus(element: T)` against `T`, but against
+        // `List<String>` the concatenating `plus(Iterable<T>)` also applies.
+        if (tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
         const head = eagerHeadOf(e.value_ptr, false) orelse continue;
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    if (audit) std.debug.print("[EAGER] {d} type heads recorded\n", .{tn});
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent)\n", .{ tn, tc.types_instantiation_dependent.count() });
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     var rit = tc.lambda_recv_heads.iterator();
