@@ -492,11 +492,26 @@ read inside it walks against the JOB. The enclosing `Recomposer` never enters
 the candidate list — hence `cands=1` — so the read falls through to the global
 and raises.
 
-The cause is in `implicitCandidatesAlloc`. Its own comment states the rule: "A
-supplied direct receiver is subject-like; it REPLACES, rather than precedes, the
-frame `this`." For an inline splice receiver that is wrong. Kotlin resolves a
-bare name against implicit receivers innermost-first and then keeps going
-outward, so the splice receiver must PRECEDE the frame's `this`, not replace it.
+The cause is in `implicitCandidatesAlloc`, but NOT simply in its
+"a supplied direct receiver replaces the frame `this`" rule — read further
+before changing that line. A follow-up block already re-adds the frame's own
+receiver param after a direct receiver, and it is gated on `consult_param`,
+which the `LoadFromThisOrGlobal` arm passes as `true`. So the ordering rule is
+not what strands the Recomposer.
+
+Since the walk still reports `cands=1`, one of these must hold at that site, and
+which one is the next thing to establish:
+
+  - `implicitThisValue(frame, this_idx, true)` is `Null`/`Unit` — plausible,
+    because the failing read sits in a lambda spliced into a PROPERTY
+    INITIALIZER thunk, which may carry no `this` at all; or
+  - it equals the direct receiver, or is already in `out`, and gets deduped.
+
+If it is the first, the fix is not in the candidate ORDER but in what the splice
+captures: the enclosing `this` has to reach the frame before any ordering can
+help. Establish which by printing `implicitThisValue` alongside the
+`[icand-append]` rows on the real failing run — the same method that found the
+mechanism, and the one that worked after five reductions did not.
 
 That makes this the third instance of one family, exactly as predicted earlier
 in this document: an implicit receiver that exists and that the runtime walk
