@@ -309,12 +309,28 @@ specific things, both measured:
        fails, because `key`'s slot target also has no body and so reaches the
        name fallback, which loses the override.
 
-    So the remaining blocker is precise: a bodyless slot target needs a
-    dispatch route that preserves overrides. Name lookup does not. The likely
-    answer is to walk the runtime class's supertype chain for the first
-    OVERRIDING declaration with a body, rather than falling back to a name — the
-    same information `runtimeVirtualTarget` already computes for instances, but
-    reached from a host-backed value's type. Start there, not from (a).
+    A correction on (c), and it moves where to look. The classes in
+    `ContinuationInterceptorKeyTest` — `DerivedElementWithOldKey`,
+    `DerivedElementWithPolyKey` — are INTERPRETED classes, so their receivers
+    are `Instance` values and never reach the non-instance branch at all. That
+    failure therefore does NOT come from the runtime fallback; it comes from the
+    LOWERING promotion binding an interface member whose override must still be
+    selected at run time.
+
+    So the two halves are independent:
+
+      - The host-backed half is solved by (b)+(c): resolve the slot against the
+        value's runtime type, fall back only when that target is bodyless. The
+        Sequence tests pass under it.
+      - The interpreted half is a promotion bug. `dispatchForTarget` is
+        returning something too strong for an interface member that a subclass
+        overrides — `key` is declared on `CoroutineContext.Element` and
+        overridden below it. Check what `dispatchForTarget` answers for an
+        interface-declared member before touching the runtime arm again; a
+        `.direct` there would explain the result exactly.
+
+    Verify that first. It is a one-line question and it decides whether the
+    interface work is a runtime change, a resolver change, or both.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
