@@ -693,6 +693,8 @@ fn runTestsOnBuilt(
     });
     if (runtime.getenvSlice("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     ir.eval.callStatsDump();
+    ir.eval.dispatchStatsDump();
+    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) ir.lower.expr.lowerSitesDump();
     ir.eval.probeStatsDump();
     ir.eval.opProfDump();
     return if (report.failed > 0) 1 else 0;

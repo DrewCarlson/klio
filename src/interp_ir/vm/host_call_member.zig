@@ -9518,6 +9518,7 @@ pub fn invokeVirtualMember(
 }
 
 fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args_in: []const Value) Allocator.Error!?EvalResult {
+    ir.eval.dispatchNote(.served_user_body);
     runtime.prof.opRoute(4);
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -10353,6 +10354,7 @@ fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?FuncId {
 }
 
 fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    ir.eval.dispatchNote(.served_intrinsic);
     runtime.prof.opRoute(6);
     // A declared lambda-taking overload the intrinsic surface cannot
     // express wins resolution; decline so the walk's extension fallback
@@ -13330,6 +13332,7 @@ fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 /// `[receiver] ++ args` with a null-shifted name vector, the self-delegation
 /// guard pushed, dispatched through the named caller.
 fn invokeMethodNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value, arg_names: ?[]const ?[]const u8) Allocator.Error!?EvalResult {
+    ir.eval.dispatchNote(.served_user_body);
     const all = try prependReceiver(allocator, receiver, args);
     defer if (runtime.freeScratch()) allocator.free(all);
     var names = try allocator.alloc(?[]const u8, all.len);

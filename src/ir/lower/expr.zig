@@ -11510,6 +11510,27 @@ const ResolvedMemberLowering = union(enum) {
     lowered: Reg,
 };
 
+/// Per-site census of the static member-call gate (`KLIO_DISPATCH_STATS`),
+/// so the coverage of static binding is a number rather than an impression.
+pub var lm_sites: [6]u64 = @splat(0);
+pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual };
+fn lmNote(comptime r: LmReason) void {
+    lm_sites[@intFromEnum(r)] += 1;
+}
+
+/// Report the static member-call gate's per-site coverage. Called at the end
+/// of a run alongside the executed-dispatch census.
+pub fn lowerSitesDump() void {
+    var total: u64 = 0;
+    for (lm_sites) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[lower-sites] total={d}\n", .{total});
+    inline for (@typeInfo(LmReason).@"enum".fields) |f| {
+        const n = lm_sites[f.value];
+        if (n != 0) std.debug.print("[lower-sites] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
 fn lowerResolvedMemberCall(
     b: *FuncBuilder,
     receiver: *const Expr,
@@ -11526,9 +11547,13 @@ fn lowerResolvedMemberCall(
                 std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
             }
         }
+        lmNote(.no_receiver_type);
         return .none;
     };
-    if (ty.nullable) return .none;
+    if (ty.nullable) {
+        lmNote(.nullable_or_generic);
+        return .none;
+    }
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
@@ -11536,7 +11561,10 @@ fn lowerResolvedMemberCall(
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head);
-    var static_owner = owner_id orelse return .none;
+    var static_owner = owner_id orelse {
+        lmNote(.no_class_id);
+        return .none;
+    };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
         const receiver_name = receiver.Path.segments[receiver.Path.segments.len - 1].name;
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
@@ -11589,10 +11617,10 @@ fn lowerResolvedMemberCall(
     }
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
-    if (resolved.dispatch == .deferred) return .deferred;
-    var target = b.module.funcById(func_id) orelse return .deferred;
+    if (resolved.dispatch == .deferred) { lmNote(.resolver_declined); return .deferred; }
+    var target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
     const has_spread = anySpread(args);
-    if (resolved.dispatch == .direct and has_spread) return .deferred;
+    if (resolved.dispatch == .direct and has_spread) { lmNote(.resolver_declined); return .deferred; }
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Numeric virtual slots operate on `Value.Instance`. Classifier ABI
@@ -11601,7 +11629,7 @@ fn lowerResolvedMemberCall(
         // classes. Named, defaulted, and vararg interface calls bind against
         // the numeric declaration ABI.
         if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
-            owner.receiver_abi != .instance) return .deferred;
+            owner.receiver_abi != .instance) { lmNote(.resolver_declined); return .deferred; }
     }
 
     try recordLambdaArgReceivers(b, target, args, ast_arg_names, ast_type_args, 1);
@@ -11629,12 +11657,12 @@ fn lowerResolvedMemberCall(
     // Lowering the receiver expression can append functions (a lambda in the
     // receiver lowers into the module's func table) and reallocate it,
     // invalidating `target`; re-fetch the pointer before reading it again.
-    target = b.module.funcById(func_id) orelse return .deferred;
+    target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
     if (resolved.dispatch == .virtual) {
         // A virtual target without even a receiver param cannot be bound
         // here on any path (the named/vararg mapping below already deferred
         // it); defer before the receiver-skipping scans slice params[1..].
-        if (target.params.len == 0) return .deferred;
+        if (target.params.len == 0) { lmNote(.resolver_declined); return .deferred; }
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -11642,9 +11670,12 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse return .deferred;
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { lmNote(.resolver_declined); return .deferred; };
             defer b.allocator.free(mapped);
-            for (mapped) |param| if (param == null) return .deferred;
+            for (mapped) |param| if (param == null) {
+                lmNote(.resolver_declined);
+                return .deferred;
+            };
             const indices = try b.allocator.alloc(u32, mapped.len);
             for (mapped, indices) |param, *out| out.* = @intCast(param.?);
             break :blk indices;
@@ -11662,6 +11693,7 @@ fn lowerResolvedMemberCall(
             return .{ .lowered = dst };
         }
         const run = try lowerArgRunWithArity(b, args, arg_arity);
+        lmNote(.bound_virtual);
         try b.push(.{ .CallVirtual = .{
             .dst = dst,
             .receiver = recv_reg,
@@ -11690,6 +11722,7 @@ fn lowerResolvedMemberCall(
     };
     const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     const dst = b.allocReg();
+    lmNote(.bound_static);
     try b.push(.{ .Call = .{
         .dst = dst,
         .func = func_id,

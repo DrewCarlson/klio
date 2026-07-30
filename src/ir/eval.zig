@@ -799,6 +799,62 @@ pub fn probeStatsDump() void {
     for (list.items[0..top]) |e| std.debug.print("[probe-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
 }
 
+/// `KLIO_DISPATCH_STATS=1` — executed-instruction census over the call
+/// forms, so the static-dispatch campaign can be planned from counts rather
+/// than from the shape of the IR. Every counter is a plain relaxed add on a
+/// process-global array; the gate is read once.
+pub const DispatchKind = enum(u8) {
+    call_static,
+    call_member_resolved,
+    call_member_virtual,
+    call_virtual_slot,
+    call_member_or_global,
+    call_value,
+    call_member_or_value,
+    call_value_or_member,
+    call_spread,
+    call_super,
+    ctx_call,
+    /// Where a name-based member dispatch ended up, so the campaign knows
+    /// whether static binding must target intrinsics or interpreted bodies.
+    served_intrinsic,
+    served_user_body,
+    served_extension,
+    /// Sub-tails of the name-based member arm, in the order it tries them.
+    member_fast_subscript,
+    member_range_iter,
+    member_flat_prepare,
+    member_ladder,
+};
+const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
+var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+var dispatch_stats_state: u8 = 0;
+
+inline fn dispatchBump(comptime k: DispatchKind) void {
+    if (dispatch_stats_state == 0) {
+        dispatch_stats_state = if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) 2 else 1;
+    }
+    if (dispatch_stats_state != 2) return;
+    _ = dispatch_counts[@intFromEnum(k)].fetchAdd(1, .monotonic);
+}
+
+/// Public tap for the host's dispatch tails (see `DispatchKind`).
+pub fn dispatchNote(comptime k: DispatchKind) void {
+    dispatchBump(k);
+}
+
+pub fn dispatchStatsDump() void {
+    if (dispatch_stats_state != 2) return;
+    var total: u64 = 0;
+    for (&dispatch_counts) |*c| total += c.load(.monotonic);
+    if (total == 0) return;
+    std.debug.print("[dispatch-stats] total={d}\n", .{total});
+    inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
+        const n = dispatch_counts[f.value].load(.monotonic);
+        if (n != 0) std.debug.print("[dispatch-stats] {d:>12} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
+
 pub fn callStatsDump() void {
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
@@ -6081,6 +6137,7 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_static);
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
     // params / native binding) called positionally at exact arity needs
@@ -6271,6 +6328,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_value);
     const callee_v = frame.read(cv.callee);
     var arg_values_list: std.ArrayList(Value) = .empty;
     defer arg_values_list.deinit(allocator);
@@ -6361,6 +6419,7 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_spread);
     const callee_v = frame.read(cs.callee);
     var arg_values: std.ArrayList(Value) = .empty;
     defer arg_values.deinit(allocator);
@@ -6477,6 +6536,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Frame, csup: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_super);
     const recv = frame.read(csup.receiver);
     recv.retain();
     defer recv.release(allocator);
@@ -6500,6 +6560,7 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
 /// has no name-based fallback: a missing slot is a link error in the program
 /// image and is reported by the host.
 noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_virtual_slot);
     if (comptime !@hasDecl(H, "invokeVirtualMember")) {
         return raiseStep(frame, .{ .Type = "CallVirtual is unsupported by this host" });
     }
@@ -6533,6 +6594,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // identity is an image/link error, never permission to reinterpret the
     // call through name-based dispatch.
     if (cm.resolved) |fid| {
+        dispatchBump(.call_member_resolved);
         if (comptime @hasDecl(H, "invokeResolvedMember")) {
             recv.retain();
             defer recv.release(allocator);
@@ -6564,7 +6626,9 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         }
         return raiseStep(frame, .{ .Type = "resolved member calls are unsupported by this host" });
     }
+    dispatchBump(.call_member_virtual);
     if (fastSubscript(allocator, frame, cm)) |rv| {
+        dispatchBump(.member_fast_subscript);
         try frame.write(cm.dst, rv);
         return .cont;
     }
@@ -6575,6 +6639,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     if (recv == .RangeIter) {
         if (constStr(frame.module, cm.name)) |nm| {
             if (rangeIterFast(allocator, &recv, nm, cm.n_args)) |r| {
+                dispatchBump(.member_range_iter);
                 switch (r) {
                     .ok => |rv| {
                         try frame.write(cm.dst, rv);
@@ -6633,6 +6698,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             else
                 null;
             if (prep_opt) |prep0| {
+                dispatchBump(.member_flat_prepare);
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
@@ -6642,6 +6708,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
+    dispatchBump(.member_ladder);
     runtime.prof.opRoute(2);
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
@@ -6667,6 +6734,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, frame: *Frame, cmv: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_member_or_value);
     const recv = frame.read(cmv.receiver);
     recv.retain();
     defer recv.release(allocator);
@@ -6856,6 +6924,7 @@ fn valueInvocable(module: *const Module, callee_v: Value) bool {
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, frame: *Frame, cvm: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_value_or_member);
     var callee_v = frame.read(cvm.callee);
     // A boxed capture holds the callable in a cell; classify the
     // CONTENT (a captured local fn in a `var` slot is invokable).
@@ -6992,6 +7061,7 @@ noinline fn execArmCtxScope(comptime H: type, allocator: Allocator, frame: *Fram
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *Frame, cc: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.ctx_call);
     if (comptime !@hasDecl(H, "ctxPush")) {
         try frame.write(cc.dst, .Null);
         return .cont;
@@ -7446,6 +7516,7 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 }
 
 fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
+    dispatchBump(.call_member_or_global);
     const name_str = constStr(frame.module, cmg.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });
     const prev_tl = if (comptime @hasDecl(H, "setTrailingMemberCall"))
