@@ -1112,3 +1112,36 @@ test "member_receiver_lambda_over_extension" {
         \\
     );
 }
+
+test "bare_write_inline_receiver_lambda" {
+    try check("bare_write_inline_receiver_lambda",
+        \\applied
+        \\ran
+        \\lbl!
+        \\withed
+        \\explicit
+        \\also
+        \\global
+        \\
+    );
+}
+
+test "bare_write_receiver_lacks_property" {
+    try check("bare_write_receiver_lacks_property",
+        \\outer
+        \\2
+        \\
+    );
+}
+
+test "bare_write_var_declared_later" {
+    try check("bare_write_var_declared_later",
+        \\applied
+        \\run!
+        \\through-run
+        \\through-with
+        \\captured
+        \\top-level
+        \\
+    );
+}

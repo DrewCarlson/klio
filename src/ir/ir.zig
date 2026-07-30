@@ -611,6 +611,16 @@ pub const Inst = union(enum) {
         this_idx: u16,
         name: ConstId,
         value: Reg,
+        /// Statically known innermost implicit receiver, when lowering has it
+        /// in a register. An inline extension's spliced body binds its
+        /// receiver as an ordinary register of the CALLER's frame, so the
+        /// capture slot `this_idx` names is never populated and the walk below
+        /// cannot see the receiver at all — a bare-name write inside
+        /// `x.apply { … }` fell through to the global and was silently lost.
+        /// Tried FIRST (it is the innermost receiver) and still subject to the
+        /// same ownership check, so a receiver that does not declare the
+        /// property falls through exactly as before.
+        recv: ?Reg = null,
     },
     /// Call a bare-name function inside a lambda body that may be
     /// invoked with a this-receiver. If the captured this is an
@@ -1000,6 +1010,12 @@ pub const Func = struct {
     package: []const u8 = "",
     params: []Param,
     return_ty: TypeRef,
+    /// Whether `return_ty` came from an explicit `: T` in the source. A
+    /// function with an expression body and no annotation gets `Unit` as a
+    /// PLACEHOLDER, so `return_ty` alone cannot distinguish "returns Unit"
+    /// from "return type not recorded". Any consumer that treats the return
+    /// type as a fact about the function must check this first.
+    return_ty_declared: bool = false,
     n_locals: u32,
     blocks: []Block,
     /// Lazy IR: `offset + 1` of this function's `blocks` in its module's
@@ -1588,7 +1604,7 @@ pub const Module = struct {
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
     /// The eager pipeline's per-call resolution: `Span(callee) ->
     /// Span(decl)` converted from typeck's records by the driver
-    /// (`KLIO_EAGER=1`). Lowering composes it with `func_by_decl_span`;
+    /// Lowering composes it with `func_by_decl_span`;
     /// absent spans keep the lazy path.
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
     /// Typeck's per-expression type heads (the E2.1 evidence seam).

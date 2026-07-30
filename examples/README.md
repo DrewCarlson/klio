@@ -47,6 +47,7 @@ Run any program with:
 | `parenthesized_callable_result.kt` | A trailing lambda after a parenthesized call invokes the callable returned by that call. |
 | `anonymous_object_classifier_identity.kt` | An anonymous-object initializer retains the exact lexical classifier and companion identity. |
 | `receiver_extension_shadow.kt` | A receiver-lambda extension shadows an applicable same-named top-level function. |
+| `receiver_lambda_bare_write.kt` | A bare-name assignment inside a receiver lambda writes the receiver's property — including in the spliced body of an inline extension such as `apply`/`run`, where the receiver is a register rather than a capture — and falls through to the enclosing binding when the receiver declares no such property. |
 | `private_base_accessor_inherited.kt` | An accessor-only property inherited from a private abstract base resolves on the subclass — the private base's accessors live under its qualified registry key, and the hierarchy walk follows it. |
 | `member_ext_property_not_instance_prop.kt` | A member-extension property (`private val Any?.x` inside a class) resolves through the extension surface for any receiver — it is not an instance property of the class and never shadows the read on subtype instances. |
 | `anon_local.kt`, `anon_object_tostring.kt` | Anonymous objects and local classes.           |

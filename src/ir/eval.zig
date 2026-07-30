@@ -7183,7 +7183,25 @@ noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocator, f
     // can only resolve to a property or variable — a member
     // *function* of the name never captures the write.
     var routed = false;
-    {
+    // The statically supplied receiver is the innermost one, so it gets first
+    // refusal. Same ownership test as the walk: a receiver that declares
+    // neither a property nor an extension-property setter of this name does
+    // not take the write, and the walk (then the global) still runs.
+    if (stg.recv) |rr| {
+        const rv = frame.read(rr);
+        if (rv == .Instance and
+            (host.hostHasProperty(&rv, name_str) or
+                host.hostHasExtPropSetter(allocator, &rv, name_str)))
+        {
+            orAudit("StoreToThisOrGlobal", name_str, "recv-reg", 0, &rv);
+            switch (try host.setField(allocator, &rv, name_str, v)) {
+                .ok => {},
+                .err => |e| return raiseStep(frame, e),
+            }
+            routed = true;
+        }
+    }
+    if (!routed) {
         // `consult_param = true`: the implicit receiver owning the
         // written property may be the frame's `this` *parameter* (a
         // bare `receiveType = …` inside an interface/extension method),
