@@ -385,8 +385,19 @@ own rule) moves 168 sites out of this bucket. They land in `resolver_declined`
 rather than binding, because their bounds are interfaces — so this bucket is now
 gated on the interface work in section 2, not on anything of its own.
 
-The unsigned types (`UInt`, `ULongArray`, …) are a separate, small, and probably
-easy item: they are value classes that do not register a ClassId.
+The unsigned types (`UInt`, `ULongArray`, …, ~146 sites) are NOT a registration
+gap, and calling them "probably easy" was wrong. `unsigned/src/kotlin/UInt.kt` is
+not in `stdlib_sources.zig` at all — only `UIntRange.kt`, `ULongRange.kt` and
+`UProgressionUtil.kt` are compiled. `UInt` is a host-implemented primitive
+(`staticBuiltinConcrete` lists every unsigned type alongside `Int` and `Boolean`),
+so there is no IR class to name and no vtable to index. Giving them a `ClassId`
+would be inventing one.
+
+These sites therefore belong to the host-member category in section 5, not to
+`no_class_id` in any actionable sense. They cannot be bound by better type
+information; they need a binding form that names a HOST SYMBOL directly. That is
+the same requirement the C transpiler has, so the two should be designed
+together rather than separately.
 
 ### 4. `nullable_or_generic` — 143 (1.5%).
 
@@ -414,7 +425,10 @@ anything:
 
 1. Interface receivers with host-backed values (section 2) — unlocks 174
    directly plus the 168 that section 3 already moved.
-2. Unsigned value classes registering a ClassId (section 3) — ~146.
+2. Unsigned/primitive receivers (section 3) — ~146. NOT a registration fix:
+   these are host-implemented primitives with no IR class, so they need the
+   host-symbol binding form from section 5. Design with the transpiler's
+   requirement, not as a quick win.
 3. Nullable receivers (section 4) — ~143.
 4. Tighten `extCouldApply` (section 2).
 5. The typeck generic-argument project (section 1) — the 68%, and by far the
