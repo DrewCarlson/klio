@@ -749,6 +749,12 @@ pub const Checker = struct {
     /// User-declared extension functions keyed by the receiver type's simple
     /// name.
     extensions: std.StringHashMap(std.ArrayList(ExtensionSig)),
+    /// Every name declared as an EXTENSION function, on any receiver. A bare
+    /// call inside an extension body has that receiver in scope, so a
+    /// same-named extension on it out-ranks a top-level declaration —
+    /// evidence the flat name registry cannot see. Names in this set stay out
+    /// of the eager call channel.
+    extension_fn_names: std.StringHashMap(void),
     /// Extension properties keyed by simple receiver-type name.
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
     /// File-level user classes.

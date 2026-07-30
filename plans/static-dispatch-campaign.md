@@ -166,6 +166,38 @@ and without the change — the fix removes wrong answers without adding
 diagnostics. The durable fix remains package-keyed class resolution; see
 the standing constraint at the top of this document.
 
+### Eager mode is a STUB, measured
+
+Before treating "open the channel" as the work, here is what eager
+currently buys for the thing it exists to enable. Executed dispatch on the
+same compose test, eager off against eager on:
+
+    call_static             6.63%  ->  6.67%
+    call_member_resolved    0.05%  ->  0.05%
+    call_member_virtual    31.63%  -> 31.70%
+    call_virtual_slot       0.21%  ->  0.21%
+
+Turning eager on moves static dispatch by 0.04 percentage points. Per
+call SITE it is the same story: bound 6.21% -> 6.73%, and the
+`no_receiver_type` share gets WORSE (72.3% -> 75.5%).
+
+The reason is the channel's payload, not its plumbing:
+
+    pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
+    pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
+
+Typeck computes full `Type` values — generic arguments, variance,
+nullability, function shapes — and discards nearly all of it at the
+boundary. A head is not a type. The `minOrNull` defect proves the cost: for
+a generic receiver a head-only answer is worse than none, so lowering must
+DECLINE it, which removes exactly the container receivers that dominate
+real code.
+
+So the build-out is: widen `EagerTypeHead` to carry a full type (generic
+arguments included), then re-measure `[lower-sites]`. The
+`no_receiver_type` bucket is the whole campaign; every later phase is
+gated on it falling.
+
 ### Eager mode is NOT yet ready to become the only mode
 
 `commontest-sweep.py --eager both` (the dual gate; it runs both modes and
@@ -211,6 +243,33 @@ collision. Until they are fixed the `KLIO_EAGER` flag and the non-eager
 branches must stay: deleting the working path while the replacement fails
 real tests would be trading correctness for tidiness. The removal is
 tracked as its own step below.
+
+### Compose under eager
+
+The stdlib dual gate is clean (`--eager both`: eager ON/OFF identical, 0
+failures across 117 files). Compose was not: 14 failures under eager,
+green by default. Two causes, one fixed:
+
+- **Extension shadowing (8 tests, FIXED).** A bare call inside an
+  extension body has that extension's receiver in scope, so a same-named
+  EXTENSION on it out-ranks the top-level declaration typeck's flat
+  registry answers with. `fun MockViewValidator.Text(...)` must beat the
+  composable `Text` for a bare `Text(...)` written inside
+  `fun MockViewValidator.Point(...)`; binding the composable reached the
+  composer with no applier (`Vm::get_field 'applier' on 'kotlin.Unit'`).
+  `recordResolvedCall`'s existing shadow walk covers MEMBERS only, and an
+  extension is not a member. `extension_fn_names` now declines any name
+  declared as an extension on any receiver. CompositionTests 139 -> 147,
+  MovableContentTests 39 -> 40.
+
+- **Infix `and` on the composer (5 tests, OPEN).** All five remaining
+  failures are one cause: `Vm::call_member 'and' on
+  'androidx.compose.runtime.GapComposer'`. A bare infix `and` bound to the
+  implicit composer receiver instead of its `Int` receiver — the compose
+  plugin's `$changed and 0b…` bit tests. `test_remember_in_a_loop` and the
+  `movableContentReceiver_{None,One,Two,Three}` family. The frame chain at
+  the failure was not captured cleanly; next step is a targeted
+  `KLIO_MISS_TRACE=and` run against a single test rather than the suite.
 
 **Phase 0b — retire non-eager.** Preconditions, all measured, none
 optional: `--eager both` clean across the stdlib sweep; every compose

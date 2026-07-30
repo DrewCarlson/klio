@@ -682,6 +682,15 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // runtime's own dispatch gets these right, so the channel stays out of
     // it, exactly as it does for an ambiguous simple class name.
     if (sigMentionsTypeParam(sig)) return;
+    // Extension-shadow gate. A bare call inside an extension body has that
+    // extension's receiver in scope, so a same-named EXTENSION on it
+    // out-ranks the top-level declaration this registry would answer with.
+    // `fun MockViewValidator.Text(...)` beats the composable `Text` for a
+    // bare `Text(...)` written inside `fun MockViewValidator.Point(...)`;
+    // binding the composable there reaches the composer with no applier.
+    // The member-shadow walk below covers members only, and an extension is
+    // not a member, so the name is declined outright.
+    if (self.extension_fn_names.contains(record_name)) return;
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing

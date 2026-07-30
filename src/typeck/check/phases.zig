@@ -74,6 +74,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .extension_properties = std.StringHashMap(std.ArrayList(root.ExtensionPropSig)).init(allocator),
         .classes = std.StringHashMap(root.ClassInfo).init(allocator),
         .ambiguous_class_names = std.StringHashMap(void).init(allocator),
+        .extension_fn_names = std.StringHashMap(void).init(allocator),
         .class_stack = .empty,
         .fn_return_stack = .empty,
         .label_stack = .empty,

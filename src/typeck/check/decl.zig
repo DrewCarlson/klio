@@ -116,6 +116,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                     .sig = sig,
                     .return_class = return_class,
                 });
+                try self.extension_fn_names.put(f.name.name, {});
             } else {
                 try pushFnSig(self, f.name.name, sig, f.is_expect or f.is_actual);
                 {
