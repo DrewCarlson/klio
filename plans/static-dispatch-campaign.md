@@ -499,19 +499,31 @@ receiver param after a direct receiver, and it is gated on `consult_param`,
 which the `LoadFromThisOrGlobal` arm passes as `true`. So the ordering rule is
 not what strands the Recomposer.
 
-Since the walk still reports `cands=1`, one of these must hold at that site, and
-which one is the next thing to establish:
+Established, by printing the walk's inputs on the real failing run:
 
-  - `implicitThisValue(frame, this_idx, true)` is `Null`/`Unit` — plausible,
-    because the failing read sits in a lambda spliced into a PROPERTY
-    INITIALIZER thunk, which may carry no `this` at all; or
-  - it equals the direct receiver, or is already in `out`, and gets deduped.
+    [icand-entry] stateLock direct_this=false entries=1 fnkind=plain fn=<lambda>
+    [icand-append] stateLock tag=Instance class=JobImpl subject=false depth=0
 
-If it is the first, the fix is not in the candidate ORDER but in what the splice
-captures: the enclosing `this` has to reach the frame before any ordering can
-help. Establish which by printing `implicitThisValue` alongside the
-`[icand-append]` rows on the real failing run — the same method that found the
-mechanism, and the one that worked after five reductions did not.
+`direct_this` is FALSE — no splice receiver is supplied at all, so neither the
+"replaces the frame `this`" rule nor the `consult_param` follow-up is involved
+(the follow-up never even runs; it is gated on `direct_this != null`). The frame
+is a plain lambda, and the enclosing-receiver chain from
+`enclosingEntriesAlloc` has exactly ONE entry: the JobImpl.
+
+**That chain is the bug.** The read sits in `invokeOnCompletion { … }`, a lambda
+nested inside `Job(...).apply { … }`, inside `Recomposer`'s property
+initializer. The chain should be `[JobImpl, Recomposer]` — innermost receiver
+first, then the enclosing class instance — and it holds only the JobImpl. The
+enclosing class receiver is dropped when a receiver-lambda is entered, so no
+ordering change in `implicitCandidatesAlloc` can help: the Recomposer is not in
+its input.
+
+The fix belongs wherever enclosing entries are pushed for a receiver lambda:
+entering one must APPEND its receiver to the enclosing chain, not replace it.
+That is the same shape as the two already fixed in this campaign
+(`StoreToThisOrGlobal`'s capture slot, `CallMemberOrGlobal`'s), and it is the
+last known thing standing between the return-type channel and a green compose
+run — the channel's stdlib sweep is already clean.
 
 That makes this the third instance of one family, exactly as predicted earlier
 in this document: an implicit receiver that exists and that the runtime walk
