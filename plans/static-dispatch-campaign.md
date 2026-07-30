@@ -380,10 +380,33 @@ specific things, both measured:
         latter, a call rooted at the base slot can never reach the override, and
         that is the bug.
 
-        `linkMethodClass` / `mergeInheritedMethod` / `preferredMethodSlotTarget`
-        look correct for choosing between two implementations of ONE slot, so
-        suspicion falls on slot ASSIGNMENT rather than merging — dump the slot
-        ids for both `minusKey` declarations before editing any of them.
+        Slot identity is settled: lowering emits
+        `.slot = MethodSlotId.fromFunc(func_id)`, so the slot IS the resolved
+        target's `FuncId` verbatim. A call rooted at `CoroutineContext.minusKey`
+        therefore needs the CONCRETE class's dispatch table to map that exact fid
+        to `Element`'s override.
+
+        And the re-pointing mechanism for that already exists. In
+        `linkMethodClass`'s own-methods loop, every inherited slot is tested with
+        `overridesSlot(cid, fid, base)` and re-pointed to the overriding
+        declaration when it matches. So the bug is NOT missing machinery, and not
+        merging either.
+
+        That leaves two specific candidates, and they are cheap to distinguish:
+
+        a. `overridesSlot` returns false for an interface-to-interface override
+           (`Element.minusKey` over `CoroutineContext.minusKey`), so the slot is
+           never re-pointed.
+        b. `Element.minusKey` never appears in `decl_sigs` with
+           `enclosing_class == Element`, so it is not in `own_methods` and the
+           loop never considers it. Note the loop also skips
+           `visibility == .Private` and anything whose `kind` is not
+           `instance_method` — an interface member with a default body is worth
+           checking against both filters.
+
+        Check (b) first: it is a single lookup, and the same filter would explain
+        why `Comparator.compare` — which has no intermediate overriding interface
+        and so needs no re-pointing — works fine.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
