@@ -761,6 +761,19 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     return null;
 }
 
+/// `KLIO_EXTKEY_TRACE=<fid>[,<fid>...]` gate; see the dump in
+/// `applicableExtension`.
+fn extKeyTraceWanted(fid: ?FuncId) bool {
+    const f = fid orelse return false;
+    const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") orelse return false);
+    var it = std.mem.tokenizeScalar(u8, want, ',');
+    while (it.next()) |tok| {
+        const n = std.fmt.parseInt(u32, tok, 10) catch continue;
+        if (n == f.int()) return true;
+    }
+    return false;
+}
+
 fn argIsProven(arg: *const ArgShape) bool {
     return arg.runtime_class != null or arg.ty != null;
 }
@@ -1219,6 +1232,14 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     };
 
     const key: [8]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+    // `KLIO_EXTKEY_TRACE=<fid>,<fid>` — dump the eight-element ranking key for
+    // the named candidates. Ranking is lexicographic, so the first component
+    // that differs is the one that decides; reading it beats guessing which
+    // term dominates.
+    if (extKeyTraceWanted(sig.fid)) {
+        std.debug.print("[extkey] fid={d} params={d} key={any}\n", .{ if (sig.fid) |f| f.int() else 0, params.len, key });
+        for (params, 0..) |*pp, pi| std.debug.print("[extkey]   p{d}: {s}\n", .{ pi, pp.ty.name });
+    }
     return .{
         .points = score,
         .proven_args = proven,
