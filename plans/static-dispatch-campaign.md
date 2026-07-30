@@ -377,12 +377,30 @@ next attempt does not repeat it:
   do NOT explain the failure — the effect lands correctly anyway. Whatever the
   member arm does here reaches the host implementation.
 
-What is left unexamined in that test and absent from the reduction: a
-multi-line exception message, three LOCAL functions (`root`, `suppressedError`,
-`induced`), a `for` loop adding suppressed exceptions, and a local
-`assertInTrace`. Reduce against those next, and get the assertion's own "to
-contain:" value out of the failure output first — the run captured only the
-"Expected top level trace:" prefix, which is why this went unidentified.
+**What actually goes missing: the CAUSE.** Getting the assertion to name the
+absent value (the sweep only prints its "Expected top level trace:" prefix)
+gives `MISSING <Root cause>` — the `Caused by:` chain is dropped from the
+rendered trace. Everything else the test asserts is present.
+
+A standalone failing program is checked in at
+`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`: the upstream test
+body verbatim, with the assertion changed to report which value is missing. It
+passes on the current tree and fails with catch-parameter typing applied. Start
+from that, not from a sweep row.
+
+Also ruled out, each as its own program that PASSES with the change applied:
+
+- a cause taken from a typed LOCAL — `val t: Throwable = …;
+  RuntimeException("w", t)` keeps its cause;
+- a cause taken directly from a catch parameter —
+  `try { … } catch (e: Throwable) { RuntimeException("w", e) }` keeps its cause
+  and renders `root` in the trace.
+
+So the trigger is not "a `Throwable`-typed argument reaches a constructor". The
+only structural difference left between the passing probes and the failing
+program is that the failing one wraps the throw in LOCAL functions (`root`
+returning `Nothing`, `suppressedError`, `induced`) and rethrows from inside
+`induced`'s own catch. That is where to look.
 
 The broader lesson does stand, and it has now cost two attempts: supplying more
 static type information keeps turning a latent wrong answer into a visible
