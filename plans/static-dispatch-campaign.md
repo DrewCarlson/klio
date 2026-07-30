@@ -229,6 +229,49 @@ get `plusCollectionInference` / `countEach` right as the first two
 regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
+### Why re-widening is blocked: one body, many instantiations
+
+The two regressions were diagnosed and they are NOT an inference gap. They
+are a rule violation, and the rule matters for every later phase.
+
+`plusElement` is one line:
+
+    public inline fun <T> Iterable<T>.plusElement(element: T): List<T> {
+        return plus(element)
+    }
+
+Inside that body `element` has the DECLARED type `T`, and Kotlin resolves
+`plus(element)` against `T` — matching `Iterable<T>.plus(element: T)`
+exactly. Now instantiate `T = List<String>`: the argument is also an
+`Iterable`, so `Iterable<T>.plus(elements: Iterable<T>)` becomes
+applicable, and that overload CONCATENATES. Hence
+`Expected <[[s], [a]]>, actual <[[s], a]>`.
+
+Without the type channel, lowering cannot prove the `Iterable` overload
+applies and picks correctly. With it, better information makes resolution
+WORSE — because the information is wrong for that position.
+
+The rule: **a generic function's body is resolved once, against its type
+PARAMETERS, not against any one call site's instantiation.** Eager evidence
+is keyed by span, and a span inside a generic body has as many types as the
+function has instantiations. Recording one of them and applying it to the
+body is ambiguous by construction — the same defect shape as the
+simple-name class map and the compose pass's shared `gen_span`, now in a
+third guise: identity by position cannot distinguish one body's many
+instantiations.
+
+So re-widening needs the channel to either (a) not record evidence for
+expressions inside a generic body, or (b) record it per instantiation and
+have lowering ask with the instantiation in hand. (a) is cheap and loses
+the coverage inside generic bodies; (b) is the real answer and is a
+significant piece of design, because lowering compiles such a body once.
+
+`GroupingTest.countEach` ("expected a Grouping receiver") is unexamined but
+almost certainly the same shape — a `Grouping<T, K>` receiver inside a
+generic body.
+
+### The inference work list
+
 The work list, ranked by how often typeck could not name a type's
 arguments (from the `[TYPEHEAD-SKIP]` audit over one compose test):
 
