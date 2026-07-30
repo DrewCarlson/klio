@@ -230,244 +230,39 @@ regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
 
-## Known pre-existing failure: UuidTest
+## RESOLVED: `unresolved global assertEquals` was a missing pack, not the interpreter
 
-`kotlin/libraries/stdlib/test/uuid/UuidTest` currently fails 5-6 cases in the
-stdlib sweep with `unresolved global assertEquals` / `unresolved global
-assertTrue`.
+The sweep intermittently reported whole files failing every case with
+`unresolved global assertEquals` / `assertTrue` / `assertSame`. `UuidTest` was
+the first file it was noticed on, and it was chased through nine wrong
+diagnoses (image cache, star imports, missing sources, `ULong` constants, the
+`Uuid` class, a nested `Clock`, path dependence, intermittency, a cross-half
+file interaction) before being attributed to a disagreement between the cold
+stdlib-assembly path and the baked-image path.
 
-It is NOT caused by the static-dispatch work. Bisected by checking out
-`387b0a43` — the commit this campaign's latest run started from, before any of
-the changes above — rebuilding the harness and re-running: it fails there
-identically. Also ruled out: a stale sweep child home (deleting
-`/tmp/klio_itest_stdlibtest_home` and rebuilding it changes nothing).
+That attribution was wrong. The cause is trivial: `assertEquals` and friends
+come from the **kotlin.test pack installed in the sweep's child HOME**
+(`/tmp/klio_itest_stdlibtest_home`), and that home's `packs/` directory was
+empty. With the pack installed the same binary on the same files passes —
+`UuidTest` 21/21, `ContinuationInterceptorKeyTest` 4/4.
 
-Two things make it confusing to encounter, so they are recorded here:
+Everything that made it look like an interpreter bug follows from that one
+fact. It presented as a RESOLUTION failure rather than an assertion mismatch
+because the symbols genuinely were not there. It looked INTERMITTENT because
+the child home is scratch: whatever populates it (a `stdlib_commontest` itest
+run) fixes it, and anything that clears `/tmp` breaks it again. It looked
+path-dependent because a file that happens not to call `assertEquals` is
+unaffected. And the earlier "deleting the child home changes nothing" check
+was worthless, since deleting it leaves the pack exactly as absent as before.
 
-  - It is INTERMITTENT. The same sweep reported `117 files, 0 failures` many
-    times earlier in the same session on the same commits.
-  - The error is a RESOLUTION failure (`assertEquals` unresolved), not an
-    assertion mismatch, which does not look like a flaky test at first glance.
-    Several of the affected cases are UUID v7, which is time-based, and the
-    failures began appearing across a date rollover — worth checking whether a
-    v7 timestamp path throws during shared setup and the unresolved-global
-    message is a cascade from that rather than the cause.
+`scripts/commontest-sweep.py` now installs the pack when it is missing and
+refuses to sweep when it cannot find one, so a silently unpopulated home can
+never be read as a mass regression again.
 
-Ruled out so far, so the next attempt does not repeat them:
-
-  - The image cache. Deleting `~/.klio/cache` in the sweep's child home (56 MB
-    of `stdlib-*.klio-image`) and re-running changes nothing. Worth ruling out
-    explicitly because a stale cached module WOULD produce exactly this symptom,
-    and the cache is known to serve warm modules without lowering at all.
-  - The star import. `UuidTest.kt` uses `import kotlin.test.*` where its passing
-    sibling `DurationTestUtils.kt` uses an explicit
-    `import kotlin.test.assertEquals`, which looks like the obvious difference —
-    but 115 files under `test/` use the star form and pass.
-  - A missing source. Unlike `UInt.kt`, `src/kotlin/uuid/Uuid.kt` IS in
-    `stdlib_sources.zig`, along with `ExperimentalUuidApi.kt` and a
-    `kotlin-uuid/UuidActuals.kt`.
-
-All 21 tests in the file fail, not a subset. The file DOES lower — the runner
-discovers all 21 `@Test` functions — so it is the bodies that fail, and the
-error is reported against the bare call.
-
-The first failing call is the simplest overload in the file:
-
-    assertEquals(uuidString, Uuid.fromLongs(msb.toLong(), lsb.toLong()).toString())
-
-`String` against `String`. So this is not overload selection. Something makes
-the whole body's bare calls unresolvable, and the most likely candidate is a
-preceding symbol the body depends on: the file's `mostSignificantBits` /
-`leastSignificantBits` constants are ULong, and unsigned types are HOST
-PRIMITIVES with no IR class (see the unsigned entry in the inventory —
-`UInt.kt` is not in `stdlib_sources.zig` and every unsigned head is in
-`staticBuiltinConcrete`). A ULong-typed property whose type never resolves would
-plausibly poison resolution for the declarations around it.
-
-DISPROVEN. A twelve-line test class with two `uL` literal properties, a derived
-`String` property, and an `assertEquals` in a `@Test` resolves and runs fine —
-`assertEquals` is found, and the ULong values are computed correctly
-(`0xa716446655440000uL` yields 12039885860129472512, which is right). Unsigned
-properties do not poison resolution.
-
-So `UuidTest` remains undiagnosed. Seven candidates are now excluded, each by a
-program that PASSES:
-
-  - the image cache (deleting 56 MB of `stdlib-*.klio-image` changes nothing);
-  - the star import (115 files under `test/` use `kotlin.test.*` and pass);
-  - a missing source (`Uuid.kt` IS in `stdlib_sources.zig`);
-  - the ULong constants (`uL` literal properties resolve and compute correctly);
-  - the `Uuid` class (`Uuid.fromULongs(msb, lsb)` at class-property scope, then
-    `uuid.toString()` in a `@Test`, passes);
-  - `package test.uuid` combined with `import kotlin.test.*`;
-  - `import kotlin.time.Clock` / `kotlin.time.Instant`.
-
-It also fails with NO sibling support files at all — `klio-harness test` on
-`UuidTest.kt` alone gives the same 21 failures — so it is not contamination from
-`ComparisonDSL.kt` / `testUtils.kt`, which do emit conflicting-overload errors in
-other file sets.
-
-Bisection COMPLETE at the range level. Cutting the class body at `@Test`
-boundaries and closing the brace:
-
-    lines 1-145  ->  4 tests,  4 passed
-    lines 1-248  ->  6 tests,  6 passed
-    lines 1-398  -> 19 tests, 19 passed
-    lines 1-475  -> 20 tests, 19 passed, 1 FAILED
-    whole file   -> 21 tests,  0 passed, 21 FAILED
-
-So there are TWO separate problems, which is why every single-cause hypothesis
-failed:
-
-  1. Lines 399-475 add ONE failing test,
-     `testV7UuidGenerationForNonMonotonicClock`. That one loops on a clock until
-     a counter is small enough — a plausible genuine timing/logic failure and
-     the likely reason this file looked intermittent all session.
-  2. Lines 476-505 flip the file from 1 failure to ALL 21 unresolved. That range
-     holds `testV7GenerateUnordered` plus the nested
-     `private class NonMonotonicClock : Clock`.
-
-The nested class is NOT the cause on its own — a standalone file with exactly
-that class (including `Clock.System.now()`, an `override fun now()`, and a
-defaulted-parameter method) compiles and passes.
-
-`Uuid.generateV7NonMonotonicAt` is not the cause either: it is declared with a
-full body at `Uuid.kt:725` (`@SinceKotlin("2.3") @ExperimentalUuidApi public fun
-generateV7NonMonotonicAt(timestamp: Instant): Uuid`), so it is implemented, not a
-bodyless expect. The zero hits in `kotlin-klio/kotlin-uuid/UuidActuals.kt` mean
-only that it needs no klio actual.
-
-And then the bisect dissolved. Every construct in `testV7GenerateUnordered` was
-tested individually against the first 475 lines and ALL passed: the
-`toLongs { msb, _ -> assertEquals(...) }` lambda, `assertNotEquals` on two
-`Uuid`s, `assertTrue(u.isIetfVariant, "…${u.toHexDashString()}")`, and the
-captured-local `tsValue` block. Reassembling the file byte-for-byte from
-`head -475` plus lines 476-505 — `diff` confirms it IDENTICAL to the original —
-also passes, 21/21.
-
-Then the ORIGINAL file at its original path passed too, 21/21, on the very next
-run.
-
-**CORRECTION: it is NOT intermittent. It is deterministic on the FILE SET.**
-
-    UuidTest.kt alone                         -> 8 runs, 21/21 pass every time
-    the sweep's full child argv (8 support
-    files + UuidTest.kt)                      -> 4 runs, 0/21 pass every time
-
-Both are reproducible on demand. The earlier "intermittent" reading came from
-comparing a standalone run against a sweep run without noticing the file set
-differed, and the "path-dependent" reading before it was the same mistake — the
-copy was run alone, the original was run with siblings.
-
-Pairs do not reproduce it: `PlatformActuals.kt + UuidTest.kt` passes, and
-`testUtils.kt + UuidTest.kt` passes. `--only-file=` is not the trigger either
-(the same pair passes with and without it). So it takes some larger combination
-of the eight support files.
-
-That makes the next step a bisect of the FILE LIST, not of the source:
-
-    tests/stdlib_commontest_actuals/PlatformActuals.kt
-    tests/stdlib_commontest_actuals/EncodingActuals.kt
-    tests/stdlib_commontest_actuals/JsCollectionFactories.kt
-    kotlin/libraries/stdlib/test/collections/CollectionBehaviors.kt
-    kotlin/libraries/stdlib/test/collections/ComparisonDSL.kt
-    kotlin/libraries/stdlib/test/testUtils.kt
-    kotlin/libraries/stdlib/test/time/DurationTestUtils.kt
-
-**ROOT CAUSE: the data home, not the file set or the source.** Same file, same
-binary:
-
-    HOME=/tmp/klio_itest_stdlibtest_home  ->  21 tests, 0 passed, 21 FAILED
-    default HOME (~/.klio)                ->  21 tests, 21 passed
-
-That is the whole difference. Every file-set result below is an artifact of
-which HOME the run happened to use, and every source-level cut before it is an
-artifact of the same thing — the standalone runs used the default home, the
-sweep runs used the child home.
-
-It is NOT stale pack content, which is the obvious reading and the one CLAUDE.md
-warns about. Deleting `.klio/cache` (56 MB of `stdlib-*.klio-image`) changes
-nothing, and `.klio/packs` is EMPTY — moving it away changes nothing either.
-With both gone the child home is bare and it still fails, while the default home
-still passes.
-
-So the difference is warm versus COLD: the default home has a cached stdlib
-image, the child home has none and must assemble the stdlib from source. The
-cold path fails to resolve `kotlin.test` for this file where the image path
-resolves it fine. That is a real klio bug and a more serious one than a flaky
-test — it means the from-scratch assembly path and the baked-image path do not
-agree on name resolution.
-
-Next: run with the child home and `KLIO_ERR_TRACE` / the resolve audit to see
-what the cold path binds `assertEquals` to, and compare against the same file
-under the default home. The two paths disagreeing is the bug; `UuidTest` is just
-where it happens to surface.
-
----
-
-Superseded below (kept only to show what was ruled out): halving the support
-list does not isolate it — both halves pass:
-
-    PlatformActuals + EncodingActuals + JsCollectionFactories + UuidTest -> 21/21
-    CollectionBehaviors + ComparisonDSL + testUtils + DurationTestUtils
-                                                    + UuidTest           -> 21/21
-    all seven + UuidTest                                                 ->  0/21
-
-So it is a CROSS-HALF interaction, not one poisoning file. That also explains why
-the single-file pairs passed. The search that will converge is to start from one
-half and add the other half's files ONE AT A TIME until it flips, then minimise
-from that pair.
-
-`ComparisonDSL.kt` and `testUtils.kt` remain the first suspects on the
-second-half side, since both are already known to emit conflicting-overload
-errors in other file sets — a duplicate-declaration diagnostic that poisons
-name resolution program-wide would produce exactly this symptom, and would
-explain why it takes two files to trigger.
-
-Everything below about cutting the SOURCE is superseded — those cuts all passed
-because they were run standalone. An intermediate conclusion that it was path-dependent (the copy passed
-while the original failed) was wrong; that was the same flakiness sampled twice.
-Every "cut X and it passes" result in this section is therefore uninformative —
-they were passing runs, not passing configurations.
-
-What is real: the file fails ALL 21 tests with `unresolved global assertEquals`
-some of the time, and passes all 21 at other times, with identical bytes and an
-identical binary. A resolution failure that is not deterministic points at
-something order- or state-dependent in module assembly rather than at anything in
-the source. Note `testV7UuidGenerationForNonMonotonicClock` spins in a
-`while (true)` until a clock counter falls in range, which is the one construct in
-the file that can vary run to run.
-
-Do not bisect the source again. Reproduce the failure first — run the file in a
-loop until it fails — and only then look at what differs.
-
-Older text, kept because its exclusions are still valid:
-
- The first 45 lines —
-package, all imports, every property including the two `Uuid` member-extension
-properties, and the first `assertEquals` of `fromLongs` — compile and PASS when
-closed off as their own file. The whole file fails. So the poisoning declaration
-is after line 45, and it makes `assertEquals` unresolvable in bodies that appear
-BEFORE it, which points at a module-level resolution table being corrupted rather
-than at ordinary scoping.
-
-Candidate declarations in the remaining range, in the order worth testing:
-
-  - line 148, a LOCAL function named `test` inside `parse()`, with defaulted
-    parameters and a function-typed parameter:
-    `fun test(hexDash: String? = null, hex: String? = null, check: (parse: () -> Uuid) -> Unit)`.
-    A local named `test` in a test file is exactly the kind of collision that
-    has produced conflicting-overload errors elsewhere in this suite.
-  - line 142, a member extension function `private fun String.mixedcase()`.
-  - lines 128-129, `UByteArray(32) { it.toUByte() }` — an unsigned ARRAY
-    constructor with a lambda, which touches the same host-primitive types the
-    inventory flags as having no IR class.
-
-Continue by halving the range 46-505, not by guessing among these.
-
-Anyone gating on the sweep should treat these as a known baseline failure until
-diagnosed, and should NOT attribute them to a dispatch change without bisecting
-first.
+The lesson worth keeping: a failure reported by EVERY test in a file is
+evidence about the environment, not about the code under test. Nine
+hypotheses were spent inside the interpreter on a fault that a single `ls` of
+the child home would have shown.
 
 ## Inventory: everything that is still not statically bound
 

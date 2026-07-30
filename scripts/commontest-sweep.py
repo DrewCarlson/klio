@@ -23,6 +23,7 @@ Exit: 0 clean; 1 divergence between eager modes (only with --eager both).
 
 import argparse
 import concurrent.futures
+import glob
 import os
 import re
 import subprocess
@@ -40,6 +41,35 @@ ACTUALS = [
 # pack into; running that suite once populates it. Override with --home.
 CHILD_HOME = "/tmp/klio_itest_stdlibtest_home"
 TEST_FILTER = None
+
+
+def ensure_kotlin_test_pack(binary):
+    """Every commontest file calls `assertEquals` and friends, which come from
+    the kotlin.test pack installed in the child HOME. When that pack is absent
+    the run does not fail loudly — every test in every file reports
+    `unresolved global assertEquals` and the sweep reads as a mass regression.
+    That has already been misdiagnosed once as an interpreter name-resolution
+    bug, so install the pack when it is missing and refuse to sweep when it
+    cannot be found."""
+    packs = os.path.join(CHILD_HOME, ".klio", "packs")
+    if glob.glob(os.path.join(packs, "kotlin.test-*.klio-pack")):
+        return True
+    src = sorted(glob.glob(os.path.join(
+        os.path.expanduser("~/.klio/packs"), "kotlin.test-*.klio-pack")))
+    if not src:
+        print(f"kotlin.test pack missing from {packs} and from ~/.klio/packs.\n"
+              f"Build and install it before sweeping, or every test will report\n"
+              f"`unresolved global assertEquals`.", file=sys.stderr)
+        return False
+    env = dict(os.environ, HOME=CHILD_HOME)
+    p = subprocess.run([binary, "pack", "install", src[-1]],
+                       cwd=ROOT, capture_output=True, env=env)
+    if p.returncode != 0:
+        print(f"installing {src[-1]} into {CHILD_HOME} failed:\n"
+              f"{p.stderr.decode(errors='replace')}", file=sys.stderr)
+        return False
+    print(f"== installed {os.path.basename(src[-1])} into {CHILD_HOME}")
+    return True
 
 
 def default_jobs():
@@ -341,6 +371,8 @@ def main():
     if args.home:
         global CHILD_HOME
         CHILD_HOME = args.home
+    if not ensure_kotlin_test_pack(args.binary):
+        return 2
 
     targets, support = collect()
     if args.filter:
