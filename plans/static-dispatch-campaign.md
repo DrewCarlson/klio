@@ -229,6 +229,26 @@ get `plusCollectionInference` / `countEach` right as the first two
 regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
+The work list, ranked by how often typeck could not name a type's
+arguments (from the `[TYPEHEAD-SKIP]` audit over one compose test):
+
+    1058  MutableList
+     880  Iterator
+     349  List
+     252  Array
+     247  MutableVector
+     172  SnapshotStateList
+      71  MutableScatterSet
+      68  Flow
+
+`Iterator` at 880 is mostly `for` loops; `MutableList`/`List` at 1407
+combined is the single biggest bucket. These are the ordinary containers,
+so the gap is not an exotic corner — typeck is not propagating element
+types through the constructs that build and traverse collections. Start
+with `listOf`/`mutableListOf` and the `iterator()` chain: whatever fraction
+of 2,300+ sites those two cover is the fraction of the receiver-type
+bucket that becomes reachable.
+
 ### Eager mode is NOT yet ready to become the only mode
 
 `commontest-sweep.py --eager both` (the dual gate; it runs both modes and
