@@ -374,9 +374,23 @@ That makes the next step a bisect of the FILE LIST, not of the source:
     kotlin/libraries/stdlib/test/testUtils.kt
     kotlin/libraries/stdlib/test/time/DurationTestUtils.kt
 
-Halve that list. Note `ComparisonDSL.kt` and `testUtils.kt` are already known to
-emit conflicting-overload errors in other file sets, which makes them the first
-place to look.
+Halving that list does NOT isolate it — both halves pass:
+
+    PlatformActuals + EncodingActuals + JsCollectionFactories + UuidTest -> 21/21
+    CollectionBehaviors + ComparisonDSL + testUtils + DurationTestUtils
+                                                    + UuidTest           -> 21/21
+    all seven + UuidTest                                                 ->  0/21
+
+So it is a CROSS-HALF interaction, not one poisoning file. That also explains why
+the single-file pairs passed. The search that will converge is to start from one
+half and add the other half's files ONE AT A TIME until it flips, then minimise
+from that pair.
+
+`ComparisonDSL.kt` and `testUtils.kt` remain the first suspects on the
+second-half side, since both are already known to emit conflicting-overload
+errors in other file sets — a duplicate-declaration diagnostic that poisons
+name resolution program-wide would produce exactly this symptom, and would
+explain why it takes two files to trigger.
 
 Everything below about cutting the SOURCE is superseded — those cuts all passed
 because they were run standalone. An intermediate conclusion that it was path-dependent (the copy passed
