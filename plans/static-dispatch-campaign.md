@@ -337,12 +337,33 @@ generateV7NonMonotonicAt(timestamp: Instant): Uuid`), so it is implemented, not 
 bodyless expect. The zero hits in `kotlin-klio/kotlin-uuid/UuidActuals.kt` mean
 only that it needs no klio actual.
 
-So the trigger is somewhere else in `testV7GenerateUnordered`'s 20-line body. The
-remaining untested constructs there are `uuid.toLongs { msb, _ -> … }` (a lambda
-with an unused destructured-style parameter, called for its side effect inside an
-assertion), `assertNotEquals` on two `Uuid` values, and the string templates
-embedding `uuid.toHexDashString()`. Bisect THAT function line by line — the range
-is small enough now that guessing is no longer cheaper than cutting.
+And then the bisect dissolved. Every construct in `testV7GenerateUnordered` was
+tested individually against the first 475 lines and ALL passed: the
+`toLongs { msb, _ -> assertEquals(...) }` lambda, `assertNotEquals` on two
+`Uuid`s, `assertTrue(u.isIetfVariant, "…${u.toHexDashString()}")`, and the
+captured-local `tsValue` block. Reassembling the file byte-for-byte from
+`head -475` plus lines 476-505 — `diff` confirms it IDENTICAL to the original —
+also passes, 21/21.
+
+Then the ORIGINAL file at its original path passed too, 21/21, on the very next
+run.
+
+**So the failure is intermittent, and none of the structural analysis above
+applies.** An intermediate conclusion that it was path-dependent (the copy passed
+while the original failed) was wrong; that was the same flakiness sampled twice.
+Every "cut X and it passes" result in this section is therefore uninformative —
+they were passing runs, not passing configurations.
+
+What is real: the file fails ALL 21 tests with `unresolved global assertEquals`
+some of the time, and passes all 21 at other times, with identical bytes and an
+identical binary. A resolution failure that is not deterministic points at
+something order- or state-dependent in module assembly rather than at anything in
+the source. Note `testV7UuidGenerationForNonMonotonicClock` spins in a
+`while (true)` until a clock counter falls in range, which is the one construct in
+the file that can vary run to run.
+
+Do not bisect the source again. Reproduce the failure first — run the file in a
+loop until it fails — and only then look at what differs.
 
 Older text, kept because its exclusions are still valid:
 
