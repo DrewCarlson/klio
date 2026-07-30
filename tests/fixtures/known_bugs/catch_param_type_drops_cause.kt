@@ -2,18 +2,16 @@
 // the `Caused by:` chain. `e.cause` is still correct — only the rendering is
 // wrong, which is what makes this quiet.
 //
-// With the receiver typed `Throwable`, the call binds statically to
-// `kotlin.stackTraceToString#5562`, the bodyless `expect` declared in
-// `common/src/kotlin/ExceptionsH.kt`, and that frame is actually ENTERED:
+// The cause is a placeholder KLIO actual in
+// `kotlin-klio/kotlin-internal/ThrowableActuals.kt`:
 //
-//     [fn-entry] kotlin.stackTraceToString#5562: this=Exception
+//     public actual fun Throwable.stackTraceToString(): String = this.toString()
 //
-// Extension resolution admits the candidate because it carries a host symbol
-// (`!has_source_body and !has_host_symbol` is what would otherwise skip it),
-// but lowering then emits an ordinary interpreted Call to a function with no
-// body instead of the host invocation. klio's real implementation lives in
-// `host_call_member.zig` (`throwableStackMember` -> `formatThrowable`, which
-// renders cause and suppressed) and never runs.
+// It discards frames, cause and suppressed. While the receiver is untyped the
+// call reaches klio's real renderer instead (`throwableStackMember` ->
+// `formatThrowable` in `host_call_member.zig`); once the receiver is statically
+// typed, resolution binds this actual and the host renderer never runs. The
+// stub was only ever correct because nothing could resolve to it.
 //
 // Prints `true` on a tree without catch-parameter typing, `false` with it.
 fun main() {

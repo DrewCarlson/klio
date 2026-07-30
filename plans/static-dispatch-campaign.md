@@ -344,85 +344,70 @@ channel's gain was never measured at all. Measure against the same binary
 before any number justifies the work — the same discipline the verification
 playbook demands for timings applies to counters.
 
-### The blocker, root-caused: a bodyless `expect` is lowered as an interpreted call
+### The blocker, root-caused: a placeholder `actual` shadows klio's own renderer
 
-Recording a catch parameter's declared type is the smallest possible increment
+Recording a catch parameter's declared type is the smallest increment available
 here — the type is always written in the source, so it is not a heuristic — and
 it binds calls that bound nothing before (`bound_static` 46 -> 47 on a probe
-whose handler calls a method on the exception; no movement on the collections
-file set, which never calls a method on a catch parameter). It is two lines at
-the handler's `bind` in `lowerTry`.
+whose handler calls a method on the exception). It is two lines at the handler's
+`bind` in `lowerTry`.
 
 It is not committed, because it makes `ExceptionTest.exceptionDetailedTrace`
-fail, and that failure is now root-caused. Minimal reproduction, six lines, in
-`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`:
+fail. Six-line reproduction in
+`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`: with the receiver
+typed, `e.stackTraceToString()` loses the `Caused by:` chain while `e.cause`
+stays correct, which is what makes it quiet.
 
-    val e = try {
-        try { throw IllegalStateException("Root cause") }
-        catch (e: Throwable) { throw RuntimeException("Induced", e) }
-    } catch (e: Throwable) { e }
-    // e.cause is correct; "Root cause" is ABSENT from e.stackTraceToString()
+The cause is one line of KLIO-authored Kotlin,
+`kotlin-klio/kotlin-internal/ThrowableActuals.kt`:
 
-`e.cause` is right — only the rendering drops the `Caused by:` chain, which is
-why this is quiet. With the receiver typed, the call binds
-`kotlin.stackTraceToString#5562`, the bodyless `expect` in
-`common/src/kotlin/ExceptionsH.kt:144` whose actuals are all platform files klio
-never compiles, and that frame is ENTERED:
+    public actual fun Throwable.stackTraceToString(): String = this.toString()
+    public actual fun Throwable.printStackTrace() { println(this) }
 
-    [fn-entry] kotlin.stackTraceToString#5562: this=Exception
+with the header comment "KLIO has no host stack-trace machinery, so these render
+the throwable itself." That comment is STALE. `throwableStackMember` in
+`host_call_member.zig` renders frames, cause and suppressed through
+`formatThrowable`, and it is what serves these calls when the receiver type is
+unknown. Once the receiver IS typed, resolution binds the real — but
+placeholder — `actual` instead, and the host renderer never runs.
 
-Extension resolution admits the candidate because it carries a host symbol —
-`if (!has_source_body and !has_host_symbol) continue` is what would otherwise
-drop it — and then lowering emits an ordinary interpreted `Call` to a function
-with no body rather than the host invocation. klio's real implementation is
-`throwableStackMember` in `host_call_member.zig`, which renders cause and
-suppressed through `formatThrowable`, and it never runs. Without a receiver type
-the call stays dynamic and reaches it.
+So this is not a dispatch defect at all. It is a stub implementation that only
+ever ran because nothing could resolve to it, and giving lowering better type
+information made it reachable.
 
-**So the rule to establish is: a declaration admitted only because it has a host
-symbol must be lowered to that host invocation, never to an interpreted call.**
-This is the third instance of one family — `Func.return_ty`'s `Unit` placeholder
-and this one both come from a declaration that exists while implementing
-nothing, read as though it implements something. It is very likely the same
-reason the return-type channel broke compose, since that channel's whole effect
-is to make more receivers statically typed.
+**The fix is to make these two actuals produce what the host renderer produces,
+not to change dispatch.** Deleting the file does not work — `build.zig` embeds
+it and the build fails on the missing path — so either the bodies are written to
+walk `stackTrace`/`cause`/`suppressedExceptions` themselves, or the `expect`
+declarations are satisfied by registering `kotlin.stackTraceToString` and
+`kotlin.printStackTrace` as host symbols and the Kotlin actuals are removed from
+the embedded set together. The second is the better shape: one implementation,
+in the place that already has one.
 
-Fix that first. Then the catch-parameter typing lands as its first beneficiary,
-and the return-type channel becomes re-testable.
+Two earlier versions of this entry asserted mechanisms that were wrong, and both
+are worth recording as dead ends. The first blamed a lost `addSuppressed`;
+`e.suppressedExceptions.size` is 1 either way. The second blamed a bodyless
+`expect` being entered as an interpreted frame — the `[fn-entry]` row is real,
+but a probe inside the resolver shows what the resolver actually sees:
 
-**A first fix attempt failed, and how it failed narrows the next one.** The
-obvious guard — decline the static bind when the target has no body — was added
-to both the extension path (`lowerResolvedExtensionCall`) and the member path
-(`lowerResolvedMemberCall`). Two things came out of it:
+    [expectprobe] fid=5562 is_expect=false hasBody=true ds_has_body=true ast_body=true
 
-- `stackTraceToString` reaches NEITHER path. The `[compose-abi]` row shows the
-  call carrying `args=0` with the receiver separate, so it is bound somewhere
-  else again; find that site before writing any guard.
-- "Has no body" is the WRONG predicate, and dangerously so. Instrumenting the
-  member guard shows what it actually catches:
+`hasBody=true`. There is nothing bodyless about it. That probe also shows
+`Func.is_expect` is never set for a real `expect` declaration — it is assigned in
+exactly one synthetic place — so any future guard written in terms of it is inert.
 
-      [bodyless] kotlin.collections.Collection.iterator fid=395
-      [bodyless] kotlin.collections.Iterator.hasNext fid=357
-      [bodyless] kotlin.coroutines.CoroutineContext.fold fid=4
+A guard phrased as "decline a static bind when the target has no body" was also
+tried and is actively dangerous: instrumented, it catches
+`kotlin.collections.Collection.iterator`, `kotlin.collections.Iterator.hasNext`
+and `kotlin.coroutines.CoroutineContext.fold` — abstract members, bodyless by
+design, which must keep binding to a virtual slot. Deferring those would push
+every interface call in the program onto dynamic dispatch.
 
-  Abstract and interface members are bodyless BY DESIGN and must bind to a
-  virtual slot. Declining them would defer every interface call in the program
-  to dynamic dispatch — the exact opposite of this campaign's goal.
-
-So the predicate has to separate three cases that all present as "no body":
-abstract/interface (bind virtually), bodyless `expect` standing in for a host
-symbol (invoke the host), and a stub with a declared arity. Only the second is
-the defect. Nothing in `Func` distinguishes them today, which is the same gap
-`return_ty_declared` closed for return types — write the distinction down at
-lowering time rather than re-deriving it from an absence.
-
-Ruled out along the way, each as its own program that passes WITH the change
-applied, so nobody repeats them: lost `addSuppressed`
-(`e.suppressedExceptions.size` is 1 either way); a cause from a `Throwable`-typed
-LOCAL; a cause taken directly from a catch parameter; and the cause/suppressed
-rendering of a nested try, which is byte-identical. An earlier version of this
-entry blamed `addSuppressed` and was wrong — the trace rows quoted for it were
-real but explained nothing, because the effect landed anyway.
+The general lesson, now four times over in this campaign: supplying better
+static type information does not introduce these failures, it REVEALS
+implementations that were never reachable. Expect the next increment to uncover
+another one, and expect the fix to be in the thing that became reachable rather
+than in the code that supplied the type.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 

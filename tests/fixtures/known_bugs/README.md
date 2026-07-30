@@ -11,4 +11,4 @@ with its output pinned, and the plan entry is updated.
 
 | File | Defect |
 |------|--------|
-| `catch_param_type_drops_cause.kt` | A bodyless `expect` admitted only because it carries a host symbol is lowered as an interpreted call, so `Throwable.stackTraceToString()` enters an empty frame instead of klio's host renderer and drops the `Caused by:` chain. Prints `true` as-is; prints `false` once a catch parameter's declared type is recorded, which is what makes the receiver statically typed. See the static-dispatch campaign plan. |
+| `catch_param_type_drops_cause.kt` | `kotlin-klio/kotlin-internal/ThrowableActuals.kt` defines `Throwable.stackTraceToString()` as `this.toString()`, a placeholder that discards frames, cause and suppressed. It is unreachable while receivers are untyped (klio's host renderer serves instead), and shadows the host renderer as soon as a receiver IS typed. Prints `true` as-is; prints `false` once a catch parameter's declared type is recorded. See the static-dispatch campaign plan. |
