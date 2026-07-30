@@ -445,12 +445,38 @@ trigger is none of these on its own; do not retry them:
    INITIALIZER (`private val cached = Inner()`), mirroring
    `private val recomposerInfo = RecomposerInfoImpl()` — prints `T`.
 
-So the remaining candidates are what those reductions still omit: the real
-`synchronized` is an `expect` with a klio actual rather than a user inline
-function, `RecomposerInfoImpl` is reached through an interface-typed collection
-in a companion (`_runningRecomposers`), and the getter is annotated. Bisect from
-the real file downward rather than building up from a toy — building up has now
-cost four attempts and produced no reproduction.
+All four reductions produce the IDENTICAL `[bare-read]` row to the failing
+Recomposer site — `in=- own=false encl=false owner=Outer$Inner` — and still
+pass, including on a build with the channel applied. So the lowering decision is
+not the difference; the runtime behaviour is.
+
+Two more hypotheses tested and DEAD, so they are not retried:
+
+- **Owner-mangled private property.** `stateLock` is `private`, and a private
+  property that shadows a supertype's writes an owner-mangled key, which would
+  make `hostHasProperty` miss. Ruled out: it is the only declaration of that
+  name anywhere in the tree, so nothing triggers mangling.
+- **The implicit-receiver site memo.** `LoadFromThisOrGlobal` short-circuits its
+  walk on a shape-hash match (`lt.site_cache`), and a colliding MISS entry would
+  produce exactly this symptom. Ruled out by a `KLIO_NO_SITE_MEMO` escape that
+  forces the full walk: compose fails identically with the memo disabled.
+
+The hard fact to build on came from printing the walk's candidate list
+(`[recv-walk]`):
+
+    [recv-walk] stateLock this_idx=0 cands=1
+    [recv-walk]   [0] depth=0 kind=Instance
+
+**One candidate.** The enclosing `Recomposer` instance is never in the list, so
+the class-nesting tower contributes nothing for the inner class here. That is
+the bug, and it is the same family as the `StoreToThisOrGlobal` capture-slot gap
+fixed earlier: an implicit receiver that exists but that the runtime walk cannot
+reach.
+
+Next: work on `implicitCandidatesAlloc` directly — find why the outer instance
+is absent for an inner-class receiver and what the passing reductions supply
+that Recomposer does not. Building reductions upward has now cost five attempts
+and produced none; instrument the real failing run instead.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 
