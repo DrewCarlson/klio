@@ -575,6 +575,28 @@ pub const TypedSupertype = struct {
 };
 
 /// Description of a user-declared class.
+/// Register a class under its simple name, recording a collision instead of
+/// overwriting. See `ambiguous_class_names`.
+pub fn putClassChecked(self: anytype, name: []const u8, info: ClassInfo, decl_file: ?FileId) !void {
+    if (self.classes.getPtr(name)) |existing| {
+        const same = if (existing.decl_file) |ef|
+            (if (decl_file) |nf| ef.int() == nf.int() else false)
+        else
+            decl_file == null;
+        if (!same) {
+            try self.ambiguous_class_names.put(name, {});
+        }
+    }
+    try self.classes.put(name, info);
+}
+
+/// The class registered under `name`, or null when the simple name is
+/// ambiguous across packages.
+pub fn classNamed(self: anytype, name: []const u8) ?ClassInfo {
+    if (self.ambiguous_class_names.contains(name)) return null;
+    return self.classes.get(name);
+}
+
 pub const ClassInfo = struct {
     /// Has any secondary constructor — we then relax primary-ctor arity
     /// checks to avoid false positives.
@@ -731,6 +753,14 @@ pub const Checker = struct {
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
     /// File-level user classes.
     classes: std.StringHashMap(ClassInfo),
+    /// Simple names declared by MORE THAN ONE class. `classes` is keyed by
+    /// simple name, so two same-named classes in different packages would
+    /// otherwise silently overwrite each other and every lookup would answer
+    /// with whichever registered last. A wrong answer is worse than none —
+    /// it feeds the eager evidence channel and can disprove valid candidates
+    /// downstream — so an ambiguous name answers nothing until typeck
+    /// resolves classes per package.
+    ambiguous_class_names: std.StringHashMap(void),
     /// Name of the enclosing class while we type-check a class body.
     class_stack: std.ArrayList([]const u8),
     /// Enclosing function's declared/inferred return type for `return`.

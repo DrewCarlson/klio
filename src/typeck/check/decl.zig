@@ -195,7 +195,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
         },
         .Class => |*c| {
             const info = try classInfo(self, c);
-            try self.classes.put(c.name.name, info);
+            try root.putClassChecked(self, c.name.name, info, c.name.span.file);
         },
         .Object => |*o| {
             // Treat object singleton like a class with no ctor.
@@ -206,7 +206,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
             for (o.supertypes) |*s| {
                 try info.supertypes.append(self.allocator, s.name.name);
             }
-            try self.classes.put(o.name.name, info);
+            try root.putClassChecked(self, o.name.name, info, o.name.span.file);
             // Bind the singleton name itself so `Foo.bar` reads pass.
             try self.frames.items[0].bindings.put(o.name.name, .{
                 .ty = Type.Unresolved,
@@ -423,7 +423,7 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
 /// along the transitive supertype chain; `null` when the chain has no
 /// link to `target`. The result owns its heap data.
 pub fn walkSupertypeArgs(self: *Checker, subclass: []const u8, target: []const u8) Allocator.Error!?[]Type {
-    const info = self.classes.get(subclass) orelse return null;
+    const info = root.classNamed(self, subclass) orelse return null;
     if (std.mem.eql(u8, subclass, target)) {
         const out = try self.allocator.alloc(Type, info.type_param_names.items.len);
         for (info.type_param_names.items, 0..) |n, i| out[i] = .{ .TypeParam = try self.allocator.dupe(u8, n) };
@@ -437,7 +437,7 @@ pub fn walkSupertypeArgs(self: *Checker, subclass: []const u8, target: []const u
         }
         if (try walkSupertypeArgs(self, s.name, target)) |deeper| {
             defer self.allocator.free(deeper);
-            const mid_info = self.classes.get(s.name) orelse return null;
+            const mid_info = root.classNamed(self, s.name) orelse return null;
             var subst = std.StringHashMap(Type).init(self.allocator);
             defer subst.deinit();
             const n = @min(mid_info.type_param_names.items.len, s.args.len);
@@ -1291,7 +1291,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         for (c.supertypes, 0..) |*s, i| {
             const is_delegated = i < c.supertype_delegates.len and c.supertype_delegates[i] != null;
             if (is_delegated) continue;
-            if (self.classes.get(s.name.name)) |parent| {
+            if (root.classNamed(self, s.name.name)) |parent| {
                 if (parent.is_abstract or parent.is_interface) {
                     for (parent.abstract_members.items) |am| try required.append(self.allocator, am);
                 }
@@ -1300,7 +1300,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         if (required.items.len != 0) {
             var provided = std.StringHashMap(void).init(self.allocator);
             defer provided.deinit();
-            if (self.classes.get(c.name.name)) |info| {
+            if (root.classNamed(self, c.name.name)) |info| {
                 for (info.concrete_members.items) |n| try provided.put(n, {});
             }
             var missing: std.ArrayList([]const u8) = .empty;
@@ -1457,7 +1457,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         if (i >= c.supertype_delegates.len) continue;
         const delegate_expr = c.supertype_delegates[i] orelse continue;
         const target_name = s.name.name;
-        const target_is_interface = if (self.classes.get(target_name)) |info| info.is_interface else false;
+        const target_is_interface = if (root.classNamed(self, target_name)) |info| info.is_interface else false;
         if (!target_is_interface) {
             const msg = try std.fmt.allocPrint(self.allocator, "Only interfaces can be delegated to; `{s}` is not an interface", .{target_name});
             try emitError(self, msg, s.span, codes.TYPE_DELEGATION_TARGET_NOT_INTERFACE);
@@ -1589,10 +1589,10 @@ pub fn checkPrivateOpenOrOverride(self: *Checker, name: []const u8, sp: Span, is
 
 /// Spec §5.1: check each declared supertype is legal to inherit from.
 pub fn checkSupertypeValidity(self: *Checker, derived_name: []const u8, supertypes: []const TypeRef) Allocator.Error!void {
-    const derived_local = if (self.classes.get(derived_name)) |i| i.is_local_or_anonymous else false;
+    const derived_local = if (root.classNamed(self, derived_name)) |i| i.is_local_or_anonymous else false;
     for (supertypes) |*s| {
         const name = s.name.name;
-        const parent = self.classes.get(name) orelse continue;
+        const parent = root.classNamed(self, name) orelse continue;
         if (parent.is_sealed and derived_local) {
             const msg = try std.fmt.allocPrint(self.allocator, "local class `{s}` cannot inherit from sealed type `{s}`: sealed inheritors must have a fully-qualified name", .{ derived_name, name });
             try emitError(self, msg, s.span, codes.TYPE_SEALED_INHERITOR_NOT_QUALIFIED);
@@ -1655,7 +1655,7 @@ pub fn nameIsThrowableSubtype(self: *Checker, name: []const u8) bool {
     while (stack.pop()) |n| {
         if ((seen.getOrPut(n) catch return false).found_existing) continue;
         if (eqAny(n, &BUILTIN_THROWABLES_FULL)) return true;
-        if (self.classes.get(n)) |info| {
+        if (root.classNamed(self, n)) |info| {
             for (info.supertypes.items) |s| stack.append(self.allocator, s) catch return false;
         }
     }
@@ -1671,7 +1671,7 @@ pub fn isThrowableSubtype(self: *Checker, c: *const Class) Allocator.Error!bool 
     while (stack.pop()) |name| {
         if ((try seen.getOrPut(name)).found_existing) continue;
         if (eqAny(name, &BUILTIN_THROWABLES_CLASS)) return true;
-        if (self.classes.get(name)) |info| {
+        if (root.classNamed(self, name)) |info| {
             for (info.supertypes.items) |s| try stack.append(self.allocator, s);
         }
     }
@@ -1728,7 +1728,7 @@ pub fn collectInheritedMemberSigs(self: *Checker, c: *const Class) Allocator.Err
         steps += 1;
         if (sliceContains(seen.items, parent_name)) continue;
         try seen.append(self.allocator, parent_name);
-        const parent = self.classes.get(parent_name) orelse continue;
+        const parent = root.classNamed(self, parent_name) orelse continue;
         var it = parent.member_sigs.iterator();
         while (it.next()) |entry| {
             if (!out.contains(entry.key_ptr.*)) {
@@ -1754,7 +1754,7 @@ pub fn collectInheritedMemberFlags(self: *Checker, c: *const Class) Allocator.Er
         steps += 1;
         if (sliceContains(seen.items, parent_name)) continue;
         try seen.append(self.allocator, parent_name);
-        const parent = self.classes.get(parent_name) orelse continue;
+        const parent = root.classNamed(self, parent_name) orelse continue;
         var it = parent.member_flags.iterator();
         while (it.next()) |entry| {
             var effective = entry.value_ptr.*;
@@ -1798,7 +1798,7 @@ pub fn checkDelegateOperator(self: *Checker, p: *const Property, delegate: *cons
         else => null,
     };
     const cn = class_name orelse return;
-    const info = self.classes.get(cn) orelse return;
+    const info = root.classNamed(self, cn) orelse return;
     const needed: []const []const u8 = if (p.mutable)
         &.{ "getValue", "setValue" }
     else
@@ -2095,7 +2095,7 @@ pub fn isSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) Allocator.E
         steps += 1;
         if (sliceContains(seen.items, name)) continue;
         try seen.append(self.allocator, name);
-        const info = self.classes.get(name) orelse continue;
+        const info = root.classNamed(self, name) orelse continue;
         for (info.supertypes.items) |s| {
             if (std.mem.eql(u8, s, sup)) return true;
             try frontier.append(self.allocator, s);
@@ -2122,7 +2122,7 @@ pub fn collectDefaultProviders(self: *Checker, c: *const Class) Allocator.Error!
         steps += 1;
         if (sliceContains(seen.items, parent_name)) continue;
         try seen.append(self.allocator, parent_name);
-        const parent = self.classes.get(parent_name) orelse continue;
+        const parent = root.classNamed(self, parent_name) orelse continue;
         var it = parent.member_flags.iterator();
         while (it.next()) |entry| {
             const flags = entry.value_ptr.*;

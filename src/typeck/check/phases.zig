@@ -73,6 +73,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .extensions = std.StringHashMap(std.ArrayList(root.ExtensionSig)).init(allocator),
         .extension_properties = std.StringHashMap(std.ArrayList(root.ExtensionPropSig)).init(allocator),
         .classes = std.StringHashMap(root.ClassInfo).init(allocator),
+        .ambiguous_class_names = std.StringHashMap(void).init(allocator),
         .class_stack = .empty,
         .fn_return_stack = .empty,
         .label_stack = .empty,
@@ -301,7 +302,7 @@ pub fn collectMemberNameSet(self: *const Checker, c: *const Class) Allocator.Err
         }
     }
     for (c.supertypes) |*s| {
-        if (self.classes.get(s.name.name)) |info| {
+        if (root.classNamed(self, s.name.name)) |info| {
             var it = info.members.keyIterator();
             while (it.next()) |k| try out.put(k.*, {});
         }
@@ -1369,7 +1370,7 @@ pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
             if (m.receiver.* == .Path) {
                 const segs = m.receiver.Path.segments;
                 if (segs.len == 1) {
-                    if (self.classes.get(segs[0].name)) |info| {
+                    if (root.classNamed(self, segs[0].name)) |info| {
                         if (info.is_enum) return true;
                     }
                     // Builtin primitive companion constants (`Long.MAX_VALUE`,
@@ -1530,7 +1531,7 @@ pub fn checkValueClass(self: *Checker, c: *const Class) Allocator.Error!void {
         }
     }
     for (c.supertypes) |*s| {
-        if (self.classes.get(s.name.name)) |info| {
+        if (root.classNamed(self, s.name.name)) |info| {
             if (!info.is_interface) {
                 try emitValueClassShape2(self, sp, "`value class {s}` cannot extend non-interface supertype `{s}`", c.name.name, s.name.name);
             }

@@ -1,5 +1,35 @@
 # Static dispatch campaign
 
+## Standing constraint: no simple-name resolution
+
+Every resolution this campaign adds or touches must key on a FULLY
+QUALIFIED name. Simple-name keys have repeatedly produced silent wrong
+answers across the project, and this campaign's whole premise — binding
+calls at lower time — is worthless if the binding can be wrong.
+
+Where a simple-name lookup genuinely helps (a short local class, an
+unambiguous top-level), it must be ISOLATED so no other class or
+top-level function can pollute it: a scoped index, not a global map.
+
+The defect found while opening the type channel is the canonical example.
+`typeck`'s class table is `classes: std.StringHashMap(ClassInfo)` keyed by
+SIMPLE name, so `androidx.compose.runtime.composer.gapbuffer.SlotTable`
+and `androidx.compose.runtime.composer.linkbuffer.SlotTable` overwrote
+each other; every lookup answered with whichever registered last. That
+made `read`'s parameter look like a receiver lambda
+(`SlotTableReader.() -> T` instead of `(reader: SlotReader) -> T`), which
+suppressed the lambda's implicit `it`, which produced 8 hard
+unresolved-reference errors in a valid program. One simple-name map, four
+layers of consequence.
+
+The interim fix records the collision and answers NOTHING for an
+ambiguous simple name — a wrong answer is worse than none, because it
+feeds the eager evidence channel and disproves valid candidates
+downstream. The durable fix is package-keyed class resolution in typeck,
+and it is a prerequisite for trusting receiver types in phase 1 rather
+than an optional cleanup.
+
+
 Goal: bind every call at lowering time, so the runtime never resolves a
 member by name. That retires the dispatch ladders and the memoization
 layered over them, and it is the prerequisite a bytecode VM needs — a
@@ -87,12 +117,104 @@ receiver type — the same missing fact, one layer earlier.
 
 ## Phases
 
-**Phase 0 — open the type channel.** Fix the `it` binding for a lambda
-argument to a member function (8 sites, one mechanism), then verify
-`KLIO_EAGER` typechecks the whole corpus. Flip the channel from
-env-gated to default-on once the audit shows zero disagreement, which is
-the trust discipline `argDeclTypeRef` already documents. Nothing
-downstream pays off before this.
+**Phase 0 — open the type channel.** Nothing downstream pays off before
+this. The blocker is diagnosed to a single mechanism, recorded here in
+full because the chain is long and easy to re-derive wrongly:
+
+1. All 8 failures are the shape `var x = slots.read { it.anchor() }`,
+   where `read` is `inline fun <T> read(block: (reader: SlotReader) -> T)`.
+   The sibling `slots.read { it.nodeCount(0) }` on the same class does NOT
+   fail.
+2. The error is emitted by LOWERING, not the eager resolver:
+   `lambda_body.zig` records `unresolved_local` when `b.it_suppressed` is
+   set and an `it` reference resolves nowhere.
+3. `suppress_it = lam.implicit_it and expected_arity == 0`, and
+   `expected_arity` falls back to typeck's recorded lambda shape
+   (`Module.eagerParamShapeOf`) when the AST sources have no answer.
+4. `KLIO_OR_AUDIT=1` now tags each decision with the evidence that set the
+   arity. Matching the failing body spans against the audit shows
+   `src=eager-recv`: typeck recorded `has_receiver = true, arity = 0` for
+   `read`'s parameter, which is a plain one-parameter function type with
+   NO receiver.
+5. `has_receiver` traces to the AST (`convertTypeRefWithTparams` sets
+   `receiver_head = ft.receiver`), so typeck resolved `slots.read` to a
+   declaration whose parameter IS a receiver lambda — a wrong overload
+   pick, which is exactly the "permissive inference" hazard
+   `argDeclTypeRef` documents.
+
+A minimal repro does NOT reproduce it: a class with an
+`inline fun <T> read(block: (reader: R) -> T)`, a defaulted-parameter
+method on `R`, and same-named methods on three classes all run correctly
+with `KLIO_EAGER=1`. So the wrong pick needs something else present in
+the compose corpus — most likely a competing `read` declaration whose
+parameter is a receiver lambda. Finding that competitor is the next step.
+
+### Fixed
+
+The competing declaration was found: TWO classes named `SlotTable` exist,
+`…composer.gapbuffer.SlotTable` (whose `read` takes
+`(reader: SlotReader) -> T`) and `…composer.linkbuffer.SlotTable` (whose
+`read` takes `SlotTableReader.() -> T`). `typeck.classes` is keyed by
+SIMPLE name, so the second registration overwrote the first and every
+lookup answered with whichever came last.
+
+The fix records the collision (`ambiguous_class_names`) and answers
+NOTHING for an ambiguous simple name, via `putClassChecked` /
+`classNamed`. With eager on, the 8 unresolved-`it` errors go to 0, and
+`klio check` over the examples corpus reports identical error counts with
+and without the change — the fix removes wrong answers without adding
+diagnostics. The durable fix remains package-keyed class resolution; see
+the standing constraint at the top of this document.
+
+### Eager mode is NOT yet ready to become the only mode
+
+`commontest-sweep.py --eager both` (the dual gate; it runs both modes and
+reports divergence per directory) shows eager FAILING three tests that
+pass with it off:
+
+    kotlin/libraries/stdlib/test/numbers: off=113/0, on=110/3
+    kotlin/libraries/stdlib/test/time:    off=81/0,  on=80/1
+
+- `NaNTotalOrderTest.listTMinOrNull` and `sequenceTMinOrNull`:
+  `minOrNull()` returns `NaN` where `0.0` is expected. A comparison
+  selected against the wrong static type — NaN total-order handling
+  differs between the boxed and primitive comparison paths.
+- `DurationTest.parseAndFormatInUnits`:
+  `Vm::get_field 'length' on 'kotlin.Array'`. `kotlin.Array` has `size`,
+  not `length`, so eager picked a declaration returning `Array` where the
+  correct one returns `String`. The read is inside the stdlib's own
+  `kotlin.time.Duration` implementation, not the test; the test's
+  `vararg representations: String` (an `Array<String>` inside) plus
+  `withIndex()` destructuring is the likely source of the confusion —
+  element type mistaken for container type.
+
+Both are wrong-static-type defects, the same family as the `SlotTable`
+collision. Until they are fixed the `KLIO_EAGER` flag and the non-eager
+branches must stay: deleting the working path while the replacement fails
+real tests would be trading correctness for tidiness. The removal is
+tracked as its own step below.
+
+**Phase 0b — retire non-eager.** Preconditions, all measured, none
+optional: `--eager both` clean across the stdlib sweep; every compose
+suite green under eager; the coroutine repros intact under eager. Then
+delete the `KLIO_EAGER` gate in `computeEagerCalls`, the non-eager
+branches it guards, and the `--eager` mode switch in the sweep (it
+becomes the only mode, so a dual gate has nothing to compare).
+
+Two candidate fixes for the `it` defect, in preference order (kept for
+the record; the first was taken):
+
+- Fix the overload pick in typeck so `read` resolves to the member on
+  `SlotTable`. Correct at the source, and it is the same defect that
+  will mis-answer receiver types in phase 1.
+- Failing that, refuse to suppress `it` on typeck evidence when the body
+  contains a bare `it` and no enclosing lambda supplies one. Suppressing
+  the binding a body demonstrably needs can only ever be wrong; kotlinc
+  rejects a genuine `() -> R` lambda that reads `it`, so no valid program
+  depends on the current behaviour.
+
+Narrowing eager trust to receiver shapes was tried and does NOT work —
+the wrong answer is the one claiming a receiver.
 
 **Phase 1 — widen the receiver-type answer.** With the channel open,
 re-measure `[lower-sites]`. The 72.3% `no_receiver_type` bucket is the

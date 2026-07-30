@@ -193,7 +193,7 @@ pub fn checkCall(
             try putListElem(self, call_span, elem);
             return .Unresolved;
         }
-        if (self.classes.get(name)) |cls| {
+        if (root.classNamed(self, name)) |cls| {
             try visibility.checkClassUseVisibility(self, name, &cls, callee_span);
             if (cls.has_secondary_ctors) {
                 // Multiple constructor arities exist; the interp picks the
@@ -631,7 +631,7 @@ fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8)
         if (sl >= seen.len) break;
         seen[sl] = cn;
         sl += 1;
-        const info = self.classes.get(cn) orelse continue;
+        const info = root.classNamed(self, cn) orelse continue;
         if (info.member_sigs.contains(name)) return true;
         for (info.supertypes.items) |sup| {
             if (fl >= frontier.len) break;
@@ -1119,7 +1119,7 @@ fn argClassName(self: *Checker, args: []const Expr, arg_tys: []const Type, i: us
 /// Name-level subtype walk over the collected class table.
 fn classIsSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) return true;
-    const info = self.classes.get(sub) orelse return false;
+    const info = root.classNamed(self, sub) orelse return false;
     var steps: usize = 0;
     for (info.supertypes.items) |s| {
         if (steps > 64) break;
@@ -1692,7 +1692,7 @@ pub fn checkUserOperatorKeyword(
         if ((try visited.getOrPut(name)).found_existing) {
             continue;
         }
-        const info = self.classes.get(name) orelse continue;
+        const info = root.classNamed(self, name) orelse continue;
         if (info.member_flags.get(op_name)) |flags| {
             if (flags.is_operator) {
                 return;

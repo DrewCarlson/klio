@@ -589,7 +589,7 @@ pub fn checkWhenExhaustive(
     branches: []const WhenBranch,
     when_span: Span,
 ) Allocator.Error!void {
-    const root_info = self.classes.get(subject_class) orelse return;
+    const root_info = root.classNamed(self, subject_class) orelse return;
     if (!root_info.is_sealed) {
         return;
     }
@@ -670,7 +670,7 @@ fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
             continue;
         }
         seen.append(self.allocator, name) catch return false;
-        const info = self.classes.get(name) orelse continue;
+        const info = root.classNamed(self, name) orelse continue;
         for (info.supertypes.items) |s| {
             if (std.mem.eql(u8, s, sup)) {
                 return true;
@@ -685,7 +685,7 @@ fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
 /// `Checker::walk_supertype_args` from the declaration phase, kept local
 /// until that phase lands. Result and its elements are owned by the caller.
 fn walkSupertypeArgs(self: *const Checker, allocator: Allocator, subclass: []const u8, target: []const u8) Allocator.Error!?[]Type {
-    const info = self.classes.get(subclass) orelse return null;
+    const info = root.classNamed(self, subclass) orelse return null;
     if (std.mem.eql(u8, subclass, target)) {
         const out = try allocator.alloc(Type, info.type_param_names.items.len);
         errdefer allocator.free(out);
@@ -706,7 +706,7 @@ fn walkSupertypeArgs(self: *const Checker, allocator: Allocator, subclass: []con
             // result: if `subclass : Mid<X>` and
             // `Mid<X> : Target<f(X)>`, derive `Target<f(arg)>`
             // by replacing `X` in `deeper` with `s_args`.
-            const mid_info = self.classes.get(s.name) orelse return null;
+            const mid_info = root.classNamed(self, s.name) orelse return null;
             var subst = std.StringHashMap(Type).init(allocator);
             var i: usize = 0;
             while (i < mid_info.type_param_names.items.len and i < s.args.len) : (i += 1) {

@@ -55,7 +55,7 @@ fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
             continue;
         }
         seen.append(self.allocator, name) catch return false;
-        const info = self.classes.get(name) orelse continue;
+        const info = root.classNamed(self, name) orelse continue;
         for (info.supertypes.items) |s| {
             if (std.mem.eql(u8, s, sup)) {
                 return true;
@@ -116,7 +116,7 @@ pub fn lookupMemberVisibility(
         if ((try seen.getOrPut(c)).found_existing) {
             continue;
         }
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         if (info.member_visibility.get(name)) |v| {
             return .{ v, c };
         }
@@ -329,7 +329,7 @@ pub fn lookupMemberThroughChain(
         if ((try seen.getOrPut(c)).found_existing) {
             continue;
         }
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         if (info.members.get(name)) |ty| {
             const cn = info.member_class.get(name);
             return .{ try ty.clone(allocator), cn };
@@ -360,7 +360,7 @@ fn memberReachable(self: *const Checker, class: []const u8, name: []const u8) Al
         if ((try seen.getOrPut(c)).found_existing) {
             continue;
         }
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         if (info.members.contains(name)) {
             return true;
         }
@@ -513,7 +513,7 @@ pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Exp
                 if ((try seen.getOrPut(c)).found_existing) {
                     continue;
                 }
-                if (self.classes.get(c)) |info| {
+                if (root.classNamed(self, c)) |info| {
                     if (info.member_flags.get(name)) |flags| {
                         any = true;
                         if (flags.is_infix) {
@@ -542,7 +542,7 @@ pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Exp
                         break;
                     }
                     steps2 += 1;
-                    if (self.classes.get(c)) |info| {
+                    if (root.classNamed(self, c)) |info| {
                         for (info.supertypes.items) |s| {
                             if (!(try seen2.getOrPut(s)).found_existing) {
                                 try keys.append(self.allocator, s);
@@ -745,7 +745,7 @@ pub fn checkCompoundAssignAmbiguity(
         else => self.expr_class.get(target.span()),
     };
     const cn = class_name orelse return;
-    const info = self.classes.get(cn) orelse return;
+    const info = root.classNamed(self, cn) orelse return;
     const has_op = info.members.contains(op_name);
     const has_assign = info.members.contains(assign_name);
     if (has_op and has_assign) {
@@ -767,7 +767,7 @@ pub fn checkSuperQualifier(self: *Checker, qualifier: *const TypeRef, super_span
         return;
     }
     const enclosing = self.class_stack.items[self.class_stack.items.len - 1];
-    const info = self.classes.get(enclosing) orelse return;
+    const info = root.classNamed(self, enclosing) orelse return;
     const q_name = qualifier.name.name;
     var is_super = false;
     for (info.supertypes.items) |s| {
@@ -796,7 +796,7 @@ pub fn checkAmbiguousSuper(self: *Checker, name: []const u8, super_span: Span) A
         return;
     }
     const enclosing = self.class_stack.items[self.class_stack.items.len - 1];
-    const info = self.classes.get(enclosing) orelse return;
+    const info = root.classNamed(self, enclosing) orelse return;
     var contributors: std.ArrayList([]const u8) = .empty;
     defer contributors.deinit(self.allocator);
     for (info.supertypes.items) |s| {

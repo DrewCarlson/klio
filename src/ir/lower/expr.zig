@@ -2669,13 +2669,18 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // receiver bound at invocation, rather than a spurious `it` parameter.
     // The arity recorded at the call site (by span), authoritative when the
     // per-argument `pending_lambda_arity` was not set on this emit path.
+    var arity_src: []const u8 = "pending";
     if (expected_arity == -1) {
-        if (b.lambdaArgArity(expr.span())) |ar| expected_arity = ar;
+        if (b.lambdaArgArity(expr.span())) |ar| {
+            expected_arity = ar;
+            arity_src = "callsite";
+        }
     }
     if (expected_arity == -1) {
         if (b.peekExpected()) |exp| {
             if (exp.function) |ft| {
                 expected_arity = @intCast(ft.params.len);
+                arity_src = "expected";
             }
         }
     }
@@ -2689,6 +2694,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (expected_arity == -1) {
         if (eager_shape) |shape| {
             expected_arity = @intCast(shape.arity);
+            arity_src = if (shape.has_receiver) "eager-recv" else "eager-plain";
         }
     }
     // A zero-`->` lambda gets its implicit `it` only when its own
@@ -2701,7 +2707,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // binding unchanged.
     const suppress_it = lam.implicit_it and expected_arity == 0;
     if (orAuditOn() and lam.implicit_it)
-        std.debug.print("[IT-AUDIT] lambda span={d}..{d} expected_arity={d} suppress={}\n", .{ lam.body.span.start, lam.body.span.end, expected_arity, suppress_it });
+        std.debug.print("[IT-AUDIT] lambda f{d}:{d}..{d} expected_arity={d} src={s} suppress={}\n", .{ lam.body.span.file.int(), lam.body.span.start, lam.body.span.end, expected_arity, arity_src, suppress_it });
     const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
     const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
     // Names of lambda params (including the implicit `it`) whose effective

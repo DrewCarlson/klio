@@ -325,7 +325,7 @@ fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch return false;
         if (std.mem.eql(u8, cur, bt)) return true;
-        if (self.classes.get(cur)) |info| {
+        if (root.classNamed(self, cur)) |info| {
             for (info.supertypes.items) |s| stack.append(self.allocator, s) catch return false;
         }
     }
