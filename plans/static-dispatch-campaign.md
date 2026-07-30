@@ -229,7 +229,40 @@ get `plusCollectionInference` / `countEach` right as the first two
 regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
-### Why re-widening is blocked: one body, many instantiations
+### Why re-widening is blocked (superseded theory below — read this first)
+
+Ruled out by experiment: it is NOT instantiation-dependent recordings.
+`generic_body_depth` + `types_instantiation_dependent` now exclude every
+type recorded inside a generic body (29,517 spans excluded against 9,192
+exported on the collections file), and both regressions still fail.
+
+What is actually happening, traced with a temporary `KLIO_ARGTY_TRACE`
+probe on `argDeclTypeRef`:
+
+    478  [argty] element -> <none>   (splice_ty=false)
+
+For the spliced `plusElement` body, `argDeclTypeRefLazy` has NO answer for
+`element` — and `spliceParamTy("element")` is not set, so the declared-type
+channel that exists for exactly this purpose is inactive. With no lazy
+answer the eager fill supplies the CALLER's type (`List<String>`), which
+makes `plus(elements: Iterable<T>)` applicable and it concatenates.
+
+`bindSpliceParamTy` is called from exactly ONE real splice path
+(`inline_call.zig:1699`, the reified/type-args path) plus one special case
+in `expr.zig`. `plusElement` declares no reified parameters, so whichever
+splice path it takes never binds its parameters' declared types.
+
+That makes the fix concrete: bind splice parameter types on EVERY splice
+path, not only the reified one. Then `argDeclTypeRefLazy` answers `T` for
+`element`, the eager fill never runs there, and the declared-type rule
+below holds by construction rather than by the absence of evidence.
+
+Unverified: the probe never showed `element -> List`, so the exact
+expression that carries the caller's type into the `plus` resolution is
+still unconfirmed. Confirm that before writing the fix — the binding gap is
+established, its causal link to these two tests is not.
+
+### The declared-type rule (still correct, but not the blocker)
 
 The two regressions were diagnosed and they are NOT an inference gap. They
 are a rule violation, and the rule matters for every later phase.
