@@ -17,6 +17,7 @@
 const std = @import("std");
 
 const ir = @import("ir");
+const span_mod = @import("span");
 
 const TypeRef = ir.TypeRef;
 const Param = ir.Param;
@@ -773,21 +774,34 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
 /// `plusCollectionInference` diagnosis.
 pub threadlocal var trace_call_span: ?ir.Span = null;
 
+/// Source-visible name of the extension call currently being scored, kept
+/// alongside `trace_call_span` and under the same gate. Selecting candidates
+/// by NAME is what makes the trace usable across rebuilds: a `FuncId` is
+/// assigned by lowering order and shifts whenever anything upstream changes,
+/// so a fid recorded in one session names a different function in the next.
+pub threadlocal var trace_call_name: ?[]const u8 = null;
+
 /// Whether any `[extkey]` tracing is requested at all. Callers use this to
 /// skip maintaining `trace_call_span` on the normal path.
 pub fn extKeyTraceEnabled() bool {
     return std.c.getenv("KLIO_EXTKEY_TRACE") != null;
 }
 
-/// `KLIO_EXTKEY_TRACE=<fid>[,<fid>...]` gate; see the dump in
-/// `applicableExtension`.
+/// `KLIO_EXTKEY_TRACE=<name|fid>[,...]` gate; see the dump in
+/// `applicableExtension`. A numeric token selects a single candidate by
+/// `FuncId`; anything else selects every candidate considered for a call of
+/// that source name, which is what you want when comparing the overloads that
+/// compete at one site.
 fn extKeyTraceWanted(fid: ?FuncId) bool {
-    const f = fid orelse return false;
     const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") orelse return false);
     var it = std.mem.tokenizeScalar(u8, want, ',');
     while (it.next()) |tok| {
-        const n = std.fmt.parseInt(u32, tok, 10) catch continue;
-        if (n == f.int()) return true;
+        if (std.fmt.parseInt(u32, tok, 10)) |n| {
+            if (fid) |f| if (n == f.int()) return true;
+            continue;
+        } else |_| {}
+        const cn = trace_call_name orelse continue;
+        if (std.mem.eql(u8, tok, cn)) return true;
     }
     return false;
 }
@@ -1255,11 +1269,22 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     // that differs is the one that decides; reading it beats guessing which
     // term dominates.
     if (extKeyTraceWanted(sig.fid)) {
-        if (trace_call_span) |cs| {
-            std.debug.print("[extkey] f{d}:{d} fid={d} key={any} recv=", .{ cs.file.int(), cs.start, if (sig.fid) |f| f.int() else 0, key });
-        } else {
-            std.debug.print("[extkey] f?:? fid={d} key={any} recv=", .{ if (sig.fid) |f| f.int() else 0, key });
-        }
+        // Name the call site. A file/line beats a file id and byte offset,
+        // and the running program's source map is a global, so resolve
+        // through it when it is installed and fall back to the raw span when
+        // it is not (unit tests, pre-run lowering).
+        var loc_buf: [256]u8 = undefined;
+        const loc: []const u8 = if (trace_call_span) |cs| blk: {
+            if (span_mod.active_map) |m| {
+                if (m.getChecked(cs.file)) |sf| {
+                    const lc = sf.lineCol(cs.start);
+                    const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                    break :blk std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                }
+            }
+            break :blk std.fmt.bufPrint(&loc_buf, "f{d}:{d}", .{ cs.file.int(), cs.start }) catch "?";
+        } else "?:?";
+        std.debug.print("[extkey] {s} {s} fid={d} key={any} recv=", .{ loc, trace_call_name orelse "?", if (sig.fid) |f| f.int() else 0, key });
         if (recv) |r| {
             if (r.ty) |t| {
                 if (t.args.len > 0) std.debug.print("{s}<{s}>", .{ t.name, t.args[0].name }) else std.debug.print("{s}", .{t.name});

@@ -561,6 +561,10 @@ pub fn runTestFiles(
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    // Reachable during LOWERING, not just during the run: lowering-time
+    // diagnostics resolve a span to a file and line through this map, and
+    // `runTestsOnBuilt` re-installs it for the run itself.
+    span.active_map = &map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
@@ -868,6 +872,9 @@ fn runBuilt(
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    // See the note in the test path: the map is installed before lowering so
+    // lowering-time diagnostics can name a file and line.
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
     return runBuiltModule(gpa, built, bindings, map, no_main_msg);
 }
