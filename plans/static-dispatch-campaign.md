@@ -473,10 +473,43 @@ the bug, and it is the same family as the `StoreToThisOrGlobal` capture-slot gap
 fixed earlier: an implicit receiver that exists but that the runtime walk cannot
 reach.
 
-Next: work on `implicitCandidatesAlloc` directly — find why the outer instance
-is absent for an inner-class receiver and what the passing reductions supply
-that Recomposer does not. Building reductions upward has now cost five attempts
-and produced none; instrument the real failing run instead.
+**MECHANISM FOUND** — and it is not the inner class at all. Instrumenting the
+real run with `KLIO_CMG_TRACE=stateLock` shows what the walk's innermost
+candidate actually is:
+
+    [icand-append] stateLock tag=Instance class=JobImpl subject=false depth=0
+    [icand-append] stateLock tag=Instance class=Recomposer subject=false depth=0
+
+A `JobImpl`. The failing read is inside
+
+    private val effectJob = Job(effectCoroutineContext[Job]).apply {
+        invokeOnCompletion { … synchronized(stateLock) { … } … }
+    }
+
+Once the channel gives `Job(...)` a static type, `apply`'s receiver is known,
+the lambda body is spliced with that receiver bound, and the bare `stateLock`
+read inside it walks against the JOB. The enclosing `Recomposer` never enters
+the candidate list — hence `cands=1` — so the read falls through to the global
+and raises.
+
+The cause is in `implicitCandidatesAlloc`. Its own comment states the rule: "A
+supplied direct receiver is subject-like; it REPLACES, rather than precedes, the
+frame `this`." For an inline splice receiver that is wrong. Kotlin resolves a
+bare name against implicit receivers innermost-first and then keeps going
+outward, so the splice receiver must PRECEDE the frame's `this`, not replace it.
+
+That makes this the third instance of one family, exactly as predicted earlier
+in this document: an implicit receiver that exists and that the runtime walk
+cannot reach, after `StoreToThisOrGlobal`'s capture slot and
+`CallMemberOrGlobal`'s. The fix is the same shape — let the splice receiver be
+the innermost candidate while the frame's own `this` continues the chain behind
+it — and it is a change to the receiver walk, so it needs the full gate rather
+than a spot check.
+
+This also explains why five standalone reductions all passed: every one of them
+put the read in an inner class, which was never the trigger. The trigger is a
+bare name inside an inline receiver-lambda whose receiver is statically typed,
+referring to a member of the ENCLOSING class.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 
