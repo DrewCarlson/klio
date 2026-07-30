@@ -322,15 +322,20 @@ specific things, both measured:
       - The host-backed half is solved by (b)+(c): resolve the slot against the
         value's runtime type, fall back only when that target is bodyless. The
         Sequence tests pass under it.
-      - The interpreted half is a promotion bug. `dispatchForTarget` is
-        returning something too strong for an interface member that a subclass
-        overrides — `key` is declared on `CoroutineContext.Element` and
-        overridden below it. Check what `dispatchForTarget` answers for an
-        interface-declared member before touching the runtime arm again; a
-        `.direct` there would explain the result exactly.
+      - The interpreted half is a promotion bug, but NOT the obvious one.
+        `dispatchForTarget` mirrors the resolver's order — `!has_body` ->
+        virtual, `Private` -> direct, stub/value -> virtual, then
+        `!class.is_interface and …` -> direct, else virtual — so an
+        interface-declared member returns `.virtual`, never `.direct`. The
+        promotion is emitting a virtual slot, which is the correct FORM.
 
-    Verify that first. It is a one-line question and it decides whether the
-    interface work is a runtime change, a resolver change, or both.
+        So the bug is in the slot, not the form. `key` is a PROPERTY on
+        `CoroutineContext.Element`, and the promotion path is the member-CALL
+        gate; a property read reaching a method slot, or a slot rooted at the
+        interface declaration rather than at the override, would both produce
+        this. Dump the emitted slot and the selected target for `key` on a
+        `DerivedElementWithPolyKey` receiver before changing anything — the
+        `[vslot-unlinked]`/`KLIO_ERR_TRACE` machinery already prints both.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
