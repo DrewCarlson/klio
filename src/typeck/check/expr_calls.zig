@@ -1405,6 +1405,7 @@ pub fn inferCallReturnWithArgs(
         self.inference_session = .{
             .cs = constraints.ConstraintSystem.init(self.allocator),
             .depth = 0,
+            .all_vars = .empty,
         };
     }
     // Values are the inference-var `TypeParam`s handed back by
@@ -1427,6 +1428,11 @@ pub fn inferCallReturnWithArgs(
             session.cs.setPreference(fresh[0], .PullUp);
             try local_subst.put(name, fresh[1]);
             try vars.append(self.allocator, fresh[0]);
+            // The name slice is arena-owned by the constraint system, which
+            // outlives the session, so the list may borrow it.
+            if (fresh[1] == .TypeParam) {
+                try session.all_vars.append(self.allocator, .{ .unique = fresh[1].TypeParam, .v = fresh[0] });
+            }
         }
         // Map each argument to its parameter slot, honouring a trailing
         // lambda that binds to the last functional parameter past defaulted
@@ -1554,11 +1560,55 @@ pub fn inferCallReturnWithArgs(
     const session = &self.inference_session.?;
     session.depth -= 1;
     if (is_root) {
-        // The root closes the session after substitution.
+        // Refresh the recorded expression types with the solved variables
+        // before the session closes. A nested call recorded its result while
+        // its own vars were still in flight, so `listOf("a")` inside a larger
+        // expression sits in `self.types` as `List<TypeParam(T@…)>`. The
+        // eager channel reads that map, and a container whose argument is an
+        // unsolved placeholder is exactly the "arguments unknown" answer that
+        // makes the channel useless for generic receivers.
+        refreshRecordedTypes(self, session) catch {};
+        self.inference_session.?.all_vars.deinit(self.allocator);
         self.inference_session.?.cs.deinit();
         self.inference_session = null;
     }
     return returned;
+}
+
+/// Substitute every solved inference variable into the types already
+/// recorded for this session's expressions. Best-effort: a variable the
+/// solver could not pin is left alone, so a partially-solved call degrades
+/// to the same "unknown" answer it had before rather than to a wrong one.
+fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocator.Error!void {
+    if (session.all_vars.items.len == 0) return;
+    var staged = try session.cs.solveStaged();
+    defer staged.deinit();
+    var legacy = try session.cs.solve();
+    defer legacy.deinit();
+    var subst = std.StringHashMap(Type).init(self.allocator);
+    defer {
+        var vit = subst.valueIterator();
+        while (vit.next()) |t| t.deinit(self.allocator);
+        subst.deinit();
+    }
+    for (session.all_vars.items) |sv| {
+        const pick = staged.get(sv.v) orelse legacy.get(sv.v) orelse continue;
+        if (pick == .Nothing or pick == .Unresolved) continue;
+        if (subst.contains(sv.unique)) continue;
+        try subst.put(sv.unique, try pick.clone(self.allocator));
+    }
+    if (subst.count() == 0) return;
+    var it = self.types.iterator();
+    while (it.next()) |e| {
+        if (!typeMentionsTypeParam(e.value_ptr)) continue;
+        var replaced = helpers.substituteTypeParams(self.allocator, e.value_ptr, &subst) catch continue;
+        if (replaced.eql(e.value_ptr.*)) {
+            replaced.deinit(self.allocator);
+            continue;
+        }
+        e.value_ptr.deinit(self.allocator);
+        e.value_ptr.* = replaced;
+    }
 }
 
 /// Index of the parameter a trailing-lambda argument binds to, when the

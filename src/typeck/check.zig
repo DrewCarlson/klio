@@ -677,7 +677,20 @@ pub const InferenceSession = struct {
     cs: types.constraints.ConstraintSystem,
     /// True when a nested call is currently using the session.
     depth: u32,
+    /// Every inference variable created in this session, with the unique
+    /// `T@start-end` name the recorded expression types carry.
+    ///
+    /// A nested call substitutes its signature with its OWN fresh vars and
+    /// returns before the root solves, so the type recorded for
+    /// `listOf("a")` inside a larger expression is `List<TypeParam(T@…)>` —
+    /// a container whose argument is an unsolved placeholder. The root has
+    /// the solution for those same vars (they live in one constraint
+    /// system); this list is what lets it go back and replace them, so the
+    /// recorded types describe real types rather than in-flight ones.
+    all_vars: std.ArrayList(SessionVar),
 };
+
+pub const SessionVar = struct { unique: []const u8, v: types.constraints.InferenceVar };
 
 /// Description of a user-declared `typealias`.
 pub const TypeAliasInfo = struct {
