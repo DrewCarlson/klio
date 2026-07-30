@@ -329,11 +329,20 @@ failed:
 
 The nested class is NOT the cause on its own — a standalone file with exactly
 that class (including `Clock.System.now()`, an `override fun now()`, and a
-defaulted-parameter method) compiles and passes. So the trigger is in
-`testV7GenerateUnordered`'s body, and the first thing to check is
-`Uuid.generateV7NonMonotonicAt(...)` and `Instant.fromEpochMilliseconds(...)`:
-an unresolved MEMBER there poisoning whole-file resolution would explain why
-`assertEquals` reports unresolved in every other test.
+defaulted-parameter method) compiles and passes.
+
+`Uuid.generateV7NonMonotonicAt` is not the cause either: it is declared with a
+full body at `Uuid.kt:725` (`@SinceKotlin("2.3") @ExperimentalUuidApi public fun
+generateV7NonMonotonicAt(timestamp: Instant): Uuid`), so it is implemented, not a
+bodyless expect. The zero hits in `kotlin-klio/kotlin-uuid/UuidActuals.kt` mean
+only that it needs no klio actual.
+
+So the trigger is somewhere else in `testV7GenerateUnordered`'s 20-line body. The
+remaining untested constructs there are `uuid.toLongs { msb, _ -> … }` (a lambda
+with an unused destructured-style parameter, called for its side effect inside an
+assertion), `assertNotEquals` on two `Uuid` values, and the string templates
+embedding `uuid.toHexDashString()`. Bisect THAT function line by line — the range
+is small enough now that guessing is no longer cheaper than cutting.
 
 Older text, kept because its exclusions are still valid:
 
