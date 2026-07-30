@@ -575,6 +575,28 @@ pub const TypedSupertype = struct {
 };
 
 /// Description of a user-declared class.
+/// Register a class under its simple name, recording a collision instead of
+/// overwriting. See `ambiguous_class_names`.
+pub fn putClassChecked(self: anytype, name: []const u8, info: ClassInfo, decl_file: ?FileId) !void {
+    if (self.classes.getPtr(name)) |existing| {
+        const same = if (existing.decl_file) |ef|
+            (if (decl_file) |nf| ef.int() == nf.int() else false)
+        else
+            decl_file == null;
+        if (!same) {
+            try self.ambiguous_class_names.put(name, {});
+        }
+    }
+    try self.classes.put(name, info);
+}
+
+/// The class registered under `name`, or null when the simple name is
+/// ambiguous across packages.
+pub fn classNamed(self: anytype, name: []const u8) ?ClassInfo {
+    if (self.ambiguous_class_names.contains(name)) return null;
+    return self.classes.get(name);
+}
+
 pub const ClassInfo = struct {
     /// Has any secondary constructor — we then relax primary-ctor arity
     /// checks to avoid false positives.
@@ -655,7 +677,20 @@ pub const InferenceSession = struct {
     cs: types.constraints.ConstraintSystem,
     /// True when a nested call is currently using the session.
     depth: u32,
+    /// Every inference variable created in this session, with the unique
+    /// `T@start-end` name the recorded expression types carry.
+    ///
+    /// A nested call substitutes its signature with its OWN fresh vars and
+    /// returns before the root solves, so the type recorded for
+    /// `listOf("a")` inside a larger expression is `List<TypeParam(T@…)>` —
+    /// a container whose argument is an unsolved placeholder. The root has
+    /// the solution for those same vars (they live in one constraint
+    /// system); this list is what lets it go back and replace them, so the
+    /// recorded types describe real types rather than in-flight ones.
+    all_vars: std.ArrayList(SessionVar),
 };
+
+pub const SessionVar = struct { unique: []const u8, v: types.constraints.InferenceVar };
 
 /// Description of a user-declared `typealias`.
 pub const TypeAliasInfo = struct {
@@ -727,10 +762,24 @@ pub const Checker = struct {
     /// User-declared extension functions keyed by the receiver type's simple
     /// name.
     extensions: std.StringHashMap(std.ArrayList(ExtensionSig)),
+    /// Every name declared as an EXTENSION function, on any receiver. A bare
+    /// call inside an extension body has that receiver in scope, so a
+    /// same-named extension on it out-ranks a top-level declaration —
+    /// evidence the flat name registry cannot see. Names in this set stay out
+    /// of the eager call channel.
+    extension_fn_names: std.StringHashMap(void),
     /// Extension properties keyed by simple receiver-type name.
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
     /// File-level user classes.
     classes: std.StringHashMap(ClassInfo),
+    /// Simple names declared by MORE THAN ONE class. `classes` is keyed by
+    /// simple name, so two same-named classes in different packages would
+    /// otherwise silently overwrite each other and every lookup would answer
+    /// with whichever registered last. A wrong answer is worse than none —
+    /// it feeds the eager evidence channel and can disprove valid candidates
+    /// downstream — so an ambiguous name answers nothing until typeck
+    /// resolves classes per package.
+    ambiguous_class_names: std.StringHashMap(void),
     /// Name of the enclosing class while we type-check a class body.
     class_stack: std.ArrayList([]const u8),
     /// Enclosing function's declared/inferred return type for `return`.

@@ -252,7 +252,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
         .Class => |*c| {
             var info = try decl_mod.classInfo(self, c);
             info.is_local_or_anonymous = true;
-            try self.classes.put(c.name.name, info);
+            try root.putClassChecked(self, c.name.name, info, c.name.span.file);
             try decl_mod.checkClass(self, c);
         },
         .Object => |*o| {
@@ -261,7 +261,7 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
             info.is_local_or_anonymous = true;
             info.decl_file = o.name.span.file;
             try decl_mod.collectMembers(self, o.members, &info);
-            try self.classes.put(o.name.name, info);
+            try root.putClassChecked(self, o.name.name, info, o.name.span.file);
             try decl_mod.checkObject(self, o);
         },
         .TypeAlias => {},
@@ -1185,7 +1185,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             // anonymous objects.
             for (oe.supertypes) |*s| {
                 const pname = s.name.name;
-                const parent = self.classes.get(pname) orelse continue;
+                const parent = root.classNamed(self, pname) orelse continue;
                 if (parent.is_sealed) {
                     const msg = try std.fmt.allocPrint(
                         a,
@@ -1362,7 +1362,7 @@ pub fn lookupMemberEbf(
         if (steps > 64) break;
         steps += 1;
         if ((try seen.getOrPut(c)).found_existing) continue;
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         if (info.member_ebf.get(name)) |hit| {
             return .{ .decl_class = c, .ebf = hit };
         }
@@ -1402,7 +1402,7 @@ pub fn lookupExtensionProperty(
         while (frontier.pop()) |cn| {
             if (steps > 64) break;
             steps += 1;
-            const info = self.classes.get(cn) orelse continue;
+            const info = root.classNamed(self, cn) orelse continue;
             for (info.supertypes.items) |s| {
                 if (!(try seen.getOrPut(s)).found_existing) {
                     try keys.append(a, s);
@@ -1469,7 +1469,7 @@ pub fn lookupExtension(
     while (frontier.pop()) |c| {
         if (steps > 64) break;
         steps += 1;
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         for (info.supertypes.items) |s| {
             if (!(try seen.getOrPut(s)).found_existing) {
                 try keys.append(a, s);
@@ -1526,7 +1526,7 @@ pub fn lookupExtensionCandidates(
     while (frontier.pop()) |c| {
         if (steps > 64) break;
         steps += 1;
-        const info = self.classes.get(c) orelse continue;
+        const info = root.classNamed(self, c) orelse continue;
         for (info.supertypes.items) |s| {
             if (!(try seen.getOrPut(s)).found_existing) {
                 try keys.append(a, s);
@@ -1538,7 +1538,7 @@ pub fn lookupExtensionCandidates(
     // Member methods declared on the receiver's class chain come first:
     // Kotlin gives members precedence over extensions.
     for (keys.items) |key| {
-        const info = self.classes.get(key) orelse continue;
+        const info = root.classNamed(self, key) orelse continue;
         const sigs = info.member_methods.get(name) orelse continue;
         for (sigs.items) |sig| {
             if (!extensionArityFits(&sig, n_args)) continue;

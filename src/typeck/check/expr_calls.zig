@@ -193,7 +193,7 @@ pub fn checkCall(
             try putListElem(self, call_span, elem);
             return .Unresolved;
         }
-        if (self.classes.get(name)) |cls| {
+        if (root.classNamed(self, name)) |cls| {
             try visibility.checkClassUseVisibility(self, name, &cls, callee_span);
             if (cls.has_secondary_ctors) {
                 // Multiple constructor arities exist; the interp picks the
@@ -631,7 +631,7 @@ fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8)
         if (sl >= seen.len) break;
         seen[sl] = cn;
         sl += 1;
-        const info = self.classes.get(cn) orelse continue;
+        const info = root.classNamed(self, cn) orelse continue;
         if (info.member_sigs.contains(name)) return true;
         for (info.supertypes.items) |sup| {
             if (fl >= frontier.len) break;
@@ -642,11 +642,55 @@ fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8)
     return false;
 }
 
+/// Whether any parameter or the return type of `sig` is (or contains) a
+/// type parameter — i.e. the signature was matched against something the
+/// checker could not pin to a concrete type.
+fn typeMentionsTypeParam(t: *const Type) bool {
+    return switch (t.*) {
+        .TypeParam => true,
+        .Nullable => |inner| typeMentionsTypeParam(inner),
+        .Generic => |g| blk: {
+            for (g.args) |*a| {
+                if (!a.is_star and typeMentionsTypeParam(&a.ty)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Function => |f| blk: {
+            for (f.params) |*p| if (typeMentionsTypeParam(p)) break :blk true;
+            break :blk typeMentionsTypeParam(f.return_type);
+        },
+        else => false,
+    };
+}
+
+fn sigMentionsTypeParam(sig: *const FnSig) bool {
+    for (sig.params) |*p| if (typeMentionsTypeParam(p)) return true;
+    return typeMentionsTypeParam(&sig.return_ty);
+}
+
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
     // A vararg overload family needs the engine's packing logic to pick
     // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
     // vararg picks stay out of the channel.
     for (sig.is_vararg) |v| if (v) return;
+    // A pick made against a TYPE PARAMETER is a guess, not a resolution.
+    // `listOf(a, b).minOrNull()` where `a: T` (`T : Comparable<T>`) has two
+    // live candidates — the total-order `Iterable<T>.minOrNull()` and the
+    // IEEE `Iterable<Double>.minOrNull()` — and only the runtime element
+    // values decide. Recording either one binds the call statically and the
+    // wrong choice silently changes the answer (NaN instead of 0.0). The
+    // runtime's own dispatch gets these right, so the channel stays out of
+    // it, exactly as it does for an ambiguous simple class name.
+    if (sigMentionsTypeParam(sig)) return;
+    // Extension-shadow gate. A bare call inside an extension body has that
+    // extension's receiver in scope, so a same-named EXTENSION on it
+    // out-ranks the top-level declaration this registry would answer with.
+    // `fun MockViewValidator.Text(...)` beats the composable `Text` for a
+    // bare `Text(...)` written inside `fun MockViewValidator.Point(...)`;
+    // binding the composable there reaches the composer with no applier.
+    // The member-shadow walk below covers members only, and an extension is
+    // not a member, so the name is declined outright.
+    if (self.extension_fn_names.contains(record_name)) return;
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing
@@ -1119,7 +1163,7 @@ fn argClassName(self: *Checker, args: []const Expr, arg_tys: []const Type, i: us
 /// Name-level subtype walk over the collected class table.
 fn classIsSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) return true;
-    const info = self.classes.get(sub) orelse return false;
+    const info = root.classNamed(self, sub) orelse return false;
     var steps: usize = 0;
     for (info.supertypes.items) |s| {
         if (steps > 64) break;
@@ -1361,6 +1405,7 @@ pub fn inferCallReturnWithArgs(
         self.inference_session = .{
             .cs = constraints.ConstraintSystem.init(self.allocator),
             .depth = 0,
+            .all_vars = .empty,
         };
     }
     // Values are the inference-var `TypeParam`s handed back by
@@ -1383,6 +1428,11 @@ pub fn inferCallReturnWithArgs(
             session.cs.setPreference(fresh[0], .PullUp);
             try local_subst.put(name, fresh[1]);
             try vars.append(self.allocator, fresh[0]);
+            // The name slice is arena-owned by the constraint system, which
+            // outlives the session, so the list may borrow it.
+            if (fresh[1] == .TypeParam) {
+                try session.all_vars.append(self.allocator, .{ .unique = fresh[1].TypeParam, .v = fresh[0] });
+            }
         }
         // Map each argument to its parameter slot, honouring a trailing
         // lambda that binds to the last functional parameter past defaulted
@@ -1510,11 +1560,55 @@ pub fn inferCallReturnWithArgs(
     const session = &self.inference_session.?;
     session.depth -= 1;
     if (is_root) {
-        // The root closes the session after substitution.
+        // Refresh the recorded expression types with the solved variables
+        // before the session closes. A nested call recorded its result while
+        // its own vars were still in flight, so `listOf("a")` inside a larger
+        // expression sits in `self.types` as `List<TypeParam(T@…)>`. The
+        // eager channel reads that map, and a container whose argument is an
+        // unsolved placeholder is exactly the "arguments unknown" answer that
+        // makes the channel useless for generic receivers.
+        refreshRecordedTypes(self, session) catch {};
+        self.inference_session.?.all_vars.deinit(self.allocator);
         self.inference_session.?.cs.deinit();
         self.inference_session = null;
     }
     return returned;
+}
+
+/// Substitute every solved inference variable into the types already
+/// recorded for this session's expressions. Best-effort: a variable the
+/// solver could not pin is left alone, so a partially-solved call degrades
+/// to the same "unknown" answer it had before rather than to a wrong one.
+fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocator.Error!void {
+    if (session.all_vars.items.len == 0) return;
+    var staged = try session.cs.solveStaged();
+    defer staged.deinit();
+    var legacy = try session.cs.solve();
+    defer legacy.deinit();
+    var subst = std.StringHashMap(Type).init(self.allocator);
+    defer {
+        var vit = subst.valueIterator();
+        while (vit.next()) |t| t.deinit(self.allocator);
+        subst.deinit();
+    }
+    for (session.all_vars.items) |sv| {
+        const pick = staged.get(sv.v) orelse legacy.get(sv.v) orelse continue;
+        if (pick == .Nothing or pick == .Unresolved) continue;
+        if (subst.contains(sv.unique)) continue;
+        try subst.put(sv.unique, try pick.clone(self.allocator));
+    }
+    if (subst.count() == 0) return;
+    var it = self.types.iterator();
+    while (it.next()) |e| {
+        if (!typeMentionsTypeParam(e.value_ptr)) continue;
+        var replaced = helpers.substituteTypeParams(self.allocator, e.value_ptr, &subst) catch continue;
+        if (replaced.eql(e.value_ptr.*)) {
+            replaced.deinit(self.allocator);
+            continue;
+        }
+        e.value_ptr.deinit(self.allocator);
+        e.value_ptr.* = replaced;
+    }
 }
 
 /// Index of the parameter a trailing-lambda argument binds to, when the
@@ -1692,7 +1786,7 @@ pub fn checkUserOperatorKeyword(
         if ((try visited.getOrPut(name)).found_existing) {
             continue;
         }
-        const info = self.classes.get(name) orelse continue;
+        const info = root.classNamed(self, name) orelse continue;
         if (info.member_flags.get(op_name)) |flags| {
             if (flags.is_operator) {
                 return;

@@ -761,6 +761,37 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     return null;
 }
 
+/// Source position of the extension call currently being scored. DIAGNOSTIC
+/// ONLY — never read by scoring, and written only while `KLIO_EXTKEY_TRACE` is
+/// set. It lives here rather than on `ApplicabilityScope` because that struct
+/// is scored on the RUNTIME dispatch path, where widening it by a `?Span`
+/// costs real time for a field that is dead in every non-tracing run.
+///
+/// Without a span an `[extkey]` row cannot be tied to a source line, and
+/// several calls in one file can share a receiver/argument type shape, so the
+/// rows are unattributable. That gap is what stalled the
+/// `plusCollectionInference` diagnosis.
+pub threadlocal var trace_call_span: ?ir.Span = null;
+
+/// Whether any `[extkey]` tracing is requested at all. Callers use this to
+/// skip maintaining `trace_call_span` on the normal path.
+pub fn extKeyTraceEnabled() bool {
+    return std.c.getenv("KLIO_EXTKEY_TRACE") != null;
+}
+
+/// `KLIO_EXTKEY_TRACE=<fid>[,<fid>...]` gate; see the dump in
+/// `applicableExtension`.
+fn extKeyTraceWanted(fid: ?FuncId) bool {
+    const f = fid orelse return false;
+    const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") orelse return false);
+    var it = std.mem.tokenizeScalar(u8, want, ',');
+    while (it.next()) |tok| {
+        const n = std.fmt.parseInt(u32, tok, 10) catch continue;
+        if (n == f.int()) return true;
+    }
+    return false;
+}
+
 fn argIsProven(arg: *const ArgShape) bool {
     return arg.runtime_class != null or arg.ty != null;
 }
@@ -1219,6 +1250,31 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     };
 
     const key: [8]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+    // `KLIO_EXTKEY_TRACE=<fid>,<fid>` — dump the eight-element ranking key for
+    // the named candidates. Ranking is lexicographic, so the first component
+    // that differs is the one that decides; reading it beats guessing which
+    // term dominates.
+    if (extKeyTraceWanted(sig.fid)) {
+        if (trace_call_span) |cs| {
+            std.debug.print("[extkey] f{d}:{d} fid={d} key={any} recv=", .{ cs.file.int(), cs.start, if (sig.fid) |f| f.int() else 0, key });
+        } else {
+            std.debug.print("[extkey] f?:? fid={d} key={any} recv=", .{ if (sig.fid) |f| f.int() else 0, key });
+        }
+        if (recv) |r| {
+            if (r.ty) |t| {
+                if (t.args.len > 0) std.debug.print("{s}<{s}>", .{ t.name, t.args[0].name }) else std.debug.print("{s}", .{t.name});
+            } else std.debug.print("?", .{});
+        } else std.debug.print("-", .{});
+        std.debug.print(" args=", .{});
+        for (args) |*aa| {
+            if (aa.ty) |t| {
+                if (t.args.len > 0) std.debug.print("{s}<{s}> ", .{ t.name, t.args[0].name }) else std.debug.print("{s} ", .{t.name});
+            } else std.debug.print("? ", .{});
+        }
+        std.debug.print("| params=", .{});
+        for (params) |*pp| std.debug.print("{s} ", .{pp.ty.name});
+        std.debug.print("\n", .{});
+    }
     return .{
         .points = score,
         .proven_args = proven,

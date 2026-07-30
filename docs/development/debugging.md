@@ -60,6 +60,9 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SAM_TRACE` | set | Implicit-receiver candidate walk and member-arm dispatch shapes | `[sam-walk]`, `[sam-direct]`, `[sam-arm]`, `[marm]` |
 | `KLIO_EF_TRACE` | `<name>` | Emit-form / member-shadowability decision for a named call (inline target chosen, shadowable routing, receiver-context flags) | `[ef]`, `[tbie]`, `[efset]` |
 | `KLIO_INLINE_PICK` | `<name>` | Inline-overload candidate set (receiver type, owner class, file) plus the receiver chain head | `[ipick]` |
+| `KLIO_EXTKEY_TRACE` | `<fid>[,<fid>]` | The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided | `[extkey]` |
+| `KLIO_ARGTY_TRACE` | `<identifier>` | The static type lowering actually used for that named expression, and whether it came from an inline splice's declared parameter type. Separates "no type" from "wrong type", which look identical from a failing test | `[argty]` |
+| `KLIO_SPLICE_TRACE` | `<function name>` | Whether a named `inline fun` reaches the splice path, and which parameter types the splice binds | `[splice]` |
 | `KLIO_LEAF_TRACE` | `<substring of a function name>` | Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf) | `[leaf]` |
 | `KLIO_SBC_TRACE` | set | Constructor-vs-member routing inputs for each capitalized bare call | `[sbc]` |
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |
@@ -81,7 +84,14 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 KLIO_BARE_TRACE=format KLIO_MISS_TRACE=format ./zig-out/bin/klio run repro.kt
 ```
 
-## Resolution audits and eager mode
+## Resolution audits and the eager front end
+
+The resolver + type checker always run ahead of lowering; their overload
+picks and type heads feed it. There is no switch — `KLIO_EAGER` was removed
+once validation was identical with and without the evidence. A
+resolver/typeck failure still falls back to AST evidence alone, so a program
+that defeats the front end runs.
+
 
 The audit switches emit machine-readable divergence records the
 sweep scripts grep; see
@@ -90,7 +100,6 @@ sweep scripts grep; see
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_EAGER` | set | Runs resolver + type checker ahead of lowering; their overload picks and type heads feed lowering. Falls back to lazy on any failure | none |
 | `KLIO_EAGER_AUDIT` | set | Eager-pipeline bookkeeping (skip reasons, record counts) and eager-vs-lazy pick disagreements | `[EAGER]`, `[EAGER-AUDIT]` |
 | `KLIO_EAGER_HITS` | set | Per-call eager record/probe/hit/miss logging (high volume) | `[EAGER-REC]`, `[REC-MSC]`, `[EAGER-PROBE]`, `[EAGER-HIT]`, `[EAGER-MISS2]` |
 | `KLIO_RESOLVE_AUDIT` | set (any value, even `0`, enables) | One record per bare call / inline target / value ref comparing the symbol index against the order-based heuristic, with a divergence grade | `[KLIO_RESOLVE_AUDIT]` |
@@ -100,9 +109,10 @@ sweep scripts grep; see
 | `KLIO_RECVHEAD_AUDIT` | set | Whether the type checker's recorded receiver-lambda head can answer the membership walk | `[RECVHEAD-AUDIT]` |
 | `KLIO_TYPEHEAD_AUDIT` | set | The type checker's per-argument type head vs the AST-derived declared type (fills and disagreements) | `[TYPEHEAD-FILL]`, `[TYPEHEAD-AUDIT]` |
 
-`scripts/commontest-sweep.py --eager both` drives `KLIO_EAGER` for
-you: it runs the corpus with the variable unset and set to `1` and
-reports any divergence between the two modes.
+`scripts/commontest-sweep.py` accepts `--eager` for compatibility and
+ignores it: there is only one pipeline, so `both` just runs the corpus
+twice and reports any run-to-run divergence (useful for catching
+nondeterminism, not modes).
 
 ## Errors, throws, and hangs
 
