@@ -458,11 +458,24 @@ specific things, both measured:
         matching the assertion exactly.
 
         Check that next: trace what `this.key` lowers to inside
-        `CoroutineContext.Element.minusKey` with and without the promotion. Note
-        an earlier `KLIO_EMIT_TRACE=key` run showed nothing, but that trace only
-        covers `Call`/`CallVirtual`/`CallMember` — a property read lowers to
-        `GetField`, which it does not report. Extend the trace before concluding
-        anything from its silence.
+        `CoroutineContext.Element.minusKey` with and without the promotion.
+
+        TWO TRAPS make `KLIO_EMIT_TRACE` unreliable for this, and both have
+        already produced a wrong conclusion in this campaign:
+
+        1. It covers `Call`/`CallVirtual`/`CallMember` only. A property read
+           lowers to `GetField`, which it does not report. Extending it to
+           `GetField` is a few lines and was verified to work.
+        2. **It only reports on a COLD run.** The second invocation of the same
+           file emitted ZERO rows where the first emitted hundreds, because the
+           module came from the image cache and no lowering happened at all.
+
+        Trap 2 retroactively invalidates the earlier inference that "`key` is
+        never statically bound" — that run may simply have been warm. Any
+        conclusion drawn from this trace's SILENCE is worthless unless the cache
+        was cleared first. Clear it between runs, and confirm the trace produces
+        rows for a known-bound name in the same run before reading anything into
+        an absence.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
