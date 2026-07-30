@@ -11580,6 +11580,118 @@ fn lmNote(comptime r: LmReason) void {
     lm_sites[@intFromEnum(r)] += 1;
 }
 
+/// Breakdown of the `no_receiver_type` bucket by the SHAPE of the receiver
+/// expression, indexed by its `ast.Expr` tag. The bucket is ~73% of all member
+/// call sites, so "lowering has no receiver type" is the whole static-dispatch
+/// problem; which expressions those are decides whether the fix belongs in
+/// typeck's inference, in an AST probe lowering is not consulting, or nowhere.
+pub var lm_norecv: [@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len]u64 = @splat(0);
+
+/// Whether the `no_receiver_type` breakdown is being collected. Classifying a
+/// site walks same-named declarations, which is real lowering-time work, so it
+/// happens only when the census is asked for. Resolved once per process.
+var norecv_census: ?bool = null;
+fn norecvCensusOn() bool {
+    if (norecv_census) |v| return v;
+    const v = runtime.getenvSlice("KLIO_DISPATCH_STATS") != null;
+    norecv_census = v;
+    return v;
+}
+
+/// Of the `no_receiver_type` sites, how many typeck DID record a type head for
+/// (it is simply not consulted for the receiver position) versus how many it
+/// has no answer for at all.
+pub var lm_norecv_eager: [2]u64 = @splat(0);
+
+/// Sub-census of the `Path` shape (the largest `no_receiver_type` bucket):
+/// what KIND of name the untyped receiver is, which decides where the missing
+/// type has to come from.
+pub const NoRecvPath = enum(u8) {
+    /// A live local/parameter register whose declared type was never recorded.
+    local_no_decl_type,
+    /// A captured name from an enclosing scope.
+    captured,
+    /// A bare read of an enclosing class's property; the type is on the class.
+    enclosing_member,
+    /// Neither local, capture, nor member: a top-level property or unknown.
+    unknown,
+};
+pub var lm_norecv_path: [4]u64 = @splat(0);
+
+/// Of the locals with no recorded declared type, whether an initializer
+/// expression was recorded for the name at all. No initializer means the
+/// binding form never registered one (loop variable, lambda parameter,
+/// destructured component, catch parameter); an initializer that still yields
+/// no type means the initializer's own type is unknown.
+pub const NoRecvInit = enum(u8) { no_init_recorded, init_yields_no_type };
+pub var lm_norecv_init: [2]u64 = @splat(0);
+
+/// Why a `Call` initializer yields no type. `argDeclTypeRefLazy` has channels
+/// for a local function, a function-typed parameter, and a constructor, but
+/// none for a module-level function's DECLARED return type, so this measures
+/// what such a channel would be worth and how often it could not be trusted.
+pub const NoRecvCall = enum(u8) {
+    /// Callee is not a plain single-name call (a member or complex callee).
+    not_simple_callee,
+    /// No function of that name is known.
+    no_func,
+    /// Several same-named functions disagree on their return type.
+    ambiguous_return,
+    /// Unique concrete declared return type: a channel would answer here.
+    unique_concrete,
+    /// Unique, but the return type names nothing resolvable to a class — a
+    /// type parameter or an unknown head, which the declaration alone does not
+    /// fix.
+    unique_unresolvable,
+};
+pub var lm_norecv_call: [5]u64 = @splat(0);
+
+/// Classify a `Call` expression against the strict condition a return-type
+/// channel would need: the name must identify one function whose declared
+/// return type is not one of its own type parameters.
+fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
+    if (e.* != .Call) return .not_simple_callee;
+    const callee = e.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return .not_simple_callee;
+    const nm = callee.Path.segments[0].name;
+    const fids = b.module.funcsBySimpleName(nm);
+    if (fids.len == 0) return .no_func;
+    var seen: ?ir.TypeRef = null;
+    for (fids) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind != .plain) continue;
+        if (seen) |prev| {
+            if (!std.mem.eql(u8, prev.name, f.return_ty.name)) return .ambiguous_return;
+        } else seen = f.return_ty;
+    }
+    const ret = seen orelse return .no_func;
+    return if (staticTypeClassId(b, ret) != null) .unique_concrete else .unique_unresolvable;
+}
+
+pub fn lowerNoRecvDump() void {
+    var total: u64 = 0;
+    for (lm_norecv) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[no-recv] total={d}\n", .{total});
+    inline for (@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields) |f| {
+        const n = lm_norecv[f.value];
+        if (n != 0) std.debug.print("[no-recv] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+    std.debug.print("[no-recv] eager-has-head={d} eager-no-head={d}\n", .{ lm_norecv_eager[0], lm_norecv_eager[1] });
+    inline for (@typeInfo(NoRecvPath).@"enum".fields) |f| {
+        const n = lm_norecv_path[f.value];
+        if (n != 0) std.debug.print("[no-recv-path] {d:>10}  {s}\n", .{ n, f.name });
+    }
+    inline for (@typeInfo(NoRecvInit).@"enum".fields) |f| {
+        const n = lm_norecv_init[f.value];
+        if (n != 0) std.debug.print("[no-recv-init] {d:>10}  {s}\n", .{ n, f.name });
+    }
+    inline for (@typeInfo(NoRecvCall).@"enum".fields) |f| {
+        const n = lm_norecv_call[f.value];
+        if (n != 0) std.debug.print("[no-recv-call] {d:>10}  {s}\n", .{ n, f.name });
+    }
+}
+
 /// Report the static member-call gate's per-site coverage. Called at the end
 /// of a run alongside the executed-dispatch census.
 pub fn lowerSitesDump() void {
@@ -11610,6 +11722,28 @@ fn lowerResolvedMemberCall(
             }
         }
         lmNote(.no_receiver_type);
+        if (!norecvCensusOn()) return .none;
+        lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
+        lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
+        if (receiver.* == .Call) lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+        if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+            const rn = receiver.Path.segments[0].name;
+            const which: NoRecvPath = if (b.resolve(rn) != null)
+                .local_no_decl_type
+            else if (b.knowsOuter(rn))
+                .captured
+            else if (enclosingHasMemberNamed(b, rn))
+                .enclosing_member
+            else
+                .unknown;
+            lm_norecv_path[@intFromEnum(which)] += 1;
+            if (which == .local_no_decl_type) {
+                if (b.localInitExpr(rn)) |ini| {
+                    lm_norecv_init[1] += 1;
+                    lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
+                } else lm_norecv_init[0] += 1;
+            }
+        }
         return .none;
     };
     if (ty.nullable) {

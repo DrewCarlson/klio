@@ -229,6 +229,74 @@ get `plusCollectionInference` / `countEach` right as the first two
 regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
+### Measured: what is actually missing is a call's return type
+
+The widening argument above ends at "typeck's generic inference is the
+bottleneck." That was inferred from the widening's own audit. Measuring the
+`no_receiver_type` bucket directly gives a different and much more actionable
+answer, and it does not implicate generic inference at all.
+
+Census on the collections/comparisons file set (`KLIO_DISPATCH_STATS`, the
+`[no-recv]` / `[no-recv-path]` / `[no-recv-init]` / `[no-recv-call]` tags):
+
+    [lower-sites] total=6958   bound_static 150 (2.16%)  bound_virtual 6 (0.09%)
+                               no_receiver_type 5091 (73.17%)
+
+    receiver SHAPE of the untyped sites (total 6720)
+        4317  64.24%  Path          <- a plain name
+        1709  25.43%  Call          <- a call result
+         286   4.26%  Binary
+         256   3.81%  Member
+        (Index/Unary/Postfix/This/ObjectExpr all under 1.5%)
+        eager-has-head=1110  eager-no-head=5610
+
+    what KIND of name the Path receivers are
+        3513  local_no_decl_type   <- a LIVE local whose type was never recorded
+         356  unknown
+         283  captured
+         161  enclosing_member
+
+    of those 3513 locals
+        2499  init_yields_no_type
+        1014  no_init_recorded     <- loop var, lambda param, destructured, catch
+
+So 3513 of 6720 untyped receivers (52%) are locals that lowering has in scope
+and simply has no type for, and 2499 of those have an initializer whose type
+it cannot derive. Classifying every call in that position (the 2499
+initializers plus the 1709 direct `Call` receivers) against the strict
+condition "does one declaration fix the return type":
+
+         715  unique_concrete      <- a declaration-backed answer exists
+        1237  ambiguous_return     <- same-named declarations disagree
+         770  no_func
+        1476  not_simple_callee    <- `x.foo()`, needs its own receiver first
+          10  unique_unresolvable
+
+`argDeclTypeRefLazy` has channels for a LOCAL function's return type, a
+function-typed parameter, and a constructor call. It has NO channel for an
+ordinary function's declared return type. That is the gap: 715 sites where the
+answer is written in the declaration and nothing asks for it, and 1237 more
+where the answer exists once the call is resolved against its argument shapes,
+which the module resolver already knows how to do.
+
+This reframes Phase 1. The rule to implement is:
+
+**a call expression's static type is the declared return type of the
+declaration the call resolves to.**
+
+That is ordinary Kotlin resolution, not generic inference. It needs no
+instantiation-specific evidence, so it does not touch the
+identity-by-position hazard that blocks the type-head widening, and it is
+what unblocks the `not_simple_callee` sites too: once a local's type is
+known, `x.foo()` has a receiver type and can resolve, whose return type types
+the next local, and so on. The buckets feed each other.
+
+Sequencing note: implement it through the FQN-aware resolution path. The
+census above counts candidates with `funcsBySimpleName`, a SIMPLE-NAME map,
+which is exactly the trap that has produced repeated wrong answers in this
+codebase; it is acceptable for bounding an opportunity and unacceptable for
+deciding a binding.
+
 ### Why re-widening is blocked (superseded theory below — read this first)
 
 Ruled out by experiment: it is NOT instantiation-dependent recordings.
