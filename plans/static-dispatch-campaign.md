@@ -267,9 +267,25 @@ Ruled out so far, so the next attempt does not repeat them:
     `stdlib_sources.zig`, along with `ExperimentalUuidApi.kt` and a
     `kotlin-uuid/UuidActuals.kt`.
 
-All 21 tests in the file fail, not a subset, which points at the whole file
-failing to resolve rather than at any individual case. No lowering diagnostic is
-printed. Start by finding out whether the file lowers at all.
+All 21 tests in the file fail, not a subset. The file DOES lower — the runner
+discovers all 21 `@Test` functions — so it is the bodies that fail, and the
+error is reported against the bare call.
+
+The first failing call is the simplest overload in the file:
+
+    assertEquals(uuidString, Uuid.fromLongs(msb.toLong(), lsb.toLong()).toString())
+
+`String` against `String`. So this is not overload selection. Something makes
+the whole body's bare calls unresolvable, and the most likely candidate is a
+preceding symbol the body depends on: the file's `mostSignificantBits` /
+`leastSignificantBits` constants are ULong, and unsigned types are HOST
+PRIMITIVES with no IR class (see the unsigned entry in the inventory —
+`UInt.kt` is not in `stdlib_sources.zig` and every unsigned head is in
+`staticBuiltinConcrete`). A ULong-typed property whose type never resolves would
+plausibly poison resolution for the declarations around it.
+
+That is a hypothesis, not a finding. Test it by checking whether the ULong
+constants resolve before assuming anything about `assertEquals`.
 
 Anyone gating on the sweep should treat these as a known baseline failure until
 diagnosed, and should NOT attribute them to a dispatch change without bisecting
