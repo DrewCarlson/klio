@@ -518,12 +518,31 @@ enclosing class receiver is dropped when a receiver-lambda is entered, so no
 ordering change in `implicitCandidatesAlloc` can help: the Recomposer is not in
 its input.
 
-The fix belongs wherever enclosing entries are pushed for a receiver lambda:
-entering one must APPEND its receiver to the enclosing chain, not replace it.
-That is the same shape as the two already fixed in this campaign
-(`StoreToThisOrGlobal`'s capture slot, `CallMemberOrGlobal`'s), and it is the
-last known thing standing between the return-type channel and a green compose
-run — the channel's stdlib sweep is already clean.
+The chain entries are not replaced — `pushEnclosing` APPENDS, so the chain
+accumulates correctly. The entry is simply never made. `captureChainAlloc`
+snapshots the chain when a lambda is created, and at the moment
+`invokeOnCompletion { … }` is created inside `Job(...).apply { … }` in
+`Recomposer`'s property initializer, the chain holds only the JobImpl the
+`apply` splice pushed. The Recomposer was never pushed.
+
+The precedent for the fix is in the same file. `host_instances.zig:3228` runs a
+class DELEGATE thunk and does exactly the right thing:
+
+    var inst_v = Value{ .Instance = inst };
+    ir.eval.pushEnclosing(&inst_v);
+    defer ir.eval.popEnclosing();
+
+with the comment "Make the instance an enclosing receiver for the thunk so the
+labeled-this walk finds it." Property-initializer and init-block thunks pass the
+instance as their `this` PARAMETER (`try all.append(allocator, inst_value.*)`)
+but never push it as an enclosing receiver, so any lambda created inside one
+snapshots a chain without it.
+
+So the fix is to give those thunks the same treatment the delegate thunk
+already has. Do it for the property-initializer and init-block sites
+specifically, NOT inside `evalThunk` — an ordinary method already seeds its own
+receiver and would end up with a duplicate entry. This wants the full gate: the
+receiver chain is consulted by every bare name in the interpreter.
 
 That makes this the third instance of one family, exactly as predicted earlier
 in this document: an implicit receiver that exists and that the runtime walk
