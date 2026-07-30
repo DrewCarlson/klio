@@ -1171,6 +1171,13 @@ pub fn tryInlineCallWithTypeArgs(
             if (std.mem.endsWith(u8, rt.name.name, "KType")) return null;
         }
     }
+    // `KLIO_SPLICE_TRACE=<fn>` — whether a named inline function reaches the
+    // splice path at all, and which parameter types the splice binds. The
+    // pair answers "did it inline" and "does its body see declared types",
+    // which is otherwise invisible from the outside.
+    if (inline_state.runtime.getenvSlice("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} entered, params={d}\n", .{ fname, f.params.len });
+    }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
     const body = if (f.body) |*body_ref| body_ref else return null;
@@ -1698,6 +1705,9 @@ pub fn tryInlineCallWithTypeArgs(
         const sub = try substReifiedInTypeRef(b, &p.ty);
         const sprev = try b.bindSpliceParamTy(p.name.name, sub);
         try splice_ty_restores.append(b.allocator, .{ .name = p.name.name, .prev = sprev });
+        if (inline_state.runtime.getenvSlice("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bound {s}: {s}\n", .{ fname, p.name.name, sub.name.name });
+        }
     }
     // Mark body-declared `var`s that a nested closure writes as boxed so
     // their decl emits `MakeCell` and the closure's write lands on the

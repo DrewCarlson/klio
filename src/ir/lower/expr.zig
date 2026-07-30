@@ -7730,6 +7730,18 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
+    // `KLIO_ARGTY_TRACE=<name>` — the static type this resolution actually
+    // used for a named expression, and whether it came from an inline
+    // splice's declared parameter type. This is what separates "lowering has
+    // no type" from "lowering has the wrong type", which look identical from
+    // a failing test.
+    if (runtime.getenvSlice("KLIO_ARGTY_TRACE")) |w| {
+        if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+            if (lazy_ans) |la| {
+                std.debug.print("[argty] {s} -> {s} args={d} splice_ty={}\n", .{ w, la.name, la.args.len, b.spliceParamTy(w) != null });
+            } else std.debug.print("[argty] {s} -> <none>\n", .{w});
+        }
+    }
     if (typeheadAuditOn()) {
         if (b.module.eagerTypeOf(arg.span())) |th| {
             if (lazy_ans) |la| {
