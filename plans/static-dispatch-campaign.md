@@ -344,70 +344,54 @@ channel's gain was never measured at all. Measure against the same binary
 before any number justifies the work — the same discipline the verification
 playbook demands for timings applies to counters.
 
-### The blocker, root-caused: a placeholder `actual` shadows klio's own renderer
+### FIXED: a placeholder `actual` shadowed klio's own renderer
 
-Recording a catch parameter's declared type is the smallest increment available
-here — the type is always written in the source, so it is not a heuristic — and
-it binds calls that bound nothing before (`bound_static` 46 -> 47 on a probe
-whose handler calls a method on the exception). It is two lines at the handler's
-`bind` in `lowerTry`.
-
-It is not committed, because it makes `ExceptionTest.exceptionDetailedTrace`
-fail. Six-line reproduction in
-`tests/fixtures/known_bugs/catch_param_type_drops_cause.kt`: with the receiver
-typed, `e.stackTraceToString()` loses the `Caused by:` chain while `e.cause`
-stays correct, which is what makes it quiet.
-
-The cause is one line of KLIO-authored Kotlin,
-`kotlin-klio/kotlin-internal/ThrowableActuals.kt`:
+`kotlin-klio/kotlin-internal/ThrowableActuals.kt` defined
 
     public actual fun Throwable.stackTraceToString(): String = this.toString()
     public actual fun Throwable.printStackTrace() { println(this) }
 
-with the header comment "KLIO has no host stack-trace machinery, so these render
-the throwable itself." That comment is STALE. `throwableStackMember` in
-`host_call_member.zig` renders frames, cause and suppressed through
-`formatThrowable`, and it is what serves these calls when the receiver type is
-unknown. Once the receiver IS typed, resolution binds the real — but
-placeholder — `actual` instead, and the host renderer never runs.
+under a header comment reading "KLIO has no host stack-trace machinery". That
+comment was stale: `throwableStackMember` in `host_call_member.zig` renders
+frames, cause and suppressed through `formatThrowable`, and it is what served
+these calls. It served them only because nothing could RESOLVE to the
+placeholder while receivers were untyped. Type a receiver and resolution binds
+the stub, and the trace silently loses its `Caused by:` chain while `cause`
+itself stays correct.
 
-So this is not a dispatch defect at all. It is a stub implementation that only
-ever ran because nothing could resolve to it, and giving lowering better type
-information made it reachable.
+The file is removed from `stdlib_sources.zig`'s embedded list and deleted, so
+the host implementation serves every case. Reimplementing the renderer in Kotlin
+was rejected: it walks internal stack/cell state and would drift on indentation
+and circular-reference handling, and one implementation beats two.
 
-**The fix is to make these two actuals produce what the host renderer produces,
-not to change dispatch.** Deleting the file does not work — `build.zig` embeds
-it and the build fails on the missing path — so either the bodies are written to
-walk `stackTrace`/`cause`/`suppressedExceptions` themselves, or the `expect`
-declarations are satisfied by registering `kotlin.stackTraceToString` and
-`kotlin.printStackTrace` as host symbols and the Kotlin actuals are removed from
-the embedded set together. The second is the better shape: one implementation,
-in the place that already has one.
+That unblocked the first increment. **Catch-parameter typing is now landed** —
+two lines at the handler's `bind` in `lowerTry`, recording the type that is
+always written in the source. Pinned by
+`tests/fixtures/parity_corpus/catch_param_static_type.kt`, which asserts both
+halves: the handler's member call binds, and the trace still renders cause,
+both suppressed sections, and the suppressed count.
 
-Two earlier versions of this entry asserted mechanisms that were wrong, and both
-are worth recording as dead ends. The first blamed a lost `addSuppressed`;
-`e.suppressedExceptions.size` is 1 either way. The second blamed a bodyless
-`expect` being entered as an interpreted frame — the `[fn-entry]` row is real,
-but a probe inside the resolver shows what the resolver actually sees:
+Dead ends recorded so they are not retried. Two mechanisms were asserted and
+disproved before the real one: a lost `addSuppressed` (`suppressedExceptions.size`
+is 1 either way), and a bodyless `expect` entered as an interpreted frame,
+disproved by a probe inside the resolver —
 
     [expectprobe] fid=5562 is_expect=false hasBody=true ds_has_body=true ast_body=true
 
-`hasBody=true`. There is nothing bodyless about it. That probe also shows
-`Func.is_expect` is never set for a real `expect` declaration — it is assigned in
-exactly one synthetic place — so any future guard written in terms of it is inert.
+`hasBody=true`; nothing about it was bodyless. That probe also showed
+`Func.is_expect` is never set for a real `expect` declaration, so any guard
+written in terms of it is inert. A guard phrased as "decline a static bind when
+the target has no body" was tried too and is dangerous: instrumented it catches
+`Collection.iterator`, `Iterator.hasNext` and `CoroutineContext.fold` — abstract
+members that must keep binding to a virtual slot.
 
-A guard phrased as "decline a static bind when the target has no body" was also
-tried and is actively dangerous: instrumented, it catches
-`kotlin.collections.Collection.iterator`, `kotlin.collections.Iterator.hasNext`
-and `kotlin.coroutines.CoroutineContext.fold` — abstract members, bodyless by
-design, which must keep binding to a virtual slot. Deferring those would push
-every interface call in the program onto dynamic dispatch.
-
-The general lesson, now four times over in this campaign: supplying better
-static type information does not introduce these failures, it REVEALS
-implementations that were never reachable. Expect the next increment to uncover
-another one, and expect the fix to be in the thing that became reachable rather
-than in the code that supplied the type.
+**The pattern to expect from every remaining increment.** Supplying better
+static type information does not introduce these failures; it makes previously
+unreachable implementations reachable. Four times now the fix has been in the
+thing that became reachable, never in the code that supplied the type. Budget
+the rest of this campaign on that basis: each new source of receiver types will
+surface another stub or placeholder, and the failure will look like a regression
+in the increment.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 

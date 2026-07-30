@@ -1145,3 +1145,15 @@ test "bare_write_var_declared_later" {
         \\
     );
 }
+
+test "catch_param_static_type" {
+    try check("catch_param_static_type",
+        \\cause=Root cause
+        \\renders-cause=true
+        \\renders-suppressed=true
+        \\renders-outer-suppressed=true
+        \\suppressed-count=1
+        \\boom:x
+        \\
+    );
+}

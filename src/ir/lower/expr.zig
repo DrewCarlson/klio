@@ -2589,6 +2589,16 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (finally_entry) |fin| b.protectCatchWithFinally(h.blk, fin, finally_done.?);
         try b.pushScope();
         try b.bind(h.c.binding.name, h.exc);
+        // A catch parameter's type is always written in the source, so it is
+        // static evidence for every member call on it in the handler. Binding
+        // the register without recording the type left those calls with no
+        // receiver type — the largest single reason static member dispatch
+        // declines is locals lowering has in scope but has no type for.
+        try b.setLocalDeclTypeOwned(
+            h.c.binding.name,
+            try decl_mod.loweredTypeRef(b.allocator, &h.c.ty, true),
+        );
+        if (h.c.ty.nullable) try b.setLocalDeclNullable(h.c.binding.name);
         const v = try lowerBlock(b, &h.c.body);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         try b.popScope();
