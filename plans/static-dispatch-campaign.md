@@ -297,6 +297,48 @@ which is exactly the trap that has produced repeated wrong answers in this
 codebase; it is acceptable for bounding an opportunity and unacceptable for
 deciding a binding.
 
+### Attempted: the return-type channel. Not landed, and why
+
+The rule the census points to was implemented — a call's static type is the
+declared return type of the declaration `resolveBareCallIndexed` picks — and it
+is NOT committed. Two findings from the attempt, both worth having before
+anyone builds it again.
+
+**`Func.return_ty` is ambiguous, and it bit immediately.** A function with an
+expression body and no annotation gets `Unit` as a PLACEHOLDER
+(`lower/decl.zig`, `interp_ir/build.zig`: `if (f.return_type) |rt| … else
+typeUnit()`). Trusting it answered `Unit` for `h2`, `normalizeCapacity`,
+`slotAddressOf`, `messagePrefix` and dozens more across androidx.collection and
+the compose runtime — all of which return Int/Long/String — and broke every
+compose suite at once. `Func.return_ty_declared` now records the distinction and
+its doc comment says so; that flag IS committed, on its own, so the next
+consumer of `return_ty` cannot repeat this.
+
+**Even with that fixed, the channel breaks compose, and the cause is not the
+channel.** Every remaining answer it supplied was individually defensible
+(`Job() -> CompletableJob`, `currentSnapshot() -> Snapshot`, `mapCapacity() ->
+Int`). What fails is `EffectsTests` and friends with `unresolved global
+stateLock`. `KLIO_BARE_TRACE=stateLock` shows the deciding site:
+
+    [bare-read] stateLock in=- known_global=false own=false encl=false
+                splice_recv=- owner=Recomposer$RecomposerInfoImpl
+
+Inside the nested `RecomposerInfoImpl`, `hasEnclosingMember("stateLock")` is
+FALSE — lowering does not know the enclosing `Recomposer` declares it — so the
+read takes the `GetField` on the nested class's own `this`, misses, and that
+arm's fallback goes straight to the GLOBAL without consulting the enclosing
+receiver chain. Better receiver types elsewhere change which of several
+`stateLock` sites executes, and this one is already wrong.
+
+So the blocker for the channel is a nested-class scope gap in bare-name reads,
+not the channel's own answers. Fix `hasEnclosingMember` for a nested class's
+outer properties (or make that arm's miss continue through the implicit
+receivers instead of jumping to the global, which is the read-side mirror of the
+`StoreToThisOrGlobal.recv` fix) and re-attempt. Do not re-attempt before that:
+the channel's measured payoff is +46 statically bound sites out of ~7000, which
+is far too small to justify carrying a compose-wide breakage while diagnosing
+it.
+
 ### Why re-widening is blocked (superseded theory below — read this first)
 
 Ruled out by experiment: it is NOT instantiation-dependent recordings.

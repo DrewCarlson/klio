@@ -517,6 +517,7 @@ pub fn reserveMemberHeaders(
             .package = class_pkg,
             .params = params,
             .return_ty = return_ty,
+            .return_ty_declared = f.return_type != null,
             .n_locals = 0,
             .blocks = &.{},
             .entry = ir.BlockId.from(0),
@@ -1963,6 +1964,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     else
         build.typeUnit();
     var func = try b.finish(f.name.name, fqn, return_ty);
+    func.return_ty_declared = f.return_type != null;
 
     var params: std.ArrayList(Param) = .empty;
     errdefer params.deinit(a);

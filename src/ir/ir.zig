@@ -1010,6 +1010,12 @@ pub const Func = struct {
     package: []const u8 = "",
     params: []Param,
     return_ty: TypeRef,
+    /// Whether `return_ty` came from an explicit `: T` in the source. A
+    /// function with an expression body and no annotation gets `Unit` as a
+    /// PLACEHOLDER, so `return_ty` alone cannot distinguish "returns Unit"
+    /// from "return type not recorded". Any consumer that treats the return
+    /// type as a fact about the function must check this first.
+    return_ty_declared: bool = false,
     n_locals: u32,
     blocks: []Block,
     /// Lazy IR: `offset + 1` of this function's `blocks` in its module's
