@@ -390,6 +390,32 @@ is to make more receivers statically typed.
 Fix that first. Then the catch-parameter typing lands as its first beneficiary,
 and the return-type channel becomes re-testable.
 
+**A first fix attempt failed, and how it failed narrows the next one.** The
+obvious guard — decline the static bind when the target has no body — was added
+to both the extension path (`lowerResolvedExtensionCall`) and the member path
+(`lowerResolvedMemberCall`). Two things came out of it:
+
+- `stackTraceToString` reaches NEITHER path. The `[compose-abi]` row shows the
+  call carrying `args=0` with the receiver separate, so it is bound somewhere
+  else again; find that site before writing any guard.
+- "Has no body" is the WRONG predicate, and dangerously so. Instrumenting the
+  member guard shows what it actually catches:
+
+      [bodyless] kotlin.collections.Collection.iterator fid=395
+      [bodyless] kotlin.collections.Iterator.hasNext fid=357
+      [bodyless] kotlin.coroutines.CoroutineContext.fold fid=4
+
+  Abstract and interface members are bodyless BY DESIGN and must bind to a
+  virtual slot. Declining them would defer every interface call in the program
+  to dynamic dispatch — the exact opposite of this campaign's goal.
+
+So the predicate has to separate three cases that all present as "no body":
+abstract/interface (bind virtually), bodyless `expect` standing in for a host
+symbol (invoke the host), and a stub with a declared arity. Only the second is
+the defect. Nothing in `Func` distinguishes them today, which is the same gap
+`return_ty_declared` closed for return types — write the distinction down at
+lowering time rather than re-deriving it from an absence.
+
 Ruled out along the way, each as its own program that passes WITH the change
 applied, so nobody repeats them: lost `addSuppressed`
 (`e.suppressedExceptions.size` is 1 either way); a cause from a `Throwable`-typed
