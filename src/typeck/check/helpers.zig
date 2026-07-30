@@ -555,6 +555,32 @@ pub fn primitiveArrayElemByName(name: []const u8) ?Type {
     return null;
 }
 
+/// The type a `vararg x: T` parameter has INSIDE the function body:
+/// `Array<out T>`, not `T`. Kotlin declares the element type at the
+/// parameter but binds the packed array in the body, so a body that calls
+/// `x.toList()` resolves the `Array` extension, not the `CharSequence` one.
+/// Primitive element types keep their specialized array
+/// (`vararg i: Int` is an `IntArray`).
+pub fn varargParamType(allocator: Allocator, elem: *const Type) Allocator.Error!Type {
+    const prim_array: ?[]const u8 = switch (elem.*) {
+        .Int => "IntArray",
+        .Long => "LongArray",
+        .Short => "ShortArray",
+        .Byte => "ByteArray",
+        .Double => "DoubleArray",
+        .Float => "FloatArray",
+        .Boolean => "BooleanArray",
+        .Char => "CharArray",
+        else => null,
+    };
+    if (prim_array) |name| {
+        return .{ .Generic = .{ .name = name, .args = &.{} } };
+    }
+    const args = try allocator.alloc(GenericArg, 1);
+    args[0] = .{ .variance = .Out, .is_star = false, .ty = try elem.clone(allocator) };
+    return .{ .Generic = .{ .name = "Array", .args = args } };
+}
+
 /// Extract the element type of an array-shaped value type. The result owns
 /// its heap data when non-null. Recognizes `Array<T>` and the primitive
 /// specializations plus their nullable forms.

@@ -642,11 +642,46 @@ fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8)
     return false;
 }
 
+/// Whether any parameter or the return type of `sig` is (or contains) a
+/// type parameter — i.e. the signature was matched against something the
+/// checker could not pin to a concrete type.
+fn typeMentionsTypeParam(t: *const Type) bool {
+    return switch (t.*) {
+        .TypeParam => true,
+        .Nullable => |inner| typeMentionsTypeParam(inner),
+        .Generic => |g| blk: {
+            for (g.args) |*a| {
+                if (!a.is_star and typeMentionsTypeParam(&a.ty)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Function => |f| blk: {
+            for (f.params) |*p| if (typeMentionsTypeParam(p)) break :blk true;
+            break :blk typeMentionsTypeParam(f.return_type);
+        },
+        else => false,
+    };
+}
+
+fn sigMentionsTypeParam(sig: *const FnSig) bool {
+    for (sig.params) |*p| if (typeMentionsTypeParam(p)) return true;
+    return typeMentionsTypeParam(&sig.return_ty);
+}
+
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
     // A vararg overload family needs the engine's packing logic to pick
     // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
     // vararg picks stay out of the channel.
     for (sig.is_vararg) |v| if (v) return;
+    // A pick made against a TYPE PARAMETER is a guess, not a resolution.
+    // `listOf(a, b).minOrNull()` where `a: T` (`T : Comparable<T>`) has two
+    // live candidates — the total-order `Iterable<T>.minOrNull()` and the
+    // IEEE `Iterable<Double>.minOrNull()` — and only the runtime element
+    // values decide. Recording either one binds the call statically and the
+    // wrong choice silently changes the answer (NaN instead of 0.0). The
+    // runtime's own dispatch gets these right, so the channel stays out of
+    // it, exactly as it does for an ambiguous simple class name.
+    if (sigMentionsTypeParam(sig)) return;
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing

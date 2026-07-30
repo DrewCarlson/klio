@@ -175,18 +175,36 @@ pass with it off:
     kotlin/libraries/stdlib/test/numbers: off=113/0, on=110/3
     kotlin/libraries/stdlib/test/time:    off=81/0,  on=80/1
 
-- `NaNTotalOrderTest.listTMinOrNull` and `sequenceTMinOrNull`:
-  `minOrNull()` returns `NaN` where `0.0` is expected. A comparison
-  selected against the wrong static type — NaN total-order handling
-  differs between the boxed and primitive comparison paths.
-- `DurationTest.parseAndFormatInUnits`:
-  `Vm::get_field 'length' on 'kotlin.Array'`. `kotlin.Array` has `size`,
-  not `length`, so eager picked a declaration returning `Array` where the
-  correct one returns `String`. The read is inside the stdlib's own
-  `kotlin.time.Duration` implementation, not the test; the test's
-  `vararg representations: String` (an `Array<String>` inside) plus
-  `withIndex()` destructuring is the likely source of the confusion —
-  element type mistaken for container type.
+- `NaNTotalOrderTest.{array,list,sequence}TMinOrNull`: STILL OPEN, and
+  the mechanism is the opposite of what the symptom suggests. Eager makes
+  lowering resolve LESS, not wrongly. `KLIO_EXT_TRACE=minOrNull` over the
+  same file set:
+
+        eager off:  recv=Array target=4432   recv=List target=2098   recv=Sequence target=2463
+        eager on:   recv=Array target=null   recv=List target=null   recv=Sequence target=null
+
+  Same receiver head, same implicit owners, same arg count — but under
+  eager the static extension pick fails, the call falls back to runtime
+  dispatch, and the runtime chooses the IEEE `Iterable<Double>.minOrNull`
+  over the total-order `Iterable<T>.minOrNull`, giving NaN instead of 0.0.
+
+  `eagerCallTarget` returns null on a missing entry, so absence is NOT
+  being read as a negative answer; the channel is additive as intended.
+  The next thing to check is the type ARGUMENTS: `EagerTypeHead` carries
+  only `{name, nullable}` — no generic args — so where the eager head
+  replaces a richer AST answer, `resolveExtensionCallForArgs` loses the
+  element type it needs to choose between `Iterable<T>` and
+  `Iterable<Double>`. That would explain a head-only answer defeating a
+  pick that AST evidence completes.
+- `DurationTest.parseAndFormatInUnits`: **FIXED.** The frame chain named
+  it exactly: `representations.toList()` dispatched to
+  `kotlin.text.toList` (the `CharSequence` extension, which reads
+  `this.length`) with an `Array` receiver. `representations` is a
+  `vararg representations: String`, and typeck bound it as the ELEMENT
+  type `String` — but Kotlin binds the packed array in the body, so its
+  type is `Array<out String>`. `varargParamType` now supplies that
+  (keeping the primitive specialisations: `vararg i: Int` is an
+  `IntArray`), and the test passes.
 
 Both are wrong-static-type defects, the same family as the `SlotTable`
 collision. Until they are fixed the `KLIO_EAGER` flag and the non-eager

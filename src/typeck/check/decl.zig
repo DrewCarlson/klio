@@ -858,9 +858,16 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     try checkCircularBounds(self, f.type_params, f.where_bounds);
     try pushFrame(self);
     for (f.params) |*p| {
-        const ty = try convertTypeRefLossy(self.allocator, &p.ty);
-        const cn = classNameFromTyperef(&p.ty);
-        const decl_type_name: ?[]const u8 = if (builtinByName(p.ty.name.name) == null) p.ty.name.name else null;
+        const declared = try convertTypeRefLossy(self.allocator, &p.ty);
+        // A `vararg x: T` binds the PACKED ARRAY in the body, not an element.
+        const ty = if (p.is_vararg)
+            try helpers.varargParamType(self.allocator, &declared)
+        else
+            declared;
+        const cn = if (p.is_vararg) null else classNameFromTyperef(&p.ty);
+        const decl_type_name: ?[]const u8 = if (p.is_vararg)
+            null
+        else if (builtinByName(p.ty.name.name) == null) p.ty.name.name else null;
         try currentFrame(self).bindings.put(p.name.name, .{
             .ty = ty,
             .mutable = false,
