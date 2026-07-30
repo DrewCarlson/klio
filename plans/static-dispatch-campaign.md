@@ -374,7 +374,39 @@ That makes the next step a bisect of the FILE LIST, not of the source:
     kotlin/libraries/stdlib/test/testUtils.kt
     kotlin/libraries/stdlib/test/time/DurationTestUtils.kt
 
-Halving that list does NOT isolate it — both halves pass:
+**ROOT CAUSE: the data home, not the file set or the source.** Same file, same
+binary:
+
+    HOME=/tmp/klio_itest_stdlibtest_home  ->  21 tests, 0 passed, 21 FAILED
+    default HOME (~/.klio)                ->  21 tests, 21 passed
+
+That is the whole difference. Every file-set result below is an artifact of
+which HOME the run happened to use, and every source-level cut before it is an
+artifact of the same thing — the standalone runs used the default home, the
+sweep runs used the child home.
+
+It is NOT stale pack content, which is the obvious reading and the one CLAUDE.md
+warns about. Deleting `.klio/cache` (56 MB of `stdlib-*.klio-image`) changes
+nothing, and `.klio/packs` is EMPTY — moving it away changes nothing either.
+With both gone the child home is bare and it still fails, while the default home
+still passes.
+
+So the difference is warm versus COLD: the default home has a cached stdlib
+image, the child home has none and must assemble the stdlib from source. The
+cold path fails to resolve `kotlin.test` for this file where the image path
+resolves it fine. That is a real klio bug and a more serious one than a flaky
+test — it means the from-scratch assembly path and the baked-image path do not
+agree on name resolution.
+
+Next: run with the child home and `KLIO_ERR_TRACE` / the resolve audit to see
+what the cold path binds `assertEquals` to, and compare against the same file
+under the default home. The two paths disagreeing is the bug; `UuidTest` is just
+where it happens to surface.
+
+---
+
+Superseded below (kept only to show what was ruled out): halving the support
+list does not isolate it — both halves pass:
 
     PlatformActuals + EncodingActuals + JsCollectionFactories + UuidTest -> 21/21
     CollectionBehaviors + ComparisonDSL + testUtils + DurationTestUtils
