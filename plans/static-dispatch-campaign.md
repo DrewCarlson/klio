@@ -427,10 +427,30 @@ That is the same family as the `StoreToThisOrGlobal` capture-slot gap fixed
 earlier this campaign: an implicit receiver that lowering knows about statically
 but the runtime walk cannot reach.
 
-Not yet reproduced standalone — an inner class implementing an interface, with a
-property initializer and a method both reading a private outer `val`, works fine
-(`L/L`). The reproduction needs whatever makes `in=-` true for that row. Find
-that first; it is the whole bug.
+The source line is
+`get() = synchronized(stateLock) { this@Recomposer.errorState.value }` — a
+property GETTER (hence `in=-`) on a private inner class, reading a private
+outer `val` as the argument of an inline call.
+
+Not yet reproduced standalone. Four reductions were tried and ALL PASS, so the
+trigger is none of these on its own; do not retry them:
+
+1. inner class implementing an interface, reading a private outer `val` from a
+   property initializer and from a method — prints `L/L`;
+2. the same read from a property GETTER, plus one through a `run { }` lambda —
+   prints `L/T`;
+3. the read as the argument of a user-defined INLINE function taking a lock and
+   a lambda, from a getter on a private inner class — prints `T`;
+4. the same, with the inner instance constructed in an outer property
+   INITIALIZER (`private val cached = Inner()`), mirroring
+   `private val recomposerInfo = RecomposerInfoImpl()` — prints `T`.
+
+So the remaining candidates are what those reductions still omit: the real
+`synchronized` is an `expect` with a klio actual rather than a user inline
+function, `RecomposerInfoImpl` is reached through an interface-typed collection
+in a companion (`_runningRecomposers`), and the getter is annotated. Bisect from
+the real file downward rather than building up from a toy — building up has now
+cost four attempts and produced no reproduction.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 
