@@ -329,13 +329,23 @@ specific things, both measured:
         interface-declared member returns `.virtual`, never `.direct`. The
         promotion is emitting a virtual slot, which is the correct FORM.
 
-        So the bug is in the slot, not the form. `key` is a PROPERTY on
-        `CoroutineContext.Element`, and the promotion path is the member-CALL
-        gate; a property read reaching a method slot, or a slot rooted at the
-        interface declaration rather than at the override, would both produce
-        this. Dump the emitted slot and the selected target for `key` on a
-        `DerivedElementWithPolyKey` receiver before changing anything — the
-        `[vslot-unlinked]`/`KLIO_ERR_TRACE` machinery already prints both.
+        And the slot hypothesis is wrong too. `KLIO_EMIT_TRACE=key` on the
+        failing file with the promotion enabled emits NOTHING for `key` — it is
+        never statically bound at all, so neither a mis-rooted slot nor a
+        property read reaching a method slot can be the cause.
+
+        Three hypotheses have now been ruled out by measurement rather than
+        argument: the runtime name-fallback (those receivers are interpreted
+        `Instance` values that never reach that branch), `dispatchForTarget`
+        answering `.direct` (it answers `.virtual` for an interface member), and
+        `key` itself being bound (it is not bound).
+
+        What IS newly bound in that file is unmeasured. The next step is
+        mechanical, not analytical: capture `KLIO_EMIT_TRACE` output for the
+        whole file with and without the promotion and DIFF them. The member that
+        appears only in the second run is the one to look at. Do not form a
+        fourth hypothesis first — the three above each cost a build-and-run and
+        each was wrong.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
