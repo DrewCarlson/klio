@@ -11823,7 +11823,7 @@ fn lowerResolvedMemberCall(
         null;
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
-    const resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
+    var resolved = b.module.resolveMemberCall(static_owner, name.name, shapes, .{
         .caller_file = name.span.file,
         .lexical_owner = lexical_owner,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
@@ -11851,6 +11851,38 @@ fn lowerResolvedMemberCall(
     }
     const func_id = resolved.target orelse
         return if (resolved.applicable) .deferred else .none;
+    // The resolver identifies a single candidate but withholds dispatch when an
+    // argument's type is unknown, so its applicability is unproven. Measured,
+    // that is EVERY deferral reaching this point — sites with a fully proven
+    // declaration identity that emitted no static binding at all.
+    //
+    // The identity is not in doubt there; only whether Kotlin would pick this
+    // member. The one thing that beats an applicable member is an EXTENSION of
+    // the same name, so ask exactly that. `extCouldApply` is chain-aware and
+    // conservative — a generic-receiver extension, a supertype's extension, or a
+    // stale index all answer yes — so a `false` means nothing else could bind
+    // and the member's identity is sufficient.
+    //
+    // Restricted to a receiver whose values are real interpreted instances. A
+    // stub or value class is host-backed, and an INTERFACE receiver can hold a
+    // host-backed value too (a `Sequence` is a generator, not an `Instance`);
+    // dispatching either through a method slot raises "virtual call receiver is
+    // not an instance".
+    if (resolved.dispatch == .deferred and resolved.target != null and
+        static_owner.int() < b.module.classes.items.len and
+        !b.module.classes.items[static_owner.int()].is_stub and
+        !b.module.classes.items[static_owner.int()].is_value and
+        !b.module.classes.items[static_owner.int()].is_interface and
+        !b.module.extCouldApply(b.allocator, head, name.name))
+    {
+        // Ask the resolver's own direct-vs-virtual rule rather than assuming
+        // virtual: a final or private method has no vtable slot, and a virtual
+        // emission for one fails at runtime even when the receiver's class is
+        // exactly the declaring class.
+        if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
+            resolved.dispatch = d;
+        }
+    }
     if (resolved.dispatch == .deferred) {
         lmNote(.resolver_declined);
         if (norecvCensusOn()) {

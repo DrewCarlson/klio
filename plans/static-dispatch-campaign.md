@@ -613,39 +613,39 @@ against 9 that emit a virtual slot. A virtual slot IS static dispatch — it is 
 numeric method index, no runtime name lookup — and it is the correct emission
 for a known-but-overridable declaration.
 
-**Attempted, and it fails on a slot-LINKING gap, not on the resolution
-question.** Promoting the deferral to `.virtual` when
-`!module.extCouldApply(head, name)` — the conservative, chain-aware "could any
-extension of this name serve this receiver" query — was tried, and the
-extension-shadowing worry it was guarding against never materialised. What
-happened instead, in three rounds:
+**LANDED.** Promoting a `target_known_deferred` resolution to a real dispatch,
+guarded by `extCouldApply` — the conservative, chain-aware "could any extension
+of this name serve this receiver" query — binds 78 more sites:
+
+    bound_static      196 -> 274
+    resolver_declined 1934 -> 1856
+
+Total statically bound 205 -> 283, a 38% increase, and every one of the 78 binds
+as a DIRECT call, the strongest form.
+
+Three wrong turns on the way, each worth not repeating:
 
 1. Unguarded on the receiver's representation: `virtual call receiver is not an
-   instance`. A virtual slot indexes an instance vtable, and a stub or value
-   class is a host-backed value.
-2. Excluding stub and value classes: same error for `Sequence`. An INTERFACE
+   instance`. A virtual slot indexes an instance vtable; a stub or value class is
+   a host-backed value.
+2. Excluding stub and value classes: the same for `Sequence`. An INTERFACE
    receiver can hold a host-backed value too — a sequence is a generator, not an
    `Instance`.
-3. Excluding interfaces as well: **the stdlib sweep goes green at 117/0** and the
-   census moves `bound_virtual` 9 -> 87, `resolver_declined` 1934 -> 1856. Total
-   statically bound 205 -> 283, a 38% increase. But `CompositionLocalTests` drops
-   to 21/31 with
+3. Excluding interfaces as well: the stdlib sweep went green but
+   `CompositionLocalTests` failed with `virtual method slot is not linked for
+   receiver class`. The diagnostic named the receiver as `TrieNode` — the SAME
+   class that declares the method. The slot was missing because the method is
+   not overridable at all, so it never had one.
 
-       virtual method slot is not linked for receiver class
+That third failure is the lesson. The promotion had been assuming `.virtual`,
+and virtual is wrong for a final or private method. The resolver already knows
+the right answer; it just could not be asked. `Module.dispatchForTarget` now
+factors that direct-vs-virtual rule out of `resolveMemberCall` so a promoting
+caller reaches the same verdict instead of guessing, and the 78 sites turn out
+to be final/private methods that bind directly.
 
-That last error is the real obstacle and it is NOT about resolution. The
-resolver already emits `.direct` for a final class, so this promotion only ever
-fires for an OPEN one, where the runtime receiver may be a subclass whose vtable
-has no linked slot for that method. The identity was right; the slot simply is
-not there.
-
-So the next step is slot linking, not dispatch: find why a subclass of an open
-class lacks a linked slot for an inherited method, and whether linking can be
-made total. With that fixed, this promotion is worth ~78 sites (measured, sweep-
-green) and probably more once interfaces can participate.
-
-Reverted for now — a 38% coverage gain does not justify shipping a compose
-regression.
+The extension-shadowing risk this guard was written for never materialised in
+any of the three rounds.
 
 This bucket is a better next target than the generic-element-type project. That
 project is still the answer for the 68% `no_receiver_type` mass, but this one is

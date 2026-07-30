@@ -4039,6 +4039,32 @@ pub const Module = struct {
         return .{ .target = target, .dispatch = .virtual, .applicable = true };
     }
 
+    /// The `direct` vs `virtual` choice for an already-identified target,
+    /// factored out of `resolveMemberCall` so a caller that promotes a
+    /// deferred-but-identified resolution reaches the SAME answer instead of
+    /// assuming `virtual`. Assuming virtual is wrong for a final or private
+    /// method: it has no vtable slot at all, and the call fails at runtime with
+    /// "virtual method slot is not linked for receiver class" even when the
+    /// receiver's class is exactly the declaring one.
+    pub fn dispatchForTarget(self: *const Module, owner: ClassId, target: FuncId) ?MemberDispatch {
+        if (owner.int() >= self.classes.items.len) return null;
+        const class = &self.classes.items[owner.int()];
+        const ds = self.decl_sigs.get(target.int()) orelse return null;
+        if (!ds.has_body) return .virtual;
+        if (ds.visibility == .Private) return .direct;
+        const f = self.funcById(target) orelse return null;
+        if (class.is_stub or class.is_value) return .virtual;
+        const declaring_class = if (ds.enclosing_class) |decl_owner|
+            (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
+        else
+            null;
+        const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
+        if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
+            return .direct;
+        }
+        return .virtual;
+    }
+
     fn methodIsFinal(f: *const Func) bool {
         if (f.is_open) return false;
         if (f.is_override and !f.is_final) return false;
