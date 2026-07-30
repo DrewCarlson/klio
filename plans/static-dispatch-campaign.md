@@ -290,10 +290,26 @@ DISPROVEN. A twelve-line test class with two `uL` literal properties, a derived
 (`0xa716446655440000uL` yields 12039885860129472512, which is right). Unsigned
 properties do not poison resolution.
 
-So `UuidTest` remains undiagnosed, with four causes now excluded: the image
-cache, the star import, a missing `Uuid.kt` source, and the ULong constants.
-What is left untested is the `Uuid` class itself — `Uuid.fromULongs(...)` at
-class-property scope, a `private constructor`, and the companion factories.
+So `UuidTest` remains undiagnosed. Seven candidates are now excluded, each by a
+program that PASSES:
+
+  - the image cache (deleting 56 MB of `stdlib-*.klio-image` changes nothing);
+  - the star import (115 files under `test/` use `kotlin.test.*` and pass);
+  - a missing source (`Uuid.kt` IS in `stdlib_sources.zig`);
+  - the ULong constants (`uL` literal properties resolve and compute correctly);
+  - the `Uuid` class (`Uuid.fromULongs(msb, lsb)` at class-property scope, then
+    `uuid.toString()` in a `@Test`, passes);
+  - `package test.uuid` combined with `import kotlin.test.*`;
+  - `import kotlin.time.Clock` / `kotlin.time.Instant`.
+
+It also fails with NO sibling support files at all — `klio-harness test` on
+`UuidTest.kt` alone gives the same 21 failures — so it is not contamination from
+`ComparisonDSL.kt` / `testUtils.kt`, which do emit conflicting-overload errors in
+other file sets.
+
+The remaining approach is mechanical: bisect `UuidTest.kt` itself by halving its
+body until the smallest failing file is found. Every structural feature guessed
+at from the outside has now been wrong, so stop guessing and halve the file.
 
 Anyone gating on the sweep should treat these as a known baseline failure until
 diagnosed, and should NOT attribute them to a dispatch change without bisecting
