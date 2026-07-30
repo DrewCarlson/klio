@@ -230,6 +230,33 @@ regression tests for it. Only then does re-widening the channel pay, and
 only then can `no_receiver_type` fall.
 
 
+## Known pre-existing failure: UuidTest
+
+`kotlin/libraries/stdlib/test/uuid/UuidTest` currently fails 5-6 cases in the
+stdlib sweep with `unresolved global assertEquals` / `unresolved global
+assertTrue`.
+
+It is NOT caused by the static-dispatch work. Bisected by checking out
+`387b0a43` — the commit this campaign's latest run started from, before any of
+the changes above — rebuilding the harness and re-running: it fails there
+identically. Also ruled out: a stale sweep child home (deleting
+`/tmp/klio_itest_stdlibtest_home` and rebuilding it changes nothing).
+
+Two things make it confusing to encounter, so they are recorded here:
+
+  - It is INTERMITTENT. The same sweep reported `117 files, 0 failures` many
+    times earlier in the same session on the same commits.
+  - The error is a RESOLUTION failure (`assertEquals` unresolved), not an
+    assertion mismatch, which does not look like a flaky test at first glance.
+    Several of the affected cases are UUID v7, which is time-based, and the
+    failures began appearing across a date rollover — worth checking whether a
+    v7 timestamp path throws during shared setup and the unresolved-global
+    message is a cascade from that rather than the cause.
+
+Anyone gating on the sweep should treat these as a known baseline failure until
+diagnosed, and should NOT attribute them to a dispatch change without bisecting
+first.
+
 ## Inventory: everything that is still not statically bound
 
 The end goal is FULL static dispatch — a bytecode VM and a Kotlin-to-C
