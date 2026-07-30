@@ -393,6 +393,45 @@ the rest of this campaign on that basis: each new source of receiver types will
 surface another stub or placeholder, and the failure will look like a regression
 in the increment.
 
+### Retried the return-type channel; blocked on an inner-class receiver walk
+
+Re-attempted with the two guards the earlier failure taught (`return_ty_declared`,
+so the `Unit` placeholder can never be read as a fact, plus a fully-concrete
+requirement on the declared return type) and with the `ThrowableActuals` stub
+gone. The stdlib sweep is CLEAN — 117 files, 0 failures, where the first attempt
+regressed two collection tests — so those guards fixed what they were for.
+
+Compose still fails, all suites, on `unresolved global stateLock`. The channel
+is reverted; the diagnosis is one step further along and is the next thing to do.
+
+`KLIO_BARE_TRACE=stateLock` gives the SAME four rows with and without the
+channel:
+
+    [bare-read] stateLock in=- known_global=false own=false encl=false
+                splice_recv=- owner=Recomposer$RecomposerInfoImpl
+    [bare-read] stateLock in=performInsertValues ... encl=true owner=Recomposer
+    [bare-read] stateLock in=recompositionRunner ... encl=true owner=Recomposer
+    [bare-read] stateLock in=runRecomposeAndApplyChanges ... encl=true owner=Recomposer
+
+So the channel does not change how `stateLock` LOWERS. It changes which of these
+sites executes. The first row is the defective one and it is present on a clean
+tree too — inside the private inner class `RecomposerInfoImpl`,
+`hasEnclosingMember("stateLock")` is FALSE and `in=-` means it is not in a real
+function (a property initializer or a synthesized context). With `own=false` and
+`encl=false` the read emits the `LoadFromThisOrGlobal` fallback, whose runtime
+walk must climb from the inner instance to the enclosing `Recomposer` through the
+class-nesting tower. It does not, so the read falls through to the global and
+raises.
+
+That is the same family as the `StoreToThisOrGlobal` capture-slot gap fixed
+earlier this campaign: an implicit receiver that lowering knows about statically
+but the runtime walk cannot reach.
+
+Not yet reproduced standalone — an inner class implementing an interface, with a
+property initializer and a method both reading a private outer `val`, works fine
+(`L/L`). The reproduction needs whatever makes `in=-` true for that row. Find
+that first; it is the whole bug.
+
 ### Why re-widening is blocked (superseded theory below — read this first)
 
 Ruled out by experiment: it is NOT instantiation-dependent recordings.
