@@ -407,14 +407,35 @@ specific things, both measured:
         fid 124, and a concrete class implementing `Element` should inherit that
         mapping.
 
-        Which means the regression is probably NOT a linking failure at all. Do
-        not audit `linkMethodClass` further on this evidence. The next step is to
-        observe what slot 128 actually resolves to for a
-        `DerivedElementWithOldKey` receiver AT RUNTIME — `methodSlotTarget` for
-        that (class, slot) pair — and compare it against fid 124. If it is 124,
-        the dispatch is right and the fault is elsewhere in the promotion; if it
-        is 128, the re-pointing did not survive into `method_dispatch` and the
-        question becomes which of the two loops dropped it.
+        And dumping the built table settles it — the dispatch is CORRECT:
+
+            [slot-dump] class=…DerivedElementWithOldKey  slot=128
+                        -> fid=124 CoroutineContext.Element.minusKey
+            [slot-dump] class=…DerivedElementWithPolyKey slot=128 -> fid=124
+            [slot-dump] class=…CustomInterceptor         slot=128 -> fid=153
+
+        Every concrete class maps slot 128 to the right override. So slot
+        rooting, slot linking and slot dispatch are all exonerated, and binding
+        `minusKey` at slot 128 would have dispatched correctly.
+
+        **The fault is in the BODY of `Element.minusKey`, not in the call to
+        it.** That body is
+
+            if (key == this.key) EmptyCoroutineContext else this
+
+        and `key` is a PROPERTY that `DerivedElementWithPolyKey` overrides. The
+        promotion changes lowering for the whole program, stdlib included, so the
+        `this.key` read inside that stdlib body is itself a candidate: bound
+        against `Element` it returns the base property instead of dispatching to
+        the override, the comparison fails, and the element is never removed —
+        matching the assertion exactly.
+
+        Check that next: trace what `this.key` lowers to inside
+        `CoroutineContext.Element.minusKey` with and without the promotion. Note
+        an earlier `KLIO_EMIT_TRACE=key` run showed nothing, but that trace only
+        covers `Call`/`CallVirtual`/`CallMember` — a property read lowers to
+        `GetField`, which it does not report. Extend the trace before concluding
+        anything from its silence.
   - **The rest of the `unknown_count == 1` set**, where `extCouldApply` cannot
     rule out an extension. Tightening that query (it answers yes for any
     generic-receiver extension) would convert more.
