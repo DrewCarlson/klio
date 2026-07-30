@@ -334,10 +334,59 @@ So the blocker for the channel is a nested-class scope gap in bare-name reads,
 not the channel's own answers. Fix `hasEnclosingMember` for a nested class's
 outer properties (or make that arm's miss continue through the implicit
 receivers instead of jumping to the global, which is the read-side mirror of the
-`StoreToThisOrGlobal.recv` fix) and re-attempt. Do not re-attempt before that:
-the channel's measured payoff is +46 statically bound sites out of ~7000, which
-is far too small to justify carrying a compose-wide breakage while diagnosing
-it.
+`StoreToThisOrGlobal.recv` fix) and re-attempt. Do not re-attempt before that.
+
+**Correction on the payoff.** An earlier draft of this section claimed the
+channel bound +46 extra sites. That compared against a baseline captured from a
+DIFFERENT build; a back-to-back measurement shows the current tree already
+reports `bound_static 196` on the same file set WITHOUT the channel, so the
+channel's gain was never measured at all. Measure against the same binary
+before any number justifies the work — the same discipline the verification
+playbook demands for timings applies to counters.
+
+### The actual blocker: a bodyless `expect` is dispatched as an implementation
+
+Found by a separate, much smaller increment, which makes it the cheapest known
+reproduction of the thing that has now broken two attempts at supplying more
+receiver types.
+
+Recording a catch parameter's declared type is unarguable — it is always written
+in the source — and it does bind calls that previously bound nothing
+(`bound_static` 46 -> 47 on a probe whose handler calls a method on the
+exception). It also breaks `ExceptionTest.exceptionDetailedTrace`. Reduced:
+
+    val e = try { throw RuntimeException("Induced") } catch (e: Throwable) {
+        e.apply { addSuppressed(UnsupportedOperationException("side")) }
+    }
+    // "side" is absent from e.stackTraceToString(); with no catch type it is present
+
+With `e` typed, the bare call inside the spliced `apply` body resolves:
+
+    [bare] addSuppressed -> kotlin.addSuppressed#4961 params=2 ext=true
+           form=CallMemberOrGlobal recv_ty=Throwable
+    [bare-candidate] kotlin.addSuppressed#4961 pkg=kotlin file=null params=2 body=false
+    [KLIO_OR_AUDIT] run inst=CallMemberOrGlobal name=addSuppressed
+           arm=member depth=0 recv=kotlin.Throwable
+
+`addSuppressed` is an `expect` whose actuals are all platform files klio does
+not compile; klio implements it as a HOST member (`host_call_member.zig`).
+Dispatch takes the member arm and invokes the BODYLESS expect, which does
+nothing at all — no error, no output, the suppressed exception simply never
+recorded. Without a receiver type the call took a different tail and reached the
+host member.
+
+So the rule that has to hold before more receiver types are worth supplying:
+**a bodyless declaration is never a dispatch target.** When the winner has no
+body and no actual, the host member probe must serve the call. This is the same
+defect family as `Func.return_ty`'s `Unit` placeholder — a declaration that
+exists but implements nothing, read as though it implements something — and both
+were found by supplying better static information and watching it turn into a
+silently wrong answer.
+
+The catch-parameter typing is NOT committed for this reason. It is a two-line
+change (`setLocalDeclTypeOwned` at the handler's `bind`, plus the nullable flag)
+and should land immediately after the bodyless-dispatch rule does, as its first
+beneficiary.
 
 ### Why re-widening is blocked (superseded theory below — read this first)
 
