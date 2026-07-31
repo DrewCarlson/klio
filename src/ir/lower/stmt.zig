@@ -292,10 +292,12 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
             // A property read and an INDEXED read both carry a static type of
             // their own: `val held = row[1]` is `Row.get`'s return type.
-            .Member, .Index => if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_INIT") orelse "1", "0"))
+            .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_INIT") orelse "1", "0"))
                 try b.setLocalInitExpr(p.name.name, e),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
-            else => {},
+            else => if (runtime.getenvSlice("KLIO_INIT_KINDS") != null) {
+                std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
+            },
         }
         // A literal init is definite NON-callable evidence that must also
         // survive into nested lambda bodies: a captured `var key = 0` does

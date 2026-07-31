@@ -1187,6 +1187,16 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "alias_local_keeps_its_source_type" {
+    try check("alias_local_keeps_its_source_type",
+        \\base
+        \\base
+        \\base
+        \\derived
+        \\
+    );
+}
+
 test "receiver_typed_from_an_operator" {
     try check("receiver_typed_from_an_operator",
         \\base

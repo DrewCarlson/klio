@@ -8367,6 +8367,14 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (norecvCensusOn()) lm_localinit[1] += 1;
         return ctor_ty;
     }
+    // An ALIAS takes the source local's type, whatever gave the source its
+    // own: `val alias = made` where `made` came from a call's return type.
+    if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
+        if (try localInitTypeRef(b, init_expr)) |aliased| {
+            if (norecvCensusOn()) lm_localinit[1] += 1;
+            return aliased;
+        }
+    }
     // A property read carries its own declared type; nothing needs resolving.
     if (init_expr.* == .Member) {
         if (argDeclTypeRef(b, init_expr)) |declared| {
