@@ -653,16 +653,29 @@ answer is a MEMBER bind against the implicit receiver's type — the same
 resolution the explicit-receiver path already performs — and it needs that
 receiver's type.
 
-That makes the tractable slice concrete: `bareStaticRecvHead(b)` already gives
-the enclosing/spliced receiver head where one is known, and
-`resolveMemberCall` already binds against a head. Wiring the two together binds
-the bare calls whose receiver is statically known, and leaves the rest to the
-same typeck work as section 1. Measure the known-head fraction of the 5,403
-before building it — that fraction is the size of the prize.
+The obvious slice was built and MEASURED, and it does not pay: wiring
+`bareStaticRecvHead(b)` into `resolveMemberCall`, handing over the `this`
+register through the same `ReceiverState` the safe-call binding uses. Result on
+the pinned set:
 
-An arm binding the TOP-LEVEL reading was written and converted 4 sites out of
-~2,400, which is the correct outcome given the above: almost none of these
-sites have a top-level reading to bind. It is not landed.
+    census total   6485 -> 7477   (the bare sites now enter the census)
+    bound_virtual  1408 -> 1426   (+18)
+    no_class_id     617 -> 1583   (+966)
+
+Of the ~992 bare-member sites the arm actually reaches, 966 have an unsigned
+array receiver (`UByteArray`, `UIntArray`, `ULongArray`, `UShortArray`) — the
+host primitives with no IR class, section 5's category — and only 26 resolve at
+all. Naming the head by FQN rather than by unique simple name changed nothing;
+the heads already resolve (`kotlin.CharSequence`, `kotlin.Array`,
+`kotlin.String`).
+
+The gap between 5,403 and ~992 is sites where `b.resolve("this")` is null: the
+receiver is a CAPTURE, not a bound parameter. So the real prerequisite for this
+family is reaching a captured implicit receiver statically, which is the
+`*OrGlobal` capture-slot problem this document describes elsewhere — not
+receiver typing.
+
+Not landed. Do not rebuild it without first fixing the captured-receiver reach.
 
 ### 7. Genuinely dynamic by design
 
@@ -682,10 +695,10 @@ sites have a top-level reading to bind. It is not landed.
 2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
    180 sites left are genuine member/extension shadowing pairs that need
    argument types, so they fold into item 3.
-3. **Bind bare MEMBER calls against a statically known implicit receiver
-   (section 6)** — up to ~5,400 sites on the measured set, of which the
-   reachable share is those whose receiver head `bareStaticRecvHead` already
-   knows. Needs no typeck for that share and reuses `resolveMemberCall`.
+3. **Reach a CAPTURED implicit receiver statically (section 6).** The bare
+   member-call bind is built and measured at +18 without it, because the
+   receiver is a capture at ~4,400 of the sites. This is the prerequisite for
+   the whole `*OrGlobal` family.
 4. **The typeck generic-argument project — 3,886 sites, 60%.** The largest
    remaining piece and the only one that requires typeck work: substituting
    type arguments through call sites and propagating them from declarations, so
