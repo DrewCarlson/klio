@@ -1158,6 +1158,24 @@ test "catch_param_static_type" {
     );
 }
 
+test "member_header_binds_its_own_owner" {
+    try check("member_header_binds_its_own_owner",
+        \\true
+        \\false
+        \\false
+        \\true
+        \\false
+        \\true
+        \\true
+        \\true
+        \\false
+        \\true
+        \\true
+        \\true
+        \\
+    );
+}
+
 test "host_backed_receiver_virtual_slot" {
     try check("host_backed_receiver_virtual_slot",
         \\10,20,30,

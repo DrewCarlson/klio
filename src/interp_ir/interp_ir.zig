@@ -580,6 +580,7 @@ pub const ProgramImage = struct {
         const f = module.funcById(fid) orelse return;
         if (f.hasBody()) return;
         if (self.resolved_native.contains(fid.int())) return;
+        const receiver_formed = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         var sibs: std.ArrayList(FuncId) = .empty;
         errdefer sibs.deinit(self.allocator);
         for (module.funcsBySimpleName(f.name)) |cand| {
@@ -594,14 +595,31 @@ pub const ProgramImage = struct {
             // `foundation.text.getString`), and the caller never learned the
             // expect was missing.
             if (!std.mem.eql(u8, cf.package, f.package)) continue;
+            // Same package is not enough for a MEMBER. `kotlin.Double.equals`
+            // and `kotlin.String.equals` share the package `kotlin`, and
+            // settling the first with the second runs an implementation that
+            // rejects the receiver it is handed. A receiver-formed header is
+            // settled only by a declaration of its own class — the FQN up to
+            // its last component. Top-level `expect`/`actual` pairs, whose
+            // owner IS their package, are unaffected.
+            if (receiver_formed and
+                !std.mem.eql(u8, declaringOwnerOfFqn(cf.fqn), declaringOwnerOfFqn(f.fqn))) continue;
             try sibs.append(self.allocator, cand);
         }
         if (sibs.items.len != 0) {
             try self.resolved_redirect.put(fid.int(), try sibs.toOwnedSlice(self.allocator));
         }
-        if (self.bodylessNativeForm(bindings, f.fqn, f.name)) |intrinsic| {
+        if (self.bodylessNativeForm(bindings, f.fqn, f.name, receiver_formed)) |intrinsic| {
             try self.resolved_native.put(fid.int(), intrinsic);
         }
+    }
+
+    /// The declaring scope of a fully qualified name: everything before its
+    /// last component. For a member that is its class (`kotlin.Double`), for a
+    /// top-level function its package (`kotlin.collections`).
+    fn declaringOwnerOfFqn(fqn: []const u8) []const u8 {
+        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return "";
+        return fqn[0..dot];
     }
 
     /// User arity of a func (value params, excluding a synthesized `this`).
@@ -663,9 +681,21 @@ pub const ProgramImage = struct {
     /// The native form a bodyless decl's per-call ladder would have
     /// found: the declared FQN against the overlay then the embedded
     /// registry, then the bare-name map's FQN against both.
-    fn bodylessNativeForm(self: *const ProgramImage, bindings: *const HostBindings, fqn: []const u8, name: []const u8) ?StdlibFn {
+    fn bodylessNativeForm(
+        self: *const ProgramImage,
+        bindings: *const HostBindings,
+        fqn: []const u8,
+        name: []const u8,
+        receiver_formed: bool,
+    ) ?StdlibFn {
         if (bindings.resolve(fqn)) |i| return i;
         if (stdlib.implementation(fqn)) |i| return i;
+        // The bare-name map names TOP-LEVEL functions, so it cannot settle a
+        // member header: `kotlin.Double.equals` is not implemented by the
+        // package-level `equals`, and running that one rejects the receiver it
+        // is handed. A member's implementation is receiver-qualified and has
+        // already been tried by exact FQN above.
+        if (receiver_formed) return null;
         if (self.default_import_globals.get(name)) |mapped| {
             if (bindings.resolve(mapped)) |i| return i;
             if (stdlib.implementation(mapped)) |i| return i;

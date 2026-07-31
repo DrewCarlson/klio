@@ -9420,8 +9420,21 @@ pub fn invokeVirtualMember(
                 break :blk .{ .target = null, .name = mname };
             const target = module.methodSlotTarget(runtime_class, slot) orelse
                 break :blk .{ .target = null, .name = mname };
-            if (!virtualTargetExecutable(module, target))
+            // A bodyless declaration linked to a host symbol is executable —
+            // as that symbol. Dispatching through it is the whole point of
+            // binding the slot: it reaches the implementation by FuncId
+            // instead of matching the member by string.
+            if (!virtualTargetExecutable(module, target) and
+                host_call_func.resolvedNativeForm(self, target) == null)
                 break :blk .{ .target = null, .name = mname };
+            if (runtime.getenvSlice("KLIO_NOINST_TRACE") != null) {
+                std.debug.print("[noinst] recv_ty={s} slot={d} root={s} -> target={s}\n", .{
+                    receiver.typeFqn(),
+                    slot.int(),
+                    if (module.funcById(root)) |f| f.fqn else "?",
+                    if (module.funcById(target)) |f| f.fqn else "?",
+                });
+            }
             break :blk .{ .target = target, .name = mname };
         };
         if (noinst.target) |target| {
