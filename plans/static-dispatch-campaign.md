@@ -980,13 +980,24 @@ reverted at zero.
      it rejected NOTHING: `[promo-blocked]` reads identically to the digit
      across all four sub-buckets.
 
-     That null result is worth more than the change was. Only AUTHORITATIVE
-     argument evidence may reject a candidate, and at these sites there is
-     none — `buildStaticReturnArgShapes` leaves `ty` null for the literals and
-     generic values these calls pass. So this bucket is not gated on the
-     guard's structure, as previously assumed; it is gated on argument types,
-     which is the same typeck work `no_receiver_type` waits on. Reverted, and
-     worth rebuilding only AFTER argument types exist.
+     Extending it further, so a LITERAL argument disproves a candidate
+     (`rnd.nextInt(1)` cannot mean `Random.nextInt(range: IntRange)`), rejected
+     nothing either — and a per-candidate probe says why. Over a whole cold
+     stdlib lowering, ZERO of the guard's queries carry a literal argument at
+     all, and the ones that carry a declared type carry a broad one:
+
+         [extlit] f5611 params=1 IntRange  | lit=- ty=-
+         [extlit] f2522 params=1 Collection| lit=- ty=Iterable
+         [extlit] f2624 params=1 T         | lit=- ty=Short
+
+     Read them in order: the `nextInt` sites pass a local with no type at all;
+     the `addAll` sites pass an `Iterable` against a `Collection` parameter,
+     where the extension GENUINELY could apply because an Iterable need not be
+     a Collection; the third's parameter is a type variable, which nothing
+     disproves. So the blocked pairs are real ambiguities, not conservatism —
+     the guard is already answering correctly and there is nothing left in it
+     to tighten. Reverted; the bucket moves only when the ARGUMENTS acquire
+     types, which is the same typeck work `no_receiver_type` waits on.
 
 ### Measured dead end: the bound fallback in the Member arm
 
