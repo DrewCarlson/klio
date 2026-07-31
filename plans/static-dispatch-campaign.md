@@ -317,68 +317,46 @@ round — a 10x increase.
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
 
-### MEASURED, not landed: typing a local from its initializer is worth +253
+### MEASURED, not landed: two stacked slices worth +279
 
-The largest derivable slice of `no_receiver_type` is a local whose own
-declaration recorded no type but whose initializer is a call. Kotlin's inferred
-type for `val x = f()` IS `f`'s return type, and a `var`'s later assignment
-must conform to it, so the initializer's type is the local's type at every use.
-On the pinned set:
+Both are implemented, both are one test away, and the blocker for each is now
+identified precisely rather than guessed.
 
-    bound_virtual      1408 -> 1661   (+253, a 14% relative gain)
-    no_receiver_type   3886 -> 3549
+**(a) Type a local from its initializer — +253.** Kotlin's inferred type for
+`val x = f()` IS `f`'s return type, and a `var`'s later assignment must conform
+to it, so the initializer's type is the local's type at every use. Four lines:
+a `localInitTypeRef` helper feeding the two places that already call
+`staticCallReturnTypeRef`, gated on `staticClassifierArgsComplete`.
 
-The implementation is four lines — a `localInitTypeRef` helper feeding the two
-places that already call `staticCallReturnTypeRef` — and it is NOT landed,
-because it reintroduces exactly the pair of failures the earlier return-type
-channel hit:
+    bound          1666 -> 1919
+    no_receiver    3900 -> 3563
 
-    CollectionTest.plusCollectionInference   Expected <[[s], [a]]>, actual <[[s], a]>
-    GroupingTest.countEach                   expected a Grouping receiver
+**(b) Use the enclosing function's DECLARED receiver type, with its type
+arguments — a further +26.** `bareStaticRecvHead` yields a bare head, and a
+head whose arguments are missing is refused, which rules out every bare call in
+a generic extension body. `FuncBuilder.recvTypeRef()` already carries
+`Iterable<T>` rather than `Iterable`.
 
-Requiring the derived type's classifier arguments to be complete
-(`staticClassifierArgsComplete`) does NOT fix either: the derived types are
-already complete (`List args=1`, `Array args=1`, `Iterator args=1`).
+With (b) in place, **all four `plusElement` bodies bind their `plus(element)`
+statically and to the correct element overload**:
 
-**`countEach` is FIXED.** `groupingBy` is an inline extension returning
-`object : Grouping<T, K>`, so typing the receiver lets lowering splice that
-body and produce a genuine implementation — while klio's terminals
-(`eachCount`, `fold`, `reduce`) read `__grouping_src` and `__grouping_key` off
-their receiver and rejected anything else. `groupingParts` now falls back to
-the interface's own protocol (`sourceIterator()` + `hasNext`/`next`, then
-`keyOf`). That is a real bug in its own right: a Kotlin class implementing
-`Grouping` could not be aggregated at all, and it is fixed and covered
-independently of this lowering change.
+    [emit] Call fqn=kotlin.collections.plus fid=2130 in_fn=plusElement
+    [emit] Call fqn=kotlin.collections.plus fid=2131 in_fn=plusElement
+    [emit] Call fqn=kotlin.collections.plus fid=2169 in_fn=plusElement
+    [emit] Call fqn=kotlin.sequences.plus  fid=2490 in_fn=plusElement
 
-`plusCollectionInference` is the one thing still holding the +253 back. Traced
-to instruction level, and the picture corrects an earlier reading in this
-document — it is NOT a generic-body instantiation problem, and the five
-falsified theories recorded further down were all reaching for that:
+That was the mechanism this document blamed for `plusCollectionInference`, and
+fixing it does NOT fix the test — so the diagnosis recorded above is now
+superseded a second time and the failure is somewhere else again. Whoever picks
+this up: start by finding which of the three assertions in that test fails
+under (a)+(b), because every previous round assumed it was the first one.
 
-  - The CALL SITE emits `CallMember name=plusElement` — dynamic — with or
-    without the receiver typed. So the runtime chooses between
-    `Iterable<T>.plusElement` and `Collection<T>.plusElement` by name.
-  - The two bodies lower DIFFERENTLY.
-    `Collection<T>.plusElement` binds its `plus(element)` statically and
-    correctly: `[emit] Call fqn=kotlin.collections.plus fid=2131 in_fn=plusElement`,
-    which `[extkey]` ranks at 100105 over the concatenating overload's 100015.
-    `Iterable<T>.plusElement` emits `CallMemberOrGlobal name=plus` — a bare
-    call on an implicit receiver, the category section 6 lists as dynamic.
-  - At run time that dynamic `plus` sees a `List<List<String>>` receiver and a
-    `List<String>` argument, both `Iterable`, and picks the concatenating
-    overload. Hence `[[s], a]`.
+(b) also costs one new failure, `SequenceTest.onEach` (`Expected <6.0>, actual
+<6>`) — a numeric-type widening, so the declared receiver type is reaching an
+overload choice that the bare head left open.
 
-So the resolver's answer is right in one body and never asked for in the other,
-and the call site never commits to either declaration. Two independent things
-would each fix it, and both are wanted anyway:
-
-  1. Bind the call site. `[extkey]` at `CollectionTest.kt:531` scores the two
-     candidates `{1,1,0,0,60010,…}` and `{1,1,1,0,60010,…}` — they differ at
-     index 2, where `Collection` is higher, so the ranking already prefers the
-     more specific receiver. It is the EMISSION that is missing, as with the
-     member promotion that landed earlier in this round.
-  2. Bind `CallMemberOrGlobal` when the implicit receiver is statically known.
-     That is section 6's first item and it is worth far more than this one test.
+Neither is landed. The tree is green without them; the last verified census is
+1,666 of 6,655.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
