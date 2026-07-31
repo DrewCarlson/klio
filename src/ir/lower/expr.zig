@@ -12431,10 +12431,11 @@ fn lowerResolvedMemberCall(
             lm_norecv_path[@intFromEnum(which)] += 1;
             if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
                 if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
-                    std.debug.print("[no-recv-name] {s} {s} owner={s}\n", .{
+                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s}\n", .{
                         @tagName(which),
                         rn,
                         b.ownerClass() orelse "<none>",
+                        bareStaticRecvHead(b) orelse "<none>",
                     });
                 }
             }

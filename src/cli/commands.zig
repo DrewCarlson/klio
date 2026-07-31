@@ -983,7 +983,9 @@ pub fn runBuiltModuleArgs(
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
         ir.lower.expr.lowerDeclineDump();
+        ir.lower.expr.lowerPromoDump();
         ir.lower.expr.lowerLocalInitDump();
+        ir.lower.expr.lowerNoClassDump();
     }
     return switch (res) {
         .ok => 0,

@@ -949,6 +949,45 @@ including up its supertype chain.
 `KLIO_EXT_RECV_PROP=0` turns it off; `bare_name_inside_an_extension_body` pins
 it, printing `derived` for a `Base`-declared property when disabled.
 
+### Measured dead ends, all three with the reason
+
+Recorded so none is retried. Each was built, measured on BOTH file sets, and
+reverted at zero.
+
+  1. **A cast initializer lending its type.** `val n = x as Node` records
+     nothing, so the local goes untyped even though `argDeclTypeRefLazy`
+     already reads a cast's target type when the cast is the argument itself.
+     Adding `.As` to the recorded initializer kinds moved 0 sites: casts as
+     initializers are simply rare in both corpora.
+
+  2. **The splice hint as the bare-receiver owner.** The `storage` sites
+     (2,392, the largest single name in the `unknown` bucket) have
+     `owner=<none>` and `recv=UByteArray`, so the extension-receiver fallback
+     above should have answered them. It does not, and the reason is upstream
+     of lowering: `unsigned/src/kotlin/UByteArray.kt` is not in
+     `stdlib_sources.zig` at all — only `_UArrays.kt`, which holds the
+     EXTENSIONS, is compiled. The class that declares `storage` has no IR
+     declaration, so no property type head exists to find. Nor would binding
+     help: `storage` is a `ByteArray`, itself a host builtin with no vtable.
+     These sites belong to the host-symbol category, exactly as the unsigned
+     scalars in section 3 do.
+
+  3. **A type-aware extension guard.** `extCouldApply` merges its candidates'
+     arities per (receiver head, name), which loses per-declaration signatures
+     — so it can only ever answer on argument COUNT. Rebuilding the index to
+     store candidate FuncIds and asking `applicability.applicable` per
+     candidate makes it able to answer on argument TYPES as well. Built, and
+     it rejected NOTHING: `[promo-blocked]` reads identically to the digit
+     across all four sub-buckets.
+
+     That null result is worth more than the change was. Only AUTHORITATIVE
+     argument evidence may reject a candidate, and at these sites there is
+     none — `buildStaticReturnArgShapes` leaves `ty` null for the literals and
+     generic values these calls pass. So this bucket is not gated on the
+     guard's structure, as previously assumed; it is gated on argument types,
+     which is the same typeck work `no_receiver_type` waits on. Reverted, and
+     worth rebuilding only AFTER argument types exist.
+
 ### Measured dead end: the bound fallback in the Member arm
 
 `staticCallReturnTypeRef`'s `.Member` arm resolves its owner without the
