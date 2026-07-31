@@ -2591,8 +2591,8 @@ test "module image preserves linked identities with lazy function headers" {
         element_all,
         loaded.methodSlotTarget(element, ir.MethodSlotId.fromFunc(abstract_all)).?,
     );
-    try testing.expect(loaded.extCouldApply(a, "IntArray", "min"));
-    try testing.expect(!loaded.extCouldApply(a, "String", "min"));
+    try testing.expect(loaded.extCouldApply(a, "IntArray", "min", 0));
+    try testing.expect(!loaded.extCouldApply(a, "String", "min", 0));
     try testing.expectEqualStrings(
         "kotlin.IntArray.min",
         loaded.decl_sigs.get(min.int()).?.host_symbol.?,

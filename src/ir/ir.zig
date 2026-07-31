@@ -1615,8 +1615,8 @@ pub const Module = struct {
     /// that apply to every head. Rebuilt lazily when the declaration index
     /// has grown. Answers the E4c membership question the hierarchy sets
     /// cannot: could ANY extension named N serve receiver head H?
-    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(void)) = null,
-    generic_ext_names: ?std.StringHashMap(void) = null,
+    ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(ExtArity)) = null,
+    generic_ext_names: ?std.StringHashMap(ExtArity) = null,
     ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
@@ -5324,8 +5324,33 @@ pub const Module = struct {
     /// holding a site back before it can be tightened.
     pub const ExtCouldApplyWhy = enum { none, index_stale, generic_receiver, own_head, builtin_super, declared_super };
 
-    pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
-        return self.extCouldApplyWhy(allocator, head, name) != .none;
+    /// Merged value-argument counts the extensions of one name on one receiver
+    /// head can accept. An extension whose declaration cannot take this call's
+    /// argument count is not a candidate for it and so cannot shadow a member.
+    pub const ExtArity = struct {
+        min: u32 = 0,
+        max: u32 = std.math.maxInt(u32),
+
+        fn accepts(self: ExtArity, argc: usize) bool {
+            return argc >= self.min and argc <= self.max;
+        }
+
+        fn merge(self: ExtArity, other: ExtArity) ExtArity {
+            return .{
+                .min = @min(self.min, other.min),
+                .max = @max(self.max, other.max),
+            };
+        }
+    };
+
+    pub fn extCouldApply(
+        self: *Module,
+        allocator: Allocator,
+        head: []const u8,
+        name: []const u8,
+        argc: usize,
+    ) bool {
+        return self.extCouldApplyWhy(allocator, head, name, argc) != .none;
     }
 
     pub fn extCouldApplyWhy(
@@ -5333,28 +5358,42 @@ pub const Module = struct {
         allocator: Allocator,
         head: []const u8,
         name: []const u8,
+        argc: usize,
     ) ExtCouldApplyWhy {
         if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
             self.rebuildExtIndex(allocator) catch return .index_stale;
         }
-        if (self.generic_ext_names.?.contains(name)) return .generic_receiver;
+        if (self.generic_ext_names.?.get(name)) |arity| {
+            if (arity.accepts(argc)) return .generic_receiver;
+        }
         const idx = &self.ext_names_by_recv_head.?;
         if (idx.get(head)) |set| {
-            if (set.contains(name)) return .own_head;
+            if (set.get(name)) |arity| {
+                if (arity.accepts(argc)) return .own_head;
+            }
         }
         for (applicability.builtinSupersOf(head)) |sup| {
             if (idx.get(sup)) |set| {
-                if (set.contains(name)) return .builtin_super;
+                if (set.get(name)) |arity| {
+                    if (arity.accepts(argc)) return .builtin_super;
+                }
             }
         }
         if (self.registry.class_super_names.get(head)) |chain| {
             for (chain) |sup| {
                 if (idx.get(sup)) |set| {
-                    if (set.contains(name)) return .declared_super;
+                    if (set.get(name)) |arity| {
+                        if (arity.accepts(argc)) return .declared_super;
+                    }
                 }
             }
         }
         return .none;
+    }
+
+    fn mergeExtArity(map: *std.StringHashMap(ExtArity), name: []const u8, arity: ExtArity) Allocator.Error!void {
+        const gop = try map.getOrPut(name);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.merge(arity) else arity;
     }
 
     fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void {
@@ -5364,8 +5403,8 @@ pub const Module = struct {
             m.deinit();
         }
         if (self.generic_ext_names) |*m| m.deinit();
-        var idx = std.StringHashMap(std.StringHashMap(void)).init(allocator);
-        var gen = std.StringHashMap(void).init(allocator);
+        var idx = std.StringHashMap(std.StringHashMap(ExtArity)).init(allocator);
+        var gen = std.StringHashMap(ExtArity).init(allocator);
         for (self.func_index.items) |entry| {
             const ds = self.decl_sigs.get(entry.id.int());
             const f = if (ds == null) self.funcById(entry.id) else null;
@@ -5380,15 +5419,21 @@ pub const Module = struct {
                 null;
             const raw_head = (receiver_ty orelse continue).name;
             const head = staticTypeHead(raw_head);
+            // A declaration without a recorded signature contributes no arity
+            // bound, so it keeps the conservative answer for its name.
+            const arity: ExtArity = if (ds) |sig| .{
+                .min = sig.arity.required,
+                .max = if (sig.arity.has_vararg) std.math.maxInt(u32) else sig.arity.total,
+            } else .{};
             if (self.funcTypeParamIndex(entry.id, head) != null or
                 (head.len <= 2 and headAllUpper(head)))
             {
-                try gen.put(entry.name, {});
+                try mergeExtArity(&gen, entry.name, arity);
                 continue;
             }
             const gop = try idx.getOrPut(head);
-            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-            try gop.value_ptr.put(entry.name, {});
+            if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap(ExtArity).init(allocator);
+            try mergeExtArity(gop.value_ptr, entry.name, arity);
         }
         self.ext_names_by_recv_head = idx;
         self.generic_ext_names = gen;
@@ -9024,9 +9069,12 @@ test "extension candidate index uses declaration metadata for bodyless headers" 
         .has_body = true,
     });
 
-    try testing.expect(m.extCouldApply(a, "IntArray", "min"));
-    try testing.expect(!m.extCouldApply(a, "String", "min"));
-    try testing.expect(!m.extCouldApply(a, "IntArray", "max"));
+    try testing.expect(m.extCouldApply(a, "IntArray", "min", 0));
+    try testing.expect(!m.extCouldApply(a, "String", "min", 0));
+    try testing.expect(!m.extCouldApply(a, "IntArray", "max", 0));
+    // The extension declares no value parameters, so a one-argument call
+    // cannot select it and it cannot shadow a member of that name.
+    try testing.expect(!m.extCouldApply(a, "IntArray", "min", 1));
 }
 
 test "member resolution uses declaration-owner visibility" {

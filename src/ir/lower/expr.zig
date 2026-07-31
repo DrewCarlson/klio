@@ -12030,21 +12030,21 @@ fn lowerResolvedMemberCall(
             b.module.classes.items[static_owner.int()].is_value);
     const promo_ext_why: ir.Module.ExtCouldApplyWhy =
         if (resolved.dispatch == .deferred and resolved.target != null and !promo_blocked_by_class)
-            b.module.extCouldApplyWhy(b.allocator, head, name.name)
+            b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
         else
             .none;
     if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
+        if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
+            std.debug.print("[promo-ext] {s}.{s} nargs={d} why={s}\n", .{
+                head, name.name, args.len, @tagName(promo_ext_why),
+            });
+        }
         if (promo_blocked_by_class) {
             lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
         } else switch (promo_ext_why) {
             .none => {},
             .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
-            .generic_receiver => {
-                lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1;
-                if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
-                    std.debug.print("[promo-generic] {s}\n", .{name.name});
-                }
-            },
+            .generic_receiver => lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
             .own_head => lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
             .builtin_super => lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
             .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
@@ -12498,12 +12498,13 @@ fn staticReceiverHasNoCompetingCallable(
     b: *FuncBuilder,
     receiver_ty: ?TypeRef,
     name: []const u8,
+    argc: usize,
 ) bool {
     const ty = receiver_ty orelse return false;
     const head = typeHead(ty.name);
     const hierarchy = b.module.registry.hierarchy_shadow_names.get(head) orelse return false;
     if (!hierarchy.complete or hierarchy.names.contains(name)) return false;
-    return !b.module.extCouldApply(b.allocator, head, name);
+    return !b.module.extCouldApply(b.allocator, head, name, argc);
 }
 
 fn localOverloadReceiverCouldApply(
@@ -12716,7 +12717,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         const callable_shape_known = callable_takes_receiver or
             (b.isLocalFn(name.name) and !b.isLocalExtFn(name.name));
         if (callable_takes_receiver and
-            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name)))
+            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name, args.len)))
         {
             orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
             try b.push(.{ .CallValueWithThis = .{

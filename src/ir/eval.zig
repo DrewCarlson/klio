@@ -8513,7 +8513,7 @@ fn samCandidateInvoke(
         if (comptime @hasDecl(H, "valueCouldServeName")) {
             var j = ci + 1;
             while (j < cands.len) : (j += 1) {
-                if (host.valueCouldServeName(allocator, &cands[j].v, name_str)) return null;
+                if (host.valueCouldServeName(allocator, &cands[j].v, name_str, arg_values.len)) return null;
             }
         }
     }
@@ -8521,7 +8521,7 @@ fn samCandidateInvoke(
     if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) {
         std.debug.print("[sam-walk] name={s} nargs={d} ci={d} n={d} tags:", .{ name_str, arg_values.len, ci, cands.len });
         for (cands, 0..) |c, k| {
-            const served = if (comptime @hasDecl(H, "valueCouldServeName")) host.valueCouldServeName(allocator, &c.v, name_str) else false;
+            const served = if (comptime @hasDecl(H, "valueCouldServeName")) host.valueCouldServeName(allocator, &c.v, name_str, arg_values.len) else false;
             const cls: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf")) host.debugClassNameOf(&c.v) else "?";
             std.debug.print(" [{d}]{s}({s})/serve={}", .{ k, @tagName(c.v), cls, served });
         }

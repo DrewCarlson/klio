@@ -3636,7 +3636,7 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
     return cg.get().name;
 }
 
-pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8) bool {
+pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, argc: usize) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
     defer g.deinit();
@@ -3652,7 +3652,7 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
         }
         // extCouldApply rebuilds its lazy index when the func table has
         // grown; VM execution is single-threaded, so the cast is sound.
-        if (@constCast(m).extCouldApply(allocator, cls_name, name)) return true;
+        if (@constCast(m).extCouldApply(allocator, cls_name, name, argc)) return true;
     }
     const def = g.get().class.clone();
     defer def.deinit();
