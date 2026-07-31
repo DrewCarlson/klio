@@ -8069,7 +8069,14 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return result;
     }
     if (b.localInitExpr(p.segments[0].name)) |init| {
-        if (init != arg) {
+        // Following a local's initializer can re-enter this local. Kotlin has
+        // no such cycle — a local cannot be initialized from one declared
+        // after it — but lowering re-asks from a later point in the block,
+        // where every local is already bound, so `val a = b.x` beside
+        // `val b = a.y` reaches itself and recurses until the stack ends.
+        // Refuse to re-enter a local already on the chain.
+        if (init != arg and pushInitChain(p.segments[0].name)) {
+            defer popInitChain();
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
         }
     }
@@ -8084,6 +8091,26 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return .{ .name = nm, .nullable = false, .args = &.{} };
     }
     return null;
+}
+
+/// Locals whose initializer the declared-type walk is currently inside, so it
+/// can refuse to re-enter one. Bounded: past the cap the walk simply stops
+/// deriving, which is the same answer a null type already stands for.
+var init_chain: [16][]const u8 = @splat(&.{});
+var init_chain_len: usize = 0;
+
+fn pushInitChain(name: []const u8) bool {
+    if (init_chain_len == init_chain.len) return false;
+    for (init_chain[0..init_chain_len]) |seen| {
+        if (std.mem.eql(u8, seen, name)) return false;
+    }
+    init_chain[init_chain_len] = name;
+    init_chain_len += 1;
+    return true;
+}
+
+fn popInitChain() void {
+    init_chain_len -= 1;
 }
 
 fn staticTypeClassId(b: *const FuncBuilder, ty: ir.TypeRef) ?ir.ClassId {
@@ -8321,6 +8348,10 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (norecvCensusOn()) lm_localinit[0] += 1;
         return null;
     };
+    // Same cycle as the declared-type walk: deriving one local's type can
+    // reach back into it once every local in the block is bound.
+    if (!pushInitChain(name)) return null;
+    defer popInitChain();
     if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| {
         if (norecvCensusOn()) lm_localinit[1] += 1;
         return ctor_ty;

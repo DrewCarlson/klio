@@ -1110,7 +1110,8 @@ pub fn lowerClassWithExtras(
                 .is_suspend = false,
                 .is_expect = false,
                 .is_actual = false,
-                .visibility = .Public,
+                // Kotlin gives the accessor the property's own visibility.
+                .visibility = p.visibility,
                 .annotations = &.{},
                 .span = p.span,
             };
@@ -1144,7 +1145,7 @@ pub fn lowerClassWithExtras(
                     .arity = .{ .required = 0, .total = 0, .has_vararg = false },
                     .sig = &.{},
                     .kind = .instance_method,
-                    .visibility = .Public,
+                    .visibility = p.visibility,
                     .is_inline = false,
                     .is_suspend = false,
                     .has_body = true,
