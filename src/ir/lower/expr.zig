@@ -8358,11 +8358,19 @@ fn staticCallReturnTypeRef(
             if (path.segments.len != 1) return null;
             const name = path.segments[0];
             if (b.resolve(name.name) != null or b.isLocalFn(name.name) or
-                b.knowsOuter(name.name) or enclosingHasMemberNamed(b, name.name))
+                b.knowsOuter(name.name))
             {
                 return null;
             }
-            const res = try b.module.resolveCall(
+            // A name the enclosing receiver declares is a MEMBER call written
+            // without `this.`, not a top-level one — so it is exactly the case
+            // the implicit-receiver resolution below answers, and returning
+            // null here is what kept 908 bare `iterator()` initializers from
+            // lending their type.
+            const member_of_enclosing = enclosingHasMemberNamed(b, name.name);
+            const res = if (member_of_enclosing)
+                ir.Module.Resolution{ .target = null, .confidence = .deferred, .emit_form = .Call }
+            else try b.module.resolveCall(
                 b.allocator,
                 name.name,
                 b.self_package,
@@ -8379,7 +8387,16 @@ fn staticCallReturnTypeRef(
             );
             defer b.allocator.free(res.candidate_set);
             var from_implicit_receiver = false;
-            target = res.target orelse blk: {
+            // A top-level pick made under a lambda's conservative receiver is
+            // not evidence, and neither is no pick at all — but the implicit
+            // RECEIVER may still prove one. Measured, a bare `iterator()`
+            // inside a stdlib extension body lands here with a non-exact
+            // top-level pick, and it is 908 of the 1,346 initializers that
+            // yield no type.
+            const top_level_usable = res.target != null and
+                (res.confidence == .exact or
+                    (b.recvTy() == null and !b.isParamThunk()));
+            target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
                 // implicit receiver written without `this.` — measured, 908 of
@@ -8432,10 +8449,9 @@ fn staticCallReturnTypeRef(
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
             // still cannot lend its target's return type to another proof.
-            // A target resolved against the implicit RECEIVER carries no
-            // top-level confidence to check — the receiver is what proved it.
-            if (!from_implicit_receiver and res.confidence != .exact and
-                (b.recvTy() != null or b.isParamThunk())) return null;
+            // `top_level_usable` already applied the confidence check to the
+            // other branch; a receiver-proved target has none to check.
+            _ = &from_implicit_receiver;
         },
         .Member => |member| {
             receiver = if (argDeclTypeRefLazy(b, member.receiver)) |known|
