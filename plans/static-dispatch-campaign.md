@@ -560,6 +560,21 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
       1. Give a data class's `componentN` a real declaration at lowering, so
          the member path finds it and no extension is consulted. That also
          removes a whole class of collisions rather than this one.
+
+         Located: nothing in lowering knows about data-class members at all —
+         the only `is_data` in `lower/decl.zig` is a `= false` initialiser, and
+         the synthesis lives entirely in `host_call_member.zig` at run time.
+         `collectClassMemberNamesInto` and `collectHierarchyShadowNames`
+         (`interp_ir/build.zig`) walk DECLARED members, so `componentN` is
+         absent from `class_member_names` and from every per-class shadow set,
+         and `resolveMemberCall` walks declarations too. The accessor is
+         invisible to all three.
+
+         So the change is to emit `componentN` declarations for a data class's
+         primary-ctor properties during class lowering — `decl_sigs` entries
+         with the property's declared type as the return type, bodyless, served
+         by the existing runtime synthesis. Feeding the name sets alone is NOT
+         enough: `resolveMemberCall` consults declarations, not those sets.
       2. Make extension receiver matching FQN-aware for nested classifiers.
          Attempted at `staticHeadCompatibility` twice, including an FQN-suffix
          comparison, with no effect — that function is demonstrably not
