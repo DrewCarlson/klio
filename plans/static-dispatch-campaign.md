@@ -300,18 +300,21 @@ the only permitted exceptions being language features deliberately omitted
 section is the running ledger of what remains, so the tail can be worked through
 deliberately instead of rediscovered.
 
-Current census (`KLIO_DISPATCH_STATS`, collections/comparisons file set):
+Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 9,755 member call sites
-      274   2.81%  bound_static     <- direct FuncId call
-        9   0.09%  bound_virtual    <- method slot, no name lookup
+    total 6,485 member call sites
+      144   2.22%  bound_static     <- direct FuncId call
+      176   2.71%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    6,720  68.89%  no_receiver_type
-    1,862  19.09%  resolver_declined
-      747   7.66%  no_class_id
-      143   1.47%  nullable_or_generic
+    3,886  59.92%  no_receiver_type
+    1,540  23.75%  resolver_declined
+      617   9.51%  no_class_id
+      122   1.88%  nullable_or_generic
 
-Statically bound: 283 of 9,755 (2.9%). Every other line below is work.
+Statically bound: 320 of 6,485 (4.93%), up from 150 (2.34%).
+
+The earlier 9,755-site census in this document was taken on a different file
+set and at an unknown cache state; do not compare against it. Use the script.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
@@ -456,7 +459,59 @@ Note the counting: the safe-call sites were never in this bucket, because the
 safe-call arm did not reach the census at all. Converting them RAISED the site
 total (6403 -> 6485) rather than draining `nullable_or_generic`.
 
-### 5. Known to be dynamic by design
+### 5. Host-backed members — 1,226 sites, and the largest actionable bucket
+
+MEASURED, and much larger than this section previously assumed. On the pinned
+set (`scripts/dispatch-census.sh`), `resolver_declined` splits as:
+
+    1540  resolver_declined
+      1226  virtual_owner_abi     <- owner classifier is `specialized`
+        98  virtual_owner_stub
+        30  virtual_owner_value
+       186  target_known_deferred <- the extension-guard bucket, below
+
+The 1,226 are calls the resolver ALREADY resolved to `.virtual`. Lowering then
+discards the binding at one check:
+
+    if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
+        owner.receiver_abi != .instance) return .deferred;
+
+`receiver_abi` comes from `classifierReceiverAbi` — a hard-coded list of
+classifiers whose values are host-represented (`Int` is a `Value.Int`, a `List`
+is a `Value.List`), so a numeric slot indexing an `Instance` vtable cannot
+address them. By owner and member, the mass is ordinary container and primitive
+work:
+
+     375  kotlin.collections.ArrayList.add
+     128  kotlin.text.StringBuilder.append
+      74  kotlin.Int.toLong
+      68  kotlin.Short.toInt / kotlin.Byte.toInt
+      35  kotlin.Int.toDouble
+      27  kotlin.collections.Iterable.iterator
+      20  kotlin.collections.HashSet.add
+      16  kotlin.Any.toString
+
+**1,216 of the 1,226 resolved targets have no body.** They are implemented
+natively, so there is no IR function to call directly and no cheaper win
+hiding here — the receiver representation is not the only obstacle, the
+callee's absence is. Checked explicitly rather than assumed.
+
+What they need is the binding form this campaign has been deferring: an
+instruction that names a HOST SYMBOL numerically instead of matching a member
+by string. `host_call_member.zig` is a 14k-line name-keyed dispatcher
+(174 `std.mem.eql(u8, name, …)` chains), so the work is to give the host layer
+an addressable table and have lowering resolve `(owner_fqn, member, arity)`
+into an index once.
+
+That is the same requirement the C transpiler has and the bytecode VM has, so
+it should be designed once for all three rather than as an interpreter
+shortcut. It is the largest actionable bucket that needs nothing from typeck.
+
+The unsigned types from section 3 (`UInt`, `ULongArray`, ~146 sites) belong
+here, not to `no_class_id`: they are host primitives with no IR class, and
+giving them a `ClassId` would be inventing one.
+
+### 6. Genuinely dynamic by design
 
 Not counted as failures, but they must be enumerated before "full" means
 anything:
@@ -465,25 +520,30 @@ anything:
     either a member or a top-level function.
   - `LoadFromThisOrGlobal` / `StoreToThisOrGlobal` — the bare-name read/write
     walks over implicit receivers.
-  - Host-backed members: everything `host_call_member.zig` intercepts by NAME
-    (`stackTraceToString`, `addSuppressed`, collection builtins). A transpiler
-    needs these bound to concrete host symbols rather than matched by string.
   - `invoke` on a function value, and SAM conversion.
   - Reflection (`::member`, `KClass`) — the one category intended to stay
     dynamic and to be omitted where it cannot be.
 
 ### Ordering for the sweep
 
-1. Interface receivers with host-backed values (section 2) — unlocks 174
-   directly plus the 168 that section 3 already moved.
-2. Unsigned/primitive receivers (section 3) — ~146. NOT a registration fix:
-   these are host-implemented primitives with no IR class, so they need the
-   host-symbol binding form from section 5. Design with the transpiler's
-   requirement, not as a quick win.
-3. Nullable receivers (section 4) — ~143.
-4. Tighten `extCouldApply` (section 2).
-5. The typeck generic-argument project (section 1) — the 68%, and by far the
-   largest single piece.
+Re-derived from the measured split rather than from the original estimates.
+
+1. **Host-symbol binding form (section 5) — 1,354 sites.** The largest
+   actionable bucket, needs nothing from typeck, and is a prerequisite for both
+   the bytecode VM and the transpiler. Design the addressable host table once
+   for all three.
+2. **Tighten `extCouldApply` (section 2) — 186 sites**, of which 114 are
+   `ext_own_head`: an extension on the receiver's own head shares the name.
+   Kotlin's rule is that an applicable MEMBER always beats an extension, so the
+   guard is only needed because the member's applicability is unproven. Proving
+   applicability for the common shapes converts most of this.
+3. **The typeck generic-argument project (section 1) — 3,886 sites, 60%.** By
+   far the largest piece and the only one that genuinely requires typeck work.
+4. `no_class_id` (section 3) — 617, now mostly type parameters whose bounds
+   resolve, plus the unsigned host primitives that belong to section 5.
+
+Nullable receivers (section 4) are done as far as they should go: safe calls
+bind, and the rest is correct to decline.
 
 ### Measured: what is actually missing is a call's return type
 
