@@ -575,6 +575,28 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
          with the property's declared type as the return type, bodyless, served
          by the existing runtime synthesis. Feeding the name sets alone is NOT
          enough: `resolveMemberCall` consults declarations, not those sets.
+
+         Implementation shape, worked out but not written. The registration
+         site is `lower/decl.zig` around line 1046, where each member function
+         gets its `decl_sigs` entry; a synthesized accessor needs the same
+         three things a real one has:
+
+           - a `FuncId` from `module.nextFuncId()` and a bodyless `Func`
+             (`params = [this]`, `return_ty` = the property's declared type,
+             `kind = .instance_method`)
+           - an entry in the class's `methods` list, so the slot linker sees it
+           - a `decl_sigs` record with `has_body = false`
+
+         The one risk to check first: a bodyless declaration with no host
+         symbol previously reached "virtual method target is not executable".
+         The slot path now falls back to name dispatch when a target is
+         unrunnable (see the host-backed receiver entry above), which should
+         cover it — verify with the four narrowed programs before the sweep.
+
+         Scope warning: this adds declarations to EVERY data class in every
+         program, so it moves member resolution and the dispatch census
+         globally. It needs the full gate plus a census A/B on both file sets,
+         not a spot check.
       2. Make extension receiver matching FQN-aware for nested classifiers.
          Attempted at `staticHeadCompatibility` twice, including an FQN-suffix
          comparison, with no effect — that function is demonstrably not
