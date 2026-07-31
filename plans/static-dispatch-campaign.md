@@ -367,8 +367,26 @@ variable needed, from a different source:
     function-typed parameter it binds to, which `argLambdaParamTypes` already
     computes for the arity/receiver stamp.
   - a DESTRUCTURED component: `componentN()`'s declared return type on the
-    element type, which the loop rule above now has in hand for the `for
-    ((k, v) in pairs)` case.
+    element type, which the loop rule above now has in hand.
+
+    **BLOCKED, and by a correctness bug rather than by typing.** Destructuring
+    a DATA CLASS in a `for` loop fails at run time on the committed tree:
+
+        data class Entry(val key: String, val item: Item)
+        for ((k, it) in listOf(Entry("a", Item("x")))) { … }
+        -> runtime error: Vm::get_field `value` on `Entry`
+
+    `value` is a `Pair` field, so the loop's `component2` call is reaching
+    `kotlin.Pair.component2` instead of the data-class auto-member — which
+    `host_call_member.zig` does synthesize, reading `primary_params[n-1]`, so
+    the synthesis is fine and the call never gets there. Same simple-name
+    family as the `Double.equals` / `String.equals` collision fixed earlier.
+    Fix that first; the typing is four lines on top of it and cannot be tested
+    until the loop runs.
+
+    The typing itself was written and measured at ~0 on BOTH censuses (for-loop
+    destructuring is rare in the corpora), so it is not landed — there is
+    nothing it can be shown to bind while the data-class case cannot execute.
 
 Neither will move the pinned stdlib set for the same reason the loop variable
 did not, so BOTH censuses matter from here:
