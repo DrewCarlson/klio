@@ -1187,6 +1187,18 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "loop_variable_typed_from_element" {
+    try check("loop_variable_typed_from_element",
+        \\item:a;item:b;
+        \\item:c
+        \\6
+        \\item:a;item:b;pqr
+        \\1=one
+        \\2=two
+        \\
+    );
+}
+
 test "bare_call_lends_its_return_type" {
     try check("bare_call_lends_its_return_type",
         \\a/b

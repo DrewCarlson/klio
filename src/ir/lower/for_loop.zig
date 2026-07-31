@@ -85,6 +85,13 @@ pub fn lowerForLabeled(
     } });
     if (vars.len == 1) {
         try b.bind(vars[0].name, next_reg);
+        if (try expr.iterableElementTypeName(b, iter)) |elem| {
+            try b.setLocalDeclTypeOwned(vars[0].name, .{
+                .name = elem,
+                .nullable = false,
+                .args = &.{},
+            });
+        }
     } else {
         for (vars, 0..) |v, i| {
             const comp = b.allocReg();

@@ -8191,6 +8191,35 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     return derived;
 }
 
+/// The element type a `for (x in xs)` binds `x` to: the sole type ARGUMENT of
+/// the iterable's declared type. A loop variable has no initializer to derive
+/// from and is one of the three shapes making up the `no_initializer` census
+/// bucket, alongside a lambda parameter and a destructured component.
+///
+/// Conservative on purpose. A head with any argument count other than one is
+/// not an element sequence this can read, and an argument that is still a type
+/// PARAMETER names nothing — committing to it would disprove candidates a null
+/// type leaves open.
+pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
+    var owned: ?ir.TypeRef = null;
+    defer if (owned) |*t| t.deinit(b.allocator);
+    const ty: ir.TypeRef = blk: {
+        if (argDeclTypeRef(b, iter)) |known| break :blk known;
+        owned = (try staticCallReturnTypeRef(b, iter)) orelse
+            (try localInitTypeRef(b, iter)) orelse return null;
+        break :blk owned.?;
+    };
+    if (ty.args.len != 1) return null;
+    const elem = ty.args[0].name;
+    if (elem.len == 0 or ty.args[0].nullable) return null;
+    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) return null;
+    var head = elem;
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (b.module.classIdByFqn(head) == null and
+        b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
+    return try b.allocator.dupe(u8, elem);
+}
+
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
     const name = receiver.Path.segments[0].name;
