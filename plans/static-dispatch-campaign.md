@@ -302,190 +302,69 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,485 member call sites
-      144   2.22%  bound_static     <- direct FuncId call
-    1,408  21.71%  bound_virtual    <- method slot, no name lookup
+    total 6,955 member call sites
+      146   2.10%  bound_static     <- direct FuncId call
+    1,768  25.42%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    3,886  59.92%  no_receiver_type
-      308   4.75%  resolver_declined
-      617   9.51%  no_class_id
-      122   1.88%  nullable_or_generic
+    3,899  56.06%  no_receiver_type
+      675   9.71%  no_class_id
+      347   4.99%  resolver_declined
+      120   1.73%  nullable_or_generic
 
-Statically bound: 1,552 of 6,485 (23.9%), from 150 (2.34%) at the start of this
-round — a 10x increase.
+Statically bound: 1,914 of 6,955 (27.5%), from 150 (2.34%) at the start of this
+round.
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
 
-### LANDED since: the bare-call arm no longer needs complete type arguments
-
-The bare member/extension arm required the receiver head's type arguments to be
-complete, which refused every bare call written in a generic body — `Iterable`
-has one type parameter and the head carries none. The completeness rule is
-right for a DERIVED receiver type, where an under-specified head disproves
-candidates a null type would have left open; it is wrong for the declaration's
-OWN receiver, which the scorer already ranks. Dropping it there is worth +187
-and the sweep stays green.
-
-    bound  1,666 -> 1,853 of 6,905  (26.8%)
-
-### MEASURED, not landed: typing a local from its initializer, +287
+### LANDED: typing a local from its initializer
 
 Kotlin's inferred type for `val x = f()` IS `f`'s return type, and a `var`'s
 later assignment must conform to it, so the initializer's type is the local's
-type at every use. Four lines: a `localInitTypeRef` helper feeding the two
-places that already call `staticCallReturnTypeRef`, gated on
-`staticClassifierArgsComplete`.
+type at every use. `localInitTypeRef` feeds the two places that already call
+`staticCallReturnTypeRef`, gated on `staticClassifierArgsComplete` — a derived
+head whose type arguments are unknown disproves candidates a null type would
+have left open.
 
-    bound          1,853 -> 2,140 of 6,929   (30.9%)
-    no_receiver    3,918 -> 3,579
+    bound  1,853 -> 1,914 of 6,955   (27.5%)
 
-**`plusCollectionInference` is FIXED and the fix is landed separately.**
-`plusElement` is inline, so the call that matters was the SPLICED
-`plus(element)`, and `spliceHintRecv` carried only the head `Collection`. A
-bare head cannot separate `plus(element: T)` from `plus(elements: Iterable<T>)`.
-Carrying the spliced declaration's receiver TYPE settles it. On its own that
-changes no count, which is why it is committed as an enabler.
+It took ten attempts, and the nine that failed all share one shape: they
+theorised about WHICH overload was selected without first measuring WHICH CODE
+RAN. The probe that ended it is four lines in `callFunc`:
 
-One failure is left, and it is the only thing between this slice and landing:
+    [whosum] callFunc fqn=kotlin.sequences.sumOf fid=1961 body=true native=false
 
-    SequenceTest.onEach   Expected <6.0>, actual <6>
+`body=true` is the whole answer. `Sequence.sumOf` declares five overloads that
+differ ONLY in the selector's return type — `(T) -> Double` first, then Int,
+Long, UInt, ULong — and Kotlin picks among them by the lambda's INFERRED return
+type, which lowering does not have. With a typed receiver the call reached
+those Kotlin declarations and the pick fell to declaration order, so
+`sumOf { it.length }` ran the Double body and returned 6.0 for a sum of 6.
 
-    val sum = newData.sumOf { it.length }
-    assertEquals(sum, count)
+Registering a host `kotlin.sequences.Sequence.sumOf` did NOT fix it on its own,
+because the declaration join at `linkResolvedForms` skips a body-bearing
+symbol — the intrinsic was linked for nothing. `intrinsicOverridesBody` now
+names the few symbols whose host implementation must serve anyway. This one
+qualifies on both counts: it reads the accumulator kind from the first value it
+computes, which is the answer Kotlin's typed selection reaches, and
+`iterableItemsCtx` drains a host `.Sequence` and an interpreted one alike, so it
+covers the same receivers the Kotlin body does.
 
-`sumOf` has `(T) -> Int` and `(T) -> Double` overloads; the selector returns
-`Int`, so `sum` must be `6`, and it comes out `6.0`.
-
-What the probe rules out, so it is not re-derived: **the only local this slice
-types in that test is `data -> Sequence<String>`, which is correct.** Neither
-`newData` nor `sum` is typed by it — `staticCallReturnTypeRef` declines a
-member-call initializer. So the failure is DOWNSTREAM of typing `data`: with a
-typed receiver, `data.onEach { … }` binds statically and splices, and something
-in that path makes the later `newData.sumOf { … }` select the `Double` overload
-at run time.
-
-Two guards were tried against it and BOTH cost sites without fixing it —
-do not retry them:
+What NOT to repeat, all measured:
 
   - rejecting a derived type whose arguments are still the declaration's own
-    type parameters (`Sequence<T>`): 2,140 -> 1,816
-  - requiring the initializer's callee to be `unique_concrete`: 2,140 -> 1,756
+    type parameters — costs 12 sites, fixes nothing (removed once the real
+    cause was found)
+  - requiring the initializer's callee to be `unique_concrete` — costs 384
+  - a `returnTypeAmbiguous` gate on `staticCallReturnTypeRef`: costs 18 scoped
+    to the receiver head, breaks `SequenceTest.zipWithNext` scoped
+    program-wide, and does not close the failure either way
+  - the pipeline lambda's BODY is not a variable: `onEach { }` and
+    `onEach { count += it.length }` behave identically
 
-Traced further, and the mechanism is named. `KLIO_MISS_TRACE=sumOf` shows
-
-    [ohtl] sumOf: 80 candidates argc=1
-    [ohtl] sumOf: cand #1804 params=2 body=true last_ty=Function1 last_arity=1
-    ... 79 more, every one identical in shape
-
-`overloadHostingTrailingLambda` walks that set to decide the trailing lambda's
-SHAPE, and its tie-break is "the overload whose leading `this` matches the
-enclosing receiver type, else declaration order". Its pick then feeds
-`recordLambdaArgReceivers`, which stamps the lambda's parameter types as if the
-choice were authoritative. Among `sumOf`'s overloads the shapes are identical —
-they differ only in the selector's RETURN type, `(T) -> Int` against
-`(T) -> Double` — so the walk cannot discriminate them and the stamp is a
-guess.
-
-Confirmed pre-existing: the same 80-candidate walk runs on the green tree (292
-trace lines) and happens to pick correctly there. Typing `data` changes which
-candidate wins, so the slice does not introduce the defect, it merely lands on
-the other side of a coin that was already being flipped.
-
-That reclassifies this slice. Kotlin selects `sumOf` by the lambda's INFERRED
-RETURN TYPE, which lowering does not have, so the honest conclusion is that
-these +287 sites are not independent of the typeck project after all — they
-need the same lambda/element type inference as section 1.
-
-Fix (1) is LANDED and did not unblock the slice.
-`overloadHostingTrailingLambda` now declines when its surviving candidates
-differ in the trailing lambda's return type, so the `sumOf` walk records
-nothing instead of guessing. That is correct on its own — the sweep, the unit
-modules and compose are all green with it — but `SequenceTest.onEach` still
-fails once locals are typed, so the wrong lambda stamp was not the (only)
-mechanism.
-
-REDUCED to a five-line program, which is where this should have started:
-
-    val data = sequenceOf("foo", "bar")
-    val newData = data.onEach { }
-    println(newData.sumOf { it.length })          // 6.0   WRONG
-    println(data.sumOf { it.length })             // 6
-    println(listOf("foo", "bar").sumOf { it.length })  // 6
-
-Any pipeline op has the same effect — `map { it }` and `filter { true }` also
-produce a sequence whose `sumOf` returns 6.0, while the raw `sequenceOf` and a
-plain `List` are both correct. `toList()` and `count()` on the derived sequence
-are correct too.
-
-And the decisive measurement: a `[retty]` probe inside `ivCallableReturnTy`
-fires for the two CORRECT calls and NOT for the 6.0 one. So the derived
-sequence's `sumOf` never reaches `coll_iter_sum_of` at all — klio's host
-sequence terminal path (`isSequenceTerminal` -> `materialiseSequence` ->
-`callMemberRec` on a List) is not what serves it. With the receiver typed,
-`data.onEach { }` binds statically to the KOTLIN `kotlin.sequences.onEach`,
-whose body is `map { action(it); it }`, and that produces an interpreted
-sequence rather than the host `.Sequence` value the terminal path expects.
-
-There are TWO mechanisms, and one of them now has a verified fix:
-
-**(i) The interpreted sequence's `sumOf`.** `iterableItemsCtx` already drains a
-host `.Sequence` and an interpreted one alike (`drainViaIterator`), and
-`coll_iter_sum_of` reads the accumulator kind from the first value it computes.
-Registering
-
-    .{ .fqn = "kotlin.sequences.Sequence.sumOf", .f = collections.coll_iter_sum_of },
-
-fixes the five-line reduction under the slice — 6, 6, 6 — and the sweep, the
-unit modules and compose all stay green with it. It is NOT committed, because
-without the slice it changes nothing observable and there is no test that fails
-when it is removed. Apply it as part of landing the slice.
-
-**(ii) `sum`'s own derived type.** With (i) applied the test STILL fails, and
-the remaining path is the slice typing `val sum = newData.sumOf { … }` from
-`sumOf`'s declared return type. `Double` is the first of the five declarations,
-so `sum` is typed `Double`, `assertEquals(sum, count)` binds a `Double`
-overload, and 6 renders as 6.0.
-
-That generalises: **`staticCallReturnTypeRef` must not derive a return type
-from an overload set whose members differ in their return type.** The precise
-version was written and MEASURED — a `returnTypeAmbiguous` check over
-same-name, same-arity, same-receiver-head siblings:
-
-    gate alone:                 1,853 -> 1,835   green, costs 18 sites
-    gate scoped program-wide:   1,853 -> 1,761   and breaks SequenceTest.zipWithNext
-    gate + (i) + the slice:     1,853 -> 1,884   SequenceTest.onEach STILL fails
-
-So all three pieces together do not close it either, and the gate on its own is
-a net loss with nothing to show for it. It is not committed.
-
-ELIMINATED: the pipeline lambda's body is not the variable. Both
-`onEach { }` and `onEach { count += it.length }` reproduce 6.0 under the slice,
-and both are correct without it. So the last uncontrolled difference between
-the reduction and the test is gone, and the reduction IS faithful.
-
-Also corrected: the host `Sequence.sumOf` registration does NOT fix the
-non-empty-lambda shape, only the `map`/`filter`/empty-`onEach` ones. So (i) is
-a partial fix for a family of shapes rather than the fix for this test, and the
-earlier entry claiming it closed the reduction was over-stated.
-
-What that leaves — and it is now a small, well-posed question rather than a
-theory: under the slice, `sequenceOf(...).onEach { … }.sumOf { it.length }`
-returns a Double, and the host implementation that infers the kind from values
-is not what serves it. Determine WHICH code computes that sum, with a probe
-rather than by reading registrations; every attempt so far has assumed an
-answer to that question instead of measuring it, and each assumption has been
-wrong.
-
-Six attempts against the symptom are recorded below so none is repeated; all
-were measured, none worked.
-
-Two guards were tried against the symptom and BOTH cost sites without fixing
-it — do not retry them:
-
-  - rejecting a derived type whose arguments are still the declaration's own
-    type parameters (`Sequence<T>`): 2,140 -> 1,816
-  - requiring the initializer's callee to be `unique_concrete`: 2,140 -> 1,756
+The lesson worth keeping, since it cost nine rounds: when a stdlib call returns
+the wrong thing, find out which function executed before reasoning about which
+one should have.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
