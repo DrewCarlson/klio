@@ -302,20 +302,50 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,929 member call sites
+    total 6,913 member call sites
       146   2.11%  bound_static     <- direct FuncId call
-    1,994  28.78%  bound_virtual    <- method slot, no name lookup
+    2,089  30.22%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    3,579  51.65%  no_receiver_type
-      675   9.74%  no_class_id
-      415   5.99%  resolver_declined
-      120   1.73%  nullable_or_generic
+    3,468  50.17%  no_receiver_type
+      675   9.76%  no_class_id
+      415   6.00%  resolver_declined
+      120   1.74%  nullable_or_generic
 
-Statically bound: 2,140 of 6,929 (30.9%), from 150 (2.34%) at the start of this
+Statically bound: 2,235 of 6,913 (32.3%), from 150 (2.34%) at the start of this
 round.
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
+
+### The remaining `no_receiver_type` mass, measured
+
+`KLIO_DISPATCH_STATS` now reports why local typing declined, and
+`KLIO_LI_NAMES` names the callees that yield nothing:
+
+    [localinit] 2,228 total
+                  350  no_initializer     <- loop var, lambda param, destructure
+                1,346  no_return_type
+                  532  derived
+
+    initializers that yield no type, by callee:
+        908  iterator          <- bare call
+         88  .iterator
+         72  listIterator
+         66  .getOrPut
+         34  toMutableList
+         30  createFrom
+
+**`iterator` alone is 908 of the 1,346**, and it did NOT move when bare calls
+were taught to lend their return type, nor when the `res.confidence` guard was
+lifted off receiver-proved targets. So those calls fail before either change
+reaches them, and the next step is to find out where — with a probe on one of
+them, not by reasoning about which of `bareStaticRecvHead`, the owner lookup,
+or `resolveMemberCall` is most likely. The last time this document guessed at
+that class of question it cost nine rounds.
+
+A local typed `Iterator<T>` binds `hasNext`/`next`, so this one bucket is worth
+roughly a thousand sites on its own — the largest single remaining item, ahead
+of the generic-argument project.
 
 ### LANDED: typing a local from its initializer
 
