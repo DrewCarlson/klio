@@ -302,16 +302,16 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,955 member call sites
-      146   2.10%  bound_static     <- direct FuncId call
-    1,768  25.42%  bound_virtual    <- method slot, no name lookup
+    total 6,929 member call sites
+      146   2.11%  bound_static     <- direct FuncId call
+    1,994  28.78%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    3,899  56.06%  no_receiver_type
-      675   9.71%  no_class_id
-      347   4.99%  resolver_declined
+    3,579  51.65%  no_receiver_type
+      675   9.74%  no_class_id
+      415   5.99%  resolver_declined
       120   1.73%  nullable_or_generic
 
-Statically bound: 1,914 of 6,955 (27.5%), from 150 (2.34%) at the start of this
+Statically bound: 2,140 of 6,929 (30.9%), from 150 (2.34%) at the start of this
 round.
 
 The earlier 9,755-site census in this document was taken on a different file
@@ -326,7 +326,11 @@ type at every use. `localInitTypeRef` feeds the two places that already call
 head whose type arguments are unknown disproves candidates a null type would
 have left open.
 
-    bound  1,853 -> 1,914 of 6,955   (27.5%)
+    bound  1,853 -> 2,140 of 6,929   (30.9%)
+
+A CONSTRUCTOR initializer is derived too, and needs no return type at all:
+`val x = Foo()` reaches the census as `no_func`, because the callee resolves to
+a class rather than to a function.
 
 It took ten attempts, and the nine that failed all share one shape: they
 theorised about WHICH overload was selected without first measuring WHICH CODE
