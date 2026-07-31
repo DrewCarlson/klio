@@ -384,15 +384,25 @@ value need not be an interpreted `Instance` — a `Sequence` is a generator — 
 falls back to the member's name only when that class implements it natively
 and there is no body to enter.
 
-Measured A/B on one pinned file set (`scripts/dispatch-census.sh`, one build,
-one command each way — the pinned set exists because an earlier round compared
-counts taken on different file sets and read a gain that was never there):
+Measured cold A/B on one pinned file set (`scripts/dispatch-census.sh`), for
+the whole of this session's dispatch work — interface receivers plus the
+safe-call binding below:
 
-    interfaces excluded:  bound_static 144  bound_virtual   6   declined 1670
-    interfaces included:  bound_static  72  bound_virtual  88   declined  766
+    before:  bound_static 144  bound_virtual   6  = 150 / 6403   2.34%
+             resolver_declined 1670   nullable_or_generic 122
+    after:   bound_static 144  bound_virtual 176  = 320 / 6485   4.93%
+             resolver_declined 1540   nullable_or_generic 122
 
-`[decline] target_known_deferred` falls 386 -> 93 on that set. Full stdlib
-sweep 117 files / 0 failures, compose 148/148.
++170 statically bound sites, a 113% increase. Full stdlib sweep 117 files / 0
+failures, compose 148/148.
+
+A measurement trap found the hard way, and the reason the census script now
+clears the cache: **lowering is on demand, so a warm run lowers roughly half
+the program.** A warm run of this same set reports total=3519 against a cold
+6485, and every bucket scales with it. An earlier A/B in this session compared
+a cold "before" against a warm "after" and read a bound_static DROP from 144 to
+72 that did not exist. Two censuses are comparable only at the same cache
+state; the script clears it so that state is always cold.
 
 Still open in this bucket: **the rest of the `unknown_count == 1` set**, where
 `extCouldApply` cannot rule out an extension. It answers yes for any
@@ -428,11 +438,23 @@ information; they need a binding form that names a HOST SYMBOL directly. That is
 the same requirement the C transpiler has, so the two should be designed
 together rather than separately.
 
-### 4. `nullable_or_generic` — 143 (1.5%).
+### 4. `nullable_or_generic` — safe calls LANDED; the rest is correct.
 
-A nullable receiver type is refused outright. `a?.f()` still has a static target
-on the non-null branch, so most of this should be reachable by binding the
-call inside the null check rather than declining the whole site.
+A nullable receiver type refused the whole site. Half of that was wrong: a
+SAFE call's member runs on the branch where the receiver has already been
+tested for null, which is exactly the receiver a member declaration expects.
+The safe-call arm now attempts a static binding there and hands over the
+register it already lowered, so the receiver expression is evaluated once.
+
+What remains in this bucket is CORRECT to decline. For a non-safe `x.f()` on a
+nullable `x`, an extension declared on `T?` is the only thing that can make the
+call compile at all, and such an extension outranks a member. Binding the
+member there would change which declaration runs. The 122 sites left on the
+pinned set are that shape.
+
+Note the counting: the safe-call sites were never in this bucket, because the
+safe-call arm did not reach the census at all. Converting them RAISED the site
+total (6403 -> 6485) rather than draining `nullable_or_generic`.
 
 ### 5. Known to be dynamic by design
 
