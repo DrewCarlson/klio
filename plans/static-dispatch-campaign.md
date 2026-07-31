@@ -459,12 +459,23 @@ same-name, same-arity, same-receiver-head siblings:
 So all three pieces together do not close it either, and the gate on its own is
 a net loss with nothing to show for it. It is not committed.
 
-The one difference left between the failing test and the five-line reduction
-that (i) fixes: the test's pipeline lambda has a BODY
-(`data.onEach { count += it.length }`) where the reduction's is empty
-(`onEach { }`). Check that difference before anything else — it is the only
-variable not yet controlled for, and eight measured attempts have now been
-spent on theories that skipped it.
+ELIMINATED: the pipeline lambda's body is not the variable. Both
+`onEach { }` and `onEach { count += it.length }` reproduce 6.0 under the slice,
+and both are correct without it. So the last uncontrolled difference between
+the reduction and the test is gone, and the reduction IS faithful.
+
+Also corrected: the host `Sequence.sumOf` registration does NOT fix the
+non-empty-lambda shape, only the `map`/`filter`/empty-`onEach` ones. So (i) is
+a partial fix for a family of shapes rather than the fix for this test, and the
+earlier entry claiming it closed the reduction was over-stated.
+
+What that leaves — and it is now a small, well-posed question rather than a
+theory: under the slice, `sequenceOf(...).onEach { … }.sumOf { it.length }`
+returns a Double, and the host implementation that infers the kind from values
+is not what serves it. Determine WHICH code computes that sum, with a probe
+rather than by reading registrations; every attempt so far has assumed an
+answer to that question instead of measuring it, and each assumption has been
+wrong.
 
 Six attempts against the symptom are recorded below so none is repeated; all
 were measured, none worked.
