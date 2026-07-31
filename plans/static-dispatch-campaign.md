@@ -304,14 +304,15 @@ Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
     total 6,485 member call sites
       144   2.22%  bound_static     <- direct FuncId call
-      176   2.71%  bound_virtual    <- method slot, no name lookup
+    1,408  21.71%  bound_virtual    <- method slot, no name lookup
     ------------------------------
     3,886  59.92%  no_receiver_type
-    1,540  23.75%  resolver_declined
+      308   4.75%  resolver_declined
       617   9.51%  no_class_id
       122   1.88%  nullable_or_generic
 
-Statically bound: 320 of 6,485 (4.93%), up from 150 (2.34%).
+Statically bound: 1,552 of 6,485 (23.9%), from 150 (2.34%) at the start of this
+round — a 10x increase.
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -472,57 +473,59 @@ Note the counting: the safe-call sites were never in this bucket, because the
 safe-call arm did not reach the census at all. Converting them RAISED the site
 total (6403 -> 6485) rather than draining `nullable_or_generic`.
 
-### 5. Host-backed members — 1,226 sites, and the largest actionable bucket
+### 5. Host-backed members — LANDED. 1,226 sites bound.
 
-MEASURED, and much larger than this section previously assumed. On the pinned
-set (`scripts/dispatch-census.sh`), `resolver_declined` splits as:
-
-    1540  resolver_declined
-      1226  virtual_owner_abi     <- owner classifier is `specialized`
-        98  virtual_owner_stub
-        30  virtual_owner_value
-       186  target_known_deferred <- the extension-guard bucket, below
-
-The 1,226 are calls the resolver ALREADY resolved to `.virtual`. Lowering then
-discards the binding at one check:
+`classifierReceiverAbi` marks the classifiers whose values the runtime
+represents natively — `Int`, `String`, `ArrayList`, `StringBuilder`,
+`Iterator`, and about 120 more. A numeric slot cannot index a vtable on such a
+value, so lowering discarded the resolver's `.virtual` verdict at every site
+with one of those as its static receiver:
 
     if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
         owner.receiver_abi != .instance) return .deferred;
 
-`receiver_abi` comes from `classifierReceiverAbi` — a hard-coded list of
-classifiers whose values are host-represented (`Int` is a `Value.Int`, a `List`
-is a `Value.List`), so a numeric slot indexing an `Instance` vtable cannot
-address them. By owner and member, the mass is ordinary container and primitive
-work:
+That was 1,226 of the 1,540 declines, and it covered the most ordinary work in
+the language — `ArrayList.add` (375), `StringBuilder.append` (128),
+`Int.toLong` (74), `Iterable.iterator` (27).
 
-     375  kotlin.collections.ArrayList.add
-     128  kotlin.text.StringBuilder.append
-      74  kotlin.Int.toLong
-      68  kotlin.Short.toInt / kotlin.Byte.toInt
-      35  kotlin.Int.toDouble
-      27  kotlin.collections.Iterable.iterator
-      20  kotlin.collections.HashSet.add
-      16  kotlin.Any.toString
+**The slot is the right emission regardless of representation.** The receiver's
+representation is a RUNTIME property; the slot names a declaration.
+`invokeVirtualMember` resolves it against an interpreted receiver's own class,
+so a user class implementing `Iterator` still gets its override, and against
+the runtime class of a host-backed value otherwise.
 
-**1,216 of the 1,226 resolved targets have no body.** They are implemented
-natively, so there is no IR function to call directly and no cheaper win
-hiding here — the receiver representation is not the only obstacle, the
-callee's absence is. Checked explicitly rather than assumed.
+Three defects had to be fixed for that to hold, each surfaced by the sweep
+rather than predicted:
 
-What they need is the binding form this campaign has been deferring: an
-instruction that names a HOST SYMBOL numerically instead of matching a member
-by string. `host_call_member.zig` is a 14k-line name-keyed dispatcher
-(174 `std.mem.eql(u8, name, …)` chains), so the work is to give the host layer
-an addressable table and have lowering resolve `(owner_fqn, member, arity)`
-into an index once.
+  - A slot with no entry for the receiver's class raised
+    `virtual method slot is not linked`. It now dispatches by the member's
+    name. A slot is a static hint, and when the runtime cannot honour it the
+    site should behave as it did before it was bound, not fail.
+  - The same for a slot resolving to a declaration with no body, no linked host
+    symbol, and no SAM callable.
+  - `invokeMethodFuncId` entered a frame for a bodyless declaration even when
+    that declaration was linked to a host symbol, turning the call into an
+    empty frame (`virtual method target is not executable` from
+    `GroupingTest`). It now routes those through the call path that consults
+    the linkage. This was a latent bug, not one this change introduced — it
+    only became reachable once these slots bound.
 
-That is the same requirement the C transpiler has and the bytecode VM has, so
-it should be designed once for all three rather than as an interpreter
-shortcut. It is the largest actionable bucket that needs nothing from typeck.
+What this does NOT do is remove the string compare inside the host layer. The
+slot identifies the declaration statically; a host-backed receiver then reaches
+`callMemberNamed`. Finishing that is the remaining piece, and the pieces are
+already in place: `src/stdlib/implementations.zig` is a static table of 1,578
+`{fqn, StdlibFn}` entries, `DeclSig.host_symbol` links a declaration to its
+entry, and `ProgramImage.resolved_native` maps `FuncId -> StdlibFn`. What is
+missing is dispatching a host-backed virtual call through that map instead of
+by name. That is also exactly the mapping a C transpiler emits: one table entry
+per host symbol.
+
+Remaining in this family: 98 `virtual_owner_stub` and 30 `virtual_owner_value`.
+A stub class is declaration-only and a value class has no instance identity, so
+both need the host-symbol route above rather than a slot.
 
 The unsigned types from section 3 (`UInt`, `ULongArray`, ~146 sites) belong
-here, not to `no_class_id`: they are host primitives with no IR class, and
-giving them a `ClassId` would be inventing one.
+here too: host primitives with no IR class.
 
 ### 6. Genuinely dynamic by design
 
@@ -539,19 +542,18 @@ anything:
 
 ### Ordering for the sweep
 
-Re-derived from the measured split rather than from the original estimates.
-
-1. **Host-symbol binding form (section 5) — 1,354 sites.** The largest
-   actionable bucket, needs nothing from typeck, and is a prerequisite for both
-   the bytecode VM and the transpiler. Design the addressable host table once
-   for all three.
+1. ~~Host-backed receivers~~ — LANDED, 1,226 sites. What is left of it is the
+   host-symbol dispatch itself (`resolved_native` instead of a name compare),
+   plus the 128 stub/value sites that need the same route.
 2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
    180 sites left are genuine member/extension shadowing pairs that need
    argument types, so they fold into item 3.
-3. **The typeck generic-argument project (section 1) — 3,886 sites, 60%.** By
-   far the largest piece and the only one that genuinely requires typeck work.
-4. `no_class_id` (section 3) — 617, now mostly type parameters whose bounds
-   resolve, plus the unsigned host primitives that belong to section 5.
+3. **The typeck generic-argument project — 3,886 sites, 60%.** Now by a wide
+   margin the largest remaining piece, and the only one that requires typeck
+   work: substituting type arguments through call sites and propagating them
+   from declarations, so a `List`'s or an `Array`'s element type is known.
+4. `no_class_id` — 617, mostly type parameters whose bounds resolve plus the
+   unsigned host primitives that belong to section 5.
 
 Nullable receivers (section 4) are done as far as they should go: safe calls
 bind, and the rest is correct to decline.
