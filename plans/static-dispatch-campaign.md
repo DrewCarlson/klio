@@ -970,6 +970,14 @@ five shapes and prints `derived` for every one of them when disabled.
 Recorded so none is retried. Each was built, measured on BOTH file sets, and
 reverted at zero.
 
+  0. **A Boolean result for the comparison and logical operators.** `a < b`,
+     `a in b`, `a && b` all yield `Boolean` with no resolution needed, and the
+     `Binary` receivers are 178 of the stdlib bucket. Returning it directly
+     moved nothing in either census AND nothing into `no_class_id` either,
+     which means those receivers are not those operators — the remaining
+     `Binary` mass is `Elvis` and `Assign`, whose type is the operand's, not
+     the operator's. Reverted.
+
   1. **A cast initializer lending its type.** `val n = x as Node` records
      nothing, so the local goes untyped even though `argDeclTypeRefLazy`
      already reads a cast's target type when the cast is the argument itself.
