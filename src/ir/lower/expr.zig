@@ -15864,6 +15864,44 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), bounded_inst.CallVirtual.slot);
 }
 
+test "the declared-type walk terminates on a cyclic initializer chain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+
+    // `a`'s type comes from `b.field`, and `b`'s from `a.field`. Kotlin cannot
+    // write that, but lowering asks about both from a point where both are
+    // bound, and the walk followed the chain forever.
+    var a_path = [_]ast.Ident{.{ .name = "a", .span = dummySpan() }};
+    var b_path = [_]ast.Ident{.{ .name = "b", .span = dummySpan() }};
+    var a_recv = Expr{ .Path = .{ .segments = &a_path, .span = dummySpan() } };
+    var b_recv = Expr{ .Path = .{ .segments = &b_path, .span = dummySpan() } };
+    const a_init = Expr{ .Member = .{
+        .receiver = &b_recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const b_init = Expr{ .Member = .{
+        .receiver = &a_recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    try b.bind("a", b.allocReg());
+    try b.bind("b", b.allocReg());
+    try b.setLocalInitExpr("a", &a_init);
+    try b.setLocalInitExpr("b", &b_init);
+
+    try testing.expect(argDeclTypeRefLazy(&b, &a_recv) == null);
+    try testing.expect(argDeclTypeRefLazy(&b, &b_recv) == null);
+    try testing.expectEqual(@as(usize, 0), init_chain_len);
+}
+
 test "explicit member extension emits its resolved declaration identity" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
