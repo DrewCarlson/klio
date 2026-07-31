@@ -1158,6 +1158,19 @@ test "catch_param_static_type" {
     );
 }
 
+test "safe_call_binds_on_non_null_branch" {
+    try check("safe_call_binds_on_non_null_branch",
+        \\node:a!
+        \\null
+        \\evaluations=2
+        \\inner:a
+        \\null
+        \\evaluations=4
+        \\node:z?
+        \\
+    );
+}
+
 test "override_param_type_from_enclosing_scope" {
     try check("override_param_type_from_enclosing_scope",
         \\tagged-empty

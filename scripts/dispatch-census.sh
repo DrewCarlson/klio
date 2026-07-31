@@ -7,10 +7,16 @@
 #   scripts/dispatch-census.sh [binary]
 #
 # Prints the `[lower-sites]` census and the `[decline]` / `[no-recv]` splits.
+#
+# The stdlib image cache is cleared first. Lowering is on demand, so a warm
+# run lowers only part of the program and reports a site total roughly half a
+# cold run's — two measurements taken at different cache states are not
+# comparable at all.
 set -e
 BIN=${1:-zig-out/bin/klio-harness}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+rm -rf /tmp/klio_itest_stdlibtest_home/.klio/cache
 exec env HOME=/tmp/klio_itest_stdlibtest_home KLIO_DISPATCH_STATS=1 \
   "$BIN" test \
   --only-file=kotlin/libraries/stdlib/test/collections/CollectionTest.kt \

@@ -955,6 +955,7 @@ fn lowerResolvedBinaryOperator(
         &.{},
         &.{},
         declared_lhs_ty,
+        .{},
     )) {
         .lowered => |reg| return reg,
         .deferred => return null,
@@ -4886,6 +4887,34 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         try b.push(.{ .Move = .{ .dst = dst, .src = n } });
         b.terminate(.{ .Goto = join });
         b.switchTo(else_b);
+        // On this branch the receiver is proven non-null, so its declared
+        // nullability no longer disqualifies a member. Bind statically when
+        // the declaration is provable; the receiver is already in a register,
+        // so hand it over rather than let it be evaluated a second time.
+        const declared_from_expr = argDeclTypeRef(b, receiver);
+        var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
+            try staticCallReturnTypeRef(b, receiver)
+        else
+            null;
+        defer if (inferred_ty) |*t| t.deinit(b.allocator);
+        switch (try lowerResolvedMemberCall(
+            b,
+            receiver,
+            name,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            declared_from_expr orelse inferred_ty,
+            .{ .reg = recv, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+                b.terminate(.{ .Goto = join });
+                b.switchTo(join);
+                return dst;
+            },
+            .deferred, .none => {},
+        }
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
@@ -4926,6 +4955,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 ast_arg_names,
                 ast_type_args,
                 argDeclTypeRef(b, member.receiver),
+                .{},
             )) {
                 .lowered => |reg| return reg,
                 .deferred, .none => {},
@@ -11767,6 +11797,16 @@ pub fn lowerSitesDump() void {
     }
 }
 
+/// How a caller has already constrained the receiver of a member call.
+const ReceiverState = struct {
+    /// The receiver, already lowered. A safe call evaluates it once to test it
+    /// for null, so re-lowering it here would evaluate it twice.
+    reg: ?Reg = null,
+    /// The receiver cannot be null at this point regardless of its declared
+    /// type, so a nullable declared type does not disqualify a member.
+    non_null: bool = false,
+};
+
 fn lowerResolvedMemberCall(
     b: *FuncBuilder,
     receiver: *const Expr,
@@ -11775,6 +11815,7 @@ fn lowerResolvedMemberCall(
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
     declared_ty: ?TypeRef,
+    recv_state: ReceiverState,
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     const ty = declared_ty orelse {
@@ -11808,10 +11849,19 @@ fn lowerResolvedMemberCall(
         }
         return .none;
     };
-    if (ty.nullable) {
+    // A nullable receiver keeps a member call off the static path, because an
+    // extension declared on `T?` outranks a member there — `x.f()` on a
+    // nullable `x` is only legal when such an extension exists. A SAFE call is
+    // different: its member runs on the non-null branch, which is exactly the
+    // receiver a member declaration expects.
+    if (ty.nullable and !recv_state.non_null) {
         lmNote(.nullable_or_generic);
         return .none;
     }
+    const recv_ty = if (ty.nullable)
+        TypeRef{ .name = std.mem.trimEnd(u8, ty.name, "?"), .nullable = false, .args = ty.args }
+    else
+        ty;
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
@@ -11881,7 +11931,7 @@ fn lowerResolvedMemberCall(
         .caller_file = name.span.file,
         .lexical_owner = lexical_owner,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
-        .receiver_type = ty,
+        .receiver_type = recv_ty,
     });
     if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
         if (std.mem.eql(u8, wanted, name.name)) {
@@ -11989,7 +12039,7 @@ fn lowerResolvedMemberCall(
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
 
-    const recv_reg = try lowerReceiver(b, receiver);
+    const recv_reg = recv_state.reg orelse try lowerReceiver(b, receiver);
     // Lowering the receiver expression can append functions (a lambda in the
     // receiver lowers into the module's func table) and reallocate it,
     // invalidating `target`; re-fetch the pointer before reading it again.
@@ -12491,6 +12541,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         ast_arg_names,
         ast_type_args,
         declared_ty,
+        .{},
     );
     switch (static_member) {
         .lowered => |reg| return reg,
@@ -12641,6 +12692,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             source_names,
             ast_type_args,
             declared_ty,
+            .{},
         );
         switch (source_member) {
             .lowered => |reg| return reg,
@@ -15059,6 +15111,7 @@ test "shared member resolution selects overloads and dispatch forms" {
         &.{},
         &.{},
         .{ .name = "Owner", .nullable = false, .args = &.{} },
+        .{},
     );
     try testing.expect(lowered_virtual == .lowered);
     const virtual_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
@@ -15073,6 +15126,7 @@ test "shared member resolution selects overloads and dispatch forms" {
         &.{},
         &.{},
         .{ .name = "Owner", .nullable = false, .args = &.{} },
+        .{},
     )) == .deferred);
     m.classes.items[owner.int()].receiver_abi = .instance;
     m.classes.items[owner.int()].is_open = false;
