@@ -397,16 +397,26 @@ RETURN TYPE, which lowering does not have, so the honest conclusion is that
 these +287 sites are not independent of the typeck project after all — they
 need the same lambda/element type inference as section 1.
 
-Two narrower fixes are possible without it, and both are worth trying before
-the big project:
+Fix (1) is LANDED and did not unblock the slice.
+`overloadHostingTrailingLambda` now declines when its surviving candidates
+differ in the trailing lambda's return type, so the `sumOf` walk records
+nothing instead of guessing. That is correct on its own — the sweep, the unit
+modules and compose are all green with it — but `SequenceTest.onEach` still
+fails once locals are typed, so the wrong lambda stamp was not the (only)
+mechanism.
 
-  1. Make `overloadHostingTrailingLambda` DECLINE when its surviving candidates
-     differ in the trailing lambda's return type. A guess that is used as a
-     stamp is worse than no stamp; the call already works when nothing is
-     recorded.
+What is left to try, in order:
+
   2. Infer a lambda's return type for the trivial shapes — a single expression
      that is a member read or a literal — which covers `{ it.length }` and most
-     of what these overload sets are discriminated by.
+     of what these overload sets are discriminated by. This is the one that
+     would actually let Kotlin's own rule be applied.
+  3. Find where `sum` acquires a `Double` type. The slice does NOT type it
+     (`staticCallReturnTypeRef` declines a member-call initializer, and the
+     probe shows `data -> Sequence<String>` is the only local it types in that
+     test), so the Double comes from somewhere else that a typed `data`
+     reaches. Instrument the `assertEquals` binding at that call site before
+     theorising further.
 
 Two guards were tried against the symptom and BOTH cost sites without fixing
 it — do not retry them:
