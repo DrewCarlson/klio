@@ -43,4 +43,15 @@ fun main() {
         apply { bump(100) }
         label()
     })
+
+    println(Report(c).render())
+}
+
+// A bare call may name an EXTENSION on the same implicit receiver. Kotlin
+// tries this receiver's extensions before moving outwards, so the site has a
+// static answer there too.
+fun Counter.doubled(): Int = n * 2
+
+class Report(val c: Counter) {
+    fun render(): String = c.run { "" + doubled() + "/" + label() }
 }

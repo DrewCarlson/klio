@@ -11187,6 +11187,23 @@ fn lowerUnresolvedBareCall(
             },
             .deferred, .none => {},
         }
+        // No member serves it. Kotlin tries this receiver's EXTENSIONS before
+        // moving outwards, so ask for them here rather than deferring the
+        // whole walk: `plus(element)` written inside `Iterable<T>.plusElement`
+        // is an extension on the body's own receiver, and leaving it dynamic
+        // is what makes that body pick the concatenating overload at run time.
+        if (try lowerResolvedExtensionCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = callee.Path.segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+        )) |reg| {
+            orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
+            return reg;
+        }
     }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();

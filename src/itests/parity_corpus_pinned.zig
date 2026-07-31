@@ -1182,6 +1182,7 @@ test "bare_member_call_on_captured_receiver" {
         \\n=6
         \\n=26
         \\n=126
+        \\252/n=126
         \\
     );
 }
