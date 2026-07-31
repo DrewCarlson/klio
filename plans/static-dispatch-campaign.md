@@ -370,10 +370,27 @@ variable needed, from a different source:
     element type, which the loop rule above now has in hand for the `for
     ((k, v) in pairs)` case.
 
-Neither will move the pinned set for the same reason the loop variable did not.
-Measuring them needs a file set whose containers are concrete — a real
-application rather than the stdlib's own generic tests. **Build that file set
-before working this bucket**, or the work will look worthless when it is not.
+Neither will move the pinned stdlib set for the same reason the loop variable
+did not, so BOTH censuses matter from here:
+
+    scripts/dispatch-census.sh           stdlib commontest — generic throughout
+    scripts/dispatch-census-examples.sh  the examples corpus — concrete types
+
+Examples baseline, the platform the plan asked for and now has:
+
+    total 72,412 member call sites
+      1,449   2.00%  bound_static
+     25,649  35.42%  bound_virtual
+     -------------------------
+     31,422  43.39%  no_receiver_type
+      8,702  12.02%  no_class_id
+      3,912   5.40%  resolver_declined
+      1,278   1.76%  nullable_or_generic
+
+27,098 of 72,412 (37.4%), against 34.6% on the stdlib set — concrete code binds
+better, as it should. Report both numbers for anything aimed at element types;
+a change that moves one and not the other is not thereby worthless, and this
+document has twice nearly discarded such a change for exactly that reason.
 
 ### LANDED: typing a local from its initializer
 
