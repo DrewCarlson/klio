@@ -1589,6 +1589,14 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
     try module.registry.func_type_params.put(id, tp_names);
 }
 
+/// The bound's head still names one classifier, which is enough to own a
+/// member call on the parameter even when the record dropped the bound's type
+/// ARGUMENTS. `C : MutableCollection<in T>` is the shape.
+fn boundTypeRecordHeadOnly(bound: *const ast.TypeRef) bool {
+    return !bound.nullable and bound.function == null and
+        bound.qualified_path == null and bound.name.name.len != 0;
+}
+
 fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
     return !bound.nullable and bound.type_args.len == 0 and
         bound.function == null and !bound.definitely_non_null and
@@ -1609,6 +1617,7 @@ fn loweredClassTypeParamBounds(
                 .param = param.name.name,
                 .bound = upper.name.name,
                 .complete = boundTypeRecordComplete(upper),
+                .head_only = boundTypeRecordHeadOnly(upper),
             });
         }
         for (class.where_bounds) |*where_bound| {
@@ -1617,6 +1626,7 @@ fn loweredClassTypeParamBounds(
                 .param = param.name.name,
                 .bound = where_bound.bound.name.name,
                 .complete = boundTypeRecordComplete(&where_bound.bound),
+                .head_only = boundTypeRecordHeadOnly(&where_bound.bound),
             });
         }
         if (bounds.items.len == first) {
@@ -1697,10 +1707,11 @@ fn addScopedTypeParamBounds(
                     }
                 }
                 if (!shadowed) {
-                    try b.addTypeParamBoundEvidence(
+                    try b.addTypeParamBoundHead(
                         bound.param,
                         bound.bound,
                         bound.complete,
+                        bound.head_only,
                     );
                 }
             }
@@ -1710,10 +1721,12 @@ fn addScopedTypeParamBounds(
         if (param.is_reified) continue;
         var bound: []const u8 = "kotlin.Any";
         var complete = true;
+        var head_only = true;
         var count: usize = 0;
         if (param.upper_bound) |*upper| {
             bound = upper.name.name;
             complete = boundTypeRecordComplete(upper);
+            head_only = boundTypeRecordHeadOnly(upper);
             count += 1;
         }
         for (f.where_bounds) |*where_bound| {
@@ -1721,12 +1734,16 @@ fn addScopedTypeParamBounds(
                 if (count == 0) {
                     bound = where_bound.bound.name.name;
                     complete = boundTypeRecordComplete(&where_bound.bound);
+                    head_only = boundTypeRecordHeadOnly(&where_bound.bound);
                 }
                 count += 1;
             }
         }
-        if (count > 1) complete = false;
-        try b.addTypeParamBoundEvidence(param.name.name, bound, complete);
+        if (count > 1) {
+            complete = false;
+            head_only = false;
+        }
+        try b.addTypeParamBoundHead(param.name.name, bound, complete, head_only);
     }
 }
 

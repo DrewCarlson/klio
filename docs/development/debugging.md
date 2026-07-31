@@ -71,6 +71,8 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_LI_NAMES` | set | Names the callee of every local initializer that yields no static type. Pair with `KLIO_BARERET` on whichever name dominates | `[li-null]` |
 | `KLIO_COMP_TRACE` | set | The type a destructured name takes from its `componentN()` accessor, or why none was available | `[comp]` |
 | `KLIO_INIT_SELF` | `0` to disable | Off, a local's own name shadows its initializer's bare call again (`val iterator = iterator()`). For A/B measurement of that channel from one binary | — |
+| `KLIO_TP_HEAD` | `0` to disable | Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so `C : MutableCollection<in T>` names no owner again | — |
+| `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read initializer (`val node = coord.layoutNode`) stops lending its type to the local | — |
 | `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic | `[gtrace]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
 | `KLIO_ANON_AUDIT` | set | Synthesized class name and captured names at each anonymous-object site | `[ANON]` |

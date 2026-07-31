@@ -70,12 +70,15 @@ fn localTypeParamBounds(
     for (function.type_params, bounds) |*param, *out| {
         var bound: []const u8 = "kotlin.Any";
         var complete = true;
+        var head_only = true;
         var count: usize = 0;
         if (param.upper_bound) |*upper| {
             bound = upper.name.name;
             complete = !upper.nullable and upper.type_args.len == 0 and
                 upper.function == null and !upper.definitely_non_null and
                 upper.qualified_path == null;
+            head_only = !upper.nullable and upper.function == null and
+                upper.qualified_path == null and upper.name.name.len != 0;
             count += 1;
         }
         for (function.where_bounds) |*where_bound| {
@@ -86,12 +89,22 @@ fn localTypeParamBounds(
                     complete = !where_type.nullable and where_type.type_args.len == 0 and
                         where_type.function == null and !where_type.definitely_non_null and
                         where_type.qualified_path == null;
+                    head_only = !where_type.nullable and where_type.function == null and
+                        where_type.qualified_path == null and where_type.name.name.len != 0;
                 }
                 count += 1;
             }
         }
-        if (count > 1) complete = false;
-        out.* = .{ .param = param.name.name, .bound = bound, .complete = complete };
+        if (count > 1) {
+            complete = false;
+            head_only = false;
+        }
+        out.* = .{
+            .param = param.name.name,
+            .bound = bound,
+            .complete = complete,
+            .head_only = head_only,
+        };
     }
     return bounds;
 }
@@ -273,7 +286,12 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // definite NON-callable evidence (`var nodeIndex = 0` beside
         // `fun nodeIndex(...)` — the call resolves to the function).
         switch (e.*) {
+            // A property read is recorded too: `val node = coord.layoutNode`
+            // lends the property's registered type head to the local, which
+            // the declared-type channel then reads back.
             .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
+            .Member => if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_INIT") orelse "1", "0"))
+                try b.setLocalInitExpr(p.name.name, e),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
             else => {},
         }

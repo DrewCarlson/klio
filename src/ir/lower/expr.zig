@@ -8325,6 +8325,13 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (norecvCensusOn()) lm_localinit[1] += 1;
         return ctor_ty;
     }
+    // A property read carries its own declared type; nothing needs resolving.
+    if (init_expr.* == .Member) {
+        if (argDeclTypeRef(b, init_expr)) |declared| {
+            if (norecvCensusOn()) lm_localinit[1] += 1;
+            return try declared.clone(b.allocator);
+        }
+    }
     // The local's own name is not in scope inside its own initializer, so the
     // initializer's bare calls must not see it. `val iterator = iterator()` is
     // the shape, and the local shadowing the call is what stopped 10,088 of
@@ -12406,7 +12413,13 @@ fn lowerResolvedMemberCall(
     // intersection or structural information and cannot stand in for the type.
     if (owner_id == null) {
         if (b.typeParamBound(head)) |tpb| {
-            if (tpb.complete) {
+            // The bound's ARGUMENTS do not matter here: this asks only which
+            // class owns a member call on the parameter, and `C` bounded by
+            // `MutableCollection<in T>` answers `MutableCollection`. Those two
+            // parameters were 6,590 of the 8,702 sites in this bucket.
+            if (tpb.complete or (tpb.head_only and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_HEAD") orelse "1", "0")))
+            {
                 var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
                 if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
                 owner_id = if (std.mem.indexOfScalar(u8, bound_identity, '.') != null)
@@ -15779,6 +15792,45 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expectEqual(nullable_plus, nullable_inst.Call.func);
     try testing.expect(nullable_inst.Call.exact);
     try testing.expect(nullable_inst.Call.func != member_plus);
+
+    // A receiver typed by a TYPE PARAMETER resolves through the parameter's
+    // upper bound. The bound record drops the bound's type ARGUMENTS, which
+    // is what `head_only` reports and what `complete` refuses — and the
+    // stdlib's two most common parameters (`C : MutableCollection<in T>`,
+    // `M : MutableMap<in K, in V>`) are exactly that shape.
+    m.classes.items[owner.int()].is_open = true;
+    try b.bind("bounded", b.allocReg());
+    try b.setLocalDeclType("bounded", "C");
+    var bounded_path = [_]ast.Ident{.{ .name = "bounded", .span = dummySpan() }};
+    var bounded_recv = Expr{ .Path = .{ .segments = &bounded_path, .span = dummySpan() } };
+    const bounded_ty = ir.TypeRef{ .name = "C", .nullable = false, .args = &.{} };
+
+    try b.addTypeParamBoundHead("C", "Owner", false, false);
+    try testing.expect((try lowerResolvedMemberCall(
+        &b,
+        &bounded_recv,
+        .{ .name = "virtualPick", .span = dummySpan() },
+        &int_args,
+        &.{},
+        &.{},
+        bounded_ty,
+        .{},
+    )) == .none);
+
+    try b.addTypeParamBoundHead("C", "Owner", false, true);
+    try testing.expect((try lowerResolvedMemberCall(
+        &b,
+        &bounded_recv,
+        .{ .name = "virtualPick", .span = dummySpan() },
+        &int_args,
+        &.{},
+        &.{},
+        bounded_ty,
+        .{},
+    )) == .lowered);
+    const bounded_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
+    try testing.expect(bounded_inst == .CallVirtual);
+    try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), bounded_inst.CallVirtual.slot);
 }
 
 test "explicit member extension emits its resolved declaration identity" {

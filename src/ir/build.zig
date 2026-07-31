@@ -1954,11 +1954,21 @@ pub const FuncBuilder = struct {
         bound: []const u8,
         complete: bool,
     ) Allocator.Error!void {
+        return self.addTypeParamBoundHead(name, bound, complete, complete);
+    }
+    pub fn addTypeParamBoundHead(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: []const u8,
+        complete: bool,
+        head_only: bool,
+    ) Allocator.Error!void {
         try self.type_param_names.put(name, {});
         try self.type_param_bounds.put(name, .{
             .param = name,
             .bound = bound,
             .complete = complete,
+            .head_only = head_only,
         });
     }
     pub fn addOwnedTypeParamBoundEvidence(
@@ -1972,7 +1982,7 @@ pub const FuncBuilder = struct {
             _ = self.owned_type_param_names.pop();
             self.allocator.free(name);
         }
-        try self.addTypeParamBoundEvidence(name, bound, complete);
+        try self.addTypeParamBoundHead(name, bound, complete, complete);
     }
     pub fn ownTypeParamText(
         self: *FuncBuilder,

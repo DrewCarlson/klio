@@ -4333,6 +4333,7 @@ pub const Module = struct {
                 if (std.mem.eql(u8, bound.param, param)) {
                     out.bound = bound.bound;
                     out.complete = bound.complete;
+                    out.head_only = bound.head_only;
                     break;
                 }
             }
@@ -8565,6 +8566,11 @@ pub const ModuleRegistry = struct {
         /// False when the string-only record dropped intersection or
         /// structural type information and cannot support a negative proof.
         complete: bool = true,
+        /// True when `bound` still names the single classifier the parameter
+        /// is bounded by, even if the record dropped its type ARGUMENTS. That
+        /// is enough to answer "which class owns a member call on this
+        /// parameter", which is all the receiver-owner lookup asks.
+        head_only: bool = true,
     };
 
     /// One class's transitive shadow-name set + chain completeness.

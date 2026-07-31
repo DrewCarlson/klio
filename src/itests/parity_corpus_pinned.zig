@@ -1187,6 +1187,26 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "receiver_typed_from_a_property_read" {
+    try check("receiver_typed_from_a_property_read",
+        \\base
+        \\derived
+        \\base
+        \\derived
+        \\
+    );
+}
+
+test "local_named_after_its_own_initializer" {
+    try check("local_named_after_its_own_initializer",
+        \\base
+        \\derived
+        \\abc
+        \\lambda
+        \\
+    );
+}
+
 test "data_class_components_are_declared_members" {
     try check("data_class_components_are_declared_members",
         \\a/1

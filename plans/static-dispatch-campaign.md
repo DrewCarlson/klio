@@ -302,31 +302,31 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,848 member call sites
-      146   2.13%  bound_static     <- direct FuncId call
-    2,975  43.44%  bound_virtual    <- method slot, no name lookup
+    total 6,776 member call sites
+      146   2.15%  bound_static     <- direct FuncId call
+    3,391  50.04%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,517  36.76%  no_receiver_type
-      675   9.86%  no_class_id
-      415   6.06%  resolver_declined
-      120   1.75%  nullable_or_generic
+    2,517  37.15%  no_receiver_type
+      415   6.12%  resolver_declined
+      187   2.76%  no_class_id
+      120   1.77%  nullable_or_generic
 
-Statically bound: 3,121 of 6,848 (45.6%), from 150 (2.34%) at the start of this
+Statically bound: 3,537 of 6,776 (52.2%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
 concrete types the stdlib's own generic containers do not:
 
-    total 72,414
-     1,451   2.00%  bound_static
-    35,425  48.92%  bound_virtual
+    total 71,478
+     1,451   2.03%  bound_static
+    40,833  57.13%  bound_virtual
     ------------------------------
-    21,646  29.89%  no_receiver_type
-     8,702  12.02%  no_class_id
-     3,912   5.40%  resolver_declined
-     1,278   1.76%  nullable_or_generic
+    21,646  30.28%  no_receiver_type
+     3,912   5.47%  resolver_declined
+     2,358   3.30%  no_class_id
+     1,278   1.79%  nullable_or_generic
 
-Statically bound: 36,876 of 72,414 (50.9%), from 27,098 (37.4%).
+Statically bound: 42,284 of 71,478 (59.2%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -887,6 +887,32 @@ Resolving a type-parameter receiver through its declared upper bound (Kotlin's
 own rule) moves 168 sites out of this bucket. They land in `resolver_declined`
 rather than binding, because their bounds are interfaces — so this bucket is now
 gated on the interface work in section 2, not on anything of its own.
+
+That gate is open now, and the bound rule was still refusing most of its own
+work: it used only a `complete` bound record, and `complete` requires the bound
+to carry NO type arguments. The stdlib's two dominant parameters are
+`C : MutableCollection<in T>` and `M : MutableMap<in K, in V>`, so both were
+excluded — 6,590 of the 8,702 sites in this bucket on the examples set, under
+the heads `C` (4,456) and `M` (2,134).
+
+The arguments are irrelevant to the question actually being asked. This site
+asks only *which class owns a member call on this parameter*, and the answer is
+the bound's head. `TypeParamBound` now carries `head_only` alongside `complete`:
+true when the record still names one classifier (not nullable, not a function
+type, not qualified, not an intersection) even though it dropped the type
+arguments. `complete` keeps its old meaning for the negative proofs that need
+it; only the owner lookup reads the new flag.
+
+    stdlib   no_class_id 675 -> 187,   bound 3,121 -> 3,537   (45.6% -> 52.2%)
+    examples no_class_id 8,702 -> 2,358, bound 36,876 -> 42,284 (50.9% -> 59.2%)
+
+Landed alongside it: a local initialized from a PROPERTY READ now carries the
+property's declared type. Only calls, literals and templates were recorded as
+initializers, so `val node = coord.layoutNode` left the local untyped even
+though `class_prop_type_heads` already knew the answer. `KLIO_TP_HEAD=0` and
+`KLIO_MEMBER_INIT=0` turn the two off for an A/B from one binary; both are
+pinned by parity fixtures that print the wrong answer when disabled, since
+each changes which extension a static receiver type selects.
 
 The unsigned types (`UInt`, `ULongArray`, …, ~146 sites) are NOT a registration
 gap, and calling them "probably easy" was wrong. `unsigned/src/kotlin/UInt.kt` is
