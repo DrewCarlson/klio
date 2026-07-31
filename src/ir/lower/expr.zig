@@ -8157,18 +8157,46 @@ fn staticDispatchReceiverTypeRef(
     return try ownedClassSelfType(b.allocator, lexical_class);
 }
 
+/// `val x = Foo()` — a constructor call names its own type, so no return-type
+/// derivation is needed at all. These reach the census as `no_func`: the callee
+/// resolves to a CLASS rather than to a function.
+fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (init_expr.* != .Call) return null;
+    const call = init_expr.Call;
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
+    const ident = call.callee.Path.segments[0];
+    // A local or a function of the same name is not a constructor call.
+    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
+    if (b.module.funcId(ident.name) != null) return null;
+    const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const class = &b.module.classes.items[cid.int()];
+    // An object is not constructed; a stub or value class has no instance
+    // identity for a member call to bind against.
+    if (class.is_object or class.is_stub or class.is_value) return null;
+    const args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
+    errdefer b.allocator.free(args);
+    for (call.type_args, args) |*ty, *out| {
+        out.* = try decl_mod.loweredTypeRef(b.allocator, ty, true);
+    }
+    var derived = ir.TypeRef{
+        .name = try b.allocator.dupe(u8, class.fqn),
+        .nullable = false,
+        .args = args,
+    };
+    if (!staticClassifierArgsComplete(b, derived)) {
+        derived.deinit(b.allocator);
+        return null;
+    }
+    return derived;
+}
+
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
     const name = receiver.Path.segments[0].name;
     if (b.resolve(name) == null) return null;
     const init_expr = b.localInitExpr(name) orelse return null;
-    // Only an initializer whose callee is UNAMBIGUOUS may type the local. An
-    // overload set the call site cannot discriminate — `sumOf` differs only in
-    // its selector's return type, `(T) -> Int` against `(T) -> Double` — would
-    // otherwise contribute whichever declaration ranked first, and `val sum =
-    // xs.sumOf { it.length }` typed `Double` picks a `Double` `assertEquals`
-    // that renders 6 as 6.0.
-    if (classifyCallReturn(b, init_expr) != .unique_concrete) return null;
+    if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| return ctor_ty;
     var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse return null;
     if (!staticClassifierArgsComplete(b, derived)) {
         derived.deinit(b.allocator);

@@ -1187,6 +1187,19 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "local_typed_from_its_initializer" {
+    try check("local_typed_from_its_initializer",
+        \\box:a
+        \\box:a!
+        \\box:made
+        \\2
+        \\20
+        \\30
+        \\box:a?
+        \\
+    );
+}
+
 test "sequence_sum_of_infers_its_kind" {
     try check("sequence_sum_of_infers_its_kind",
         \\7
