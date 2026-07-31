@@ -13,3 +13,4 @@ scripts/__pycache__/
 .klio-local/
 .fleet-logs/
 .sweep-times.json
+.klio-census-home/

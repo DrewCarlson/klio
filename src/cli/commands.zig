@@ -974,6 +974,17 @@ pub fn runBuiltModuleArgs(
     runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();
+    // The dispatch census is reported for `run` as well as for `test`. The two
+    // answer different questions: the stdlib's own tests are generic
+    // throughout, so a change that reads a CONCRETE element type measures as
+    // zero there and is not worthless — ordinary application code is where it
+    // shows.
+    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) {
+        ir.lower.expr.lowerSitesDump();
+        ir.lower.expr.lowerNoRecvDump();
+        ir.lower.expr.lowerDeclineDump();
+        ir.lower.expr.lowerLocalInitDump();
+    }
     return switch (res) {
         .ok => 0,
         .err => |e| blk: {
