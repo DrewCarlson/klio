@@ -510,15 +510,35 @@ rather than predicted:
     the linkage. This was a latent bug, not one this change introduced — it
     only became reachable once these slots bound.
 
-What this does NOT do is remove the string compare inside the host layer. The
-slot identifies the declaration statically; a host-backed receiver then reaches
-`callMemberNamed`. Finishing that is the remaining piece, and the pieces are
-already in place: `src/stdlib/implementations.zig` is a static table of 1,578
-`{fqn, StdlibFn}` entries, `DeclSig.host_symbol` links a declaration to its
-entry, and `ProgramImage.resolved_native` maps `FuncId -> StdlibFn`. What is
-missing is dispatching a host-backed virtual call through that map instead of
-by name. That is also exactly the mapping a C transpiler emits: one table entry
-per host symbol.
+**And the host symbol is now reached by FuncId, not by name.** A slot resolved
+against a host-backed receiver's runtime class was only used when its target
+had a Kotlin body; every native member fell through to `callMemberNamed`, so
+the slot identified the declaration and the runtime matched it by string
+anyway. A bodyless declaration linked to a host symbol is executable AS that
+symbol (`DeclSig.host_symbol` -> `ProgramImage.resolved_native` ->
+`src/stdlib/implementations.zig`, a static table of 1,578 `{fqn, StdlibFn}`
+entries), so it dispatches by FuncId. On one collections file that is 1,163
+calls per run reaching their implementation with no name compare
+(`KLIO_NOINST_TRACE`).
+
+That table is also exactly what a C transpiler emits: one entry per host
+symbol, and a call site that names its entry.
+
+Landing it exposed three latent name-keyed defects in how a bodyless
+declaration is linked to an executable form, all of the same shape — identity
+by SIMPLE NAME:
+
+  - The same-package sibling scan settled `kotlin.Double.equals` with
+    `kotlin.String.equals`. A receiver-formed header now only accepts a sibling
+    declared by the same owner.
+  - The bare-name map did the same, carrying `equals` to the package-level
+    string form. That map names top-level functions and cannot settle a member
+    header at all.
+  - The sibling redirect ran BEFORE the declaration's own linked symbol. Its
+    own implementation outranks another class's same-named one.
+
+The package guard already in that code was added for this exact shape in
+another guise. Simple-name identity keeps producing the same bug.
 
 Remaining in this family: 98 `virtual_owner_stub` and 30 `virtual_owner_value`.
 A stub class is declaration-only and a value class has no instance identity, so
@@ -542,9 +562,10 @@ anything:
 
 ### Ordering for the sweep
 
-1. ~~Host-backed receivers~~ — LANDED, 1,226 sites. What is left of it is the
-   host-symbol dispatch itself (`resolved_native` instead of a name compare),
-   plus the 128 stub/value sites that need the same route.
+1. ~~Host-backed receivers~~ — LANDED, 1,226 sites, including the host-symbol
+   dispatch itself. What is left is the 128 stub/value sites, which need the
+   same route from a receiver representation that has no runtime class to look
+   the slot up against.
 2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
    180 sites left are genuine member/extension shadowing pairs that need
    argument types, so they fold into item 3.
