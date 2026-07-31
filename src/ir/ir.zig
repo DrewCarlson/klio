@@ -5319,28 +5319,42 @@ pub const Module = struct {
     /// table are consulted, and generic-receiver extensions answer true
     /// for every head. Conservative on staleness: the index rebuilds when
     /// the declaration index has grown since the last build.
+    /// Which part of `extCouldApply` answered yes. Diagnostic only: the answer
+    /// is a single bit, but the campaign needs to know WHICH conservatism is
+    /// holding a site back before it can be tightened.
+    pub const ExtCouldApplyWhy = enum { none, index_stale, generic_receiver, own_head, builtin_super, declared_super };
+
     pub fn extCouldApply(self: *Module, allocator: Allocator, head: []const u8, name: []const u8) bool {
+        return self.extCouldApplyWhy(allocator, head, name) != .none;
+    }
+
+    pub fn extCouldApplyWhy(
+        self: *Module,
+        allocator: Allocator,
+        head: []const u8,
+        name: []const u8,
+    ) ExtCouldApplyWhy {
         if (self.ext_names_by_recv_head == null or self.ext_index_decl_count != self.func_index.items.len) {
-            self.rebuildExtIndex(allocator) catch return true;
+            self.rebuildExtIndex(allocator) catch return .index_stale;
         }
-        if (self.generic_ext_names.?.contains(name)) return true;
+        if (self.generic_ext_names.?.contains(name)) return .generic_receiver;
         const idx = &self.ext_names_by_recv_head.?;
         if (idx.get(head)) |set| {
-            if (set.contains(name)) return true;
+            if (set.contains(name)) return .own_head;
         }
         for (applicability.builtinSupersOf(head)) |sup| {
             if (idx.get(sup)) |set| {
-                if (set.contains(name)) return true;
+                if (set.contains(name)) return .builtin_super;
             }
         }
         if (self.registry.class_super_names.get(head)) |chain| {
             for (chain) |sup| {
                 if (idx.get(sup)) |set| {
-                    if (set.contains(name)) return true;
+                    if (set.contains(name)) return .declared_super;
                 }
             }
         }
-        return false;
+        return .none;
     }
 
     fn rebuildExtIndex(self: *Module, allocator: Allocator) Allocator.Error!void {

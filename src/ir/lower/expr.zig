@@ -11700,8 +11700,59 @@ pub const DeclineKind = enum(u8) {
     not_applicable,
     /// A target id that no longer resolves to a function.
     target_unresolvable,
+    /// A direct call carrying a `*spread` argument.
+    direct_spread,
+    /// A virtual slot on a `value class` owner.
+    virtual_owner_value,
+    /// A virtual slot on a stub (host-backed declaration-only) owner.
+    virtual_owner_stub,
+    /// A virtual call carrying an explicit type-argument list.
+    virtual_type_args,
+    /// A virtual slot whose owner declares a non-instance receiver ABI.
+    virtual_owner_abi,
+    /// A virtual target declaring no receiver parameter.
+    virtual_no_receiver_param,
+    /// A named or vararg argument list that could not be mapped onto the
+    /// target's parameters.
+    arg_mapping_failed,
 };
-pub var lm_decline: [4]u64 = @splat(0);
+pub var lm_decline: [11]u64 = @splat(0);
+
+fn declineNote(k: DeclineKind) void {
+    lmNote(.resolver_declined);
+    if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
+}
+
+/// Why a `target_known_deferred` site did NOT get promoted to a real dispatch.
+/// The identity is proven at every one of these; each variant names the
+/// conservatism that still holds it back.
+pub const PromoBlock = enum(u8) {
+    /// A stub or value receiver class: host-backed, with no vtable to index.
+    receiver_not_instance,
+    /// An extension whose receiver is a TYPE PARAMETER declares this name, so
+    /// the index cannot say which receivers it serves. The blunt one.
+    ext_generic_receiver,
+    /// An extension on the receiver's own head declares this name.
+    ext_own_head,
+    /// An extension on a builtin supertype of the receiver.
+    ext_builtin_super,
+    /// An extension on a declared supertype of the receiver.
+    ext_declared_super,
+    /// The extension index could not be rebuilt.
+    ext_index_stale,
+};
+pub var lm_promo: [6]u64 = @splat(0);
+
+pub fn lowerPromoDump() void {
+    var total: u64 = 0;
+    for (lm_promo) |n| total += n;
+    if (total == 0) return;
+    std.debug.print("[promo-blocked] total={d}\n", .{total});
+    inline for (@typeInfo(PromoBlock).@"enum".fields) |f| {
+        const n = lm_promo[f.value];
+        if (n != 0) std.debug.print("[promo-blocked] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+}
 
 /// Breakdown of `no_class_id` — lowering HAS a receiver type and cannot map its
 /// head to a declared class. Nothing here needs typeck; it is name resolution.
@@ -11973,11 +12024,34 @@ fn lowerResolvedMemberCall(
     // `Sequence` is a generator, not an `Instance`), and `invokeVirtualMember`
     // resolves the slot against such a value's runtime class instead of
     // requiring an `Instance`.
-    if (resolved.dispatch == .deferred and resolved.target != null and
-        static_owner.int() < b.module.classes.items.len and
-        !b.module.classes.items[static_owner.int()].is_stub and
-        !b.module.classes.items[static_owner.int()].is_value and
-        !b.module.extCouldApply(b.allocator, head, name.name))
+    const promo_blocked_by_class = resolved.dispatch == .deferred and resolved.target != null and
+        (static_owner.int() >= b.module.classes.items.len or
+            b.module.classes.items[static_owner.int()].is_stub or
+            b.module.classes.items[static_owner.int()].is_value);
+    const promo_ext_why: ir.Module.ExtCouldApplyWhy =
+        if (resolved.dispatch == .deferred and resolved.target != null and !promo_blocked_by_class)
+            b.module.extCouldApplyWhy(b.allocator, head, name.name)
+        else
+            .none;
+    if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
+        if (promo_blocked_by_class) {
+            lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
+        } else switch (promo_ext_why) {
+            .none => {},
+            .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
+            .generic_receiver => {
+                lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1;
+                if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                    std.debug.print("[promo-generic] {s}\n", .{name.name});
+                }
+            },
+            .own_head => lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
+            .builtin_super => lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
+            .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
+        }
+    }
+    if (!promo_blocked_by_class and promo_ext_why == .none and
+        resolved.dispatch == .deferred and resolved.target != null)
     {
         // Ask the resolver's own direct-vs-virtual rule rather than assuming
         // virtual: a final or private method has no vtable slot, and a virtual
@@ -12006,7 +12080,7 @@ fn lowerResolvedMemberCall(
         return .deferred;
     };
     const has_spread = anySpread(args);
-    if (resolved.dispatch == .direct and has_spread) { lmNote(.resolver_declined); return .deferred; }
+    if (resolved.dispatch == .direct and has_spread) { declineNote(.direct_spread); return .deferred; }
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Numeric virtual slots operate on `Value.Instance`. Classifier ABI
@@ -12015,7 +12089,29 @@ fn lowerResolvedMemberCall(
         // classes. Named, defaulted, and vararg interface calls bind against
         // the numeric declaration ABI.
         if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
-            owner.receiver_abi != .instance) { lmNote(.resolver_declined); return .deferred; }
+            owner.receiver_abi != .instance)
+        {
+            declineNote(if (owner.is_value)
+                .virtual_owner_value
+            else if (owner.is_stub)
+                .virtual_owner_stub
+            else if (ast_type_args.len != 0)
+                .virtual_type_args
+            else
+                .virtual_owner_abi);
+            if (runtime.getenvSlice("KLIO_VABI_NAMES") != null) {
+                const t = b.module.funcById(func_id);
+                const sig = b.module.decl_sigs.get(func_id.int());
+                std.debug.print("[vabi] {s}.{s} abi={s} has_body={} nblocks={d}\n", .{
+                    owner.fqn,
+                    name.name,
+                    @tagName(owner.receiver_abi),
+                    if (sig) |sg| sg.has_body else false,
+                    if (t) |tf| tf.blocks.len else 0,
+                });
+            }
+            return .deferred;
+        }
     }
 
     try recordLambdaArgReceivers(b, target, args, ast_arg_names, ast_type_args, 1);
@@ -12043,12 +12139,12 @@ fn lowerResolvedMemberCall(
     // Lowering the receiver expression can append functions (a lambda in the
     // receiver lowers into the module's func table) and reallocate it,
     // invalidating `target`; re-fetch the pointer before reading it again.
-    target = b.module.funcById(func_id) orelse { lmNote(.resolver_declined); return .deferred; };
+    target = b.module.funcById(func_id) orelse { declineNote(.target_unresolvable); return .deferred; };
     if (resolved.dispatch == .virtual) {
         // A virtual target without even a receiver param cannot be bound
         // here on any path (the named/vararg mapping below already deferred
         // it); defer before the receiver-skipping scans slice params[1..].
-        if (target.params.len == 0) { lmNote(.resolver_declined); return .deferred; }
+        if (target.params.len == 0) { declineNote(.virtual_no_receiver_param); return .deferred; }
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -12056,10 +12152,10 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { lmNote(.resolver_declined); return .deferred; };
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { declineNote(.arg_mapping_failed); return .deferred; };
             defer b.allocator.free(mapped);
             for (mapped) |param| if (param == null) {
-                lmNote(.resolver_declined);
+                declineNote(.arg_mapping_failed);
                 return .deferred;
             };
             const indices = try b.allocator.alloc(u32, mapped.len);
