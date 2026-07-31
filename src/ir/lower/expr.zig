@@ -3197,6 +3197,20 @@ fn memberHostsTrailingLambdaAtArity(b: *FuncBuilder, cls: []const u8, f: *const 
     return true;
 }
 
+/// The declared RETURN type head of a function-typed parameter — the last type
+/// argument of its `FunctionN`. Null when the shape is not a function type.
+fn lambdaReturnHead(ty: ir.TypeRef) ?[]const u8 {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    if (ty.args.len == 0) return null;
+    return ty.args[ty.args.len - 1].name;
+}
+
+fn retHeadEql(a: ?[]const u8, b_in: ?[]const u8) bool {
+    if (a == null and b_in == null) return true;
+    if (a == null or b_in == null) return false;
+    return std.mem.eql(u8, a.?, b_in.?);
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const ohtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const list = b.module.func_name_index.get(name) orelse {
@@ -3224,6 +3238,8 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     // With-body candidates still outrank body-less ones: an `expect`
     // declaration shadowed by its actual keeps losing to the real one.
     var bodyless: ?FuncId = null;
+    var fallback_ret: ?[]const u8 = null;
+    var ret_conflict = false;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (ohtl_trace) std.debug.print("[ohtl] {s}: cand #{d} params={d} body={} last_ty={s} last_arity={?d}\n", .{ name, fid.int(), f.params.len, f.hasBody(), if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
@@ -3259,7 +3275,23 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
             if (off == 1 and std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), rs))
                 return fid;
         }
-        if (fallback == null) fallback = fid;
+        if (fallback == null) {
+            fallback = fid;
+            fallback_ret = lambdaReturnHead(last.ty);
+        } else if (!retHeadEql(fallback_ret, lambdaReturnHead(last.ty))) {
+            ret_conflict = true;
+        }
+    }
+    // Several surviving candidates whose trailing lambdas differ in RETURN
+    // type — `sumOf(selector: (T) -> Int)` against `(T) -> Double`, 80 of them
+    // for that name. Kotlin picks by the lambda's inferred return type, which
+    // lowering does not have, so declaration order here is a guess. The pick
+    // is used to STAMP the lambda's parameter types as if it were proven, and
+    // a wrong stamp is worse than none: the call resolves correctly when
+    // nothing is recorded. Decline instead.
+    if (ret_conflict) {
+        if (ohtl_trace) std.debug.print("[ohtl] {s}: declined, candidates differ in lambda return type\n", .{name});
+        return null;
     }
     if (fallback) |fid| return fid;
     // A member on the enclosing/receiver class outranks a SIGNATURE-ONLY
