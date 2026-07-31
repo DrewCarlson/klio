@@ -610,15 +610,47 @@ both need the host-symbol route above rather than a slot.
 The unsigned types from section 3 (`UInt`, `ULongArray`, ~146 sites) belong
 here too: host primitives with no IR class.
 
-### 6. Genuinely dynamic by design
+### 6. `CallMemberOrGlobal` — 2,436 sites, and what actually blocks them
 
-Not counted as failures, but they must be enumerated before "full" means
-anything:
+`CallMemberOrGlobal` exists because a bare name in a receiver context could be
+a member of an implicit receiver or a top-level function. Where nothing in the
+receiver chain declares the name and no extension of it fits the call, only the
+top-level reading remains, and the site has a static target.
 
-  - `CallMemberOrGlobal` — a bare call in a receiver context that could be
-    either a member or a top-level function.
+Emission census on the collections file set (`KLIO_OR_AUDIT`):
+
+    2436  unresolved_bare_call
+     628  implicit_this_call_global_fallback
+     548  bare_call_member_shadowable
+    1420  bare_ctor_shadowed_by_class      <- NewInstance, already static
+
+The receiver-side guards are NOT the blocker. Measured over those sites, the
+breakdown of why a static bind was refused is:
+
+    2329  receiver class declares the name, and an extension fits
+    1889  nothing declares it, but an extension fits
+     124  nothing declares it and no extension fits  <- should have bound
+    4926  the scoped candidate set was EMPTY
+      10  the scoped candidate set held exactly one declaration
+
+**`boundedCallCandidates` answers null at 4,926 of 4,936 sites.** The names
+involved are `assertEquals`, `assertTrue`, `expect`, `listOf` — declarations
+that reach the file through a wildcard import of a PACK package, and
+`bareCallCandidateIterator` has no entry for them. So the site cannot name its
+target not because the reasoning is too weak but because the import-scoped
+candidate index does not cover pack-provided top-level functions.
+
+An arm implementing the bind was written, is correct, and converted 4 sites out
+of ~2,400 for exactly this reason; it is not landed. **Widening the bare-call
+candidate index to pack declarations is the prerequisite**, and it is worth
+doing on its own — the same index bounds every bare-call resolution, so its
+gaps push work to the runtime everywhere, not only here.
+
+### 7. Genuinely dynamic by design
+
   - `LoadFromThisOrGlobal` / `StoreToThisOrGlobal` — the bare-name read/write
-    walks over implicit receivers.
+    walks over implicit receivers. Same shape as section 6 and blocked on the
+    same index.
   - `invoke` on a function value, and SAM conversion.
   - Reflection (`::member`, `KClass`) — the one category intended to stay
     dynamic and to be omitted where it cannot be.
@@ -632,12 +664,16 @@ anything:
 2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
    180 sites left are genuine member/extension shadowing pairs that need
    argument types, so they fold into item 3.
-3. **The typeck generic-argument project — 3,886 sites, 60%.** Now by a wide
-   margin the largest remaining piece, and the only one that requires typeck
-   work: substituting type arguments through call sites and propagating them
-   from declarations, so a `List`'s or an `Array`'s element type is known.
-4. `no_class_id` — 617, mostly type parameters whose bounds resolve plus the
-   unsigned host primitives that belong to section 5.
+3. **Widen the bare-call candidate index to pack declarations (section 6).**
+   It answers null at 4,926 of 4,936 bare-call sites, which blocks ~2,400
+   `CallMemberOrGlobal` binds AND bounds every other bare-call resolution.
+   Cheaper than item 4 and it unblocks a whole instruction family.
+4. **The typeck generic-argument project — 3,886 sites, 60%.** The largest
+   remaining piece and the only one that requires typeck work: substituting
+   type arguments through call sites and propagating them from declarations, so
+   a `List`'s or an `Array`'s element type is known. Note that +253 of it is
+   already reachable without any of that — see the local-initializer entry
+   above, which needs only the `plusElement` emission fixed.
 
 Nullable receivers (section 4) are done as far as they should go: safe calls
 bind, and the rest is correct to decline.
