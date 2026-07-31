@@ -523,13 +523,25 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     `hasOwnMember` this-field read; the other three are the same pattern in
     other arms.
 
-    That is the whole remaining question, and it is now a small one: the
-    `component2()` CALL is being lowered as a property READ named `component2`
-    -> whose resolution against a user `Entry` finds `Map.Entry`'s accessor ->
-    whose body is the field `value`. Find which of the five fires for the
-    call site (they are distinguishable by putting the source span in the
-    print), then apply the uppercase-qualifier discriminator to the receiver
-    lookup that arm uses.
+    CORRECTION to the reading above. Line 2374 is the FINAL fallback of the
+    member-property read and emits `GetField <name>` — for a `component2` read
+    it would emit the field `component2`, not `value`. So these five sites are
+    not the `component2()` call at all: they are `Map.Entry.component2`'s BODY
+    (`value`) being lowered. Which means the accessor body IS getting inlined,
+    just not through `inline_call.zig`'s expand entry, and the resolution that
+    chose `Map.Entry.component2` happens strictly BEFORE any of them.
+
+    So the five lines are a symptom, not the site — the same mistake as the
+    five selector probes, made from the other direction. What the control diff
+    does establish is that nothing in this chain fires without the name
+    collision, which is worth keeping.
+
+    The unanswered question is unchanged and should be attacked by narrowing
+    the PROGRAM, not the interpreter: `e.component2()` on a two-line file with
+    a hand-written `class Entry` and no data modifier, then with `Map` imported
+    and not, until the smallest program that fails is known. Every probe so far
+    has instrumented a large interpreter against a program that exercises too
+    much of it at once.
 
     The discriminator is written, correct, and has been staged at five sites
     this call does not reach. It has never been the hard part; locating the arm
