@@ -4928,7 +4928,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // so hand it over rather than let it be evaluated a second time.
         const declared_from_expr = argDeclTypeRef(b, receiver);
         var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
-            try staticCallReturnTypeRef(b, receiver)
+            (try staticCallReturnTypeRef(b, receiver)) orelse
+                try localInitTypeRef(b, receiver)
         else
             null;
         defer if (inferred_ty) |*t| t.deinit(b.allocator);
@@ -8173,30 +8174,7 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         derived.deinit(b.allocator);
         return null;
     }
-    // A type ARGUMENT that is still the declaration's own type parameter is
-    // not an answer either. `val newData = data.onEach { … }` derives
-    // `Sequence<T>` from `onEach`'s declared return type, and committing to it
-    // types the lambda's `it` as `T` — which loses the element type the
-    // `sumOf(selector: (T) -> Int)` / `(T) -> Double` overload pair is chosen
-    // by, and the call picks the Double form.
-    for (derived.args) |arg| {
-        if (isTypeParamName(arg.name)) {
-            derived.deinit(b.allocator);
-            return null;
-        }
-    }
     return derived;
-}
-
-/// A single- or double-letter all-caps head is a type PARAMETER by Kotlin
-/// convention, and the stdlib follows it without exception. Same test the
-/// extension index uses to bucket generic-receiver extensions.
-fn isTypeParamName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 2) return false;
-    for (name) |c| {
-        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c)) return false;
-    }
-    return std.ascii.isUpper(name[0]);
 }
 
 fn staticCallReturnTypeRef(
@@ -12827,7 +12805,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const name = callee.Member.name;
     const declared_from_expr = argDeclTypeRef(b, receiver);
     var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
-        try staticCallReturnTypeRef(b, receiver)
+        (try staticCallReturnTypeRef(b, receiver)) orelse
+            try localInitTypeRef(b, receiver)
     else
         null;
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);

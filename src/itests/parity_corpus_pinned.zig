@@ -1187,6 +1187,20 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "sequence_sum_of_infers_its_kind" {
+    try check("sequence_sum_of_infers_its_kind",
+        \\7
+        \\7
+        \\7
+        \\7
+        \\7
+        \\7
+        \\3.5
+        \\7000000000
+        \\
+    );
+}
+
 test "grouping_through_its_own_protocol" {
     try check("grouping_through_its_own_protocol",
         \\{b=2, f=2, z=1}

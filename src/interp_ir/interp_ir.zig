@@ -502,7 +502,7 @@ pub const ProgramImage = struct {
             var decl_it = module.decl_sigs.iterator();
             while (decl_it.next()) |entry| {
                 const symbol = entry.value_ptr.host_symbol orelse continue;
-                if (entry.value_ptr.has_body) continue;
+                if (entry.value_ptr.has_body and !intrinsicOverridesBody(symbol)) continue;
                 const intrinsic = bindings.resolve(symbol) orelse
                     stdlib.implementation(symbol) orelse continue;
                 try self.resolved_native.put(entry.key_ptr.*, intrinsic);
@@ -612,6 +612,28 @@ pub const ProgramImage = struct {
         if (self.bodylessNativeForm(bindings, f.fqn, f.name, receiver_formed)) |intrinsic| {
             try self.resolved_native.put(fid.int(), intrinsic);
         }
+    }
+
+    /// Symbols whose host implementation must serve even though the Kotlin
+    /// declaration has a body.
+    ///
+    /// `Sequence.sumOf` declares five overloads that differ ONLY in the
+    /// selector's return type — `(T) -> Double` first, then Int, Long, UInt,
+    /// ULong — and Kotlin picks between them by the lambda's inferred return
+    /// type. A lambda carries no declared return type here, so the pick falls
+    /// to declaration order and `sumOf { it.length }` runs the Double body,
+    /// accumulating 6 as 6.0. The host implementation reads the kind from the
+    /// first value it computes, which is the answer Kotlin's typed selection
+    /// reaches, and it drains a host `.Sequence` and an interpreted one alike
+    /// so it covers the same receivers the Kotlin body does.
+    fn intrinsicOverridesBody(symbol: []const u8) bool {
+        const overrides = [_][]const u8{
+            "kotlin.sequences.Sequence.sumOf",
+        };
+        for (overrides) |o| {
+            if (std.mem.eql(u8, o, symbol)) return true;
+        }
+        return false;
     }
 
     /// The declaring scope of a fully qualified name: everything before its

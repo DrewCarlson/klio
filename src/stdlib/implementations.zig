@@ -1330,6 +1330,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.Set.sumOf", .f = collections.coll_iter_sum_of },
     .{ .fqn = "kotlin.collections.MutableSet.sumOf", .f = collections.coll_iter_sum_of },
     .{ .fqn = "kotlin.collections.Map.sumOf", .f = collections.coll_iter_sum_of },
+    .{ .fqn = "kotlin.sequences.Sequence.sumOf", .f = collections.coll_iter_sum_of },
     .{ .fqn = "kotlin.collections.MutableMap.sumOf", .f = collections.coll_iter_sum_of },
     .{ .fqn = "kotlin.collections.List.maxOfOrNull", .f = collections.coll_iter_max_of_or_null },
     .{ .fqn = "kotlin.collections.MutableList.maxOfOrNull", .f = collections.coll_iter_max_of_or_null },
