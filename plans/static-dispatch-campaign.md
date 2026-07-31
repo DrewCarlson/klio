@@ -376,13 +376,36 @@ variable needed, from a different source:
         for ((k, it) in listOf(Entry("a", Item("x")))) { … }
         -> runtime error: Vm::get_field `value` on `Entry`
 
-    `value` is a `Pair` field, so the loop's `component2` call is reaching
-    `kotlin.Pair.component2` instead of the data-class auto-member — which
-    `host_call_member.zig` does synthesize, reading `primary_params[n-1]`, so
-    the synthesis is fine and the call never gets there. Same simple-name
-    family as the `Double.equals` / `String.equals` collision fixed earlier.
-    Fix that first; the typing is four lines on top of it and cannot be tested
-    until the loop runs.
+    DIAGNOSED. `value` is `kotlin.collections.Map.Entry`'s field, and the
+    stdlib declares
+
+        public inline operator fun <K, V> Map.Entry<K, V>.component2(): V = value
+
+    A user class named `Entry` is picking up that extension. Bisected by
+    renaming the class — `Entry` -> `Rec` makes the same program run — which is
+    NOT the fix and must never be, per this project's root-cause rule; it only
+    identifies the collision. Reduced further: `e.component1()` works and
+    `e.component2()` fails, because `component1` falls through to the
+    data-class auto-member while `component2` is intercepted by the Map.Entry
+    extension first.
+
+    The mechanism is `Module.staticTypeHead`, which buckets an extension by
+    `applicability.simpleName(name)` — so `Map.Entry` indexes under `Entry`
+    and every user `Entry` matches it. That is the same simple-name identity
+    defect as the `Double.equals` / `String.equals` collision fixed earlier in
+    this campaign, and as the `expect`/`actual` sibling scan before it. It is
+    the third instance.
+
+    The fix is to key a NESTED receiver by enough of its qualification to be
+    unambiguous (`Map.Entry`, not `Entry`) and match a candidate receiver by
+    FQN suffix rather than by simple name. It touches every extension
+    resolution in the interpreter, so it wants a full gate rather than a spot
+    check — but it is not optional: a user type named after any nested stdlib
+    type silently inherits that type's extensions today, and `Entry` is only
+    the instance that happened to surface.
+
+    The destructured-component typing is four lines on top of it and cannot be
+    tested until the loop runs.
 
     The typing itself was written and measured at ~0 on BOTH censuses (for-loop
     destructuring is rare in the corpora), so it is not landed — there is
