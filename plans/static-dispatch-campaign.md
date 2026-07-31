@@ -302,16 +302,16 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,913 member call sites
-      146   2.11%  bound_static     <- direct FuncId call
-    2,089  30.22%  bound_virtual    <- method slot, no name lookup
+    total 6,848 member call sites
+      146   2.13%  bound_static     <- direct FuncId call
+    2,223  32.46%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    3,468  50.17%  no_receiver_type
-      675   9.76%  no_class_id
-      415   6.00%  resolver_declined
-      120   1.74%  nullable_or_generic
+    3,269  47.74%  no_receiver_type
+      675   9.86%  no_class_id
+      415   6.06%  resolver_declined
+      120   1.75%  nullable_or_generic
 
-Statically bound: 2,235 of 6,913 (32.3%), from 150 (2.34%) at the start of this
+Statically bound: 2,369 of 6,848 (34.6%), from 150 (2.34%) at the start of this
 round.
 
 The earlier 9,755-site census in this document was taken on a different file
@@ -335,17 +335,25 @@ set and at an unknown cache state; do not compare against it. Use the script.
          34  toMutableList
          30  createFrom
 
-**`iterator` alone is 908 of the 1,346**, and it did NOT move when bare calls
-were taught to lend their return type, nor when the `res.confidence` guard was
-lifted off receiver-proved targets. So those calls fail before either change
-reaches them, and the next step is to find out where — with a probe on one of
-them, not by reasoning about which of `bareStaticRecvHead`, the owner lookup,
-or `resolveMemberCall` is most likely. The last time this document guessed at
-that class of question it cost nine rounds.
+**The `iterator` bucket is CLOSED.** `staticCallReturnTypeRef` refused outright
+when `enclosingHasMemberNamed` held — backwards, because that condition means
+the bare call IS a member of the implicit receiver written without `this.`, and
+the receiver resolution right below it is what answers such a call. Worth +134.
 
-A local typed `Iterator<T>` binds `hasNext`/`next`, so this one bucket is worth
-roughly a thousand sites on its own — the largest single remaining item, ahead
-of the generic-argument project.
+It took a probe to find, and the probe's value was in what it did NOT print:
+two changes aimed at this bucket (teaching bare calls to lend a return type,
+then lifting the `res.confidence` guard) moved nothing, and `[bareret]` was
+silent, which proved the receiver fallback was never reached rather than
+reached-and-declining. Reasoning from the two null results alone would have
+pointed at the resolution; the silence pointed at the guard above it.
+
+    [localinit] 1,346 -> 1,254 no_return_type,  532 -> 624 derived
+
+What is left in that census, by callee: `.iterator` 88, `listIterator` 72,
+`.getOrPut` 66, `toMutableList` 34, `createFrom` 30 — a long tail rather than
+another block. The 350 `no_initializer` locals (loop variable, lambda
+parameter, destructured component) and the generic-argument project are now the
+larger remaining items.
 
 ### LANDED: typing a local from its initializer
 
