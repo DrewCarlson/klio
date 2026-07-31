@@ -984,6 +984,27 @@ above is what makes following it safe.
 `alias_local_keeps_its_source_type` pins three depths and the declared-source
 case, and prints `derived` for the first three when the channel is disabled.
 
+### A null check narrows through an `&&` chain and past an early return
+
+Two shapes, one defect, and the same one the `is`-chain entry describes: only a
+condition that WAS the whole check narrowed anything.
+
+    if (a != null && b != null) b.tag()      // b stayed nullable
+    if (a == null) return; a.tag()           // a stayed nullable
+
+Both matter because a nullable receiver is the ONE case Kotlin reaches a `T?`
+extension over a member — so `b.tag()` bound `Base?.tag` where kotlinc binds
+`Base.tag`. `narrowNullCheckAll` walks `&&` for the true branch and `||` for
+the false one, and `lowerBlock` applies the false-branch facts to the rest of
+the block when the guard's then-branch cannot fall through (`exprAlwaysExits`:
+return/throw/break/continue, a block ending in one, or an if whose both arms
+do).
+
+Worth ZERO on both censuses — neither corpus writes a `T?` extension beside a
+member — and kept anyway, because it is a wrong ANSWER rather than a missed
+binding. `null_check_through_and_chain` pins all four shapes plus the
+unguarded control, and gets three of them wrong when `KLIO_NULL_CHAIN=0`.
+
 ### Measured dead ends, all three with the reason
 
 Recorded so none is retried. Each was built, measured on BOTH file sets, and

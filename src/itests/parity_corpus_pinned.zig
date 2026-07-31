@@ -1187,6 +1187,19 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "null_check_through_and_chain" {
+    try check("null_check_through_and_chain",
+        \\member
+        \\member
+        \\member
+        \\member
+        \\none
+        \\nullable-ext
+        \\nullable-ext
+        \\
+    );
+}
+
 test "alias_local_keeps_its_source_type" {
     try check("alias_local_keeps_its_source_type",
         \\base

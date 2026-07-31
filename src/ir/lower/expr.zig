@@ -328,18 +328,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer narrowed.deinit(b.allocator);
             try narrowIsCheckAll(b, f.cond, &narrowed);
-            const narrowed_not_null = try narrowNullCheck(b, f.cond, true);
+            var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, f.cond, true, &not_null);
             const t_val = try lowerExpr(b, f.then_branch);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var nn = not_null.items.len;
+            while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
             var ni = narrowed.items.len;
             while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
             b.switchTo(f_block);
-            const narrowed_else_not_null = try narrowNullCheck(b, f.cond, false);
+            var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer else_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, f.cond, false, &else_not_null);
             const f_val = if (f.else_branch) |e| try lowerExpr(b, e) else try b.emitConst(.Unit);
-            if (narrowed_else_not_null) |n| b.restoreLocal(n);
+            var en = else_not_null.items.len;
+            while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = f_val } });
             b.terminate(.{ .Goto = join });
             b.switchTo(join);
@@ -360,9 +366,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
             b.switchTo(body_blk);
             try b.pushLoop(null, header, exit);
-            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
+            var w_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer w_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, w.cond, true, &w_not_null);
             _ = try lowerExpr(b, w.body);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var wn = w_not_null.items.len;
+            while (wn > 0) : (wn -= 1) b.restoreLocal(w_not_null.items[wn - 1]);
             b.popLoop();
             b.terminate(.{ .Goto = header });
 
@@ -4313,9 +4322,12 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, header, exit);
-            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
+            var lw_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer lw_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, w.cond, true, &lw_not_null);
             _ = try lowerExpr(b, w.body);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var lwn = lw_not_null.items.len;
+            while (lwn > 0) : (lwn -= 1) b.restoreLocal(lw_not_null.items[lwn - 1]);
             b.popLoop();
             b.terminate(.{ .Goto = header });
             b.switchTo(exit);
@@ -7779,6 +7791,34 @@ pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.
         return try b.narrowLocal("this", head);
     }
     return null;
+}
+
+/// Every non-null narrowing a condition proves for the branch it guards.
+/// Kotlin narrows on each `!= null` in an `&&` chain, exactly as it does for
+/// each `is` check — `if (a != null && b != null)` narrows both — and on each
+/// `== null` in an `||` chain for the ELSE branch. Only a condition that was
+/// itself the whole check narrowed anything, so the common guarded shape got
+/// no narrowing at all and its member calls stayed off the static path.
+///
+/// Applied in source order; the caller restores in reverse, because each
+/// narrowing saves the binding the previous one left.
+pub fn narrowNullCheckAll(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    truthy: bool,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (cond.* == .Binary and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_NULL_CHAIN") orelse "1", "0"))
+    {
+        const op = cond.Binary.op;
+        if ((truthy and op == .And) or (!truthy and op == .Or)) {
+            try narrowNullCheckAll(b, cond.Binary.lhs, truthy, out);
+            try narrowNullCheckAll(b, cond.Binary.rhs, truthy, out);
+            return;
+        }
+    }
+    if (try narrowNullCheck(b, cond, truthy)) |n| try out.append(b.allocator, n);
 }
 
 fn narrowNullCheck(
@@ -13534,13 +13574,52 @@ pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
     // Hoist the local-fn names an earlier-declared sibling references, so a
     // mutually-recursive forward reference resolves through a shared cell.
     try hoistMutualLocalFns(b, block);
+    // An early-return guard narrows the REST of the block: after
+    // `if (a == null) return`, `a` is not null for everything below it,
+    // because the only path that reaches them is the one where the check
+    // failed. Kotlin narrows there and the guard is the idiomatic shape.
+    var guarded: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+    defer guarded.deinit(b.allocator);
     var last: ?Reg = null;
     for (block.stmts) |*stmt| {
         last = try lowerStmt(b, stmt);
+        try narrowAfterExitGuard(b, stmt, &guarded);
     }
     const result = last orelse try b.emitConst(.Unit);
+    var gi = guarded.items.len;
+    while (gi > 0) : (gi -= 1) b.restoreLocal(guarded.items[gi - 1]);
     try b.popScope();
     return result;
+}
+
+/// Narrowings an already-lowered guard statement proves for the statements
+/// that FOLLOW it. Only an `if` whose then-branch cannot fall through, and
+/// only the non-null facts its condition's negation proves.
+fn narrowAfterExitGuard(
+    b: *FuncBuilder,
+    stmt: *const ast.Stmt,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (stmt.* != .Expr or stmt.Expr != .If) return;
+    const f = stmt.Expr.If;
+    if (f.else_branch != null) return;
+    if (!exprAlwaysExits(f.then_branch)) return;
+    try narrowNullCheckAll(b, f.cond, false, out);
+}
+
+/// Whether control cannot fall out of this expression: it returns, throws,
+/// breaks or continues on every path.
+fn exprAlwaysExits(e: *const Expr) bool {
+    return switch (e.*) {
+        .Return, .Throw, .Break, .Continue => true,
+        .Block => |blk| blk.stmts.len != 0 and
+            blk.stmts[blk.stmts.len - 1] == .Expr and
+            exprAlwaysExits(&blk.stmts[blk.stmts.len - 1].Expr),
+        .If => |inner| inner.else_branch != null and
+            exprAlwaysExits(inner.then_branch) and
+            exprAlwaysExits(inner.else_branch.?),
+        else => false,
+    };
 }
 
 fn hoistMutualLocalFns(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!void {
