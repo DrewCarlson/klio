@@ -351,9 +351,29 @@ pointed at the resolution; the silence pointed at the guard above it.
 
 What is left in that census, by callee: `.iterator` 88, `listIterator` 72,
 `.getOrPut` 66, `toMutableList` 34, `createFrom` 30 — a long tail rather than
-another block. The 350 `no_initializer` locals (loop variable, lambda
-parameter, destructured component) and the generic-argument project are now the
-larger remaining items.
+another block.
+
+### `no_initializer` — 350 locals, one of three shapes done
+
+A loop variable is now typed from the iterable's sole type ARGUMENT, so
+`for (i in items)` over a `List<Item>` binds `i.show()`. It is worth NOTHING on
+the pinned stdlib set, whose iterables are generic, and the parity fixture is
+where it shows — verified by building both ways.
+
+That leaves the other two shapes, and both need the same thing the loop
+variable needed, from a different source:
+
+  - a LAMBDA parameter: its type is the corresponding parameter of the
+    function-typed parameter it binds to, which `argLambdaParamTypes` already
+    computes for the arity/receiver stamp.
+  - a DESTRUCTURED component: `componentN()`'s declared return type on the
+    element type, which the loop rule above now has in hand for the `for
+    ((k, v) in pairs)` case.
+
+Neither will move the pinned set for the same reason the loop variable did not.
+Measuring them needs a file set whose containers are concrete — a real
+application rather than the stdlib's own generic tests. **Build that file set
+before working this bucket**, or the work will look worthless when it is not.
 
 ### LANDED: typing a local from its initializer
 
