@@ -487,12 +487,26 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     i.e. `Map.Entry.component2`'s one-expression body was folded in by an
     accessor/property fast path rather than expanded as an inline call.
 
-    So the search is now: which lowering path turns `e.component2()` into a
-    GetField. Grep the emitters of `GetField` for the one that consults a
-    resolved accessor or a single-expression body, and instrument THAT. Four
-    measurements have each excluded a path; this one is the first with a
-    positive signal (the emitted instruction) to search from rather than an
-    absence.
+    So the search is: which lowering path turns `e.component2()` into a
+    GetField. Twenty `GetField` emitters exist in `lower/expr.zig`; none of the
+    obvious ones (the safe-call arm, the `super.<prop>` arm, the this-field
+    arms) reads a resolved accessor.
+
+    ONE LEAD, not yet tested. `resolveCallableExtensionProperty` — reached from
+    the member-call fallback — takes `receiver_head` as a bare STRING:
+
+        return b.module.resolveCallableExtensionProperty(
+            name.name, receiver_head, receiver_is_class, value_arity, …);
+
+    That is the same simple-name identity the rest of this entry is about, on
+    the one path that can turn a member CALL into a property read. Instrument
+    it for `component*` before assuming it; four assumptions have now been
+    wrong here and the fifth should be measured first.
+
+    The uppercase-qualifier discriminator (a qualifier segment beginning with a
+    capital is a CLASS, so its simple name is not an identity) is written and
+    correct — it has simply been applied at four sites that this call does not
+    reach. Once the site is known it drops in unchanged.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
