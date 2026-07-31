@@ -69,8 +69,30 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SHADOW_TRACE` | set | Whether an imported pack extension shadows a member call (probe plus each candidate) | `[shadow]` |
 | `KLIO_BARERET` | `<name>` or `*` | Why a bare call does or does not lend its return type to the local it initializes: the receiver head it resolved against, the target, the final type, and each refusal | `[bareret]` |
 | `KLIO_LI_NAMES` | set | Names the callee of every local initializer that yields no static type. Pair with `KLIO_BARERET` on whichever name dominates | `[li-null]` |
+| `KLIO_NORECV_NAMES` | a `[no-recv-path]` bucket name, or `*` | Names the receiver identifier behind each untyped bare-path receiver, split by why it is untyped (`local_no_decl_type`, `captured`, `enclosing_member`, `unknown`) | `[no-recv-name]` |
 | `KLIO_COMP_TRACE` | set | The type a destructured name takes from its `componentN()` accessor, or why none was available | `[comp]` |
 | `KLIO_INIT_SELF` | `0` to disable | Off, a local's own name shadows its initializer's bare call again (`val iterator = iterator()`). For A/B measurement of that channel from one binary | — |
+| `KLIO_TP_HEAD` | `0` to disable | Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so `C : MutableCollection<in T>` names no owner again | — |
+| `KLIO_EXT_RECV_PROP` | `0` to disable | Off, a bare name in a top-level extension's body stops resolving to the extension receiver's property, so it gets no declared type | — |
+| `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read, indexed-read or ALIAS initializer (`val node = coord.layoutNode`, `val held = row[1]`, `val b = a`) stops lending its type to the local | — |
+| `KLIO_RECV_CHAIN` | `0` to disable | Off, a member or indexed receiver is typed only from a declared type or a call's return type, never from the type a local's own initializer lends it | — |
+| `KLIO_BIND_LUB` | `0` to disable | Off, a generic call's type-parameter constraints must be EQUAL across the receiver and every argument — a subsumed constraint (`getOrDefault(k, Derived())` on a Map of Base, `listOf(Derived(), base)`) rejects the instantiation again | — |
+| `KLIO_TP_RECV` | `0` to disable | Off, a call on a receiver typed by a TYPE PARAMETER (`M : MutableMap<in K, MutableList<T>>`) stops deriving its return type through the parameter's full upper bound, so the local it initializes loses its type again | — |
+| `KLIO_SOLE_GLOBAL` | `0` to disable | Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide | — |
+| `KLIO_FACTORY_PROP` | `0` to disable | Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (`val made = newBase()`) and a constructor PARAMETER (`private val held = start`) both stop registering a type head | — |
+| `KLIO_NULL_CHAIN` | `0` to disable | Off, only a condition that is itself the whole `!= null` check narrows — an `&&` chain and an early-return guard stop smart-casting | — |
+| `KLIO_INIT_KINDS` | set | Names the AST kind of every local initializer that is NOT recorded, so the next gap in that list is data rather than a guess | `[init-kind]` |
+| `KLIO_SLOT_TRACE` | `<name>` or `*` | Each inherited-slot merge decision for methods of that simple name: the competing FuncIds and which one the class's table keeps | `[slot-merge]` |
+| `KLIO_SLOT_DUMP` | `<name>` | Every `(class, slot) -> implementation` entry whose target has that simple name, with the target's owner — what runtime virtual dispatch will actually reach | `[slot-dump]` |
+
+The `0`-to-disable rows above exist so one binary can be compared against
+itself: `scripts/examples-ab.sh KLIO_SOME_GATE` runs the examples corpus both
+ways and reports what differs. It skips the twelve examples that never
+terminate (each blocks on a window or event loop at ~0% CPU, at every commit) —
+left in, they cost twice the timeout apiece for no signal and turn a five-minute
+comparison into a three-hour one.
+
+| `KLIO_OPERATOR_TY` | `0` to disable | Off, an indexed read and the `times`/`div`/`rem`/`rangeTo` operators stop lending their declared return type to a receiver | — |
 | `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic | `[gtrace]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
 | `KLIO_ANON_AUDIT` | set | Synthesized class name and captured names at each anonymous-object site | `[ANON]` |

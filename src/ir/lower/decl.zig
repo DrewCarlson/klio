@@ -1110,7 +1110,8 @@ pub fn lowerClassWithExtras(
                 .is_suspend = false,
                 .is_expect = false,
                 .is_actual = false,
-                .visibility = .Public,
+                // Kotlin gives the accessor the property's own visibility.
+                .visibility = p.visibility,
                 .annotations = &.{},
                 .span = p.span,
             };
@@ -1144,7 +1145,7 @@ pub fn lowerClassWithExtras(
                     .arity = .{ .required = 0, .total = 0, .has_vararg = false },
                     .sig = &.{},
                     .kind = .instance_method,
-                    .visibility = .Public,
+                    .visibility = p.visibility,
                     .is_inline = false,
                     .is_suspend = false,
                     .has_body = true,
@@ -1495,7 +1496,22 @@ pub fn lowerMethodWithMemberContext(
         // a `::name` referencing an owner member must bind the DISPATCH
         // receiver via the qualified-this walk, and the ref lowering
         // keys that on the owner-class name.
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null);
+        //
+        // The DISPATCH owner's members ARE the enclosing member scope of a
+        // member extension's body: a bare `state` the extension receiver's
+        // static type does not declare resolves to `this@Owner.state`, and
+        // without the owner set the read lowered to a plain field read on
+        // the extension receiver — where a runtime SUBTYPE's unrelated
+        // same-named field captured it.
+        var owner_scope = StringSet.init(a);
+        defer owner_scope.deinit();
+        {
+            var it = own_members.keyIterator();
+            while (it.next()) |k| try owner_scope.put(k.*, {});
+            var eit = enclosing_members.keyIterator();
+            while (eit.next()) |k| try owner_scope.put(k.*, {});
+        }
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, &owner_scope, null);
         const reserved_id = module.funcByDeclSpan(f.name.span);
         const id = reserved_id orelse module.nextFuncId();
         var placed = func;
@@ -1589,6 +1605,14 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
     try module.registry.func_type_params.put(id, tp_names);
 }
 
+/// The bound's head still names one classifier, which is enough to own a
+/// member call on the parameter even when the record dropped the bound's type
+/// ARGUMENTS. `C : MutableCollection<in T>` is the shape.
+fn boundTypeRecordHeadOnly(bound: *const ast.TypeRef) bool {
+    return !bound.nullable and bound.function == null and
+        bound.qualified_path == null and bound.name.name.len != 0;
+}
+
 fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
     return !bound.nullable and bound.type_args.len == 0 and
         bound.function == null and !bound.definitely_non_null and
@@ -1609,6 +1633,7 @@ fn loweredClassTypeParamBounds(
                 .param = param.name.name,
                 .bound = upper.name.name,
                 .complete = boundTypeRecordComplete(upper),
+                .head_only = boundTypeRecordHeadOnly(upper),
             });
         }
         for (class.where_bounds) |*where_bound| {
@@ -1617,6 +1642,7 @@ fn loweredClassTypeParamBounds(
                 .param = param.name.name,
                 .bound = where_bound.bound.name.name,
                 .complete = boundTypeRecordComplete(&where_bound.bound),
+                .head_only = boundTypeRecordHeadOnly(&where_bound.bound),
             });
         }
         if (bounds.items.len == first) {
@@ -1697,10 +1723,11 @@ fn addScopedTypeParamBounds(
                     }
                 }
                 if (!shadowed) {
-                    try b.addTypeParamBoundEvidence(
+                    try b.addTypeParamBoundHead(
                         bound.param,
                         bound.bound,
                         bound.complete,
+                        bound.head_only,
                     );
                 }
             }
@@ -1710,10 +1737,14 @@ fn addScopedTypeParamBounds(
         if (param.is_reified) continue;
         var bound: []const u8 = "kotlin.Any";
         var complete = true;
+        var head_only = true;
         var count: usize = 0;
+        var bound_ast: ?*const ast.TypeRef = null;
         if (param.upper_bound) |*upper| {
             bound = upper.name.name;
             complete = boundTypeRecordComplete(upper);
+            head_only = boundTypeRecordHeadOnly(upper);
+            bound_ast = upper;
             count += 1;
         }
         for (f.where_bounds) |*where_bound| {
@@ -1721,12 +1752,28 @@ fn addScopedTypeParamBounds(
                 if (count == 0) {
                     bound = where_bound.bound.name.name;
                     complete = boundTypeRecordComplete(&where_bound.bound);
+                    head_only = boundTypeRecordHeadOnly(&where_bound.bound);
+                    bound_ast = &where_bound.bound;
                 }
                 count += 1;
             }
         }
-        if (count > 1) complete = false;
-        try b.addTypeParamBoundEvidence(param.name.name, bound, complete);
+        if (count > 1) {
+            complete = false;
+            head_only = false;
+        }
+        try b.addTypeParamBoundHead(param.name.name, bound, complete, head_only);
+        // The string record drops the bound's type ARGUMENTS; keep the full
+        // lowered form when there are any, so a receiver typed by this
+        // parameter can instantiate a call's return type through it.
+        if (count == 1) if (bound_ast) |upper| {
+            if (upper.type_args.len != 0) {
+                try b.addTypeParamBoundRef(
+                    param.name.name,
+                    try loweredTypeRef(b.allocator, upper, true),
+                );
+            }
+        };
     }
 }
 

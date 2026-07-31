@@ -1187,6 +1187,127 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "redeclared_interface_slot_reaches_the_inherited_body" {
+    try check("redeclared_interface_slot_reaches_the_inherited_body",
+        \\[a, b]
+        \\[b, a]
+        \\[b]
+        \\
+    );
+}
+
+test "receiver_typed_through_its_parameter_bound" {
+    try check("receiver_typed_through_its_parameter_bound",
+        \\base
+        \\1
+        \\2
+        \\
+    );
+}
+
+test "generic_argument_from_every_constraint" {
+    try check("generic_argument_from_every_constraint",
+        \\base
+        \\base
+        \\base
+        \\base
+        \\true
+        \\false
+        \\
+    );
+}
+
+test "generic_receiver_through_its_initializer" {
+    try check("generic_receiver_through_its_initializer",
+        \\base
+        \\base
+        \\derived
+        \\base
+        \\base
+        \\
+    );
+}
+
+test "property_typed_from_a_ctor_parameter" {
+    try check("property_typed_from_a_ctor_parameter",
+        \\base
+        \\derived
+        \\
+    );
+}
+
+test "property_typed_from_a_factory_call" {
+    try check("property_typed_from_a_factory_call",
+        \\base
+        \\derived
+        \\derived
+        \\
+    );
+}
+
+test "null_check_through_and_chain" {
+    try check("null_check_through_and_chain",
+        \\member
+        \\member
+        \\member
+        \\member
+        \\none
+        \\nullable-ext
+        \\nullable-ext
+        \\
+    );
+}
+
+test "alias_local_keeps_its_source_type" {
+    try check("alias_local_keeps_its_source_type",
+        \\base
+        \\base
+        \\base
+        \\derived
+        \\
+    );
+}
+
+test "receiver_typed_from_an_operator" {
+    try check("receiver_typed_from_an_operator",
+        \\base
+        \\base
+        \\base
+        \\base
+        \\derived
+        \\
+    );
+}
+
+test "bare_name_inside_an_extension_body" {
+    try check("bare_name_inside_an_extension_body",
+        \\base
+        \\derived
+        \\base
+        \\
+    );
+}
+
+test "receiver_typed_from_a_property_read" {
+    try check("receiver_typed_from_a_property_read",
+        \\base
+        \\derived
+        \\base
+        \\derived
+        \\
+    );
+}
+
+test "local_named_after_its_own_initializer" {
+    try check("local_named_after_its_own_initializer",
+        \\base
+        \\derived
+        \\abc
+        \\lambda
+        \\
+    );
+}
+
 test "data_class_components_are_declared_members" {
     try check("data_class_components_are_declared_members",
         \\a/1

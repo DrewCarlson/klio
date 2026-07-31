@@ -1240,11 +1240,27 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]c
     const callee = src.Call.callee;
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
-    if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
-    for (decls) |*d| {
-        if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
+    if (nm.len == 0) return null;
+    if (std.ascii.isUpper(nm[0])) {
+        for (decls) |*d| {
+            if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
+        }
+        return null;
     }
-    return null;
+    // A FACTORY call names its type just as a constructor does, as long as
+    // exactly one declaration answers to the name and it declares a return
+    // type: `val cache = newCache()` is whatever `newCache` returns.
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0")) return null;
+    var found: ?[]const u8 = null;
+    for (decls) |*d| {
+        if (d.* != .Function) continue;
+        if (!std.mem.eql(u8, d.Function.name.name, nm)) continue;
+        if (found != null) return null;
+        const rt = d.Function.return_type orelse return null;
+        if (rt.nullable or rt.function != null or rt.qualified_path != null) return null;
+        found = rt.name.name;
+    }
+    return found;
 }
 
 /// The materialized array head a `vararg` property has (mirrors the body-side
@@ -1900,6 +1916,19 @@ fn buildModuleWithOverrides(
                 const prop = m.Property;
                 const ty_opt: ?*const ast.TypeRef = if (prop.ty) |*t| t else blk: {
                     const src = propHeadSourceExpr(prop) orelse break :blk null;
+                    // `private val _start = start` beside `class R(start: Double)`
+                    // is the parameter's type. The stdlib's ranges and `Lazy`
+                    // are written this way, and it was the whole of the
+                    // enclosing-member bucket.
+                    if (src.* == .Path and src.Path.segments.len == 1 and
+                        !std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0"))
+                    {
+                        const pname = src.Path.segments[0].name;
+                        for (c.primary_params) |*pp| {
+                            if (std.mem.eql(u8, pp.name.name, pname)) break :blk &pp.ty;
+                        }
+                        break :blk null;
+                    }
                     if (src.* != .Call) break :blk null;
                     const callee = src.Call.callee;
                     if (callee.* != .Path or callee.Path.segments.len != 1) break :blk null;
@@ -2478,6 +2507,53 @@ fn buildModuleWithOverrides(
                 var tp_names: std.ArrayList([]const u8) = .empty;
                 for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
                 try module.registry.func_type_params.put(id, tp_names);
+                var hdr_bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+                for (f.type_params) |*tp| {
+                    const first = hdr_bounds.items.len;
+                    if (tp.upper_bound) |*ub| {
+                        try hdr_bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = ub.name.name,
+                            .complete = boundTypeRecordComplete(ub),
+                        });
+                    }
+                    for (f.where_bounds) |*wb| {
+                        if (!std.mem.eql(u8, wb.name.name, tp.name.name)) continue;
+                        try hdr_bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = wb.bound.name.name,
+                            .complete = boundTypeRecordComplete(&wb.bound),
+                        });
+                    }
+                    if (hdr_bounds.items.len - first > 1) {
+                        for (hdr_bounds.items[first..]) |*bd| bd.complete = false;
+                    }
+                }
+                const hdr_skip = blk: {
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
+                    break :blk std.mem.indexOf(u8, std.mem.span(w), f.name.name) != null;
+                };
+                // Default OFF: arming the runtime refuter program-wide flips
+                // the inner pick of the range `contains` family into
+                // self-recursion (DurationTest; skip=contains alone restores
+                // 52/52). Opt in with KLIO_HDR_BOUNDS=1 to reproduce; the
+                // ranking interplay is the tracked next fix, after which this
+                // becomes the default and bounded_typeparam_receiver goes
+                // green end-to-end.
+                const hdr_on = blk: {
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk false;
+                    break :blk std.mem.eql(u8, std.mem.span(w), "1");
+                };
+                if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
+                    if (std.c.getenv("KLIO_HDR_BOUNDS_LIST") != null) {
+                        std.debug.print("[hdrb] {s}", .{f.name.name});
+                        for (hdr_bounds.items) |bd| std.debug.print(" {s}<:{s}", .{ bd.param, bd.bound });
+                        std.debug.print("\n", .{});
+                    }
+                    try module.registry.func_type_param_bounds.put(id, try hdr_bounds.toOwnedSlice(a));
+                } else {
+                    hdr_bounds.deinit(a);
+                }
             }
             // Key the inline-fn AST by the header stub's FuncId, so a
             // bare call the symbol index resolves to this declaration

@@ -3213,7 +3213,11 @@ pub const Module = struct {
         }
         if (args.len > params.len) return .incompatible;
         var bindings: std.ArrayList(TypeBinding) = .empty;
-        if (receiver) |actual_receiver| {
+        // The receiver's type arguments exist to instantiate the PARAMETER
+        // types below. A zero-argument call has none to instantiate, so a
+        // receiver that cannot project (a bare `Set` head from a lambda body)
+        // must not turn `iterator()` unknown.
+        if (args.len != 0) if (receiver) |actual_receiver| {
             if (self.decl_sigs.get(fid.int())) |sig| {
                 if (sig.enclosing_class) |owner| {
                     if (owner.int() < self.classes.items.len) {
@@ -3240,7 +3244,7 @@ pub const Module = struct {
                     }
                 }
             }
-        }
+        };
         var result: StaticCompatibility = .compatible;
         for (args, params[0..args.len]) |arg, param| {
             const instantiated_param = if (bindings.items.len == 0)
@@ -4004,7 +4008,23 @@ pub const Module = struct {
                 best_score = applied;
                 tied = false;
             } else if (applied == best_score) {
-                tied = true;
+                // Redeclarations of one virtual family are not an overload
+                // tie: `Set.iterator` overrides `Collection.iterator`
+                // overrides `Iterable.iterator`, and every one of them names
+                // the same slot family. Keep the overriding declaration; a
+                // genuine tie between unrelated members still defers.
+                const existing = best.?;
+                var family = false;
+                if (self.decl_sigs.get(fid.int())) |cs| if (cs.enclosing_class) |co| {
+                    if (self.overridesSlot(sa, co, fid, existing) catch false) {
+                        best = fid;
+                        family = true;
+                    }
+                };
+                if (!family) if (self.decl_sigs.get(existing.int())) |es| if (es.enclosing_class) |eo| {
+                    if (self.overridesSlot(sa, eo, existing, fid) catch false) family = true;
+                };
+                if (!family) tied = true;
             }
         }
         if (visibility_unknown or tied or unknown_count != 0 and best != null) {
@@ -4146,6 +4166,11 @@ pub const Module = struct {
     const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
+        /// The call site wrote this type argument out. Kotlin takes an
+        /// explicit argument as final and does not infer the parameter from
+        /// the value arguments at all, so a later value argument may be a
+        /// SUBTYPE of it without contradicting it.
+        explicit: bool = false,
     };
 
     fn bindingType(bindings: []const TypeBinding, name: []const u8) ?TypeRef {
@@ -4153,6 +4178,19 @@ pub const Module = struct {
             if (std.mem.eql(u8, binding.name, name)) return binding.ty;
         }
         return null;
+    }
+
+    fn bindingIsExplicit(bindings: []const TypeBinding, name: []const u8) bool {
+        for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding.explicit;
+        }
+        return false;
+    }
+
+    fn widenBinding(bindings: []TypeBinding, name: []const u8, ty: TypeRef) void {
+        for (bindings) |*binding| {
+            if (std.mem.eql(u8, binding.name, name)) binding.ty = ty;
+        }
     }
 
     fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
@@ -4262,7 +4300,38 @@ pub const Module = struct {
         const pattern_head = staticTypeHead(pattern.name);
         if (callTypeRefParam(params, pattern)) {
             if (bindingType(bindings.items, pattern_head)) |bound| {
-                return bound.eql(actual);
+                // `arrayOf<Base>(Derived())`: the written argument decides the
+                // parameter, and the value being a subtype of it is exactly
+                // what the call means. Demanding equality here rejected the
+                // whole instantiation and left the receiver untyped.
+                if (bindingIsExplicit(bindings.items, pattern_head)) return true;
+                if (bound.eql(actual)) return true;
+                // Kotlin infers the parameter from every constraint together,
+                // so a constraint one side already subsumes narrows nothing:
+                // `m.getOrDefault(k, Derived())` on a Map<K, Base> means
+                // V=Base with the value argument a subtype of it, and
+                // `listOf(Derived(), base)` means T=Base by the same rule.
+                // Keep the subsuming side; genuinely unrelated constraints
+                // (kotlinc would compute a common supertype) still refuse.
+                const lub_off = if (std.c.getenv("KLIO_BIND_LUB")) |v|
+                    std.mem.eql(u8, std.mem.span(v), "0")
+                else
+                    false;
+                const bound_plain = overrideArgs(bound).len == 0;
+                const actual_plain = overrideArgs(actual).len == 0;
+                if (!lub_off and bound_plain and actual_plain) {
+                    const bound_head = staticTypeHead(bound.name);
+                    const actual_head = staticTypeHead(actual.name);
+                    if ((!actual.nullable or bound.nullable) and
+                        self.classIsOrExtends(actual_head, bound_head)) return true;
+                    if ((!bound.nullable or actual.nullable) and
+                        self.classIsOrExtends(bound_head, actual_head))
+                    {
+                        widenBinding(bindings.items, pattern_head, actual);
+                        return true;
+                    }
+                }
+                return false;
             }
             try bindings.append(allocator, .{ .name = pattern_head, .ty = actual });
             return true;
@@ -4333,6 +4402,7 @@ pub const Module = struct {
                 if (std.mem.eql(u8, bound.param, param)) {
                     out.bound = bound.bound;
                     out.complete = bound.complete;
+                    out.head_only = bound.head_only;
                     break;
                 }
             }
@@ -4372,7 +4442,11 @@ pub const Module = struct {
 
         var bindings: std.ArrayList(TypeBinding) = .empty;
         for (explicit_type_args, 0..) |ty, i| {
-            try bindings.append(a, .{ .name = function_type_params[i], .ty = ty });
+            try bindings.append(a, .{
+                .name = function_type_params[i],
+                .ty = ty,
+                .explicit = true,
+            });
         }
 
         var all_type_params: std.ArrayList([]const u8) = .empty;
@@ -4802,6 +4876,43 @@ pub const Module = struct {
         }
     }
 
+    /// Point a slot left naming a bodyless interface declaration at the bodied
+    /// implementation the class holds for the same member under another slot.
+    /// A redeclared interface member owns a slot of its own —
+    /// `MutableList.remove` redeclares `MutableCollection.remove` — while the
+    /// implementing body arrives through a different supertype edge keyed by
+    /// the base declaration's slot (`AbstractMutableCollection.remove`), so
+    /// nothing else connects the two and the redeclaration's slot dispatches
+    /// into an unexecutable header. Class-owned bodyless declarations are left
+    /// alone: those are host-linked members, not unmet requirements.
+    fn unifyRedeclaredSlots(
+        self: *const Module,
+        allocator: Allocator,
+        map: *std.AutoHashMap(u32, FuncId),
+    ) Allocator.Error!void {
+        if (map.count() < 2) return;
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const target = entry.value_ptr.*;
+            const sig = self.decl_sigs.get(target.int()) orelse continue;
+            if (sig.has_body) continue;
+            const owner = sig.enclosing_class orelse continue;
+            if (owner.int() >= self.classes.items.len or
+                !self.classes.items[owner.int()].is_interface) continue;
+            var candidates = map.iterator();
+            while (candidates.next()) |cand| {
+                const impl = cand.value_ptr.*;
+                if (impl.int() == target.int()) continue;
+                const impl_sig = self.decl_sigs.get(impl.int()) orelse continue;
+                if (!impl_sig.has_body) continue;
+                if (try self.overridesSlot(allocator, owner, target, FuncId.from(cand.key_ptr.*))) {
+                    entry.value_ptr.* = impl;
+                    break;
+                }
+            }
+        }
+    }
+
     /// Choose the more-specific implementation of one inherited virtual slot.
     /// Runtime-defined classes use the same rule when merging the already-linked
     /// slot tables of their declared supertypes.
@@ -4886,6 +4997,7 @@ pub const Module = struct {
             }
             try maps[cid.int()].put(MethodSlotId.fromFunc(fid).int(), fid);
         }
+        try self.unifyRedeclaredSlots(allocator, &maps[cid.int()]);
         state[cid.int()] = 2;
     }
 
@@ -8565,6 +8677,11 @@ pub const ModuleRegistry = struct {
         /// False when the string-only record dropped intersection or
         /// structural type information and cannot support a negative proof.
         complete: bool = true,
+        /// True when `bound` still names the single classifier the parameter
+        /// is bounded by, even if the record dropped its type ARGUMENTS. That
+        /// is enough to answer "which class owns a member call on this
+        /// parameter", which is all the receiver-owner lookup asks.
+        head_only: bool = true,
     };
 
     /// One class's transitive shadow-name set + chain completeness.
@@ -9790,6 +9907,184 @@ test "method slots link generic overrides and multiple interface roots" {
         child_pick,
         m.methodSlotTarget(shadow_child, MethodSlotId.fromFunc(base_pick)).?,
     );
+}
+
+test "a redeclared interface slot reaches the body inherited beside it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    const root = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Root",
+        .fqn = "sample.Root",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const redecl_supers = try a.alloc(TypeRef, 1);
+    redecl_supers[0] = .{ .name = "Root", .nullable = false, .args = &.{} };
+    const redecl = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Redecl",
+        .fqn = "sample.Redecl",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{root}),
+        .supertype_refs = redecl_supers,
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const impl_supers = try a.alloc(TypeRef, 1);
+    impl_supers[0] = .{ .name = "Root", .nullable = false, .args = &.{} };
+    const impl = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Impl",
+        .fqn = "sample.Impl",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{root}),
+        .supertype_refs = impl_supers,
+        .is_abstract = true,
+    });
+    const leaf_supers = try a.alloc(TypeRef, 2);
+    leaf_supers[0] = .{ .name = "Impl", .nullable = false, .args = &.{} };
+    leaf_supers[1] = .{ .name = "Redecl", .nullable = false, .args = &.{} };
+    const leaf = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "Leaf",
+        .fqn = "sample.Leaf",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{ impl, redecl }),
+        .supertype_refs = leaf_supers,
+    });
+
+    const root_del = try pushTestFuncOpts(&m, a, "del", "sample.Root.del", "sample", 1, .{ .stub = true });
+    const redecl_del = try pushTestFuncOpts(&m, a, "del", "sample.Redecl.del", "sample", 1, .{ .stub = true });
+    const impl_del = try pushTestFuncOpts(&m, a, "del", "sample.Impl.del", "sample", 1, .{});
+    for ([_]FuncId{ root_del, redecl_del, impl_del }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[redecl_del.int()].is_override = true;
+    m.funcs.items[impl_del.int()].is_override = true;
+    m.classes.items[impl.int()].methods = try a.dupe(FuncId, &.{impl_del});
+
+    const owners = [_]ClassId{ root, redecl, impl };
+    const funcs = [_]FuncId{ root_del, redecl_del, impl_del };
+    for (funcs, owners) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+            .sig = try a.dupe(TypeRef, &.{.{ .name = "Int", .nullable = false, .args = &.{} }}),
+            .kind = .instance_method,
+            .has_body = m.funcs.items[fid.int()].hasBody(),
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "del", fid);
+    }
+
+    try m.linkMethodSlots(a);
+    // The base family reaches the body, and the redeclaration's own slot must
+    // reach the SAME body rather than the bodyless header it inherits.
+    try testing.expectEqual(impl_del, m.methodSlotTarget(leaf, MethodSlotId.fromFunc(root_del)).?);
+    try testing.expectEqual(impl_del, m.methodSlotTarget(leaf, MethodSlotId.fromFunc(redecl_del)).?);
+    // With no body anywhere in the family, the header stays as linked.
+    try testing.expectEqual(redecl_del, m.methodSlotTarget(redecl, MethodSlotId.fromFunc(redecl_del)).?);
+
+    // Resolution over a redeclaration chain: equal-scoring redeclarations are
+    // one slot family, not an overload tie, and a zero-argument call has no
+    // parameter for an unprojectable bare receiver to turn unknown. Both
+    // wrong answers came back as `dispatch=deferred` with no target — the
+    // `Set.iterator()` shape.
+    const root_size = try pushTestFuncOpts(&m, a, "size", "sample.Root.size", "sample", 0, .{ .stub = true });
+    const redecl_size = try pushTestFuncOpts(&m, a, "size", "sample.Redecl.size", "sample", 0, .{ .stub = true });
+    for ([_]FuncId{ root_size, redecl_size }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[redecl_size.int()].is_override = true;
+    const size_owners = [_]ClassId{ root, redecl };
+    const size_funcs = [_]FuncId{ root_size, redecl_size };
+    for (size_funcs, size_owners) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+            .sig = &.{},
+            .kind = .instance_method,
+            .has_body = false,
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "size", fid);
+    }
+    const bare_recv = TypeRef{ .name = "Redecl", .nullable = false, .args = &.{} };
+    const res = m.resolveMemberCall(redecl, "size", &.{}, .{
+        .receiver_type = bare_recv,
+    });
+    try testing.expect(res.dispatch != .deferred);
+    try testing.expectEqual(redecl_size, res.target.?);
+
+    // The GENERIC owner is where the bare receiver bites: `Set<E>` cannot be
+    // projected from a bare `Set` head, and that unknown must not defer a
+    // call with no parameters to instantiate.
+    const groot = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "GRoot",
+        .fqn = "sample.GRoot",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .type_params = &.{"E"},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const gredecl_args = try a.alloc(TypeRef, 1);
+    gredecl_args[0] = .{ .name = "E", .nullable = false, .args = &.{} };
+    const gredecl_supers = try a.alloc(TypeRef, 1);
+    gredecl_supers[0] = .{ .name = "GRoot", .nullable = false, .args = gredecl_args };
+    const gredecl = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "GRedecl",
+        .fqn = "sample.GRedecl",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{groot}),
+        .supertype_refs = gredecl_supers,
+        .type_params = &.{"E"},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const groot_first = try pushTestFuncOpts(&m, a, "first", "sample.GRoot.first", "sample", 0, .{ .stub = true });
+    const gredecl_first = try pushTestFuncOpts(&m, a, "first", "sample.GRedecl.first", "sample", 0, .{ .stub = true });
+    for ([_]FuncId{ groot_first, gredecl_first }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[gredecl_first.int()].is_override = true;
+    const first_owners = [_]ClassId{ groot, gredecl };
+    const first_funcs = [_]FuncId{ groot_first, gredecl_first };
+    for (first_funcs, first_owners) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+            .sig = &.{},
+            .kind = .instance_method,
+            .has_body = false,
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "first", fid);
+    }
+    const bare_generic = TypeRef{ .name = "GRedecl", .nullable = false, .args = &.{} };
+    const gres = m.resolveMemberCall(gredecl, "first", &.{}, .{
+        .receiver_type = bare_generic,
+    });
+    try testing.expect(gres.dispatch != .deferred);
+    try testing.expectEqual(gredecl_first, gres.target.?);
 }
 
 /// Options for the symbol-index test func pusher.

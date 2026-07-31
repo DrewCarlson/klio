@@ -328,18 +328,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer narrowed.deinit(b.allocator);
             try narrowIsCheckAll(b, f.cond, &narrowed);
-            const narrowed_not_null = try narrowNullCheck(b, f.cond, true);
+            var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, f.cond, true, &not_null);
             const t_val = try lowerExpr(b, f.then_branch);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var nn = not_null.items.len;
+            while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
             var ni = narrowed.items.len;
             while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
             b.switchTo(f_block);
-            const narrowed_else_not_null = try narrowNullCheck(b, f.cond, false);
+            var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer else_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, f.cond, false, &else_not_null);
             const f_val = if (f.else_branch) |e| try lowerExpr(b, e) else try b.emitConst(.Unit);
-            if (narrowed_else_not_null) |n| b.restoreLocal(n);
+            var en = else_not_null.items.len;
+            while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = f_val } });
             b.terminate(.{ .Goto = join });
             b.switchTo(join);
@@ -360,9 +366,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
             b.switchTo(body_blk);
             try b.pushLoop(null, header, exit);
-            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
+            var w_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer w_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, w.cond, true, &w_not_null);
             _ = try lowerExpr(b, w.body);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var wn = w_not_null.items.len;
+            while (wn > 0) : (wn -= 1) b.restoreLocal(w_not_null.items[wn - 1]);
             b.popLoop();
             b.terminate(.{ .Goto = header });
 
@@ -2384,12 +2393,23 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // A local/param binding shadows an enclosing member of the same name.
     if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
     if (b.knowsOuter(recv_name)) return null;
-    const owner = b.ownerClass() orelse return null;
+    // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
+    // `fun UByteArray.indices()` is a member of the receiver, and a top-level
+    // extension has no enclosing class at all, so the search stopped there.
+    const owner = b.ownerClass() orelse blk: {
+        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
+        const head = b.recvTy() orelse return null;
+        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+    };
+    return propTypeHeadOn(b, owner, recv_name);
+}
+
+fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     const heads = b.module.registry.class_prop_type_heads;
-    if (heads.get(.{ .a = owner, .b = recv_name })) |h| return h;
+    if (heads.get(.{ .a = owner, .b = name })) |h| return h;
     const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
     for (chain) |cls| {
-        if (heads.get(.{ .a = cls, .b = recv_name })) |h| return h;
+        if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
     return null;
 }
@@ -4302,9 +4322,12 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, header, exit);
-            const narrowed_not_null = try narrowNullCheck(b, w.cond, true);
+            var lw_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer lw_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, w.cond, true, &lw_not_null);
             _ = try lowerExpr(b, w.body);
-            if (narrowed_not_null) |n| b.restoreLocal(n);
+            var lwn = lw_not_null.items.len;
+            while (lwn > 0) : (lwn -= 1) b.restoreLocal(lw_not_null.items[lwn - 1]);
             b.popLoop();
             b.terminate(.{ .Goto = header });
             b.switchTo(exit);
@@ -7770,6 +7793,34 @@ pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.
     return null;
 }
 
+/// Every non-null narrowing a condition proves for the branch it guards.
+/// Kotlin narrows on each `!= null` in an `&&` chain, exactly as it does for
+/// each `is` check — `if (a != null && b != null)` narrows both — and on each
+/// `== null` in an `||` chain for the ELSE branch. Only a condition that was
+/// itself the whole check narrowed anything, so the common guarded shape got
+/// no narrowing at all and its member calls stayed off the static path.
+///
+/// Applied in source order; the caller restores in reverse, because each
+/// narrowing saves the binding the previous one left.
+pub fn narrowNullCheckAll(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    truthy: bool,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (cond.* == .Binary and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_NULL_CHAIN") orelse "1", "0"))
+    {
+        const op = cond.Binary.op;
+        if ((truthy and op == .And) or (!truthy and op == .Or)) {
+            try narrowNullCheckAll(b, cond.Binary.lhs, truthy, out);
+            try narrowNullCheckAll(b, cond.Binary.rhs, truthy, out);
+            return;
+        }
+    }
+    if (try narrowNullCheck(b, cond, truthy)) |n| try out.append(b.allocator, n);
+}
+
 fn narrowNullCheck(
     b: *FuncBuilder,
     cond: *const Expr,
@@ -8069,7 +8120,14 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return result;
     }
     if (b.localInitExpr(p.segments[0].name)) |init| {
-        if (init != arg) {
+        // Following a local's initializer can re-enter this local. Kotlin has
+        // no such cycle — a local cannot be initialized from one declared
+        // after it — but lowering re-asks from a later point in the block,
+        // where every local is already bound, so `val a = b.x` beside
+        // `val b = a.y` reaches itself and recurses until the stack ends.
+        // Refuse to re-enter a local already on the chain.
+        if (init != arg and pushInitChain(p.segments[0].name)) {
+            defer popInitChain();
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
         }
     }
@@ -8084,6 +8142,26 @@ fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return .{ .name = nm, .nullable = false, .args = &.{} };
     }
     return null;
+}
+
+/// Locals whose initializer the declared-type walk is currently inside, so it
+/// can refuse to re-enter one. Bounded: past the cap the walk simply stops
+/// deriving, which is the same answer a null type already stands for.
+var init_chain: [16][]const u8 = @splat(&.{});
+var init_chain_len: usize = 0;
+
+fn pushInitChain(name: []const u8) bool {
+    if (init_chain_len == init_chain.len) return false;
+    for (init_chain[0..init_chain_len]) |seen| {
+        if (std.mem.eql(u8, seen, name)) return false;
+    }
+    init_chain[init_chain_len] = name;
+    init_chain_len += 1;
+    return true;
+}
+
+fn popInitChain() void {
+    init_chain_len -= 1;
 }
 
 fn staticTypeClassId(b: *const FuncBuilder, ty: ir.TypeRef) ?ir.ClassId {
@@ -8226,6 +8304,36 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     return try b.allocator.dupe(u8, elem.name);
 }
 
+/// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
+/// plain parameter, recursively. The owned name is re-allocated so `deinit`
+/// still frees what `clone` allocated.
+fn stripUseSiteProjections(a: Allocator, ty: *ir.TypeRef) Allocator.Error!void {
+    for (ty.args) |*arg| {
+        const suffix: ?[]const u8 = if (std.mem.startsWith(u8, arg.name, "in#"))
+            arg.name["in#".len..]
+        else if (std.mem.startsWith(u8, arg.name, "out#"))
+            arg.name["out#".len..]
+        else
+            null;
+        if (suffix) |plain| {
+            const owned = try a.dupe(u8, plain);
+            a.free(arg.name);
+            arg.name = owned;
+        }
+        try stripUseSiteProjections(a, arg);
+    }
+}
+
+/// The receiver-type chain used by the `Member` and `Index` arms. Gated so the
+/// widening can be measured against the narrower answer it replaced.
+fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_RECV_CHAIN") orelse "1", "0")) {
+        if (argDeclTypeRefLazy(b, e)) |known| return try known.clone(b.allocator);
+        return staticCallReturnTypeRef(b, e);
+    }
+    return staticExprTypeRef(b, e);
+}
+
 /// A statically known type for an arbitrary expression: its own declared type
 /// where it has one, otherwise a constructed class, a resolved call's return
 /// type, or the type a local's initializer lends it. Owned by the caller.
@@ -8321,9 +8429,28 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (norecvCensusOn()) lm_localinit[0] += 1;
         return null;
     };
+    // Same cycle as the declared-type walk: deriving one local's type can
+    // reach back into it once every local in the block is bound.
+    if (!pushInitChain(name)) return null;
+    defer popInitChain();
     if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| {
         if (norecvCensusOn()) lm_localinit[1] += 1;
         return ctor_ty;
+    }
+    // An ALIAS takes the source local's type, whatever gave the source its
+    // own: `val alias = made` where `made` came from a call's return type.
+    if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
+        if (try localInitTypeRef(b, init_expr)) |aliased| {
+            if (norecvCensusOn()) lm_localinit[1] += 1;
+            return aliased;
+        }
+    }
+    // A property read carries its own declared type; nothing needs resolving.
+    if (init_expr.* == .Member) {
+        if (argDeclTypeRef(b, init_expr)) |declared| {
+            if (norecvCensusOn()) lm_localinit[1] += 1;
+            return try declared.clone(b.allocator);
+        }
     }
     // The local's own name is not in scope inside its own initializer, so the
     // initializer's bare calls must not see it. `val iterator = iterator()` is
@@ -8364,6 +8491,16 @@ fn staticCallReturnTypeRef(
         const method: []const u8 = switch (bin.op) {
             .Add => "plus",
             .Sub => "minus",
+            .Mul, .Div, .Rem, .Range, .RangeUntil => blk: {
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0")) return null;
+                break :blk switch (bin.op) {
+                    .Mul => "times",
+                    .Div => "div",
+                    .Rem => "rem",
+                    .Range => "rangeTo",
+                    else => "rangeUntil",
+                };
+            },
             else => return null,
         };
         var inferred_receiver: ?ir.TypeRef = null;
@@ -8453,6 +8590,43 @@ fn staticCallReturnTypeRef(
             &.{},
         );
     }
+    // `a[i]` is `a.get(i)`, so the element's static type is `get`'s return
+    // type on the container. Lowering emits it as an Index instruction, but the
+    // TYPE question is the ordinary member one.
+    if (call_expr.* == .Index and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0"))
+    {
+        const idx = call_expr.Index;
+        var recv_owned = (try recvChainTypeRef(b, idx.receiver)) orelse return null;
+        defer recv_owned.deinit(b.allocator);
+        var shape_set = try buildStaticReturnArgShapes(b, idx.args, &.{});
+        defer shape_set.deinit(b.allocator);
+        const owned_bounds = try b.typeParamBoundsSlice();
+        defer if (owned_bounds) |bounds| b.allocator.free(bounds);
+        var identity = std.mem.trimEnd(u8, recv_owned.name, "?");
+        if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+        const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            b.module.classIdByFqn(identity)
+        else
+            b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse return null;
+        const resolved = b.module.resolveMemberCall(owner, "get", shape_set.shapes, .{
+            .caller_file = idx.span.file,
+            .lexical_owner = null,
+            .actual_type_param_bounds = owned_bounds orelse &.{},
+            .receiver_type = recv_owned,
+        });
+        const target = resolved.target orelse return null;
+        var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv_owned, idx.span.file);
+        defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
+        return try b.module.instantiatedCallReturnType(
+            b.allocator,
+            target,
+            recv_owned,
+            dispatch_receiver,
+            shape_set.shapes,
+            &.{},
+        );
+    }
     if (call_expr.* != .Call) return null;
     const call = call_expr.Call;
     if (call.is_infix and call.args.len == 2 and call.callee.* == .Path and
@@ -8533,6 +8707,21 @@ fn staticCallReturnTypeRef(
             const top_level_usable = res.target != null and
                 (res.confidence == .exact or
                     (b.recvTy() == null and !b.isParamThunk()));
+            // A refused top-level pick is still the ONLY answer when the name
+            // has exactly one declaration program-wide and no enclosing
+            // receiver declares a member of that name: there is nothing else
+            // it could resolve to, whatever the receiver context is. Used only
+            // where the receiver walk below finds nothing.
+            const sole_global: ?FuncId = blk_sole: {
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_SOLE_GLOBAL") orelse "1", "0")) break :blk_sole null;
+                if (top_level_usable) break :blk_sole null;
+                const t = res.target orelse break :blk_sole null;
+                if (b.module.funcsBySimpleName(name.name).len != 1) break :blk_sole null;
+                if (enclosingHasMemberNamed(b, name.name)) break :blk_sole null;
+                const f = b.module.funcById(t) orelse break :blk_sole null;
+                if (f.kind != .plain) break :blk_sole null;
+                break :blk_sole t;
+            };
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
@@ -8543,7 +8732,7 @@ fn staticCallReturnTypeRef(
                 const bt = bareRetTraceFor(b, name.name);
                 const head_name = bareStaticRecvHead(b) orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
-                    return null;
+                    break :blk sole_global orelse return null;
                 };
                 const recv_ref = if (b.spliceHintActive())
                     (if (b.spliceHintRecvRef()) |rt|
@@ -8575,7 +8764,7 @@ fn staticCallReturnTypeRef(
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
                         b.module.classId(bare_head)) orelse {
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
-                    return null;
+                    break :blk sole_global orelse return null;
                 };
                 const bare_resolved = b.module.resolveMemberCall(
                     owner,
@@ -8593,7 +8782,7 @@ fn staticCallReturnTypeRef(
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
                 });
-                break :blk bare_resolved.target orelse return null;
+                break :blk bare_resolved.target orelse (sole_global orelse return null);
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
@@ -8603,18 +8792,50 @@ fn staticCallReturnTypeRef(
             _ = &from_implicit_receiver;
         },
         .Member => |member| {
-            receiver = if (argDeclTypeRefLazy(b, member.receiver)) |known|
-                try known.clone(b.allocator)
-            else
-                try staticCallReturnTypeRef(b, member.receiver);
-            const recv_ty = receiver orelse return null;
-            var identity = std.mem.trimEnd(u8, recv_ty.name, "?");
+            const mt = bareRetTraceFor(b, member.name.name);
+            // The full chain, not just the declared-type probe: a local whose
+            // only type comes from its own INITIALIZER is invisible to the
+            // lazy answer, and `val xs = listOf<Base>(...)` is that shape.
+            receiver = try recvChainTypeRef(b, member.receiver);
+            if (receiver == null) {
+                if (mt) std.debug.print("[bareret] .{s} no receiver type\n", .{member.name.name});
+                return null;
+            }
+            var identity = std.mem.trimEnd(u8, receiver.?.name, "?");
             if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
-            const head = typeHead(identity);
-            const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            var head = typeHead(identity);
+            var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
                 b.module.classIdByFqn(identity)
             else
                 b.module.uniqueClassIdBySimpleName(head);
+            // A receiver typed by a TYPE PARAMETER names no class. Kotlin
+            // resolves the call against the parameter's declared upper bound,
+            // and the full bound carries the type arguments instantiation
+            // needs: `M : MutableMap<in K, MutableList<T>>` makes `getOrPut`
+            // return `MutableList<T>`.
+            if (owner_id == null and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0"))
+            {
+                if (b.typeParamBoundRef(head)) |bref| {
+                    receiver.?.deinit(b.allocator);
+                    receiver = try bref.clone(b.allocator);
+                    // A use-site projection in the bound (`MutableMap<in K,
+                    // MutableList<T>>`) would need capture conversion the
+                    // engine does not model. For deriving a RETURN type the
+                    // captured argument behaves as the plain parameter, and a
+                    // projected parameter that survives into the result is an
+                    // unresolved name later guards refuse anyway.
+                    try stripUseSiteProjections(b.allocator, &receiver.?);
+                    identity = std.mem.trimEnd(u8, receiver.?.name, "?");
+                    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+                    head = typeHead(identity);
+                    owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                        b.module.classIdByFqn(identity)
+                    else
+                        b.module.uniqueClassIdBySimpleName(head);
+                }
+            }
+            const recv_ty = receiver.?;
 
             var resolved_target: ?FuncId = null;
             var member_applicable = false;
@@ -8645,7 +8866,10 @@ fn staticCallReturnTypeRef(
                 if (resolved.dispatch != .deferred) resolved_target = resolved.target;
             }
             if (resolved_target == null) {
-                if (member_applicable) return null;
+                if (member_applicable) {
+                    if (mt) std.debug.print("[bareret] .{s} on {s} member applicable but deferred\n", .{ member.name.name, head });
+                    return null;
+                }
                 const implicit_owners = try b.collectImplicitReceiverTower(
                     b.allocator,
                     eagerLambdaRecvHead(b),
@@ -8665,7 +8889,11 @@ fn staticCallReturnTypeRef(
                     },
                 ).target;
             }
-            target = resolved_target orelse return null;
+            target = resolved_target orelse {
+                if (mt) std.debug.print("[bareret] .{s} on {s} no target\n", .{ member.name.name, head });
+                return null;
+            };
+            if (mt) std.debug.print("[bareret] .{s} on {s} target ok\n", .{ member.name.name, head });
         },
         else => return null,
     }
@@ -12369,6 +12597,16 @@ fn lowerResolvedMemberCall(
             else
                 .unknown;
             lm_norecv_path[@intFromEnum(which)] += 1;
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
+                if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
+                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s}\n", .{
+                        @tagName(which),
+                        rn,
+                        b.ownerClass() orelse "<none>",
+                        bareStaticRecvHead(b) orelse "<none>",
+                    });
+                }
+            }
             if (which == .local_no_decl_type) {
                 if (b.localInitExpr(rn)) |ini| {
                     lm_norecv_init[1] += 1;
@@ -12406,7 +12644,13 @@ fn lowerResolvedMemberCall(
     // intersection or structural information and cannot stand in for the type.
     if (owner_id == null) {
         if (b.typeParamBound(head)) |tpb| {
-            if (tpb.complete) {
+            // The bound's ARGUMENTS do not matter here: this asks only which
+            // class owns a member call on the parameter, and `C` bounded by
+            // `MutableCollection<in T>` answers `MutableCollection`. Those two
+            // parameters were 6,590 of the 8,702 sites in this bucket.
+            if (tpb.complete or (tpb.head_only and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_HEAD") orelse "1", "0")))
+            {
                 var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
                 if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
                 owner_id = if (std.mem.indexOfScalar(u8, bound_identity, '.') != null)
@@ -13400,13 +13644,52 @@ pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
     // Hoist the local-fn names an earlier-declared sibling references, so a
     // mutually-recursive forward reference resolves through a shared cell.
     try hoistMutualLocalFns(b, block);
+    // An early-return guard narrows the REST of the block: after
+    // `if (a == null) return`, `a` is not null for everything below it,
+    // because the only path that reaches them is the one where the check
+    // failed. Kotlin narrows there and the guard is the idiomatic shape.
+    var guarded: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+    defer guarded.deinit(b.allocator);
     var last: ?Reg = null;
     for (block.stmts) |*stmt| {
         last = try lowerStmt(b, stmt);
+        try narrowAfterExitGuard(b, stmt, &guarded);
     }
     const result = last orelse try b.emitConst(.Unit);
+    var gi = guarded.items.len;
+    while (gi > 0) : (gi -= 1) b.restoreLocal(guarded.items[gi - 1]);
     try b.popScope();
     return result;
+}
+
+/// Narrowings an already-lowered guard statement proves for the statements
+/// that FOLLOW it. Only an `if` whose then-branch cannot fall through, and
+/// only the non-null facts its condition's negation proves.
+fn narrowAfterExitGuard(
+    b: *FuncBuilder,
+    stmt: *const ast.Stmt,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (stmt.* != .Expr or stmt.Expr != .If) return;
+    const f = stmt.Expr.If;
+    if (f.else_branch != null) return;
+    if (!exprAlwaysExits(f.then_branch)) return;
+    try narrowNullCheckAll(b, f.cond, false, out);
+}
+
+/// Whether control cannot fall out of this expression: it returns, throws,
+/// breaks or continues on every path.
+fn exprAlwaysExits(e: *const Expr) bool {
+    return switch (e.*) {
+        .Return, .Throw, .Break, .Continue => true,
+        .Block => |blk| blk.stmts.len != 0 and
+            blk.stmts[blk.stmts.len - 1] == .Expr and
+            exprAlwaysExits(&blk.stmts[blk.stmts.len - 1].Expr),
+        .If => |inner| inner.else_branch != null and
+            exprAlwaysExits(inner.then_branch) and
+            exprAlwaysExits(inner.else_branch.?),
+        else => false,
+    };
 }
 
 fn hoistMutualLocalFns(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!void {
@@ -15779,6 +16062,83 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expectEqual(nullable_plus, nullable_inst.Call.func);
     try testing.expect(nullable_inst.Call.exact);
     try testing.expect(nullable_inst.Call.func != member_plus);
+
+    // A receiver typed by a TYPE PARAMETER resolves through the parameter's
+    // upper bound. The bound record drops the bound's type ARGUMENTS, which
+    // is what `head_only` reports and what `complete` refuses — and the
+    // stdlib's two most common parameters (`C : MutableCollection<in T>`,
+    // `M : MutableMap<in K, in V>`) are exactly that shape.
+    m.classes.items[owner.int()].is_open = true;
+    try b.bind("bounded", b.allocReg());
+    try b.setLocalDeclType("bounded", "C");
+    var bounded_path = [_]ast.Ident{.{ .name = "bounded", .span = dummySpan() }};
+    var bounded_recv = Expr{ .Path = .{ .segments = &bounded_path, .span = dummySpan() } };
+    const bounded_ty = ir.TypeRef{ .name = "C", .nullable = false, .args = &.{} };
+
+    try b.addTypeParamBoundHead("C", "Owner", false, false);
+    try testing.expect((try lowerResolvedMemberCall(
+        &b,
+        &bounded_recv,
+        .{ .name = "virtualPick", .span = dummySpan() },
+        &int_args,
+        &.{},
+        &.{},
+        bounded_ty,
+        .{},
+    )) == .none);
+
+    try b.addTypeParamBoundHead("C", "Owner", false, true);
+    try testing.expect((try lowerResolvedMemberCall(
+        &b,
+        &bounded_recv,
+        .{ .name = "virtualPick", .span = dummySpan() },
+        &int_args,
+        &.{},
+        &.{},
+        bounded_ty,
+        .{},
+    )) == .lowered);
+    const bounded_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
+    try testing.expect(bounded_inst == .CallVirtual);
+    try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), bounded_inst.CallVirtual.slot);
+}
+
+test "the declared-type walk terminates on a cyclic initializer chain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+
+    // `a`'s type comes from `b.field`, and `b`'s from `a.field`. Kotlin cannot
+    // write that, but lowering asks about both from a point where both are
+    // bound, and the walk followed the chain forever.
+    var a_path = [_]ast.Ident{.{ .name = "a", .span = dummySpan() }};
+    var b_path = [_]ast.Ident{.{ .name = "b", .span = dummySpan() }};
+    var a_recv = Expr{ .Path = .{ .segments = &a_path, .span = dummySpan() } };
+    var b_recv = Expr{ .Path = .{ .segments = &b_path, .span = dummySpan() } };
+    const a_init = Expr{ .Member = .{
+        .receiver = &b_recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const b_init = Expr{ .Member = .{
+        .receiver = &a_recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    try b.bind("a", b.allocReg());
+    try b.bind("b", b.allocReg());
+    try b.setLocalInitExpr("a", &a_init);
+    try b.setLocalInitExpr("b", &b_init);
+
+    try testing.expect(argDeclTypeRefLazy(&b, &a_recv) == null);
+    try testing.expect(argDeclTypeRefLazy(&b, &b_recv) == null);
+    try testing.expectEqual(@as(usize, 0), init_chain_len);
 }
 
 test "explicit member extension emits its resolved declaration identity" {
