@@ -492,16 +492,29 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     obvious ones (the safe-call arm, the `super.<prop>` arm, the this-field
     arms) reads a resolved accessor.
 
-    ONE LEAD, not yet tested. `resolveCallableExtensionProperty` — reached from
-    the member-call fallback — takes `receiver_head` as a bare STRING:
+    MEASURED, AND NEGATIVE — the fifth exclusion.
+    `resolveCallableExtensionProperty` IS reached for both accessors and it
+    MISSES both:
 
-        return b.module.resolveCallableExtensionProperty(
-            name.name, receiver_head, receiver_is_class, value_arity, …);
+        [extprop] component1 recv_head=Entry is_class=false hit=false
+        [extprop] component2 recv_head=Entry is_class=false hit=false
 
-    That is the same simple-name identity the rest of this entry is about, on
-    the one path that can turn a member CALL into a property read. Instrument
-    it for `component*` before assuming it; four assumptions have now been
-    wrong here and the fifth should be measured first.
+    It passes the bare simple-name head, as suspected, but it is not the
+    selector here. That also rules out the whole "member call folded into a
+    property read" theory the GetField in the error suggested — the property
+    resolution declines.
+
+    Five paths now excluded by experiment: `Value.isRuntimeType`,
+    `receiverCompatibleWithParam`, `Module.staticHeadCompatibility`,
+    `inline_call`'s expand entry, and `resolveCallableExtensionProperty`. The
+    call emits no `Call`/`CallMember`, never reaches `callFunc`, and is not
+    inline-expanded — yet a `GetField value` lands on the receiver.
+
+    Next: stop searching for the SELECTOR and find the EMITTER. Put a print on
+    every `GetField` push in `lower/expr.zig` (twenty sites), gated on the
+    field name being `value`, and run the reproducer. That names the emitting
+    line directly, and unlike the five inferences above it cannot come back
+    silent — the instruction is provably emitted.
 
     The uppercase-qualifier discriminator (a qualifier segment beginning with a
     capital is a CLASS, so its simple name is not an identity) is written and
