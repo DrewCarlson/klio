@@ -510,11 +510,30 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     call emits no `Call`/`CallMember`, never reaches `callFunc`, and is not
     inline-expanded — yet a `GetField value` lands on the receiver.
 
-    Next: stop searching for the SELECTOR and find the EMITTER. Put a print on
-    every `GetField` push in `lower/expr.zig` (twenty sites), gated on the
-    field name being `value`, and run the reproducer. That names the emitting
-    line directly, and unlike the five inferences above it cannot come back
-    silent — the instruction is provably emitted.
+    EMITTERS NAMED. A print on all twenty `GetField` pushes in
+    `lower/expr.zig`, gated on the field name, run against the reproducer and
+    against the renamed control:
+
+        Entry (fails):  lower/expr.zig 1624, 1903, 2200, 2254, 2374
+        Rec   (works):  none
+
+    Five sites, and ZERO of them fire once the collision is removed — so every
+    one is downstream of it, not incidental. Line 2374 is the plain member
+    property read (`lowerReceiver` then `GetField name`), and 2200 is the
+    `hasOwnMember` this-field read; the other three are the same pattern in
+    other arms.
+
+    That is the whole remaining question, and it is now a small one: the
+    `component2()` CALL is being lowered as a property READ named `component2`
+    -> whose resolution against a user `Entry` finds `Map.Entry`'s accessor ->
+    whose body is the field `value`. Find which of the five fires for the
+    call site (they are distinguishable by putting the source span in the
+    print), then apply the uppercase-qualifier discriminator to the receiver
+    lookup that arm uses.
+
+    The discriminator is written, correct, and has been staged at five sites
+    this call does not reach. It has never been the hard part; locating the arm
+    has.
 
     The uppercase-qualifier discriminator (a qualifier segment beginning with a
     capital is a CLASS, so its simple name is not an identity) is written and
