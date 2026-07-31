@@ -1324,6 +1324,8 @@ pub fn tryInlineCallWithTypeArgs(
     const prev_hint_recv = b.spliceHintRecv();
     b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else if (member_splice) inline_state.inlineMemberOwner(f) else null);
     defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
+    const prev_hint_recv_ref = b.setSpliceHintRecvRef(f.receiver_type);
+    defer _ = b.setSpliceHintRecvRef(prev_hint_recv_ref);
     // The spliced body has its own receiver context: the caller's
     // smart-cast narrow of `this` must not leak into it.
     const prev_this_narrow = b.setThisNarrow(null);

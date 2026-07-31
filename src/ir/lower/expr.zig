@@ -8124,6 +8124,49 @@ fn staticDispatchReceiverTypeRef(
     return try ownedClassSelfType(b.allocator, lexical_class);
 }
 
+fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
+    const name = receiver.Path.segments[0].name;
+    if (b.resolve(name) == null) return null;
+    const init_expr = b.localInitExpr(name) orelse return null;
+    // Only an initializer whose callee is UNAMBIGUOUS may type the local. An
+    // overload set the call site cannot discriminate — `sumOf` differs only in
+    // its selector's return type, `(T) -> Int` against `(T) -> Double` — would
+    // otherwise contribute whichever declaration ranked first, and `val sum =
+    // xs.sumOf { it.length }` typed `Double` picks a `Double` `assertEquals`
+    // that renders 6 as 6.0.
+    if (classifyCallReturn(b, init_expr) != .unique_concrete) return null;
+    var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse return null;
+    if (!staticClassifierArgsComplete(b, derived)) {
+        derived.deinit(b.allocator);
+        return null;
+    }
+    // A type ARGUMENT that is still the declaration's own type parameter is
+    // not an answer either. `val newData = data.onEach { … }` derives
+    // `Sequence<T>` from `onEach`'s declared return type, and committing to it
+    // types the lambda's `it` as `T` — which loses the element type the
+    // `sumOf(selector: (T) -> Int)` / `(T) -> Double` overload pair is chosen
+    // by, and the call picks the Double form.
+    for (derived.args) |arg| {
+        if (isTypeParamName(arg.name)) {
+            derived.deinit(b.allocator);
+            return null;
+        }
+    }
+    return derived;
+}
+
+/// A single- or double-letter all-caps head is a type PARAMETER by Kotlin
+/// convention, and the stdlib follows it without exception. Same test the
+/// extension index uses to bucket generic-receiver extensions.
+fn isTypeParamName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 2) return false;
+    for (name) |c| {
+        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c)) return false;
+    }
+    return std.ascii.isUpper(name[0]);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
@@ -11166,8 +11209,21 @@ fn lowerUnresolvedBareCall(
         // rules out every bare call in a generic body — which is most of them.
         // Prefer the enclosing declaration's own receiver type when it names
         // this head, since that one carries the arguments.
+        var owned_recv_ty: ?TypeRef = null;
+        defer if (owned_recv_ty) |*t| t.deinit(b.allocator);
         const recv_ty = blk: {
-            if (b.recvTypeRef()) |declared| {
+            // Inside a splice the enclosing declaration's receiver is the
+            // CALLER's, not the spliced body's. Use the spliced declaration's
+            // own receiver type, which carries the type arguments an overload
+            // set that differs by element type needs.
+            if (b.spliceHintActive()) {
+                if (b.spliceHintRecvRef()) |rt| {
+                    if (std.mem.eql(u8, typeHead(rt.name.name), head_name)) {
+                        owned_recv_ty = try decl_mod.loweredTypeRef(b.allocator, &rt, true);
+                        break :blk owned_recv_ty.?;
+                    }
+                }
+            } else if (b.recvTypeRef()) |declared| {
                 if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
             }
             break :blk TypeRef{ .name = head_fqn, .nullable = false, .args = &.{} };
@@ -11212,6 +11268,27 @@ fn lowerUnresolvedBareCall(
         )) |reg| {
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
+        }
+        if (runtime.getenvSlice("KLIO_BAREARM") != null) {
+            var loc_buf: [256]u8 = undefined;
+            const cs = callee.Path.segments[0].span;
+            const loc: []const u8 = blk2: {
+                if (span.active_map) |m| {
+                    if (m.getChecked(cs.file)) |sf| {
+                        const lc = sf.lineCol(cs.start);
+                        const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                        break :blk2 std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                    }
+                }
+                break :blk2 std.fmt.bufPrint(&loc_buf, "f{d}:{d}", .{ cs.file.int(), cs.start }) catch "?";
+            };
+            std.debug.print("[barearm-miss] {s} {s} recv={s} nargs={d} splice={}\n", .{
+                loc, name0, recv_ty.name, args.len, b.spliceHintActive(),
+            });
+            for (args, 0..) |*a, i| {
+                const t = argDeclTypeRefLazy(b, a);
+                std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+            }
         }
     }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
