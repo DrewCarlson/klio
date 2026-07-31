@@ -1158,6 +1158,23 @@ test "catch_param_static_type" {
     );
 }
 
+test "smart_cast_through_and_chain" {
+    try check("smart_cast_through_and_chain",
+        \\circle
+        \\circle
+        \\circle
+        \\circle/circle
+        \\none
+        \\none
+        \\true
+        \\false
+        \\true
+        \\c
+        \\b
+        \\
+    );
+}
+
 test "bare_member_call_on_captured_receiver" {
     try check("bare_member_call_on_captured_receiver",
         \\n=5

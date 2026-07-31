@@ -325,11 +325,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // Then arm. An `if (x is T)` guard smart-casts `x` to `T` for the
             // arm, and extension resolution is static — see `narrowIsCheck`.
             b.switchTo(t_block);
-            const narrowed = try narrowIsCheck(b, f.cond);
+            var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer narrowed.deinit(b.allocator);
+            try narrowIsCheckAll(b, f.cond, &narrowed);
             const narrowed_not_null = try narrowNullCheck(b, f.cond, true);
             const t_val = try lowerExpr(b, f.then_branch);
             if (narrowed_not_null) |n| b.restoreLocal(n);
-            if (narrowed) |n| b.restoreLocal(n);
+            var ni = narrowed.items.len;
+            while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
@@ -7696,6 +7699,29 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// narrowing the declared head (`Any?`) refutes every `CharSequence` extension
 /// and `x.isEmpty()` misses. A negated check narrows nothing here (its
 /// information is on the else path).
+/// Every smart cast a condition proves for its TRUE branch. Kotlin narrows on
+/// each `is` check in an `&&` chain, not only on a condition that is itself an
+/// `is` check: `if (!ignoreCase && this is String && prefix is String)` narrows
+/// both. Without walking the chain, `CharSequence.startsWith` resolved its own
+/// `this.startsWith(prefix)` — written under exactly that guard — back to the
+/// CharSequence extension instead of `String.startsWith`, and recursed until
+/// the stack ran out.
+///
+/// Applied in source order; the caller restores in reverse, because each
+/// narrowing saves the binding the previous one left.
+pub fn narrowIsCheckAll(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (cond.* == .Binary and cond.Binary.op == .And) {
+        try narrowIsCheckAll(b, cond.Binary.lhs, out);
+        try narrowIsCheckAll(b, cond.Binary.rhs, out);
+        return;
+    }
+    if (try narrowIsCheck(b, cond)) |n| try out.append(b.allocator, n);
+}
+
 pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
     if (cond.* != .IsCheck) return null;
     const ck = cond.IsCheck;
