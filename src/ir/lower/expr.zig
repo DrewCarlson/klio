@@ -8200,7 +8200,7 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
 /// not an element sequence this can read, and an argument that is still a type
 /// PARAMETER names nothing — committing to it would disprove candidates a null
 /// type leaves open.
-pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
+pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?ir.TypeRef {
     var owned: ?ir.TypeRef = null;
     defer if (owned) |*t| t.deinit(b.allocator);
     const ty: ir.TypeRef = blk: {
@@ -8217,7 +8217,95 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
-    return try b.allocator.dupe(u8, elem);
+    return try ty.args[0].clone(b.allocator);
+}
+
+pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
+    var elem = (try iterableElementTypeRef(b, iter)) orelse return null;
+    defer elem.deinit(b.allocator);
+    return try b.allocator.dupe(u8, elem.name);
+}
+
+/// A statically known type for an arbitrary expression: its own declared type
+/// where it has one, otherwise a constructed class, a resolved call's return
+/// type, or the type a local's initializer lends it. Owned by the caller.
+pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
+    if (try ctorInitTypeRef(b, e)) |t| return t;
+    if (try staticCallReturnTypeRef(b, e)) |t| return t;
+    return try localInitTypeRef(b, e);
+}
+
+/// The declared return type of a nullary member on a known receiver type, with
+/// the receiver's own type arguments substituted in. This is what a
+/// DESTRUCTURED component needs: `for ((a, b) in xs)` binds each name to the
+/// element's `componentN()`, so each one's type is that accessor's return type.
+pub fn nullaryMemberReturnTypeRef(
+    b: *FuncBuilder,
+    recv: ir.TypeRef,
+    name: []const u8,
+    file: span.FileId,
+) Allocator.Error!?ir.TypeRef {
+    const trace = runtime.getenvSlice("KLIO_COMP_TRACE") != null;
+    var identity = std.mem.trimEnd(u8, recv.name, "?");
+    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (identity.len == 0) return null;
+    const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+        b.module.classIdByFqn(identity)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no owner\n", .{ identity, name });
+        return null;
+    };
+    var shape_set = try buildStaticReturnArgShapes(b, &.{}, &.{});
+    defer shape_set.deinit(b.allocator);
+    const owned_bounds = try b.typeParamBoundsSlice();
+    defer if (owned_bounds) |bounds| b.allocator.free(bounds);
+    const resolved = b.module.resolveMemberCall(owner, name, shape_set.shapes, .{
+        .caller_file = file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = owned_bounds orelse &.{},
+        .receiver_type = recv,
+    });
+    // A deferred resolution that still names one declaration is enough here:
+    // this reads a RETURN TYPE, not a dispatch commitment, and an override
+    // may only narrow it.
+    const target = resolved.target orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no target applicable={} methods={d}\n", .{
+            identity,
+            name,
+            resolved.applicable,
+            b.module.classes.items[owner.int()].methods.len,
+        });
+        return null;
+    };
+    var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv, file);
+    defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
+    var out = (try b.module.instantiatedCallReturnType(
+        b.allocator,
+        target,
+        recv,
+        dispatch_receiver,
+        shape_set.shapes,
+        &.{},
+    )) orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no return type\n", .{ identity, name });
+        return null;
+    };
+    // A return type left as the owner's own type PARAMETER names no class —
+    // the receiver was written without its arguments. Committing to it would
+    // disprove candidates a null type leaves open.
+    var head = std.mem.trimEnd(u8, out.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (b.module.classIdByFqn(head) == null and
+        b.module.uniqueClassIdBySimpleName(typeHead(head)) == null)
+    {
+        if (trace) std.debug.print("[comp] {s}.{s} unknown head {s}\n", .{ identity, name, out.name });
+        out.deinit(b.allocator);
+        return null;
+    }
+    if (trace) std.debug.print("[comp] {s}.{s} -> {s}\n", .{ identity, name, out.name });
+    return out;
 }
 
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {

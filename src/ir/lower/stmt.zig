@@ -1273,6 +1273,11 @@ fn lowerDestructuringDecl(
     // eval_stmt; the IR's CallMember + Host dispatch covers
     // the same surface, so we lower it inline.
     const recv = try lowerExpr(b, init);
+    // Each name's type is its `componentN()`'s declared return type on the
+    // initializer's type, so the destructured names carry a receiver type into
+    // dispatch instead of arriving untyped.
+    var recv_ty = try expr_mod.staticExprTypeRef(b, init);
+    defer if (recv_ty) |*t| t.deinit(b.allocator);
     for (names, 0..) |name, i| {
         if (std.mem.eql(u8, name.name, "_")) continue;
         const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
@@ -1288,6 +1293,11 @@ fn lowerDestructuringDecl(
             .arg_names = &.{},
         } });
         try b.bind(name.name, dst);
+        if (recv_ty) |rty| {
+            if (try expr_mod.nullaryMemberReturnTypeRef(b, rty, comp_name, name.span.file)) |ct| {
+                try b.setLocalDeclTypeOwned(name.name, ct);
+            }
+        }
     }
     return null;
 }

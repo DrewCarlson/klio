@@ -1123,6 +1123,11 @@ pub fn lowerClassWithExtras(
                 &own_member_arity,
             );
             try methods.append(a, placed.id);
+            // Member resolution reads the owner-scoped overload index, not the
+            // class's method list, so the accessor has to land there too.
+            if (class_id.int() < module.classes.items.len) {
+                try module.registerMemberDecl(a, module.classes.items[class_id.int()].fqn, cname, placed.id);
+            }
             {
                 const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x000", .{ c.name.name, cname });
                 const gop = try module.registry.member_method_fids.getOrPut(ukey);

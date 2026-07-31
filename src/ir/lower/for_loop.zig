@@ -93,6 +93,10 @@ pub fn lowerForLabeled(
             });
         }
     } else {
+        // Each destructured name is bound to the element's `componentN()`, so
+        // its type is that accessor's declared return type on the element.
+        var elem_ty = try expr.iterableElementTypeRef(b, iter);
+        defer if (elem_ty) |*t| t.deinit(b.allocator);
         for (vars, 0..) |v, i| {
             const comp = b.allocReg();
             const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
@@ -107,6 +111,11 @@ pub fn lowerForLabeled(
                 .arg_names = &.{},
             } });
             try b.bind(v.name, comp);
+            if (elem_ty) |ety| {
+                if (try expr.nullaryMemberReturnTypeRef(b, ety, comp_name, iter.span().file)) |ct| {
+                    try b.setLocalDeclTypeOwned(v.name, ct);
+                }
+            }
         }
     }
     try b.pushLoop(label, header, exit);
