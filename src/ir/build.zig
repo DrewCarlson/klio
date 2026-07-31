@@ -544,6 +544,11 @@ pub const FuncBuilder = struct {
     /// narrowing can infer a type from the init call's return type. The
     /// AST outlives the lowering pass.
     local_init_exprs: std.StringHashMap(*const ast.Expr),
+    /// Locals whose name named nothing at the point of their own declaration.
+    /// Kotlin does not bring a local into scope until after its initializer,
+    /// so a bare call inside that initializer must ignore the local — but only
+    /// when the name really was free there.
+    local_init_name_free: std.StringHashMap(void),
     /// Params whose declared type is a receiver-typed function
     /// (`block: T.() -> R`). A bare call `block(...)` on one of these
     /// must dispatch with the enclosing `this` as the implicit
@@ -768,6 +773,7 @@ pub const FuncBuilder = struct {
             .local_call_returns = std.StringHashMap(ir.EagerTypeHead).init(allocator),
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
+            .local_init_name_free = std.StringHashMap(void).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .nonfn_locals = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
@@ -871,6 +877,7 @@ pub const FuncBuilder = struct {
         self.local_call_returns.deinit();
         self.local_decl_recv_fn.deinit();
         self.local_init_exprs.deinit();
+        self.local_init_name_free.deinit();
         self.local_ext_fns.deinit();
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
@@ -1633,6 +1640,13 @@ pub const FuncBuilder = struct {
         return self.local_decl_recv_fn.contains(name);
     }
     pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
+        // Recorded BEFORE the local is bound, which is the scope its own
+        // initializer was written in.
+        if (self.resolve(name) == null and !self.isLocalFn(name) and !self.knowsOuter(name)) {
+            try self.local_init_name_free.put(name, {});
+        } else {
+            _ = self.local_init_name_free.remove(name);
+        }
         try self.local_init_exprs.put(name, e);
         if (self.local_decl_types.fetchRemove(name)) |old| {
             var cleanup = old.value;
@@ -1705,6 +1719,10 @@ pub const FuncBuilder = struct {
     }
     pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
         return self.local_init_exprs.get(name);
+    }
+    /// Whether this local's name was free at its own declaration point.
+    pub fn localInitNameFree(self: *const FuncBuilder, name: []const u8) bool {
+        return self.local_init_name_free.contains(name);
     }
 
     pub fn markLocalFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
