@@ -2384,12 +2384,23 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // A local/param binding shadows an enclosing member of the same name.
     if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
     if (b.knowsOuter(recv_name)) return null;
-    const owner = b.ownerClass() orelse return null;
+    // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
+    // `fun UByteArray.indices()` is a member of the receiver, and a top-level
+    // extension has no enclosing class at all, so the search stopped there.
+    const owner = b.ownerClass() orelse blk: {
+        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
+        const head = b.recvTy() orelse return null;
+        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+    };
+    return propTypeHeadOn(b, owner, recv_name);
+}
+
+fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     const heads = b.module.registry.class_prop_type_heads;
-    if (heads.get(.{ .a = owner, .b = recv_name })) |h| return h;
+    if (heads.get(.{ .a = owner, .b = name })) |h| return h;
     const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
     for (chain) |cls| {
-        if (heads.get(.{ .a = cls, .b = recv_name })) |h| return h;
+        if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
     return null;
 }
@@ -8641,11 +8652,15 @@ fn staticCallReturnTypeRef(
             _ = &from_implicit_receiver;
         },
         .Member => |member| {
+            const mt = bareRetTraceFor(b, member.name.name);
             receiver = if (argDeclTypeRefLazy(b, member.receiver)) |known|
                 try known.clone(b.allocator)
             else
                 try staticCallReturnTypeRef(b, member.receiver);
-            const recv_ty = receiver orelse return null;
+            const recv_ty = receiver orelse {
+                if (mt) std.debug.print("[bareret] .{s} no receiver type\n", .{member.name.name});
+                return null;
+            };
             var identity = std.mem.trimEnd(u8, recv_ty.name, "?");
             if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
             const head = typeHead(identity);
@@ -8683,7 +8698,10 @@ fn staticCallReturnTypeRef(
                 if (resolved.dispatch != .deferred) resolved_target = resolved.target;
             }
             if (resolved_target == null) {
-                if (member_applicable) return null;
+                if (member_applicable) {
+                    if (mt) std.debug.print("[bareret] .{s} on {s} member applicable but deferred\n", .{ member.name.name, head });
+                    return null;
+                }
                 const implicit_owners = try b.collectImplicitReceiverTower(
                     b.allocator,
                     eagerLambdaRecvHead(b),
@@ -8703,7 +8721,11 @@ fn staticCallReturnTypeRef(
                     },
                 ).target;
             }
-            target = resolved_target orelse return null;
+            target = resolved_target orelse {
+                if (mt) std.debug.print("[bareret] .{s} on {s} no target\n", .{ member.name.name, head });
+                return null;
+            };
+            if (mt) std.debug.print("[bareret] .{s} on {s} target ok\n", .{ member.name.name, head });
         },
         else => return null,
     }
@@ -12407,6 +12429,15 @@ fn lowerResolvedMemberCall(
             else
                 .unknown;
             lm_norecv_path[@intFromEnum(which)] += 1;
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
+                if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
+                    std.debug.print("[no-recv-name] {s} {s} owner={s}\n", .{
+                        @tagName(which),
+                        rn,
+                        b.ownerClass() orelse "<none>",
+                    });
+                }
+            }
             if (which == .local_no_decl_type) {
                 if (b.localInitExpr(rn)) |ini| {
                     lm_norecv_init[1] += 1;

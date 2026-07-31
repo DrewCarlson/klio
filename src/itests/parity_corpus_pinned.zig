@@ -1187,6 +1187,15 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "bare_name_inside_an_extension_body" {
+    try check("bare_name_inside_an_extension_body",
+        \\base
+        \\derived
+        \\base
+        \\
+    );
+}
+
 test "receiver_typed_from_a_property_read" {
     try check("receiver_typed_from_a_property_read",
         \\base

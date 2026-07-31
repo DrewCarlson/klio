@@ -302,31 +302,31 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,776 member call sites
-      146   2.15%  bound_static     <- direct FuncId call
-    3,391  50.04%  bound_virtual    <- method slot, no name lookup
+    total 6,698 member call sites
+      146   2.18%  bound_static     <- direct FuncId call
+    3,449  51.49%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,517  37.15%  no_receiver_type
-      415   6.12%  resolver_declined
-      187   2.76%  no_class_id
-      120   1.77%  nullable_or_generic
+    2,425  36.20%  no_receiver_type
+      371   5.54%  resolver_declined
+      187   2.79%  no_class_id
+      120   1.79%  nullable_or_generic
 
-Statically bound: 3,537 of 6,776 (52.2%), from 150 (2.34%) at the start of this
+Statically bound: 3,595 of 6,698 (53.7%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
 concrete types the stdlib's own generic containers do not:
 
-    total 71,478
-     1,451   2.03%  bound_static
-    40,833  57.13%  bound_virtual
+    total 70,463
+     1,451   2.06%  bound_static
+    41,588  59.02%  bound_virtual
     ------------------------------
-    21,646  30.28%  no_receiver_type
-     3,912   5.47%  resolver_declined
-     2,358   3.30%  no_class_id
-     1,278   1.79%  nullable_or_generic
+    20,447  29.02%  no_receiver_type
+     3,340   4.74%  resolver_declined
+     2,359   3.35%  no_class_id
+     1,278   1.81%  nullable_or_generic
 
-Statically bound: 42,284 of 71,478 (59.2%), from 27,098 (37.4%).
+Statically bound: 43,039 of 70,463 (61.1%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -927,6 +927,38 @@ treat any scope query that takes a name and no position as suspect.
 
 Fixed by tracking the locals whose initializer the walk is inside and refusing
 to re-enter one. Pinned by a unit test that overflows the stack without it.
+
+### A bare name in an extension body belonged to the receiver
+
+`KLIO_NORECV_NAMES=unknown` named the receivers behind the `unknown` bucket, and
+two names were most of it — `storage` (2,208) and `indices` (484), both with
+`owner=<none>`. They are the unsigned array classes, written as top-level
+extensions:
+
+    public val UByteArray.indices: IntRange get() = storage.indices
+
+`staticBareReceiverType` searched only the ENCLOSING CLASS for the name's
+declared type, and a top-level extension has none, so the search stopped before
+it began. A bare name in an extension body is a member of the extension
+RECEIVER written without `this.`, so the receiver's class is where to look —
+including up its supertype chain.
+
+    stdlib   bound 3,537 -> 3,595   (52.2% -> 53.7%)
+    examples bound 42,284 -> 43,039 (59.2% -> 61.1%)
+
+`KLIO_EXT_RECV_PROP=0` turns it off; `bare_name_inside_an_extension_body` pins
+it, printing `derived` for a `Base`-declared property when disabled.
+
+### Measured dead end: the bound fallback in the Member arm
+
+`staticCallReturnTypeRef`'s `.Member` arm resolves its owner without the
+type-parameter bound fallback, and `KLIO_BARERET=getOrPut` showed all 834 of its
+sites exiting there with `on M no target`. Adding the fallback moved ZERO sites
+on both file sets, and the reason is not plumbing: `M : MutableMap<K, V>` makes
+`getOrPut` return `V`, the caller's own type parameter, which names no class
+either. The bound record drops the bound's ARGUMENTS, so nothing downstream can
+substitute them. Reverted. This bucket needs real generic-argument inference —
+it is the typeck project, not a missing lookup.
 
 The unsigned types (`UInt`, `ULongArray`, …, ~146 sites) are NOT a registration
 gap, and calling them "probably easy" was wrong. `unsigned/src/kotlin/UInt.kt` is
