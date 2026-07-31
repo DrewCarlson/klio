@@ -437,11 +437,30 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
       2. Guarding `receiverCompatibleWithParam` itself so a nested-classifier
          receiver must actually match. Also no effect.
 
-    So the Map.Entry extension is selected BEFORE either check. Find the
-    selection site first — a probe on the chosen FuncId at the `component2`
-    call, not another guard — because two plausible guards have now been placed
-    on paths the call does not take. The discriminator above is reusable once
-    the site is known.
+    SELECTION SITE FOUND, and it is not at run time at all. A `callFunc` probe
+    over every `component*` name prints NOTHING for this program, and
+    `KLIO_EMIT_TRACE='*'` emits no `component2` call either. `Map.Entry`'s
+    accessor is declared
+
+        public inline operator fun <K, V> Map.Entry<K, V>.component2(): V = value
+
+    — INLINE, so lowering splices its body straight into the caller and the
+    failure is a bare `value` field read on the user's `Entry`. There is no
+    call to intercept, which is exactly why two runtime guards changed nothing.
+
+    That vindicates the ORIGINAL diagnosis in this entry: the selection is
+    `Module.staticTypeHead` bucketing an extension by
+    `applicability.simpleName`, so `Map.Entry` indexes under `Entry`. The fix
+    belongs in the lowering-side extension resolution
+    (`resolveExtensionCall` / `resolveExtensionCallForArgs`), where the
+    uppercase-qualifier discriminator recorded above applies unchanged: an
+    extension whose declared receiver is a NESTED classifier must not match a
+    receiver that is not that nested type.
+
+    Cost of getting here: two guards on the runtime path, both revert-only,
+    because the pinpoint that produced them assumed a runtime selection without
+    checking whether a call was emitted at all. `KLIO_EMIT_TRACE` answers that
+    in one run and should have been the first thing tried.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
