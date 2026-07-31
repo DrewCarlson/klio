@@ -304,15 +304,29 @@ Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
     total 6,848 member call sites
       146   2.13%  bound_static     <- direct FuncId call
-    2,223  32.46%  bound_virtual    <- method slot, no name lookup
+    2,975  43.44%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    3,269  47.74%  no_receiver_type
+    2,517  36.76%  no_receiver_type
       675   9.86%  no_class_id
       415   6.06%  resolver_declined
       120   1.75%  nullable_or_generic
 
-Statically bound: 2,369 of 6,848 (34.6%), from 150 (2.34%) at the start of this
+Statically bound: 3,121 of 6,848 (45.6%), from 150 (2.34%) at the start of this
 round.
+
+And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
+concrete types the stdlib's own generic containers do not:
+
+    total 72,414
+     1,451   2.00%  bound_static
+    35,425  48.92%  bound_virtual
+    ------------------------------
+    21,646  29.89%  no_receiver_type
+     8,702  12.02%  no_class_id
+     3,912   5.40%  resolver_declined
+     1,278   1.76%  nullable_or_generic
+
+Statically bound: 36,876 of 72,414 (50.9%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -353,6 +367,41 @@ What is left in that census, by callee: `.iterator` 88, `listIterator` 72,
 `.getOrPut` 66, `toMutableList` 34, `createFrom` 30 — a long tail rather than
 another block.
 
+**The stdlib set said "long tail". The EXAMPLES set said otherwise, and it was
+right.** Re-run on the examples, the same census reads:
+
+    9,458  iterator          <- still, and by two orders of magnitude
+      770  .getOrPut
+      408  toMutableList
+      271  .iterator
+
+So the `iterator` bucket was never closed; only the stdlib set's copy of it was
+small enough to look closed. The cause found by `KLIO_BARERET=iterator` — the
+trace's whole value again being WHERE it stopped, 10,088 exits at one guard:
+
+    [bareret] iterator shadowed local=true localfn=false outer=false
+
+The shape is `val iterator = iterator()`, and the guard is
+`staticCallReturnTypeRef`'s "a name bound to a local is not a top-level call".
+Correct at a call site, wrong here: `localInitTypeRef` re-asks about the
+INITIALIZER from a later point in the block, where the local it defines is
+already bound — so the local shadowed the very call that produced it. Kotlin
+does not bring a local into scope until after its own initializer, so the name
+must resolve past it.
+
+Fixed by recording, at the declaration, whether the name was free there
+(`local_init_name_free`, written before the bind, which is the initializer's
+own scope) and suppressing only that one name while its own initializer is
+typed. The flag is what makes it exact: `val f = f()` where `f` names an
+enclosing local of function type must still decline, and does.
+
+    stdlib   2,369 -> 3,121 bound   (34.6% -> 45.6%)
+    examples 27,100 -> 36,876 bound (37.4% -> 50.9%)
+
+This is the same defect as the "later local captured an earlier bare write"
+entry at the end of this document: a scope query that knows the name but not
+the point in the block. Any third instance is likely to be the same shape.
+
 ### `no_initializer` — 350 locals, one of three shapes done
 
 A loop variable is now typed from the iterable's sole type ARGUMENT, so
@@ -368,6 +417,24 @@ variable needed, from a different source:
     computes for the arity/receiver stamp.
   - a DESTRUCTURED component: `componentN()`'s declared return type on the
     element type, which the loop rule above now has in hand.
+
+    **LANDED, and the collision below is fixed.** A data class's `componentN`
+    accessors are now real declarations, lowered from the primary-constructor
+    properties with each property's declared type as the return type, so
+    member resolution finds them and no extension is consulted. Both
+    destructuring forms (`val (a, b) = x` and `for ((a, b) in xs)`) then type
+    each name from that accessor, via `nullaryMemberReturnTypeRef`.
+
+    Two things had to be right and only the second is obvious. The accessor
+    must be registered with `registerMemberDecl` — `resolveMemberCall` reads
+    the owner-scoped overload index, NOT the class's method list, so appending
+    to `methods` alone left the class with three methods and no candidates. And
+    a return type that comes back as the owner's own type PARAMETER (`Pair`
+    written without arguments answers `component1 -> K`) names no class and is
+    refused; `KLIO_COMP_TRACE` shows both outcomes.
+
+    Worth +2 sites on examples and 0 on the stdlib set — the value is the
+    correctness fix, not the census. The original report:
 
     **BLOCKED, and by a correctness bug rather than by typing.** Destructuring
     a DATA CLASS in a `for` loop fails at run time on the committed tree:
@@ -587,16 +654,18 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
            - an entry in the class's `methods` list, so the slot linker sees it
            - a `decl_sigs` record with `has_body = false`
 
-         The one risk to check first: a bodyless declaration with no host
-         symbol previously reached "virtual method target is not executable".
-         The slot path now falls back to name dispatch when a target is
-         unrunnable (see the host-backed receiver entry above), which should
-         cover it — verify with the four narrowed programs before the sweep.
+         DONE, and the bodyless risk was avoided by not being bodyless. The
+         accessor is synthesized as an `ast.Function` with an expression body
+         reading the property (`this.<name>`) and run through
+         `lowerMethodWithMemberContext` like any other member, so `decl_sigs`,
+         `member_method_fids`, the default-arg bookkeeping and an executable
+         body all fall out of the existing path. A hand-written `componentN`
+         suppresses the synthesized one, which is what Kotlin does, and the
+         run-time synthesis in `host_call_member.zig` then sees a user method
+         and stands down on its own.
 
-         Scope warning: this adds declarations to EVERY data class in every
-         program, so it moves member resolution and the dispatch census
-         globally. It needs the full gate plus a census A/B on both file sets,
-         not a spot check.
+         Census A/B on both file sets: no movement on either beyond the two
+         sites the new bodies themselves add. It is a correctness fix.
       2. Make extension receiver matching FQN-aware for nested classifiers.
          Attempted at `staticHeadCompatibility` twice, including an FQN-suffix
          comparison, with no effect — that function is demonstrably not
@@ -612,8 +681,9 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     correct — it has simply been applied at four sites that this call does not
     reach. Once the site is known it drops in unchanged.
 
-    The destructured-component typing is four lines on top of it and cannot be
-    tested until the loop runs.
+    The destructured-component typing sits on top of it and is now landed;
+    `data_class_components_are_declared_members` pins the program the collision
+    broke, with the name `Entry` unchanged.
 
     The typing itself was written and measured at ~0 on BOTH censuses (for-loop
     destructuring is rare in the corpora), so it is not landed — there is

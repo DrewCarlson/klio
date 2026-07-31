@@ -8308,6 +8308,11 @@ pub fn nullaryMemberReturnTypeRef(
     return out;
 }
 
+/// The local whose own initializer is currently being typed. Its name is not
+/// in scope there, so a bare call of that name inside the initializer resolves
+/// past it. Saved and restored by `localInitTypeRef`, which nests.
+var init_self_name: ?[]const u8 = null;
+
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
     const name = receiver.Path.segments[0].name;
@@ -8320,6 +8325,13 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (norecvCensusOn()) lm_localinit[1] += 1;
         return ctor_ty;
     }
+    // The local's own name is not in scope inside its own initializer, so the
+    // initializer's bare calls must not see it. `val iterator = iterator()` is
+    // the shape, and the local shadowing the call is what stopped 10,088 of
+    // these from lending a type.
+    const prev_self = init_self_name;
+    if (b.localInitNameFree(name) and !std.mem.eql(u8, runtime.getenvSlice("KLIO_INIT_SELF") orelse "1", "0")) init_self_name = name;
+    defer init_self_name = prev_self;
     var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse {
         if (norecvCensusOn()) {
             lm_localinit[2] += 1;
@@ -8474,9 +8486,17 @@ fn staticCallReturnTypeRef(
         .Path => |path| {
             if (path.segments.len != 1) return null;
             const name = path.segments[0];
-            if (b.resolve(name.name) != null or b.isLocalFn(name.name) or
-                b.knowsOuter(name.name))
+            const own_init = init_self_name != null and
+                std.mem.eql(u8, init_self_name.?, name.name);
+            if (!own_init and (b.resolve(name.name) != null or b.isLocalFn(name.name) or
+                b.knowsOuter(name.name)))
             {
+                if (bareRetTraceFor(b, name.name)) std.debug.print("[bareret] {s} shadowed local={} localfn={} outer={}\n", .{
+                    name.name,
+                    b.resolve(name.name) != null,
+                    b.isLocalFn(name.name),
+                    b.knowsOuter(name.name),
+                });
                 return null;
             }
             // A name the enclosing receiver declares is a MEMBER call written
@@ -8520,7 +8540,11 @@ fn staticCallReturnTypeRef(
                 // the 1,439 initializers that yield no type are a bare
                 // `iterator()`, another 165 a bare `listIterator()`. Their
                 // result type is exactly what the local needs.
-                const head_name = bareStaticRecvHead(b) orelse return null;
+                const bt = bareRetTraceFor(b, name.name);
+                const head_name = bareStaticRecvHead(b) orelse {
+                    if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
+                    return null;
+                };
                 const recv_ref = if (b.spliceHintActive())
                     (if (b.spliceHintRecvRef()) |rt|
                         try decl_mod.loweredTypeRef(b.allocator, &rt, true)
@@ -8549,7 +8573,10 @@ fn staticCallReturnTypeRef(
                     b.module.classIdByFqn(ident)
                 else
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
-                        b.module.classId(bare_head)) orelse return null;
+                        b.module.classId(bare_head)) orelse {
+                    if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
+                    return null;
+                };
                 const bare_resolved = b.module.resolveMemberCall(
                     owner,
                     name.name,
@@ -8561,6 +8588,11 @@ fn staticCallReturnTypeRef(
                         .receiver_type = bare_recv,
                     },
                 );
+                if (bt) std.debug.print("[bareret] {s} on {s} target={s}\n", .{
+                    name.name,
+                    ident,
+                    if (bare_resolved.target != null) "yes" else "no",
+                });
                 break :blk bare_resolved.target orelse return null;
             };
             // A plain lambda that captures its lexical class receiver makes
@@ -8666,7 +8698,23 @@ fn staticCallReturnTypeRef(
     {
         inferred.?.nullable = true;
     }
+    if (call.callee.* == .Path and call.callee.Path.segments.len == 1 and
+        bareRetTraceFor(b, call.callee.Path.segments[0].name))
+    {
+        std.debug.print("[bareret] {s} return={s}\n", .{
+            call.callee.Path.segments[0].name,
+            if (inferred) |i| i.name else "<null>",
+        });
+    }
     return inferred;
+}
+
+/// `KLIO_BARERET=<name>` (or `*`) traces why a bare call does or does not lend
+/// its return type to the local it initializes.
+fn bareRetTraceFor(b: *const FuncBuilder, name: []const u8) bool {
+    _ = b;
+    const want = runtime.getenvSlice("KLIO_BARERET") orelse return false;
+    return std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, name);
 }
 
 const StaticReturnArgShapes = struct {
