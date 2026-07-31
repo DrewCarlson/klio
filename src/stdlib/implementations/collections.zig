@@ -1344,36 +1344,93 @@ pub fn coll_grouping_key_of(ctx: *CallCtx) Error!EvalResult {
     };
 }
 
-const GroupingParts = union(enum) { parts: struct { items: []Value, key: Value }, err: EvalResult };
+/// A `Grouping` reduced to what the terminals need: its elements, and a way to
+/// key one. `key` is the captured selector for klio's own representation; when
+/// it is null the receiver is an ordinary `Grouping` implementation and the
+/// key comes from its `keyOf` method.
+const GroupingParts = union(enum) {
+    parts: struct { items: []Value, key: ?Value, receiver: Value },
+    err: EvalResult,
+};
 
-fn groupingParts(a: Allocator, v: Value) Error!GroupingParts {
+/// Drain a `Grouping` written in Kotlin through the interface's own protocol:
+/// `sourceIterator()`, then `hasNext`/`next`. `groupingBy` is an inline
+/// extension returning `object : Grouping<T, K>`, so a statically bound call
+/// splices that body and produces a genuine implementation rather than the
+/// `__grouping_src` instance klio builds for the same source.
+fn groupingItemsViaProtocol(ctx: *CallCtx, recv: Value) Error!?[]Value {
+    const it = switch ((try ctx.host.invokeMethod(&recv, "sourceIterator", &.{}, ctx.out)) orelse return null) {
+        .ok => |v| v,
+        .err => return null,
+    };
+    var items: std.ArrayList(Value) = .empty;
+    errdefer items.deinit(ctx.allocator);
+    while (true) {
+        const more = switch ((try ctx.host.invokeMethod(&it, "hasNext", &.{}, ctx.out)) orelse return null) {
+            .ok => |v| v,
+            .err => return null,
+        };
+        if (more != .Bool or !more.Bool) break;
+        const next = switch ((try ctx.host.invokeMethod(&it, "next", &.{}, ctx.out)) orelse return null) {
+            .ok => |v| v,
+            .err => return null,
+        };
+        try items.append(ctx.allocator, next);
+    }
+    return try items.toOwnedSlice(ctx.allocator);
+}
+
+fn groupingParts(ctx: *CallCtx, v: Value) Error!GroupingParts {
+    const a = ctx.allocator;
     if (v == .Instance) {
-        const g = v.Instance.borrow();
-        defer g.deinit();
-        const inst = g.get();
-        if (inst.get("__grouping_src")) |src| {
-            if (src == .List) {
-                if (inst.get("__grouping_key")) |key| {
-                    // Escapes to the caller via `parts.items`; freed there.
-                    const items = try snapshotItems(a, src.List.items);
-                    return .{ .parts = .{ .items = items, .key = key } };
-                }
-            }
+        const captured: ?struct { src: Value, key: Value } = blk: {
+            const g = v.Instance.borrow();
+            defer g.deinit();
+            const inst = g.get();
+            const src = inst.get("__grouping_src") orelse break :blk null;
+            if (src != .List) break :blk null;
+            const key = inst.get("__grouping_key") orelse break :blk null;
+            break :blk .{ .src = src, .key = key };
+        };
+        if (captured) |c| {
+            // Escapes to the caller via `parts.items`; freed there.
+            const items = try snapshotItems(a, c.src.List.items);
+            return .{ .parts = .{ .items = items, .key = c.key, .receiver = v } };
+        }
+        if (try groupingItemsViaProtocol(ctx, v)) |items| {
+            return .{ .parts = .{ .items = items, .key = null, .receiver = v } };
         }
     }
     return .{ .err = typeErr("expected a Grouping receiver") };
 }
 
+const GroupingKey = union(enum) { value: Value, err: EvalResult };
+
+fn groupingKeyOf(ctx: *CallCtx, key: ?Value, receiver: Value, element: Value) Error!GroupingKey {
+    if (key) |k| {
+        return switch (try invoke(ctx, &k, &.{element})) {
+            .value => |val| .{ .value = val },
+            .err => |e| .{ .err = e },
+        };
+    }
+    const r = (try ctx.host.invokeMethod(&receiver, "keyOf", &.{element}, ctx.out)) orelse
+        return .{ .err = typeErr("Grouping has no keyOf") };
+    return switch (r) {
+        .ok => |val| .{ .value = val },
+        .err => .{ .err = r },
+    };
+}
+
 pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const gp = switch (try groupingParts(a, ctx.args[0])) {
+    const gp = switch (try groupingParts(ctx, ctx.args[0])) {
         .parts => |p| p,
         .err => |e| return e,
     };
     const Count = struct { key: Value, n: i64 };
     var counts: std.ArrayList(Count) = .empty;
     for (gp.items) |v| {
-        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+        const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };
@@ -1396,7 +1453,7 @@ pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const gp = switch (try groupingParts(a, ctx.args[0])) {
+    const gp = switch (try groupingParts(ctx, ctx.args[0])) {
         .parts => |p| p,
         .err => |e| return e,
     };
@@ -1405,7 +1462,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
     const op = ctx.args[2];
     var acc: std.ArrayList(MapPair) = .empty;
     for (gp.items) |v| {
-        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+        const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };
@@ -1438,7 +1495,7 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const gp = switch (try groupingParts(a, ctx.args[0])) {
+    const gp = switch (try groupingParts(ctx, ctx.args[0])) {
         .parts => |p| p,
         .err => |e| return e,
     };
@@ -1446,7 +1503,7 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
     const op = ctx.args[1];
     var acc: std.ArrayList(MapPair) = .empty;
     for (gp.items) |v| {
-        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+        const k = switch (try groupingKeyOf(ctx, gp.key, gp.receiver, v)) {
             .value => |val| val,
             .err => |e| return e,
         };

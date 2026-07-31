@@ -1158,6 +1158,17 @@ test "catch_param_static_type" {
     );
 }
 
+test "grouping_through_its_own_protocol" {
+    try check("grouping_through_its_own_protocol",
+        \\{b=2, f=2, z=1}
+        \\{b=10, f=7, z=3}
+        \\{b=biscuit, f=flea, z=zoo}
+        \\{b=2, f=2, z=1}
+        \\{b=10, f=7, z=3}
+        \\
+    );
+}
+
 test "member_header_binds_its_own_owner" {
     try check("member_header_binds_its_own_owner",
         \\true
