@@ -448,15 +448,23 @@ so `sum` is typed `Double`, `assertEquals(sum, count)` binds a `Double`
 overload, and 6 renders as 6.0.
 
 That generalises: **`staticCallReturnTypeRef` must not derive a return type
-from an overload set whose members differ in their return type.** Gating on
-`classifyCallReturn == .unique_concrete` was tried and cost 384 sites
-(2,140 -> 1,756) because it is far broader than this rule — it rejects every
-non-unique callee rather than only the return-type-ambiguous ones. The precise
-version is the one to write.
+from an overload set whose members differ in their return type.** The precise
+version was written and MEASURED — a `returnTypeAmbiguous` check over
+same-name, same-arity, same-receiver-head siblings:
 
-So the slice needs (i) plus that precise gate, and neither depends on the
-generic-argument project after all. This supersedes the classification recorded
-immediately above.
+    gate alone:                 1,853 -> 1,835   green, costs 18 sites
+    gate scoped program-wide:   1,853 -> 1,761   and breaks SequenceTest.zipWithNext
+    gate + (i) + the slice:     1,853 -> 1,884   SequenceTest.onEach STILL fails
+
+So all three pieces together do not close it either, and the gate on its own is
+a net loss with nothing to show for it. It is not committed.
+
+The one difference left between the failing test and the five-line reduction
+that (i) fixes: the test's pipeline lambda has a BODY
+(`data.onEach { count += it.length }`) where the reduction's is empty
+(`onEach { }`). Check that difference before anything else — it is the only
+variable not yet controlled for, and eight measured attempts have now been
+spent on theories that skipped it.
 
 Six attempts against the symptom are recorded below so none is repeated; all
 were measured, none worked.
