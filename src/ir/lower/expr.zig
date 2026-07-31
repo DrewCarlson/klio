@@ -8378,7 +8378,9 @@ fn staticCallReturnTypeRef(
                 ),
             );
             defer b.allocator.free(res.candidate_set);
+            var from_implicit_receiver = false;
             target = res.target orelse blk: {
+                from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
                 // implicit receiver written without `this.` — measured, 908 of
                 // the 1,439 initializers that yield no type are a bare
@@ -8430,7 +8432,9 @@ fn staticCallReturnTypeRef(
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
             // still cannot lend its target's return type to another proof.
-            if (res.confidence != .exact and
+            // A target resolved against the implicit RECEIVER carries no
+            // top-level confidence to check — the receiver is what proved it.
+            if (!from_implicit_receiver and res.confidence != .exact and
                 (b.recvTy() != null or b.isParamThunk())) return null;
         },
         .Member => |member| {
