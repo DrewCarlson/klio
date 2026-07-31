@@ -422,9 +422,26 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
 
     It is not optional — a user type named after any nested stdlib type
     silently inherits that type's extensions today, and `Entry` is only the
-    instance that happened to surface — but it is a change to the hot type-test
-    path that every extension resolution runs through, so it wants a full gate,
-    not a spot check.
+    instance that happened to surface.
+
+    TWO GUARDS WRITTEN AND MEASURED, NEITHER ON THE PATH. Both used the same
+    discriminator, which is sound and is the one this codebase already applies
+    to pack aliases: a qualifier whose last segment begins with an uppercase
+    letter is a CLASS (`Map.Entry`), a lowercase one is a package
+    (`kotlin.collections.List`), and only the former makes the simple-name
+    fallback wrong.
+
+      1. Refusing the fallback inside `Value.isRuntimeType`'s `.Instance`
+         branch. No effect — `receiverCompatibleWithParam` returns true for an
+         Instance before ever calling it.
+      2. Guarding `receiverCompatibleWithParam` itself so a nested-classifier
+         receiver must actually match. Also no effect.
+
+    So the Map.Entry extension is selected BEFORE either check. Find the
+    selection site first — a probe on the chosen FuncId at the `component2`
+    call, not another guard — because two plausible guards have now been placed
+    on paths the call does not take. The discriminator above is reusable once
+    the site is known.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
