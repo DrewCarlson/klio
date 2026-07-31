@@ -350,28 +350,35 @@ the interface's own protocol (`sourceIterator()` + `hasNext`/`next`, then
 `Grouping` could not be aggregated at all, and it is fixed and covered
 independently of this lowering change.
 
-`plusCollectionInference` is the one thing still holding the +253 back, and it
-is now traced far enough to name the mechanism rather than the symptom:
+`plusCollectionInference` is the one thing still holding the +253 back. Traced
+to instruction level, and the picture corrects an earlier reading in this
+document — it is NOT a generic-body instantiation problem, and the five
+falsified theories recorded further down were all reaching for that:
 
-  - Two `plusElement` candidates exist, `Iterable<T>.plusElement` and
-    `Collection<T>.plusElement`. With the receiver typed they TIE
-    (`recv=List<List> args=? … 60010` for both), where an untyped receiver
-    reached neither and the call dispatched dynamically.
-  - The spliced body resolves correctly. `[extkey]` at `_Collections.kt:3516`
-    shows `recv=Collection args=T` ranking `plus(element: T)` at 100105 over
-    `plus(elements: Iterable<T>)` at 100015 — the right pick.
-  - But it does not EMIT. `plus` is an extension, so it goes through
-    `lowerResolvedExtensionCall` rather than the member promotion, and the call
-    falls to runtime dispatch. At run time the receiver is a
-    `List<List<String>>` and the argument a `List<String>`, both `Iterable`, so
-    the concatenating overload wins and the result is `[[s], a]`.
+  - The CALL SITE emits `CallMember name=plusElement` — dynamic — with or
+    without the receiver typed. So the runtime chooses between
+    `Iterable<T>.plusElement` and `Collection<T>.plusElement` by name.
+  - The two bodies lower DIFFERENTLY.
+    `Collection<T>.plusElement` binds its `plus(element)` statically and
+    correctly: `[emit] Call fqn=kotlin.collections.plus fid=2131 in_fn=plusElement`,
+    which `[extkey]` ranks at 100105 over the concatenating overload's 100015.
+    `Iterable<T>.plusElement` emits `CallMemberOrGlobal name=plus` — a bare
+    call on an implicit receiver, the category section 6 lists as dynamic.
+  - At run time that dynamic `plus` sees a `List<List<String>>` receiver and a
+    `List<String>` argument, both `Iterable`, and picks the concatenating
+    overload. Hence `[[s], a]`.
 
-So lowering already knows the answer and throws it away. The fix is to emit the
-extension binding the resolver already ranked, not to weaken the receiver
-typing — and it is the same shape as the member promotion that landed earlier
-in this round. Do NOT re-diagnose this as a generic-body instantiation problem;
-the `[extkey]` rows above rule that out, and the earlier five falsified
-theories in this document were all reaching for it.
+So the resolver's answer is right in one body and never asked for in the other,
+and the call site never commits to either declaration. Two independent things
+would each fix it, and both are wanted anyway:
+
+  1. Bind the call site. `[extkey]` at `CollectionTest.kt:531` scores the two
+     candidates `{1,1,0,0,60010,…}` and `{1,1,1,0,60010,…}` — they differ at
+     index 2, where `Collection` is higher, so the ranking already prefers the
+     more specific receiver. It is the EMISSION that is missing, as with the
+     member promotion that landed earlier in this round.
+  2. Bind `CallMemberOrGlobal` when the implicit receiver is statically known.
+     That is section 6's first item and it is worth far more than this one test.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
