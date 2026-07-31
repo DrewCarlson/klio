@@ -476,10 +476,23 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
       - it is NOT decided by `Value.isRuntimeType`, `receiverCompatibleWithParam`,
         or `staticHeadCompatibility` (proved by guarding each)
 
-    The next step is to instrument the SPLICE: print the FuncId and receiver
-    type at `inline_call.zig`'s splice entry for any `component*` name. That
-    names the decision directly instead of inferring it, and three inferences
-    have now failed.
+    FOURTH MEASUREMENT: not that splice entry either. A print at
+    `inline_call.zig`'s expand entry, for any `component*` name, is also
+    SILENT on the reproducer.
+
+    So the body is reaching the caller without going through the call emitter,
+    `callFunc`, or the inline-expand entry. The error text is the remaining
+    clue and it is specific: `Vm::get_field \`value\` on \`Entry\`` means
+    lowering emitted a **GetField named `value`** against the Entry receiver —
+    i.e. `Map.Entry.component2`'s one-expression body was folded in by an
+    accessor/property fast path rather than expanded as an inline call.
+
+    So the search is now: which lowering path turns `e.component2()` into a
+    GetField. Grep the emitters of `GetField` for the one that consults a
+    resolved accessor or a single-expression body, and instrument THAT. Four
+    measurements have each excluded a path; this one is the first with a
+    positive signal (the emitted instruction) to search from rather than an
+    absence.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
