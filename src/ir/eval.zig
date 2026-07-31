@@ -4617,6 +4617,13 @@ fn runFrameExec(
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
     if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
+        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+            std.debug.print("[empty-frame] fqn={s} params={d} caller={s}\n", .{
+                func.fqn, func.params.len,
+                if (currentFrameFunc()) |cf| cf.fqn else "<none>",
+            });
+            dumpFrameChainForDiagAlways();
+        }
         return errResult(.{ .Type = "virtual method target is not executable" });
     }
     dumpFnIfRequested(frame.module, func);

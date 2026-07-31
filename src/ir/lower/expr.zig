@@ -12088,17 +12088,20 @@ fn lowerResolvedMemberCall(
         // while source-backed stdlib classes use the same static ABI as user
         // classes. Named, defaulted, and vararg interface calls bind against
         // the numeric declaration ABI.
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0 or
-            owner.receiver_abi != .instance)
+        // A `specialized` classifier's values are host-represented, so a slot
+        // cannot index a vtable on them. It is still the right EMISSION:
+        // `invokeVirtualMember` resolves the slot against an interpreted
+        // receiver's own class (honouring a user subtype's override) and
+        // falls back to the member's name only for a host-backed value, which
+        // is what the site did unconditionally before.
+        if (owner.is_value or owner.is_stub or ast_type_args.len != 0)
         {
             declineNote(if (owner.is_value)
                 .virtual_owner_value
             else if (owner.is_stub)
                 .virtual_owner_stub
-            else if (ast_type_args.len != 0)
-                .virtual_type_args
             else
-                .virtual_owner_abi);
+                .virtual_type_args);
             if (runtime.getenvSlice("KLIO_VABI_NAMES") != null) {
                 const t = b.module.funcById(func_id);
                 const sig = b.module.decl_sigs.get(func_id.int());
@@ -15214,6 +15217,10 @@ test "shared member resolution selects overloads and dispatch forms" {
     const virtual_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
     try testing.expect(virtual_inst == .CallVirtual);
     try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), virtual_inst.CallVirtual.slot);
+    // A `specialized` classifier's values are host-represented, and a virtual
+    // slot is still the right emission for one: `invokeVirtualMember` resolves
+    // it against an interpreted receiver's own class and falls back to the
+    // member's name for a host-backed value.
     m.classes.items[owner.int()].receiver_abi = .specialized;
     try testing.expect((try lowerResolvedMemberCall(
         &b,
@@ -15224,7 +15231,9 @@ test "shared member resolution selects overloads and dispatch forms" {
         &.{},
         .{ .name = "Owner", .nullable = false, .args = &.{} },
         .{},
-    )) == .deferred);
+    )) == .lowered);
+    const specialized_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
+    try testing.expect(specialized_inst == .CallVirtual);
     m.classes.items[owner.int()].receiver_abi = .instance;
     m.classes.items[owner.int()].is_open = false;
     m.classes.items[owner.int()].is_stub = true;

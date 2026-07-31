@@ -1158,6 +1158,20 @@ test "catch_param_static_type" {
     );
 }
 
+test "host_backed_receiver_virtual_slot" {
+    try check("host_backed_receiver_virtual_slot",
+        \\10,20,30,
+        \\2,1,0,
+        \\a1true
+        \\w|x|y
+        \\3
+        \\43
+        \\7
+        \\true
+        \\
+    );
+}
+
 test "safe_call_binds_on_non_null_branch" {
     try check("safe_call_binds_on_non_null_branch",
         \\node:a!
