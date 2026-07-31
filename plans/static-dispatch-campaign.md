@@ -335,34 +335,47 @@ Kotlin's inferred type for `val x = f()` IS `f`'s return type, and a `var`'s
 later assignment must conform to it, so the initializer's type is the local's
 type at every use. Four lines: a `localInitTypeRef` helper feeding the two
 places that already call `staticCallReturnTypeRef`, gated on
-`staticClassifierArgsComplete` (a derived type, so the gate belongs).
+`staticClassifierArgsComplete`.
 
-    bound          1,853 -> 2,140
+    bound          1,853 -> 2,140 of 6,929   (30.9%)
     no_receiver    3,918 -> 3,579
 
-It costs two failures, and the diagnosis for the first is now much closer:
+**`plusCollectionInference` is FIXED and the fix is landed separately.**
+`plusElement` is inline, so the call that matters was the SPLICED
+`plus(element)`, and `spliceHintRecv` carried only the head `Collection`. A
+bare head cannot separate `plus(element: T)` from `plus(elements: Iterable<T>)`.
+Carrying the spliced declaration's receiver TYPE settles it. On its own that
+changes no count, which is why it is committed as an enabler.
 
-  - `CollectionTest.plusCollectionInference` — `Expected <[[s], [a]]>, actual
-    <[[s], a]>`. The message identifies the FIRST assertion, so an earlier note
-    in this document speculating otherwise is withdrawn.
+One failure is left, and it is the only thing between this slice and landing:
 
-    `plusElement` is INLINE, so the call site splices its body and the spliced
-    `plus(element)` is lowered inside `plusCollectionInference` — not in any of
-    the four standalone `plusElement` bodies, all of which bind `plus` to the
-    correct element overload. That spliced call still emits
-    `CallMemberOrGlobal name=plus func=5111`.
+    SequenceTest.onEach   Expected <6.0>, actual <6>
 
-    `KLIO_BAREARM` shows the arm DOES fire there: `head=Collection thisreg=true
-    splice=true`. So `bareStaticRecvHead` and the receiver register are both
-    available and it is `lowerResolvedExtensionCall` that declines inside the
-    splice. **That is the next probe: why the extension resolution returns null
-    for `plus` on a `Collection` receiver with a spliced `element` argument,
-    when the same resolution ranks it at 100105 in the standalone body.**
-    Label the `[barearm]` rows with their enclosing function first — the rows
-    above cannot be attributed to a specific body without it.
+    val sum = newData.sumOf { it.length }
+    assertEquals(sum, count)
 
-  - `SequenceTest.onEach` — `Expected <6.0>, actual <6>`, a numeric widening.
-    Unexamined.
+`sumOf` has `(T) -> Int` and `(T) -> Double` overloads; the selector returns
+`Int`, so `sum` must be `6`, and it comes out `6.0`.
+
+What the probe rules out, so it is not re-derived: **the only local this slice
+types in that test is `data -> Sequence<String>`, which is correct.** Neither
+`newData` nor `sum` is typed by it — `staticCallReturnTypeRef` declines a
+member-call initializer. So the failure is DOWNSTREAM of typing `data`: with a
+typed receiver, `data.onEach { … }` binds statically and splices, and something
+in that path makes the later `newData.sumOf { … }` select the `Double` overload
+at run time.
+
+Two guards were tried against it and BOTH cost sites without fixing it —
+do not retry them:
+
+  - rejecting a derived type whose arguments are still the declaration's own
+    type parameters (`Sequence<T>`): 2,140 -> 1,816
+  - requiring the initializer's callee to be `unique_concrete`: 2,140 -> 1,756
+
+Next step: trace which `sumOf` the runtime picks with `data` typed versus
+untyped. The selection is dynamic in both cases (`[emit] CallMember name=sumOf`),
+so the difference is in what the static receiver hint or the lambda's recorded
+parameter types tell the runtime walk — not in a static bind.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
