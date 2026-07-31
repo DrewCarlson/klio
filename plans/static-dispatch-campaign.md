@@ -427,11 +427,36 @@ sequence terminal path (`isSequenceTerminal` -> `materialiseSequence` ->
 whose body is `map { action(it); it }`, and that produces an interpreted
 sequence rather than the host `.Sequence` value the terminal path expects.
 
-That is the whole mechanism, and it settles the classification: on the
-interpreted path `sumOf` must be chosen by the lambda's INFERRED RETURN TYPE,
-which lowering does not have. **The +287 slice is blocked on the same lambda /
-element type inference as section 1, not on anything separable.** It should
-land as part of that project, not before it.
+There are TWO mechanisms, and one of them now has a verified fix:
+
+**(i) The interpreted sequence's `sumOf`.** `iterableItemsCtx` already drains a
+host `.Sequence` and an interpreted one alike (`drainViaIterator`), and
+`coll_iter_sum_of` reads the accumulator kind from the first value it computes.
+Registering
+
+    .{ .fqn = "kotlin.sequences.Sequence.sumOf", .f = collections.coll_iter_sum_of },
+
+fixes the five-line reduction under the slice — 6, 6, 6 — and the sweep, the
+unit modules and compose all stay green with it. It is NOT committed, because
+without the slice it changes nothing observable and there is no test that fails
+when it is removed. Apply it as part of landing the slice.
+
+**(ii) `sum`'s own derived type.** With (i) applied the test STILL fails, and
+the remaining path is the slice typing `val sum = newData.sumOf { … }` from
+`sumOf`'s declared return type. `Double` is the first of the five declarations,
+so `sum` is typed `Double`, `assertEquals(sum, count)` binds a `Double`
+overload, and 6 renders as 6.0.
+
+That generalises: **`staticCallReturnTypeRef` must not derive a return type
+from an overload set whose members differ in their return type.** Gating on
+`classifyCallReturn == .unique_concrete` was tried and cost 384 sites
+(2,140 -> 1,756) because it is far broader than this rule — it rejects every
+non-unique callee rather than only the return-type-ambiguous ones. The precise
+version is the one to write.
+
+So the slice needs (i) plus that precise gate, and neither depends on the
+generic-argument project after all. This supersedes the classification recorded
+immediately above.
 
 Six attempts against the symptom are recorded below so none is repeated; all
 were measured, none worked.
