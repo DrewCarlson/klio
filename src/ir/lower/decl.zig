@@ -288,6 +288,18 @@ fn memberOwnerTypeRef(
     };
 }
 
+/// Whether the class body already declares a zero-parameter function of this
+/// name. A hand-written `componentN` wins over the synthesized one, exactly as
+/// it does in Kotlin.
+fn declaresNullaryMember(c: *const ast.Class, name: []const u8) bool {
+    for (c.members) |*m| {
+        if (m.* != .Function) continue;
+        const f = &m.Function;
+        if (f.params.len == 0 and std.mem.eql(u8, f.name.name, name)) return true;
+    }
+    return false;
+}
+
 fn functionTypeParamShadows(f: *const ast.Function, name: []const u8) bool {
     for (f.type_params) |*param| {
         if (std.mem.eql(u8, param.name.name, name)) return true;
@@ -1052,6 +1064,84 @@ pub fn lowerClassWithExtras(
                     .visibility = f.visibility,
                     .is_inline = f.is_inline,
                     .is_suspend = f.is_suspend,
+                    .has_body = true,
+                });
+            }
+        }
+    }
+    // A data class's `componentN` accessors are members of the class, and
+    // until now they existed only as a dispatch-time synthesis. Member
+    // resolution walks declarations, so `e.component2()` found nothing on the
+    // class and fell through to extension lookup, where `Map.Entry.component2`
+    // matched any class named `Entry` by simple head. Declaring them keeps the
+    // answer on the member path, where it belongs, and gives each accessor its
+    // property's declared return type.
+    if (c.is_data) {
+        for (c.primary_params, 0..) |*p, idx| {
+            if (p.property == null) continue;
+            const cname = try std.fmt.allocPrint(a, "component{d}", .{idx + 1});
+            if (declaresNullaryMember(c, cname)) {
+                a.free(cname);
+                continue;
+            }
+            const recv = try a.create(ast.Expr);
+            recv.* = .{ .This = .{ .qualifier = null, .span = p.span } };
+            const syn = try a.create(ast.Function);
+            syn.* = .{
+                .name = .{ .name = cname, .span = p.name.span },
+                .receiver_type = null,
+                .type_params = &.{},
+                .where_bounds = &.{},
+                .params = &.{},
+                .return_type = p.ty,
+                .body = .{ .Expr = .{ .Member = .{
+                    .receiver = recv,
+                    .name = p.name,
+                    .safe = false,
+                    .span = p.span,
+                } } },
+                .is_open = false,
+                .is_override = false,
+                .is_abstract = false,
+                .is_operator = true,
+                .is_inline = false,
+                .is_infix = false,
+                .is_tailrec = false,
+                .is_suspend = false,
+                .is_expect = false,
+                .is_actual = false,
+                .visibility = .Public,
+                .annotations = &.{},
+                .span = p.span,
+            };
+            const placed = try lowerMethodWithMemberContext(
+                module,
+                syn,
+                c.name.name,
+                &own_member_names,
+                extra_members,
+                &own_member_arity,
+            );
+            try methods.append(a, placed.id);
+            {
+                const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x000", .{ c.name.name, cname });
+                const gop = try module.registry.member_method_fids.getOrPut(ukey);
+                if (gop.found_existing) {
+                    a.free(ukey);
+                } else {
+                    gop.value_ptr.* = placed.id;
+                }
+            }
+            if (!module.decl_sigs.contains(placed.id.int())) {
+                try module.decl_sigs.put(placed.id.int(), .{
+                    .enclosing_class = class_id,
+                    .receiver_ty = null,
+                    .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+                    .sig = &.{},
+                    .kind = .instance_method,
+                    .visibility = .Public,
+                    .is_inline = false,
+                    .is_suspend = false,
                     .has_body = true,
                 });
             }

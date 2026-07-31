@@ -1187,6 +1187,22 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "data_class_components_are_declared_members" {
+    try check("data_class_components_are_declared_members",
+        \\a/1
+        \\a/1
+        \\6/t
+        \\200
+        \\1/200
+        \\x=1
+        \\x:1
+        \\Entry(key=a, num=1)
+        \\true
+        \\Entry(key=a, num=3)
+        \\
+    );
+}
+
 test "loop_variable_typed_from_element" {
     try check("loop_variable_typed_from_element",
         \\item:a;item:b;
