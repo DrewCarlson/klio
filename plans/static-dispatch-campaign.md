@@ -396,13 +396,35 @@ variable needed, from a different source:
     this campaign, and as the `expect`/`actual` sibling scan before it. It is
     the third instance.
 
-    The fix is to key a NESTED receiver by enough of its qualification to be
-    unambiguous (`Map.Entry`, not `Entry`) and match a candidate receiver by
-    FQN suffix rather than by simple name. It touches every extension
-    resolution in the interpreter, so it wants a full gate rather than a spot
-    check — but it is not optional: a user type named after any nested stdlib
-    type silently inherits that type's extensions today, and `Entry` is only
-    the instance that happened to surface.
+PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
+    `.Instance` branch:
+
+        if (cg.get().isSubtypeOf(a, name)) break :blk true;
+        if (lastDotSegment(name)) |simple| {
+            scratch.reset();
+            if (cg.get().isSubtypeOf(a, simple)) break :blk true;   // <- here
+        }
+
+    A QUALIFIED name is a precise identity, and this falls back to its last
+    segment, so `isRuntimeType("Map.Entry")` answers true for a user class
+    named `Entry`. `receiverCompatibleWithParam` then admits the extension.
+    (That function also returns true unconditionally for any `.Instance`
+    receiver, so the qualified-name test is the only guard in the path.)
+
+    The fallback cannot simply be deleted: many stdlib classes are registered
+    under a SIMPLE name while the query arrives qualified
+    (`kotlin.collections.List` against a class registered as `List`), and every
+    one of those depends on it. The fix has to distinguish "the query is
+    qualified because the class is nested" from "the query is qualified because
+    the caller spelled the package", which means comparing the receiver
+    hierarchy's FQNs against the query as a suffix rather than comparing last
+    segments.
+
+    It is not optional — a user type named after any nested stdlib type
+    silently inherits that type's extensions today, and `Entry` is only the
+    instance that happened to surface — but it is a change to the hot type-test
+    path that every extension resolution runs through, so it wants a full gate,
+    not a spot check.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
