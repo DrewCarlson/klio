@@ -448,6 +448,7 @@ pub const FuncBuilder = struct {
     splice_recv_ty: ?[]const u8 = null,
     splice_hint_active: bool = false,
     splice_hint_recv: ?[]const u8 = null,
+    splice_hint_recv_ref: ?ast.TypeRef = null,
     /// Smart-cast narrowing of the implicit `this` (a `when (this) { is T ->`
     /// branch): the branch body's bare/`this.` calls resolve extensions
     /// against the NARROWED static type, as kotlinc does. Cleared on inline
@@ -1308,6 +1309,19 @@ pub const FuncBuilder = struct {
     }
     pub fn spliceHintRecv(self: *const FuncBuilder) ?[]const u8 {
         return self.splice_hint_recv;
+    }
+    /// The active splice's declared receiver type WITH its type arguments.
+    /// `spliceHintRecv` carries only the head, and a bare head cannot rank an
+    /// overload set that differs by element type — which is the whole of
+    /// `Collection<T>.plus(element: T)` against `plus(elements: Iterable<T>)`.
+    /// Borrowed from the spliced declaration; never freed by the caller.
+    pub fn setSpliceHintRecvRef(self: *FuncBuilder, ty: ?ast.TypeRef) ?ast.TypeRef {
+        const prev = self.splice_hint_recv_ref;
+        self.splice_hint_recv_ref = ty;
+        return prev;
+    }
+    pub fn spliceHintRecvRef(self: *const FuncBuilder) ?ast.TypeRef {
+        return self.splice_hint_recv_ref;
     }
     /// Set the smart-cast narrow of `this`, returning the previous value for
     /// restore at branch exit.

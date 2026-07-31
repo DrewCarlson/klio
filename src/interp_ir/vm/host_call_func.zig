@@ -1215,6 +1215,20 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         if (try samLambdaOnTower(self, allocator, module, func, f, args_in)) |r| return r;
     }
 
+    // A bodyless declaration with its OWN linked host symbol dispatches that
+    // symbol. The sibling redirect below is keyed by SIMPLE NAME, so without
+    // this a bodyless `kotlin.Double.equals` reaches `kotlin.String.equals`
+    // and fails on the receiver it was handed. A declaration's own resolved
+    // implementation outranks another class's same-named one.
+    if (!f.hasBody()) {
+        if (resolvedNativeForm(self, func)) |intrinsic| {
+            if (trace.enabled(f.name)) {
+                trace.emit("map=bodyless_native_own name={s} fqn={s}", .{ f.name, f.fqn });
+            }
+            return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
+        }
+    }
+
     // Bodyless `expect` / header-only decl: the link step settled its
     // body siblings (declaration order); the first whose arity fits the
     // call runs. Settled once by `linkResolvedForms` — no per-call
@@ -1469,7 +1483,7 @@ fn composableEval(
 ) Allocator.Error!EvalResult {
     if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
         if (std.mem.eql(u8, w, f.name)) {
-            std.debug.print("[fn-entry] {s}#{d}:", .{ f.fqn, f.id.int() });
+            std.debug.print("[fn-entry] {s}#{d} caller={s}:", .{ f.fqn, f.id.int(), if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>" });
             for (f.params, 0..) |p, i| {
                 if (i >= packed_args.items.len) break;
                 const v = &packed_args.items[i];

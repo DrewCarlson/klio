@@ -1158,6 +1158,129 @@ test "catch_param_static_type" {
     );
 }
 
+test "smart_cast_through_and_chain" {
+    try check("smart_cast_through_and_chain",
+        \\circle
+        \\circle
+        \\circle
+        \\circle/circle
+        \\none
+        \\none
+        \\true
+        \\false
+        \\true
+        \\c
+        \\b
+        \\
+    );
+}
+
+test "bare_member_call_on_captured_receiver" {
+    try check("bare_member_call_on_captured_receiver",
+        \\n=5
+        \\n=6
+        \\n=6
+        \\n=26
+        \\n=126
+        \\252/n=126
+        \\
+    );
+}
+
+test "data_class_components_are_declared_members" {
+    try check("data_class_components_are_declared_members",
+        \\a/1
+        \\a/1
+        \\6/t
+        \\200
+        \\1/200
+        \\x=1
+        \\x:1
+        \\Entry(key=a, num=1)
+        \\true
+        \\Entry(key=a, num=3)
+        \\
+    );
+}
+
+test "loop_variable_typed_from_element" {
+    try check("loop_variable_typed_from_element",
+        \\item:a;item:b;
+        \\item:c
+        \\6
+        \\item:a;item:b;pqr
+        \\1=one
+        \\2=two
+        \\
+    );
+}
+
+test "bare_call_lends_its_return_type" {
+    try check("bare_call_lends_its_return_type",
+        \\a/b
+        \\3
+        \\3
+        \\xy
+        \\
+    );
+}
+
+test "local_typed_from_its_initializer" {
+    try check("local_typed_from_its_initializer",
+        \\box:a
+        \\box:a!
+        \\box:made
+        \\2
+        \\20
+        \\30
+        \\box:a?
+        \\
+    );
+}
+
+test "sequence_sum_of_infers_its_kind" {
+    try check("sequence_sum_of_infers_its_kind",
+        \\7
+        \\7
+        \\7
+        \\7
+        \\7
+        \\7
+        \\3.5
+        \\7000000000
+        \\
+    );
+}
+
+test "grouping_through_its_own_protocol" {
+    try check("grouping_through_its_own_protocol",
+        \\{b=2, f=2, z=1}
+        \\{b=10, f=7, z=3}
+        \\{b=biscuit, f=flea, z=zoo}
+        \\{b=2, f=2, z=1}
+        \\{b=10, f=7, z=3}
+        \\
+    );
+}
+
+test "member_header_binds_its_own_owner" {
+    try check("member_header_binds_its_own_owner",
+        \\true
+        \\false
+        \\false
+        \\true
+        \\false
+        \\true
+        \\true
+        \\true
+        \\false
+        \\true
+        \\true
+        \\true
+        \\
+    );
+}
+
 test "host_backed_receiver_virtual_slot" {
     try check("host_backed_receiver_virtual_slot",
         \\10,20,30,

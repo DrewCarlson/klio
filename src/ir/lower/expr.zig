@@ -325,11 +325,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // Then arm. An `if (x is T)` guard smart-casts `x` to `T` for the
             // arm, and extension resolution is static — see `narrowIsCheck`.
             b.switchTo(t_block);
-            const narrowed = try narrowIsCheck(b, f.cond);
+            var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer narrowed.deinit(b.allocator);
+            try narrowIsCheckAll(b, f.cond, &narrowed);
             const narrowed_not_null = try narrowNullCheck(b, f.cond, true);
             const t_val = try lowerExpr(b, f.then_branch);
             if (narrowed_not_null) |n| b.restoreLocal(n);
-            if (narrowed) |n| b.restoreLocal(n);
+            var ni = narrowed.items.len;
+            while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = t_val } });
             b.terminate(.{ .Goto = join });
             // Else arm.
@@ -3194,6 +3197,20 @@ fn memberHostsTrailingLambdaAtArity(b: *FuncBuilder, cls: []const u8, f: *const 
     return true;
 }
 
+/// The declared RETURN type head of a function-typed parameter — the last type
+/// argument of its `FunctionN`. Null when the shape is not a function type.
+fn lambdaReturnHead(ty: ir.TypeRef) ?[]const u8 {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    if (ty.args.len == 0) return null;
+    return ty.args[ty.args.len - 1].name;
+}
+
+fn retHeadEql(a: ?[]const u8, b_in: ?[]const u8) bool {
+    if (a == null and b_in == null) return true;
+    if (a == null or b_in == null) return false;
+    return std.mem.eql(u8, a.?, b_in.?);
+}
+
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const ohtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const list = b.module.func_name_index.get(name) orelse {
@@ -3221,6 +3238,8 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
     // With-body candidates still outrank body-less ones: an `expect`
     // declaration shadowed by its actual keeps losing to the real one.
     var bodyless: ?FuncId = null;
+    var fallback_ret: ?[]const u8 = null;
+    var ret_conflict = false;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (ohtl_trace) std.debug.print("[ohtl] {s}: cand #{d} params={d} body={} last_ty={s} last_arity={?d}\n", .{ name, fid.int(), f.params.len, f.hasBody(), if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
@@ -3256,7 +3275,23 @@ fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_cou
             if (off == 1 and std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), rs))
                 return fid;
         }
-        if (fallback == null) fallback = fid;
+        if (fallback == null) {
+            fallback = fid;
+            fallback_ret = lambdaReturnHead(last.ty);
+        } else if (!retHeadEql(fallback_ret, lambdaReturnHead(last.ty))) {
+            ret_conflict = true;
+        }
+    }
+    // Several surviving candidates whose trailing lambdas differ in RETURN
+    // type — `sumOf(selector: (T) -> Int)` against `(T) -> Double`, 80 of them
+    // for that name. Kotlin picks by the lambda's inferred return type, which
+    // lowering does not have, so declaration order here is a guess. The pick
+    // is used to STAMP the lambda's parameter types as if it were proven, and
+    // a wrong stamp is worse than none: the call resolves correctly when
+    // nothing is recorded. Decline instead.
+    if (ret_conflict) {
+        if (ohtl_trace) std.debug.print("[ohtl] {s}: declined, candidates differ in lambda return type\n", .{name});
+        return null;
     }
     if (fallback) |fid| return fid;
     // A member on the enclosing/receiver class outranks a SIGNATURE-ONLY
@@ -4893,7 +4928,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // so hand it over rather than let it be evaluated a second time.
         const declared_from_expr = argDeclTypeRef(b, receiver);
         var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
-            try staticCallReturnTypeRef(b, receiver)
+            (try staticCallReturnTypeRef(b, receiver)) orelse
+                try localInitTypeRef(b, receiver)
         else
             null;
         defer if (inferred_ty) |*t| t.deinit(b.allocator);
@@ -7696,6 +7732,29 @@ fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
 /// narrowing the declared head (`Any?`) refutes every `CharSequence` extension
 /// and `x.isEmpty()` misses. A negated check narrows nothing here (its
 /// information is on the else path).
+/// Every smart cast a condition proves for its TRUE branch. Kotlin narrows on
+/// each `is` check in an `&&` chain, not only on a condition that is itself an
+/// `is` check: `if (!ignoreCase && this is String && prefix is String)` narrows
+/// both. Without walking the chain, `CharSequence.startsWith` resolved its own
+/// `this.startsWith(prefix)` — written under exactly that guard — back to the
+/// CharSequence extension instead of `String.startsWith`, and recursed until
+/// the stack ran out.
+///
+/// Applied in source order; the caller restores in reverse, because each
+/// narrowing saves the binding the previous one left.
+pub fn narrowIsCheckAll(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (cond.* == .Binary and cond.Binary.op == .And) {
+        try narrowIsCheckAll(b, cond.Binary.lhs, out);
+        try narrowIsCheckAll(b, cond.Binary.rhs, out);
+        return;
+    }
+    if (try narrowIsCheck(b, cond)) |n| try out.append(b.allocator, n);
+}
+
 pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
     if (cond.* != .IsCheck) return null;
     const ck = cond.IsCheck;
@@ -8098,6 +8157,192 @@ fn staticDispatchReceiverTypeRef(
     return try ownedClassSelfType(b.allocator, lexical_class);
 }
 
+/// `val x = Foo()` — a constructor call names its own type, so no return-type
+/// derivation is needed at all. These reach the census as `no_func`: the callee
+/// resolves to a CLASS rather than to a function.
+fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (init_expr.* != .Call) return null;
+    const call = init_expr.Call;
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
+    const ident = call.callee.Path.segments[0];
+    // A local or a function of the same name is not a constructor call.
+    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
+    if (b.module.funcId(ident.name) != null) return null;
+    const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const class = &b.module.classes.items[cid.int()];
+    // An object is not constructed; a stub or value class has no instance
+    // identity for a member call to bind against.
+    if (class.is_object or class.is_stub or class.is_value) return null;
+    const args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
+    errdefer b.allocator.free(args);
+    for (call.type_args, args) |*ty, *out| {
+        out.* = try decl_mod.loweredTypeRef(b.allocator, ty, true);
+    }
+    var derived = ir.TypeRef{
+        .name = try b.allocator.dupe(u8, class.fqn),
+        .nullable = false,
+        .args = args,
+    };
+    if (!staticClassifierArgsComplete(b, derived)) {
+        derived.deinit(b.allocator);
+        return null;
+    }
+    return derived;
+}
+
+/// The element type a `for (x in xs)` binds `x` to: the sole type ARGUMENT of
+/// the iterable's declared type. A loop variable has no initializer to derive
+/// from and is one of the three shapes making up the `no_initializer` census
+/// bucket, alongside a lambda parameter and a destructured component.
+///
+/// Conservative on purpose. A head with any argument count other than one is
+/// not an element sequence this can read, and an argument that is still a type
+/// PARAMETER names nothing — committing to it would disprove candidates a null
+/// type leaves open.
+pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?ir.TypeRef {
+    var owned: ?ir.TypeRef = null;
+    defer if (owned) |*t| t.deinit(b.allocator);
+    const ty: ir.TypeRef = blk: {
+        if (argDeclTypeRef(b, iter)) |known| break :blk known;
+        owned = (try staticCallReturnTypeRef(b, iter)) orelse
+            (try localInitTypeRef(b, iter)) orelse return null;
+        break :blk owned.?;
+    };
+    if (ty.args.len != 1) return null;
+    const elem = ty.args[0].name;
+    if (elem.len == 0 or ty.args[0].nullable) return null;
+    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) return null;
+    var head = elem;
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (b.module.classIdByFqn(head) == null and
+        b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
+    return try ty.args[0].clone(b.allocator);
+}
+
+pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
+    var elem = (try iterableElementTypeRef(b, iter)) orelse return null;
+    defer elem.deinit(b.allocator);
+    return try b.allocator.dupe(u8, elem.name);
+}
+
+/// A statically known type for an arbitrary expression: its own declared type
+/// where it has one, otherwise a constructed class, a resolved call's return
+/// type, or the type a local's initializer lends it. Owned by the caller.
+pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
+    if (try ctorInitTypeRef(b, e)) |t| return t;
+    if (try staticCallReturnTypeRef(b, e)) |t| return t;
+    return try localInitTypeRef(b, e);
+}
+
+/// The declared return type of a nullary member on a known receiver type, with
+/// the receiver's own type arguments substituted in. This is what a
+/// DESTRUCTURED component needs: `for ((a, b) in xs)` binds each name to the
+/// element's `componentN()`, so each one's type is that accessor's return type.
+pub fn nullaryMemberReturnTypeRef(
+    b: *FuncBuilder,
+    recv: ir.TypeRef,
+    name: []const u8,
+    file: span.FileId,
+) Allocator.Error!?ir.TypeRef {
+    const trace = runtime.getenvSlice("KLIO_COMP_TRACE") != null;
+    var identity = std.mem.trimEnd(u8, recv.name, "?");
+    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (identity.len == 0) return null;
+    const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+        b.module.classIdByFqn(identity)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no owner\n", .{ identity, name });
+        return null;
+    };
+    var shape_set = try buildStaticReturnArgShapes(b, &.{}, &.{});
+    defer shape_set.deinit(b.allocator);
+    const owned_bounds = try b.typeParamBoundsSlice();
+    defer if (owned_bounds) |bounds| b.allocator.free(bounds);
+    const resolved = b.module.resolveMemberCall(owner, name, shape_set.shapes, .{
+        .caller_file = file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = owned_bounds orelse &.{},
+        .receiver_type = recv,
+    });
+    // A deferred resolution that still names one declaration is enough here:
+    // this reads a RETURN TYPE, not a dispatch commitment, and an override
+    // may only narrow it.
+    const target = resolved.target orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no target applicable={} methods={d}\n", .{
+            identity,
+            name,
+            resolved.applicable,
+            b.module.classes.items[owner.int()].methods.len,
+        });
+        return null;
+    };
+    var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv, file);
+    defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
+    var out = (try b.module.instantiatedCallReturnType(
+        b.allocator,
+        target,
+        recv,
+        dispatch_receiver,
+        shape_set.shapes,
+        &.{},
+    )) orelse {
+        if (trace) std.debug.print("[comp] {s}.{s} no return type\n", .{ identity, name });
+        return null;
+    };
+    // A return type left as the owner's own type PARAMETER names no class —
+    // the receiver was written without its arguments. Committing to it would
+    // disprove candidates a null type leaves open.
+    var head = std.mem.trimEnd(u8, out.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (b.module.classIdByFqn(head) == null and
+        b.module.uniqueClassIdBySimpleName(typeHead(head)) == null)
+    {
+        if (trace) std.debug.print("[comp] {s}.{s} unknown head {s}\n", .{ identity, name, out.name });
+        out.deinit(b.allocator);
+        return null;
+    }
+    if (trace) std.debug.print("[comp] {s}.{s} -> {s}\n", .{ identity, name, out.name });
+    return out;
+}
+
+fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
+    const name = receiver.Path.segments[0].name;
+    if (b.resolve(name) == null) return null;
+    const init_expr = b.localInitExpr(name) orelse {
+        if (norecvCensusOn()) lm_localinit[0] += 1;
+        return null;
+    };
+    if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| {
+        if (norecvCensusOn()) lm_localinit[1] += 1;
+        return ctor_ty;
+    }
+    var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse {
+        if (norecvCensusOn()) {
+            lm_localinit[2] += 1;
+            if (runtime.getenvSlice("KLIO_LI_NAMES") != null and init_expr.* == .Call) {
+                const c = init_expr.Call.callee;
+                if (c.* == .Path and c.Path.segments.len == 1) {
+                    std.debug.print("[li-null] {s}\n", .{c.Path.segments[0].name});
+                } else if (c.* == .Member) {
+                    std.debug.print("[li-null] .{s}\n", .{c.Member.name.name});
+                } else std.debug.print("[li-null] <{s}>\n", .{@tagName(std.meta.activeTag(c.*))});
+            }
+        }
+        return null;
+    };
+    if (!staticClassifierArgsComplete(b, derived)) {
+        if (norecvCensusOn()) lm_localinit[3] += 1;
+        derived.deinit(b.allocator);
+        return null;
+    }
+    if (norecvCensusOn()) lm_localinit[4] += 1;
+    return derived;
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
@@ -8230,11 +8475,19 @@ fn staticCallReturnTypeRef(
             if (path.segments.len != 1) return null;
             const name = path.segments[0];
             if (b.resolve(name.name) != null or b.isLocalFn(name.name) or
-                b.knowsOuter(name.name) or enclosingHasMemberNamed(b, name.name))
+                b.knowsOuter(name.name))
             {
                 return null;
             }
-            const res = try b.module.resolveCall(
+            // A name the enclosing receiver declares is a MEMBER call written
+            // without `this.`, not a top-level one — so it is exactly the case
+            // the implicit-receiver resolution below answers, and returning
+            // null here is what kept 908 bare `iterator()` initializers from
+            // lending their type.
+            const member_of_enclosing = enclosingHasMemberNamed(b, name.name);
+            const res = if (member_of_enclosing)
+                ir.Module.Resolution{ .target = null, .confidence = .deferred, .emit_form = .Call }
+            else try b.module.resolveCall(
                 b.allocator,
                 name.name,
                 b.self_package,
@@ -8250,12 +8503,72 @@ fn staticCallReturnTypeRef(
                 ),
             );
             defer b.allocator.free(res.candidate_set);
-            target = res.target orelse return null;
+            var from_implicit_receiver = false;
+            // A top-level pick made under a lambda's conservative receiver is
+            // not evidence, and neither is no pick at all — but the implicit
+            // RECEIVER may still prove one. Measured, a bare `iterator()`
+            // inside a stdlib extension body lands here with a non-exact
+            // top-level pick, and it is 908 of the 1,346 initializers that
+            // yield no type.
+            const top_level_usable = res.target != null and
+                (res.confidence == .exact or
+                    (b.recvTy() == null and !b.isParamThunk()));
+            target = (if (top_level_usable) res.target else null) orelse blk: {
+                from_implicit_receiver = true;
+                // A BARE call in a receiver context is usually a member of the
+                // implicit receiver written without `this.` — measured, 908 of
+                // the 1,439 initializers that yield no type are a bare
+                // `iterator()`, another 165 a bare `listIterator()`. Their
+                // result type is exactly what the local needs.
+                const head_name = bareStaticRecvHead(b) orelse return null;
+                const recv_ref = if (b.spliceHintActive())
+                    (if (b.spliceHintRecvRef()) |rt|
+                        try decl_mod.loweredTypeRef(b.allocator, &rt, true)
+                    else
+                        null)
+                else
+                    (if (b.recvTypeRef()) |declared| try declared.clone(b.allocator) else null);
+                var bare_recv = recv_ref orelse ir.TypeRef{
+                    .name = try b.allocator.dupe(u8, head_name),
+                    .nullable = false,
+                    .args = &.{},
+                };
+                if (!std.mem.eql(u8, typeHead(bare_recv.name), head_name)) {
+                    bare_recv.deinit(b.allocator);
+                    bare_recv = ir.TypeRef{
+                        .name = try b.allocator.dupe(u8, head_name),
+                        .nullable = false,
+                        .args = &.{},
+                    };
+                }
+                receiver = bare_recv;
+                var ident = std.mem.trimEnd(u8, bare_recv.name, "?");
+                if (std.mem.indexOfScalar(u8, ident, '<')) |lt| ident = ident[0..lt];
+                const bare_head = typeHead(ident);
+                const owner = (if (std.mem.indexOfScalar(u8, ident, '.') != null)
+                    b.module.classIdByFqn(ident)
+                else
+                    b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
+                        b.module.classId(bare_head)) orelse return null;
+                const bare_resolved = b.module.resolveMemberCall(
+                    owner,
+                    name.name,
+                    shape_set.shapes,
+                    .{
+                        .caller_file = name.span.file,
+                        .lexical_owner = null,
+                        .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+                        .receiver_type = bare_recv,
+                    },
+                );
+                break :blk bare_resolved.target orelse return null;
+            };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
             // still cannot lend its target's return type to another proof.
-            if (res.confidence != .exact and
-                (b.recvTy() != null or b.isParamThunk())) return null;
+            // `top_level_usable` already applied the confidence check to the
+            // other branch; a receiver-proved target has none to check.
+            _ = &from_implicit_receiver;
         },
         .Member => |member| {
             receiver = if (argDeclTypeRefLazy(b, member.receiver)) |known|
@@ -11120,6 +11433,108 @@ fn lowerUnresolvedBareCall(
             }
         }
     }
+    // A bare call in a receiver context is usually a MEMBER call written
+    // without `this.` — measured, the names reaching here are `isEmpty`,
+    // `get`, `contains`, `append`, not top-level functions. When the implicit
+    // receiver's head names a class, the member has the same static answer the
+    // explicit-receiver path computes. The receiver itself may be a CAPTURE
+    // rather than a bound parameter, which is the case at most of these sites,
+    // so materialise it through the closure's slot before asking.
+    if (bareStaticRecvHead(b)) |head_name| bare_member: {
+        const head_fqn = blk: {
+            if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
+            const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
+                b.module.classId(head_name) orelse break :bare_member;
+            if (cid.int() >= b.module.classes.items.len) break :bare_member;
+            break :blk b.module.classes.items[cid.int()].fqn;
+        };
+        // The head's type ARGUMENTS are usually absent here, and that is fine
+        // for this arm: the scorer already ranks a bare head, and refusing one
+        // rules out every bare call in a generic body — which is most of them.
+        // Prefer the enclosing declaration's own receiver type when it names
+        // this head, since that one carries the arguments.
+        var owned_recv_ty: ?TypeRef = null;
+        defer if (owned_recv_ty) |*t| t.deinit(b.allocator);
+        const recv_ty = blk: {
+            // Inside a splice the enclosing declaration's receiver is the
+            // CALLER's, not the spliced body's. Use the spliced declaration's
+            // own receiver type, which carries the type arguments an overload
+            // set that differs by element type needs.
+            if (b.spliceHintActive()) {
+                if (b.spliceHintRecvRef()) |rt| {
+                    if (std.mem.eql(u8, typeHead(rt.name.name), head_name)) {
+                        owned_recv_ty = try decl_mod.loweredTypeRef(b.allocator, &rt, true);
+                        break :blk owned_recv_ty.?;
+                    }
+                }
+            } else if (b.recvTypeRef()) |declared| {
+                if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
+            }
+            break :blk TypeRef{ .name = head_fqn, .nullable = false, .args = &.{} };
+        };
+        const this_reg = if (b.resolve("this")) |r|
+            r
+        else if (b.capturesThisSlot() or b.knowsOuter("this"))
+            try lambda_body.resolveCapture(b, "this")
+        else
+            break :bare_member;
+        var this_path = [_]ast.Ident{.{ .name = "this", .span = callee.Path.segments[0].span }};
+        const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = callee.Path.segments[0].span } };
+        switch (try lowerResolvedMemberCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = callee.Path.segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+            .{ .reg = this_reg, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                orEmitAudit(b, "unresolved_bare_call", "Call/bare-member", name0);
+                return reg;
+            },
+            .deferred, .none => {},
+        }
+        // No member serves it. Kotlin tries this receiver's EXTENSIONS before
+        // moving outwards, so ask for them here rather than deferring the
+        // whole walk: `plus(element)` written inside `Iterable<T>.plusElement`
+        // is an extension on the body's own receiver, and leaving it dynamic
+        // is what makes that body pick the concatenating overload at run time.
+        if (try lowerResolvedExtensionCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = callee.Path.segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+        )) |reg| {
+            orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
+            return reg;
+        }
+        if (runtime.getenvSlice("KLIO_BAREARM") != null) {
+            var loc_buf: [256]u8 = undefined;
+            const cs = callee.Path.segments[0].span;
+            const loc: []const u8 = blk2: {
+                if (span.active_map) |m| {
+                    if (m.getChecked(cs.file)) |sf| {
+                        const lc = sf.lineCol(cs.start);
+                        const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                        break :blk2 std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                    }
+                }
+                break :blk2 std.fmt.bufPrint(&loc_buf, "f{d}:{d}", .{ cs.file.int(), cs.start }) catch "?";
+            };
+            std.debug.print("[barearm-miss] {s} {s} recv={s} nargs={d} splice={}\n", .{
+                loc, name0, recv_ty.name, args.len, b.spliceHintActive(),
+            });
+            for (args, 0..) |*a, i| {
+                const t = argDeclTypeRefLazy(b, a);
+                std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+            }
+        }
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
@@ -11742,6 +12157,21 @@ pub const PromoBlock = enum(u8) {
     ext_index_stale,
 };
 pub var lm_promo: [6]u64 = @splat(0);
+
+/// Why `localInitTypeRef` did or did not answer: no initializer, a constructor,
+/// no derivable return type, incomplete type arguments, derived.
+pub var lm_localinit: [5]u64 = @splat(0);
+
+pub fn lowerLocalInitDump() void {
+    var total: u64 = 0;
+    for (lm_localinit) |n| total += n;
+    if (total == 0) return;
+    const names = [_][]const u8{ "no_initializer", "constructor", "no_return_type", "args_incomplete", "derived" };
+    std.debug.print("[localinit] total={d}\n", .{total});
+    for (names, lm_localinit) |n, c| {
+        if (c != 0) std.debug.print("[localinit] {d:>10} {s}\n", .{ c, n });
+    }
+}
 
 pub fn lowerPromoDump() void {
     var total: u64 = 0;
@@ -12624,7 +13054,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const name = callee.Member.name;
     const declared_from_expr = argDeclTypeRef(b, receiver);
     var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
-        try staticCallReturnTypeRef(b, receiver)
+        (try staticCallReturnTypeRef(b, receiver)) orelse
+            try localInitTypeRef(b, receiver)
     else
         null;
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
