@@ -457,10 +457,29 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     extension whose declared receiver is a NESTED classifier must not match a
     receiver that is not that nested type.
 
-    Cost of getting here: two guards on the runtime path, both revert-only,
-    because the pinpoint that produced them assumed a runtime selection without
-    checking whether a call was emitted at all. `KLIO_EMIT_TRACE` answers that
-    in one run and should have been the first thing tried.
+    THIRD GUARD, ALSO NOT THE PATH. `Module.staticHeadCompatibility` (the
+    `actual_head` / `param_erased_head` comparison in `ir.zig`) was given the
+    nested-classifier test: when the param names one, require
+    `classIdIsOrExtends` rather than accepting a head match. No effect on the
+    reproducer, so either that function is not consulted for this splice or
+    `staticTypeClassId` answers null for one side.
+
+    Cost so far: three guards, all revert-only, and the pattern in the misses
+    is consistent — each was placed by reading code that LOOKS like the
+    decision point instead of by observing the decision. What is actually
+    established is narrow and worth stating plainly:
+
+      - the failure is an inline splice of `Map.Entry.component2`, so no call
+        is emitted and no runtime dispatch runs (proved by `KLIO_EMIT_TRACE`
+        and a `callFunc` probe, both silent)
+      - it is a name collision, not a typing bug (proved by renaming the class)
+      - it is NOT decided by `Value.isRuntimeType`, `receiverCompatibleWithParam`,
+        or `staticHeadCompatibility` (proved by guarding each)
+
+    The next step is to instrument the SPLICE: print the FuncId and receiver
+    type at `inline_call.zig`'s splice entry for any `component*` name. That
+    names the decision directly instead of inferring it, and three inferences
+    have now failed.
 
     The destructured-component typing is four lines on top of it and cannot be
     tested until the loop runs.
