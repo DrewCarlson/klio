@@ -317,46 +317,52 @@ round — a 10x increase.
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
 
-### MEASURED, not landed: two stacked slices worth +279
+### LANDED since: the bare-call arm no longer needs complete type arguments
 
-Both are implemented, both are one test away, and the blocker for each is now
-identified precisely rather than guessed.
+The bare member/extension arm required the receiver head's type arguments to be
+complete, which refused every bare call written in a generic body — `Iterable`
+has one type parameter and the head carries none. The completeness rule is
+right for a DERIVED receiver type, where an under-specified head disproves
+candidates a null type would have left open; it is wrong for the declaration's
+OWN receiver, which the scorer already ranks. Dropping it there is worth +187
+and the sweep stays green.
 
-**(a) Type a local from its initializer — +253.** Kotlin's inferred type for
-`val x = f()` IS `f`'s return type, and a `var`'s later assignment must conform
-to it, so the initializer's type is the local's type at every use. Four lines:
-a `localInitTypeRef` helper feeding the two places that already call
-`staticCallReturnTypeRef`, gated on `staticClassifierArgsComplete`.
+    bound  1,666 -> 1,853 of 6,905  (26.8%)
 
-    bound          1666 -> 1919
-    no_receiver    3900 -> 3563
+### MEASURED, not landed: typing a local from its initializer, +287
 
-**(b) Use the enclosing function's DECLARED receiver type, with its type
-arguments — a further +26.** `bareStaticRecvHead` yields a bare head, and a
-head whose arguments are missing is refused, which rules out every bare call in
-a generic extension body. `FuncBuilder.recvTypeRef()` already carries
-`Iterable<T>` rather than `Iterable`.
+Kotlin's inferred type for `val x = f()` IS `f`'s return type, and a `var`'s
+later assignment must conform to it, so the initializer's type is the local's
+type at every use. Four lines: a `localInitTypeRef` helper feeding the two
+places that already call `staticCallReturnTypeRef`, gated on
+`staticClassifierArgsComplete` (a derived type, so the gate belongs).
 
-With (b) in place, **all four `plusElement` bodies bind their `plus(element)`
-statically and to the correct element overload**:
+    bound          1,853 -> 2,140
+    no_receiver    3,918 -> 3,579
 
-    [emit] Call fqn=kotlin.collections.plus fid=2130 in_fn=plusElement
-    [emit] Call fqn=kotlin.collections.plus fid=2131 in_fn=plusElement
-    [emit] Call fqn=kotlin.collections.plus fid=2169 in_fn=plusElement
-    [emit] Call fqn=kotlin.sequences.plus  fid=2490 in_fn=plusElement
+It costs two failures, and the diagnosis for the first is now much closer:
 
-That was the mechanism this document blamed for `plusCollectionInference`, and
-fixing it does NOT fix the test — so the diagnosis recorded above is now
-superseded a second time and the failure is somewhere else again. Whoever picks
-this up: start by finding which of the three assertions in that test fails
-under (a)+(b), because every previous round assumed it was the first one.
+  - `CollectionTest.plusCollectionInference` — `Expected <[[s], [a]]>, actual
+    <[[s], a]>`. The message identifies the FIRST assertion, so an earlier note
+    in this document speculating otherwise is withdrawn.
 
-(b) also costs one new failure, `SequenceTest.onEach` (`Expected <6.0>, actual
-<6>`) — a numeric-type widening, so the declared receiver type is reaching an
-overload choice that the bare head left open.
+    `plusElement` is INLINE, so the call site splices its body and the spliced
+    `plus(element)` is lowered inside `plusCollectionInference` — not in any of
+    the four standalone `plusElement` bodies, all of which bind `plus` to the
+    correct element overload. That spliced call still emits
+    `CallMemberOrGlobal name=plus func=5111`.
 
-Neither is landed. The tree is green without them; the last verified census is
-1,666 of 6,655.
+    `KLIO_BAREARM` shows the arm DOES fire there: `head=Collection thisreg=true
+    splice=true`. So `bareStaticRecvHead` and the receiver register are both
+    available and it is `lowerResolvedExtensionCall` that declines inside the
+    splice. **That is the next probe: why the extension resolution returns null
+    for `plus` on a `Collection` receiver with a spliced `element` argument,
+    when the same resolution ranks it at 100105 in the standalone body.**
+    Label the `[barearm]` rows with their enclosing function first — the rows
+    above cannot be attributed to a specific body without it.
+
+  - `SequenceTest.onEach` — `Expected <6.0>, actual <6>`, a numeric widening.
+    Unexamined.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
