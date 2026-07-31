@@ -11120,6 +11120,48 @@ fn lowerUnresolvedBareCall(
             }
         }
     }
+    // A bare call in a receiver context is usually a MEMBER call written
+    // without `this.` — measured, the names reaching here are `isEmpty`,
+    // `get`, `contains`, `append`, not top-level functions. When the implicit
+    // receiver's head names a class, the member has the same static answer the
+    // explicit-receiver path computes. The receiver itself may be a CAPTURE
+    // rather than a bound parameter, which is the case at most of these sites,
+    // so materialise it through the closure's slot before asking.
+    if (bareStaticRecvHead(b)) |head_name| bare_member: {
+        const head_fqn = blk: {
+            if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
+            const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
+                b.module.classId(head_name) orelse break :bare_member;
+            if (cid.int() >= b.module.classes.items.len) break :bare_member;
+            break :blk b.module.classes.items[cid.int()].fqn;
+        };
+        const recv_ty = TypeRef{ .name = head_fqn, .nullable = false, .args = &.{} };
+        if (!staticClassifierArgsComplete(b, recv_ty)) break :bare_member;
+        const this_reg = if (b.resolve("this")) |r|
+            r
+        else if (b.capturesThisSlot() or b.knowsOuter("this"))
+            try lambda_body.resolveCapture(b, "this")
+        else
+            break :bare_member;
+        var this_path = [_]ast.Ident{.{ .name = "this", .span = callee.Path.segments[0].span }};
+        const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = callee.Path.segments[0].span } };
+        switch (try lowerResolvedMemberCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = callee.Path.segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+            .{ .reg = this_reg, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                orEmitAudit(b, "unresolved_bare_call", "Call/bare-member", name0);
+                return reg;
+            },
+            .deferred, .none => {},
+        }
+    }
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);

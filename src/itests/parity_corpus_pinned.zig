@@ -1158,6 +1158,17 @@ test "catch_param_static_type" {
     );
 }
 
+test "bare_member_call_on_captured_receiver" {
+    try check("bare_member_call_on_captured_receiver",
+        \\n=5
+        \\n=6
+        \\n=6
+        \\n=26
+        \\n=126
+        \\
+    );
+}
+
 test "grouping_through_its_own_protocol" {
     try check("grouping_through_its_own_protocol",
         \\{b=2, f=2, z=1}
