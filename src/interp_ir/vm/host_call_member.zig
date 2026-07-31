@@ -9361,6 +9361,19 @@ fn virtualSlotUnlinkedDiag(
     ir.eval.dumpFrameChainForDiagAlways();
 }
 
+/// `KLIO_NOINST_TRACE=1`: report each virtual slot resolved against the runtime
+/// class of a host-backed (non-`Instance`) receiver. Resolved once — this sits
+/// on the member-dispatch path, where the env cache's mutex would show up.
+fn noinstTraceOn() bool {
+    const S = struct {
+        var known: ?bool = null;
+    };
+    if (S.known) |k| return k;
+    const k = std.c.getenv("KLIO_NOINST_TRACE") != null;
+    S.known = k;
+    return k;
+}
+
 /// Invoke a statically resolved virtual family by numeric slot. The runtime
 /// receiver contributes its exact class identity; named and runtime-defined
 /// classes both resolve to an O(1) `(class, slot)` target.
@@ -9427,7 +9440,7 @@ pub fn invokeVirtualMember(
             if (!virtualTargetExecutable(module, target) and
                 host_call_func.resolvedNativeForm(self, target) == null)
                 break :blk .{ .target = null, .name = mname };
-            if (runtime.getenvSlice("KLIO_NOINST_TRACE") != null) {
+            if (noinstTraceOn()) {
                 std.debug.print("[noinst] recv_ty={s} slot={d} root={s} -> target={s}\n", .{
                     receiver.typeFqn(),
                     slot.int(),
