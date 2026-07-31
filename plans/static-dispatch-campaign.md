@@ -633,18 +633,36 @@ breakdown of why a static bind was refused is:
     4926  the scoped candidate set was EMPTY
       10  the scoped candidate set held exactly one declaration
 
-**`boundedCallCandidates` answers null at 4,926 of 4,936 sites.** The names
-involved are `assertEquals`, `assertTrue`, `expect`, `listOf` — declarations
-that reach the file through a wildcard import of a PACK package, and
-`bareCallCandidateIterator` has no entry for them. So the site cannot name its
-target not because the reasoning is too weak but because the import-scoped
-candidate index does not cover pack-provided top-level functions.
+`boundedCallCandidates` answers null at nearly every one of these sites, and
+`KLIO_BCC_WHY` says why:
 
-An arm implementing the bind was written, is correct, and converted 4 sites out
-of ~2,400 for exactly this reason; it is not landed. **Widening the bare-call
-candidate index to pack declarations is the prerequisite**, and it is worth
-doing on its own — the same index bounds every bare-call resolution, so its
-gaps push work to the runtime everywhere, not only here.
+    5403  no-visible-tier    <- candidates exist, none is a top-level function
+     488  no-candidates
+     265  no-arity-match
+
+The `no-visible-tier` names settle it — `isEmpty` (793), `get` (322),
+`contains` (86), `sort` (71), `append` (65), `toList`, `apply`. These are
+MEMBERS and EXTENSIONS. `lowestVisibleGlobalTier` skips anything whose
+`declarationKind` is not `.plain`, so it correctly reports that the site has no
+top-level reading at all.
+
+**So an earlier note in this document was wrong, and is corrected here: this is
+not a gap in the pack-provided candidate index.** These bare calls really are
+member calls on an implicit receiver, written without `this.`. Their static
+answer is a MEMBER bind against the implicit receiver's type — the same
+resolution the explicit-receiver path already performs — and it needs that
+receiver's type.
+
+That makes the tractable slice concrete: `bareStaticRecvHead(b)` already gives
+the enclosing/spliced receiver head where one is known, and
+`resolveMemberCall` already binds against a head. Wiring the two together binds
+the bare calls whose receiver is statically known, and leaves the rest to the
+same typeck work as section 1. Measure the known-head fraction of the 5,403
+before building it — that fraction is the size of the prize.
+
+An arm binding the TOP-LEVEL reading was written and converted 4 sites out of
+~2,400, which is the correct outcome given the above: almost none of these
+sites have a top-level reading to bind. It is not landed.
 
 ### 7. Genuinely dynamic by design
 
@@ -664,10 +682,10 @@ gaps push work to the runtime everywhere, not only here.
 2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
    180 sites left are genuine member/extension shadowing pairs that need
    argument types, so they fold into item 3.
-3. **Widen the bare-call candidate index to pack declarations (section 6).**
-   It answers null at 4,926 of 4,936 bare-call sites, which blocks ~2,400
-   `CallMemberOrGlobal` binds AND bounds every other bare-call resolution.
-   Cheaper than item 4 and it unblocks a whole instruction family.
+3. **Bind bare MEMBER calls against a statically known implicit receiver
+   (section 6)** — up to ~5,400 sites on the measured set, of which the
+   reachable share is those whose receiver head `bareStaticRecvHead` already
+   knows. Needs no typeck for that share and reuses `resolveMemberCall`.
 4. **The typeck generic-argument project — 3,886 sites, 60%.** The largest
    remaining piece and the only one that requires typeck work: substituting
    type arguments through call sites and propagating them from declarations, so

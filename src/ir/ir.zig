@@ -6935,6 +6935,18 @@ pub const Module = struct {
     /// set for `name` (the remaining host-only/incomplete-header boundary); a
     /// non-null slice is bounded by Kotlin visibility, and may be empty when
     /// rankable declarations exist but none are visible from this site.
+    /// `KLIO_BCC_WHY=1`: report why the scoped bare-call candidate set came
+    /// back empty. Resolved once — this runs per lowered call site.
+    fn bccWhyOn() bool {
+        const S = struct {
+            var known: ?bool = null;
+        };
+        if (S.known) |k| return k;
+        const k = std.c.getenv("KLIO_BCC_WHY") != null;
+        S.known = k;
+        return k;
+    }
+
     pub fn boundedCallCandidates(
         self: *const Module,
         alloc: std.mem.Allocator,
@@ -6945,7 +6957,11 @@ pub const Module = struct {
     ) std.mem.Allocator.Error!?[]const FuncId {
         const candidates = try self.bareCallCandidates(alloc, name, caller_file);
         defer alloc.free(candidates);
-        if (candidates.len == 0) return null;
+        const dbg = bccWhyOn();
+        if (candidates.len == 0) {
+            if (dbg) std.debug.print("[bcc] {s} no-candidates\n", .{name});
+            return null;
+        }
         const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         const first_tier = self.lowestVisibleGlobalTier(
             name,
@@ -6953,8 +6969,12 @@ pub const Module = struct {
             caller_pkg,
             caller_file,
         );
-        if (first_tier == 255) return null;
+        if (first_tier == 255) {
+            if (dbg) std.debug.print("[bcc] {s} no-visible-tier n={d}\n", .{ name, candidates.len });
+            return null;
+        }
         if (first_tier >= other_package_tier) {
+            if (dbg) std.debug.print("[bcc] {s} other-package-tier n={d}\n", .{ name, candidates.len });
             return try alloc.alloc(FuncId, 0);
         }
         var list: std.ArrayList(FuncId) = .empty;
@@ -6967,6 +6987,7 @@ pub const Module = struct {
             if (self.globalArityCanBind(id, f, user_arg_count)) any_arity_match = true;
         }
         if (!any_arity_match) {
+            if (dbg) std.debug.print("[bcc] {s} no-arity-match n={d} kept={d}\n", .{ name, candidates.len, list.items.len });
             list.deinit(alloc);
             return null;
         }
