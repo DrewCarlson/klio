@@ -372,10 +372,48 @@ do not retry them:
     type parameters (`Sequence<T>`): 2,140 -> 1,816
   - requiring the initializer's callee to be `unique_concrete`: 2,140 -> 1,756
 
-Next step: trace which `sumOf` the runtime picks with `data` typed versus
-untyped. The selection is dynamic in both cases (`[emit] CallMember name=sumOf`),
-so the difference is in what the static receiver hint or the lambda's recorded
-parameter types tell the runtime walk — not in a static bind.
+Traced further, and the mechanism is named. `KLIO_MISS_TRACE=sumOf` shows
+
+    [ohtl] sumOf: 80 candidates argc=1
+    [ohtl] sumOf: cand #1804 params=2 body=true last_ty=Function1 last_arity=1
+    ... 79 more, every one identical in shape
+
+`overloadHostingTrailingLambda` walks that set to decide the trailing lambda's
+SHAPE, and its tie-break is "the overload whose leading `this` matches the
+enclosing receiver type, else declaration order". Its pick then feeds
+`recordLambdaArgReceivers`, which stamps the lambda's parameter types as if the
+choice were authoritative. Among `sumOf`'s overloads the shapes are identical —
+they differ only in the selector's RETURN type, `(T) -> Int` against
+`(T) -> Double` — so the walk cannot discriminate them and the stamp is a
+guess.
+
+Confirmed pre-existing: the same 80-candidate walk runs on the green tree (292
+trace lines) and happens to pick correctly there. Typing `data` changes which
+candidate wins, so the slice does not introduce the defect, it merely lands on
+the other side of a coin that was already being flipped.
+
+That reclassifies this slice. Kotlin selects `sumOf` by the lambda's INFERRED
+RETURN TYPE, which lowering does not have, so the honest conclusion is that
+these +287 sites are not independent of the typeck project after all — they
+need the same lambda/element type inference as section 1.
+
+Two narrower fixes are possible without it, and both are worth trying before
+the big project:
+
+  1. Make `overloadHostingTrailingLambda` DECLINE when its surviving candidates
+     differ in the trailing lambda's return type. A guess that is used as a
+     stamp is worse than no stamp; the call already works when nothing is
+     recorded.
+  2. Infer a lambda's return type for the trivial shapes — a single expression
+     that is a member read or a literal — which covers `{ it.length }` and most
+     of what these overload sets are discriminated by.
+
+Two guards were tried against the symptom and BOTH cost sites without fixing
+it — do not retry them:
+
+  - rejecting a derived type whose arguments are still the declaration's own
+    type parameters (`Sequence<T>`): 2,140 -> 1,816
+  - requiring the initializer's callee to be `unique_concrete`: 2,140 -> 1,756
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
