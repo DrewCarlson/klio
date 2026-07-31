@@ -1187,6 +1187,16 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "bare_call_lends_its_return_type" {
+    try check("bare_call_lends_its_return_type",
+        \\a/b
+        \\3
+        \\3
+        \\xy
+        \\
+    );
+}
+
 test "local_typed_from_its_initializer" {
     try check("local_typed_from_its_initializer",
         \\box:a

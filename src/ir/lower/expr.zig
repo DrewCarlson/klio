@@ -8195,13 +8195,34 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
     const name = receiver.Path.segments[0].name;
     if (b.resolve(name) == null) return null;
-    const init_expr = b.localInitExpr(name) orelse return null;
-    if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| return ctor_ty;
-    var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse return null;
+    const init_expr = b.localInitExpr(name) orelse {
+        if (norecvCensusOn()) lm_localinit[0] += 1;
+        return null;
+    };
+    if (try ctorInitTypeRef(b, init_expr)) |ctor_ty| {
+        if (norecvCensusOn()) lm_localinit[1] += 1;
+        return ctor_ty;
+    }
+    var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse {
+        if (norecvCensusOn()) {
+            lm_localinit[2] += 1;
+            if (runtime.getenvSlice("KLIO_LI_NAMES") != null and init_expr.* == .Call) {
+                const c = init_expr.Call.callee;
+                if (c.* == .Path and c.Path.segments.len == 1) {
+                    std.debug.print("[li-null] {s}\n", .{c.Path.segments[0].name});
+                } else if (c.* == .Member) {
+                    std.debug.print("[li-null] .{s}\n", .{c.Member.name.name});
+                } else std.debug.print("[li-null] <{s}>\n", .{@tagName(std.meta.activeTag(c.*))});
+            }
+        }
+        return null;
+    };
     if (!staticClassifierArgsComplete(b, derived)) {
+        if (norecvCensusOn()) lm_localinit[3] += 1;
         derived.deinit(b.allocator);
         return null;
     }
+    if (norecvCensusOn()) lm_localinit[4] += 1;
     return derived;
 }
 
@@ -8357,7 +8378,55 @@ fn staticCallReturnTypeRef(
                 ),
             );
             defer b.allocator.free(res.candidate_set);
-            target = res.target orelse return null;
+            target = res.target orelse blk: {
+                // A BARE call in a receiver context is usually a member of the
+                // implicit receiver written without `this.` — measured, 908 of
+                // the 1,439 initializers that yield no type are a bare
+                // `iterator()`, another 165 a bare `listIterator()`. Their
+                // result type is exactly what the local needs.
+                const head_name = bareStaticRecvHead(b) orelse return null;
+                const recv_ref = if (b.spliceHintActive())
+                    (if (b.spliceHintRecvRef()) |rt|
+                        try decl_mod.loweredTypeRef(b.allocator, &rt, true)
+                    else
+                        null)
+                else
+                    (if (b.recvTypeRef()) |declared| try declared.clone(b.allocator) else null);
+                var bare_recv = recv_ref orelse ir.TypeRef{
+                    .name = try b.allocator.dupe(u8, head_name),
+                    .nullable = false,
+                    .args = &.{},
+                };
+                if (!std.mem.eql(u8, typeHead(bare_recv.name), head_name)) {
+                    bare_recv.deinit(b.allocator);
+                    bare_recv = ir.TypeRef{
+                        .name = try b.allocator.dupe(u8, head_name),
+                        .nullable = false,
+                        .args = &.{},
+                    };
+                }
+                receiver = bare_recv;
+                var ident = std.mem.trimEnd(u8, bare_recv.name, "?");
+                if (std.mem.indexOfScalar(u8, ident, '<')) |lt| ident = ident[0..lt];
+                const bare_head = typeHead(ident);
+                const owner = (if (std.mem.indexOfScalar(u8, ident, '.') != null)
+                    b.module.classIdByFqn(ident)
+                else
+                    b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
+                        b.module.classId(bare_head)) orelse return null;
+                const bare_resolved = b.module.resolveMemberCall(
+                    owner,
+                    name.name,
+                    shape_set.shapes,
+                    .{
+                        .caller_file = name.span.file,
+                        .lexical_owner = null,
+                        .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+                        .receiver_type = bare_recv,
+                    },
+                );
+                break :blk bare_resolved.target orelse return null;
+            };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
             // still cannot lend its target's return type to another proof.
@@ -11951,6 +12020,21 @@ pub const PromoBlock = enum(u8) {
     ext_index_stale,
 };
 pub var lm_promo: [6]u64 = @splat(0);
+
+/// Why `localInitTypeRef` did or did not answer: no initializer, a constructor,
+/// no derivable return type, incomplete type arguments, derived.
+pub var lm_localinit: [5]u64 = @splat(0);
+
+pub fn lowerLocalInitDump() void {
+    var total: u64 = 0;
+    for (lm_localinit) |n| total += n;
+    if (total == 0) return;
+    const names = [_][]const u8{ "no_initializer", "constructor", "no_return_type", "args_incomplete", "derived" };
+    std.debug.print("[localinit] total={d}\n", .{total});
+    for (names, lm_localinit) |n, c| {
+        if (c != 0) std.debug.print("[localinit] {d:>10} {s}\n", .{ c, n });
+    }
+}
 
 pub fn lowerPromoDump() void {
     var total: u64 = 0;
