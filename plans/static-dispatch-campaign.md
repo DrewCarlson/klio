@@ -340,25 +340,38 @@ Requiring the derived type's classifier arguments to be complete
 (`staticClassifierArgsComplete`) does NOT fix either: the derived types are
 already complete (`List args=1`, `Array args=1`, `Iterator args=1`).
 
-**`countEach` is now diagnosed**, which it was not before. `groupingBy` is an
-INLINE extension returning `object : Grouping<T, K>`. Typing `elements` lets
-lowering resolve it to the Kotlin declaration and splice that body, producing
-an ordinary anonymous object — while klio's `eachCount` is a host intrinsic
-whose `groupingParts` only accepts klio's own representation, an `Instance`
-carrying `__grouping_src` and `__grouping_key`. The static binding is correct;
-the host intrinsic is what is narrow.
+**`countEach` is FIXED.** `groupingBy` is an inline extension returning
+`object : Grouping<T, K>`, so typing the receiver lets lowering splice that
+body and produce a genuine implementation — while klio's terminals
+(`eachCount`, `fold`, `reduce`) read `__grouping_src` and `__grouping_key` off
+their receiver and rejected anything else. `groupingParts` now falls back to
+the interface's own protocol (`sourceIterator()` + `hasNext`/`next`, then
+`keyOf`). That is a real bug in its own right: a Kotlin class implementing
+`Grouping` could not be aggregated at all, and it is fixed and covered
+independently of this lowering change.
 
-So the fix is in the host, not in lowering: `groupingParts` must also accept a
-genuine `Grouping` instance and go through its `sourceIterator()`/`keyOf()`,
-which is the interface's own protocol. That is the shape to write next, and it
-makes the +253 available.
+`plusCollectionInference` is the one thing still holding the +253 back, and it
+is now traced far enough to name the mechanism rather than the symptom:
 
-`plusCollectionInference` remains the overload problem this document analyses
-under "the declared-type rule": inside the spliced `plusElement` body, better
-information about the caller's instantiation makes
-`Iterable<T>.plus(elements: Iterable<T>)` applicable where Kotlin resolves the
-body once against `T` and picks `plus(element: T)`. That one is a real
-generic-body-resolution question, not a host narrowness.
+  - Two `plusElement` candidates exist, `Iterable<T>.plusElement` and
+    `Collection<T>.plusElement`. With the receiver typed they TIE
+    (`recv=List<List> args=? … 60010` for both), where an untyped receiver
+    reached neither and the call dispatched dynamically.
+  - The spliced body resolves correctly. `[extkey]` at `_Collections.kt:3516`
+    shows `recv=Collection args=T` ranking `plus(element: T)` at 100105 over
+    `plus(elements: Iterable<T>)` at 100015 — the right pick.
+  - But it does not EMIT. `plus` is an extension, so it goes through
+    `lowerResolvedExtensionCall` rather than the member promotion, and the call
+    falls to runtime dispatch. At run time the receiver is a
+    `List<List<String>>` and the argument a `List<String>`, both `Iterable`, so
+    the concatenating overload wins and the result is `[[s], a]`.
+
+So lowering already knows the answer and throws it away. The fix is to emit the
+extension binding the resolver already ranked, not to weaken the receiver
+typing — and it is the same shape as the member promotion that landed earlier
+in this round. Do NOT re-diagnose this as a generic-body instantiation problem;
+the `[extkey]` rows above rule that out, and the earlier five falsified
+theories in this document were all reaching for it.
 
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
