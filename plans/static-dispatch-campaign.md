@@ -405,25 +405,36 @@ modules and compose are all green with it — but `SequenceTest.onEach` still
 fails once locals are typed, so the wrong lambda stamp was not the (only)
 mechanism.
 
-The `Double` is produced by `coll_iter_sum_of`, which chooses its accumulator
-kind from `ctx.host.callableReturnTy(&block)` — the LAMBDA's recorded return
-type — and only falls back to inferring from the first computed value when that
-answers null. So the failure is a recorded-type problem, not an overload-pick
-problem, and the recorded type is a guess for a lambda that declares none.
+REDUCED to a five-line program, which is where this should have started:
 
-Three further attempts, all measured, all negative — do not repeat them:
+    val data = sequenceOf("foo", "bar")
+    val newData = data.onEach { }
+    println(newData.sumOf { it.length })          // 6.0   WRONG
+    println(data.sumOf { it.length })             // 6
+    println(listOf("foo", "bar").sumOf { it.length })  // 6
 
-  - Making `ivCallableReturnTy` answer only for a `return_ty_declared` callable
-    (a lambda declares none, so it would fall back to value inference). Sound in
-    principle and it does NOT fix this test — a probe inside that function
-    prints NOTHING for this call, so `coll_iter_sum_of` is not the intrinsic
-    running here.
-  - `kotlin.sequences.sumOf` is not registered in `implementations.zig` at all,
-    so whatever serves `Sequence.sumOf` is reached another way. **Find that
-    first.** Every remaining theory about this test depends on knowing which
-    code computes the sum, and three rounds have now guessed instead.
-  - The lambda-stamp decline in `overloadHostingTrailingLambda` (landed for its
-    own sake, green, and orthogonal to this).
+Any pipeline op has the same effect — `map { it }` and `filter { true }` also
+produce a sequence whose `sumOf` returns 6.0, while the raw `sequenceOf` and a
+plain `List` are both correct. `toList()` and `count()` on the derived sequence
+are correct too.
+
+And the decisive measurement: a `[retty]` probe inside `ivCallableReturnTy`
+fires for the two CORRECT calls and NOT for the 6.0 one. So the derived
+sequence's `sumOf` never reaches `coll_iter_sum_of` at all — klio's host
+sequence terminal path (`isSequenceTerminal` -> `materialiseSequence` ->
+`callMemberRec` on a List) is not what serves it. With the receiver typed,
+`data.onEach { }` binds statically to the KOTLIN `kotlin.sequences.onEach`,
+whose body is `map { action(it); it }`, and that produces an interpreted
+sequence rather than the host `.Sequence` value the terminal path expects.
+
+That is the whole mechanism, and it settles the classification: on the
+interpreted path `sumOf` must be chosen by the lambda's INFERRED RETURN TYPE,
+which lowering does not have. **The +287 slice is blocked on the same lambda /
+element type inference as section 1, not on anything separable.** It should
+land as part of that project, not before it.
+
+Six attempts against the symptom are recorded below so none is repeated; all
+were measured, none worked.
 
 Two guards were tried against the symptom and BOTH cost sites without fixing
 it — do not retry them:
