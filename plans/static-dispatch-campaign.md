@@ -536,12 +536,35 @@ PINPOINTED to `Value.isRuntimeType`, `src/runtime/value.zig`, the
     does establish is that nothing in this chain fires without the name
     collision, which is worth keeping.
 
-    The unanswered question is unchanged and should be attacked by narrowing
-    the PROGRAM, not the interpreter: `e.component2()` on a two-line file with
-    a hand-written `class Entry` and no data modifier, then with `Map` imported
-    and not, until the smallest program that fails is known. Every probe so far
-    has instrumented a large interpreter against a program that exercises too
-    much of it at once.
+    PROGRAM NARROWED — and this is the artifact worth keeping. Four two-line
+    files, one variable each:
+
+        class Entry(val key: String, val num: Int)          e.num           OK
+        data class Entry(val key: String, val num: Int)     e.component2()  FAILS
+        class Entry(...) { fun component2(): Int = num }    e.component2()  OK
+        data class Pairish(...)                             e.component2()  OK
+
+    So the failure needs BOTH: a DATA class — whose `componentN` is synthesized
+    at run time in `host_call_member.zig` and therefore has NO IR declaration
+    for the member path to find — AND the name `Entry`. An explicitly written
+    `component2` fixes it, because a real member wins before the extension
+    fallback is ever reached.
+
+    That names the mechanism exactly: the member lookup finds nothing (the
+    synthesized accessor is invisible to lowering), the call falls through to
+    EXTENSION resolution, and the extension index matches `Map.Entry` to a
+    user `Entry` by simple head.
+
+    Two fixes are possible and the first is probably better:
+
+      1. Give a data class's `componentN` a real declaration at lowering, so
+         the member path finds it and no extension is consulted. That also
+         removes a whole class of collisions rather than this one.
+      2. Make extension receiver matching FQN-aware for nested classifiers.
+         Attempted at `staticHeadCompatibility` twice, including an FQN-suffix
+         comparison, with no effect — that function is demonstrably not
+         consulted for this match, so find the one that is before trying a
+         third time.
 
     The discriminator is written, correct, and has been staged at five sites
     this call does not reach. It has never been the hard part; locating the arm
