@@ -304,14 +304,14 @@ Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
     total 6,656 member call sites
       146   2.19%  bound_static     <- direct FuncId call
-    3,477  52.24%  bound_virtual    <- method slot, no name lookup
+    3,481  52.30%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,297  34.51%  no_receiver_type
-      403   6.05%  resolver_declined
+    2,291  34.42%  no_receiver_type
+      405   6.08%  resolver_declined
       213   3.20%  no_class_id
       120   1.80%  nullable_or_generic
 
-Statically bound: 3,623 of 6,656 (54.4%), from 150 (2.34%) at the start of this
+Statically bound: 3,627 of 6,656 (54.5%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
@@ -319,14 +319,14 @@ concrete types the stdlib's own generic containers do not:
 
     total 69,959
      1,451   2.07%  bound_static
-    41,605  59.47%  bound_virtual
+    41,658  59.55%  bound_virtual
     ------------------------------
-    19,524  27.91%  no_receiver_type
-     3,404   4.87%  resolver_declined
+    19,446  27.80%  no_receiver_type
+     3,429   4.90%  resolver_declined
      2,697   3.86%  no_class_id
      1,278   1.83%  nullable_or_generic
 
-Statically bound: 43,056 of 69,959 (61.5%), from 27,098 (37.4%).
+Statically bound: 43,109 of 69,959 (61.6%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -964,6 +964,25 @@ recorded an indexed read as an initializer so `val held = row[1]` carries
 
 `KLIO_OPERATOR_TY=0` turns it off; `receiver_typed_from_an_operator` pins all
 five shapes and prints `derived` for every one of them when disabled.
+
+### An alias keeps its source's type, whatever gave the source one
+
+`val b = a` copied the source's type only when the source had a DECLARED one,
+so a local typed by its own initializer instead — a property read, a call's
+return type — handed the alias nothing and the chain broke at the first rename.
+`KLIO_INIT_KINDS` named the gap rather than guessing at it: over four example
+programs the unrecorded initializer kinds are `Path` 626, `Binary` 250, `If` 44,
+`This` 26, and nothing else above ten. So the alias was the whole of it.
+
+Recording a `Path` initializer, and following it in `localInitTypeRef` to the
+source's own initializer, closes the chain to any depth; the cycle guard added
+above is what makes following it safe.
+
+    stdlib   bound 3,623 -> 3,627   (54.4% -> 54.5%)
+    examples bound 43,056 -> 43,109 (61.5% -> 61.6%)
+
+`alias_local_keeps_its_source_type` pins three depths and the declared-source
+case, and prints `derived` for the first three when the channel is disabled.
 
 ### Measured dead ends, all three with the reason
 
