@@ -405,18 +405,25 @@ modules and compose are all green with it — but `SequenceTest.onEach` still
 fails once locals are typed, so the wrong lambda stamp was not the (only)
 mechanism.
 
-What is left to try, in order:
+The `Double` is produced by `coll_iter_sum_of`, which chooses its accumulator
+kind from `ctx.host.callableReturnTy(&block)` — the LAMBDA's recorded return
+type — and only falls back to inferring from the first computed value when that
+answers null. So the failure is a recorded-type problem, not an overload-pick
+problem, and the recorded type is a guess for a lambda that declares none.
 
-  2. Infer a lambda's return type for the trivial shapes — a single expression
-     that is a member read or a literal — which covers `{ it.length }` and most
-     of what these overload sets are discriminated by. This is the one that
-     would actually let Kotlin's own rule be applied.
-  3. Find where `sum` acquires a `Double` type. The slice does NOT type it
-     (`staticCallReturnTypeRef` declines a member-call initializer, and the
-     probe shows `data -> Sequence<String>` is the only local it types in that
-     test), so the Double comes from somewhere else that a typed `data`
-     reaches. Instrument the `assertEquals` binding at that call site before
-     theorising further.
+Three further attempts, all measured, all negative — do not repeat them:
+
+  - Making `ivCallableReturnTy` answer only for a `return_ty_declared` callable
+    (a lambda declares none, so it would fall back to value inference). Sound in
+    principle and it does NOT fix this test — a probe inside that function
+    prints NOTHING for this call, so `coll_iter_sum_of` is not the intrinsic
+    running here.
+  - `kotlin.sequences.sumOf` is not registered in `implementations.zig` at all,
+    so whatever serves `Sequence.sumOf` is reached another way. **Find that
+    first.** Every remaining theory about this test depends on knowing which
+    code computes the sum, and three rounds have now guessed instead.
+  - The lambda-stamp decline in `overloadHostingTrailingLambda` (landed for its
+    own sake, green, and orthogonal to this).
 
 Two guards were tried against the symptom and BOTH cost sites without fixing
 it — do not retry them:
