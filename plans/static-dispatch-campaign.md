@@ -407,11 +407,24 @@ a cold "before" against a warm "after" and read a bound_static DROP from 144 to
 72 that did not exist. Two censuses are comparable only at the same cache
 state; the script clears it so that state is always cold.
 
-Still open in this bucket: **the rest of the `unknown_count == 1` set**, where
-`extCouldApply` cannot rule out an extension. It answers yes for any
-generic-receiver extension, and it is what keeps the fixture's original
-`remove` spelling on the dynamic path (the stdlib has `remove` extensions).
-Tightening that query is the next conversion here.
+The extension guard is now arity-aware: the index records each name's merged
+argument-count range (required, total, unbounded for a vararg) and a call whose
+count falls outside it cannot select that extension. Worth +4 sites, which is
+the honest measure of how much of this bucket was shape conservatism.
+
+**And that closes the bucket as a separate lever.** The 180 sites left are real
+Kotlin shadowing pairs, named by `KLIO_PROMO_NAMES`:
+
+      90  Random.nextInt          nargs=1  own_head
+      12  ClosedRange.contains    nargs=1  generic_receiver
+       8  ArrayList.addAll        nargs=1  declared_super
+       6  MutableSet.removeAll    nargs=1  builtin_super
+       2  Map.get / Map.containsKey / List.indexOf / Comparable.compareTo …
+
+Each has a member and a same-arity extension of the same name, and Kotlin picks
+between them by ARGUMENT TYPE. Nothing about the guard can be tightened
+further without that information, so this bucket now waits on the same typeck
+work as `no_receiver_type` rather than standing on its own.
 
 ### 3. `no_class_id` — 747 (7.7%). Mostly type parameters, now partly solved.
 
@@ -532,11 +545,9 @@ Re-derived from the measured split rather than from the original estimates.
    actionable bucket, needs nothing from typeck, and is a prerequisite for both
    the bytecode VM and the transpiler. Design the addressable host table once
    for all three.
-2. **Tighten `extCouldApply` (section 2) — 186 sites**, of which 114 are
-   `ext_own_head`: an extension on the receiver's own head shares the name.
-   Kotlin's rule is that an applicable MEMBER always beats an extension, so the
-   guard is only needed because the member's applicability is unproven. Proving
-   applicability for the common shapes converts most of this.
+2. ~~Tighten `extCouldApply`~~ — DONE and closed. The arity filter landed; the
+   180 sites left are genuine member/extension shadowing pairs that need
+   argument types, so they fold into item 3.
 3. **The typeck generic-argument project (section 1) — 3,886 sites, 60%.** By
    far the largest piece and the only one that genuinely requires typeck work.
 4. `no_class_id` (section 3) — 617, now mostly type parameters whose bounds
