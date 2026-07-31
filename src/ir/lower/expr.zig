@@ -11161,8 +11161,17 @@ fn lowerUnresolvedBareCall(
             if (cid.int() >= b.module.classes.items.len) break :bare_member;
             break :blk b.module.classes.items[cid.int()].fqn;
         };
-        const recv_ty = TypeRef{ .name = head_fqn, .nullable = false, .args = &.{} };
-        if (!staticClassifierArgsComplete(b, recv_ty)) break :bare_member;
+        // The head's type ARGUMENTS are usually absent here, and that is fine
+        // for this arm: the scorer already ranks a bare head, and refusing one
+        // rules out every bare call in a generic body — which is most of them.
+        // Prefer the enclosing declaration's own receiver type when it names
+        // this head, since that one carries the arguments.
+        const recv_ty = blk: {
+            if (b.recvTypeRef()) |declared| {
+                if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
+            }
+            break :blk TypeRef{ .name = head_fqn, .nullable = false, .args = &.{} };
+        };
         const this_reg = if (b.resolve("this")) |r|
             r
         else if (b.capturesThisSlot() or b.knowsOuter("this"))
