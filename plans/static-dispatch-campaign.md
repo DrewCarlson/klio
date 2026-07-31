@@ -317,6 +317,49 @@ round — a 10x increase.
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
 
+### MEASURED, not landed: typing a local from its initializer is worth +253
+
+The largest derivable slice of `no_receiver_type` is a local whose own
+declaration recorded no type but whose initializer is a call. Kotlin's inferred
+type for `val x = f()` IS `f`'s return type, and a `var`'s later assignment
+must conform to it, so the initializer's type is the local's type at every use.
+On the pinned set:
+
+    bound_virtual      1408 -> 1661   (+253, a 14% relative gain)
+    no_receiver_type   3886 -> 3549
+
+The implementation is four lines — a `localInitTypeRef` helper feeding the two
+places that already call `staticCallReturnTypeRef` — and it is NOT landed,
+because it reintroduces exactly the pair of failures the earlier return-type
+channel hit:
+
+    CollectionTest.plusCollectionInference   Expected <[[s], [a]]>, actual <[[s], a]>
+    GroupingTest.countEach                   expected a Grouping receiver
+
+Requiring the derived type's classifier arguments to be complete
+(`staticClassifierArgsComplete`) does NOT fix either: the derived types are
+already complete (`List args=1`, `Array args=1`, `Iterator args=1`).
+
+**`countEach` is now diagnosed**, which it was not before. `groupingBy` is an
+INLINE extension returning `object : Grouping<T, K>`. Typing `elements` lets
+lowering resolve it to the Kotlin declaration and splice that body, producing
+an ordinary anonymous object — while klio's `eachCount` is a host intrinsic
+whose `groupingParts` only accepts klio's own representation, an `Instance`
+carrying `__grouping_src` and `__grouping_key`. The static binding is correct;
+the host intrinsic is what is narrow.
+
+So the fix is in the host, not in lowering: `groupingParts` must also accept a
+genuine `Grouping` instance and go through its `sourceIterator()`/`keyOf()`,
+which is the interface's own protocol. That is the shape to write next, and it
+makes the +253 available.
+
+`plusCollectionInference` remains the overload problem this document analyses
+under "the declared-type rule": inside the spliced `plusElement` body, better
+information about the caller's instantiation makes
+`Iterable<T>.plus(elements: Iterable<T>)` applicable where Kotlin resolves the
+body once against `T` and picks `plus(element: T)`. That one is a real
+generic-body-resolution question, not a host narrowness.
+
 ### 1. `no_receiver_type` — 6,720 (68.9%). Needs typeck.
 
 Broken down by receiver shape and, for the dominant `Path` shape, by what kind
