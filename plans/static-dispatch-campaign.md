@@ -914,6 +914,20 @@ though `class_prop_type_heads` already knew the answer. `KLIO_TP_HEAD=0` and
 pinned by parity fixtures that print the wrong answer when disabled, since
 each changes which extension a static receiver type selects.
 
+The property-read initializer also exposed a latent crash, and the A/B is what
+found it — `compose_material3_text` segfaulted with the change on and ran with
+it off. Following a local's initializer to derive its type can reach back into
+that local: `val a = b.x` beside `val b = a.y` walks itself until the stack
+ends. The `init != arg` guard only blocked a local reaching itself in ONE step.
+Kotlin cannot write the cycle — a local is not in scope before its own
+declaration — but lowering asks from a point where every local in the block is
+bound, which is the same missing-position defect as the self-name entry above
+and as the captured-write entry at the end of this document. THIRD instance;
+treat any scope query that takes a name and no position as suspect.
+
+Fixed by tracking the locals whose initializer the walk is inside and refusing
+to re-enter one. Pinned by a unit test that overflows the stack without it.
+
 The unsigned types (`UInt`, `ULongArray`, …, ~146 sites) are NOT a registration
 gap, and calling them "probably easy" was wrong. `unsigned/src/kotlin/UInt.kt` is
 not in `stdlib_sources.zig` at all — only `UIntRange.kt`, `ULongRange.kt` and
