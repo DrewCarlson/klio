@@ -74,7 +74,8 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_INIT_SELF` | `0` to disable | Off, a local's own name shadows its initializer's bare call again (`val iterator = iterator()`). For A/B measurement of that channel from one binary | — |
 | `KLIO_TP_HEAD` | `0` to disable | Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so `C : MutableCollection<in T>` names no owner again | — |
 | `KLIO_EXT_RECV_PROP` | `0` to disable | Off, a bare name in a top-level extension's body stops resolving to the extension receiver's property, so it gets no declared type | — |
-| `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read initializer (`val node = coord.layoutNode`) stops lending its type to the local | — |
+| `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read or indexed-read initializer (`val node = coord.layoutNode`, `val held = row[1]`) stops lending its type to the local | — |
+| `KLIO_OPERATOR_TY` | `0` to disable | Off, an indexed read and the `times`/`div`/`rem`/`rangeTo` operators stop lending their declared return type to a receiver | — |
 | `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic | `[gtrace]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
 | `KLIO_ANON_AUDIT` | set | Synthesized class name and captured names at each anonymous-object site | `[ANON]` |

@@ -8413,6 +8413,16 @@ fn staticCallReturnTypeRef(
         const method: []const u8 = switch (bin.op) {
             .Add => "plus",
             .Sub => "minus",
+            .Mul, .Div, .Rem, .Range, .RangeUntil => blk: {
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0")) return null;
+                break :blk switch (bin.op) {
+                    .Mul => "times",
+                    .Div => "div",
+                    .Rem => "rem",
+                    .Range => "rangeTo",
+                    else => "rangeUntil",
+                };
+            },
             else => return null,
         };
         var inferred_receiver: ?ir.TypeRef = null;
@@ -8497,6 +8507,46 @@ fn staticCallReturnTypeRef(
             b.allocator,
             resolved_target,
             receiver,
+            dispatch_receiver,
+            shape_set.shapes,
+            &.{},
+        );
+    }
+    // `a[i]` is `a.get(i)`, so the element's static type is `get`'s return
+    // type on the container. Lowering emits it as an Index instruction, but the
+    // TYPE question is the ordinary member one.
+    if (call_expr.* == .Index and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0"))
+    {
+        const idx = call_expr.Index;
+        var recv_owned = if (argDeclTypeRefLazy(b, idx.receiver)) |known|
+            try known.clone(b.allocator)
+        else
+            (try staticCallReturnTypeRef(b, idx.receiver)) orelse return null;
+        defer recv_owned.deinit(b.allocator);
+        var shape_set = try buildStaticReturnArgShapes(b, idx.args, &.{});
+        defer shape_set.deinit(b.allocator);
+        const owned_bounds = try b.typeParamBoundsSlice();
+        defer if (owned_bounds) |bounds| b.allocator.free(bounds);
+        var identity = std.mem.trimEnd(u8, recv_owned.name, "?");
+        if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+        const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            b.module.classIdByFqn(identity)
+        else
+            b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse return null;
+        const resolved = b.module.resolveMemberCall(owner, "get", shape_set.shapes, .{
+            .caller_file = idx.span.file,
+            .lexical_owner = null,
+            .actual_type_param_bounds = owned_bounds orelse &.{},
+            .receiver_type = recv_owned,
+        });
+        const target = resolved.target orelse return null;
+        var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv_owned, idx.span.file);
+        defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
+        return try b.module.instantiatedCallReturnType(
+            b.allocator,
+            target,
+            recv_owned,
             dispatch_receiver,
             shape_set.shapes,
             &.{},

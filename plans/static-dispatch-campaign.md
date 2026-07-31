@@ -302,31 +302,31 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,698 member call sites
-      146   2.18%  bound_static     <- direct FuncId call
-    3,449  51.49%  bound_virtual    <- method slot, no name lookup
+    total 6,656 member call sites
+      146   2.19%  bound_static     <- direct FuncId call
+    3,477  52.24%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,425  36.20%  no_receiver_type
-      371   5.54%  resolver_declined
-      187   2.79%  no_class_id
-      120   1.79%  nullable_or_generic
+    2,297  34.51%  no_receiver_type
+      403   6.05%  resolver_declined
+      213   3.20%  no_class_id
+      120   1.80%  nullable_or_generic
 
-Statically bound: 3,595 of 6,698 (53.7%), from 150 (2.34%) at the start of this
+Statically bound: 3,623 of 6,656 (54.4%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
 concrete types the stdlib's own generic containers do not:
 
-    total 70,463
-     1,451   2.06%  bound_static
-    41,588  59.02%  bound_virtual
+    total 69,959
+     1,451   2.07%  bound_static
+    41,605  59.47%  bound_virtual
     ------------------------------
-    20,447  29.02%  no_receiver_type
-     3,340   4.74%  resolver_declined
-     2,359   3.35%  no_class_id
-     1,278   1.81%  nullable_or_generic
+    19,524  27.91%  no_receiver_type
+     3,404   4.87%  resolver_declined
+     2,697   3.86%  no_class_id
+     1,278   1.83%  nullable_or_generic
 
-Statically bound: 43,039 of 70,463 (61.1%), from 27,098 (37.4%).
+Statically bound: 43,056 of 69,959 (61.5%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -948,6 +948,22 @@ including up its supertype chain.
 
 `KLIO_EXT_RECV_PROP=0` turns it off; `bare_name_inside_an_extension_body` pins
 it, printing `derived` for a `Base`-declared property when disabled.
+
+### An operator call has a declared return type like any other
+
+`staticCallReturnTypeRef` answered for `plus` and `minus` and nothing else, and
+for indexing it answered nothing at all — so `row[i].tag()` and
+`(scale * 3).tag()` reached dispatch with no receiver type. Both are ordinary
+member calls: `a[i]` is `a.get(i)`, `a * b` is `a.times(b)`. Added the `Index`
+arm and `times`/`div`/`rem`/`rangeTo`/`rangeUntil` to the operator map, and
+recorded an indexed read as an initializer so `val held = row[1]` carries
+`get`'s return type too.
+
+    stdlib   bound 3,595 -> 3,623   (53.7% -> 54.4%)
+    examples bound 43,039 -> 43,056 (61.1% -> 61.5%)
+
+`KLIO_OPERATOR_TY=0` turns it off; `receiver_typed_from_an_operator` pins all
+five shapes and prints `derived` for every one of them when disabled.
 
 ### Measured dead ends, all three with the reason
 

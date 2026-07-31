@@ -1187,6 +1187,17 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "receiver_typed_from_an_operator" {
+    try check("receiver_typed_from_an_operator",
+        \\base
+        \\base
+        \\base
+        \\base
+        \\derived
+        \\
+    );
+}
+
 test "bare_name_inside_an_extension_body" {
     try check("bare_name_inside_an_extension_body",
         \\base
