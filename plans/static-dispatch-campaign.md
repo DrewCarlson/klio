@@ -1079,7 +1079,43 @@ is the already-recorded blocked-pair population getting bigger, which is what
 every receiver-typing fix does until the argument side of the inference
 exists.
 
-**And the regression it exposed was a real dispatch bug.** With receivers of
+### The second slice: a parameter is inferred from every constraint together
+
+Probing today's residue (`KLIO_LI_NAMES` over the census set: bare/member
+`iterator` 230, `.getOrPut` 66, `toMutableList` 43) established that the
+substitution machinery already works for concrete callers — `getOrPut`,
+`toMutableList`, `getValue`, `getOrElse` all type correctly in a plain
+`main()`; the stdlib-set misses are generic-caller residue, the stdlib testing
+itself. The one WRONG ANSWER left in the family was `getOrDefault`, and it was
+two defects stacked:
+
+1. **No declaration existed at all.** On the JVM `getOrDefault` is a member of
+   the `Map` builtin (`jvm/builtins/Collections.kt`), which the compiled
+   common surface never declares — klio served it purely by name from the
+   host table, so no call site could carry its return type. Declared now in
+   `kotlin-klio/kotlin-collections/MapActuals.kt` with the JDK's exact
+   semantics (a `null` value for a PRESENT key returns as-is, not the
+   default). Statically typed sites run the interpreted body; untyped sites
+   keep the host member.
+2. **`bindCallType` demanded constraint EQUALITY.** With the declaration in
+   place, the receiver bound `V=Base` and the value argument `Derived()` then
+   had to equal it, so the whole instantiation was rejected and the site
+   stayed untyped. Kotlin infers a parameter from every constraint together.
+   A subsumed constraint now keeps the subsuming side — `actual ⊆ bound`
+   keeps the bound, `bound ⊆ actual` widens the binding, nullability carried
+   in both directions — and genuinely unrelated constraints (where kotlinc
+   would compute a common supertype neither side names) still refuse rather
+   than guess. Gate: `KLIO_BIND_LUB`.
+
+The widen direction also fixes mixed-element factories: `listOf(Derived(),
+Base())` now types `List<Base>` in either element order.
+
+Census: UNCHANGED on both sets — the sixth wrong-answer fix this campaign
+that is invisible to the census and visible only as kotlinc parity. Pinned by
+`generic_argument_from_every_constraint` (gate on: exact parity; off: four
+wrong answers of six lines).
+
+**And the regression the first slice exposed was a real dispatch bug.** With receivers of
 type `MutableList` newly typed, `reversed.remove("c")` on an `asReversed()`
 view bound through `MutableList.remove`'s own virtual slot — and that slot,
 being a REDECLARATION of `MutableCollection.remove`, was linked to the

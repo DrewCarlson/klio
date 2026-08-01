@@ -1196,6 +1196,18 @@ test "redeclared_interface_slot_reaches_the_inherited_body" {
     );
 }
 
+test "generic_argument_from_every_constraint" {
+    try check("generic_argument_from_every_constraint",
+        \\base
+        \\base
+        \\base
+        \\base
+        \\true
+        \\false
+        \\
+    );
+}
+
 test "generic_receiver_through_its_initializer" {
     try check("generic_receiver_through_its_initializer",
         \\base

@@ -4167,6 +4167,12 @@ pub const Module = struct {
         return false;
     }
 
+    fn widenBinding(bindings: []TypeBinding, name: []const u8, ty: TypeRef) void {
+        for (bindings) |*binding| {
+            if (std.mem.eql(u8, binding.name, name)) binding.ty = ty;
+        }
+    }
+
     fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
         const projection_prefix: ?[]const u8 = if (std.mem.startsWith(u8, ty.name, "out#"))
             "out#"
@@ -4279,7 +4285,33 @@ pub const Module = struct {
                 // what the call means. Demanding equality here rejected the
                 // whole instantiation and left the receiver untyped.
                 if (bindingIsExplicit(bindings.items, pattern_head)) return true;
-                return bound.eql(actual);
+                if (bound.eql(actual)) return true;
+                // Kotlin infers the parameter from every constraint together,
+                // so a constraint one side already subsumes narrows nothing:
+                // `m.getOrDefault(k, Derived())` on a Map<K, Base> means
+                // V=Base with the value argument a subtype of it, and
+                // `listOf(Derived(), base)` means T=Base by the same rule.
+                // Keep the subsuming side; genuinely unrelated constraints
+                // (kotlinc would compute a common supertype) still refuse.
+                const lub_off = if (std.c.getenv("KLIO_BIND_LUB")) |v|
+                    std.mem.eql(u8, std.mem.span(v), "0")
+                else
+                    false;
+                const bound_plain = overrideArgs(bound).len == 0;
+                const actual_plain = overrideArgs(actual).len == 0;
+                if (!lub_off and bound_plain and actual_plain) {
+                    const bound_head = staticTypeHead(bound.name);
+                    const actual_head = staticTypeHead(actual.name);
+                    if ((!actual.nullable or bound.nullable) and
+                        self.classIsOrExtends(actual_head, bound_head)) return true;
+                    if ((!bound.nullable or actual.nullable) and
+                        self.classIsOrExtends(bound_head, actual_head))
+                    {
+                        widenBinding(bindings.items, pattern_head, actual);
+                        return true;
+                    }
+                }
+                return false;
             }
             try bindings.append(allocator, .{ .name = pattern_head, .ty = actual });
             return true;
