@@ -1496,7 +1496,22 @@ pub fn lowerMethodWithMemberContext(
         // a `::name` referencing an owner member must bind the DISPATCH
         // receiver via the qualified-this walk, and the ref lowering
         // keys that on the owner-class name.
-        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, enclosing_members, null);
+        //
+        // The DISPATCH owner's members ARE the enclosing member scope of a
+        // member extension's body: a bare `state` the extension receiver's
+        // static type does not declare resolves to `this@Owner.state`, and
+        // without the owner set the read lowered to a plain field read on
+        // the extension receiver — where a runtime SUBTYPE's unrelated
+        // same-named field captured it.
+        var owner_scope = StringSet.init(a);
+        defer owner_scope.deinit();
+        {
+            var it = own_members.keyIterator();
+            while (it.next()) |k| try owner_scope.put(k.*, {});
+            var eit = enclosing_members.keyIterator();
+            while (eit.next()) |k| try owner_scope.put(k.*, {});
+        }
+        const func = try lowerFunctionBodyWithImplicitOwnerEnclosing(module, f, &implicit, owner_class, null, &owner_scope, null);
         const reserved_id = module.funcByDeclSpan(f.name.span);
         const id = reserved_id orelse module.nextFuncId();
         var placed = func;

@@ -2488,3 +2488,16 @@ still committed type `Foo`, so `value.tag()` bound `Foo.tag` statically
 and executed it against the `Bar` the member returned. The derivation now
 applies the router's own shadow rule. Pinned suite 129 -> 130 of 134;
 sweep 117/0, examples A/B clean.
+
+
+### LANDED: a member extension's body sees its dispatch owner's members
+
+A member extension (`class Owner { fun Scope.readState() }`) lowered its
+body with an EMPTY enclosing-member set, so a bare `state` the extension
+receiver's static type does not declare became a plain field read on the
+extension receiver — and a runtime SUBTYPE's unrelated same-named field
+captured it (99 where kotlinc reads `this@Owner.state` = 7). The dispatch
+owner's members now merge into the enclosing scope, sending the read
+through the scoped-getter walk that carries the declaring class. Both the
+direct read and the read inside a spliced lambda resolve to the owner.
+Pinned suite 130 -> 131 of 134; sweep 117/0, examples A/B clean.
