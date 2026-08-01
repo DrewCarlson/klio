@@ -11834,7 +11834,7 @@ fn lowerUnresolvedBareCall(
             break :bare_member;
         var this_path = [_]ast.Ident{.{ .name = "this", .span = callee.Path.segments[0].span }};
         const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = callee.Path.segments[0].span } };
-        switch (try lowerResolvedMemberCall(
+        const bare_member = try lowerResolvedMemberCall(
             b,
             &this_expr,
             .{ .name = name0, .span = callee.Path.segments[0].span },
@@ -11843,7 +11843,8 @@ fn lowerUnresolvedBareCall(
             ast_type_args,
             recv_ty,
             .{ .reg = this_reg, .non_null = true },
-        )) {
+        );
+        switch (bare_member) {
             .lowered => |reg| {
                 orEmitAudit(b, "unresolved_bare_call", "Call/bare-member", name0);
                 return reg;
@@ -11855,7 +11856,13 @@ fn lowerUnresolvedBareCall(
         // whole walk: `plus(element)` written inside `Iterable<T>.plusElement`
         // is an extension on the body's own receiver, and leaving it dynamic
         // is what makes that body pick the concatenating overload at run time.
-        if (try lowerResolvedExtensionCall(
+        // An applicable-but-DEFERRED member blocks the static extension
+        // commit exactly as on the explicit-receiver path: a member the
+        // receiver declares beats every extension in Kotlin, and committing
+        // the extension here bound `Iterable.contains`'s own smart-cast
+        // `contains(element)` back to itself once bound refutation pruned
+        // the candidate tie down to it.
+        if (bare_member != .deferred) if (try lowerResolvedExtensionCall(
             b,
             &this_expr,
             .{ .name = name0, .span = callee.Path.segments[0].span },
@@ -11866,7 +11873,7 @@ fn lowerUnresolvedBareCall(
         )) |reg| {
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
-        }
+        };
         if (runtime.getenvSlice("KLIO_BAREARM") != null) {
             var loc_buf: [256]u8 = undefined;
             const cs = callee.Path.segments[0].span;

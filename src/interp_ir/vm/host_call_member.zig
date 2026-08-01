@@ -11497,6 +11497,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
 /// whether any candidate was a member-extension, which makes the resolution
 /// context-dependent and vetoes both positive and negative memoization.
 fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8, cache_key: ?root_mod.ProgramImage.InstanceMethodKey, chain_key: ?root_mod.ProgramImage.InstanceMethodKey, saw_member_ext_out: *bool) Allocator.Error!?EvalResult {
+    var bound_thinned = false;
     ir.eval.callStatsProbe(name);
     const want = args.len + 1;
     if (missTraceWant(name)) {
@@ -11695,7 +11696,10 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             // never takes a ContentDrawScope receiver, however generically
             // the bare head reads. The static-hint shortcut above cannot see
             // the bounds, so re-check them against the runtime receiver.
-            if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) continue;
+            if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) {
+                bound_thinned = true;
+                continue;
+            }
             if (!extArityApplicable(self, &c.func, want)) continue;
             if (candidateArgsDisproven(self, &c.func, args)) continue;
             // Kotlin selects extensions against the receiver's DECLARED
@@ -11743,6 +11747,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             for (candidates.items) |c| {
                 if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) {
                     if (mtr) std.debug.print("[extfb]  fid={d} lenient bound-skip\n", .{c.fid.int()});
+                    bound_thinned = true;
                     continue;
                 }
                 if (builtinReceiverDisproven(receiver, c.func.params[0].ty.name)) {
@@ -12000,7 +12005,14 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         break :blk (lookupIntrinsic(self, ip) != null) or (lookupIntrinsic(self, lp) != null);
     };
 
-    if (!defer_to_property and !defer_to_iterable) {
+    // Kotlin gives a receiver MEMBER precedence over any extension. When
+    // bound refutation THINNED this walk's candidate set, a pick that used
+    // to decline on a tie can newly commit — and `Iterable.contains`'s own
+    // `if (this is Collection) return contains(element)` then re-enters
+    // itself instead of reaching the List member. Scoped to the thinned
+    // case so unarmed behavior is unchanged.
+    const defer_to_member = bound_thinned and hostHasMember(self, receiver, name);
+    if (!defer_to_property and !defer_to_iterable and !defer_to_member) {
         const c = chosen.?;
         if (trace.enabled(name)) {
             const d = funcDefaults(self, &c.func);
