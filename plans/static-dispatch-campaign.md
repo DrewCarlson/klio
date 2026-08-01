@@ -3246,3 +3246,33 @@ pack context — next: probe upstream SelectImplementation.register's
 actual invoke site with KLIO_CALLVALUE_TRACE / a pack-source print in
 Select.kt (the memory's pack-instrumentation recipe), checking whether
 `clause.regFunc` reads the stored reference or a mis-resolved member.
+
+
+### select ROOT FOUND: member defaults-padding beats the file-private extension
+
+Pack-probe chain (all recovered, probes reverted): registration is FINE
+(`klioRegReceive` runs — the earlier fn-entry=0 was a closure-wrapper
+trace artifact), the send offers (`sel_recv=1`), trySelectInternal
+reaches the WAITING arm, the CAS succeeds — and
+`cont.tryResume(onCancellation)` printed `<RESUME_TOKEN>`: klio bound
+the MEMBER `tryResume(value, idempotent = null, ...)` by padding
+defaults for a 1-arg call, where kotlinc binds Select.kt's
+FILE-PRIVATE extension `CancellableContinuation<Unit>.tryResume(
+onCancellation): Boolean` — the member's `value: T=Unit` cannot accept
+the onCancellation argument, so it is inapplicable and the extension
+wins. The member's raw token skipped `completeResume`, the select never
+resumed (permanent park), and the token failed the `if (...)`
+truthiness with the CalleeFailed the bridge swallowed.
+
+The fix, precisely: member-vs-extension applicability for a
+DEFAULTS-PADDED member bind — when the member fits only by padding
+defaults AND its first bound param's INSTANTIATED type (here `value:
+Unit` from the receiver's `CancellableContinuation<Unit>`) refutes the
+argument (a nullable function value against Unit), the member is
+inapplicable and a same-file extension with EXACT arity takes the
+call. Implementable at resolveInstanceMethod's candidate gathering
+(instantiated-param refutation) or as the lowering-side commit for the
+statically known site. `[seldbg]` probes in channelSend /
+selectTrySelect / the invokeMethod bridge (gated, kept) show each stage.
+Also revealed: the bridge's non-Throw error swallow hid the real
+failure — the gated print stays.

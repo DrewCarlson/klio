@@ -442,7 +442,16 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
     var recv = Value{ .Instance = sel };
     const args = [_]Value{ clause_obj, internal };
     const r = ctx.host.invokeMethod(&recv, "trySelect", &args, ctx.out) catch return false;
-    const res = r orelse return false;
+    const res = r orelse {
+        if (runtime.getenvSlice("KLIO_SELDBG") != null) std.debug.print("[seldbg] trySelect: no result\n", .{});
+        return false;
+    };
+    if (runtime.getenvSlice("KLIO_SELDBG") != null) {
+        switch (res) {
+            .ok => |v| std.debug.print("[seldbg] trySelect ok tag={s} val={}\n", .{ @tagName(std.meta.activeTag(v)), v == .Bool and v.Bool }),
+            .err => |e| std.debug.print("[seldbg] trySelect ERR {s}\n", .{@tagName(std.meta.activeTag(e))}),
+        }
+    }
     return switch (res) {
         .ok => |v| (v == .Bool and v.Bool),
         .err => false,
@@ -860,6 +869,9 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
+        if (runtime.getenvSlice("KLIO_SELDBG") != null) {
+            std.debug.print("[seldbg] send id={d} sel_recv={d} recv_waiters={d} rendezvous={}\n", .{ id, state.select_recv_waiters.len(), state.receive_waiters.len(), state.rendezvous });
+        }
         if (state.closed) {
             outcome = .{ .Closed = state.close_cause };
         } else if (state.receive_iter_waiters.popFront()) |w| {
