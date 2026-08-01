@@ -1504,3 +1504,14 @@ test "vararg_before_defaulted_positional" {
         \\
     );
 }
+
+test "range_in_range_user_operator" {
+    try check("range_in_range_user_operator",
+        \\true
+        \\false
+        \\true
+        \\true
+        \\false
+        \\
+    );
+}

@@ -12057,6 +12057,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         }
     }
 
+    if (missTraceWant(name)) std.debug.print("[extpick] n={d} unique_exact={}\n", .{ candidates.items.len, unique_exact != null });
     var chosen: ?Candidate = null;
     if (candidates.items.len <= 1) {
         chosen = if (candidates.items.len == 1) candidates.items[0] else null;
@@ -12065,6 +12066,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
     } else {
         chosen = try scoreExtCandidates(self, allocator, receiver, candidates.items, args);
     }
+    if (missTraceWant(name)) std.debug.print("[extpick] chosen={?d}\n", .{if (chosen) |c| c.fid.int() else null});
 
     if (chosen == null) return null;
 
@@ -12135,7 +12137,15 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
     // `if (this is Collection) return contains(element)` then re-enters
     // itself instead of reaching the List member. Scoped to the thinned
     // case so unarmed behavior is unchanged.
-    const defer_to_member = bound_thinned and receiverHasMemberNamed(self, receiver, name);
+    // `range in range` never defers: the builtin `Range.contains` member
+    // surface takes an ELEMENT, so a Range argument leaves the chosen
+    // extension (`operator LongRange.contains(LongRange)`) as the only
+    // applicable candidate — same predicate as the ladder's
+    // `range_in_range` standdown.
+    const member_could_take_args = !(receiver.* == .Range and args.len == 1 and
+        args[0] == .Range and std.mem.eql(u8, name, "contains"));
+    const defer_to_member = bound_thinned and member_could_take_args and
+        receiverHasMemberNamed(self, receiver, name);
     if (!defer_to_property and !defer_to_iterable and !defer_to_member) {
         const c = chosen.?;
         if (trace.enabled(name)) {

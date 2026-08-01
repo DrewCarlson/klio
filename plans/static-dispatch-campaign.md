@@ -2987,3 +2987,18 @@ prefix through `padArgsWithDefaults` (the first padding pass ran before
 packing and saw four args). Pinned by
 vararg_before_defaulted_positional (including the `::report` reference
 route); the example matches. Drift 255 -> 256; sweep 117/0.
+
+
+### range_in_range: the thinned-set member guard deferred to an inapplicable member
+
+The user `operator LongRange.contains(LongRange)` was correctly the
+extension fallback's sole survivor (the armed bound refutation thinned
+the other eight), but the `defer_to_member` guard — added for the
+Iterable.contains self-loop — saw `receiverHasMemberNamed(Range,
+"contains")` and stood the pick down, handing the call to the
+range-to-list re-dispatch, which compared elements and answered false.
+The member surface it deferred to takes an ELEMENT; a Range argument
+makes it inapplicable, which is exactly the ladder's existing
+`range_in_range` standdown predicate — the guard now carries the same
+exclusion. Pinned by range_in_range_user_operator; the example matches.
+Sweep 117/0.
