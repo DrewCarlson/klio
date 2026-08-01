@@ -3312,3 +3312,20 @@ stripped), (3) whether `staticArgCompatibility`'s named-vs-named tail
 can refute `fn-type vs Unit` at all (it must — Unit is a complete
 disproof target). Whichever link is dead is the fix site; ground truth
 stays `got 99` on select_on_timeout_loses.
+
+
+Probe (1) DECISIVE: `KLIO_SMAC_TRACE=tryResume` (the gated print now at
+`staticMemberArgsCompatibility` entry) shows the resolver evaluating
+tryResume candidates for nargs=3 and nargs=0 sites — but NEVER nargs=1.
+The failing call `cont.tryResume(onCancellation)` never reaches
+resolveMemberCall's member compatibility at all: lowering defers the
+site before candidate evaluation, so the existing substitution/
+refutation machinery never gets its chance and the runtime walk picks
+the member unrefuted. NEXT: find where the 1-arg site's lowering bails
+— `cont` is the cast local `curState as CancellableContinuation<Unit>`
+inside trySelectInternal's `when` arm; check whether the member-call
+arm's receiver derivation (`recvChainTypeRef`) carries the cast type
+and which decline reason fires (lmNote/declineNote around the Member
+emission), then let the site reach resolveMemberCall — the machinery
+downstream is already correct, and refutation will drop the member for
+the file-private extension.
