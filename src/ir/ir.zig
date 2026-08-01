@@ -4666,6 +4666,19 @@ pub const Module = struct {
     /// The target identity comes from the shared call resolver; this step only
     /// binds its declaration-owned type parameters from explicit type
     /// arguments and the statically-known argument types.
+    /// Whether `ty` (recursively) names any of `params` — raw source
+    /// spellings, the form a declared return type carries.
+    fn typeMentionsAnyParamName(ty: *const TypeRef, params: []const []const u8) bool {
+        const head = staticTypeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        for (params) |p| {
+            if (std.mem.eql(u8, head, p)) return true;
+        }
+        for (ty.args) |*arg| {
+            if (typeMentionsAnyParamName(arg, params)) return true;
+        }
+        return false;
+    }
+
     pub fn instantiatedCallReturnType(
         self: *const Module,
         allocator: Allocator,
@@ -4723,18 +4736,30 @@ pub const Module = struct {
                 actual_dispatch_receiver != null)
             {
                 const actual_receiver = actual_dispatch_receiver.?;
-                const projected = (try self.projectTypeToClass(
-                    a,
-                    actual_receiver,
-                    owner,
-                )) orelse return null;
-                const projected_args = overrideArgs(projected);
-                if (projected_args.len < owner_class.type_params.len) return null;
-                for (owner_class.type_params, 0..) |param, i| {
-                    try bindings.append(a, .{
-                        .name = try classTypeParamIdentity(a, owner, param),
-                        .ty = projected_args[i],
-                    });
+                const projected_ok = blk2: {
+                    const projected = (try self.projectTypeToClass(
+                        a,
+                        actual_receiver,
+                        owner,
+                    )) orelse break :blk2 false;
+                    const projected_args = overrideArgs(projected);
+                    if (projected_args.len < owner_class.type_params.len) break :blk2 false;
+                    for (owner_class.type_params, 0..) |param, i| {
+                        try bindings.append(a, .{
+                            .name = try classTypeParamIdentity(a, owner, param),
+                            .ty = projected_args[i],
+                        });
+                    }
+                    break :blk2 true;
+                };
+                // A bare receiver HEAD (an implicit `this` in a method body)
+                // carries no type arguments to project — but a return that
+                // never mentions the class's parameters is complete without
+                // them (`findClause(...): ClauseData?` on a bare
+                // SelectImplementation head). Only a param-mentioning return
+                // still refuses.
+                if (!projected_ok) {
+                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) return null;
                 }
             }
         }

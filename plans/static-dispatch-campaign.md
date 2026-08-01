@@ -3420,3 +3420,23 @@ its `ClauseData?` NESTED-class return ([bareret] findClause return=
 inner-class receiver walk'). Unblocking nested-class return references
 in instantiatedCallReturnType is now the last link for select, shared
 with the previously-blocked return-type channel.
+
+
+Two more links opened, validated (sweep 117/0, drift 262/266
+unchanged): a bare owner-head receiver no longer refuses
+`instantiatedCallReturnType` when the return never mentions the class's
+params (`findClause: ClauseData?` on bare SelectImplementation — the
+documented inner-class blocker's common case), and the bareret Member
+arm accepts a DEFERRED-but-named target for return typing (the
+nullaryMemberReturnTypeRef rule). The chain now reads: clause typed
+(`return=ClauseData`), the site targets createOnCancellationAction
+(`target ok`), the invoke arm derives `fn-return=Function3` — yet
+tryResume#79 STILL resolves `deferred applicable=true`. The one open
+question is SUBSTITUTION IDENTITY in staticMemberArgsCompatibility:
+the class-param bindings key on MANGLED identities
+(`$class$237 1:R` per the member-static-bound prints) while
+`f.params[i].ty` may spell the RAW `T`, so `substituteType` misses and
+`value: T` never becomes Unit for the refutation. Verify with a print
+of the instantiated param at the smac site; if raw-vs-mangled is
+confirmed, bind BOTH spellings (raw name + classTypeParamIdentity) in
+the bindings list. Everything else in the chain is verified live.

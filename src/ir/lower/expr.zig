@@ -9018,7 +9018,10 @@ fn staticCallReturnTypeRef(
                     },
                 );
                 member_applicable = resolved.applicable;
-                if (resolved.dispatch != .deferred) resolved_target = resolved.target;
+                // A deferred resolution that still NAMES one declaration is
+                // enough for a RETURN type — an override may only narrow it
+                // (the same rule nullaryMemberReturnTypeRef applies).
+                resolved_target = resolved.target;
             }
             if (resolved_target == null) {
                 if (member_applicable) {
