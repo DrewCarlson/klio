@@ -2390,6 +2390,9 @@ fn valueFromImage(a: Allocator, defs: []const ObjRef(ClassDef), v: ValueImage) A
                 .outer = null,
                 .identity = inst.identity,
                 .native_state = null,
+                // The buffer belongs to the adoption arena; runtime growth
+                // must re-buffer instead of freeing it across allocators.
+                .fields_foreign = true,
             });
             return Value{ .Instance = copy };
         },

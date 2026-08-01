@@ -549,6 +549,7 @@ pub fn initLocalParentChain(
             defer g.deinit();
             if (g.get().get(pp.name) == null) {
                 if (runtime.reclaimEnabled()) cur_args.items[i].retain();
+                try g.get().ensureFieldsOwned(allocator, 1);
                 try g.get().fields.append(allocator, .{ .name = pp.name, .value = cur_args.items[i] });
             }
         }
@@ -585,6 +586,7 @@ pub fn initLocalParentChain(
                 const g = inst.borrowMut();
                 defer g.deinit();
                 if (g.get().get(bp.name) == null) {
+                    try g.get().ensureFieldsOwned(allocator, 1);
                     try g.get().fields.append(allocator, .{ .name = bp.name, .value = bp.primitive_zero orelse Value.Null });
                 }
             }
@@ -896,6 +898,7 @@ fn retainField(g: *InstanceData, allocator: Allocator, key: []const u8) void {
 }
 
 fn pushField(g: *InstanceData, allocator: Allocator, key: []const u8, v: Value) Allocator.Error!void {
+    try g.ensureFieldsOwned(allocator, 1);
     try g.fields.append(allocator, .{ .name = key, .value = v });
 }
 
@@ -3242,6 +3245,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                 const g = inst.borrowMut();
                                 const already = g.get().get(key) != null;
                                 if (!already) {
+                                    try g.get().ensureFieldsOwned(allocator, 1);
                                     try g.get().fields.append(allocator, .{ .name = key, .value = v });
                                 }
                                 g.deinit();

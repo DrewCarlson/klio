@@ -400,6 +400,11 @@ pub const InstanceData = struct {
     identity: u64,
     /// Opaque per-instance state owned by a native host binding.
     native_state: ?NativeState,
+    /// True when `fields` points into a baked image's arena rather than the
+    /// runtime allocator. Growing or freeing that buffer with the runtime
+    /// allocator crosses allocators; the first growth re-buffers and clears
+    /// this, and teardown skips the spine free (the arena owns it).
+    fields_foreign: bool = false,
     /// For an anonymous-object instance, the values it captured from its
     /// enclosing scope, used to seed the method-body env at dispatch. Held here
     /// (per instance) rather than in a global registry so they are reclaimed
@@ -454,7 +459,20 @@ pub const InstanceData = struct {
                 return;
             }
         }
+        try self.ensureFieldsOwned(allocator, 1);
         try self.fields.append(allocator, .{ .name = name, .value = v });
+    }
+
+    /// Re-buffer an image-arena field list with the runtime allocator before
+    /// its first growth. The arena keeps the original buffer; the in-place
+    /// replace and read paths never needed this.
+    pub fn ensureFieldsOwned(self: *InstanceData, allocator: std.mem.Allocator, extra: usize) !void {
+        if (!self.fields_foreign) return;
+        var fresh: std.ArrayList(Field) = .empty;
+        try fresh.ensureTotalCapacity(allocator, self.fields.items.len + extra);
+        fresh.appendSliceAssumeCapacity(self.fields.items);
+        self.fields = fresh;
+        self.fields_foreign = false;
     }
 
     /// Reference-counting teardown: run when an instance's strong count
@@ -471,7 +489,7 @@ pub const InstanceData = struct {
         for (self.anon_enclosing) |e| e.v.release(allocator);
         if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         if (self.stack) |*s| s.deinit();
-        self.fields.deinit(allocator);
+        if (!self.fields_foreign) self.fields.deinit(allocator);
         self.class.deinit();
     }
 
@@ -494,7 +512,7 @@ pub const InstanceData = struct {
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
         if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
         if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
-        self.fields.deinit(allocator);
+        if (!self.fields_foreign) self.fields.deinit(allocator);
     }
 
     /// Fetch the instance's native-state cell, creating it via `init` on

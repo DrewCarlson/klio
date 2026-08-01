@@ -86,11 +86,15 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
     built.classes = ClassTable.init(allocator);
     vm.classes = try ObjRef(ClassTable).init(allocator, taken);
 
-    // Move the enum-entry ctor-arg thunks into the Vm; the startup pass
-    // patches each entry's instance fields with their evaluated values.
+    // COPY the enum-entry ctor-arg thunks rather than moving the list: the
+    // built list is arena-owned, and the Vm frees its own containers with
+    // the VM allocator — under a GC run that is the slab, and freeing an
+    // arena buffer through the slab reads a garbage page header at
+    // teardown. The entries are plain values; the donor list stays with
+    // `built` so its own deinit frees it where it was allocated.
     vm.enum_entry_arg_inits.deinit(allocator);
-    vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
-    built.enum_entry_arg_inits = .empty;
+    vm.enum_entry_arg_inits = .empty;
+    try vm.enum_entry_arg_inits.appendSlice(allocator, built.enum_entry_arg_inits.items);
 
     // Top-level property initialiser order is preserved.
     vm.top_level_props.deinit(allocator);
@@ -612,6 +616,25 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
     }
 
+    if (runtime.getenvSlice("KLIO_DUMP_FN")) |w| {
+        if (std.fmt.parseInt(u32, w, 10)) |want| {
+            const dmg = self.module.borrow();
+            defer dmg.deinit();
+            if (dmg.get().funcById(ir.FuncId.from(want))) |df| {
+                std.debug.print("[dumpfn] {s}#{d} blocks={d}\n", .{ df.fqn, want, df.blocks.len });
+                for (df.blocks, 0..) |blk, bi| {
+                    std.debug.print("[dumpfn] b{d}:\n", .{bi});
+                    for (blk.insts) |inst| {
+                        switch (inst) {
+                            .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
+                            else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
+                        }
+                    }
+                    std.debug.print("[dumpfn]   -> {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
+                }
+            }
+        } else |_| {}
+    }
     // Patch enum-entry instance fields with evaluated ctor args.
     for (self.enum_entry_arg_inits.items) |entry| {
         const class_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
@@ -639,6 +662,20 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
         const inst = entry_inst orelse continue;
         defer inst.deinit();
+        // A cached base shares these instances across per-program Vms, and
+        // the ctor args are per-class constants: once one Vm has patched the
+        // fields, re-evaluating them would only swap equal values — and the
+        // release of the previous Vm's value would cross allocators. Skip
+        // entries whose fields are already complete.
+        const already_patched = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            for (param_names.items) |pn| {
+                if (g.get().get(pn) == null) break :blk false;
+            }
+            break :blk true;
+        };
+        if (already_patched) continue;
         for (entry.funcs, 0..) |fid, idx| {
             const init_func = module.funcById(fid) orelse continue;
             const v = blk: {
@@ -649,8 +686,32 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 }
             };
             if (idx < param_names.items.len) {
+                // The instance is shared through the base cache, so the value
+                // stored must share the CACHE's lifetime: copy a string into
+                // the patch allocator (scalars are by value; anything else is
+                // left as-is and noted by the trace above when it appends).
+                const pa = self.patch_allocator orelse self.allocator;
+                const stored: Value = switch (v) {
+                    .String => |sref| blk: {
+                        const sg = sref.borrow();
+                        defer sg.deinit();
+                        break :blk .{ .String = try runtime.strInit(pa, sg.get().bytes) };
+                    },
+                    else => v,
+                };
                 const g = inst.borrowMut();
-                g.get().define(self.allocator, param_names.items[idx], v) catch {};
+                // A baked enum instance carries every constructor-parameter
+                // field, so this define REPLACES in place. An append here
+                // means the bake dropped a field — name it, because the
+                // shared image instance cannot grow a per-VM buffer.
+                if (g.get().get(param_names.items[idx]) == null and
+                    runtime.getenvSlice("KLIO_ENUM_INIT_TRACE") != null)
+                {
+                    std.debug.print("[enum-init-append] class={s} entry={s} field={s}\n", .{
+                        entry.class_name, entry.entry_name, param_names.items[idx],
+                    });
+                }
+                g.get().define(pa, param_names.items[idx], stored) catch {};
                 g.deinit();
             }
         }

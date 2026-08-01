@@ -2533,16 +2533,18 @@ fn buildModuleWithOverrides(
                     const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
                     break :blk std.mem.indexOf(u8, std.mem.span(w), f.name.name) != null;
                 };
-                // Default OFF: arming the runtime refuter program-wide flips
-                // the inner pick of the range `contains` family into
-                // self-recursion (DurationTest; skip=contains alone restores
-                // 52/52). Opt in with KLIO_HDR_BOUNDS=1 to reproduce; the
-                // ranking interplay is the tracked next fix, after which this
-                // becomes the default and bounded_typeparam_receiver goes
-                // green end-to-end.
+                // Default ON. The armed roll-out list is empty: the
+                // contains loop was the smart-cast `this`-narrow being
+                // invisible to bare-call resolution, ArrayDeque's was the
+                // enclosing method's `this` decl leaking through a
+                // receiver-less lambda, and the DeepRecursive slowdown was
+                // the same over-broad consult — all fixed by the genuine-
+                // narrow gate. Full armed sweep: 117/0 at 1:03 wall on the
+                // heaviest file. `KLIO_HDR_BOUNDS=0` disables for
+                // single-binary A/B; KLIO_HDR_BOUNDS_SKIP bisects by name.
                 const hdr_on = blk: {
-                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk false;
-                    break :blk std.mem.eql(u8, std.mem.span(w), "1");
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk true;
+                    break :blk !std.mem.eql(u8, std.mem.span(w), "0");
                 };
                 if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
                     if (std.c.getenv("KLIO_HDR_BOUNDS_LIST") != null) {
