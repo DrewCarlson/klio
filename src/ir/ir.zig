@@ -3082,6 +3082,10 @@ pub const Module = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var bindings: std.ArrayList(TypeBinding) = .empty;
+        const gra_trace = blk: {
+            const w = std.c.getenv("KLIO_GRA_TRACE") orelse break :blk false;
+            break :blk std.mem.eql(u8, std.mem.span(w), staticTypeHead(actual.name));
+        };
         if (!try self.bindReceiverTypeParams(
             a,
             actual,
@@ -3089,7 +3093,15 @@ pub const Module = struct {
             declared_params,
             &bindings,
             0,
-        )) return false;
+        )) {
+            if (gra_trace) std.debug.print("[gra] {s} vs {s}: bind FAILED\n", .{ actual.name, pattern.name });
+            return false;
+        }
+        if (gra_trace) {
+            std.debug.print("[gra] {s} vs {s}: bound n={d}", .{ actual.name, pattern.name, bindings.items.len });
+            for (bindings.items) |bd| std.debug.print(" {s}:={s}", .{ bd.name, bd.ty.name });
+            std.debug.print(" params={d}\n", .{declared_params.len});
+        }
         for (declared_params) |param| {
             // The pattern head's own parameter IS the receiver: a missing
             // binding entry must not silently skip its bound check, or a
@@ -3100,6 +3112,7 @@ pub const Module = struct {
                     actual
                 else
                     continue);
+            if (gra_trace) std.debug.print("[gra]  param {s}<:{s} complete={} actual={s}\n", .{ param.param, param.bound, param.complete, bound_actual.name });
             if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
             const dependent_bound = rawBoundNamesDeclaredParam(
                 declared_params,

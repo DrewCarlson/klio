@@ -2596,6 +2596,25 @@ the DrawNode. Established so far:
 - kotlinc's answer for the example: `observed:3:ok`
   (tests/corpus/expected/bounded_typeparam_receiver.out); the DrawNode
   dispatch receiver is the only bounds-satisfying candidate.
+- ROOT CAUSE FOUND AND SPLIT: `func_type_param_bounds` was EMPTY at both
+  lowering and runtime for `klio run` programs — the interp-build loop
+  that fills it (build.zig ~2660) never runs on this path (verified: a
+  probe there never fired), so `declaredTypeParamBounds` handed the
+  prover the default `T <: kotlin.Any complete=true` record and the
+  prover accepted any receiver. Registering the bounds AT HEADER TIME
+  fixes the example (`observed:3:ok` verified) when done in the
+  interp-build header block — but that same registration also ARMS the
+  runtime refuter (`receiverViolatesTypeParamBound`) program-wide for
+  the first time, and DurationTest.parseAndFormatInUnits then dies in
+  eval recursion (some runtime pick flips to a self-recursive sibling;
+  Int-vs-Comparable is NOT the mechanism — `isRuntimeType` handles it).
+  LANDED: the decl.zig-side header registration (static resolution
+  path, no runtime effect, all suites green). REVERTED pending the
+  recursion's root cause: the interp-build header-block registration.
+  Next: re-apply it, trace the DurationTest recursion frames (the sweep
+  hides child stderr — run the harness `test` invocation the sweep
+  builds, with the FULL sibling file set, plus KLIO_ERR_TRACE), find
+  which candidate the armed refuter drops, and fix that refutation.
 - NARROWED (`KLIO_REX_TRACE`, per-candidate loop verdicts): the loop
   reaches the generic branch with bounds=1 and
   `staticGenericReceiverApplicable` returns TRUE for the CanvasScope

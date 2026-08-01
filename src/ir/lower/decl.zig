@@ -1603,6 +1603,38 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
     var tp_names: std.ArrayList([]const u8) = .empty;
     for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
     try module.registry.func_type_params.put(id, tp_names);
+    // The declared bounds register at header time for the same reason the
+    // names do: a body lowered before this declaration's own must see them,
+    // or a `where`-bounded receiver proves applicable to anything.
+    var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+    for (f.type_params) |*tp| {
+        const first = bounds.items.len;
+        if (tp.upper_bound) |*ub| {
+            try bounds.append(a, .{
+                .param = tp.name.name,
+                .bound = ub.name.name,
+                .complete = boundTypeRecordComplete(ub),
+                .head_only = boundTypeRecordHeadOnly(ub),
+            });
+        }
+        for (f.where_bounds) |*wb| {
+            if (!std.mem.eql(u8, wb.name.name, tp.name.name)) continue;
+            try bounds.append(a, .{
+                .param = tp.name.name,
+                .bound = wb.bound.name.name,
+                .complete = boundTypeRecordComplete(&wb.bound),
+                .head_only = boundTypeRecordHeadOnly(&wb.bound),
+            });
+        }
+        if (bounds.items.len - first > 1) {
+            for (bounds.items[first..]) |*bd| bd.complete = false;
+        }
+    }
+    if (bounds.items.len != 0) {
+        try module.registry.func_type_param_bounds.put(id, try bounds.toOwnedSlice(a));
+    } else {
+        bounds.deinit(a);
+    }
 }
 
 /// The bound's head still names one classifier, which is enough to own a
