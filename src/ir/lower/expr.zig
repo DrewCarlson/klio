@@ -13290,13 +13290,26 @@ fn staticReceiverHasNoCompetingCallable(
 fn localOverloadReceiverCouldApply(
     b: *const FuncBuilder,
     overload: *const build.LocalFnOverload,
-    actual: TypeRef,
+    raw_actual: TypeRef,
 ) Allocator.Error!bool {
     const declared = overload.receiver_ty orelse return true;
     const owned_bounds = try b.typeParamBoundsSlice();
     defer if (owned_bounds) |bounds| b.allocator.free(bounds);
     const actual_bounds: []const ir.ModuleRegistry.TypeParamBound =
         owned_bounds orelse &.{};
+    // An ALIAS head (`Ints = MutableList<Int>`) names no class, so without
+    // resolution it fell into the unresolvable-type-parameter escape below
+    // and the overload applied to a receiver its real type refutes. Resolve
+    // the alias the same way global extension resolution does.
+    var alias_arena = std.heap.ArenaAllocator.init(b.allocator);
+    defer alias_arena.deinit();
+    const actual_scoped = b.module.resolveTypeAliasAt(
+        alias_arena.allocator(),
+        raw_actual,
+        null,
+        b.self_package,
+    ) catch raw_actual;
+    const actual = actual_scoped;
     // An actual head that names NO known classifier and carries no bound
     // here is a type parameter of a spliced/generic context (`it: T` inside
     // `compareBy`'s SAM lambda, where T instantiates to the caller's

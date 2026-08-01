@@ -2463,3 +2463,16 @@ candidate sets and need their own look.
   own root-cause pass with the harness where reproducible
   (`local_extension_generic_applicability_matrix` prints 2 of its 5
   expected lines there).
+
+
+### LANDED: a local extension resolves its receiver's alias
+
+`localOverloadReceiverCouldApply` compared the receiver's DECLARED name
+against known classifiers, so an alias head (`Ints = MutableList<Int>`)
+matched nothing and fell into the unresolvable-type-parameter escape —
+the local overload then applied to a receiver its real type refutes,
+and `values.tag()` on an `Ints` picked a `MutableList<String>.tag()`
+local. The alias now resolves through `resolveTypeAliasAt` first,
+exactly as global extension resolution already did. Pinned suite
+127 -> 129 of 134 (this healed `qualified_alias_static_applicability`
+too); sweep 117/0, examples A/B clean.
