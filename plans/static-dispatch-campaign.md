@@ -2555,3 +2555,29 @@ Campaign standing: stdlib 56.7% bound, examples 64.4%, from 2.34% /
 iterator mass), the resolver_declined blocked pairs beyond the
 type-parameter disproof, and the e2e drift triage now that the suite
 runs deep enough to show it.
+
+
+### IN PROGRESS: bounded_typeparam_receiver — where-bounds don't refute at runtime
+
+`fun <T> T.observe() where T : Node, T : Observer`, called bare inside
+`DrawNode.draw()` (a CanvasScope member extension): the runtime receiver
+walk invokes `observe` with the innermost candidate (the CanvasScope
+receiver, DrawImpl) which fails `T : Node` — kotlinc skips it and binds
+the DrawNode. Established so far:
+
+- The registry DOES carry both where-bounds per func
+  (`func_type_param_bounds`, populated in interp_ir/build.zig ~2660,
+  marked complete=false for multi-bounds) and
+  `receiverViolatesTypeParamBound` iterates them ignoring `.complete` —
+  data and refuter are both sound.
+- The failure reproduces with `KLIO_FLAT=0` (not the flat arm), with no
+  `[strictext]` output (not `callMemberStrictExt`), and with no
+  `extLocal cand` output under `KLIO_TRACE_RESOLVE=observe` (not the
+  ~12940 walk). The frame chain (`KLIO_ERR_TRACE=1`): lambda ->
+  DrawNode.draw -> observe with this=DrawImpl.
+- Next probe: the accepting route is one of the remaining CMG arms —
+  most likely `extensionFnFallback` (its reject helper at
+  host_call_member.zig:12469 consults the refuter; verify that helper
+  actually runs for the innermost candidate, e.g. by tracing the accept
+  path) or the lenient pass. One added `[extfb-accept]` print on the
+  accept path pins it in a single run.
