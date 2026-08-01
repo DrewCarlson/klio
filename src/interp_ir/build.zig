@@ -3946,8 +3946,16 @@ fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8
 fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void {
     for (members) |*m| {
         switch (m.*) {
-            .Function => |*f| if (f.is_inline and f.body != null) {
-                ir.lower.registerInlineMemberOwner(f, owner);
+            .Function => |*f| {
+                if (f.is_inline and f.body != null) {
+                    ir.lower.registerInlineMemberOwner(f, owner);
+                }
+                // Un-annotated expression bodies register for on-demand
+                // return derivation: a caller lowered before this member's
+                // own pass still types its locals from the inferred return.
+                if (f.body != null and f.body.? == .Expr and f.return_type == null) {
+                    ir.lower.registerExprBodyMember(owner, f) catch {};
+                }
             },
             .Class => |*c| registerInlineMemberOwners(c.members, c.name.name),
             .Object => |*o| registerInlineMemberOwners(o.members, o.name.name),

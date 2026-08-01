@@ -3487,3 +3487,26 @@ Implementation sketch for the ordering pass (mechanism fully known):
   select prints `got 99`; then sweep + drift + pinned (the standard
   battery), pin select_on_timeout_loses as a parity fixture, and close
   the residual.
+
+
+The ordering pass is LANDED (validated: sweep 117/0, drift 262/266
+unchanged): expression-bodied members with no annotation register under
+(owner, name, arity) in the member walk
+(`inline_state.registerExprBodyMember` / `exprBodyMemberAst`, exported
+through lower.zig), and the bareret Member tail derives the return ON
+DEMAND from the registered AST when `instantiatedCallReturnType` finds
+the placeholder — with a threadlocal depth guard (od_depth < 3; the
+unguarded version segfaulted on mutual body recursion).
+
+The remaining inch moved INSIDE the on-demand derivation: the fresh
+FuncBuilder is seeded only setOwnerClass/setRecvTy, so
+`onCancellationConstructor` (a CTOR-PROPERTY of ClauseData) does not
+resolve through the member-property channel and the body's
+`?.invoke(...)` receiver stays untyped — the site still answers
+`target=79 deferred applicable=true`. Wire the builder the way
+`lowerAccessorExprFull` / `lowerPropertyInitExpr` do: seed
+own_members and the declared ctor-param/property TYPES of the owner
+class (`setLocalDeclType` for each primary param, as
+lowerPropertyInitExpr's declared_params path does) before running
+staticExprTypeRef. Then the invoke arm fires (proven live), the local
+types Function3, and `inst=Unit` refutes — the verified-ready tail.

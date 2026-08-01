@@ -8414,6 +8414,10 @@ fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef
 /// A statically known type for an arbitrary expression: its own declared type
 /// where it has one, otherwise a constructed class, a resolved call's return
 /// type, or the type a local's initializer lends it. Owned by the caller.
+/// On-demand return-derivation nesting: a body deriving a body must
+/// terminate on mutual recursion.
+threadlocal var od_depth: u8 = 0;
+
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
@@ -9079,6 +9083,37 @@ fn staticCallReturnTypeRef(
         shape_set.shapes,
         explicit,
     );
+    // Declaration order must not decide whether a caller's local types:
+    // when the target is an un-annotated EXPRESSION body whose own decl
+    // pass has not run yet (its return still the Unit placeholder),
+    // derive the return from the registered AST on demand, in the
+    // target's own class context.
+    if (inferred == null and od_depth < 3) {
+        od_depth += 1;
+        defer od_depth -= 1;
+        if (b.module.decl_sigs.get(target.int())) |dsg| {
+            if (dsg.enclosing_class) |oid| {
+                if (oid.int() < b.module.classes.items.len) {
+                    const oc = &b.module.classes.items[oid.int()];
+                    if (b.module.funcById(target)) |tf| {
+                        const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
+                        const nparams = tf.params.len - @intFromBool(has_this);
+                        if (inline_state.exprBodyMemberAst(oc.name, tf.name, nparams)) |fa| {
+                            if (fa.body) |*fbody| {
+                                if (fbody.* == .Expr) {
+                                    var nb = try FuncBuilder.init(b.allocator, b.module);
+                                    defer nb.deinit();
+                                    nb.setOwnerClass(oc.name);
+                                    nb.setRecvTy(oc.name);
+                                    inferred = try staticExprTypeRef(&nb, &fbody.Expr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (inferred != null and
         call.callee.* == .Member and call.callee.Member.safe)
     {

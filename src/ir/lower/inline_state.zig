@@ -221,6 +221,30 @@ pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
 /// map container outlives the build arena (same process-lifetime
 /// backing as the other tables here); the AST pointers share the build
 /// arena's lifetime exactly like `inline_fn_asts`.
+var expr_body_members: ?std.StringHashMap(FnField) = null;
+
+/// Record an expression-bodied member with NO return annotation under
+/// its (owner, name, arity) key, so a caller lowered BEFORE the member's
+/// own decl pass can derive the inferred return on demand (declaration
+/// order must not decide whether a local types).
+pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem.Allocator.Error!void {
+    if (expr_body_members == null) {
+        expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
+    }
+    const key = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{d}", .{ owner, f.name.name, f.params.len });
+    try expr_body_members.?.put(key, FnField.fromPtr(f));
+}
+
+/// The registered expression body for (owner, name, arity), or null.
+pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
+    if (expr_body_members) |*m| {
+        if (m.get(key)) |ff| return ff.get();
+    }
+    return null;
+}
+
 pub fn registerInlineFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
     if (inline_fn_ids == null) {
         inline_fn_ids = std.AutoHashMap(u32, FnField).init(std.heap.page_allocator);
