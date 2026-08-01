@@ -3133,3 +3133,28 @@ commit it. Two emission options, decide by experiment:
 flow_operators (drop/dropWhile emitting through bare `collect {}`) is
 the driving repro; the iterator mass (919 examples sites) is the
 census payoff once the channel lands.
+
+
+### Lambda-receiver channel, refined: option 3 is the real root
+
+Option 2 (committed-ext) dead-ends: `committedExtReceiverProven/
+Disproven` cannot discriminate CLOSURE receivers (a raw IrClosure
+carries no class), and in the flow walk both the collector AND the
+flowOf Flow are closures — the commitment would bind the wrong one or
+none. The deeper distortion, confirmed in the traces: flowOf's spliced
+`unsafeFlow` body lowers `object : Flow<T> { override collect }` to a
+RAW CLOSURE, while drop's identical object (different splice shape)
+stays Instance($anon : Flow) — [sam-walk] showed
+[0]IrClosure [1]IrClosure [2]Instance($anon$0). If the object-expression
+kept its interface identity (Instance with supertype Flow, method
+registered), the EXISTING machinery resolves everything:
+valueCouldServeName proves `collect` on [1] via the hierarchy, the SAM
+arm declines at [0], and the extension fallback binds Flow.collect.
+
+NEXT: find where the inline splice's expression-body context
+SAM-collapses a single-method `object : Interface` into a closure
+(expr.zig object lowering under splice — compare the two flow-builder
+splice sites), and keep the Instance form when the interface is a
+NAMED source interface (not a fun-interface conversion). Then re-run
+dropmin/flow_operators; the [bare] collect -> NONE static gap (tower
+consult, option 1) remains the census lever afterwards.
