@@ -3752,18 +3752,55 @@ pub const Module = struct {
                 if (generic_applies) {
                     compatibility = .compatible;
                 } else {
-                    var erased_receiver = scoped_receiver;
-                    erased_receiver.args = &.{};
-                    var erased_param = scoped_recv_param;
-                    erased_param.args = &.{};
-                    compatibility = if (self.staticReceiverCompatibility(
-                        null,
-                        erased_receiver,
-                        erased_param,
-                    ) == .incompatible)
-                        .incompatible
+                    // A bound HEAD the actual receiver provably fails refutes
+                    // the candidate outright: `where T : Node, T : Observer`
+                    // never binds a CanvasScope receiver, and kotlinc drops
+                    // the candidate at the declaration. Sound even for
+                    // records marked incomplete — dropped bound arguments
+                    // only narrow a bound — but only when BOTH classifiers
+                    // are known classes with a provably absent relation.
+                    var head_refuted = false;
+                    const recv_head_name = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+                    const recv_cid: ?ClassId = if (std.mem.indexOfScalar(u8, recv_head_name, '.') != null)
+                        self.classIdByFqn(recv_head_name)
                     else
-                        .unknown;
+                        self.classId(recv_head_name);
+                    if (recv_cid != null) {
+                        const recv_param_head = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
+                        for (declared_bounds) |db| {
+                            if (!std.mem.eql(u8, db.param, recv_param_head)) continue;
+                            var bh = staticTypeHead(db.bound);
+                            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+                            bh = std.mem.trimEnd(u8, std.mem.trim(u8, bh, " "), "?");
+                            if (std.mem.eql(u8, bh, "Any") or std.mem.eql(u8, bh, "kotlin.Any")) continue;
+                            const bound_cid: ?ClassId = if (std.mem.indexOfScalar(u8, bh, '.') != null)
+                                self.classIdByFqn(bh)
+                            else
+                                self.classId(bh);
+                            if (bound_cid == null) continue;
+                            if (!self.classIdIsOrExtends(recv_cid.?, bound_cid.?)) {
+                                head_refuted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (head_refuted) {
+                        compatibility = .incompatible;
+                        receiver_pruned += 1;
+                    } else {
+                        var erased_receiver = scoped_receiver;
+                        erased_receiver.args = &.{};
+                        var erased_param = scoped_recv_param;
+                        erased_param.args = &.{};
+                        compatibility = if (self.staticReceiverCompatibility(
+                            null,
+                            erased_receiver,
+                            erased_param,
+                        ) == .incompatible)
+                            .incompatible
+                        else
+                            .unknown;
+                    }
                 }
             } else if (compatibility == .unknown) {
                 const receiver_id = self.staticTypeClassId(scoped_receiver);

@@ -2575,9 +2575,24 @@ the DrawNode. Established so far:
   `extLocal cand` output under `KLIO_TRACE_RESOLVE=observe` (not the
   ~12940 walk). The frame chain (`KLIO_ERR_TRACE=1`): lambda ->
   DrawNode.draw -> observe with this=DrawImpl.
-- Next probe: the accepting route is one of the remaining CMG arms —
-  most likely `extensionFnFallback` (its reject helper at
-  host_call_member.zig:12469 consults the refuter; verify that helper
-  actually runs for the innermost candidate, e.g. by tracing the accept
-  path) or the lenient pass. One added `[extfb-accept]` print on the
-  accept path pins it in a single run.
+- ROUTE FOUND (`KLIO_OR_AUDIT`): the call is STATICALLY committed by the
+  bare-extension arm — `[ext-static] observe recv=CanvasScope
+  target=7029 applicable=true` from `lowerResolvedExtensionCall` →
+  `Module.resolveExtensionCall`. The runtime is executing a wrong static
+  pin, not making its own choice.
+- LANDED toward the fix (inert until the loop reaches it): bound-HEAD
+  refutation in `resolveExtensionCall`'s generic branch — a known
+  receiver class that provably does not extend a known bound-head class
+  is `.incompatible` even when the bound record is marked incomplete
+  (multi-bound `where` records), since dropped bound arguments only
+  narrow.
+- OPEN PUZZLE: a probe placed at the `declaredTypeParamBounds` line
+  inside the candidate loop never fired for `observe` even though the
+  SAME call returns target=7029 — some earlier guard `continue`s past
+  the generic branch for this fid, or the commit comes from a different
+  leg of the loop. Next probe: print each candidate fid and the guard it
+  exits through for name==observe; one run pins the accepting flow, and
+  then the refutation lands on that leg.
+- kotlinc's answer for the example: `observed:3:ok`
+  (tests/corpus/expected/bounded_typeparam_receiver.out); the DrawNode
+  dispatch receiver is the only bounds-satisfying candidate.
