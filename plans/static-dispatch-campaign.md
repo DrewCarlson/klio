@@ -2796,3 +2796,25 @@ fix ArrayDeque.clear's instance of the shape, then both defaults flip
 and the gates delete. Fourteen member-first/self-serve guards, the
 route-print and dump tooling, and the caller-span [fn-entry] remain
 landed from the hunt.
+
+
+### ArrayDeque.clear armed recursion: mechanism identified
+
+Repro needs the BATCHED directory compile (33 tests; standalone passes
+66/66). Pinned: the loop is the TEST METHOD `ArrayDequeTest.clear`
+re-entered from the test's lambda (`fun clear() = testArrayDeque { ...
+generateArrayDeque(...).apply { clear() } ... }`), and the runtime
+audit shows `run inst=CallMemberOrGlobal name=clear arm=member depth=0`
+— the emitted CMG for the bare `clear()` carries NO receiver register
+(the capture-path emission), so the innermost implicit candidate is the
+CAPTURED TEST INSTANCE and its same-name member (the test method
+itself) serves. Kotlin binds the `apply` receiver's member: the
+receiver-lambda (`T.()`) must own `this` inside the spliced block.
+Minimal repros (adm2/adm3 in the scratchpad shapes: lambda indirection,
+same-name enclosing member, generic helper receiver) all BIND CORRECTLY
+— the failing delta vs those is still open (candidates: the helper
+being a member of the test class, the four-param outer lambda, or the
+batched sibling set changing the receiver derivation). Next: [bare-read]
+/emission-arm trace on the exact span (file2:3031) in the batched run to
+see which emission arm fires and why `this` fails to resolve/bind for
+the spliced receiver-lambda there; the fix then lands at that arm.
