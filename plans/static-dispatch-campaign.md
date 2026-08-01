@@ -2949,3 +2949,23 @@ into a runtime member-miss. Split the mode:
 already accepted the declaration); prove callers keep declining. Pinned
 by local_extension_fbounded_param; complex_oop_delegation matches its
 expected output again. Sweep 117/0.
+
+
+### compose_path: the Iterable fallback ignored the call's arity
+
+The Div-on-PathSegment failure decomposed cleanly with the pack-source
+probe recipe: every sub-expression of `max(1, ceil(abs(sweepRad) /
+(PI.toFloat() / 2f)).toInt())` evaluated correctly in isolation, and the
+literal probe `max(1, 4)` returned `PathSegment(Move, [10, 5])` — the
+path's single segment. KlioPath declares `iterator()`, so the runtime
+Iterable fallback matched the `kotlin.collections.Iterable.max`
+intrinsic BY NAME ALONE, drained the path into a list of segments, and
+answered with its largest element — swallowing a two-argument call the
+zero-argument collection extension can never mean (the lowering had
+resolved kotlin.math.max, but the site emitted deferred CMG in the pack
+context and the member walk preempted it). The fallback now requires the
+call shape to fit SOME source declaration of the name on
+Iterable/List/Collection (`extCouldApply` arity), so `max(1, n)` falls
+through to the resolved global. Pinned by iterator_member_global_arity
+(behavioral; the deferred-CMG route itself is pinned by compose_path in
+the corpus). Drift 253 -> 255; sweep 117/0; pinned 138/139.

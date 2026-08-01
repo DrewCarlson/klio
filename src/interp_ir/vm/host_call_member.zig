@@ -5143,6 +5143,23 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 matched = p2;
             }
             if (intrinsic) |f| {
+                // The call shape must fit SOME source declaration of this
+                // name for an iterable receiver. Inside KlioPath (which has
+                // an `iterator()`), `max(1, 4)` is the imported
+                // kotlin.math.max global — the zero-argument collection
+                // `max` must not swallow it by draining the path into a
+                // list and returning its largest segment.
+                const arity_fits = blk2: {
+                    const mg2 = self.module.borrow();
+                    defer mg2.deinit();
+                    const m2 = @constCast(mg2.get());
+                    break :blk2 m2.extCouldApply(allocator, "Iterable", name, args.len) or
+                        m2.extCouldApply(allocator, "List", name, args.len) or
+                        m2.extCouldApply(allocator, "Collection", name, args.len);
+                };
+                if (!arity_fits) {
+                    if (routeTraceOn(name)) std.debug.print("[route] L5147-arity-skip\n", .{});
+                } else {
                 // `toTypedArray` must observe a user `toArray()` override
                 // before any drain (JS/native `collectionToArray` semantics);
                 // its intrinsic handles Instance receivers itself.
@@ -5161,6 +5178,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 const new_args = try prependReceiver(allocator, &dv, args);
                 defer if (runtime.freeScratch()) allocator.free(new_args);
                 return dispatchIntrinsic(self, allocator, matched, f, new_args);
+                }
             }
         }
     }

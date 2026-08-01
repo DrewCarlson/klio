@@ -1485,3 +1485,11 @@ test "local_extension_fbounded_param" {
         \\
     );
 }
+
+test "iterator_member_global_arity" {
+    try check("iterator_member_global_arity",
+        \\4
+        \\9
+        \\
+    );
+}
