@@ -306,9 +306,9 @@ Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
       146   2.23%  bound_static     <- direct FuncId call
     3,563  54.50%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,044  31.26%  no_receiver_type
+    2,012  30.77%  no_receiver_type
       451   6.90%  resolver_declined
-      214   3.27%  no_class_id
+      246   3.76%  no_class_id
       120   1.84%  nullable_or_generic
 
 Statically bound: 3,709 of 6,538 (56.7%), from 150 (2.34%) at the start of this
@@ -322,9 +322,9 @@ concrete types the stdlib's own generic containers do not:
      1,453   2.12%  bound_static
     42,680  62.24%  bound_virtual
     ------------------------------
-    16,762  24.45%  no_receiver_type
+    16,346  23.84%  no_receiver_type
      3,697   5.39%  resolver_declined
-     2,698   3.93%  no_class_id
+     3,114   4.54%  no_class_id
      1,278   1.86%  nullable_or_generic
 
 Statically bound: 44,133 of 68,568 (64.4%), from 27,098 (37.4%).
@@ -1161,6 +1161,15 @@ still wins the deferral. Gate: `KLIO_BARE_EXT`.
 
     stdlib   2,144 -> 2,044 no_receiver_type, total 6,638 -> 6,538 (56.7% bound)
     examples 18,041 -> 16,762 no_receiver_type, total 69,847 -> 68,568 (64.4% bound)
+
+The arm also serves a receiver head with NO class id at all — `UShortArray`
+and the unsigned-array family have extensions but no classes — which moves
+their downstream sites from `no_receiver_type` into `no_class_id` (32 stdlib,
+416 examples): the receiver is now NAMED, and what those sites wait on is the
+unsigned-array types getting a members-by-head answer. The exposing crash was
+its own latent bug, fixed separately: `lowerResolvedExtensionCall` read its
+resolved-target pointer after receiver lowering, which can append to (and
+move) the function table.
 
 The bound sites leave the member census (they are extension calls now), so
 the gain shows as the DENOMINATOR shrinking: 100 stdlib and 1,279 examples

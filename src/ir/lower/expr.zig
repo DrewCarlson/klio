@@ -8304,6 +8304,37 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     return try b.allocator.dupe(u8, elem.name);
 }
 
+/// The bare-call arm's extension attempt: a bare name in a receiver context
+/// that no member serves may be an extension of the implicit receiver.
+/// Gated by `KLIO_BARE_EXT` for single-binary A/B.
+fn bareExtensionTarget(
+    b: *FuncBuilder,
+    name: ast.Ident,
+    recv: ir.TypeRef,
+    shapes: []applicability.ArgShape,
+    bounds: ?[]const ir.ModuleRegistry.TypeParamBound,
+) Allocator.Error!?ir.FuncId {
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_BARE_EXT") orelse "1", "0")) return null;
+    const implicit_owners = try b.collectImplicitReceiverTower(
+        b.allocator,
+        eagerLambdaRecvHead(b),
+    );
+    defer b.allocator.free(implicit_owners);
+    return b.module.resolveExtensionCall(
+        name.name,
+        recv,
+        shapes,
+        .{
+            .caller_file = name.span.file,
+            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+            .implicit_dispatch_owners = implicit_owners,
+            .lexical_owner = b.ownerClass(),
+            .call_name = name.name,
+            .actual_type_param_bounds = bounds orelse &.{},
+        },
+    ).target;
+}
+
 /// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
 /// plain parameter, recursively. The owned name is re-allocated so `deinit`
 /// still frees what `clone` allocated.
@@ -8763,6 +8794,13 @@ fn staticCallReturnTypeRef(
                 else
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
                         b.module.classId(bare_head)) orelse {
+                    // A receiver head with no class id (`UShortArray`) still
+                    // has EXTENSIONS — resolution over them never needed the
+                    // class, only the member walk below does.
+                    if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
+                        if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
+                        break :blk t;
+                    }
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
                     break :blk sole_global orelse return null;
                 };
@@ -8789,28 +8827,8 @@ fn staticCallReturnTypeRef(
                 // inside an `Iterable<T>` extension body. Members were tried
                 // first, exactly as Kotlin orders them, and an applicable-but-
                 // unproven member still wins the deferral.
-                if (!bare_resolved.applicable and
-                    !std.mem.eql(u8, runtime.getenvSlice("KLIO_BARE_EXT") orelse "1", "0"))
-                {
-                    const implicit_owners = try b.collectImplicitReceiverTower(
-                        b.allocator,
-                        eagerLambdaRecvHead(b),
-                    );
-                    defer b.allocator.free(implicit_owners);
-                    const ext_target = b.module.resolveExtensionCall(
-                        name.name,
-                        bare_recv,
-                        shape_set.shapes,
-                        .{
-                            .caller_file = name.span.file,
-                            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
-                            .implicit_dispatch_owners = implicit_owners,
-                            .lexical_owner = b.ownerClass(),
-                            .call_name = name.name,
-                            .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
-                        },
-                    ).target;
-                    if (ext_target) |t| {
+                if (!bare_resolved.applicable) {
+                    if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
                         if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
                         break :blk t;
                     }
