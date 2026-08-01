@@ -3048,3 +3048,16 @@ from the lambda annotation (`{ s: String -> }`), which the unifier
 already knew how to do. Pinned by reified_from_lambda_annotation; the
 example matches. Sweep 117/0. (`[tbie]` now also prints the index
 outcome/pick provenance under KLIO_EF_TRACE.)
+
+
+### delegated_member_named_args: arg_params died at the by-name fallback
+
+The bound_virtual emission folds named arguments into `arg_params`
+(param indices) and deliberately empties `arg_names`. When the slot is
+UNLINKED for the receiver class (a `by`-delegating wrapper with no own
+override), `invokeVirtualMember` falls back to dispatch by NAME — with
+the empty names — so `emit(tag = "b", scale = 2.5f)` re-bound
+positionally through the delegate walk and scale's value landed in
+`value`. The fallback now derives the names back from the slot root's
+declared params before any by-name route runs. Pinned by
+delegated_member_named_args_pin; the example matches. Sweep 117/0.

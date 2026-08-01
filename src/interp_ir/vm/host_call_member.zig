@@ -9485,9 +9485,28 @@ pub fn invokeVirtualMember(
     receiver: *const Value,
     slot: MethodSlotId,
     args: []const Value,
-    arg_names: []const ?[]const u8,
+    arg_names_in: []const ?[]const u8,
     arg_params: ?[]const u32,
 ) Allocator.Error!EvalResult {
+    // Named arguments folded into `arg_params` at lowering must survive a
+    // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
+    // names back from the slot root's declared params, or a delegated
+    // `emit(tag = ..., scale = ...)` re-binds its arguments positionally.
+    var derived_names: []?[]const u8 = &.{};
+    defer if (derived_names.len != 0 and runtime.freeScratch()) allocator.free(derived_names);
+    const arg_names: []const ?[]const u8 = blk: {
+        const params = arg_params orelse break :blk arg_names_in;
+        if (params.len != args.len) break :blk arg_names_in;
+        const mg0 = self.module.borrow();
+        defer mg0.deinit();
+        const rootf = mg0.get().funcById(FuncId.from(slot.int())) orelse break :blk arg_names_in;
+        derived_names = try allocator.alloc(?[]const u8, args.len);
+        for (params, derived_names) |ui, *out| {
+            const pi = @as(usize, ui) + 1;
+            out.* = if (pi < rootf.params.len) rootf.params[pi].name else null;
+        }
+        break :blk derived_names;
+    };
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
             const mg = self.module.borrow();

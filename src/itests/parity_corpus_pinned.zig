@@ -1547,3 +1547,11 @@ test "reified_from_lambda_annotation" {
         \\
     );
 }
+
+test "delegated_member_named_args_pin" {
+    try check("delegated_member_named_args_pin",
+        \\a:7@1.0
+        \\b:0@2.5
+        \\
+    );
+}
