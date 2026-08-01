@@ -2611,10 +2611,22 @@ the DrawNode. Established so far:
   LANDED: the decl.zig-side header registration (static resolution
   path, no runtime effect, all suites green). REVERTED pending the
   recursion's root cause: the interp-build header-block registration.
-  Next: re-apply it, trace the DurationTest recursion frames (the sweep
-  hides child stderr — run the harness `test` invocation the sweep
-  builds, with the FULL sibling file set, plus KLIO_ERR_TRACE), find
-  which candidate the armed refuter drops, and fix that refutation.
+  DONE and bisected to ONE name: with the runtime registration armed,
+  ONLY the `contains` records flip behavior — `KLIO_HDR_BOUNDS_SKIP=
+  contains` restores DurationTest to 52/52 (it even heals the two
+  pre-existing parse failures). The recursion pair is the range
+  `contains` family (`<T, R> R.contains(element: T) where R :
+  ClosedRange<T>, R : Iterable<T>` and its Comparable twin): arming
+  their bounds changes the INNER pick inside the family's own body into
+  self-recursion (`Duration.Companion.parse` at Duration.kt:299 x5,595
+  frames through the test utils' `in` checks). The registration is
+  landed OPT-IN (`KLIO_HDR_BOUNDS=1`, with `KLIO_HDR_BOUNDS_SKIP` and
+  `KLIO_HDR_BOUNDS_LIST` as bisect knobs): default off keeps every
+  suite green; opted in, `bounded_typeparam_receiver` prints
+  `observed:3:ok`. Next: reproduce the contains recursion under the
+  opt-in (`KLIO_MISS_TRACE=contains` on the DurationTest argv), find
+  which candidate the armed records displace in the runtime ranking,
+  fix that, flip the default, and delete the gate.
 - NARROWED (`KLIO_REX_TRACE`, per-candidate loop verdicts): the loop
   reaches the generic branch with bounds=1 and
   `staticGenericReceiverApplicable` returns TRUE for the CanvasScope

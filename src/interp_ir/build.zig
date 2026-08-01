@@ -2507,6 +2507,53 @@ fn buildModuleWithOverrides(
                 var tp_names: std.ArrayList([]const u8) = .empty;
                 for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
                 try module.registry.func_type_params.put(id, tp_names);
+                var hdr_bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
+                for (f.type_params) |*tp| {
+                    const first = hdr_bounds.items.len;
+                    if (tp.upper_bound) |*ub| {
+                        try hdr_bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = ub.name.name,
+                            .complete = boundTypeRecordComplete(ub),
+                        });
+                    }
+                    for (f.where_bounds) |*wb| {
+                        if (!std.mem.eql(u8, wb.name.name, tp.name.name)) continue;
+                        try hdr_bounds.append(a, .{
+                            .param = tp.name.name,
+                            .bound = wb.bound.name.name,
+                            .complete = boundTypeRecordComplete(&wb.bound),
+                        });
+                    }
+                    if (hdr_bounds.items.len - first > 1) {
+                        for (hdr_bounds.items[first..]) |*bd| bd.complete = false;
+                    }
+                }
+                const hdr_skip = blk: {
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
+                    break :blk std.mem.indexOf(u8, std.mem.span(w), f.name.name) != null;
+                };
+                // Default OFF: arming the runtime refuter program-wide flips
+                // the inner pick of the range `contains` family into
+                // self-recursion (DurationTest; skip=contains alone restores
+                // 52/52). Opt in with KLIO_HDR_BOUNDS=1 to reproduce; the
+                // ranking interplay is the tracked next fix, after which this
+                // becomes the default and bounded_typeparam_receiver goes
+                // green end-to-end.
+                const hdr_on = blk: {
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk false;
+                    break :blk std.mem.eql(u8, std.mem.span(w), "1");
+                };
+                if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
+                    if (std.c.getenv("KLIO_HDR_BOUNDS_LIST") != null) {
+                        std.debug.print("[hdrb] {s}", .{f.name.name});
+                        for (hdr_bounds.items) |bd| std.debug.print(" {s}<:{s}", .{ bd.param, bd.bound });
+                        std.debug.print("\n", .{});
+                    }
+                    try module.registry.func_type_param_bounds.put(id, try hdr_bounds.toOwnedSlice(a));
+                } else {
+                    hdr_bounds.deinit(a);
+                }
             }
             // Key the inline-fn AST by the header stub's FuncId, so a
             // bare call the symbol index resolves to this declaration
