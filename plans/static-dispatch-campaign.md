@@ -2529,3 +2529,29 @@ function's own receiver context is empty. Pinned suite 132 -> 133 of
 `backtick_this_param_not_receiver`, which is resolution-STRICTNESS work
 tracked by the resolution-unification plan. Sweep 117/0, examples A/B
 clean.
+
+
+### Closing gate ledger for this round
+
+- unit: GREEN (67/67 build steps, 467 tests) — was broken since 89d7f3bc
+  mangled diagnostics_gen's message assignments; restored.
+- parity_corpus_pinned: 133/134 — every applicability red fixed this
+  round; the last red is the resolution-strictness fixture
+  (`backtick_this_param_not_receiver`), tracked by the
+  resolution-unification plan.
+- dual eager sweep: 117/0 in both modes, identical outputs.
+- Six litmus suites fully green (lambdas_and_dispatch,
+  inheritance_dispatch, extension_resolution, object_init,
+  ktor_channel_async, concurrency_stress, bundle_smoke).
+- Still red, all pre-existing and enumerated above: threaded_litmus
+  43/44 (one crash), check_examples 3/4 (vararg_spread), ktor_server
+  1/2, e2e 1/3 (the in-process jit segfault plus the drift list:
+  bounded_typeparam_receiver, channel_invoke_on_close,
+  complex_oop_delegation, compose_nodes, compose_path,
+  compose_snapshot_flow, delegated_member_named_args, ...).
+
+Campaign standing: stdlib 56.7% bound, examples 64.4%, from 2.34% /
+37.4%. The next campaign fronts remain: lambda-receiver evidence (the
+iterator mass), the resolver_declined blocked pairs beyond the
+type-parameter disproof, and the e2e drift triage now that the suite
+runs deep enough to show it.
