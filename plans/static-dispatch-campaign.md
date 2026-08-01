@@ -2395,3 +2395,29 @@ identically with all four session gates off):
   (vararg_spread duplicate-declaration), ktor_server 1/2 (expected 200,
   found null), e2e 1/3 (the deep-corpus segfault above plus masked
   program-level failures).
+
+
+### The pinned NaN failure names the blocked-pair fix precisely
+
+`generic_factory_return_extension`: `arrayOf(a, b).minOrNull()` inside
+`fun <T : Comparable<T>> choose(a: T, b: T)`. The receiver derives as
+`Array<T>`; the candidates are the total-order
+`Array<out T : Comparable<T>>.minOrNull` and the IEEE
+`Array<out Double>.minOrNull`. kotlinc EXCLUDES the IEEE overload — a
+declared type parameter is not `Double` statically — and uniquely picks
+total-order (prints 0.0). klio's extension ranking treats the
+param-typed element as a wildcard compatible with BOTH, declines as
+ambiguous (`applicable=true target=null`, the blocked-pair shape), and
+runtime dispatch picks IEEE from the runtime values (prints NaN).
+
+The fix: in extension-receiver applicability, a receiver type argument
+that is a DECLARED TYPE PARAMETER (present in
+`actual_type_param_bounds`) DISPROVES a candidate whose corresponding
+pattern argument names a concrete classifier the parameter's bound does
+not entail. That is Kotlin's own rule, it is exactly what the
+`[member-static-bound] T <: Comparable complete=false` context already
+carries into resolution, and it attacks the `resolver_declined` mass
+(451 stdlib / 3,697 examples) that every receiver-typing fix has been
+feeding. Verify against the eight red pinned fixtures — several
+(`local_extension_generic_applicability_matrix`,
+`tier5_loose_member_redispatch_resolves`) look like the same family.
