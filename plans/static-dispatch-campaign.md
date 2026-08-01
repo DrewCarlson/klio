@@ -3354,3 +3354,20 @@ deferred-applicable for this candidate set and thread the compat check
 (or its refutation) through it; then the member drops and the
 file-private extension binds. Ground truth: `got 99`, and
 select_on_timeout_loses in the corpus sweep.
+
+
+Third piece LANDED and validated (sweep 117/0, drift 262/266 unchanged,
+pinned 145/146): un-annotated `val x = call(...)` locals now record the
+callee's DECLARED return type via `staticExprTypeRef` — the same
+derivation the destructuring arm trusts — so argument shapes built from
+call-typed locals can refute members. With it the select chain stands
+at: site typed (cast piece), candidate #79 evaluated with
+`CancellableContinuation<Unit>` (smac nargs=1), callable-vs-builtin
+refutation armed — and the LAST link is `onCancellation`'s type:
+`createOnCancellationAction(select, internalResult) =` has an INFERRED
+expression-body return (`onCancellationConstructor?.invoke(...)`), so
+the local stays untyped and the member stays .unknown/deferred. The
+residual prerequisite is expression-body return inference for that
+shape (a safe-call invoke of a nullable function-typed property), or
+any equivalent decidable discriminator; everything downstream is
+verified ready. select_on_timeout_loses stays the driving repro.

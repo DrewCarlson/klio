@@ -291,6 +291,18 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                 );
                 if (cast.ty.nullable) try b.setLocalDeclNullable(p.name.name);
             },
+            // A call initializer's declared RETURN type is the local's
+            // static type (`val onCancellation = clause
+            // .createOnCancellationAction(...)`), the same derivation the
+            // destructuring arm already trusts. Argument shapes built from
+            // the local then refute inapplicable members.
+            .Call => {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    const was_nullable = ct.nullable;
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                    if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                }
+            },
             else => {},
         }
         // Literal initializers are recorded too: a call site uses them as
