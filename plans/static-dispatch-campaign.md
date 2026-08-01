@@ -2596,3 +2596,14 @@ the DrawNode. Established so far:
 - kotlinc's answer for the example: `observed:3:ok`
   (tests/corpus/expected/bounded_typeparam_receiver.out); the DrawNode
   dispatch receiver is the only bounds-satisfying candidate.
+- NARROWED (`KLIO_REX_TRACE`, per-candidate loop verdicts): the loop
+  reaches the generic branch with bounds=1 and
+  `staticGenericReceiverApplicable` returns TRUE for the CanvasScope
+  receiver even though the single declared bound is `T <: Node`
+  (complete=false) and the proof gate should return false. The
+  receiver-binding fallback (bindingType miss on the pattern-head param
+  now falls back to the actual receiver) did not change the verdict, so
+  the accepting leg is INSIDE the prover before/around the per-param
+  proof gate — next probe goes inside `staticGenericReceiverApplicable`
+  (print the binding table and each param's gate result for
+  name==observe) and lands the refutation on whichever leg accepts.

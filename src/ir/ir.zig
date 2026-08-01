@@ -3091,8 +3091,15 @@ pub const Module = struct {
             0,
         )) return false;
         for (declared_params) |param| {
+            // The pattern head's own parameter IS the receiver: a missing
+            // binding entry must not silently skip its bound check, or a
+            // `where`-bounded receiver (`T.observe() where T : Node`)
+            // accepts any receiver at all.
             const bound_actual = bindingType(bindings.items, param.param) orelse
-                continue;
+                (if (std.mem.eql(u8, param.param, staticTypeHead(pattern.name)))
+                    actual
+                else
+                    continue);
             if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
             const dependent_bound = rawBoundNamesDeclaredParam(
                 declared_params,
@@ -3605,6 +3612,8 @@ pub const Module = struct {
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
             const is_member_extension = kind == .member_extension;
+            const rex_trace = std.c.getenv("KLIO_REX_TRACE") != null;
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter\n", .{ name, fid.int(), @tagName(kind) });
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
@@ -3741,6 +3750,7 @@ pub const Module = struct {
                 scoped_recv_param,
             );
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}\n", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
             if (declared_bounds.len != 0) {
                 const generic_applies = self.staticGenericReceiverApplicable(
                     sa,
@@ -3749,6 +3759,7 @@ pub const Module = struct {
                     declared_bounds,
                     ctx.actual_type_param_bounds,
                 ) catch return .{};
+                if (rex_trace) std.debug.print("[rex] {s} fid={d} generic_applies={}\n", .{ name, fid.int(), generic_applies });
                 if (generic_applies) {
                     compatibility = .compatible;
                 } else {
@@ -3784,6 +3795,7 @@ pub const Module = struct {
                             }
                         }
                     }
+                    if (rex_trace) std.debug.print("[rex] {s} fid={d} head_refuted={}\n", .{ name, fid.int(), head_refuted });
                     if (head_refuted) {
                         compatibility = .incompatible;
                         receiver_pruned += 1;
@@ -3890,6 +3902,7 @@ pub const Module = struct {
                 }
             }
             if (compatibility == .incompatible) continue;
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} KEPT {s}\n", .{ name, fid.int(), @tagName(compatibility) });
             ids.append(sa, fid) catch return .{};
             tiers.append(sa, tier) catch return .{};
             unknowns.append(sa, compatibility == .unknown) catch return .{};
