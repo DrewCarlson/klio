@@ -2658,3 +2658,15 @@ self-bind. Next: the strict per-candidate walk's sole-candidate return
 (~host_call_member.zig:12995) lacks the member-defer the fallback walk
 now has — give it the same member-first rule, flip the KLIO_HDR_BOUNDS
 default, delete the gate.
+
+
+Also eliminated: `resolveExtOverloadLocal`'s sole-candidate return now
+carries the same thinned+member-first guard (correct regardless) and the
+armed residual persists unchanged — so the committing tail for the
+spliced ranges `contains` shape is NONE of: the extension fallback walk,
+the bare-member static arm, or the strict local overload resolver. The
+remaining suspects are the CMG lenient pass and the splice-emitted
+`inline_splice_recv_walk` CMG's own candidate list (`cmg.candidates`,
+built at lowering — check whether the armed static candidate FILTER
+prunes the member-reaching fallback out of that list before runtime ever
+walks it).

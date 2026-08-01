@@ -12947,6 +12947,7 @@ fn userMethodNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 /// Resolve the user extension/top-level fn an unqualified `recv.name(args)`
 /// would dispatch to (same candidate selection as `extensionFnFallback`).
 fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8, receiver: *const Value, args: []const Value, arg_names: []const ?[]const u8) ?FuncId {
+    var bound_thinned = false;
     const want = args.len + 1;
     var visible_owners = enclosingOwnerSet(self, allocator) catch return null;
     defer visible_owners.deinit();
@@ -12978,7 +12979,10 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
             // runtime receiver is not applicable at all (kotlinc drops it):
             // `UIntArray.fill` never binds a plain `Array` receiver even when
             // no other overload survives the walk.
-            if (receiverViolatesTypeParamBound(self, fid, &f.params[0].ty, receiver)) continue;
+            if (receiverViolatesTypeParamBound(self, fid, &f.params[0].ty, receiver)) {
+                bound_thinned = true;
+                continue;
+            }
             if (builtinReceiverDisproven(receiver, f.params[0].ty.name)) continue;
             if (argDefinitelyNotParamType(self, &f.params[0].ty, receiver)) continue;
             // Full applicability under the actual binding (kotlinc semantics):
@@ -13003,6 +13007,12 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
         }
     }
     if (candidates.items.len == 0) return null;
+    // A member of the receiver beats every extension: when bound
+    // refutation THINNED this set, a sole survivor that used to lose a
+    // tie must not newly commit past the member tail — the ranges
+    // `contains` family's own `element != null && contains(element)`
+    // re-entered itself exactly here.
+    if (bound_thinned and hostHasMember(self, receiver, name)) return null;
     if (candidates.items.len == 1) return candidates.items[0].fid;
     const chosen = scoreExtCandidates(self, allocator, receiver, candidates.items, args) catch return null;
     if (trace.enabled(name)) {
