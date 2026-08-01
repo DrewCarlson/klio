@@ -2731,3 +2731,22 @@ tree recursion); the next session goes straight to route prints before
 EVERY invoke in callMemberInnerStatic's remaining ladder (the builtin
 probe ladder and irMethodWalk's serves), one armed run, and the fix
 lands on the printed line.
+
+
+Route-print instrumentation landed IN-TREE (`KLIO_ROUTE=<name>`): 15
+prints across callMemberInnerStatic's every invoking return, 3 across
+the eval CMG tail (overload / committed / by_id+name-fallback). The
+decisive armed run: ZERO prints from all 18 points while the loop runs
+3,996 frames (`caller=kotlin.collections.contains`), and KLIO_FLAT=0
+with every guard in place changes nothing. Both by-name dispatch
+ladders and the CMG tail are therefore fully excluded — the recursive
+invoker is OUTSIDE them. The one uninstrumented family that can invoke
+a fid with a bound receiver is the VIRTUAL-SLOT path
+(`invokeVirtualMember`'s non-Instance branch resolving the smart-cast
+`contains(element)` site against the host List's class → slot →
+target). Next: KLIO_ROUTE-style prints at invokeVirtualMember's commit
+points (noinst target serve, callMemberNamed fallback, the slot invoke)
+plus [member-static] on the _Collections.kt contains body's inner site
+to see whether lowering bound it dispatch=virtual; the fix then follows
+the printed line. Fourteen member-first/self-serve guards from this
+hunt remain landed and validated.

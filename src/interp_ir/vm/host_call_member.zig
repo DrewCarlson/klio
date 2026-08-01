@@ -4045,6 +4045,11 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
     };
 }
 
+fn routeTraceOn(name: []const u8) bool {
+    const w = std.c.getenv("KLIO_ROUTE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(w), name);
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
@@ -4080,6 +4085,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (instanceMethodCacheGetRaw(self, rk)) |raw| {
                     if (raw != METHOD_MISS) {
                         if (!cacheServesExecutingFrame(raw))
+                            if (routeTraceOn(name)) std.debug.print("[route] L4083\n", .{});
                             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                     }
                 }
@@ -4089,6 +4095,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
                     if (!cacheServesExecutingFrame(raw))
+                        if (routeTraceOn(name)) std.debug.print("[route] L4092\n", .{});
                         if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                 }
                 // A cached miss falls through to the probe ladder (stdlib /
@@ -4108,6 +4115,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     // it builds the frame args in one allocation (no prepend
                     // scratch slice), matching the member fast path's speed.
                     if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
+                        if (routeTraceOn(name)) std.debug.print("[route] L4111\n", .{});
                         if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                     }
                 }
@@ -4115,6 +4123,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k2| {
                     if (extMethodCacheGet(self, k2)) |fid| {
                         if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
+                            if (routeTraceOn(name)) std.debug.print("[route] L4118\n", .{});
                             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                         }
                     }
@@ -4130,6 +4139,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k| {
             if (extMethodCacheGet(self, k)) |fid| {
                 if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
+                    if (routeTraceOn(name)) std.debug.print("[route] L4133\n", .{});
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                 }
             }
@@ -4153,6 +4163,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Pack-installed binding overlay + stdlib intrinsic probes for an
     // Instance receiver.
     if (receiver.* == .Instance) {
+        if (routeTraceOn(name)) std.debug.print("[route] L4156\n", .{});
         if (try instanceBindingProbe(self, allocator, receiver, name, args)) |r| return r;
     }
 
@@ -4657,6 +4668,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Instance and
         hostHasMember(self, receiver, "containsKey") and !hostHasMember(self, receiver, "contains"))
     {
+        if (routeTraceOn(name)) std.debug.print("[route] L4660\n", .{});
         return callMemberRec(self, allocator, receiver, "containsKey", args);
     }
 
@@ -4763,6 +4775,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // IR class + supertype method walk.
     if (receiver.* == .Instance) {
+        if (routeTraceOn(name)) std.debug.print("[route] L4766\n", .{});
         if (try irMethodWalk(self, allocator, receiver, name, args, static_recv)) |r| return r;
     }
 
@@ -4887,6 +4900,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const r = receiver.Range;
         const items = try materialiseRangeItems(allocator, r.start, r.end, r.step, r.kind);
         const as_list = try listOf(allocator, items, false);
+        if (routeTraceOn(name)) std.debug.print("[route] L4890\n", .{});
         return callMemberRec(self, allocator, &as_list, name, args);
     }
 
@@ -5071,10 +5085,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     {
         charseq_fallback_active = true;
         defer charseq_fallback_active = false;
+        if (routeTraceOn(name)) std.debug.print("[route] L5074\n", .{});
         const sres = try callMemberRec(self, allocator, receiver, "toString", &.{});
         switch (sres) {
             .ok => |sv| {
                 if (sv == .String) {
+                    if (routeTraceOn(name)) std.debug.print("[route] L5078\n", .{});
                     return try callMemberRec(self, allocator, &sv, name, args);
                 }
             },
@@ -5097,6 +5113,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 mg.deinit();
                 const new_args = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(new_args);
+                if (routeTraceOn(name)) std.debug.print("[route] L5100\n", .{});
                 return try host_call_func.callFunc(self, allocator, mod, fid, new_args);
             }
         }
@@ -5241,14 +5258,28 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
         }
         if (chosen) |fid| {
-            const mg = self.module.borrow();
-            const mod: *const Module = mg.get();
-            mg.deinit();
-            const call_args = try allocator.alloc(Value, args.len + 1);
-            defer allocator.free(call_args);
-            call_args[0] = receiver.*;
-            @memcpy(call_args[1..], args);
-            return host_call_func.callFunc(self, allocator, mod, fid, call_args);
+            // The terminal by-name scan must not re-pick the EXECUTING
+            // function when the receiver's own type declares this member:
+            // kotlinc binds the member, and re-entering the caller is the
+            // armed `Iterable.contains` self-loop (`contains(element)` on
+            // a List inside contains' own smart-cast branch). Skipping
+            // falls through to the host member probes below.
+            const self_repick = blk: {
+                const cf = ir.eval.currentFrameFunc() orelse break :blk false;
+                break :blk cf.id.int() == fid.int() and
+                    receiverHasMemberNamed(self, receiver, name);
+            };
+            if (!self_repick) {
+                const mg = self.module.borrow();
+                const mod: *const Module = mg.get();
+                mg.deinit();
+                const call_args = try allocator.alloc(Value, args.len + 1);
+                defer allocator.free(call_args);
+                call_args[0] = receiver.*;
+                @memcpy(call_args[1..], args);
+                if (routeTraceOn(name)) std.debug.print("[route] L5263\n", .{});
+                return host_call_func.callFunc(self, allocator, mod, fid, call_args);
+            }
         }
         if (retry_leaf) |leaf| {
             // No body-bearing overload under the aliased FQN: the target is
@@ -5257,6 +5288,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             // wrapper bearing that simple name must not rebind itself.
             const cur = ir.eval.currentFuncName() orelse "";
             if (!std.mem.eql(u8, cur, leaf)) {
+                if (routeTraceOn(name)) std.debug.print("[route] L5273\n", .{});
                 return callMemberRec(self, allocator, receiver, leaf, args);
             }
         }
@@ -5273,6 +5305,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // not an instance member; resolve it on the class-hierarchy companion.
         if (try companionWithMember(self, allocator, receiver, name)) |comp| {
             if (!Value.referenceEq(&comp, receiver)) {
+                if (routeTraceOn(name)) std.debug.print("[route] L5289\n", .{});
                 return callMemberRec(self, allocator, &comp, name, args);
             }
         }
