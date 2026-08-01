@@ -1916,6 +1916,19 @@ fn buildModuleWithOverrides(
                 const prop = m.Property;
                 const ty_opt: ?*const ast.TypeRef = if (prop.ty) |*t| t else blk: {
                     const src = propHeadSourceExpr(prop) orelse break :blk null;
+                    // `private val _start = start` beside `class R(start: Double)`
+                    // is the parameter's type. The stdlib's ranges and `Lazy`
+                    // are written this way, and it was the whole of the
+                    // enclosing-member bucket.
+                    if (src.* == .Path and src.Path.segments.len == 1 and
+                        !std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0"))
+                    {
+                        const pname = src.Path.segments[0].name;
+                        for (c.primary_params) |*pp| {
+                            if (std.mem.eql(u8, pp.name.name, pname)) break :blk &pp.ty;
+                        }
+                        break :blk null;
+                    }
                     if (src.* != .Call) break :blk null;
                     const callee = src.Call.callee;
                     if (callee.* != .Path or callee.Path.segments.len != 1) break :blk null;

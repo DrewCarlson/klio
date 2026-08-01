@@ -1187,6 +1187,14 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "property_typed_from_a_ctor_parameter" {
+    try check("property_typed_from_a_ctor_parameter",
+        \\base
+        \\derived
+        \\
+    );
+}
+
 test "property_typed_from_a_factory_call" {
     try check("property_typed_from_a_factory_call",
         \\base

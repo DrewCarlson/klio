@@ -1013,9 +1013,19 @@ it bound against the runtime class rather than the declared one. Accept a call
 to a uniquely-named declaration with a declared return type, which is the same
 evidence a constructor gives.
 
-Worth ZERO on both censuses and kept for the same reason as the null-narrowing
-entry: `property_typed_from_a_factory_call` prints `derived` where kotlinc
-prints `base`, so it was a wrong ANSWER, not a missed binding.
+A constructor PARAMETER is the same evidence again — `private val held = start`
+beside `class Holder(start: Base)` — and `KLIO_NORECV_NAMES=enclosing_member`
+showed it was the WHOLE of that bucket on the examples set: `_start` 104,
+`value` 98, `_endInclusive` and `_endExclusive` 52 each, then nothing above
+four. The stdlib's ranges and `Lazy` are written that way.
+
+Both are worth ZERO bound sites — the receivers acquire a type and then decline
+at the extension guard instead — and both are kept for the same reason as the
+null-narrowing entry: `property_typed_from_a_factory_call` and
+`property_typed_from_a_ctor_parameter` print `derived` where kotlinc prints
+`base`, so each was a wrong ANSWER, not a missed binding. What they do move is
+`no_receiver_type` into `resolver_declined` (stdlib 2,271 -> 2,255,
+examples 19,207 -> 18,999), which is the bucket the argument-type work unlocks.
 
 ### A sole global is the only answer, whatever the receiver context
 
