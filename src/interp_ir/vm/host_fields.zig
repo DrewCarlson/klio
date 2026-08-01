@@ -3239,11 +3239,30 @@ fn resolveInstanceGetter(
             // own class; everything after it is inherited.
             const inherited = head != 0;
             const private_here = lookupPairFunc(pg.get().instance_prop_private, cn, name) != null;
+            // On an ANONYMOUS receiver class an INHERITED member getter is a
+            // supertype-matched guess (the synth lists upstream classes for
+            // type checks), and the pack's shadowing EXTENSION property is
+            // the real implementation: `ch.onReceive` inside a select must
+            // reach the klio clause glue on ReceiveChannel, never upstream
+            // BufferedChannel's SelectClause machinery. Stand down when an
+            // extension property of the name is keyed on this chain entry.
+            const ext_shadows = inherited and hit != null and blk: {
+                const ig = inst.borrow();
+                defer ig.deinit();
+                const icg = ig.get().class.borrow();
+                defer icg.deinit();
+                if (!icg.get().is_anonymous) break :blk false;
+                for (icg.get().supertype_names) |sup| {
+                    if (lookupPairFunc(pg.get().extension_props, sup, name) != null) break :blk true;
+                }
+                break :blk false;
+            };
             pg.deinit();
-            if (hit != null and !(private_here and inherited)) {
+            if (hit != null and !(private_here and inherited) and !ext_shadows) {
                 found = hit.?;
                 break;
             }
+            if (ext_shadows) return null;
         }
         if (cdef) |d| {
             const dg = d.borrow();

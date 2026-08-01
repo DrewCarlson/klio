@@ -3212,3 +3212,15 @@ slot link + no __sam_target__ -> dispatch by name) is implemented in
 invokeVirtualMember in this commit — correct but insufficient alone,
 since the clause is a PROPERTY read. onSend/onReceiveCatching will
 recover with the same fix. interp_ir 117/117 with the reroute in.
+
+
+Property-side standdown IMPLEMENTED at `resolveInstanceGetter` (an
+anonymous receiver's INHERITED member getter stands down when any of
+the synth's supertype_names keys an extension property of the name) —
+unit gates green, but select STILL HANGS: the serving arm for
+`ch.onReceive` is elsewhere. Next probes: the sgetter walk (~1035), the
+getter MEMO caches (`sgetterPutGetter` may serve a stale pick before
+the walk), and `KLIO_MISS_TRACE=onReceive` with the [sgp]/field-trace
+prints to see which arm answers. The klio clause glue's entry
+(`klioRegReceive` [fn-entry]) is the ground-truth signal that the read
+finally reached the pack's extension property.
