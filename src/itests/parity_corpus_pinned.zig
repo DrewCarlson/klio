@@ -1493,3 +1493,25 @@ test "iterator_member_global_arity" {
         \\
     );
 }
+
+test "vararg_before_defaulted_positional" {
+    try check("vararg_before_defaulted_positional",
+        \\A [1,2,3] end
+        \\B [1] end
+        \\C [] end
+        \\D [4,5] z
+        \\E [7,8,9] end
+        \\
+    );
+}
+
+test "range_in_range_user_operator" {
+    try check("range_in_range_user_operator",
+        \\true
+        \\false
+        \\true
+        \\true
+        \\false
+        \\
+    );
+}

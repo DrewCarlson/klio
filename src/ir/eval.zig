@@ -968,17 +968,32 @@ pub fn dumpCurrentFrameParamsForDiag() void {
             if (i >= fr.params.items.len) break;
             const v = &fr.params.items[i];
             std.debug.print("  [{d}] {s} = {s} {s}\n", .{
-                i, p.name, @tagName(std.meta.activeTag(v.*)), v.typeFqn(),
+                i, p.name, @tagName(std.meta.activeTag(v.*)), diagValueClassName(v),
             });
         }
         // Captures carry a closure's environment; a mis-captured callee
         // slot (`this.LocalFn(...)` binding an Any) is only visible here.
         for (fr.captures.items, 0..) |*cv, i| {
             std.debug.print("  [cap {d}] {s} {s}\n", .{
-                i, @tagName(std.meta.activeTag(cv.*)), cv.typeFqn(),
+                i, @tagName(std.meta.activeTag(cv.*)), diagValueClassName(cv),
             });
         }
     }
+}
+
+/// The value's concrete runtime class name for diagnostics: an Instance
+/// answers its class, everything else its type FQN. `typeFqn` alone prints
+/// `<instance>` for interpreted objects, which hides exactly the fact a
+/// wrong-receiver diagnosis needs.
+fn diagValueClassName(v: *const Value) []const u8 {
+    if (v.* == .Instance) {
+        const ig = v.Instance.borrow();
+        defer ig.deinit();
+        const cg = ig.get().class.borrow();
+        defer cg.deinit();
+        return cg.get().name;
+    }
+    return v.typeFqn();
 }
 
 fn spinDumpMaybe() void {

@@ -1491,6 +1491,13 @@ fn composableEval(
                 if (v.* == .Int) std.debug.print(":{d}", .{v.Int});
                 if (v.* == .Long) std.debug.print(":{d}", .{v.Long});
                 if (v.* == .ULong) std.debug.print(":{x}", .{v.ULong});
+                if (v.* == .Instance) {
+                    const ig = v.Instance.borrow();
+                    const cg = ig.get().class.borrow();
+                    std.debug.print(":{s}", .{cg.get().name});
+                    cg.deinit();
+                    ig.deinit();
+                }
             }
             std.debug.print("\n", .{});
         }
@@ -1922,6 +1929,10 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                             (std.mem.eql(u8, pp.name, "$composer") or std.mem.eql(u8, pp.name, "$changed"))) continue;
                         const has_default = walk_defaults != null and j < walk_defaults.?.len and walk_defaults.?[j] != null;
                         if (!has_default) required_tail += 1;
+                    }
+                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                        if (std.mem.eql(u8, w, f.name))
+                            std.debug.print("[vabsorb] {s} n_pos={d} seen={d} req_tail={d} defaults={}\n", .{ f.name, n_pos_total, pos_seen, required_tail, walk_defaults != null });
                     }
                     if (n_pos_total - pos_seen > required_tail) {
                         try vararg_acc.append(allocator, a);
