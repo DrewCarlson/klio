@@ -3969,6 +3969,32 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
 /// Shared flat-request tail: resolve `target`, admit only the fully-applied
 /// no-vararg shape, and build the `[receiver] ++ args` frame vector with the
 /// threaded-composer push the recursive invoker would perform.
+/// Whether the receiver's type declares a member of `name`, for ANY
+/// receiver kind. `hostHasMember` answers only for interpreted Instances;
+/// a HOST container (`.List`, `.Map`, a scalar) dispatches its members
+/// through the FQN-keyed host table, so probe that table under the value's
+/// nominal type and its builtin supertypes. The member-first guards lean
+/// on this: with the Instance-only test they were blind to exactly the
+/// receivers the `contains` self-loop runs on.
+fn receiverHasMemberNamed(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    if (receiver.* == .Instance) return hostHasMember(self, receiver, name);
+    var buf: [192]u8 = undefined;
+    const nominal = valueNominalFqn(receiver);
+    if (std.fmt.bufPrint(&buf, "{s}.{s}", .{ nominal, name })) |fqn| {
+        if (lookupIntrinsic(self, fqn) != null) return true;
+    } else |_| {}
+    const simple = simpleName(nominal);
+    for (applicability.builtinSupersOf(simple)) |sup| {
+        if (std.fmt.bufPrint(&buf, "kotlin.collections.{s}.{s}", .{ sup, name })) |fqn| {
+            if (lookupIntrinsic(self, fqn) != null) return true;
+        } else |_| {}
+        if (std.fmt.bufPrint(&buf, "kotlin.{s}.{s}", .{ sup, name })) |fqn| {
+            if (lookupIntrinsic(self, fqn) != null) return true;
+        } else |_| {}
+    }
+    return false;
+}
+
 /// A cached by-name extension resolution must never serve the frame that
 /// is currently EXECUTING it: the bare call inside `Iterable.contains`'s
 /// own body hitting the same (receiver-class, name, argc) key as the call
@@ -4053,7 +4079,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             if (instanceMethodKeyRelaxed(self, receiver, name, args, static_recv)) |rk| {
                 if (instanceMethodCacheGetRaw(self, rk)) |raw| {
                     if (raw != METHOD_MISS) {
-                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                        if (!cacheServesExecutingFrame(raw))
+                            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                     }
                 }
             }
@@ -4061,7 +4088,8 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (head_strict) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
                 if (raw != METHOD_MISS) {
-                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                    if (!cacheServesExecutingFrame(raw))
+                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                 }
                 // A cached miss falls through to the probe ladder (stdlib /
                 // extension / field), but `irMethodWalk` will skip the walk.
@@ -12022,7 +12050,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
     // `if (this is Collection) return contains(element)` then re-enters
     // itself instead of reaching the List member. Scoped to the thinned
     // case so unarmed behavior is unchanged.
-    const defer_to_member = bound_thinned and hostHasMember(self, receiver, name);
+    const defer_to_member = bound_thinned and receiverHasMemberNamed(self, receiver, name);
     if (!defer_to_property and !defer_to_iterable and !defer_to_member) {
         const c = chosen.?;
         if (trace.enabled(name)) {
@@ -13023,7 +13051,7 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
     // tie must not newly commit past the member tail — the ranges
     // `contains` family's own `element != null && contains(element)`
     // re-entered itself exactly here.
-    if (bound_thinned and hostHasMember(self, receiver, name)) return null;
+    if (bound_thinned and receiverHasMemberNamed(self, receiver, name)) return null;
     if (candidates.items.len == 1) return candidates.items[0].fid;
     const chosen = scoreExtCandidates(self, allocator, receiver, candidates.items, args) catch return null;
     if (trace.enabled(name)) {

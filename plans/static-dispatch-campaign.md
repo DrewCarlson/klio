@@ -2714,3 +2714,20 @@ callMemberNamedInner's interior: an env-gated route print before every
 and the member-first rule lands on the printed line. Every guard landed
 during this hunt is independently Kotlin-true and validated; the
 default path has stayed green throughout.
+
+
+Eleventh and twelfth: the two member method-cache serves at the top of
+`callMemberInnerStatic` carry the executing-frame guard, and — the
+inert-guard root cause — `hostHasMember` answers FALSE for every
+non-Instance receiver, so all member-first guards were blind to host
+containers (the exact receivers in the loop). `receiverHasMemberNamed`
+now probes the FQN-keyed host table under the value's nominal type and
+its builtin supertypes, and the fallback-walk and strict-resolver
+guards use it. The armed loop STILL reproduces, so its committing line
+sits in a resolver none of the twelve guarded routes cover and none of
+the audits print. Do NOT add further blind guards (a categorical
+self-fid decline at invokeMethodFuncId would break legitimate by-name
+tree recursion); the next session goes straight to route prints before
+EVERY invoke in callMemberInnerStatic's remaining ladder (the builtin
+probe ladder and irMethodWalk's serves), one armed run, and the fix
+lands on the printed line.
