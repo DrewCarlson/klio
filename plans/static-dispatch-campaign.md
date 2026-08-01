@@ -2818,3 +2818,16 @@ batched sibling set changing the receiver derivation). Next: [bare-read]
 /emission-arm trace on the exact span (file2:3031) in the batched run to
 see which emission arm fires and why `this` fails to resolve/bind for
 the spliced receiver-lambda there; the fix then lands at that arm.
+
+
+ArrayDeque armed follow-up, two measured zeros recorded: hinting the
+generic receiver-lambda's substituted head (both `orelse spliceRecvTy`
+and the isTypeParam-aware variant) did not change the armed verdict —
+the failing bare `clear()` sits under NESTED splices (`testArrayDeque
+{ ... }`'s lambda splice wraps the `apply { }` splice) and the
+hint/receiver channels are restored per layer, so the inner
+substitution never survives to the site. Both edits reverted. Next
+probe: print `spliceRecvTy`/`spliceHintRecv`/`lambda_splice_resolve`
+at the exact site (KLIO_BAREARM extended with the three channel values)
+through the nested-splice path in the batched run; the fix belongs at
+whichever layer drops the subject's head.
