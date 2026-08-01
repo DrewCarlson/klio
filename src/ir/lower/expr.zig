@@ -13105,7 +13105,11 @@ fn lowerResolvedExtensionCall(
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
 
-    const dispatch_reg: ?Reg = if (target.kind == .member_extension)
+    // `lowerMemberExtensionDispatchReceiver` and `lowerReceiver` can lower
+    // lambda bodies, which appends to the module's function table and moves
+    // it — `target` points into that table and must not be read after them.
+    const target_is_member_extension = target.kind == .member_extension;
+    const dispatch_reg: ?Reg = if (target_is_member_extension)
         (try lowerMemberExtensionDispatchReceiver(
             b,
             resolution.dispatch_owner orelse return null,
@@ -13113,7 +13117,7 @@ fn lowerResolvedExtensionCall(
     else
         null;
     const recv_reg = try lowerReceiver(b, receiver);
-    if (target.kind == .member_extension) {
+    if (target_is_member_extension) {
         const run = try lowerArgRunWithArity(b, selected_values, arg_arity);
         const arg_names = try trailingLambdaArgNames(
             b,
