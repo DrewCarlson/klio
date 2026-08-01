@@ -2340,3 +2340,31 @@ The fast loop (harness + sweep + unit modules) structurally cannot see this
 path: only the e2e/parity itests run in-process base-image adoption with the
 loop JIT forced on. `KLIO_E2E_SHARD=0/16` on a built e2e binary covers it in
 under a minute — use it whenever interp_ir/runtime/image internals change.
+
+
+### e2e recovery status: three allocator bugs fixed, one residual
+
+Fixed and verified by crash-shape elimination (0/3 tests -> 1/3, and the
+corpus now runs deep instead of dying on its first program):
+
+1. `vmFromBuilt` MOVED the arena-owned `enum_entry_arg_inits` list into a
+   Vm whose GC-run allocator is the slab; teardown freed the arena buffer
+   through it (the collapsed `vm.deinit -> rawFree` trace, `0xAAAAAAAA`
+   header). It now copies the list with the Vm allocator; managed hashmaps
+   were never affected because they remember their own allocator.
+2. Base-backed programs patch SHARED cached instances; values now allocate
+   from the cache entry's arena (`Vm.patch_allocator`, threaded
+   BaseEntry -> PreparedProgram -> runFilesInMode).
+3. Whole-program fallbacks own their instances; their patch allocator is
+   the run arena (which outlives the Vm), not the slab.
+
+RESIDUAL: one segfault (`0xaaaaaaaaaaaaaaf0` — poisoned pointer read) in
+`jit_object_traversal_loop` (jit=true) that needs ~150 prior in-process
+programs to manifest — it passes standalone under KLIO_JIT=1. Plus
+program-level FAILs (missing fields like `DrawImpl.id`,
+`KlioBufferedChannel.closeHandler`; drifted outputs) that the
+first-program crash previously MASKED — they need triage against expected
+outputs before they can be attributed. The e2e suite has been red since
+e7f76632 (the GC test-profile alignment, ~534 commits ago), so these
+failures accumulated unseen; `KLIO_E2E_FILTER`/`KLIO_E2E_SHARD` are the
+narrowing tools.

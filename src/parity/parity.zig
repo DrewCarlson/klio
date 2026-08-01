@@ -1408,6 +1408,10 @@ const StdlibBase = interp_ir.build.StdlibBase;
 const BaseEntry = struct {
     base: *const StdlibBase,
     map: *const SourceMap,
+    /// The cache entry's own arena. Values the enum-entry patch writes into
+    /// the SHARED base instances must live exactly as long as the entry, not
+    /// as long as the program that happened to evaluate them.
+    patch_allocator: ?Allocator = null,
 };
 
 var base_lock: runtime.SpinMutex = .{};
@@ -1754,7 +1758,7 @@ fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: u16, full: bool) Al
     const loaded = (try interp_ir.image.load(a, bytes)) orelse return null;
     for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
     const entry = try a.create(BaseEntry);
-    entry.* = .{ .base = loaded.base, .map = loaded.map };
+    entry.* = .{ .base = loaded.base, .map = loaded.map, .patch_allocator = a };
     return entry;
 }
 
@@ -1836,7 +1840,7 @@ fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: u16, ful
     base.user_file_start = @intCast(map.files.items.len);
 
     const entry = try a.create(BaseEntry);
-    entry.* = .{ .base = base, .map = map };
+    entry.* = .{ .base = base, .map = map, .patch_allocator = a };
     return entry;
 }
 
@@ -1846,6 +1850,7 @@ const PreparedProgram = struct {
     built: interp_ir.build.BuiltModule,
     map: *const SourceMap,
     bindings: ?HostBindings,
+    patch_allocator: ?Allocator = null,
 };
 
 /// Try to assemble `files` against the shared dependency base. Returns
@@ -1914,7 +1919,12 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
 
     const built = try interp_ir.build.buildModuleFilesExtend(arena, entry.base, user_asts);
     const bindings: ?HostBindings = if (mode == .EmbeddedOnly) null else try packHostBindings(arena);
-    return .{ .ok = .{ .built = built, .map = map, .bindings = bindings } };
+    return .{ .ok = .{
+        .built = built,
+        .map = map,
+        .bindings = bindings,
+        .patch_allocator = entry.patch_allocator,
+    } };
 }
 
 /// Assemble `file` under `mode`, build the module, and run `main`, returning
@@ -1992,6 +2002,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     var built: interp_ir.build.BuiltModule = undefined;
     var prog_map: *const SourceMap = undefined;
     var prog_bindings: ?HostBindings = null;
+    var prog_patch_alloc: ?Allocator = null;
     var used_base = false;
     if (try prepareWithBase(arena, io, files, mode)) |r| switch (r) {
         .err => |e| return .{ .err = try allocator.dupe(u8, e) },
@@ -1999,6 +2010,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
             built = p.built;
             prog_map = p.map;
             prog_bindings = p.bindings;
+            prog_patch_alloc = p.patch_allocator;
             used_base = true;
         },
     };
@@ -2038,6 +2050,11 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     const pair = try interp_ir.Vm.fromBuilt(vm_allocator, &built);
     built.deinit();
     var vm = pair.vm;
+    // A base-backed program patches the SHARED cached instances, so its
+    // values must live with the cache entry; a whole-program fallback owns
+    // its instances outright, and the run arena (which outlives the Vm) is
+    // the allocator its field lists were built from.
+    vm.patch_allocator = prog_patch_alloc orelse arena;
     defer {
         if (gc_run) interp_ir.resetRunGlobalCaches();
         vm.deinit();

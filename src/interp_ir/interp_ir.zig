@@ -1231,6 +1231,12 @@ pub const Vm = struct {
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
     allocator: Allocator,
+    /// When set, the enum-entry ctor-arg patch allocates its values and
+    /// field buffers here instead of `allocator`. The parity drivers point
+    /// it at the shared base cache entry's arena, because the patch writes
+    /// into instances that OUTLIVE the program: a per-program value there is
+    /// swept at end-of-program collect and dangles for the next program.
+    patch_allocator: ?Allocator = null,
     /// Process argv for the program's `main(args: Array<String>)`. Empty
     /// under `klio run`; a bundle passes its argv[1..] through.
     program_args: []const []const u8 = &.{},

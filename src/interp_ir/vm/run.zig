@@ -86,11 +86,15 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
     built.classes = ClassTable.init(allocator);
     vm.classes = try ObjRef(ClassTable).init(allocator, taken);
 
-    // Move the enum-entry ctor-arg thunks into the Vm; the startup pass
-    // patches each entry's instance fields with their evaluated values.
+    // COPY the enum-entry ctor-arg thunks rather than moving the list: the
+    // built list is arena-owned, and the Vm frees its own containers with
+    // the VM allocator — under a GC run that is the slab, and freeing an
+    // arena buffer through the slab reads a garbage page header at
+    // teardown. The entries are plain values; the donor list stays with
+    // `built` so its own deinit frees it where it was allocated.
     vm.enum_entry_arg_inits.deinit(allocator);
-    vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
-    built.enum_entry_arg_inits = .empty;
+    vm.enum_entry_arg_inits = .empty;
+    try vm.enum_entry_arg_inits.appendSlice(allocator, built.enum_entry_arg_inits.items);
 
     // Top-level property initialiser order is preserved.
     vm.top_level_props.deinit(allocator);
@@ -663,6 +667,19 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 }
             };
             if (idx < param_names.items.len) {
+                // The instance is shared through the base cache, so the value
+                // stored must share the CACHE's lifetime: copy a string into
+                // the patch allocator (scalars are by value; anything else is
+                // left as-is and noted by the trace above when it appends).
+                const pa = self.patch_allocator orelse self.allocator;
+                const stored: Value = switch (v) {
+                    .String => |sref| blk: {
+                        const sg = sref.borrow();
+                        defer sg.deinit();
+                        break :blk .{ .String = try runtime.strInit(pa, sg.get().bytes) };
+                    },
+                    else => v,
+                };
                 const g = inst.borrowMut();
                 // A baked enum instance carries every constructor-parameter
                 // field, so this define REPLACES in place. An append here
@@ -675,7 +692,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                         entry.class_name, entry.entry_name, param_names.items[idx],
                     });
                 }
-                g.get().define(self.allocator, param_names.items[idx], v) catch {};
+                g.get().define(pa, param_names.items[idx], stored) catch {};
                 g.deinit();
             }
         }
