@@ -1525,3 +1525,13 @@ test "finally_runs_on_return_leaf_shape" {
         \\
     );
 }
+
+test "throwable_suppressed_user_instance" {
+    try check("throwable_suppressed_user_instance",
+        \\0
+        \\2
+        \\[side, side2]
+        \\2
+        \\
+    );
+}

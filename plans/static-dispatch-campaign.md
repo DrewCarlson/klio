@@ -3019,3 +3019,17 @@ finally_runs_on_return_leaf_shape; the example matches. Sweep 117/0.
 KLIO_DUMP_FN now also accepts a function NAME (dumps every func bearing
 it) and prints per-block try metadata (catches/finally/sentinel/pop) —
 both were needed to see this.
+
+
+### throwable_suppressed: the statically bound header skipped the Instance arms
+
+`addSuppressed`/`suppressedExceptions` on a USER throwable class: the
+member-dispatch arms maintain the hidden `__suppressed__` list on
+interpreted instances, but the campaign's static binding routes the
+expect-header call straight to the host intrinsic — which handled only
+host `.Exception` values and silently no-opped on an Instance. Another
+instance of the invokeOnClose class: a site becoming statically bound
+exposes an intrinsic that never expected interpreted receivers. Both
+intrinsics now serve the `__suppressed__` protocol for Instances.
+Pinned by throwable_suppressed_user_instance; the example matches.
+Sweep 117/0.

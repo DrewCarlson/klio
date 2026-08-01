@@ -221,6 +221,33 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
             try g.get().append(ctx.allocator, ctx.args[1]);
         }
     }
+    // A USER throwable is an interpreted Instance; its suppressed set is
+    // the hidden `__suppressed__` list the member arms also maintain. The
+    // statically bound header call lands here directly, so the Instance
+    // shape must be served, not silently dropped.
+    if (ctx.args.len >= 2 and ctx.args[0] == .Instance) {
+        const inst = ctx.args[0].Instance;
+        const existing: ?Value = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().get("__suppressed__");
+        };
+        const list: Value = blk: {
+            if (existing) |l| {
+                if (l == .List) break :blk l;
+            }
+            const items = try ValueList.init(ctx.allocator, .empty);
+            const fresh = Value{ .List = .{ .items = items, .mutable = true, .enum_entries = false, .backing = null } };
+            const g = inst.borrowMut();
+            defer g.deinit();
+            try g.get().define(ctx.allocator, "__suppressed__", fresh);
+            break :blk fresh;
+        };
+        const g = list.List.items.borrowMut();
+        defer g.deinit();
+        if (runtime.reclaimEnabled()) ctx.args[1].retain();
+        try g.get().append(ctx.allocator, ctx.args[1]);
+    }
     return ok(.Unit);
 }
 
@@ -230,6 +257,14 @@ pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
             return ok(makeList((ValueList{ .cell = sl_cell }).clone(), false));
+        }
+    }
+    if (ctx.args.len >= 1 and ctx.args[0] == .Instance) {
+        const inst = ctx.args[0].Instance;
+        const g = inst.borrow();
+        defer g.deinit();
+        if (g.get().get("__suppressed__")) |l| {
+            if (l == .List) return ok(makeList(l.List.items.clone(), false));
         }
     }
     const items = try ValueList.init(ctx.allocator, .empty);
