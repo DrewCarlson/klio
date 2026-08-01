@@ -2501,3 +2501,15 @@ owner's members now merge into the enclosing scope, sending the read
 through the scoped-getter walk that carries the declaring class. Both the
 direct read and the read inside a spliced lambda resolve to the owner.
 Pinned suite 130 -> 131 of 134; sweep 117/0, examples A/B clean.
+
+
+### LANDED: a private member extension stays inside its declaring class
+
+Extension resolution's visibility switch skipped the Private check
+entirely for MEMBER extensions, so `PrivateBase`'s private
+`String.startsWith` bound inside `PrivateDerived` — inheritance is not
+lexical visibility, and kotlinc gives the call to the stdlib candidate.
+The rule now requires the caller's lexical family to contain the
+declaring class in either nesting direction (which keeps a companion's
+privates visible in its enclosing class) and never through inheritance.
+Pinned suite 131 -> 132 of 134; sweep 117/0, examples A/B clean.

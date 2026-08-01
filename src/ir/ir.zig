@@ -3661,6 +3661,24 @@ pub const Module = struct {
                                 continue;
                             };
                             if (decl_file.int() != ctx.caller_file.int()) continue;
+                        } else {
+                            // A private MEMBER extension is visible only in
+                            // its declaring class's lexical family — nesting
+                            // in either direction covers a companion's
+                            // privates in the enclosing class — and never
+                            // through inheritance: PrivateDerived does not
+                            // see PrivateBase's private extension, so the
+                            // stdlib candidate must win there.
+                            const owner_name = self.registry.member_ext_owner_class.get(fid) orelse continue;
+                            const owner_cid = (self.classIdByFqn(owner_name) orelse
+                                self.classId(owner_name)) orelse continue;
+                            const lex_name = ctx.lexical_owner orelse continue;
+                            const lex_cid = (if (std.mem.indexOfScalar(u8, lex_name, '.') != null)
+                                self.classIdByFqn(lex_name)
+                            else
+                                self.classId(lex_name)) orelse continue;
+                            if (!self.lexicalChainContains(lex_cid, owner_cid) and
+                                !self.lexicalChainContains(owner_cid, lex_cid)) continue;
                         }
                     },
                     .Internal => {
