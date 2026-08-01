@@ -1453,3 +1453,43 @@ test "init_lambda_encloses_instance" {
         \\
     );
 }
+
+test "receiver_scope_zero_arg_println" {
+    try check("receiver_scope_zero_arg_println",
+        \\a
+        \\b
+        \\
+    );
+}
+
+test "getter_lambda_param_shape" {
+    try check("getter_lambda_param_shape",
+        \\got:x
+        \\
+    );
+}
+
+test "bare_call_through_closure_subject" {
+    try check("bare_call_through_closure_subject",
+        \\v1
+        \\v2
+        \\v3
+        \\
+    );
+}
+
+test "local_extension_fbounded_param" {
+    try check("local_extension_fbounded_param",
+        \\5
+        \\fig
+        \\
+    );
+}
+
+test "iterator_member_global_arity" {
+    try check("iterator_member_global_arity",
+        \\4
+        \\9
+        \\
+    );
+}

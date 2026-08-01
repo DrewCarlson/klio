@@ -2919,7 +2919,11 @@ fn buildModuleWithOverrides(
                 const fid = switch (getter.body) {
                     .Expr => |body| blk: {
                         const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body);
-                        break :blk try ir.lower.lowerAccessorExpr(module, c.name.name, &own_members, &.{"this"}, rewritten, nm);
+                        // The property's declared type is the expression body's
+                        // expected type: a getter returning a lambda
+                        // (`get() = { collectTo(it) }` typed `suspend (P) -> Unit`)
+                        // needs it to prove the lambda's parameter shape.
+                        break :blk try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, &.{"this"}, rewritten, nm, p.ty);
                     },
                     .Block => |blk_body| blk: {
                         const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name);
@@ -3619,7 +3623,7 @@ fn buildModuleWithOverrides(
             defer empty_members.deinit();
             const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
             const fid = switch (getter.body) {
-                .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &empty_members, &.{"this"}, &body, nm),
+                .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, p.ty),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
             };
             if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
