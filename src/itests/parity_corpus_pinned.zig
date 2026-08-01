@@ -1535,3 +1535,15 @@ test "throwable_suppressed_user_instance" {
         \\
     );
 }
+
+test "reified_from_lambda_annotation" {
+    try check("reified_from_lambda_annotation",
+        \\is
+        \\no
+        \\plain:5
+        \\is:HI
+        \\no
+        \\is
+        \\
+    );
+}

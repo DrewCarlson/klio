@@ -6455,6 +6455,21 @@ fn inlineTargetForBareCall(
         args.len,
         shape.last_is_lambda,
     );
+    if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| {
+        if (std.mem.eql(u8, efw, nm)) {
+            const rid: i64 = switch (ires.outcome) {
+                .resolved => |fid| @intCast(fid.int()),
+                else => -1,
+            };
+            std.debug.print("[tbie] {s} outcome={s} fid={d} narrowed={} ast_by_id={}\n", .{
+                nm,
+                @tagName(ires.outcome),
+                rid,
+                narrowed != null,
+                rid >= 0 and inline_state.inlineAstById(@intCast(rid)) != null,
+            });
+        }
+    }
     var pick: ?*const ast.Function = switch (ires.outcome) {
         .resolved => |fid| blk: {
             // Receiver preference: an extension the receiver narrowing matched
@@ -6685,6 +6700,10 @@ fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const 
         const pname = f.params[i].ty.name.name;
         const phead = std.mem.trimEnd(u8, pname, "?");
         if (std.mem.eql(u8, ehead, phead)) continue;
+        // A top-type parameter accepts every argument; evidence can never
+        // disprove it (`classify(x: Any, block: (T) -> String)` called
+        // with an Int must keep the reified splice).
+        if (std.mem.eql(u8, phead, "Any")) continue;
         const e_builtin = paramLitKind(ehead);
         const p_builtin = paramLitKind(phead);
         // A known user class where a builtin kind is required (or vice

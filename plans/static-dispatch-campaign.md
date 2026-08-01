@@ -3033,3 +3033,18 @@ exposes an intrinsic that never expected interpreted receivers. Both
 intrinsics now serve the `__suppressed__` protocol for Instances.
 Pinned by throwable_suppressed_user_instance; the example matches.
 Sweep 117/0.
+
+
+### reified_param_inference: `Any` treated as evidence-refutable
+
+`inline fun <reified T> classify(x: Any, block: (T) -> String)` called
+with an Int lost its splice: `inlineEvidenceRejects` counted the
+argument's Int evidence against the `Any` parameter as a definite
+mismatch (builtin evidence vs a registered non-builtin class), declined
+the splice, and the dynamic `is T` ran with T unbound — answering `is`
+for every argument. A top-type parameter can never be disproven by
+evidence; the check now skips `Any` params. T then solves statically
+from the lambda annotation (`{ s: String -> }`), which the unifier
+already knew how to do. Pinned by reified_from_lambda_annotation; the
+example matches. Sweep 117/0. (`[tbie]` now also prints the index
+outcome/pick provenance under KLIO_EF_TRACE.)
