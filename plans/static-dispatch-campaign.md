@@ -2932,3 +2932,20 @@ throwable_suppressed_user_class, vararg_nonfinal (vararg tail loss),
 select_on_timeout_loses (timeout), runtest_channel_resume_order advanced
 to a comparator-from-bound-reference failure (`compare` on
 `$bound_ref$time`).
+
+
+### An F-bounded local extension vanished at its own call site
+
+complex_oop_delegation's real defect had nothing to do with delegation:
+`fun <T : Comparable<T>> List<T>.medianish()` declared INSIDE main was
+uncallable. `localTypeParamBounds` records `Comparable<T>` head-only
+(`complete=false` — the args are dropped), and
+`staticGenericReceiverApplicable` treats an incomplete bound as a failed
+proof. Right for the campaign's PROVE callers (never commit on an
+unprovable bound), wrong for `localOverloadReceiverCouldApply`: a local
+fn has no other server, so refusing the sole candidate turned the call
+into a runtime member-miss. Split the mode:
+`staticGenericReceiverCouldApply` skips incomplete bounds (kotlinc
+already accepted the declaration); prove callers keep declining. Pinned
+by local_extension_fbounded_param; complex_oop_delegation matches its
+expected output again. Sweep 117/0.

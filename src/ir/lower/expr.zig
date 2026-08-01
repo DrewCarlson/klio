@@ -13458,7 +13458,7 @@ fn localOverloadReceiverCouldApply(
         }
     }
     if (overload.receiver_has_type_params) {
-        return b.module.staticGenericReceiverApplicable(
+        return b.module.staticGenericReceiverCouldApply(
             b.allocator,
             actual,
             declared,

@@ -1477,3 +1477,11 @@ test "bare_call_through_closure_subject" {
         \\
     );
 }
+
+test "local_extension_fbounded_param" {
+    try check("local_extension_fbounded_param",
+        \\5
+        \\fig
+        \\
+    );
+}

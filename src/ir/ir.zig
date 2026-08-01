@@ -3078,6 +3078,35 @@ pub const Module = struct {
         declared_params: []const ModuleRegistry.TypeParamBound,
         actual_bounds: []const ModuleRegistry.TypeParamBound,
     ) Allocator.Error!bool {
+        return self.staticGenericReceiverApplicableMode(allocator, actual, pattern, declared_params, actual_bounds, .prove);
+    }
+
+    /// Could-apply variant: a bound whose recorded form is INCOMPLETE (a
+    /// head-only `Comparable` standing in for `Comparable<T>`) does not
+    /// refute — kotlinc already accepted the declaration, and for a LOCAL
+    /// extension nothing else can serve the call, so an unprovable bound
+    /// must not make the sole candidate vanish. Prove callers keep
+    /// declining on incomplete bounds through the wrapper above.
+    pub fn staticGenericReceiverCouldApply(
+        self: *const Module,
+        allocator: Allocator,
+        actual: TypeRef,
+        pattern: TypeRef,
+        declared_params: []const ModuleRegistry.TypeParamBound,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
+    ) Allocator.Error!bool {
+        return self.staticGenericReceiverApplicableMode(allocator, actual, pattern, declared_params, actual_bounds, .could_apply);
+    }
+
+    fn staticGenericReceiverApplicableMode(
+        self: *const Module,
+        allocator: Allocator,
+        actual: TypeRef,
+        pattern: TypeRef,
+        declared_params: []const ModuleRegistry.TypeParamBound,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
+        mode: enum { prove, could_apply },
+    ) Allocator.Error!bool {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -3113,7 +3142,10 @@ pub const Module = struct {
                 else
                     continue);
             if (gra_trace) std.debug.print("[gra]  param {s}<:{s} complete={} actual={s}\n", .{ param.param, param.bound, param.complete, bound_actual.name });
-            if (!self.staticBoundProofComplete(param, declared_params, 0)) return false;
+            if (!self.staticBoundProofComplete(param, declared_params, 0)) {
+                if (mode == .could_apply) continue;
+                return false;
+            }
             const dependent_bound = rawBoundNamesDeclaredParam(
                 declared_params,
                 param.bound,
