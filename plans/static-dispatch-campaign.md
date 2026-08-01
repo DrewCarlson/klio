@@ -3463,3 +3463,27 @@ inline_state.inlineAstById-style registry for expr bodies). Either
 unblocks the chain's last inch: arg typed Function3 -> the landed
 refutation drops #79 (`inst=Unit` vs Function3) -> the file-private
 extension binds -> `got 99`.
+
+
+Implementation sketch for the ordering pass (mechanism fully known):
+
+- REGISTRY: extend build.zig's stub pass (the loop that already does
+  `registerInlineFnId(id, FF(ast.Function).fromPtr(f))` for inline fns
+  at ~2563) to also register EXPR-BODIED non-inline fns in a parallel
+  `expr_body_asts` table keyed by the header FuncId, via a sibling
+  `inline_state.registerExprBodyFn` — same FF mechanism, same lifetime.
+- ON-DEMAND DERIVE: in expr.zig's bareret Member arm (and the
+  stmt.zig `.Call` local-recording arm), when
+  `instantiatedCallReturnType` answers null AND the target's return is
+  the undeclared-Unit placeholder, look up the registered AST and run
+  `staticExprTypeRef` on its body with a FRESH FuncBuilder seeded
+  `setOwnerClass(<target's enclosing class>)` + `setRecvTy` — the
+  derivation for `onCancellationConstructor?.invoke(...)` needs only
+  the owner-class property channel plus the landed invoke arm. Cache
+  the answer into the module func's return_ty so the second consult is
+  free (and decl lowering's own step-2 pass stays authoritative).
+- VERIFY: smac-arg flips `arg_ty=-` to `arg_ty=Function3` and
+  `-> incompatible`; member-static for the 1-arg site loses target=79;
+  select prints `got 99`; then sweep + drift + pinned (the standard
+  battery), pin select_on_timeout_loses as a parity fixture, and close
+  the residual.
