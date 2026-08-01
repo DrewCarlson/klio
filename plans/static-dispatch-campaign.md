@@ -2969,3 +2969,21 @@ Iterable/List/Collection (`extCouldApply` arity), so `max(1, n)` falls
 through to the resolved global. Pinned by iterator_member_global_arity
 (behavioral; the deferred-CMG route itself is pinned by compose_path in
 the corpus). Drift 253 -> 255; sweep 117/0; pinned 138/139.
+
+
+### vararg_nonfinal: the value-call packer let a defaulted tail claim positionals
+
+Three vararg packers exist (host_call_func's simple packer, the
+reorder-aware named binder, and host_call_value's `nonfinal:` block for
+value calls) and only the named binder knew Kotlin's rule: a parameter
+AFTER a vararg is fillable positionally only when it cannot default (a
+generated slot-exact call) or through trailing-lambda syntax. The value
+route — which the bare CMG global tail takes — surrendered the last
+positional to `footer: String = "end"` unconditionally, so
+`report("A", 1, 2, 3)` printed `A [1,2] 3`. The block now computes the
+claiming tail from the defaults table plus the trailing-lambda shape,
+and a zero-claim tail packs everything into the vararg and re-pads the
+prefix through `padArgsWithDefaults` (the first padding pass ran before
+packing and saw four args). Pinned by
+vararg_before_defaulted_positional (including the `::report` reference
+route); the example matches. Drift 255 -> 256; sweep 117/0.

@@ -1493,3 +1493,14 @@ test "iterator_member_global_arity" {
         \\
     );
 }
+
+test "vararg_before_defaulted_positional" {
+    try check("vararg_before_defaulted_positional",
+        \\A [1,2,3] end
+        \\B [1] end
+        \\C [] end
+        \\D [4,5] z
+        \\E [7,8,9] end
+        \\
+    );
+}

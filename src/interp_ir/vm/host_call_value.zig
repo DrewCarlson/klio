@@ -1253,7 +1253,47 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 }
             }
             if (vi >= func.params.len - 1) break :nonfinal;
-            const trailing = func.params.len - vi - 1;
+            // A post-vararg param claims a positional tail arg only when it
+            // cannot default (a generated slot-exact call) or through
+            // trailing-lambda syntax; a defaulted tail (`footer: String =
+            // "end"`) never claims one — `report("A", 1, 2, 3)` packs all
+            // three ints and the footer defaults. Mirrors the reorder-aware
+            // named binder's rule.
+            const trailing = blk: {
+                const tail_defaults: ?[]?FuncId = dblk: {
+                    const pg = self.prog.borrow();
+                    defer pg.deinit();
+                    break :dblk pg.get().func_defaults.get(func.id.int());
+                };
+                const last_idx = func.params.len - 1;
+                const lambda_claim = std.mem.startsWith(u8, func.params[last_idx].ty.name, "Function") and
+                    args.len > 0 and
+                    (args[args.len - 1] == .IrClosure or args[args.len - 1] == .Function or
+                        args[args.len - 1] == .BoundMethod);
+                var n: usize = 0;
+                for (vi + 1..func.params.len) |j| {
+                    const has_default = tail_defaults != null and j < tail_defaults.?.len and tail_defaults.?[j] != null;
+                    if (!has_default or (j == last_idx and lambda_claim)) n += 1;
+                }
+                break :blk n;
+            };
+            if (trailing == 0) {
+                if (args.len > vi and !(args.len == vi + 1 and args[vi] == .Array)) {
+                    var packed_args: std.ArrayList(Value) = .empty;
+                    try packed_args.appendSlice(allocator, args[vi..]);
+                    const items = try ValueList.init(allocator, packed_args);
+                    var prefix: std.ArrayList(Value) = .empty;
+                    defer prefix.deinit(allocator);
+                    try prefix.appendSlice(allocator, args[0..vi]);
+                    try prefix.append(allocator, runtime.ArrayData.fromBoxedList(items));
+                    call_args.deinit(allocator);
+                    call_args = switch (try padArgsWithDefaults(self, allocator, module_ref, info.n_params, prefix.items, defaults)) {
+                        .ok => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                }
+                break :nonfinal;
+            }
             if (args.len < vi + trailing) break :nonfinal;
             const var_count = args.len - vi - trailing;
             if (var_count == 1 and args[vi] == .Array) break :nonfinal;
