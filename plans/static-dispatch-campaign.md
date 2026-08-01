@@ -2670,3 +2670,15 @@ remaining suspects are the CMG lenient pass and the splice-emitted
 built at lowering — check whether the armed static candidate FILTER
 prunes the member-reaching fallback out of that list before runtime ever
 walks it).
+
+
+Eliminated further: the bare-path CMG self-hint (a spliced body's bare
+call of its own name no longer carries the enclosing fn as the global
+hint — Kotlin binds the receiver's member there) and the flat arm
+(KLIO_FLAT=0 unchanged). The armed residual persists, so the committing
+route for the spliced ranges `contains` is the
+`implicit_this_call_global_fallback` emission arm (34 of the armed
+run's contains emissions) — inspect what func/candidates that arm
+attaches and whether its runtime tier can reach the receiver member at
+all. Armed DurationTest holds at 51/52 with all guards; default-off
+keeps every suite green.

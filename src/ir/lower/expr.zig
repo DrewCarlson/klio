@@ -11663,6 +11663,20 @@ fn lowerUnresolvedBareCall(
     static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
+    // Inside its own inline splice, a bare call of the SPLICED FUNCTION'S
+    // name resolves through the receiver walk — kotlinc binds the
+    // receiver's member (`ClosedRange.contains` inside the ranges
+    // `contains` body), never the enclosing extension itself. Keeping the
+    // self hint re-enters the splice at the global tier whenever every
+    // receiver probe misses, which is an unconditional recursion.
+    var ext_hint = static_ext;
+    if (ext_hint) |hint| {
+        if (b.currentInlineDecl()) |decl| {
+            if (inline_state.inlineIdByAst(decl)) |own| {
+                if (own == hint.int()) ext_hint = null;
+            }
+        }
+    }
     // A bare call to a name the enclosing anon object closes over.
     if (isLowerAnonCapture(name0)) {
         const idx = try b.recordCapture(name0);
@@ -11967,7 +11981,7 @@ fn lowerUnresolvedBareCall(
             .n_args = run[1],
             .arg_names = arg_names,
             .recv = this_reg,
-            .func = static_ext,
+            .func = ext_hint,
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -11985,7 +11999,7 @@ fn lowerUnresolvedBareCall(
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
-        .func = static_ext,
+        .func = ext_hint,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
