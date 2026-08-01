@@ -2316,9 +2316,25 @@ its arena) should run the enum ctor-arg patch itself, passing the
 entry's arena as the evaluation/definition allocator, and
 `vmPrepareInner`'s per-Vm loop keeps only the skip-if-present guard.
 An alternative with the same ownership result: deep-copy the evaluated
-values into the entry arena before `define`. Verify with
-`KLIO_E2E_SHARD=0/8` on the rebuilt binary, then the full suite, then
-the whole gate.
+values into the entry arena before `define`.
+
+One more layer, read from `runFilesInMode`: under a GC run the Vm
+allocator is `runtime.slab.allocator` (process-global) and program end
+runs `runtime.gc.collect()` under an explicit contract — "Nothing from
+the finished program may remain rooted while its compiler arena is
+about to be released." The enum patch violates exactly that contract:
+it roots program-lifetime GC cells (the `code` STRING values) inside
+the cross-program cached base, and the sweep recycles them. So the fix
+must produce values OUTSIDE the swept heap: scalars are by-value
+(safe); the string fields need `strInit` against the entry arena, and
+the field-list buffer likewise. Whether arena-backed cells are safe to
+hand to GC-run programs (release/trace paths) must be checked against
+how the adopted base's OWN image values already work — they are the
+precedent, since baked-in fields live in the entry arena today and GC
+programs read them.
+
+Verify with `KLIO_E2E_SHARD=0/8` on the rebuilt binary, then the full
+suite, then the whole gate.
 
 The fast loop (harness + sweep + unit modules) structurally cannot see this
 path: only the e2e/parity itests run in-process base-image adoption with the
