@@ -2256,3 +2256,40 @@ at the use site, which requires the name to be in scope as a local (bound in
 this frame, or a capture from an enclosing one) before the cell path applies.
 Pinned by `bare_write_var_declared_later`, which exercises both directions in
 one program.
+
+
+## Pre-existing: the e2e/parity in-process suites crash on enum-entry patching
+
+Found by the full gate (which then sat 40+ minutes inside the segfault
+handler's DWARF symbolication — `gate.sh` now runs every phase under
+`GATE_PHASE_TIMEOUT`, default 1200s, so a hang is a fast RED). Bisected: the
+crash reproduces at de72470a, BEFORE this session's commits. Three stacked
+mechanisms, all in the enum-entry ctor-arg patch (`vmPrepareInner`):
+
+1. `parity-base-gen` bakes WITHOUT executing, so baked enum instances carry
+   only `name`/`ordinal`; the ctor-param fields (`CharCategory.value`,
+   `.code`) are deferred to every adopting program's patch loop. The stdlib
+   image path is immune because it bakes AFTER a run.
+2. `valueFromImage` sizes field buffers at exact capacity in the adoption
+   arena, so the patch's first `define` must GROW — freeing an arena buffer
+   through the VM slab (`class_states[0xAAAAAAAA]`). LANDED: `InstanceData.
+   fields_foreign` + `ensureFieldsOwned` re-buffer on first growth, foreign
+   spines skipped at `deinit`/`gcFinalize`, all raw append sites guarded.
+   `KLIO_ENUM_INIT_TRACE` prints `[enum-init-append]` when a patch APPENDS
+   (a baked field was missing) rather than replaces.
+3. STILL OPEN: the parity base cache (`base_cache_max`) shares the adopted
+   class defs across per-program Vms, so VM-A's patch writes VM-A-slab
+   values into image-lifetime instances; VM-B then releases them with its
+   own slab (integer-overflow in the refcount atomic) or reads them after
+   VM-A's slab died. The fix is to patch ONCE at ADOPT time with the base
+   entry's own arena (values and buffers then share the cache entry's
+   lifetime), and make the per-VM loop skip fields that are already
+   present — enum ctor args are per-class constants, so skipping is
+   semantics-preserving. That refactor moves the patch out of
+   `vmPrepareInner` into the adopt paths (parity base cache and
+   stdlib_image), which both know their arena.
+
+The fast loop (harness + sweep + unit modules) structurally cannot see this
+path: only the e2e/parity itests run in-process base-image adoption with the
+loop JIT forced on. `KLIO_E2E_SHARD=0/16` on a built e2e binary covers it in
+under a minute — use it whenever interp_ir/runtime/image internals change.

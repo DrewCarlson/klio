@@ -650,6 +650,17 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             };
             if (idx < param_names.items.len) {
                 const g = inst.borrowMut();
+                // A baked enum instance carries every constructor-parameter
+                // field, so this define REPLACES in place. An append here
+                // means the bake dropped a field — name it, because the
+                // shared image instance cannot grow a per-VM buffer.
+                if (g.get().get(param_names.items[idx]) == null and
+                    runtime.getenvSlice("KLIO_ENUM_INIT_TRACE") != null)
+                {
+                    std.debug.print("[enum-init-append] class={s} entry={s} field={s}\n", .{
+                        entry.class_name, entry.entry_name, param_names.items[idx],
+                    });
+                }
                 g.get().define(self.allocator, param_names.items[idx], v) catch {};
                 g.deinit();
             }
