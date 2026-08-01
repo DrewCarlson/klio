@@ -616,6 +616,25 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
     }
 
+    if (runtime.getenvSlice("KLIO_DUMP_FN")) |w| {
+        if (std.fmt.parseInt(u32, w, 10)) |want| {
+            const dmg = self.module.borrow();
+            defer dmg.deinit();
+            if (dmg.get().funcById(ir.FuncId.from(want))) |df| {
+                std.debug.print("[dumpfn] {s}#{d} blocks={d}\n", .{ df.fqn, want, df.blocks.len });
+                for (df.blocks, 0..) |blk, bi| {
+                    std.debug.print("[dumpfn] b{d}:\n", .{bi});
+                    for (blk.insts) |inst| {
+                        switch (inst) {
+                            .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
+                            else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
+                        }
+                    }
+                    std.debug.print("[dumpfn]   -> {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
+                }
+            }
+        } else |_| {}
+    }
     // Patch enum-entry instance fields with evaluated ctor args.
     for (self.enum_entry_arg_inits.items) |entry| {
         const class_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {

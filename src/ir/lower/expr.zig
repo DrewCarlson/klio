@@ -11125,6 +11125,20 @@ fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
 fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
     if (b.thisNarrow()) |t| return t;
     if (b.spliceHintActive()) return b.spliceHintRecv();
+    // An `is`-narrow of `this` is the innermost receiver truth: inside
+    // `if (this is Collection)`, a bare call resolves against Collection
+    // exactly as kotlinc smart-casts — `Iterable.contains`'s own
+    // `contains(element)` binds the Collection MEMBER, never itself. The
+    // narrow lives in the local-decl map under "this" (`narrowLocal`);
+    // consulted AFTER the splice hint so a spliced stdlib body never
+    // resolves against the inline site's caller context. Gated OFF by
+    // default: consulting it re-forms bare emissions across the stdlib
+    // and DeepRecursiveTest measured 4.3x slower wall-clock — the
+    // emission delta needs the census treatment before this defaults on.
+    // Arming KLIO_HDR_BOUNDS requires it (the contains loop's fix).
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_THIS_NARROW") orelse "0", "0")) {
+        if (b.localDeclType("this")) |narrowed| return typeHead(narrowed);
+    }
     return b.recvTy();
 }
 

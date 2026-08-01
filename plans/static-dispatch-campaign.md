@@ -2766,3 +2766,33 @@ fid 1949's baked instruction stream (the image already serializes it;
 a tiny `KLIO_DUMP_FN=<fid>` printer over Func.blocks at adopt) and read
 which instruction sits at span 1998 — the fix then lands at that
 emission's lowering arm, the default flips, and the gate deletes.
+
+
+### ARMED-REFUTER ARC RESOLVED: the smart-cast `this` was invisible
+
+The baked instruction dump (`KLIO_DUMP_FN=<fid>`, now in-tree) ended the
+hunt: block b1 of `Iterable.contains` held a STATIC `Call` — the armed
+sole-survivor rule had bound the smart-cast `contains(element)` to the
+enclosing function itself, because `bareStaticRecvHead` never consulted
+the `is`-narrow of `this` (`narrowLocal("this", ...)` records it; the
+head read only the splice channel). With the narrow consulted — AFTER
+the splice hint, so spliced bodies keep their hygiene (the first
+ordering broke `UnsignedArraysTest.onEachIndexed`) — the member binds
+and armed DurationTest runs 52/52, both pre-existing parse failures
+included, and `bounded_typeparam_receiver` prints `observed:3:ok`.
+
+Both levers are staged behind gates with their coupling documented:
+- `KLIO_THIS_NARROW` (default OFF): consulting the narrow re-forms bare
+  emissions across the stdlib, and DeepRecursiveTest measured 4.3x
+  slower wall-clock (1:07 -> 4:49, deterministic, 99% CPU) — the
+  emission delta needs the census treatment before this defaults on.
+- `KLIO_HDR_BOUNDS` (default OFF) REQUIRES the narrow: armed without it
+  the contains loop returns. The armed full sweep additionally shows
+  `ArrayDequeTest.clear` recursing — the same shape family, next on the
+  roll-out list.
+
+Flip order when resuming: census + perf the narrow's emission delta,
+fix ArrayDeque.clear's instance of the shape, then both defaults flip
+and the gates delete. Fourteen member-first/self-serve guards, the
+route-print and dump tooling, and the caller-span [fn-entry] remain
+landed from the hunt.
