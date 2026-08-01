@@ -1224,7 +1224,10 @@ pub const Func = struct {
         if (self.n_locals > LEAF_MAX_REGS) return false;
         var total: usize = 0;
         for (self.blocks) |*b| {
-            if (b.catches.len != 0) return false;
+            // A finally-carrying body needs the try-stack machinery: the
+            // frameless walk would return straight out of the try region
+            // and never run the finally.
+            if (b.catches.len != 0 or b.finally != null) return false;
             total += b.insts.len;
             if (total > LEAF_MAX_INSTS) return false;
             switch (b.terminator) {
@@ -3293,6 +3296,11 @@ pub const Module = struct {
                 }
                 return .unknown;
             }
+            if (nonCallableBuiltinHead(declared) and
+                std.mem.startsWith(u8, staticTypeHead(ty.name), "Function"))
+            {
+                return .incompatible;
+            }
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
@@ -3312,9 +3320,29 @@ pub const Module = struct {
             }
             // Callable arity proves the FunctionN surface, but not a SAM
             // conversion or an unknown callable's parameter/return types.
+            // A non-callable BUILTIN parameter, though, is a definite
+            // refutation: no lambda converts to Unit or a primitive, so
+            // `tryResume(value: T := Unit)` drops for the onCancellation
+            // argument and the file-private Boolean extension binds. User
+            // classes stay unknown (a fun-interface SAM target).
+            if (nonCallableBuiltinHead(head)) return .incompatible;
             return .unknown;
         }
         return .unknown;
+    }
+
+    /// Builtin classifier heads no function value can convert to: the
+    /// definite-refutation set for a callable argument.
+    fn nonCallableBuiltinHead(head: []const u8) bool {
+        const set = [_][]const u8{
+            "Unit",  "Int",    "Long",  "Short",  "Byte",  "Boolean",
+            "Char",  "Float",  "Double", "String", "UInt",  "ULong",
+            "UShort", "UByte",
+        };
+        for (set) |n| {
+            if (std.mem.eql(u8, head, n)) return true;
+        }
+        return false;
     }
 
     fn staticMemberArgsCompatibility(
@@ -3329,6 +3357,17 @@ pub const Module = struct {
         const skip: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const params = f.params[skip..];
+        if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
+            if (std.mem.eql(u8, std.mem.span(w), f.name)) {
+                std.debug.print("[smac] {s}#{d} nargs={d} recv={s} recv_args={d}\n", .{
+                    f.fqn,
+                    fid.int(),
+                    args.len,
+                    if (receiver) |r| r.name else "-",
+                    if (receiver) |r| r.args.len else 0,
+                });
+            }
+        }
         for (args) |arg| {
             if (arg.named != null or arg.is_spread) return .unknown;
         }
@@ -3385,6 +3424,16 @@ pub const Module = struct {
                 instantiated_param,
                 actual_bounds,
             );
+            if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), f.name)) {
+                    std.debug.print("[smac-arg] param={s} inst={s} arg_ty={s} -> {s}\n", .{
+                        param.ty.name,
+                        instantiated_param.name,
+                        if (arg.ty) |t| t.name else "-",
+                        @tagName(arg_result),
+                    });
+                }
+            }
             if (arg_result == .incompatible) return .incompatible;
             if (arg_result == .unknown) result = .unknown;
         }
@@ -4627,6 +4676,19 @@ pub const Module = struct {
     /// The target identity comes from the shared call resolver; this step only
     /// binds its declaration-owned type parameters from explicit type
     /// arguments and the statically-known argument types.
+    /// Whether `ty` (recursively) names any of `params` — raw source
+    /// spellings, the form a declared return type carries.
+    fn typeMentionsAnyParamName(ty: *const TypeRef, params: []const []const u8) bool {
+        const head = staticTypeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        for (params) |p| {
+            if (std.mem.eql(u8, head, p)) return true;
+        }
+        for (ty.args) |*arg| {
+            if (typeMentionsAnyParamName(arg, params)) return true;
+        }
+        return false;
+    }
+
     pub fn instantiatedCallReturnType(
         self: *const Module,
         allocator: Allocator,
@@ -4684,18 +4746,30 @@ pub const Module = struct {
                 actual_dispatch_receiver != null)
             {
                 const actual_receiver = actual_dispatch_receiver.?;
-                const projected = (try self.projectTypeToClass(
-                    a,
-                    actual_receiver,
-                    owner,
-                )) orelse return null;
-                const projected_args = overrideArgs(projected);
-                if (projected_args.len < owner_class.type_params.len) return null;
-                for (owner_class.type_params, 0..) |param, i| {
-                    try bindings.append(a, .{
-                        .name = try classTypeParamIdentity(a, owner, param),
-                        .ty = projected_args[i],
-                    });
+                const projected_ok = blk2: {
+                    const projected = (try self.projectTypeToClass(
+                        a,
+                        actual_receiver,
+                        owner,
+                    )) orelse break :blk2 false;
+                    const projected_args = overrideArgs(projected);
+                    if (projected_args.len < owner_class.type_params.len) break :blk2 false;
+                    for (owner_class.type_params, 0..) |param, i| {
+                        try bindings.append(a, .{
+                            .name = try classTypeParamIdentity(a, owner, param),
+                            .ty = projected_args[i],
+                        });
+                    }
+                    break :blk2 true;
+                };
+                // A bare receiver HEAD (an implicit `this` in a method body)
+                // carries no type arguments to project — but a return that
+                // never mentions the class's parameters is complete without
+                // them (`findClause(...): ClauseData?` on a bare
+                // SelectImplementation head). Only a param-mentioning return
+                // still refuses.
+                if (!projected_ok) {
+                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) return null;
                 }
             }
         }

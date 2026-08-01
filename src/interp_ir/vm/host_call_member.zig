@@ -3636,6 +3636,14 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
     return cg.get().name;
 }
 
+/// The classifier head of a source-spelled supertype name: generic args
+/// and nullability stripped (`Flow<T>` -> `Flow`).
+fn supertypeHead(raw: []const u8) []const u8 {
+    var h = raw;
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    return std.mem.trimEnd(u8, std.mem.trim(u8, h, " "), "?");
+}
+
 pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, argc: usize) bool {
     if (v.* != .Instance) {
         // A builtin-backed value (a List, String, Array, Sequence...) serves
@@ -3664,9 +3672,30 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
         if (m.registry.hierarchy_methods.get(cls_name)) |methods| {
             if (methods.contains(name)) return true;
         }
+        // An anonymous object's class name says nothing; its SUPERTYPES
+        // carry the declared members (an `object : Flow<T>` serves
+        // `collect` through the interface). Walk the chain so the
+        // SAM-candidate arm declines in favor of the real receiver.
+        for (cg.get().supertype_names) |sup| {
+            const head = supertypeHead(sup);
+            if (m.registry.hierarchy_methods.get(head)) |methods| {
+                if (methods.contains(name)) return true;
+            }
+        }
         // extCouldApply rebuilds its lazy index when the func table has
         // grown; VM execution is single-threaded, so the cast is sound.
         if (@constCast(m).extCouldApply(allocator, cls_name, name, argc)) return true;
+        for (cg.get().supertype_names) |sup| {
+            if (@constCast(m).extCouldApply(allocator, supertypeHead(sup), name, argc)) return true;
+        }
+    }
+    // A runtime-lowered anon object registers its methods in the per-site
+    // table, not the class def.
+    {
+        var mbuf: [96]u8 = undefined;
+        if (std.fmt.bufPrint(&mbuf, "{s}/{d}", .{ name, argc })) |mkey| {
+            if (lookupAnonMethod(self, allocator, cls_name, mkey, name) != null) return true;
+        } else |_| {}
     }
     const def = g.get().class.clone();
     defer def.deinit();
@@ -9485,9 +9514,28 @@ pub fn invokeVirtualMember(
     receiver: *const Value,
     slot: MethodSlotId,
     args: []const Value,
-    arg_names: []const ?[]const u8,
+    arg_names_in: []const ?[]const u8,
     arg_params: ?[]const u32,
 ) Allocator.Error!EvalResult {
+    // Named arguments folded into `arg_params` at lowering must survive a
+    // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
+    // names back from the slot root's declared params, or a delegated
+    // `emit(tag = ..., scale = ...)` re-binds its arguments positionally.
+    var derived_names: []?[]const u8 = &.{};
+    defer if (derived_names.len != 0 and runtime.freeScratch()) allocator.free(derived_names);
+    const arg_names: []const ?[]const u8 = blk: {
+        const params = arg_params orelse break :blk arg_names_in;
+        if (params.len != args.len) break :blk arg_names_in;
+        const mg0 = self.module.borrow();
+        defer mg0.deinit();
+        const rootf = mg0.get().funcById(FuncId.from(slot.int())) orelse break :blk arg_names_in;
+        derived_names = try allocator.alloc(?[]const u8, args.len);
+        for (params, derived_names) |ui, *out| {
+            const pi = @as(usize, ui) + 1;
+            out.* = if (pi < rootf.params.len) rootf.params[pi].name else null;
+        }
+        break :blk derived_names;
+    };
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
             const mg = self.module.borrow();
@@ -9666,6 +9714,32 @@ pub fn invokeVirtualMember(
             args,
             arg_params,
         );
+    }
+    // A main-module slot link on an ANONYMOUS receiver class is a
+    // supertype-matched guess: the synth lists upstream classes for type
+    // checks (a KlioBufferedChannel names BufferedChannel), and entering
+    // the supertype's Kotlin body bypasses the pack's shadowing extension
+    // properties — `ch.onReceive` inside a select must reach the klio
+    // clause glue, not upstream's SelectClause machinery. Dispatch by
+    // name so the full ladder (host bindings, extension properties, anon
+    // methods) serves; a SAM conversion keeps the slot path (its stored
+    // lambda is served below by target signature).
+    if (linked == .main_func) {
+        const anon_recv = blk: {
+            const class = runtime_def.borrow();
+            defer class.deinit();
+            break :blk class.get().is_anonymous;
+        };
+        if (anon_recv) {
+            const sam = blk: {
+                const instance = receiver.Instance.borrow();
+                defer instance.deinit();
+                break :blk instance.get().get("__sam_target__");
+            };
+            if (sam == null) {
+                if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+            }
+        }
     }
     const target = FuncId.from(linked.main_func);
 

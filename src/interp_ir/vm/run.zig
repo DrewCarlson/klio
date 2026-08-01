@@ -617,23 +617,34 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
     }
 
     if (runtime.getenvSlice("KLIO_DUMP_FN")) |w| {
-        if (std.fmt.parseInt(u32, w, 10)) |want| {
-            const dmg = self.module.borrow();
-            defer dmg.deinit();
-            if (dmg.get().funcById(ir.FuncId.from(want))) |df| {
-                std.debug.print("[dumpfn] {s}#{d} blocks={d}\n", .{ df.fqn, want, df.blocks.len });
-                for (df.blocks, 0..) |blk, bi| {
-                    std.debug.print("[dumpfn] b{d}:\n", .{bi});
-                    for (blk.insts) |inst| {
-                        switch (inst) {
-                            .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
-                            else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
-                        }
+        const dmg = self.module.borrow();
+        defer dmg.deinit();
+        // Accepts a numeric FuncId or a function simple name (dumps every
+        // func bearing the name).
+        const by_id: ?u32 = std.fmt.parseInt(u32, w, 10) catch null;
+        for (dmg.get().funcs.items) |*df| {
+            if (by_id) |want| {
+                if (df.id.int() != want) continue;
+            } else if (!std.mem.eql(u8, df.name, w)) continue;
+            std.debug.print("[dumpfn] {s}#{d} blocks={d}\n", .{ df.fqn, df.id.int(), df.blocks.len });
+            for (df.blocks, 0..) |blk, bi| {
+                std.debug.print("[dumpfn] b{d}: catches={d} fin={?} fin_done={?} done_for={?} pop={d}\n", .{
+                    bi,
+                    blk.catches.len,
+                    if (blk.finally) |x| @intFromEnum(x) else null,
+                    if (blk.finally_done) |x| @intFromEnum(x) else null,
+                    if (blk.finally_done_for) |x| @intFromEnum(x) else null,
+                    blk.pop_on_exit.len,
+                });
+                for (blk.insts) |inst| {
+                    switch (inst) {
+                        .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
+                        else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
                     }
-                    std.debug.print("[dumpfn]   -> {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
                 }
+                std.debug.print("[dumpfn]   -> {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
             }
-        } else |_| {}
+        }
     }
     // Patch enum-entry instance fields with evaluated ctor args.
     for (self.enum_entry_arg_inits.items) |entry| {

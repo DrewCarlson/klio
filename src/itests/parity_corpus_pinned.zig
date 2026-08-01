@@ -1515,3 +1515,55 @@ test "range_in_range_user_operator" {
         \\
     );
 }
+
+test "finally_runs_on_return_leaf_shape" {
+    try check("finally_runs_on_return_leaf_shape",
+        \\fin-a
+        \\1
+        \\fin-b
+        \\2
+        \\
+    );
+}
+
+test "throwable_suppressed_user_instance" {
+    try check("throwable_suppressed_user_instance",
+        \\0
+        \\2
+        \\[side, side2]
+        \\2
+        \\
+    );
+}
+
+test "reified_from_lambda_annotation" {
+    try check("reified_from_lambda_annotation",
+        \\is
+        \\no
+        \\plain:5
+        \\is:HI
+        \\no
+        \\is
+        \\
+    );
+}
+
+test "delegated_member_named_args_pin" {
+    try check("delegated_member_named_args_pin",
+        \\a:7@1.0
+        \\b:0@2.5
+        \\
+    );
+}
+
+test "flow_builder_object_identity" {
+    try check("flow_builder_object_identity",
+        \\d3
+        \\d4
+        \\w7
+        \\w1
+        \\a5
+        \\a6
+        \\
+    );
+}

@@ -97,6 +97,7 @@ pub const lowerBinaryExprAsThunk = thunks.lowerBinaryExprAsThunk;
 pub const lowerBlockAsThunk = thunks.lowerBlockAsThunk;
 pub const lowerBlockAsUnaryThunk = thunks.lowerBlockAsUnaryThunk;
 pub const lowerEmptyThunk = thunks.lowerEmptyThunk;
+pub const staticExprTypeRef = expr.staticExprTypeRef;
 pub const lowerExprAsParamThunk = thunks.lowerExprAsParamThunk;
 pub const lowerExprAsParamThunkScoped = thunks.lowerExprAsParamThunkScoped;
 pub const lowerExprAsParamThunkScopedEnclosing = thunks.lowerExprAsParamThunkScopedEnclosing;
