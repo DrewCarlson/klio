@@ -1483,7 +1483,7 @@ fn composableEval(
 ) Allocator.Error!EvalResult {
     if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
         if (std.mem.eql(u8, w, f.name)) {
-            std.debug.print("[fn-entry] {s}#{d}:", .{ f.fqn, f.id.int() });
+            std.debug.print("[fn-entry] {s}#{d} caller={s}:", .{ f.fqn, f.id.int(), if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>" });
             for (f.params, 0..) |p, i| {
                 if (i >= packed_args.items.len) break;
                 const v = &packed_args.items[i];

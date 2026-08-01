@@ -7775,6 +7775,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                     }
                 }
             }
+            if (committed_ext_h == null) {
+                // Every receiver disproves the committed target. The static
+                // commitment still LOCKS this self-name walk to members-only:
+                // unlocking the by-name extension re-pick is what let a body
+                // re-select ITSELF once bound refutation disproved its
+                // committed sibling on every receiver (`Iterable.contains`'s
+                // smart-cast `contains(element)` on a List). Members serve
+                // exactly as when the commitment merely failed its positive
+                // proof, and the terminal committed invoke keeps the
+                // pre-refuter fallback shape.
+                committed_ext_h = fid;
+            }
         }
         // Strict pass: members and receiver-compatible extensions of each
         // candidate, innermost first — the kotlinc candidate order.

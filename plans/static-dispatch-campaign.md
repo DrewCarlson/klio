@@ -2682,3 +2682,20 @@ run's contains emissions) — inspect what func/candidates that arm
 attaches and whether its runtime tier can reach the receiver member at
 all. Armed DurationTest holds at 51/52 with all guards; default-off
 keeps every suite green.
+
+
+Ninth elimination + the decisive datum: the caller-tagged `[fn-entry]`
+(now permanent in the trace) proves the loop is `contains#1949 ->
+contains#1949` with `this=List`, entered from `assertContains`. The
+recursing inner site's emission arm attaches NO func hint
+(`implicit_this_call_global_fallback`), so the self-name committed_ext
+path never engages there — the new members-only lock (every receiver
+disproving a committed target still locks the walk to members) is
+landed and principled but does not reach this site. The committing
+route produces NO runtime orAudit line, is not the flat arm
+(KLIO_FLAT=0 unchanged), not the CNO bounded tier (kind-skip), and not
+the three guarded extension tails. Next probe: env-gated route prints
+at every commit point inside `callMemberNamedInner` (the ext-cache
+serve and each tail) for name==contains — one armed run pins the line,
+the member-first rule lands there, then flip KLIO_HDR_BOUNDS and
+delete the gate.
