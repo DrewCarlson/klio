@@ -3061,3 +3061,39 @@ positionally through the delegate walk and scale's value landed in
 `value`. The fallback now derives the names back from the slot root's
 declared params before any by-name route runs. Pinned by
 delegated_member_named_args_pin; the example matches. Sweep 117/0.
+
+
+### Drift-triage arc closed at 261/266: the five residuals, each sized
+
+Eleven root causes fixed across the arc (channel host-binding override,
+getter expected type, kotlin.io any-member removal, SAM-guard builtin
+blindness, alias inline splice, F-bounded local extension, Iterable
+fallback arity, vararg defaulted tail, range-in-range defer,
+finally-leaf classification, Any evidence, suppressed-exception
+intrinsics, virtual-fallback arg_params — plus the guard-bracing
+repair). Corpus 249 -> 261 of 266; pinned suite 134 -> 145 (+11 pins,
+the backtick strictness fixture stays the one red); sweep 117/0
+throughout.
+
+The five residuals, triaged:
+
+- flow_operators (drop/dropWhile): needs the lambda-receiver-evidence
+  channel — bare `collect {}` inside drop's flow-lambda sees only
+  recv_ty=FlowCollector and defers; the outer `this@drop : Flow`
+  receiver is the campaign's named next lever, now with a concrete
+  blocking example and a traced resolution ([bare] collect -> NONE).
+- select_on_timeout_loses: TIMEOUT in the select machinery, older
+  drift, untraced.
+- compose_nodes: reorder recreates nodes (nodesCreated 10 vs 7) — a
+  recomposition identity/movable-content defect.
+- compose_ui_text: layout metrics differ (height 48 vs 68, para y
+  offsets) — text measurement.
+- mosaic_hello: `appendCodePoint`'s `codePoint.toChar()` appends digit
+  codes in the PACK universe only (the 12-line standalone passes) —
+  shape B context-dependence, un-minimized.
+
+Tooling landed with the arc: `scripts`-side corpus drift sweep (run
+every example with expected output through the harness against
+source-built packs — the fast out-of-process e2e loop), KLIO_DUMP_FN by
+NAME with per-block try metadata, [extpick]/[vabsorb]/[tbie]-outcome
+traces. KLIO_HOME gotcha recorded: it is the PARENT of `.klio/packs`.
