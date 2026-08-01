@@ -3276,3 +3276,20 @@ statically known site. `[seldbg]` probes in channelSend /
 selectTrySelect / the invokeMethod bridge (gated, kept) show each stage.
 Also revealed: the bridge's non-Throw error swallow hid the real
 failure — the gated print stays.
+
+
+Spec correction after re-reading upstream: the member
+`tryResume(value: T, idempotent: Any? = null)` fits the 1-arg call by
+plain arity (one default), so defaults-padding is not the
+discriminator. The decidable refutation is STATIC: at the call site the
+receiver is the smart-cast local `cont: CancellableContinuation<Unit>`,
+so the member's `value: T` instantiates to Unit and the argument's
+nullable-function type refutes it — kotlinc then binds the file-private
+extension. The right home is the campaign's existing
+receiver-type-arg substitution in the Member arm (the KLIO_TP_RECV
+channel): extend it to refute a member whose SUBSTITUTED param type the
+argument's static type disproves, letting the bare/member resolver
+commit the same-file extension. The runtime walk alone cannot decide
+this (the instance carries no type args). Driving repro:
+select_on_timeout_loses, ground truth `dbg-tsi: tryResume=true` +
+`got 99`.
