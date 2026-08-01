@@ -302,16 +302,16 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,656 member call sites
-      146   2.19%  bound_static     <- direct FuncId call
-    3,481  52.30%  bound_virtual    <- method slot, no name lookup
+    total 6,648 member call sites
+      146   2.20%  bound_static     <- direct FuncId call
+    3,493  52.54%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,291  34.42%  no_receiver_type
-      405   6.08%  resolver_declined
+    2,271  34.16%  no_receiver_type
+      405   6.09%  resolver_declined
       213   3.20%  no_class_id
-      120   1.80%  nullable_or_generic
+      120   1.81%  nullable_or_generic
 
-Statically bound: 3,627 of 6,656 (54.5%), from 150 (2.34%) at the start of this
+Statically bound: 3,639 of 6,648 (54.7%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
@@ -1016,6 +1016,24 @@ evidence a constructor gives.
 Worth ZERO on both censuses and kept for the same reason as the null-narrowing
 entry: `property_typed_from_a_factory_call` prints `derived` where kotlinc
 prints `base`, so it was a wrong ANSWER, not a missed binding.
+
+### A sole global is the only answer, whatever the receiver context
+
+`[no-recv-call] unique_concrete` counted 175 receivers whose callee names ONE
+function with a concrete return type — the census said the type was knowable
+and the real path still returned nothing. The cause is the deliberate refusal
+just above it: a top-level pick made under a lambda's conservative receiver is
+not evidence, so the code falls to the implicit-receiver walk and gives up when
+that finds nothing.
+
+The refusal is right in general and wrong when the name has exactly one
+declaration program-wide and no enclosing receiver declares a member of it:
+there is then nothing else the call could resolve to, whatever the receiver
+context is. Used only where the receiver walk has already found nothing, so it
+never outranks a real member.
+
+    stdlib   bound 3,627 -> 3,639   (54.5% -> 54.7%)
+    examples bound 43,109 -> 43,243 (61.6% -> 61.9%)
 
 ### Measured dead ends, all three with the reason
 

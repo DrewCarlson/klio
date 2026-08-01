@@ -8680,6 +8680,21 @@ fn staticCallReturnTypeRef(
             const top_level_usable = res.target != null and
                 (res.confidence == .exact or
                     (b.recvTy() == null and !b.isParamThunk()));
+            // A refused top-level pick is still the ONLY answer when the name
+            // has exactly one declaration program-wide and no enclosing
+            // receiver declares a member of that name: there is nothing else
+            // it could resolve to, whatever the receiver context is. Used only
+            // where the receiver walk below finds nothing.
+            const sole_global: ?FuncId = blk_sole: {
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_SOLE_GLOBAL") orelse "1", "0")) break :blk_sole null;
+                if (top_level_usable) break :blk_sole null;
+                const t = res.target orelse break :blk_sole null;
+                if (b.module.funcsBySimpleName(name.name).len != 1) break :blk_sole null;
+                if (enclosingHasMemberNamed(b, name.name)) break :blk_sole null;
+                const f = b.module.funcById(t) orelse break :blk_sole null;
+                if (f.kind != .plain) break :blk_sole null;
+                break :blk_sole t;
+            };
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
@@ -8690,7 +8705,7 @@ fn staticCallReturnTypeRef(
                 const bt = bareRetTraceFor(b, name.name);
                 const head_name = bareStaticRecvHead(b) orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
-                    return null;
+                    break :blk sole_global orelse return null;
                 };
                 const recv_ref = if (b.spliceHintActive())
                     (if (b.spliceHintRecvRef()) |rt|
@@ -8722,7 +8737,7 @@ fn staticCallReturnTypeRef(
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
                         b.module.classId(bare_head)) orelse {
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
-                    return null;
+                    break :blk sole_global orelse return null;
                 };
                 const bare_resolved = b.module.resolveMemberCall(
                     owner,
@@ -8740,7 +8755,7 @@ fn staticCallReturnTypeRef(
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
                 });
-                break :blk bare_resolved.target orelse return null;
+                break :blk bare_resolved.target orelse (sole_global orelse return null);
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
