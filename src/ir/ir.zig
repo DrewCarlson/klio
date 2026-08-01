@@ -3424,6 +3424,16 @@ pub const Module = struct {
                 instantiated_param,
                 actual_bounds,
             );
+            if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), f.name)) {
+                    std.debug.print("[smac-arg] param={s} inst={s} arg_ty={s} -> {s}\n", .{
+                        param.ty.name,
+                        instantiated_param.name,
+                        if (arg.ty) |t| t.name else "-",
+                        @tagName(arg_result),
+                    });
+                }
+            }
             if (arg_result == .incompatible) return .incompatible;
             if (arg_result == .unknown) result = .unknown;
         }

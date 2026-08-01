@@ -3440,3 +3440,26 @@ the class-param bindings key on MANGLED identities
 of the instantiated param at the smac site; if raw-vs-mangled is
 confirmed, bind BOTH spellings (raw name + classTypeParamIdentity) in
 the bindings list. Everything else in the chain is verified live.
+
+
+Probe DECISIVE (smac-arg, gated print kept): substitution is CORRECT —
+`param=$class$ 50 1:T inst=Unit` — the raw-vs-mangled theory is dead.
+The starved side is the ARGUMENT: `arg_ty=-`. The local
+`onCancellation` never gets its type because of DECLARATION ORDER:
+trySelectInternal lowers BEFORE the nested ClauseData's members, so
+createOnCancellationAction's step-2 derived return (Function3, proven
+by the invoke-arm print) is not yet recorded when the site derives —
+instantiatedCallReturnType reads the target's CURRENT return_ty and
+finds the Unit placeholder.
+
+Design (the in-repo precedent is the KLIO_HDR_BOUNDS header pass): a
+HEADER-TIME return-derivation pre-pass — before member bodies lower,
+walk the class's (and file's) expr-bodied fns and record derived
+returns via staticExprTypeRef, exactly as decl lowering now does
+inline; bodies then lower against complete return evidence regardless
+of order. Alternatively derive ON DEMAND in instantiatedCallReturnType
+when the target still carries the placeholder (needs the AST handle —
+inline_state.inlineAstById-style registry for expr bodies). Either
+unblocks the chain's last inch: arg typed Function3 -> the landed
+refutation drops #79 (`inst=Unit` vs Function3) -> the file-private
+extension binds -> `got 99`.
