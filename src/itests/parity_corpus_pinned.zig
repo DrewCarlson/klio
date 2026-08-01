@@ -1453,3 +1453,27 @@ test "init_lambda_encloses_instance" {
         \\
     );
 }
+
+test "receiver_scope_zero_arg_println" {
+    try check("receiver_scope_zero_arg_println",
+        \\a
+        \\b
+        \\
+    );
+}
+
+test "getter_lambda_param_shape" {
+    try check("getter_lambda_param_shape",
+        \\got:x
+        \\
+    );
+}
+
+test "bare_call_through_closure_subject" {
+    try check("bare_call_through_closure_subject",
+        \\v1
+        \\v2
+        \\v3
+        \\
+    );
+}

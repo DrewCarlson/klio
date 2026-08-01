@@ -336,8 +336,11 @@ pub const ProgramImage = struct {
 
     /// Builtin receiver surfaces probed for a member call on an
     /// instance with no user extension, in the dispatcher's order.
+    /// `kotlin.io` is NOT one: its intrinsics (`println`, `print`,
+    /// `readLine`, ...) are receiver-less top-level functions, and serving
+    /// them member-style prepends the receiver as the printed argument —
+    /// `with(x) { println() }` printed `x` instead of a bare newline.
     pub const any_member_prefixes = [_][]const u8{
-        "kotlin.io",
         "kotlin.AutoCloseable",
         "kotlin.Any",
     };
@@ -1875,10 +1878,13 @@ test "link-time bare-name maps are deterministic and package-ranked" {
     try testing.expectEqualStrings("kotlin.math.min", prog.defaultImportGlobal("min").?);
     try testing.expectEqualStrings("kotlin.intArrayOf", prog.defaultImportGlobal("intArrayOf").?);
 
-    // Member-surface map: `kotlin.io.println` is the one real any-member
-    // edge, and no source registers a `kotlin.AutoCloseable.*` /
-    // `kotlin.Any.*` FQN today — `use` must stay absent.
-    try testing.expectEqualStrings("kotlin.io.println", prog.anyMemberGlobal("println").?);
+    // Member-surface map: `kotlin.io`'s receiver-less globals must NOT be
+    // member edges — serving `println` member-style printed the receiver
+    // (`with(x) { println() }` printed `x`). No source registers a
+    // `kotlin.AutoCloseable.*` / `kotlin.Any.*` FQN today — `use` stays
+    // absent too.
+    try testing.expect(prog.anyMemberGlobal("println") == null);
+    try testing.expect(prog.anyMemberGlobal("print") == null);
     try testing.expect(prog.anyMemberGlobal("use") == null);
 }
 

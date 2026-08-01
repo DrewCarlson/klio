@@ -3637,7 +3637,21 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
 }
 
 pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, argc: usize) bool {
-    if (v.* != .Instance) return false;
+    if (v.* != .Instance) {
+        // A builtin-backed value (a List, String, Array, Sequence...) serves
+        // a name through the stdlib ladder or a source extension on its
+        // nominal type. Answering false for these let the SAM-candidate arm
+        // swallow a bare call that belongs to a DEEPER receiver: inside
+        // `asFlow`'s block the collector closure took `forEach`, ran the
+        // user's collect action with the forEach action as its element, and
+        // the list never iterated.
+        if (v.* == .Null or v.* == .Unit) return false;
+        if (receiverHasMemberNamed(self, v, name)) return true;
+        const nominal = simpleName(valueNominalFqn(v));
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        return @constCast(mg.get()).extCouldApply(allocator, nominal, name, argc);
+    }
     const g = v.Instance.borrow();
     defer g.deinit();
     const cg = g.get().class.borrow();
@@ -4083,20 +4097,18 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             // caches stay strict-key-only below.
             if (instanceMethodKeyRelaxed(self, receiver, name, args, static_recv)) |rk| {
                 if (instanceMethodCacheGetRaw(self, rk)) |raw| {
-                    if (raw != METHOD_MISS) {
-                        if (!cacheServesExecutingFrame(raw))
-                            if (routeTraceOn(name)) std.debug.print("[route] L4083\n", .{});
-                            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                    if (raw != METHOD_MISS and !cacheServesExecutingFrame(raw)) {
+                        if (routeTraceOn(name)) std.debug.print("[route] L4083\n", .{});
+                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                     }
                 }
             }
         }
         if (head_strict) |k| {
             if (instanceMethodCacheGetRaw(self, k)) |raw| {
-                if (raw != METHOD_MISS) {
-                    if (!cacheServesExecutingFrame(raw))
-                        if (routeTraceOn(name)) std.debug.print("[route] L4092\n", .{});
-                        if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
+                if (raw != METHOD_MISS and !cacheServesExecutingFrame(raw)) {
+                    if (routeTraceOn(name)) std.debug.print("[route] L4092\n", .{});
+                    if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args)) |r| return r;
                 }
                 // A cached miss falls through to the probe ladder (stdlib /
                 // extension / field), but `irMethodWalk` will skip the walk.
@@ -9580,6 +9592,28 @@ pub fn invokeVirtualMember(
     // declaration with nothing to execute, dispatch by the member's name — the
     // same result the site produced before it was bound, rather than a failure.
     const slot_name: ?[]const u8 = if (module.funcById(FuncId.from(slot.int()))) |f| f.name else null;
+    // A host-synthesized class implements its members as native intrinsics
+    // keyed by its own FQN, and that binding is the most-derived override of
+    // the slot. The synth's `supertype_names` exist for type checks (a
+    // KlioBufferedChannel names BufferedChannel), so linking the slot through
+    // them would enter the supertype's Kotlin body — which reads internal
+    // fields the native implementation never materializes. Only anonymous
+    // (runtime-built) classes can carry such bindings, so named classes skip
+    // the probe.
+    if (slot_name) |n| {
+        const anon = blk: {
+            const class = runtime_def.borrow();
+            defer class.deinit();
+            break :blk class.get().is_anonymous;
+        };
+        if (anon) {
+            var fqn_buf: [192]u8 = undefined;
+            if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ recv_fqn, n })) |member_fqn| {
+                if (lookupIntrinsic(self, member_fqn) != null)
+                    return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+            } else |_| {}
+        }
+    }
     var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
         .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse {
             virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "receiver class");

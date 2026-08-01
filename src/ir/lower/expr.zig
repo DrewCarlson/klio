@@ -9714,6 +9714,39 @@ fn lowerPathCall(
             // reference (kotlinc rejects the call); the diagnostic fails the
             // program before it runs.
             _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
+            // A per-file import alias (`import ... unsafeFlow as flow`)
+            // resolves through the symbol index to a target the NAME-keyed
+            // inline table cannot see — it holds declared names only. When
+            // that committed target is an inline header stub, emitting the
+            // call would enter a bodyless frame at runtime; splice its
+            // registered AST by id instead.
+            if (b.module.funcById(target)) |tfi| {
+                // Alias calls only (`import ... unsafeFlow as flow` spells
+                // `flow`): when the call-site name matches the declared name,
+                // the NAME-keyed inline path already made its splice-or-defer
+                // decision and forcing a second splice here re-lowers bodies
+                // in foreign file scopes (a compose body's package-private
+                // reference failed at its splice site).
+                if (tfi.is_inline and !tfi.hasBody() and !std.mem.eql(u8, name0, tfi.name)) {
+                    if (inline_state.inlineAstById(target.int())) |inline_ast| {
+                        inline_state.ensureInlineBody(inline_ast);
+                        const iexp = b.peekExpected();
+                        const iexp_ptr: ?*const ast.TypeRef = if (iexp) |*_e| _e else null;
+                        var iselected = try selectedCallArgsForBuilder(
+                            b,
+                            target,
+                            args,
+                            ast_arg_names,
+                            exprSpan(callee),
+                            call.has_trailing_lambda,
+                        );
+                        defer iselected.deinit(b.allocator);
+                        if (try tryInlineCallWithTypeArgs(b, name0, inline_ast, iselected.args, iselected.names, null, ast_type_args, iexp_ptr)) |r| {
+                            return r;
+                        }
+                    }
+                }
+            }
             return switch (res_final.emit_form) {
                 // A finalized pick is as definitive as a cast pick: the
                 // runtime's value-typed overload re-pick must not override it.

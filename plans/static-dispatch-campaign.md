@@ -2853,3 +2853,82 @@ reproduces the old wrong dispatch, default prints kotlinc's
 no_receiver_type 2,012 -> 1,964 and resolver_declined 451 -> 445 — 130
 more sites now resolve statically as extension calls and leave the
 member census entirely.
+
+
+### The e2e drift, triaged out-of-process: five root causes, eight examples recovered
+
+The corpus drift list finally got a fast loop: run every `examples/*.kt`
+with expected output through the ReleaseSafe harness against fresh
+source-built packs (`scripts/install-local-packs.sh` into `.klio-local`;
+KLIO_HOME is the PARENT of `.klio/packs` — passing the `.klio` dir itself
+silently loses every pack). 17 of 266 failed out-of-process — all
+pre-existing (both flipped defaults off change nothing), five with roots
+found and fixed:
+
+1. **A host-implemented member lost to a virtual slot.** The synth channel
+   classes list `BufferedChannel` in `supertype_names` for type checks, and
+   the campaign's `bound_virtual` emission resolved `invokeOnClose` through
+   that supertype into upstream's Kotlin body — which reads fields the
+   native channel never materializes (`closeHandler`). The old name-dispatch
+   found the host binding first, so this class of failure appeared only
+   when a site became statically bound. Fix: in `invokeVirtualMember`, an
+   exact-FQN host binding on an ANONYMOUS receiver class is the
+   most-derived override and dispatches by name before any slot link.
+   Recovered channel_invoke_on_close, compose_snapshot_flow, and (with 2
+   below) runtest_channel_resume_order, scope_body_throw_cancels_unstarted_child.
+
+2. **A getter's expression body lowered with no expected type.**
+   `collectToFun get() = { collectTo(it) }` declares
+   `suspend (ProducerScope<T>) -> Unit`, but the accessor lowering passed
+   `expected = null`, so the headerless lambda's shape stayed unknown and
+   the runtime receiver-bind ran it as a receiver-lambda: `it` unbound
+   (Null), the ProducerScope displaced into `this`. `SendingCollector`
+   then stored a null channel and `send` failed on `kotlin.Nothing`. Fix:
+   both accessor sites now pass the property's declared type
+   (`lowerAccessorExprWithExpected`). Pinned by getter_lambda_param_shape.
+
+3. **`kotlin.io` was an any-member surface.** Its five intrinsics are
+   receiver-less top-level functions, yet `anyMemberGlobal` served them
+   member-style with the receiver PREPENDED: `with(x) { println() }`
+   printed `x`. Removed from `any_member_prefixes`; pinned by
+   receiver_scope_zero_arg_println and the flipped unit expectations.
+
+4. **The SAM-candidate arm was blind to builtin-backed deeper receivers.**
+   `valueCouldServeName` answered false for every non-Instance value, so
+   inside `asFlow`'s block the collector closure swallowed `forEach` and
+   the list never iterated. The guard now vouches for builtin values via
+   the host-member probe plus `extCouldApply` on the nominal head. Pinned
+   by bare_call_through_closure_subject.
+
+5. **An import alias defeated the name-keyed inline table.**
+   `import ...unsafeFlow as flow` resolves through the symbol index to an
+   inline HEADER STUB (bodyless), and the commit emitted a call that
+   entered nothing — `flowOf` returned its own block closure. The commit
+   path now splices the registered AST by id, gated to ALIAS calls only
+   (call-site name != declared name): ungated, it force-spliced bodies the
+   name-keyed path had declined, breaking every compose example on a
+   package-private reference re-lowered in a foreign file scope AND
+   blowing the stdlib utils batch past the 6GB RSS cap. The narrow gate
+   fixed both.
+
+Also fixed on the way: the route-print insertion in the instance-method
+cache serve had broken the `cacheServesExecutingFrame` guard bracing (the
+guard applied to the print, the invoke ran unconditionally).
+
+Verified: sweep 117/0, pinned 136/137 (+3 pins; the backtick strictness
+fixture stays the one red), cli 58/58, corpus drift 249 -> 253 of 266.
+
+The 13 residuals and their shapes: flow_operators' drop/dropWhile emit
+through a bare `collect {}` whose receiver evidence needs the OUTER
+lambda receiver (`this@drop : Flow`) — the resolver sees only
+recv_ty=FlowCollector and defers, and no runtime heuristic can
+discriminate (this is the plan's lambda-receiver-evidence channel, now
+with a concrete blocking example). complex_oop_delegation
+(`medianish` extension through a delegating receiver), compose_path
+(arg-shift Div Float/PathSegment), compose_nodes/compose_ui_text/
+mosaic_hello (DIFFs), delegated_member_named_args, finally_own_throw,
+range_in_range_operator, reified_param_inference,
+throwable_suppressed_user_class, vararg_nonfinal (vararg tail loss),
+select_on_timeout_loses (timeout), runtest_channel_resume_order advanced
+to a comparator-from-bound-reference failure (`compare` on
+`$bound_ref$time`).
