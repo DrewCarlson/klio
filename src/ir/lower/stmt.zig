@@ -169,6 +169,10 @@ fn isSafeMemberTarget(target: *const Expr) bool {
 }
 
 fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?Reg {
+    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (std.mem.eql(u8, w, p.name.name))
+            std.debug.print("[valty] enter {s} annotated={} init_tag={s} nf={d}\n", .{ p.name.name, p.ty != null, if (p.init) |*e| @tagName(std.meta.activeTag(e.*)) else "-", b.module.funcs.items.len });
+    }
     // `val x = expr` / `var x = expr`. The init is lowered
     // into a fresh register and bound in the current scope;
     // mutability is enforced by typeck, not the IR.
@@ -297,10 +301,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // destructuring arm already trusts. Argument shapes built from
             // the local then refute inapplicable members.
             .Call => {
+                const vt = runtime.getenvSlice("KLIO_VALTY_TRACE");
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
+                        std.debug.print("[valty] {s} = {s} mod={x} classes={d}\n", .{ p.name.name, ct.name, @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
                     const was_nullable = ct.nullable;
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                } else if (vt) |w| {
+                    if (std.mem.eql(u8, w, p.name.name))
+                        std.debug.print("[valty] {s} = <null> mod={x} classes={d}\n", .{ p.name.name, @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
                 }
             },
             // `val clause = findClause(x) ?: continue` — the elvis arm of

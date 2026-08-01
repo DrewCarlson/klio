@@ -221,6 +221,40 @@ pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
 /// map container outlives the build arena (same process-lifetime
 /// backing as the other tables here); the AST pointers share the build
 /// arena's lifetime exactly like `inline_fn_asts`.
+var expr_body_members: ?std.StringHashMap(FnField) = null;
+
+/// Record an expression-bodied member with NO return annotation under
+/// its (owner, name, arity) key, so a caller lowered BEFORE the member's
+/// own decl pass can derive the inferred return on demand (declaration
+/// order must not decide whether a local types).
+pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem.Allocator.Error!void {
+    if (expr_body_members == null) {
+        expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
+    }
+    const key = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{d}", .{ owner, f.name.name, f.params.len });
+    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, f.name.name, "createOnCancellationAction"))
+        std.debug.print("[ebm] register owner={s} arity={d}\n", .{ owner, f.params.len });
+    try expr_body_members.?.put(key, FnField.fromPtr(f));
+}
+
+/// The registered expression body for (owner, name, arity), or null.
+pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
+    var buf: [256]u8 = undefined;
+    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, name, "createOnCancellationAction"))
+        std.debug.print("[ebm] lookup owner={s} arity={d} n={d}\n", .{ owner, nparams, if (expr_body_members) |m| m.count() else 0 });
+    if (expr_body_members) |*m| {
+        const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
+        if (m.get(key)) |ff| return ff.get();
+        // A LIFTED nested class spells `Outer$Inner`; the registration walk
+        // spells the source-simple `Inner`. Normalize on miss.
+        if (std.mem.lastIndexOfScalar(u8, owner, '$')) |d| {
+            const key2 = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner[d + 1 ..], name, nparams }) catch return null;
+            if (m.get(key2)) |ff| return ff.get();
+        }
+    }
+    return null;
+}
+
 pub fn registerInlineFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
     if (inline_fn_ids == null) {
         inline_fn_ids = std.AutoHashMap(u32, FnField).init(std.heap.page_allocator);

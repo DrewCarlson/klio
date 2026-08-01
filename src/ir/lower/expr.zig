@@ -7883,6 +7883,11 @@ fn narrowNullCheck(
 }
 
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+            std.debug.print("[valty] READ {s} decl={s}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>" });
+        }
+    }
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
     // NOT feed evidence yet: typeck's permissive inference can hand back
     // a wrong container head (a ByteArray value typed Iterable), and a
@@ -7988,6 +7993,11 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
 }
 
 pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+            std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
+        }
+    }
     if (arg.* == .This and arg.This.qualifier == null) {
         // An extension body spliced into a member function binds a new `this`
         // register while the builder's flat declaration metadata still names
@@ -8170,6 +8180,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (init != arg and pushInitChain(p.segments[0].name)) {
             defer popInitChain();
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
+            // A MEMBER-call or elvis initializer needs the full derivation
+            // the lazy reader lacks (`val clause = findClause(x) ?:
+            // continue; val onCancellation = clause.create...(a, b)`), so a
+            // pass whose statement arm recorded nothing still types the
+            // shape. Depth-guarded with the on-demand counter.
+            if (od_depth < 3) {
+                od_depth += 1;
+                defer od_depth -= 1;
+                if (staticExprTypeRef(b, init) catch null) |derived| return derived;
+            }
         }
     }
     if (staticBareReceiverType(b, p.segments[0].name)) |head| {
@@ -8366,19 +8386,29 @@ fn bareExtensionTarget(
         eagerLambdaRecvHead(b),
     );
     defer b.allocator.free(implicit_owners);
-    return b.module.resolveExtensionCall(
-        name.name,
-        recv,
-        shapes,
-        .{
-            .caller_file = name.span.file,
-            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
-            .implicit_dispatch_owners = implicit_owners,
-            .lexical_owner = b.ownerClass(),
-            .call_name = name.name,
-            .actual_type_param_bounds = bounds orelse &.{},
-        },
-    ).target;
+    const ctx = ir.Module.ExtensionResolveCtx{
+        .caller_file = name.span.file,
+        .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+        .implicit_dispatch_owners = implicit_owners,
+        .lexical_owner = b.ownerClass(),
+        .call_name = name.name,
+        .actual_type_param_bounds = bounds orelse &.{},
+    };
+    if (b.module.resolveExtensionCall(name.name, recv, shapes, ctx).target) |t| return t;
+    // Kotlin resolves a bare call against EVERY implicit receiver,
+    // innermost first. When the innermost head serves no extension, the
+    // OUTER tower entries are the remaining candidates (`collect {}`
+    // inside an operator's flow-lambda belongs to `this@drop : Flow`).
+    // Derivation-side only; gated for single-binary A/B.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EXT") orelse "1", "0")) {
+        const recv_head = typeHead(std.mem.trimEnd(u8, recv.name, "?"));
+        for (b.implicit_receiver_tower.items) |outer_head| {
+            if (std.mem.eql(u8, outer_head, recv_head)) continue;
+            const outer_ref = ir.TypeRef{ .name = outer_head, .nullable = false, .args = &.{} };
+            if (b.module.resolveExtensionCall(name.name, outer_ref, shapes, ctx).target) |t| return t;
+        }
+    }
+    return null;
 }
 
 /// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
@@ -8414,6 +8444,16 @@ fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef
 /// A statically known type for an arbitrary expression: its own declared type
 /// where it has one, otherwise a constructed class, a resolved call's return
 /// type, or the type a local's initializer lends it. Owned by the caller.
+/// On-demand return-derivation nesting: a body deriving a body must
+/// terminate on mutual recursion.
+threadlocal var od_depth: u8 = 0;
+
+/// The user-argument count of a `.Call` expression (named or not).
+fn memberArgCount(call_expr: *const Expr) usize {
+    if (call_expr.* != .Call) return 0;
+    return call_expr.Call.args.len;
+}
+
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
@@ -8907,6 +8947,20 @@ fn staticCallReturnTypeRef(
                         break :blk t;
                     }
                 }
+                // Same-class FORWARD reference: while a class's own bodies
+                // lower its method list is incomplete, so a member declared
+                // LATER (`findClause` below trySelectInternal) resolves to
+                // nothing. The pre-pass AST registry answers the DECLARED
+                // return directly.
+                if (bare_resolved.target == null) {
+                    if (inline_state.exprBodyMemberAst(bare_head, name.name, call.args.len)) |fa| {
+                        if (fa.return_type) |*rt| {
+                            const fwd = try loweredOwnedLocalTypeRef(b, rt);
+                            if (bt) std.debug.print("[bareret] {s} on {s} ast-declared return={s}\n", .{ name.name, ident, fwd.name });
+                            return fwd;
+                        }
+                    }
+                }
                 break :blk sole_global orelse return null;
             };
             // A plain lambda that captures its lexical class receiver makes
@@ -9023,7 +9077,52 @@ fn staticCallReturnTypeRef(
                 // (the same rule nullaryMemberReturnTypeRef applies).
                 resolved_target = resolved.target;
             }
+            // Same-class FORWARD references: while a class's own bodies
+            // lower, its IR method list is incomplete, so a member declared
+            // LATER in the class resolves to nothing. The pre-pass AST
+            // registry answers the return type directly — a declared
+            // annotation as-is, an un-annotated expression body by on-demand
+            // derivation.
             if (resolved_target == null) {
+                if (inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr))) |fa| {
+                    if (fa.return_type) |*rt| {
+                        var out = try loweredOwnedLocalTypeRef(b, rt);
+                        if (member.safe) out.nullable = true;
+                        if (mt) std.debug.print("[bareret] .{s} on {s} ast-declared return={s}\n", .{ member.name.name, head, out.name });
+                        return out;
+                    }
+                    if (fa.body) |*fbody| {
+                        if (fbody.* == .Expr and od_depth < 3) {
+                            od_depth += 1;
+                            defer od_depth -= 1;
+                            var nb = try FuncBuilder.init(b.allocator, b.module);
+                            defer nb.deinit();
+                            nb.setOwnerClass(head);
+                            nb.setRecvTy(head);
+                            // The owner's ctor properties are the body's
+                            // lexical bindings (`onCancellationConstructor`
+                            // inside ClauseData's members).
+                            if (b.module.uniqueClassIdBySimpleName(head)) |ocid| {
+                                if (ocid.int() < b.module.classes.items.len) {
+                                    for (b.module.classes.items[ocid.int()].primary_params) |*pp| {
+                                        try nb.setLocalDeclTypeOwned(pp.name, try pp.ty.clone(b.allocator));
+                                        if (pp.ty.nullable) try nb.setLocalDeclNullable(pp.name);
+                                    }
+                                }
+                            }
+                            for (fa.params) |*ap| {
+                                try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
+                                if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
+                            }
+                            if (try staticExprTypeRef(&nb, &fbody.Expr)) |derived| {
+                                var out = derived;
+                                if (member.safe) out.nullable = true;
+                                if (mt) std.debug.print("[bareret] .{s} on {s} ast-derived return={s}\n", .{ member.name.name, head, out.name });
+                                return out;
+                            }
+                        }
+                    }
+                }
                 if (member_applicable) {
                     if (mt) std.debug.print("[bareret] .{s} on {s} member applicable but deferred\n", .{ member.name.name, head });
                     return null;
@@ -9079,6 +9178,51 @@ fn staticCallReturnTypeRef(
         shape_set.shapes,
         explicit,
     );
+    // Declaration order must not decide whether a caller's local types:
+    // when the target is an un-annotated EXPRESSION body whose own decl
+    // pass has not run yet (its return still the Unit placeholder),
+    // derive the return from the registered AST on demand, in the
+    // target's own class context.
+    if (inferred == null and od_depth < 3) {
+        od_depth += 1;
+        defer od_depth -= 1;
+        if (b.module.decl_sigs.get(target.int())) |dsg| {
+            if (dsg.enclosing_class) |oid| {
+                if (oid.int() < b.module.classes.items.len) {
+                    const oc = &b.module.classes.items[oid.int()];
+                    if (b.module.funcById(target)) |tf| {
+                        const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
+                        const nparams = tf.params.len - @intFromBool(has_this);
+                        if (inline_state.exprBodyMemberAst(oc.name, tf.name, nparams)) |fa| {
+                            if (fa.body) |*fbody| {
+                                if (fbody.* == .Expr) {
+                                    var nb = try FuncBuilder.init(b.allocator, b.module);
+                                    defer nb.deinit();
+                                    nb.setOwnerClass(oc.name);
+                                    nb.setRecvTy(oc.name);
+                                    // The owner's ctor properties are the
+                                    // body's lexical bindings — seed their
+                                    // declared types so a bare property read
+                                    // (`onCancellationConstructor?.invoke`)
+                                    // resolves, the pattern
+                                    // lowerPropertyInitExpr already uses.
+                                    for (oc.primary_params) |*pp| {
+                                        try nb.setLocalDeclTypeOwned(pp.name, try pp.ty.clone(b.allocator));
+                                        if (pp.ty.nullable) try nb.setLocalDeclNullable(pp.name);
+                                    }
+                                    for (fa.params) |*ap| {
+                                        try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
+                                        if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
+                                    }
+                                    inferred = try staticExprTypeRef(&nb, &fbody.Expr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (inferred != null and
         call.callee.* == .Member and call.callee.Member.safe)
     {
@@ -9089,6 +9233,12 @@ fn staticCallReturnTypeRef(
     {
         std.debug.print("[bareret] {s} return={s}\n", .{
             call.callee.Path.segments[0].name,
+            if (inferred) |i| i.name else "<null>",
+        });
+    }
+    if (call.callee.* == .Member and bareRetTraceFor(b, call.callee.Member.name.name)) {
+        std.debug.print("[bareret] .{s} return={s}\n", .{
+            call.callee.Member.name.name,
             if (inferred) |i| i.name else "<null>",
         });
     }
@@ -9169,6 +9319,11 @@ fn buildStaticArgShapes(
     const shapes = try buildArgShapes(b, args, arg_names);
     for (args, shapes) |*arg, *shape| {
         shape.ty = argDeclTypeRefLazy(b, arg);
+        if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+            if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+                std.debug.print("[valty] SHAPE {s} ty={s} in={s}\n", .{ w, if (shape.ty) |t| t.name else "<null>", build.currentRealFn() orelse "-" });
+            }
+        }
         shape.ty_authoritative = shape.ty != null;
     }
     return shapes;
@@ -12828,6 +12983,7 @@ fn lowerResolvedMemberCall(
     recv_state: ReceiverState,
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
+    last_member_refuted = false;
     const ty = declared_ty orelse {
         if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
             if (std.mem.eql(u8, wanted, name.name)) {
@@ -12979,8 +13135,10 @@ fn lowerResolvedMemberCall(
             }
         }
     }
-    const func_id = resolved.target orelse
+    const func_id = resolved.target orelse {
+        last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
+    };
     // The resolver identifies a single candidate but withholds dispatch when an
     // argument's type is unknown, so its applicability is unproven. Measured,
     // that is EVERY deferral reaching this point — sites with a fully proven
@@ -13401,6 +13559,11 @@ fn lowerResolvedExtensionCall(
     return dst;
 }
 
+/// Whether the immediately preceding member resolution statically refuted
+/// every candidate (consumed by the extension leg that runs next, so a
+/// sole receiver-proven extension can commit).
+threadlocal var last_member_refuted: bool = false;
+
 fn resolveExtensionCallForArgs(
     b: *FuncBuilder,
     recv_ty: TypeRef,
@@ -13416,6 +13579,8 @@ fn resolveExtensionCallForArgs(
     defer b.allocator.free(implicit_owners);
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
+    const member_refuted = last_member_refuted;
+    last_member_refuted = false;
     const resolve_ctx = ir.Module.ExtensionResolveCtx{
         .caller_file = caller_file,
         .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
@@ -13423,6 +13588,7 @@ fn resolveExtensionCallForArgs(
         .lexical_owner = b.ownerClass(),
         .call_name = name.name,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+        .member_refuted = member_refuted,
     };
     // Diagnostic only; see `applicability.trace_call_span`.
     if (applicability.extKeyTraceEnabled()) {
