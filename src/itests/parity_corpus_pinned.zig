@@ -1187,6 +1187,15 @@ test "bare_member_call_on_captured_receiver" {
     );
 }
 
+test "redeclared_interface_slot_reaches_the_inherited_body" {
+    try check("redeclared_interface_slot_reaches_the_inherited_body",
+        \\[a, b]
+        \\[b, a]
+        \\[b]
+        \\
+    );
+}
+
 test "property_typed_from_a_ctor_parameter" {
     try check("property_typed_from_a_ctor_parameter",
         \\base

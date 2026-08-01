@@ -79,6 +79,8 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_FACTORY_PROP` | `0` to disable | Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (`val made = newBase()`) and a constructor PARAMETER (`private val held = start`) both stop registering a type head | — |
 | `KLIO_NULL_CHAIN` | `0` to disable | Off, only a condition that is itself the whole `!= null` check narrows — an `&&` chain and an early-return guard stop smart-casting | — |
 | `KLIO_INIT_KINDS` | set | Names the AST kind of every local initializer that is NOT recorded, so the next gap in that list is data rather than a guess | `[init-kind]` |
+| `KLIO_SLOT_TRACE` | `<name>` or `*` | Each inherited-slot merge decision for methods of that simple name: the competing FuncIds and which one the class's table keeps | `[slot-merge]` |
+| `KLIO_SLOT_DUMP` | `<name>` | Every `(class, slot) -> implementation` entry whose target has that simple name, with the target's owner — what runtime virtual dispatch will actually reach | `[slot-dump]` |
 
 The `0`-to-disable rows above exist so one binary can be compared against
 itself: `scripts/examples-ab.sh KLIO_SOME_GATE` runs the examples corpus both
