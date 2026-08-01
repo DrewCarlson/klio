@@ -5569,7 +5569,15 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // b)` inside `Buffer.indexOf`, whose extension overloads are
         // `Iterable.maxOf` / array `maxOf`) is the package-level function,
         // not a receiver member — it must fall through to the bare-name path.
-        const recv_chain = try narrowingRecvChain(b);
+        var recv_chain = try narrowingRecvChain(b);
+        // Inside an inline splice the ACTIVE receiver is the splice's — for
+        // `Greeter().apply { greet() }` the substituted concrete head — and
+        // the enclosing function's own receiver context says nothing about
+        // it. Without this, the receiver's member could not shadow a
+        // same-named top-level function.
+        if (recv_chain == null) {
+            if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
+        }
         // A captured crossinline param shadows a same-named member of the
         // anonymous object being lowered (`object : Iterable<T> { override fun
         // iterator() = iterator() }` — the bare `iterator()` is the captured
@@ -5600,6 +5608,20 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             };
             const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
                 (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
+            if (runtime.getenvSlice("KLIO_BINDS_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm)) {
+                    const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
+                    const hs_state: []const u8 = if (recv_chain) |ch| blk: {
+                        if (ch.len == 0) break :blk "-";
+                        const hs = b.module.registry.hierarchy_shadow_names.get(ch[0]) orelse break :blk "no-entry";
+                        if (!hs.complete) break :blk "incomplete";
+                        break :blk if (hs.names.contains(nm)) "contains" else "missing";
+                    } else "-";
+                    std.debug.print("[binds] {s} chain0={s} hs={s} own={} scoped_class={} binds={}\n", .{
+                        nm, c0, hs_state, b.hasOwnMember(nm), is_scoped_class, binds_this,
+                    });
+                }
+            }
             if (binds_this) {
                 // Pinning the dispatch to the innermost bound `this` is only
                 // sound when the receiver evidence proves that value serves
@@ -7946,7 +7968,7 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     return false;
 }
 
-fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .This and arg.This.qualifier == null) {
         // An extension body spliced into a member function binds a new `this`
         // register while the builder's flat declaration metadata still names
@@ -12231,7 +12253,7 @@ fn fqnCallArityFits(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 
 /// The simple head of a type name: drop a package qualifier and any generic
 /// arguments (`kotlin.collections.Iterable<Int>` -> `Iterable`).
-fn typeHead(s: []const u8) []const u8 {
+pub fn typeHead(s: []const u8) []const u8 {
     var t = s;
     if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
     if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];

@@ -2513,3 +2513,19 @@ The rule now requires the caller's lexical family to contain the
 declaring class in either nesting direction (which keeps a companion's
 privates visible in its enclosing class) and never through inheritance.
 Pinned suite 131 -> 132 of 134; sweep 117/0, examples A/B clean.
+
+
+### LANDED: a generic inline receiver carries the call site's classifier
+
+`T.apply { greet() }` spliced its body with receiver evidence "T" — no
+classifier — so a bare call inside the lambda could not see the
+receiver's members, and a same-named top-level function captured it
+(`lib-lib` where kotlinc dispatches the member: `member-member`). Two
+halves: the splice substitutes the CALL SITE's static receiver head when
+the declared receiver is the inline fn's own type parameter, and the
+member-shadow gate consults the splice receiver when the enclosing
+function's own receiver context is empty. Pinned suite 132 -> 133 of
+134 — every applicability red is now green; the one remaining red is
+`backtick_this_param_not_receiver`, which is resolution-STRICTNESS work
+tracked by the resolution-unification plan. Sweep 117/0, examples A/B
+clean.
