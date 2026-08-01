@@ -3213,7 +3213,11 @@ pub const Module = struct {
         }
         if (args.len > params.len) return .incompatible;
         var bindings: std.ArrayList(TypeBinding) = .empty;
-        if (receiver) |actual_receiver| {
+        // The receiver's type arguments exist to instantiate the PARAMETER
+        // types below. A zero-argument call has none to instantiate, so a
+        // receiver that cannot project (a bare `Set` head from a lambda body)
+        // must not turn `iterator()` unknown.
+        if (args.len != 0) if (receiver) |actual_receiver| {
             if (self.decl_sigs.get(fid.int())) |sig| {
                 if (sig.enclosing_class) |owner| {
                     if (owner.int() < self.classes.items.len) {
@@ -3240,7 +3244,7 @@ pub const Module = struct {
                     }
                 }
             }
-        }
+        };
         var result: StaticCompatibility = .compatible;
         for (args, params[0..args.len]) |arg, param| {
             const instantiated_param = if (bindings.items.len == 0)
@@ -4004,7 +4008,23 @@ pub const Module = struct {
                 best_score = applied;
                 tied = false;
             } else if (applied == best_score) {
-                tied = true;
+                // Redeclarations of one virtual family are not an overload
+                // tie: `Set.iterator` overrides `Collection.iterator`
+                // overrides `Iterable.iterator`, and every one of them names
+                // the same slot family. Keep the overriding declaration; a
+                // genuine tie between unrelated members still defers.
+                const existing = best.?;
+                var family = false;
+                if (self.decl_sigs.get(fid.int())) |cs| if (cs.enclosing_class) |co| {
+                    if (self.overridesSlot(sa, co, fid, existing) catch false) {
+                        best = fid;
+                        family = true;
+                    }
+                };
+                if (!family) if (self.decl_sigs.get(existing.int())) |es| if (es.enclosing_class) |eo| {
+                    if (self.overridesSlot(sa, eo, existing, fid) catch false) family = true;
+                };
+                if (!family) tied = true;
             }
         }
         if (visibility_unknown or tied or unknown_count != 0 and best != null) {
@@ -9980,6 +10000,91 @@ test "a redeclared interface slot reaches the body inherited beside it" {
     try testing.expectEqual(impl_del, m.methodSlotTarget(leaf, MethodSlotId.fromFunc(redecl_del)).?);
     // With no body anywhere in the family, the header stays as linked.
     try testing.expectEqual(redecl_del, m.methodSlotTarget(redecl, MethodSlotId.fromFunc(redecl_del)).?);
+
+    // Resolution over a redeclaration chain: equal-scoring redeclarations are
+    // one slot family, not an overload tie, and a zero-argument call has no
+    // parameter for an unprojectable bare receiver to turn unknown. Both
+    // wrong answers came back as `dispatch=deferred` with no target — the
+    // `Set.iterator()` shape.
+    const root_size = try pushTestFuncOpts(&m, a, "size", "sample.Root.size", "sample", 0, .{ .stub = true });
+    const redecl_size = try pushTestFuncOpts(&m, a, "size", "sample.Redecl.size", "sample", 0, .{ .stub = true });
+    for ([_]FuncId{ root_size, redecl_size }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[redecl_size.int()].is_override = true;
+    const size_owners = [_]ClassId{ root, redecl };
+    const size_funcs = [_]FuncId{ root_size, redecl_size };
+    for (size_funcs, size_owners) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+            .sig = &.{},
+            .kind = .instance_method,
+            .has_body = false,
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "size", fid);
+    }
+    const bare_recv = TypeRef{ .name = "Redecl", .nullable = false, .args = &.{} };
+    const res = m.resolveMemberCall(redecl, "size", &.{}, .{
+        .receiver_type = bare_recv,
+    });
+    try testing.expect(res.dispatch != .deferred);
+    try testing.expectEqual(redecl_size, res.target.?);
+
+    // The GENERIC owner is where the bare receiver bites: `Set<E>` cannot be
+    // projected from a bare `Set` head, and that unknown must not defer a
+    // call with no parameters to instantiate.
+    const groot = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "GRoot",
+        .fqn = "sample.GRoot",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .type_params = &.{"E"},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const gredecl_args = try a.alloc(TypeRef, 1);
+    gredecl_args[0] = .{ .name = "E", .nullable = false, .args = &.{} };
+    const gredecl_supers = try a.alloc(TypeRef, 1);
+    gredecl_supers[0] = .{ .name = "GRoot", .nullable = false, .args = gredecl_args };
+    const gredecl = try m.addClass(a, .{
+        .id = ClassId.from(0),
+        .name = "GRedecl",
+        .fqn = "sample.GRedecl",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = try a.dupe(ClassId, &.{groot}),
+        .supertype_refs = gredecl_supers,
+        .type_params = &.{"E"},
+        .is_abstract = true,
+        .is_interface = true,
+    });
+    const groot_first = try pushTestFuncOpts(&m, a, "first", "sample.GRoot.first", "sample", 0, .{ .stub = true });
+    const gredecl_first = try pushTestFuncOpts(&m, a, "first", "sample.GRedecl.first", "sample", 0, .{ .stub = true });
+    for ([_]FuncId{ groot_first, gredecl_first }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
+    m.funcs.items[gredecl_first.int()].is_override = true;
+    const first_owners = [_]ClassId{ groot, gredecl };
+    const first_funcs = [_]FuncId{ groot_first, gredecl_first };
+    for (first_funcs, first_owners) |fid, owner| {
+        try m.decl_sigs.put(fid.int(), .{
+            .enclosing_class = owner,
+            .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+            .sig = &.{},
+            .kind = .instance_method,
+            .has_body = false,
+        });
+        try m.registerMemberDecl(a, m.classes.items[owner.int()].fqn, "first", fid);
+    }
+    const bare_generic = TypeRef{ .name = "GRedecl", .nullable = false, .args = &.{} };
+    const gres = m.resolveMemberCall(gredecl, "first", &.{}, .{
+        .receiver_type = bare_generic,
+    });
+    try testing.expect(gres.dispatch != .deferred);
+    try testing.expectEqual(gredecl_first, gres.target.?);
 }
 
 /// Options for the symbol-index test func pusher.

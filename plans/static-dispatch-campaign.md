@@ -1149,6 +1149,43 @@ Still open in the residue, in order: `iterator`/`.iterator` (919 examples /
 no type arguments at all, so instantiation refuses before any bound is
 involved), `toMutableList` 442, `nextInt` 182, `lines` 130.
 
+### Two resolver defects under the iterator residue, and one measured zero
+
+Chasing the iterator population surfaced `.iterator on Set member applicable
+but deferred` — a ZERO-ARGUMENT member call on a known receiver head that
+still refused to bind. Two independent defects, both fixed and both pinned by
+module tests on the Root/Redecl (and generic GRoot/GRedecl) families:
+
+1. **A redeclaration chain scored as an overload tie.** `Set.iterator`
+   overrides `Collection.iterator` overrides `Iterable.iterator`; all three
+   reach the candidate list, score identically, and the equal score set
+   `tied` — which defers. Redeclarations of one virtual family are not a
+   tie: the override relation now picks the overriding declaration, and a
+   genuine tie between unrelated members still defers.
+2. **A bare receiver head turned a zero-argument call unknown.** The
+   receiver's type arguments exist to instantiate PARAMETER types, but the
+   projection ran before looking at the arguments — of which there were
+   none — so an unprojectable bare `Set` marked `iterator()` unknown and
+   the site deferred.
+
+Census: UNCHANGED on both sets. The deferral sat on type-DERIVATION queries,
+not on emitted call sites, so fixing it feeds later channels rather than
+binding sites today.
+
+**Measured zero, twice: head-only receiver evidence.** A slice that let a
+local's derived type commit with a known head but unresolved arguments
+(member binding only, extensions kept strict) measured zero on both sets, was
+reverted, was re-tried after the resolver fixes above unblocked its feed, and
+measured zero again. The mechanism: the population it targets sits in lambda
+bodies where `bareStaticRecvHead` has NO answer at all (`with(xs) { iterator()
+}` — `no recv head`), so there is nothing to commit head-only. A trace-reading
+lesson is recorded with it: `[bareret] ... return=Iterator` prints only the
+type's NAME — those 403 derivations were complete `Iterator<T>` answers
+already committed by the strict channel, not bare heads. The iterator
+residue's real prerequisite is RECEIVER EVIDENCE FOR LAMBDA BODIES — the
+lambda's receiver type from its callee's signature and argument — which is
+the eager-mode question, not another syntactic channel.
+
 **And the regression the first slice exposed was a real dispatch bug.** With receivers of
 type `MutableList` newly typed, `reversed.remove("c")` on an `asReversed()`
 view bound through `MutableList.remove`'s own virtual slot — and that slot,
