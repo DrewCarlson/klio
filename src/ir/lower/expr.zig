@@ -8247,6 +8247,11 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
     if (b.module.funcId(ident.name) != null) return null;
     const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    // A MEMBER of the enclosing receiver shadows the constructor, exactly as
+    // the emission router decides it (`fun Foo(): Bar` inside Host makes a
+    // bare `Foo()` the member call). Typing the local as the class here bound
+    // later calls against the wrong receiver class.
+    if (enclosingHasMemberNamed(b, ident.name) and !classNestedInEnclosing(b, cid)) return null;
     if (cid.int() >= b.module.classes.items.len) return null;
     const class = &b.module.classes.items[cid.int()];
     // An object is not constructed; a stub or value class has no instance

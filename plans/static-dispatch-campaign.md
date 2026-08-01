@@ -2476,3 +2476,15 @@ local. The alias now resolves through `resolveTypeAliasAt` first,
 exactly as global extension resolution already did. Pinned suite
 127 -> 129 of 134 (this healed `qualified_alias_static_applicability`
 too); sweep 117/0, examples A/B clean.
+
+
+### LANDED: a member shadowing a constructor types its call site
+
+`ctorInitTypeRef` typed any bare capitalized call as the class it names,
+but a MEMBER of the enclosing receiver shadows the constructor — the
+emission router already decided that (`fun Foo(): Bar` inside Host makes
+a bare `Foo()` the member call, and the member RAN) while the derivation
+still committed type `Foo`, so `value.tag()` bound `Foo.tag` statically
+and executed it against the `Bar` the member returned. The derivation now
+applies the router's own shadow rule. Pinned suite 129 -> 130 of 134;
+sweep 117/0, examples A/B clean.
