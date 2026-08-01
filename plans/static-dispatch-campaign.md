@@ -2296,12 +2296,29 @@ that PREDATES the campaign (bisected: de72470a crashes identically):
 allocated moments earlier — its slab header was overwritten between the
 two enum-field defines, i.e. the patch loop is the victim, not the
 source. Second shape: a free of already-freed memory (`0xAAAAAAAA`)
-under `vm.deinit` at parity.zig:2043. Next diagnostic step: run the e2e
-binary under a safety allocator (`guardAllocator` exists in main.zig;
-the parity/test path needs the same wrapping, or a
-GeneralPurposeAllocator with safety on) to name the first bad
-alloc/free pair with both stacks, sharded via `KLIO_E2E_SHARD` to keep
-the run short.
+under `vm.deinit` at parity.zig:2043.
+
+MEASURED: cache EVICTION is NOT the cause — with `base_cache_max = 0`
+(both sites in e2e.zig; the probe was reverted) all three tests still
+crash identically. The remaining mechanism, consistent with every
+observation: the e2e loop resets ONE run arena per program
+(`run_arena.reset(.retain_capacity)`), and `parity.runWithPacks(a, ...)`
+builds the per-program Vm on that arena — so the enum-entry patch
+writes VALUES evaluated with program N's arena into the CACHED,
+program-spanning base instances. Program N+1's reset recycles that
+memory under the cached fields; skip-if-present then preserves dangling
+values, and any later read/replace/release of them is a use-after-reset
+(the slab frames come from deeper layers that wrap the same memory).
+
+The fix shape: patch values must be allocated from the CACHE ENTRY's
+arena. Concretely, `prepareWithBase` (which holds both the entry and
+its arena) should run the enum ctor-arg patch itself, passing the
+entry's arena as the evaluation/definition allocator, and
+`vmPrepareInner`'s per-Vm loop keeps only the skip-if-present guard.
+An alternative with the same ownership result: deep-copy the evaluated
+values into the entry arena before `define`. Verify with
+`KLIO_E2E_SHARD=0/8` on the rebuilt binary, then the full suite, then
+the whole gate.
 
 The fast loop (harness + sweep + unit modules) structurally cannot see this
 path: only the e2e/parity itests run in-process base-image adoption with the
