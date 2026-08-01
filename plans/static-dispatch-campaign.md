@@ -1979,6 +1979,35 @@ re-measure `[lower-sites]`. The 72.3% `no_receiver_type` bucket is the
 number to drive down; the 6.4% `no_class_id` and 14.3%
 `resolver_declined` buckets get their own passes afterwards.
 
+**Phase 1 is DONE as far as syntax can take it.** 2.34% -> 54.7% bound on the
+stdlib set, 37.4% -> 61.9% on the examples set. Every channel that reads a type
+out of the SOURCE has been opened: a local's own initializer (call, constructor,
+property read, indexed read, alias chain, operator result), a loop variable, a
+destructured component, a lambda parameter, an extension body's receiver, a
+type parameter's upper bound, a property's constructor parameter or factory
+call, a bare call's sole global. Each is pinned by a fixture that prints the
+wrong answer when its channel is switched off.
+
+What remains is NOT more of the same, and six separate measured zeros say so.
+Both remaining buckets are blocked on the same missing thing, and the probes
+that establish it are recorded below:
+
+  - `no_receiver_type`, still the mass. Its initializers are dominated by
+    `getOrPut`, `iterator`, `toMutableList`, `listIterator` — stdlib generics
+    whose declared return type is the CALLER's own type parameter. `M :
+    MutableMap<K, V>` makes `getOrPut` return `V`, which names no class, and
+    the bound record drops the arguments that would substitute it. No lookup
+    fixes this; the type arguments have to be inferred.
+  - `resolver_declined`, which the last few fixes GREW by moving sites into it.
+    Every blocked pair there has an applicable member and an applicable
+    same-arity extension, and `[extlit]` shows the arguments carry no
+    authoritative type to choose between them.
+
+So the next phase is one project, not two: infer and carry GENERIC ARGUMENTS
+through the call graph. It unlocks both buckets at once, and until it exists
+every further syntactic channel measures zero — which is what the dead-end list
+below is for.
+
 **Phase 2 — lower `a[i]` as `Index`.** 19.9M `member_fast_subscript`
 dispatches should never reach the member arm.
 
