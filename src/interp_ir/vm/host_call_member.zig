@@ -3636,6 +3636,14 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
     return cg.get().name;
 }
 
+/// The classifier head of a source-spelled supertype name: generic args
+/// and nullability stripped (`Flow<T>` -> `Flow`).
+fn supertypeHead(raw: []const u8) []const u8 {
+    var h = raw;
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    return std.mem.trimEnd(u8, std.mem.trim(u8, h, " "), "?");
+}
+
 pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, argc: usize) bool {
     if (v.* != .Instance) {
         // A builtin-backed value (a List, String, Array, Sequence...) serves
@@ -3664,9 +3672,30 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
         if (m.registry.hierarchy_methods.get(cls_name)) |methods| {
             if (methods.contains(name)) return true;
         }
+        // An anonymous object's class name says nothing; its SUPERTYPES
+        // carry the declared members (an `object : Flow<T>` serves
+        // `collect` through the interface). Walk the chain so the
+        // SAM-candidate arm declines in favor of the real receiver.
+        for (cg.get().supertype_names) |sup| {
+            const head = supertypeHead(sup);
+            if (m.registry.hierarchy_methods.get(head)) |methods| {
+                if (methods.contains(name)) return true;
+            }
+        }
         // extCouldApply rebuilds its lazy index when the func table has
         // grown; VM execution is single-threaded, so the cast is sound.
         if (@constCast(m).extCouldApply(allocator, cls_name, name, argc)) return true;
+        for (cg.get().supertype_names) |sup| {
+            if (@constCast(m).extCouldApply(allocator, supertypeHead(sup), name, argc)) return true;
+        }
+    }
+    // A runtime-lowered anon object registers its methods in the per-site
+    // table, not the class def.
+    {
+        var mbuf: [96]u8 = undefined;
+        if (std.fmt.bufPrint(&mbuf, "{s}/{d}", .{ name, argc })) |mkey| {
+            if (lookupAnonMethod(self, allocator, cls_name, mkey, name) != null) return true;
+        } else |_| {}
     }
     const def = g.get().class.clone();
     defer def.deinit();

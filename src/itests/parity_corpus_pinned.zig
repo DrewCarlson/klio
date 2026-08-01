@@ -1555,3 +1555,15 @@ test "delegated_member_named_args_pin" {
         \\
     );
 }
+
+test "flow_builder_object_identity" {
+    try check("flow_builder_object_identity",
+        \\d3
+        \\d4
+        \\w7
+        \\w1
+        \\a5
+        \\a6
+        \\
+    );
+}

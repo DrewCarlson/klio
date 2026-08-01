@@ -3169,3 +3169,23 @@ pack-context ingredient. Next repro dimension: two-file/pack setup with
 the import alias, or probe the REAL flowOf splice with KLIO_DUMP_FN over
 the spliced caller to see what instruction the object lowered to
 (AstLambda vs NewInstance).
+
+
+### flow_operators GREEN: the anon object's interface chain was invisible
+
+The closure-collapse theory was wrong — KLIO_DUMP_FN over the spliced
+flowOf showed BuildObject, and the walk's [2]Instance($anon$0) WAS the
+flowOf Flow. The real gap: `valueCouldServeName`'s Instance arm keyed
+`hierarchy_methods` by the class's OWN name only, and an anonymous
+object's name says nothing — its `supertype_names` carry the declared
+members (`object : Flow<T>` serves `collect` through the interface),
+and a runtime-lowered anon registers methods in the per-site table.
+The arm now walks the supertype chain through hierarchy_methods and
+extCouldApply and probes the anon-method table, so the SAM-candidate
+arm declines at the collector closure and the walk reaches the real
+Flow. drop/dropWhile emit correctly; flow_operators matches. Pinned by
+flow_builder_object_identity. Drift 261 -> 262/266 (compose_nodes,
+compose_ui_text, mosaic_hello, select_on_timeout_loses remain); sweep
+117/0; pinned 145/146. The [bare] collect -> NONE static gap (the
+tower consult) is still the census lever, but no longer blocks
+correctness here.
