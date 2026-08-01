@@ -2447,3 +2447,19 @@ harness. Census UNCHANGED on the stdlib set — the seventh wrong-answer fix
 visible only as parity. The pinned itest suite still reports 126/134
 through the PARITY pipeline: those failures resolve against base-image
 candidate sets and need their own look.
+
+
+### The seven remaining pinned reds, triaged
+
+- `backtick_this_param_not_receiver` is `checkErr`: kotlinc REJECTS the
+  bare `show()` (no implicit receiver in scope) before running; klio defers
+  it to a runtime unresolved-global. That is resolution-STRICTNESS work and
+  belongs to the resolution-unification plan, not an applicability fix.
+- The other six (`local_extension_generic_applicability_matrix`,
+  `qualified_alias_static_applicability`, `member_factory_constructor_shadow`,
+  `unimported_object_member_extension`, `member_extension_foreign_field_shadow`,
+  `tier5_loose_member_redispatch_resolves`) are output mismatches in
+  extension/member applicability matrices — campaign-domain, each needs its
+  own root-cause pass with the harness where reproducible
+  (`local_extension_generic_applicability_matrix` prints 2 of its 5
+  expected lines there).
