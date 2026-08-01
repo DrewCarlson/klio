@@ -1515,3 +1515,13 @@ test "range_in_range_user_operator" {
         \\
     );
 }
+
+test "finally_runs_on_return_leaf_shape" {
+    try check("finally_runs_on_return_leaf_shape",
+        \\fin-a
+        \\1
+        \\fin-b
+        \\2
+        \\
+    );
+}

@@ -1224,7 +1224,10 @@ pub const Func = struct {
         if (self.n_locals > LEAF_MAX_REGS) return false;
         var total: usize = 0;
         for (self.blocks) |*b| {
-            if (b.catches.len != 0) return false;
+            // A finally-carrying body needs the try-stack machinery: the
+            // frameless walk would return straight out of the try region
+            // and never run the finally.
+            if (b.catches.len != 0 or b.finally != null) return false;
             total += b.insts.len;
             if (total > LEAF_MAX_INSTS) return false;
             switch (b.terminator) {

@@ -3002,3 +3002,20 @@ makes it inapplicable, which is exactly the ladder's existing
 `range_in_range` standdown predicate — the guard now carries the same
 exclusion. Pinned by range_in_range_user_operator; the example matches.
 Sweep 117/0.
+
+
+### finally_own_throw: the leaf serve skipped finally blocks
+
+`fun returnInFinally() { try { return 1 } finally { return 2 } }`
+answered 1 — and a diagnostic `println` in the finally never printed:
+`classifyLeafExprBody` rejected bodies with CATCHES but admitted
+finally-carrying ones, and the frameless leaf walk has no try-stack, so
+the return left the try region without ever entering the finally. The
+classifier now rejects `finally != null` blocks too. The eval's own
+machinery was correct all along (once framed, a return inside the
+finally replaces the pending one). Pinned by
+finally_runs_on_return_leaf_shape; the example matches. Sweep 117/0.
+
+KLIO_DUMP_FN now also accepts a function NAME (dumps every func bearing
+it) and prints per-block try metadata (catches/finally/sentinel/pop) —
+both were needed to see this.
