@@ -739,6 +739,11 @@ pub const FuncBuilder = struct {
     /// resolved by the reified splice, which substitutes the concrete type.
     type_param_names: StringSet,
     type_param_bounds: std.StringHashMap(ir.ModuleRegistry.TypeParamBound),
+    /// The full lowered upper bound of a type parameter, when it carries type
+    /// ARGUMENTS the string record above drops. `M : MutableMap<in K,
+    /// MutableList<T>>` needs them to instantiate a member/extension return
+    /// type on a receiver typed `M`.
+    type_param_bound_refs: std.StringHashMap(TypeRef),
     owned_type_param_names: std.ArrayList([]u8),
 
     pub fn init(allocator: Allocator, module: *Module) Allocator.Error!FuncBuilder {
@@ -760,6 +765,7 @@ pub const FuncBuilder = struct {
             .own_members = StringSet.init(allocator),
             .type_param_names = StringSet.init(allocator),
             .type_param_bounds = std.StringHashMap(ir.ModuleRegistry.TypeParamBound).init(allocator),
+            .type_param_bound_refs = std.StringHashMap(TypeRef).init(allocator),
             .owned_type_param_names = .empty,
             .own_member_arity = std.StringHashMap(u64).init(allocator),
             .lambda_arg_arity = std.AutoHashMap(span_mod.Span, i16).init(allocator),
@@ -839,6 +845,11 @@ pub const FuncBuilder = struct {
         self.own_members.deinit();
         self.type_param_names.deinit();
         self.type_param_bounds.deinit();
+        {
+            var it = self.type_param_bound_refs.valueIterator();
+            while (it.next()) |v| v.deinit(a);
+            self.type_param_bound_refs.deinit();
+        }
         for (self.owned_type_param_names.items) |name| a.free(name);
         self.owned_type_param_names.deinit(a);
         self.own_member_arity.deinit();
@@ -1998,6 +2009,19 @@ pub const FuncBuilder = struct {
     /// such a receiver name a class at all.
     pub fn typeParamBound(self: *const FuncBuilder, name: []const u8) ?ir.ModuleRegistry.TypeParamBound {
         return self.type_param_bounds.get(name);
+    }
+    /// Record the fully lowered upper bound of `name`, keeping its type
+    /// arguments. Takes ownership of `ref`.
+    pub fn addTypeParamBoundRef(self: *FuncBuilder, name: []const u8, ref: TypeRef) Allocator.Error!void {
+        if (try self.type_param_bound_refs.fetchPut(name, ref)) |old| {
+            var stale = old.value;
+            stale.deinit(self.allocator);
+        }
+    }
+    /// The full lowered upper bound of type parameter `name`, with its type
+    /// arguments, when the declaration wrote any.
+    pub fn typeParamBoundRef(self: *const FuncBuilder, name: []const u8) ?*const TypeRef {
+        return self.type_param_bound_refs.getPtr(name);
     }
 
     pub fn typeParamBoundsSlice(

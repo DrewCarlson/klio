@@ -8304,6 +8304,26 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     return try b.allocator.dupe(u8, elem.name);
 }
 
+/// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
+/// plain parameter, recursively. The owned name is re-allocated so `deinit`
+/// still frees what `clone` allocated.
+fn stripUseSiteProjections(a: Allocator, ty: *ir.TypeRef) Allocator.Error!void {
+    for (ty.args) |*arg| {
+        const suffix: ?[]const u8 = if (std.mem.startsWith(u8, arg.name, "in#"))
+            arg.name["in#".len..]
+        else if (std.mem.startsWith(u8, arg.name, "out#"))
+            arg.name["out#".len..]
+        else
+            null;
+        if (suffix) |plain| {
+            const owned = try a.dupe(u8, plain);
+            a.free(arg.name);
+            arg.name = owned;
+        }
+        try stripUseSiteProjections(a, arg);
+    }
+}
+
 /// The receiver-type chain used by the `Member` and `Index` arms. Gated so the
 /// widening can be measured against the narrower answer it replaced.
 fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
@@ -8777,17 +8797,45 @@ fn staticCallReturnTypeRef(
             // only type comes from its own INITIALIZER is invisible to the
             // lazy answer, and `val xs = listOf<Base>(...)` is that shape.
             receiver = try recvChainTypeRef(b, member.receiver);
-            const recv_ty = receiver orelse {
+            if (receiver == null) {
                 if (mt) std.debug.print("[bareret] .{s} no receiver type\n", .{member.name.name});
                 return null;
-            };
-            var identity = std.mem.trimEnd(u8, recv_ty.name, "?");
+            }
+            var identity = std.mem.trimEnd(u8, receiver.?.name, "?");
             if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
-            const head = typeHead(identity);
-            const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            var head = typeHead(identity);
+            var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
                 b.module.classIdByFqn(identity)
             else
                 b.module.uniqueClassIdBySimpleName(head);
+            // A receiver typed by a TYPE PARAMETER names no class. Kotlin
+            // resolves the call against the parameter's declared upper bound,
+            // and the full bound carries the type arguments instantiation
+            // needs: `M : MutableMap<in K, MutableList<T>>` makes `getOrPut`
+            // return `MutableList<T>`.
+            if (owner_id == null and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0"))
+            {
+                if (b.typeParamBoundRef(head)) |bref| {
+                    receiver.?.deinit(b.allocator);
+                    receiver = try bref.clone(b.allocator);
+                    // A use-site projection in the bound (`MutableMap<in K,
+                    // MutableList<T>>`) would need capture conversion the
+                    // engine does not model. For deriving a RETURN type the
+                    // captured argument behaves as the plain parameter, and a
+                    // projected parameter that survives into the result is an
+                    // unresolved name later guards refuse anyway.
+                    try stripUseSiteProjections(b.allocator, &receiver.?);
+                    identity = std.mem.trimEnd(u8, receiver.?.name, "?");
+                    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+                    head = typeHead(identity);
+                    owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                        b.module.classIdByFqn(identity)
+                    else
+                        b.module.uniqueClassIdBySimpleName(head);
+                }
+            }
+            const recv_ty = receiver.?;
 
             var resolved_target: ?FuncId = null;
             var member_applicable = false;

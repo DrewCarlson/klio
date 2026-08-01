@@ -304,14 +304,14 @@ Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
     total 6,638 member call sites
       146   2.20%  bound_static     <- direct FuncId call
-    3,499  52.71%  bound_virtual    <- method slot, no name lookup
+    3,563  53.68%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,208  33.26%  no_receiver_type
+    2,144  32.30%  no_receiver_type
       451   6.79%  resolver_declined
       214   3.22%  no_class_id
       120   1.81%  nullable_or_generic
 
-Statically bound: 3,645 of 6,638 (54.9%), from 150 (2.34%) at the start of this
+Statically bound: 3,709 of 6,638 (55.9%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
@@ -319,14 +319,14 @@ concrete types the stdlib's own generic containers do not:
 
     total 69,847
      1,453   2.08%  bound_static
-    41,848  59.91%  bound_virtual
+    42,680  61.10%  bound_virtual
     ------------------------------
-    18,873  27.02%  no_receiver_type
+    18,041  25.83%  no_receiver_type
      3,697   5.29%  resolver_declined
      2,698   3.86%  no_class_id
      1,278   1.83%  nullable_or_generic
 
-Statically bound: 43,301 of 69,847 (62.0%), from 27,098 (37.4%).
+Statically bound: 44,133 of 69,847 (63.2%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -1114,6 +1114,40 @@ Census: UNCHANGED on both sets — the sixth wrong-answer fix this campaign
 that is invisible to the census and visible only as kotlinc parity. Pinned by
 `generic_argument_from_every_constraint` (gate on: exact parity; off: four
 wrong answers of six lines).
+
+### The third slice: a receiver typed by a type parameter reads its full bound
+
+Ranked by `KLIO_LI_NAMES` on the EXAMPLES set, the residue was `.getOrPut`
+834, `iterator`/`.iterator` 919 combined, `toMutableList` 442 — and the
+getOrPut receivers were all typed `M`, a type parameter (`M : MutableMap<in
+K, MutableList<T>>`, the shape `groupByTo` and every grouping helper write).
+The call-site gate already resolves a member call on such a receiver through
+the parameter's bound, but the bound RECORD keeps only the head name — the
+type arguments the return-type instantiation needs were dropped at
+declaration lowering.
+
+The builder now keeps the full lowered bound (`type_param_bound_refs`)
+beside the string record, and `staticCallReturnTypeRef`'s Member arm
+substitutes it when the receiver head names no class. A use-site projection
+in the bound (`in K`) is stripped at that boundary: the engine has no
+capture conversion, a captured argument behaves as the plain parameter for
+deriving a return type, and a projected parameter surviving into a result is
+an unresolved name the completeness guards refuse anyway. Gate:
+`KLIO_TP_RECV`.
+
+    stdlib   bound 3,645 -> 3,709   (54.9% -> 55.9%)
+    examples bound 43,301 -> 44,133 (62.0% -> 63.2%)
+
+The examples gain (-832 `no_receiver_type`) is almost exactly the measured
+getOrPut population (834): one channel, one bucket. Pinned by
+`receiver_typed_through_its_parameter_bound` — the un-projected and
+projected shapes both, exact kotlinc parity with the gate on and a wrong
+extension pick with it off.
+
+Still open in the residue, in order: `iterator`/`.iterator` (919 examples /
+230 stdlib — the initializer sits in bodies whose implicit receiver carries
+no type arguments at all, so instantiation refuses before any bound is
+involved), `toMutableList` 442, `nextInt` 182, `lines` 130.
 
 **And the regression the first slice exposed was a real dispatch bug.** With receivers of
 type `MutableList` newly typed, `reversed.remove("c")` on an `asReversed()`

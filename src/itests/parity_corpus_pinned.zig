@@ -1196,6 +1196,15 @@ test "redeclared_interface_slot_reaches_the_inherited_body" {
     );
 }
 
+test "receiver_typed_through_its_parameter_bound" {
+    try check("receiver_typed_through_its_parameter_bound",
+        \\base
+        \\1
+        \\2
+        \\
+    );
+}
+
 test "generic_argument_from_every_constraint" {
     try check("generic_argument_from_every_constraint",
         \\base

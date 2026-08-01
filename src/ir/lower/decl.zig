@@ -1724,10 +1724,12 @@ fn addScopedTypeParamBounds(
         var complete = true;
         var head_only = true;
         var count: usize = 0;
+        var bound_ast: ?*const ast.TypeRef = null;
         if (param.upper_bound) |*upper| {
             bound = upper.name.name;
             complete = boundTypeRecordComplete(upper);
             head_only = boundTypeRecordHeadOnly(upper);
+            bound_ast = upper;
             count += 1;
         }
         for (f.where_bounds) |*where_bound| {
@@ -1736,6 +1738,7 @@ fn addScopedTypeParamBounds(
                     bound = where_bound.bound.name.name;
                     complete = boundTypeRecordComplete(&where_bound.bound);
                     head_only = boundTypeRecordHeadOnly(&where_bound.bound);
+                    bound_ast = &where_bound.bound;
                 }
                 count += 1;
             }
@@ -1745,6 +1748,17 @@ fn addScopedTypeParamBounds(
             head_only = false;
         }
         try b.addTypeParamBoundHead(param.name.name, bound, complete, head_only);
+        // The string record drops the bound's type ARGUMENTS; keep the full
+        // lowered form when there are any, so a receiver typed by this
+        // parameter can instantiate a call's return type through it.
+        if (count == 1) if (bound_ast) |upper| {
+            if (upper.type_args.len != 0) {
+                try b.addTypeParamBoundRef(
+                    param.name.name,
+                    try loweredTypeRef(b.allocator, upper, true),
+                );
+            }
+        };
     }
 }
 
