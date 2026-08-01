@@ -639,6 +639,20 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
         const inst = entry_inst orelse continue;
         defer inst.deinit();
+        // A cached base shares these instances across per-program Vms, and
+        // the ctor args are per-class constants: once one Vm has patched the
+        // fields, re-evaluating them would only swap equal values — and the
+        // release of the previous Vm's value would cross allocators. Skip
+        // entries whose fields are already complete.
+        const already_patched = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            for (param_names.items) |pn| {
+                if (g.get().get(pn) == null) break :blk false;
+            }
+            break :blk true;
+        };
+        if (already_patched) continue;
         for (entry.funcs, 0..) |fid, idx| {
             const init_func = module.funcById(fid) orelse continue;
             const v = blk: {

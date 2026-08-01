@@ -2285,9 +2285,23 @@ mechanisms, all in the enum-entry ctor-arg patch (`vmPrepareInner`):
    entry's own arena (values and buffers then share the cache entry's
    lifetime), and make the per-VM loop skip fields that are already
    present — enum ctor args are per-class constants, so skipping is
-   semantics-preserving. That refactor moves the patch out of
-   `vmPrepareInner` into the adopt paths (parity base cache and
-   stdlib_image), which both know their arena.
+   semantics-preserving. LANDED as skip-if-present in `vmPrepareInner`
+   (the process-global slab means the first Vm's values legitimately
+   outlive it while the cached base holds them); the cross-Vm RELEASE
+   crash (integer overflow in the refcount atomic) is gone.
+
+STILL RED, and the surviving evidence points at an underlying heap stomp
+that PREDATES the campaign (bisected: de72470a crashes identically):
+`freeSmall` sees `class_idx=34, len 32` when growing a buffer the SAME Vm
+allocated moments earlier — its slab header was overwritten between the
+two enum-field defines, i.e. the patch loop is the victim, not the
+source. Second shape: a free of already-freed memory (`0xAAAAAAAA`)
+under `vm.deinit` at parity.zig:2043. Next diagnostic step: run the e2e
+binary under a safety allocator (`guardAllocator` exists in main.zig;
+the parity/test path needs the same wrapping, or a
+GeneralPurposeAllocator with safety on) to name the first bad
+alloc/free pair with both stacks, sharded via `KLIO_E2E_SHARD` to keep
+the run short.
 
 The fast loop (harness + sweep + unit modules) structurally cannot see this
 path: only the e2e/parity itests run in-process base-image adoption with the
