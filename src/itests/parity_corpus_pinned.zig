@@ -1196,6 +1196,14 @@ test "redeclared_interface_slot_reaches_the_inherited_body" {
     );
 }
 
+test "bare_extension_call_in_a_receiver_body" {
+    try check("bare_extension_call_in_a_receiver_body",
+        \\base
+        \\base
+        \\
+    );
+}
+
 test "receiver_typed_through_its_parameter_bound" {
     try check("receiver_typed_through_its_parameter_bound",
         \\base

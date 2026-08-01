@@ -302,31 +302,32 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,638 member call sites
-      146   2.20%  bound_static     <- direct FuncId call
-    3,563  53.68%  bound_virtual    <- method slot, no name lookup
+    total 6,538 member call sites
+      146   2.23%  bound_static     <- direct FuncId call
+    3,563  54.50%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,144  32.30%  no_receiver_type
-      451   6.79%  resolver_declined
-      214   3.22%  no_class_id
-      120   1.81%  nullable_or_generic
+    2,044  31.26%  no_receiver_type
+      451   6.90%  resolver_declined
+      214   3.27%  no_class_id
+      120   1.84%  nullable_or_generic
 
-Statically bound: 3,709 of 6,638 (55.9%), from 150 (2.34%) at the start of this
-round.
+Statically bound: 3,709 of 6,538 (56.7%), from 150 (2.34%) at the start of this
+round. The TOTAL shrinks as bare calls that were member sites become
+statically bound extension calls and leave the member census entirely.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
 concrete types the stdlib's own generic containers do not:
 
-    total 69,847
-     1,453   2.08%  bound_static
-    42,680  61.10%  bound_virtual
+    total 68,568
+     1,453   2.12%  bound_static
+    42,680  62.24%  bound_virtual
     ------------------------------
-    18,041  25.83%  no_receiver_type
-     3,697   5.29%  resolver_declined
-     2,698   3.86%  no_class_id
-     1,278   1.83%  nullable_or_generic
+    16,762  24.45%  no_receiver_type
+     3,697   5.39%  resolver_declined
+     2,698   3.93%  no_class_id
+     1,278   1.86%  nullable_or_generic
 
-Statically bound: 44,133 of 69,847 (63.2%), from 27,098 (37.4%).
+Statically bound: 44,133 of 68,568 (64.4%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -1148,6 +1149,24 @@ Still open in the residue, in order: `iterator`/`.iterator` (919 examples /
 230 stdlib — the initializer sits in bodies whose implicit receiver carries
 no type arguments at all, so instantiation refuses before any bound is
 involved), `toMutableList` 442, `nextInt` 182, `lines` 130.
+
+### The fourth slice: a bare call may be an extension of the implicit receiver
+
+The bare-call arm resolved MEMBERS of the implicit receiver but never its
+EXTENSIONS, so `toMutableList()` written inside an `Iterable<T>` extension
+body found no target at all — and every stdlib body writes that shape. The
+arm now falls to `resolveExtensionCall` with the same receiver, members
+first exactly as Kotlin orders them, and an applicable-but-unproven member
+still wins the deferral. Gate: `KLIO_BARE_EXT`.
+
+    stdlib   2,144 -> 2,044 no_receiver_type, total 6,638 -> 6,538 (56.7% bound)
+    examples 18,041 -> 16,762 no_receiver_type, total 69,847 -> 68,568 (64.4% bound)
+
+The bound sites leave the member census (they are extension calls now), so
+the gain shows as the DENOMINATOR shrinking: 100 stdlib and 1,279 examples
+sites moved from unresolved-member to statically-bound-extension. Pinned by
+`bare_extension_call_in_a_receiver_body`, which reads an element out of the
+derived local — the runtime class answers with the gate off.
 
 ### Two resolver defects under the iterator residue, and one measured zero
 

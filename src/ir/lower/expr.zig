@@ -8782,7 +8782,40 @@ fn staticCallReturnTypeRef(
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
                 });
-                break :blk bare_resolved.target orelse (sole_global orelse return null);
+                if (bare_resolved.target) |member_target| break :blk member_target;
+                // No member serves it, and none is even applicable: a bare
+                // call in a receiver context may be an EXTENSION of the
+                // implicit receiver written without `this.` — `toMutableList()`
+                // inside an `Iterable<T>` extension body. Members were tried
+                // first, exactly as Kotlin orders them, and an applicable-but-
+                // unproven member still wins the deferral.
+                if (!bare_resolved.applicable and
+                    !std.mem.eql(u8, runtime.getenvSlice("KLIO_BARE_EXT") orelse "1", "0"))
+                {
+                    const implicit_owners = try b.collectImplicitReceiverTower(
+                        b.allocator,
+                        eagerLambdaRecvHead(b),
+                    );
+                    defer b.allocator.free(implicit_owners);
+                    const ext_target = b.module.resolveExtensionCall(
+                        name.name,
+                        bare_recv,
+                        shape_set.shapes,
+                        .{
+                            .caller_file = name.span.file,
+                            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+                            .implicit_dispatch_owners = implicit_owners,
+                            .lexical_owner = b.ownerClass(),
+                            .call_name = name.name,
+                            .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+                        },
+                    ).target;
+                    if (ext_target) |t| {
+                        if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
+                        break :blk t;
+                    }
+                }
+                break :blk sole_global orelse return null;
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
