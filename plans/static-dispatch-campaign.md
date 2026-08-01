@@ -2831,3 +2831,25 @@ probe: print `spliceRecvTy`/`spliceHintRecv`/`lambda_splice_resolve`
 at the exact site (KLIO_BAREARM extended with the three channel values)
 through the nested-splice path in the batched run; the fix belongs at
 whichever layer drops the subject's head.
+
+
+### THE FLIP: bounds refutation and the smart-cast narrow are the default
+
+The armed roll-out list emptied in one stroke: the genuine-narrow gate
+(the entry must differ from the frame's own declared receiver) fixed the
+ArrayDeque mis-bind AND restored DeepRecursive to 1:03 — the 4.3x
+slowdown and the mis-bind were the same defect, the ungated consult
+trusting an enclosing method's `this` decl through receiver-less
+lambdas. Full armed sweep 117/0, so both defaults flipped:
+`KLIO_HDR_BOUNDS` and `KLIO_THIS_NARROW` are ON (`=0` disables for A/B,
+per house style; the SKIP/LIST bisect knobs remain).
+
+Verified at the flip: sweep 117/0, pinned 133/134 (the strictness
+fixture only), cli 58/58, and the examples A/B shows exactly TWO diffs —
+`serial_names` (the known warm-cache artifact) and
+`bounded_typeparam_receiver` itself, which is the fix: gates-off
+reproduces the old wrong dispatch, default prints kotlinc's
+`observed:3:ok`. Stdlib census: member-site total 6,538 -> 6,408 with
+no_receiver_type 2,012 -> 1,964 and resolver_declined 451 -> 445 — 130
+more sites now resolve statically as extension calls and leave the
+member census entirely.

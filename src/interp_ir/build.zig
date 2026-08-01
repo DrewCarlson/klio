@@ -2533,17 +2533,18 @@ fn buildModuleWithOverrides(
                     const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
                     break :blk std.mem.indexOf(u8, std.mem.span(w), f.name.name) != null;
                 };
-                // Staged roll-out, default OFF: the original armed
-                // recursion (DurationTest's contains loop) is FIXED — the
-                // smart-cast `this`-narrow was invisible to the bare-call
-                // receiver head — and armed DurationTest runs 52/52. The
-                // full armed sweep still shows ArrayDequeTest.clear
-                // recursing and DeepRecursiveTest over its wall clock; the
-                // default flips when that list is empty. KLIO_HDR_BOUNDS=1
-                // arms; KLIO_HDR_BOUNDS_SKIP bisects by name.
+                // Default ON. The armed roll-out list is empty: the
+                // contains loop was the smart-cast `this`-narrow being
+                // invisible to bare-call resolution, ArrayDeque's was the
+                // enclosing method's `this` decl leaking through a
+                // receiver-less lambda, and the DeepRecursive slowdown was
+                // the same over-broad consult — all fixed by the genuine-
+                // narrow gate. Full armed sweep: 117/0 at 1:03 wall on the
+                // heaviest file. `KLIO_HDR_BOUNDS=0` disables for
+                // single-binary A/B; KLIO_HDR_BOUNDS_SKIP bisects by name.
                 const hdr_on = blk: {
-                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk false;
-                    break :blk std.mem.eql(u8, std.mem.span(w), "1");
+                    const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk true;
+                    break :blk !std.mem.eql(u8, std.mem.span(w), "0");
                 };
                 if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
                     if (std.c.getenv("KLIO_HDR_BOUNDS_LIST") != null) {

@@ -11131,13 +11131,24 @@ fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
     // `contains(element)` binds the Collection MEMBER, never itself. The
     // narrow lives in the local-decl map under "this" (`narrowLocal`);
     // consulted AFTER the splice hint so a spliced stdlib body never
-    // resolves against the inline site's caller context. Gated OFF by
-    // default: consulting it re-forms bare emissions across the stdlib
-    // and DeepRecursiveTest measured 4.3x slower wall-clock — the
-    // emission delta needs the census treatment before this defaults on.
-    // Arming KLIO_HDR_BOUNDS requires it (the contains loop's fix).
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_THIS_NARROW") orelse "0", "0")) {
-        if (b.localDeclType("this")) |narrowed| return typeHead(narrowed);
+    // resolves against the inline site's caller context. Default ON with
+    // the genuine-narrow gate below — the earlier 4.3x DeepRecursive
+    // slowdown and the ArrayDeque mis-bind were both the UNGATED consult
+    // trusting an enclosing method's `this` decl through receiver-less
+    // lambdas. `KLIO_THIS_NARROW=0` disables for single-binary A/B.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_THIS_NARROW") orelse "1", "0")) {
+        // Only a genuine NARROW counts: the entry must differ from this
+        // frame's own declared receiver. A lambda with no receiver of its
+        // own sees the ENCLOSING method's `this` decl through the shared
+        // local map, and trusting that bound a bare `clear()` inside
+        // `apply { }` to the enclosing test method (the ArrayDeque armed
+        // recursion) instead of the runtime receiver walk.
+        if (b.recvTy()) |declared| {
+            if (b.localDeclType("this")) |narrowed| {
+                if (!std.mem.eql(u8, typeHead(narrowed), typeHead(declared)))
+                    return typeHead(narrowed);
+            }
+        }
     }
     return b.recvTy();
 }
@@ -11822,6 +11833,22 @@ fn lowerUnresolvedBareCall(
     // explicit-receiver path computes. The receiver itself may be a CAPTURE
     // rather than a bound parameter, which is the case at most of these sites,
     // so materialise it through the closure's slot before asking.
+    if (runtime.getenvSlice("KLIO_CHAN")) |w| {
+        if (std.mem.eql(u8, w, name0)) {
+            std.debug.print("[chan] {s} narrow={?s} hint_active={} hint={?s} splice_recv={?s} recv_ty={?s} owner={?s} lam_splice={} this_decl={?s} head={?s}\n", .{
+                name0,
+                b.thisNarrow(),
+                b.spliceHintActive(),
+                b.spliceHintRecv(),
+                b.spliceRecvTy(),
+                b.recvTy(),
+                b.ownerClass(),
+                b.lambda_splice_resolve != null,
+                b.localDeclType("this"),
+                bareStaticRecvHead(b),
+            });
+        }
+    }
     if (bareStaticRecvHead(b)) |head_name| bare_member: {
         const head_fqn = blk: {
             if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
