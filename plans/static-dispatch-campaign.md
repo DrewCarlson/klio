@@ -2750,3 +2750,19 @@ plus [member-static] on the _Collections.kt contains body's inner site
 to see whether lowering bound it dispatch=virtual; the fix then follows
 the printed line. Fourteen member-first/self-serve guards from this
 hunt remain landed and validated.
+
+
+FINAL NARROWING of the armed contains loop, with the tooling now
+in-tree: `[fn-entry]` prints the caller's call-site span
+(byte-exact: file 41 offsets 1998-2054 = `if (this is Collection)\n
+return contains(element)` in _Collections.kt), and `[cmgsec]` section
+markers cover the CMG arm's entry/member-gate/resolution. The armed run
+executes the loop 3,996 frames with ZERO CMG-section hits — on the
+shared home AND on a fresh bake — so the instruction the bake holds at
+that span is NOT CallMemberOrGlobal, and every dynamic-dispatch route
+investigated (fourteen guards, eighteen route prints, the flat lane
+now honouring KLIO_FLAT) was innocent. Next probe is mechanical: dump
+fid 1949's baked instruction stream (the image already serializes it;
+a tiny `KLIO_DUMP_FN=<fid>` printer over Func.blocks at adopt) and read
+which instruction sits at span 1998 — the fix then lands at that
+emission's lowering arm, the default flips, and the gate deletes.
