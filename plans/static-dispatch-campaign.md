@@ -2421,3 +2421,29 @@ carries into resolution, and it attacks the `resolver_declined` mass
 feeding. Verify against the eight red pinned fixtures — several
 (`local_extension_generic_applicability_matrix`,
 `tier5_loose_member_redispatch_resolves`) look like the same family.
+
+
+### LANDED: the type-parameter disproof and the sole-survivor commit
+
+Two halves, separately gated, both required for the NaN fixture:
+
+1. `staticTypeDisproofComplete` (gate `KLIO_TP_DISPROOF`): for the NEGATIVE
+   conclusion only, a head-only bound record is fully known — dropped bound
+   arguments narrow a bound, never add a supertype — so a failed subtype
+   check against a concrete classifier becomes `.incompatible` instead of
+   `.unknown`. Applied at the three negative-polarity proof sites; the two
+   positive-capable sites keep the strict proof.
+2. The sole-survivor commit (gate `KLIO_SOLE_EXT`): when the disproof
+   PRUNED at least one competitor and exactly one candidate remains, with a
+   receiver carrying explicit type arguments, the survivor commits — kotlinc
+   resolves to the only applicable candidate. The pruning-evidence guard is
+   load-bearing: without it the sole candidate for a name that never had
+   competitors (`indentWidth` inside `trimIndent`) was committed on weak
+   receiver evidence and broke the sweep; with it the sweep is green and the
+   examples A/B is clean.
+
+`generic_factory_return_extension` prints 0.0 (was NaN) through the
+harness. Census UNCHANGED on the stdlib set — the seventh wrong-answer fix
+visible only as parity. The pinned itest suite still reports 126/134
+through the PARITY pipeline: those failures resolve against base-image
+candidate sets and need their own look.

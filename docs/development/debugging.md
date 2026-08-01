@@ -77,6 +77,9 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read, indexed-read or ALIAS initializer (`val node = coord.layoutNode`, `val held = row[1]`, `val b = a`) stops lending its type to the local | — |
 | `KLIO_RECV_CHAIN` | `0` to disable | Off, a member or indexed receiver is typed only from a declared type or a call's return type, never from the type a local's own initializer lends it | — |
 | `KLIO_BIND_LUB` | `0` to disable | Off, a generic call's type-parameter constraints must be EQUAL across the receiver and every argument — a subsumed constraint (`getOrDefault(k, Derived())` on a Map of Base, `listOf(Derived(), base)`) rejects the instantiation again | — |
+| `KLIO_TP_DISPROOF` | `0` to disable | Off, a receiver type argument that is a declared TYPE PARAMETER stops disproving concrete-element extension candidates (`Array<T>` no longer rules out `Array<out Double>.minOrNull`) | — |
+| `KLIO_SOLE_EXT` | `0` to disable | Off, the single extension candidate left after the disproof pruned every competitor is withheld again instead of committed | — |
+| `KLIO_DISPROOF_TRACE` | set | Per-candidate receiver-compat decision in extension resolution: subtype result and both disproof-completeness answers | `[disproof]` |
 | `KLIO_BARE_EXT` | `0` to disable | Off, a bare call in a receiver context resolves only MEMBERS of the implicit receiver — an extension written without `this.` (`toMutableList()` in an extension body) stops lending its return type | — |
 | `KLIO_TP_RECV` | `0` to disable | Off, a call on a receiver typed by a TYPE PARAMETER (`M : MutableMap<in K, MutableList<T>>`) stops deriving its return type through the parameter's full upper bound, so the local it initializes loses its type again | — |
 | `KLIO_SOLE_GLOBAL` | `0` to disable | Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide | — |

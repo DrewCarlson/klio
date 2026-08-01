@@ -2418,6 +2418,78 @@ pub const Module = struct {
             self.staticTypeClassId(ty) != null;
     }
 
+    /// Like `staticBoundProofComplete`, but for DISPROOF: a head-only bound
+    /// record still names the one classifier the parameter is bounded by,
+    /// and dropped bound ARGUMENTS only narrow a bound — they never add a
+    /// supertype. Knowing the head is therefore enough to conclude that a
+    /// failed subtype check against a concrete classifier is a real NO.
+    fn staticBoundProofHead(
+        self: *const Module,
+        bound: ModuleRegistry.TypeParamBound,
+        bounds: []const ModuleRegistry.TypeParamBound,
+        depth: u8,
+    ) bool {
+        if (!(bound.complete or bound.head_only) or depth >= 64) return false;
+        const head = staticTypeHead(bound.bound);
+        if (rawBoundNamesDeclaredParam(bounds, bound.bound)) {
+            var matched = false;
+            for (bounds) |dependent| {
+                if (!std.mem.eql(u8, dependent.param, head)) continue;
+                matched = true;
+                if (!self.staticBoundProofHead(
+                    dependent,
+                    bounds,
+                    depth + 1,
+                )) return false;
+            }
+            return matched;
+        }
+        const ty = TypeRef{ .name = bound.bound, .nullable = false, .args = &.{} };
+        const alias = self.staticAliasHead(ty);
+        if (alias.structure_lost) return false;
+        return self.staticBuiltinIdentity(ty, alias.name) == .yes or
+            self.staticTypeClassId(ty) != null;
+    }
+
+    /// `staticTypeProofComplete` for the NEGATIVE direction only: consumers
+    /// use it to turn a failed subtype check into `.incompatible`. A declared
+    /// type parameter whose bound names its classifier (`T : Comparable<T>`,
+    /// recorded head-only) is fully known for that purpose — kotlinc rules
+    /// `Array<out Double>.minOrNull` out for an `Array<T>` receiver at the
+    /// declaration, whatever T is later instantiated to. Gated by
+    /// `KLIO_TP_DISPROOF` for single-binary A/B.
+    fn staticTypeDisproofComplete(
+        self: *const Module,
+        raw_ty: TypeRef,
+        bounds: []const ModuleRegistry.TypeParamBound,
+    ) bool {
+        const relaxed = if (std.c.getenv("KLIO_TP_DISPROOF")) |v|
+            !std.mem.eql(u8, std.mem.span(v), "0")
+        else
+            true;
+        if (!relaxed) return self.staticTypeProofComplete(raw_ty, bounds);
+        const projected = projectionType(raw_ty);
+        if (projected.star) return false;
+        const ty = projected.ty;
+        const head = staticTypeHead(ty.name);
+        if (head.len == 0 or ty.name[0] == '#') return false;
+        if (typeRefIsDeclaredParam(bounds, ty)) {
+            for (bounds) |bound| {
+                if (std.mem.eql(u8, bound.param, head) and
+                    !self.staticBoundProofHead(bound, bounds, 0)) return false;
+            }
+            return true;
+        }
+        const alias = self.staticAliasHead(ty);
+        if (alias.structure_lost) return false;
+        const identity = self.staticBuiltinIdentity(ty, alias.name);
+        if (identity != .yes and self.staticTypeClassId(ty) == null) return false;
+        for (overrideArgs(ty)) |arg| {
+            if (!self.staticTypeDisproofComplete(arg, bounds)) return false;
+        }
+        return true;
+    }
+
     fn staticReceiverCompatibility(
         self: *const Module,
         fid: ?FuncId,
@@ -3102,8 +3174,8 @@ pub const Module = struct {
                         required.?,
                         actual_bounds,
                     ) catch false) return .compatible;
-                    if (self.staticTypeProofComplete(arg.ty.?, actual_bounds) and
-                        self.staticTypeProofComplete(required.?, actual_bounds))
+                    if (self.staticTypeDisproofComplete(arg.ty.?, actual_bounds) and
+                        self.staticTypeDisproofComplete(required.?, actual_bounds))
                     {
                         return .incompatible;
                     }
@@ -3162,8 +3234,8 @@ pub const Module = struct {
                     param,
                     actual_bounds,
                 ) catch false) return .compatible;
-                if (self.staticTypeProofComplete(ty, actual_bounds) and
-                    self.staticTypeProofComplete(param, actual_bounds))
+                if (self.staticTypeDisproofComplete(ty, actual_bounds) and
+                    self.staticTypeDisproofComplete(param, actual_bounds))
                 {
                     return .incompatible;
                 }
@@ -3527,6 +3599,7 @@ pub const Module = struct {
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
         var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
+        var receiver_pruned: usize = 0;
         candidate_loop: while (candidate_it.next()) |fid| {
             const f = self.funcById(fid) orelse continue;
             const ds = self.decl_sigs.get(fid.int());
@@ -3711,18 +3784,32 @@ pub const Module = struct {
                         scoped_recv_param,
                         ctx.actual_type_param_bounds,
                     ) catch return .{};
+                    if (std.c.getenv("KLIO_DISPROOF_TRACE") != null) {
+                        std.debug.print("[disproof] {s} fid={d} recv={s}<{d}> param={s}<{d}> subtype={} recv_dis={} param_dis={}\n", .{
+                            name,
+                            fid.int(),
+                            scoped_receiver.name,
+                            scoped_receiver.args.len,
+                            scoped_recv_param.name,
+                            scoped_recv_param.args.len,
+                            subtype,
+                            self.staticTypeDisproofComplete(scoped_receiver, ctx.actual_type_param_bounds),
+                            self.staticTypeDisproofComplete(scoped_recv_param, ctx.actual_type_param_bounds),
+                        });
+                    }
                     if (subtype) {
                         compatibility = .compatible;
-                    } else if (self.staticTypeProofComplete(
+                    } else if (self.staticTypeDisproofComplete(
                         scoped_receiver,
                         ctx.actual_type_param_bounds,
                     ) and
-                        self.staticTypeProofComplete(
+                        self.staticTypeDisproofComplete(
                             scoped_recv_param,
                             ctx.actual_type_param_bounds,
                         ))
                     {
                         compatibility = .incompatible;
+                        receiver_pruned += 1;
                     }
                 }
             }
@@ -3874,8 +3961,21 @@ pub const Module = struct {
                 self.genericReceiverSuppliesLambdaReceiver(target, args)
         else
             false;
+        // Every other candidate was ELIMINATED by proof and exactly one
+        // remains: kotlinc commits it — an unproven receiver instantiation
+        // does not change that there is nothing else the call could resolve
+        // to. Guarded to receivers that carry explicit type arguments
+        // (`Array<T>`), so a bare conservative head keeps the withhold.
+        const sole_off = if (std.c.getenv("KLIO_SOLE_EXT")) |v|
+            std.mem.eql(u8, std.mem.span(v), "0")
+        else
+            false;
+        const sole_survivor = !sole_off and ids.items.len == 1 and
+            ranked_sigs.items.len == 1 and scoped_receiver.args.len != 0 and
+            receiver_pruned != 0;
         if (tied or
-            (best_unknown and !receiver_supplies_lambda and !renamed_best))
+            (best_unknown and !receiver_supplies_lambda and !renamed_best and
+                !sole_survivor))
             return .{ .applicable = true };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
