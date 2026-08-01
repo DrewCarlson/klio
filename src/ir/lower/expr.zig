@@ -8418,6 +8418,20 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
+    // `lhs ?: <jump>` carries the lhs type made NON-null: `val clause =
+    // findClause(x) ?: continue` types `clause` as the call's declared
+    // return without its `?` — the jump arm never produces a value.
+    if (e.* == .Binary and e.Binary.op == .Elvis) {
+        const bin = e.Binary;
+        if (try staticExprTypeRef(b, bin.lhs)) |lhs_ty| {
+            var out = lhs_ty;
+            switch (bin.rhs.*) {
+                .Continue, .Break, .Return, .Throw => out.nullable = false,
+                else => {},
+            }
+            return out;
+        }
+    }
     return try localInitTypeRef(b, e);
 }
 
@@ -8807,7 +8821,11 @@ fn staticCallReturnTypeRef(
                 // `iterator()`, another 165 a bare `listIterator()`. Their
                 // result type is exactly what the local needs.
                 const bt = bareRetTraceFor(b, name.name);
-                const head_name = bareStaticRecvHead(b) orelse {
+                // Inside a plain METHOD body the implicit receiver is the
+                // owner class itself (`findClause(x)` in trySelectInternal
+                // is `this.findClause(x)`); the head channels only cover
+                // extension receivers and narrows.
+                const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
                     break :blk sole_global orelse return null;
                 };
@@ -8850,13 +8868,23 @@ fn staticCallReturnTypeRef(
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
                     break :blk sole_global orelse return null;
                 };
+                // The lexical owner makes PRIVATE members visible to their
+                // own class's bodies (`findClause` inside trySelectInternal).
+                const bare_lexical: ?ir.ClassId = if (b.ownerClass()) |oc|
+                    (if (std.mem.indexOfScalar(u8, oc, '.') != null)
+                        b.module.classIdByFqn(oc)
+                    else
+                        b.module.classIdIndexed(oc, b.self_package, name.span.file) orelse
+                            b.module.classId(oc))
+                else
+                    null;
                 const bare_resolved = b.module.resolveMemberCall(
                     owner,
                     name.name,
                     shape_set.shapes,
                     .{
                         .caller_file = name.span.file,
-                        .lexical_owner = null,
+                        .lexical_owner = bare_lexical,
                         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
                         .receiver_type = bare_recv,
                     },
@@ -8901,6 +8929,36 @@ fn staticCallReturnTypeRef(
             var identity = std.mem.trimEnd(u8, receiver.?.name, "?");
             if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
             var head = typeHead(identity);
+            // `invoke` on a FUNCTION-typed receiver returns the function
+            // type's declared return — the last type argument of the
+            // lowered `FunctionN` head (alias-resolved:
+            // `onCancellationConstructor?.invoke(...)` on a typealiased
+            // constructor type yields the handler function it builds).
+            if (std.mem.eql(u8, member.name.name, "invoke")) {
+                var fn_ref: ?ir.TypeRef = null;
+                defer if (fn_ref) |*t| t.deinit(b.allocator);
+                var fn_ty: *const ir.TypeRef = &receiver.?;
+                if (!std.mem.startsWith(u8, typeHead(fn_ty.name), "Function")) {
+                    var alias_arena = std.heap.ArenaAllocator.init(b.allocator);
+                    defer alias_arena.deinit();
+                    const resolved_alias = b.module.resolveTypeAliasAt(
+                        alias_arena.allocator(),
+                        receiver.?,
+                        null,
+                        b.self_package,
+                    ) catch receiver.?;
+                    if (std.mem.startsWith(u8, typeHead(resolved_alias.name), "Function")) {
+                        fn_ref = try resolved_alias.clone(b.allocator);
+                        fn_ty = &fn_ref.?;
+                    }
+                }
+                if (std.mem.startsWith(u8, typeHead(fn_ty.name), "Function") and fn_ty.args.len != 0) {
+                    var out = try fn_ty.args[fn_ty.args.len - 1].clone(b.allocator);
+                    if (member.safe or receiver.?.nullable) out.nullable = true;
+                    if (mt) std.debug.print("[bareret] .invoke fn-return={s}\n", .{out.name});
+                    return out;
+                }
+            }
             var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
                 b.module.classIdByFqn(identity)
             else

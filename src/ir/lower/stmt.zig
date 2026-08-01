@@ -303,6 +303,15 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
                 }
             },
+            // `val clause = findClause(x) ?: continue` — the elvis arm of
+            // staticExprTypeRef strips the null.
+            .Binary => |bin| if (bin.op == .Elvis) {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    const was_nullable = ct.nullable;
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                    if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                }
+            },
             else => {},
         }
         // Literal initializers are recorded too: a call site uses them as

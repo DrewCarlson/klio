@@ -2104,6 +2104,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // The boxed-var set (body `var`s plus nested-closure-written params) was
     // computed and set before `bindParams` above so the params bind as cells.
     var result: ?ir.Reg = null;
+    var derived_return: ?TypeRef = null;
     if (f.body) |body| {
         switch (body) {
             .Block => |*blk| {
@@ -2122,6 +2123,15 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 // running `fun f() = g()` would report no line.
                 try b.push(.{ .Trace = .{ .span = e.span() } });
                 const prev = b.pushExpected(f.return_type);
+                // An expression body with NO annotation carries its inferred
+                // return where the static derivation can prove one — a
+                // safe-invoke of a function-typed property, a member call
+                // with a declared return. Callers' locals then type through
+                // it (`val onCancellation = clause.createOnCancellationAction(
+                // ...)`), which member refutation needs.
+                if (f.return_type == null and derived_return == null) {
+                    derived_return = try mod.staticExprTypeRef(&b, e);
+                }
                 result = try mod.lowerExpr(&b, e);
                 b.restoreExpected(prev);
             },
@@ -2135,6 +2145,8 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // harmless, as the coercion only triggers on an explicit `Long`.
     const return_ty: TypeRef = if (f.return_type) |*rt|
         try loweredTypeRef(a, rt, false)
+    else if (derived_return) |dr|
+        dr
     else
         build.typeUnit();
     var func = try b.finish(f.name.name, fqn, return_ty);

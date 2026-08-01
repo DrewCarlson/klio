@@ -3396,3 +3396,27 @@ callable-vs-builtin refutation drops member #79, and the file-private
 extension binds: `dbg-tsi: tryResume=true`, `got 99`. All three
 downstream pieces (cast typing, call-typed locals, the refutation) are
 landed and gate-validated (sweep 117/0, drift 262/266, pinned 145/146).
+
+
+Ladder progress — four more pieces LANDED and validated (sweep 117/0,
+drift 262/266 unchanged, pinned unchanged):
+
+1. `invoke` on a FUNCTION-typed receiver derives the function type's
+   return (alias-resolved, safe-call nullable) in
+   staticCallReturnTypeRef's Member arm.
+2. Expression-body decls with no annotation record their return through
+   staticExprTypeRef at decl time (derived_return in decl lowering).
+3. `lhs ?: <jump>` types as the lhs stripped of null (staticExprTypeRef
+   elvis arm + the un-annotated-val Binary/elvis recording).
+4. The bareret channel now treats the OWNER CLASS as the implicit
+   receiver head in plain method bodies, and passes the lexical owner
+   so PRIVATE members resolve (`findClause` inside trySelectInternal:
+   was `no recv head`, now `target=yes`).
+
+The chain now dies at the plan's DOCUMENTED inner-class return blocker:
+`findClause` resolves but `instantiatedCallReturnType` yields null for
+its `ClauseData?` NESTED-class return ([bareret] findClause return=
+<null> — see 'Retried the return-type channel; blocked on an
+inner-class receiver walk'). Unblocking nested-class return references
+in instantiatedCallReturnType is now the last link for select, shared
+with the previously-blocked return-type channel.
