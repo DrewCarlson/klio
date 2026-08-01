@@ -280,6 +280,17 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (b.localDeclNullable(path.segments[0].name)) try b.setLocalDeclNullable(p.name.name);
                 }
             },
+            // A cast initializer IS the local's static type: `val cont =
+            // curState as CancellableContinuation<Unit>` types `cont` with
+            // the full generic reference, so a member call on it reaches
+            // resolution with the type arguments applicability needs.
+            .As => |cast| if (!cast.safe) {
+                try b.setLocalDeclTypeOwned(
+                    p.name.name,
+                    try expr_mod.loweredOwnedLocalTypeRef(b, &cast.ty),
+                );
+                if (cast.ty.nullable) try b.setLocalDeclNullable(p.name.name);
+            },
             else => {},
         }
         // Literal initializers are recorded too: a call site uses them as

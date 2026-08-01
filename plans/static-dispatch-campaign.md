@@ -3329,3 +3329,28 @@ and which decline reason fires (lmNote/declineNote around the Member
 emission), then let the site reach resolveMemberCall — the machinery
 downstream is already correct, and refutation will drop the member for
 the file-private extension.
+
+
+Two fix pieces LANDED (ir 235/235; select still red — VERIFY SWEEP
+FIRST next session, these are unswept):
+
+1. A cast initializer types its local: `val cont = curState as
+   CancellableContinuation<Unit>` now records the full generic
+   reference via setLocalDeclType (stmt.zig un-annotated-val arm), so
+   the 1-arg site reaches lowerResolvedMemberCall TYPED
+   ([member-static] recv=CancellableContinuation, was <unknown>).
+2. A callable argument refutes a non-callable BUILTIN parameter
+   (staticArgCompatibility: the func_typed tail and the named-arg path
+   both answer .incompatible when the substituted param head is
+   Unit/a primitive/String — no lambda converts to those; user classes
+   stay unknown for fun-interface SAMs).
+
+REMAINING BREAK: the 1-arg site's resolveMemberCall still answers
+`target=80 dispatch=deferred applicable=true` WITHOUT a
+[smac] nargs=1 line — the resolution short-circuits before
+staticMemberArgsCompatibility (a memo? the shape fast path before the
+compat loop?). Find the early path in resolveMemberCall that returns
+deferred-applicable for this candidate set and thread the compat check
+(or its refutation) through it; then the member drops and the
+file-private extension binds. Ground truth: `got 99`, and
+select_on_timeout_loses in the corpus sweep.

@@ -3296,6 +3296,11 @@ pub const Module = struct {
                 }
                 return .unknown;
             }
+            if (nonCallableBuiltinHead(declared) and
+                std.mem.startsWith(u8, staticTypeHead(ty.name), "Function"))
+            {
+                return .incompatible;
+            }
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
@@ -3315,9 +3320,29 @@ pub const Module = struct {
             }
             // Callable arity proves the FunctionN surface, but not a SAM
             // conversion or an unknown callable's parameter/return types.
+            // A non-callable BUILTIN parameter, though, is a definite
+            // refutation: no lambda converts to Unit or a primitive, so
+            // `tryResume(value: T := Unit)` drops for the onCancellation
+            // argument and the file-private Boolean extension binds. User
+            // classes stay unknown (a fun-interface SAM target).
+            if (nonCallableBuiltinHead(head)) return .incompatible;
             return .unknown;
         }
         return .unknown;
+    }
+
+    /// Builtin classifier heads no function value can convert to: the
+    /// definite-refutation set for a callable argument.
+    fn nonCallableBuiltinHead(head: []const u8) bool {
+        const set = [_][]const u8{
+            "Unit",  "Int",    "Long",  "Short",  "Byte",  "Boolean",
+            "Char",  "Float",  "Double", "String", "UInt",  "ULong",
+            "UShort", "UByte",
+        };
+        for (set) |n| {
+            if (std.mem.eql(u8, head, n)) return true;
+        }
+        return false;
     }
 
     fn staticMemberArgsCompatibility(
