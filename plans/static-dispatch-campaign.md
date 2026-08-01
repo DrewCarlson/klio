@@ -3224,3 +3224,17 @@ the walk), and `KLIO_MISS_TRACE=onReceive` with the [sgp]/field-trace
 prints to see which arm answers. The klio clause glue's entry
 (`klioRegReceive` [fn-entry]) is the ground-truth signal that the read
 finally reached the pack's extension property.
+
+
+Select, narrowed one more level: the clause getter NOW serves the klio
+glue (`[getter] __ext_get_ReceiveChannel_onReceive` on
+KlioBufferedChannel — the standdown works), yet `klioRegReceive` still
+never enters. The remaining break is the REGISTRATION invoke: upstream
+`SelectImplementation.register` calls `clause.regFunc(clauseObject,
+this, param)` where regFunc is `::klioRegReceive as
+RegistrationFunction` — a function REFERENCE cast to a function type,
+invoked with 3 args. Probe next: how a stored `::fn` reference invoked
+through a cast function type dispatches (KLIO_MISS_TRACE=regFunc showed
+`runSafely` misses on kotlin.Function — the reference may be wrapped),
+and whether SelectClause1Impl's field read loses the reference.
+klioRegReceive [fn-entry] stays the ground-truth signal.
