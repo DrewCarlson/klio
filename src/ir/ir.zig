@@ -4146,6 +4146,11 @@ pub const Module = struct {
     const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
+        /// The call site wrote this type argument out. Kotlin takes an
+        /// explicit argument as final and does not infer the parameter from
+        /// the value arguments at all, so a later value argument may be a
+        /// SUBTYPE of it without contradicting it.
+        explicit: bool = false,
     };
 
     fn bindingType(bindings: []const TypeBinding, name: []const u8) ?TypeRef {
@@ -4153,6 +4158,13 @@ pub const Module = struct {
             if (std.mem.eql(u8, binding.name, name)) return binding.ty;
         }
         return null;
+    }
+
+    fn bindingIsExplicit(bindings: []const TypeBinding, name: []const u8) bool {
+        for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding.explicit;
+        }
+        return false;
     }
 
     fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
@@ -4262,6 +4274,11 @@ pub const Module = struct {
         const pattern_head = staticTypeHead(pattern.name);
         if (callTypeRefParam(params, pattern)) {
             if (bindingType(bindings.items, pattern_head)) |bound| {
+                // `arrayOf<Base>(Derived())`: the written argument decides the
+                // parameter, and the value being a subtype of it is exactly
+                // what the call means. Demanding equality here rejected the
+                // whole instantiation and left the receiver untyped.
+                if (bindingIsExplicit(bindings.items, pattern_head)) return true;
                 return bound.eql(actual);
             }
             try bindings.append(allocator, .{ .name = pattern_head, .ty = actual });
@@ -4373,7 +4390,11 @@ pub const Module = struct {
 
         var bindings: std.ArrayList(TypeBinding) = .empty;
         for (explicit_type_args, 0..) |ty, i| {
-            try bindings.append(a, .{ .name = function_type_params[i], .ty = ty });
+            try bindings.append(a, .{
+                .name = function_type_params[i],
+                .ty = ty,
+                .explicit = true,
+            });
         }
 
         var all_type_params: std.ArrayList([]const u8) = .empty;

@@ -8304,6 +8304,16 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     return try b.allocator.dupe(u8, elem.name);
 }
 
+/// The receiver-type chain used by the `Member` and `Index` arms. Gated so the
+/// widening can be measured against the narrower answer it replaced.
+fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_RECV_CHAIN") orelse "1", "0")) {
+        if (argDeclTypeRefLazy(b, e)) |known| return try known.clone(b.allocator);
+        return staticCallReturnTypeRef(b, e);
+    }
+    return staticExprTypeRef(b, e);
+}
+
 /// A statically known type for an arbitrary expression: its own declared type
 /// where it has one, otherwise a constructed class, a resolved call's return
 /// type, or the type a local's initializer lends it. Owned by the caller.
@@ -8567,10 +8577,7 @@ fn staticCallReturnTypeRef(
         !std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0"))
     {
         const idx = call_expr.Index;
-        var recv_owned = if (argDeclTypeRefLazy(b, idx.receiver)) |known|
-            try known.clone(b.allocator)
-        else
-            (try staticCallReturnTypeRef(b, idx.receiver)) orelse return null;
+        var recv_owned = (try recvChainTypeRef(b, idx.receiver)) orelse return null;
         defer recv_owned.deinit(b.allocator);
         var shape_set = try buildStaticReturnArgShapes(b, idx.args, &.{});
         defer shape_set.deinit(b.allocator);
@@ -8766,10 +8773,10 @@ fn staticCallReturnTypeRef(
         },
         .Member => |member| {
             const mt = bareRetTraceFor(b, member.name.name);
-            receiver = if (argDeclTypeRefLazy(b, member.receiver)) |known|
-                try known.clone(b.allocator)
-            else
-                try staticCallReturnTypeRef(b, member.receiver);
+            // The full chain, not just the declared-type probe: a local whose
+            // only type comes from its own INITIALIZER is invisible to the
+            // lazy answer, and `val xs = listOf<Base>(...)` is that shape.
+            receiver = try recvChainTypeRef(b, member.receiver);
             const recv_ty = receiver orelse {
                 if (mt) std.debug.print("[bareret] .{s} no receiver type\n", .{member.name.name});
                 return null;

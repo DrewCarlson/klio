@@ -1196,6 +1196,17 @@ test "redeclared_interface_slot_reaches_the_inherited_body" {
     );
 }
 
+test "generic_receiver_through_its_initializer" {
+    try check("generic_receiver_through_its_initializer",
+        \\base
+        \\base
+        \\derived
+        \\base
+        \\base
+        \\
+    );
+}
+
 test "property_typed_from_a_ctor_parameter" {
     try check("property_typed_from_a_ctor_parameter",
         \\base

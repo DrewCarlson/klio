@@ -75,6 +75,7 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_TP_HEAD` | `0` to disable | Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so `C : MutableCollection<in T>` names no owner again | — |
 | `KLIO_EXT_RECV_PROP` | `0` to disable | Off, a bare name in a top-level extension's body stops resolving to the extension receiver's property, so it gets no declared type | — |
 | `KLIO_MEMBER_INIT` | `0` to disable | Off, a property-read, indexed-read or ALIAS initializer (`val node = coord.layoutNode`, `val held = row[1]`, `val b = a`) stops lending its type to the local | — |
+| `KLIO_RECV_CHAIN` | `0` to disable | Off, a member or indexed receiver is typed only from a declared type or a call's return type, never from the type a local's own initializer lends it | — |
 | `KLIO_SOLE_GLOBAL` | `0` to disable | Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide | — |
 | `KLIO_FACTORY_PROP` | `0` to disable | Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (`val made = newBase()`) and a constructor PARAMETER (`private val held = start`) both stop registering a type head | — |
 | `KLIO_NULL_CHAIN` | `0` to disable | Off, only a condition that is itself the whole `!= null` check narrows — an `&&` chain and an early-return guard stop smart-casting | — |

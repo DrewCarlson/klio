@@ -302,31 +302,31 @@ deliberately instead of rediscovered.
 
 Current census — `scripts/dispatch-census.sh`, cold cache, pinned file set:
 
-    total 6,648 member call sites
+    total 6,638 member call sites
       146   2.20%  bound_static     <- direct FuncId call
-    3,493  52.54%  bound_virtual    <- method slot, no name lookup
+    3,499  52.71%  bound_virtual    <- method slot, no name lookup
     ------------------------------
-    2,271  34.16%  no_receiver_type
-      405   6.09%  resolver_declined
-      213   3.20%  no_class_id
+    2,208  33.26%  no_receiver_type
+      451   6.79%  resolver_declined
+      214   3.22%  no_class_id
       120   1.81%  nullable_or_generic
 
-Statically bound: 3,639 of 6,648 (54.7%), from 150 (2.34%) at the start of this
+Statically bound: 3,645 of 6,638 (54.9%), from 150 (2.34%) at the start of this
 round.
 
 And on the examples set (`scripts/dispatch-census-examples.sh`), which has the
 concrete types the stdlib's own generic containers do not:
 
-    total 69,959
-     1,451   2.07%  bound_static
-    41,658  59.55%  bound_virtual
+    total 69,847
+     1,453   2.08%  bound_static
+    41,848  59.91%  bound_virtual
     ------------------------------
-    19,446  27.80%  no_receiver_type
-     3,429   4.90%  resolver_declined
-     2,697   3.86%  no_class_id
+    18,873  27.02%  no_receiver_type
+     3,697   5.29%  resolver_declined
+     2,698   3.86%  no_class_id
      1,278   1.83%  nullable_or_generic
 
-Statically bound: 43,109 of 69,959 (61.6%), from 27,098 (37.4%).
+Statically bound: 43,301 of 69,847 (62.0%), from 27,098 (37.4%).
 
 The earlier 9,755-site census in this document was taken on a different file
 set and at an unknown cache state; do not compare against it. Use the script.
@@ -1044,6 +1044,53 @@ never outranks a real member.
 
     stdlib   bound 3,627 -> 3,639   (54.5% -> 54.7%)
     examples bound 43,109 -> 43,243 (61.6% -> 61.9%)
+
+### The generic project's first landing: the initializer chain reaches receivers
+
+The first slice of the generic-argument project, and it is two rules, not a
+new inference pass:
+
+1. **The receiver walk asks the full chain.** The `Member` and `Index` arms of
+   `staticCallReturnTypeRef` typed their receiver from a declared type or a
+   call's return type, never from the type a local's own INITIALIZER lends it.
+   `val xs = listOf<Base>(...); xs[0]` is that shape, and every generic factory
+   writes it. Both arms now go through `recvChainTypeRef` (gate:
+   `KLIO_RECV_CHAIN`), which is the same `staticExprTypeRef` chain every other
+   consumer already uses.
+2. **An explicit type argument is final.** `instantiatedCallReturnType`
+   demanded that every value argument EQUAL the bound the pattern had, so
+   `listOf<Base>(Derived())` — where the value argument is a strict subtype of
+   the written argument — rejected the whole instantiation and left the
+   receiver untyped. Kotlin takes a written type argument as final and does
+   not infer the parameter from the value arguments at all; the binding now
+   carries `explicit` and skips the equality check.
+
+Pinned by `generic_receiver_through_its_initializer`: five shapes (explicit
+list, explicit array, inferred, declared, member call), exact kotlinc parity
+with the gate on, four of five wrong with it off.
+
+    stdlib   bound 3,639 -> 3,645   (54.7% -> 54.9%)
+    examples bound 43,243 -> 43,301 (61.9% -> 62.0%)
+
+`resolver_declined` grew on both sets (405 -> 451, 3,429 -> 3,697): a newly
+typed receiver that finds BOTH an applicable member and an applicable
+same-arity extension moves into the declined bucket instead of binding. That
+is the already-recorded blocked-pair population getting bigger, which is what
+every receiver-typing fix does until the argument side of the inference
+exists.
+
+**And the regression it exposed was a real dispatch bug.** With receivers of
+type `MutableList` newly typed, `reversed.remove("c")` on an `asReversed()`
+view bound through `MutableList.remove`'s own virtual slot — and that slot,
+being a REDECLARATION of `MutableCollection.remove`, was linked to the
+bodyless interface header in every class that inherited its implementation
+from `AbstractMutableCollection` under the base declaration's slot. The
+host-linked header then rejected the interpreted receiver at runtime
+(`MutableList.remove requires a List receiver`). The same shape sat latent
+under `MutableSet.remove`, reachable without any widening through a DECLARED
+`MutableList` local. Fixed at the linker (`unifyRedeclaredSlots`), not by
+narrowing the widening: see the commit
+`ir: a redeclared interface slot reaches the inherited body`.
 
 ### Measured dead ends, all three with the reason
 
@@ -1979,8 +2026,8 @@ re-measure `[lower-sites]`. The 72.3% `no_receiver_type` bucket is the
 number to drive down; the 6.4% `no_class_id` and 14.3%
 `resolver_declined` buckets get their own passes afterwards.
 
-**Phase 1 is DONE as far as syntax can take it.** 2.34% -> 54.7% bound on the
-stdlib set, 37.4% -> 61.9% on the examples set. Every channel that reads a type
+**Phase 1 is DONE as far as syntax can take it.** 2.34% -> 54.9% bound on the
+stdlib set, 37.4% -> 62.0% on the examples set. Every channel that reads a type
 out of the SOURCE has been opened: a local's own initializer (call, constructor,
 property read, indexed read, alias chain, operator result), a loop variable, a
 destructured component, a lambda parameter, an extension body's receiver, a
@@ -2006,7 +2053,11 @@ that establish it are recorded below:
 So the next phase is one project, not two: infer and carry GENERIC ARGUMENTS
 through the call graph. It unlocks both buckets at once, and until it exists
 every further syntactic channel measures zero — which is what the dead-end list
-below is for.
+below is for. Its first slice has landed (the initializer chain reaching
+receivers, and explicit type arguments being final — the section above); the
+open work list is "The inference work list" below, starting with the
+substitution of a caller's own type arguments into a generic member's return
+type (`getOrPut` returning `V`).
 
 **Phase 2 — lower `a[i]` as `Index`.** 19.9M `member_fast_subscript`
 dispatches should never reach the member arm.
