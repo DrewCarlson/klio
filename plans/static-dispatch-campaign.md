@@ -2638,3 +2638,23 @@ the DrawNode. Established so far:
   proof gate — next probe goes inside `staticGenericReceiverApplicable`
   (print the binding table and each param's gate result for
   name==observe) and lands the refutation on whichever leg accepts.
+
+
+### Armed-refuter recovery: two member-first guards landed, one residual
+
+(1) The bare-member arm blocks the static extension commit when a member
+is applicable-but-deferred — matching the explicit path's
+member_shadows_extensions. (2) `extensionFnFallbackWalk` defers to a
+receiver MEMBER when bound refutation THINNED its candidate set. Armed
+DurationTest: all-crashing -> 51/52; unarmed unchanged, suites green.
+
+RESIDUAL (armed-only): the ranges `contains` family — `element != null
+&& contains(element)` (Ranges.kt:259/275, InlineOnly so SPLICED) —
+kotlinc binds the inner call to the ClosedRange.contains MEMBER; klio's
+runtime walk re-picks the extension family on the range receiver. All
+emissions are CallMemberOrGlobal (inline_splice_recv_walk /
+implicit_this_call_global_fallback, pkg=kotlin.ranges); no static
+self-bind. Next: the strict per-candidate walk's sole-candidate return
+(~host_call_member.zig:12995) lacks the member-defer the fallback walk
+now has — give it the same member-first rule, flip the KLIO_HDR_BOUNDS
+default, delete the gate.
