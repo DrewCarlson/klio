@@ -78,6 +78,14 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_FACTORY_PROP` | `0` to disable | Off, only a CONSTRUCTOR call names an un-annotated property's type, so `val made = newBase()` registers no type head | — |
 | `KLIO_NULL_CHAIN` | `0` to disable | Off, only a condition that is itself the whole `!= null` check narrows — an `&&` chain and an early-return guard stop smart-casting | — |
 | `KLIO_INIT_KINDS` | set | Names the AST kind of every local initializer that is NOT recorded, so the next gap in that list is data rather than a guess | `[init-kind]` |
+
+The `0`-to-disable rows above exist so one binary can be compared against
+itself: `scripts/examples-ab.sh KLIO_SOME_GATE` runs the examples corpus both
+ways and reports what differs. It skips the twelve examples that never
+terminate (each blocks on a window or event loop at ~0% CPU, at every commit) —
+left in, they cost twice the timeout apiece for no signal and turn a five-minute
+comparison into a three-hour one.
+
 | `KLIO_OPERATOR_TY` | `0` to disable | Off, an indexed read and the `times`/`div`/`rem`/`rangeTo` operators stop lending their declared return type to a receiver | — |
 | `KLIO_GLOBAL_TRACE` | `<name>` | Which arm resolves a global lookup: cached value, function, or intrinsic | `[gtrace]` |
 | `KLIO_OUTER_TRACE` | `<substr>` | Inner-class enclosing `this@Outer` selection for IR names containing the substring | `[outer]` |
