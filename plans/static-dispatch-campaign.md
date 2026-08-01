@@ -3158,3 +3158,14 @@ splice sites), and keep the Instance form when the interface is a
 NAMED source interface (not a fun-interface conversion). Then re-run
 dropmin/flow_operators; the [bare] collect -> NONE static gap (tower
 consult, option 1) remains the census lever afterwards.
+
+
+Standalone repro attempt is NEGATIVE: an inline block-body fn with a
+crossinline param returning `object : Box<T> { override fun peek }`
+keeps its Instance identity through the splice (`peek` runs, `is Box<*>`
+true). The collapse therefore needs the ALIAS-splice context (`import
+unsafeFlow as flow` — the by-id splice arm added this arc) or another
+pack-context ingredient. Next repro dimension: two-file/pack setup with
+the import alias, or probe the REAL flowOf splice with KLIO_DUMP_FN over
+the spliced caller to see what instruction the object lowered to
+(AstLambda vs NewInstance).
