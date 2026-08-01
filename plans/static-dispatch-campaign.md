@@ -3293,3 +3293,22 @@ commit the same-file extension. The runtime walk alone cannot decide
 this (the instance carries no type args). Driving repro:
 select_on_timeout_loses, ground truth `dbg-tsi: tryResume=true` +
 `got 99`.
+
+
+Implementation reconnaissance: the receiver-substitution machinery the
+fix needs ALREADY EXISTS — `staticMemberArgsCompatibility` projects the
+receiver onto the member's owner (`projectTypeToClass`), binds the
+class type params, substitutes into each param, and refutes via
+`staticArgCompatibility` (a first attempt to duplicate it at the
+per-arg level was reverted; tree clean, ir 235/235). So the question is
+WHY the pipeline does not refute `tryResume(value: T:=Unit)` against
+the nullable-function argument at this site. Three probes, in order:
+(1) does `cont.tryResume(...)` even reach `resolveMemberCall` with
+`receiver_type = CancellableContinuation<Unit>` when the pack lowers
+Select.kt (KLIO_REX_TRACE / a [mev] print at the
+staticMemberArgsCompatibility entry for name=tryResume), (2) what
+`arg.ty` carries for the `onCancellation` local (authoritative or
+stripped), (3) whether `staticArgCompatibility`'s named-vs-named tail
+can refute `fn-type vs Unit` at all (it must — Unit is a complete
+disproof target). Whichever link is dead is the fix site; ground truth
+stays `got 99` on select_on_timeout_loses.
