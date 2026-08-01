@@ -3097,3 +3097,39 @@ every example with expected output through the harness against
 source-built packs — the fast out-of-process e2e loop), KLIO_DUMP_FN by
 NAME with per-block try metadata, [extpick]/[vabsorb]/[tbie]-outcome
 traces. KLIO_HOME gotcha recorded: it is the PARENT of `.klio/packs`.
+
+
+### IN PROGRESS: lambda-receiver evidence — the tower exists, the resolver ignores it
+
+Traced to the exact gap. At argument-lambda lowering (expr.zig ~2803)
+`collectImplicitReceiverTower(receiver_head)` already builds the full
+tower — for drop's flow-lambda that is [FlowCollector, Flow] — and
+lambda_body.zig installs it on the body builder
+(`setImplicitReceiverTower`). But `pending_lambda_enclosing_recv` is
+`receiver_head orelse enclosingRecvTy()`, so the lambda's OWN receiver
+becomes both recv_ty and encl_recv ([bare] collect showed
+FlowCollector/FlowCollector), and the bare resolver's extension arm
+consults only those two heads — the tower's outer entries
+(`b.implicit_receiver_tower.items`) are never candidates.
+
+The channel to build (gate: KLIO_TOWER_EXT): in the bare-call arm, when
+the innermost receiver head refutes every extension candidate, walk
+tower[1..]; if exactly ONE candidate proves applicable to an outer head,
+commit it. Two emission options, decide by experiment:
+
+1. FULL static commit with the outer receiver: the lambda's frame
+   reaches the outer `this` as a capture (`this@drop` resolution
+   exists), so lowerResolvedExtensionCall with receiver =
+   resolveCapture("this") at that depth. Strongest form; needs the
+   capture-depth plumbing.
+2. CHEAPER committed-ext form: emit CMG with committed_ext = the proven
+   target (the machinery exists — callMemberMembersOnly walk). The
+   runtime candidates walk already carries the outer receiver at
+   [1]; the failure is only the SAM arm swallowing at [0]. With a
+   committed extension whose declared receiver head a closure candidate
+   cannot satisfy, the SAM arm must decline (add that guard) and the
+   walk reaches the true receiver.
+
+flow_operators (drop/dropWhile emitting through bare `collect {}`) is
+the driving repro; the iterator mass (919 examples sites) is the
+census payoff once the channel lands.
