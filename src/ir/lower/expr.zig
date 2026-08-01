@@ -5569,7 +5569,15 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // b)` inside `Buffer.indexOf`, whose extension overloads are
         // `Iterable.maxOf` / array `maxOf`) is the package-level function,
         // not a receiver member — it must fall through to the bare-name path.
-        const recv_chain = try narrowingRecvChain(b);
+        var recv_chain = try narrowingRecvChain(b);
+        // Inside an inline splice the ACTIVE receiver is the splice's — for
+        // `Greeter().apply { greet() }` the substituted concrete head — and
+        // the enclosing function's own receiver context says nothing about
+        // it. Without this, the receiver's member could not shadow a
+        // same-named top-level function.
+        if (recv_chain == null) {
+            if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
+        }
         // A captured crossinline param shadows a same-named member of the
         // anonymous object being lowered (`object : Iterable<T> { override fun
         // iterator() = iterator() }` — the bare `iterator()` is the captured
@@ -5600,6 +5608,20 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             };
             const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
                 (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
+            if (runtime.getenvSlice("KLIO_BINDS_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm)) {
+                    const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
+                    const hs_state: []const u8 = if (recv_chain) |ch| blk: {
+                        if (ch.len == 0) break :blk "-";
+                        const hs = b.module.registry.hierarchy_shadow_names.get(ch[0]) orelse break :blk "no-entry";
+                        if (!hs.complete) break :blk "incomplete";
+                        break :blk if (hs.names.contains(nm)) "contains" else "missing";
+                    } else "-";
+                    std.debug.print("[binds] {s} chain0={s} hs={s} own={} scoped_class={} binds={}\n", .{
+                        nm, c0, hs_state, b.hasOwnMember(nm), is_scoped_class, binds_this,
+                    });
+                }
+            }
             if (binds_this) {
                 // Pinning the dispatch to the innermost bound `this` is only
                 // sound when the receiver evidence proves that value serves
@@ -7946,7 +7968,7 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     return false;
 }
 
-fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .This and arg.This.qualifier == null) {
         // An extension body spliced into a member function binds a new `this`
         // register while the builder's flat declaration metadata still names
@@ -8247,6 +8269,11 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
     if (b.module.funcId(ident.name) != null) return null;
     const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    // A MEMBER of the enclosing receiver shadows the constructor, exactly as
+    // the emission router decides it (`fun Foo(): Bar` inside Host makes a
+    // bare `Foo()` the member call). Typing the local as the class here bound
+    // later calls against the wrong receiver class.
+    if (enclosingHasMemberNamed(b, ident.name) and !classNestedInEnclosing(b, cid)) return null;
     if (cid.int() >= b.module.classes.items.len) return null;
     const class = &b.module.classes.items[cid.int()];
     // An object is not constructed; a stub or value class has no instance
@@ -8302,6 +8329,37 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     var elem = (try iterableElementTypeRef(b, iter)) orelse return null;
     defer elem.deinit(b.allocator);
     return try b.allocator.dupe(u8, elem.name);
+}
+
+/// The bare-call arm's extension attempt: a bare name in a receiver context
+/// that no member serves may be an extension of the implicit receiver.
+/// Gated by `KLIO_BARE_EXT` for single-binary A/B.
+fn bareExtensionTarget(
+    b: *FuncBuilder,
+    name: ast.Ident,
+    recv: ir.TypeRef,
+    shapes: []applicability.ArgShape,
+    bounds: ?[]const ir.ModuleRegistry.TypeParamBound,
+) Allocator.Error!?ir.FuncId {
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_BARE_EXT") orelse "1", "0")) return null;
+    const implicit_owners = try b.collectImplicitReceiverTower(
+        b.allocator,
+        eagerLambdaRecvHead(b),
+    );
+    defer b.allocator.free(implicit_owners);
+    return b.module.resolveExtensionCall(
+        name.name,
+        recv,
+        shapes,
+        .{
+            .caller_file = name.span.file,
+            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+            .implicit_dispatch_owners = implicit_owners,
+            .lexical_owner = b.ownerClass(),
+            .call_name = name.name,
+            .actual_type_param_bounds = bounds orelse &.{},
+        },
+    ).target;
 }
 
 /// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
@@ -8763,6 +8821,13 @@ fn staticCallReturnTypeRef(
                 else
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
                         b.module.classId(bare_head)) orelse {
+                    // A receiver head with no class id (`UShortArray`) still
+                    // has EXTENSIONS — resolution over them never needed the
+                    // class, only the member walk below does.
+                    if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
+                        if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
+                        break :blk t;
+                    }
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
                     break :blk sole_global orelse return null;
                 };
@@ -8782,7 +8847,20 @@ fn staticCallReturnTypeRef(
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
                 });
-                break :blk bare_resolved.target orelse (sole_global orelse return null);
+                if (bare_resolved.target) |member_target| break :blk member_target;
+                // No member serves it, and none is even applicable: a bare
+                // call in a receiver context may be an EXTENSION of the
+                // implicit receiver written without `this.` — `toMutableList()`
+                // inside an `Iterable<T>` extension body. Members were tried
+                // first, exactly as Kotlin orders them, and an applicable-but-
+                // unproven member still wins the deferral.
+                if (!bare_resolved.applicable) {
+                    if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
+                        if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
+                        break :blk t;
+                    }
+                }
+                break :blk sole_global orelse return null;
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
@@ -11585,6 +11663,20 @@ fn lowerUnresolvedBareCall(
     static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
+    // Inside its own inline splice, a bare call of the SPLICED FUNCTION'S
+    // name resolves through the receiver walk — kotlinc binds the
+    // receiver's member (`ClosedRange.contains` inside the ranges
+    // `contains` body), never the enclosing extension itself. Keeping the
+    // self hint re-enters the splice at the global tier whenever every
+    // receiver probe misses, which is an unconditional recursion.
+    var ext_hint = static_ext;
+    if (ext_hint) |hint| {
+        if (b.currentInlineDecl()) |decl| {
+            if (inline_state.inlineIdByAst(decl)) |own| {
+                if (own == hint.int()) ext_hint = null;
+            }
+        }
+    }
     // A bare call to a name the enclosing anon object closes over.
     if (isLowerAnonCapture(name0)) {
         const idx = try b.recordCapture(name0);
@@ -11756,7 +11848,7 @@ fn lowerUnresolvedBareCall(
             break :bare_member;
         var this_path = [_]ast.Ident{.{ .name = "this", .span = callee.Path.segments[0].span }};
         const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = callee.Path.segments[0].span } };
-        switch (try lowerResolvedMemberCall(
+        const bare_member = try lowerResolvedMemberCall(
             b,
             &this_expr,
             .{ .name = name0, .span = callee.Path.segments[0].span },
@@ -11765,7 +11857,8 @@ fn lowerUnresolvedBareCall(
             ast_type_args,
             recv_ty,
             .{ .reg = this_reg, .non_null = true },
-        )) {
+        );
+        switch (bare_member) {
             .lowered => |reg| {
                 orEmitAudit(b, "unresolved_bare_call", "Call/bare-member", name0);
                 return reg;
@@ -11777,7 +11870,13 @@ fn lowerUnresolvedBareCall(
         // whole walk: `plus(element)` written inside `Iterable<T>.plusElement`
         // is an extension on the body's own receiver, and leaving it dynamic
         // is what makes that body pick the concatenating overload at run time.
-        if (try lowerResolvedExtensionCall(
+        // An applicable-but-DEFERRED member blocks the static extension
+        // commit exactly as on the explicit-receiver path: a member the
+        // receiver declares beats every extension in Kotlin, and committing
+        // the extension here bound `Iterable.contains`'s own smart-cast
+        // `contains(element)` back to itself once bound refutation pruned
+        // the candidate tie down to it.
+        if (bare_member != .deferred) if (try lowerResolvedExtensionCall(
             b,
             &this_expr,
             .{ .name = name0, .span = callee.Path.segments[0].span },
@@ -11788,7 +11887,7 @@ fn lowerUnresolvedBareCall(
         )) |reg| {
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
-        }
+        };
         if (runtime.getenvSlice("KLIO_BAREARM") != null) {
             var loc_buf: [256]u8 = undefined;
             const cs = callee.Path.segments[0].span;
@@ -11882,7 +11981,7 @@ fn lowerUnresolvedBareCall(
             .n_args = run[1],
             .arg_names = arg_names,
             .recv = this_reg,
-            .func = static_ext,
+            .func = ext_hint,
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -11900,7 +11999,7 @@ fn lowerUnresolvedBareCall(
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
-        .func = static_ext,
+        .func = ext_hint,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -12175,7 +12274,7 @@ fn fqnCallArityFits(b: *FuncBuilder, fid: FuncId, want: usize) bool {
 
 /// The simple head of a type name: drop a package qualifier and any generic
 /// arguments (`kotlin.collections.Iterable<Int>` -> `Iterable`).
-fn typeHead(s: []const u8) []const u8 {
+pub fn typeHead(s: []const u8) []const u8 {
     var t = s;
     if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
     if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
@@ -13072,7 +13171,11 @@ fn lowerResolvedExtensionCall(
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
 
-    const dispatch_reg: ?Reg = if (target.kind == .member_extension)
+    // `lowerMemberExtensionDispatchReceiver` and `lowerReceiver` can lower
+    // lambda bodies, which appends to the module's function table and moves
+    // it — `target` points into that table and must not be read after them.
+    const target_is_member_extension = target.kind == .member_extension;
+    const dispatch_reg: ?Reg = if (target_is_member_extension)
         (try lowerMemberExtensionDispatchReceiver(
             b,
             resolution.dispatch_owner orelse return null,
@@ -13080,7 +13183,7 @@ fn lowerResolvedExtensionCall(
     else
         null;
     const recv_reg = try lowerReceiver(b, receiver);
-    if (target.kind == .member_extension) {
+    if (target_is_member_extension) {
         const run = try lowerArgRunWithArity(b, selected_values, arg_arity);
         const arg_names = try trailingLambdaArgNames(
             b,
@@ -13235,13 +13338,26 @@ fn staticReceiverHasNoCompetingCallable(
 fn localOverloadReceiverCouldApply(
     b: *const FuncBuilder,
     overload: *const build.LocalFnOverload,
-    actual: TypeRef,
+    raw_actual: TypeRef,
 ) Allocator.Error!bool {
     const declared = overload.receiver_ty orelse return true;
     const owned_bounds = try b.typeParamBoundsSlice();
     defer if (owned_bounds) |bounds| b.allocator.free(bounds);
     const actual_bounds: []const ir.ModuleRegistry.TypeParamBound =
         owned_bounds orelse &.{};
+    // An ALIAS head (`Ints = MutableList<Int>`) names no class, so without
+    // resolution it fell into the unresolvable-type-parameter escape below
+    // and the overload applied to a receiver its real type refutes. Resolve
+    // the alias the same way global extension resolution does.
+    var alias_arena = std.heap.ArenaAllocator.init(b.allocator);
+    defer alias_arena.deinit();
+    const actual_scoped = b.module.resolveTypeAliasAt(
+        alias_arena.allocator(),
+        raw_actual,
+        null,
+        b.self_package,
+    ) catch raw_actual;
+    const actual = actual_scoped;
     // An actual head that names NO known classifier and carries no bound
     // here is a type parameter of a spliced/generic context (`it: T` inside
     // `compareBy`'s SAM lambda, where T instantiates to the caller's

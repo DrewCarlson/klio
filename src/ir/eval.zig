@@ -7661,6 +7661,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
         }
     }
+    if (routeTraceOn(name_str)) std.debug.print("[cmgsec] enter frame={s}\n", .{frame.func.fqn});
     var committed_ext_h: ?FuncId = null;
     var committed_recv_h: ?Value = null;
     var resolved: ?Value = null;
@@ -7680,6 +7681,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values);
     var single_cand = false;
 
+    if (routeTraceOn(name_str)) std.debug.print("[cmgsec] member-gate ctor={} shadow={} skip={}\n", .{ is_ctor_name, shadow_capture, skip_member });
     if (!is_ctor_name and !shadow_capture and !skip_member) {
         const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer allocator.free(cands);
@@ -8006,6 +8008,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             for (arg_values, 0..) |av, i| ext_args[i + 1] = av;
             switch (try host.callFunc(allocator, frame.module, fid, ext_args)) {
                 .ok => |v| {
+                    if (routeTraceOn(name_str)) std.debug.print("[evroute] committed_ext\n", .{});
                     orAudit("CallMemberOrGlobal", name_str, "committed_ext", -1, null);
                     try frame.write(cmg.dst, v);
                     return .cont;
@@ -8014,6 +8017,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             }
         }
     }
+    if (routeTraceOn(name_str)) std.debug.print("[cmgsec] resolved={}\n", .{resolved != null});
     if (resolved) |v| {
         result = v;
     } else {
@@ -8057,7 +8061,10 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         } else "";
         // Arm the host→driver flat handoff: the overload terminal may
         // stash a prepared flat request instead of dispatching natively.
-        armHostFlatReq();
+        // Honour KLIO_FLAT: this lane bypasses every instrumented dispatch
+        // route, and an un-gated arm made the flat kill-switch a no-op for
+        // exactly the calls it exists to bisect.
+        if (flatEnabled()) armHostFlatReq();
         const cno_res = try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor);
         _ = takeHostFlatArm();
         if (takeHostFlatReq()) |req0| {
@@ -8071,6 +8078,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             .err => |e| return raiseStep(frame, e),
         };
         if (overload) |v| {
+            if (routeTraceOn(name_str)) std.debug.print("[evroute] overload\n", .{});
             orAudit("CallMemberOrGlobal", name_str, "overload", -1, null);
             result = v;
         } else {
@@ -8151,6 +8159,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // carry null and retain legacy lookup until their declarations
             // are complete enough to rank.
             const allow_name_global = cmg.candidates == null or shadow_capture;
+            if (routeTraceOn(name_str)) std.debug.print("[evroute] by_id={} allow_name={}\n", .{ by_id != null, allow_name_global });
             const global = if (by_id != null)
                 by_id
             else if (allow_name_global)
@@ -8728,6 +8737,11 @@ var or_audit_enabled: bool = false;
 /// `global_id` (the lowering-resolved identity), `global` (name lookup),
 /// or the store/global-fallback variants — so a corpus sweep proves which
 /// runtime arms are live before an emit site is statically classified.
+fn routeTraceOn(name: []const u8) bool {
+    const w = std.c.getenv("KLIO_ROUTE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(w), name);
+}
+
 fn orAuditOn() bool {
     if (!or_audit_checked) {
         or_audit_checked = true;

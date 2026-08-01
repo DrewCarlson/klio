@@ -1306,7 +1306,25 @@ pub fn tryInlineCallWithTypeArgs(
     // the runtime receiver walk instead of pinning to the innermost this.
     const prev_splice_recv = b.spliceRecvTy();
     if (f.receiver_type) |rt| {
-        b.setSpliceRecvTy(rt.name.name);
+        // A generic inline receiver (`T.apply`) names no classifier; the
+        // CALL SITE's static receiver type does. Substitute it so the
+        // spliced body's bare calls see the real receiver class and its
+        // members can shadow same-named top-level functions.
+        var recv_head: []const u8 = rt.name.name;
+        var declares_param = false;
+        for (f.type_params) |*tp| {
+            if (std.mem.eql(u8, tp.name.name, rt.name.name)) declares_param = true;
+        }
+        if (declares_param) if (this_arg) |ra| {
+            if (expr_lower.argDeclTypeRefLazy(b, ra)) |known| {
+                recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, known.name, "?")));
+            } else if (try expr_lower.staticExprTypeRef(b, ra)) |owned_ty| {
+                var owned = owned_ty;
+                defer owned.deinit(b.allocator);
+                recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, owned.name, "?")));
+            }
+        };
+        b.setSpliceRecvTy(recv_head);
     } else if (member_splice) {
         // A member-inline splice's bare names resolve against the OWNER
         // class exactly as an extension's resolve against its receiver
