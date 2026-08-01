@@ -9715,6 +9715,32 @@ pub fn invokeVirtualMember(
             arg_params,
         );
     }
+    // A main-module slot link on an ANONYMOUS receiver class is a
+    // supertype-matched guess: the synth lists upstream classes for type
+    // checks (a KlioBufferedChannel names BufferedChannel), and entering
+    // the supertype's Kotlin body bypasses the pack's shadowing extension
+    // properties — `ch.onReceive` inside a select must reach the klio
+    // clause glue, not upstream's SelectClause machinery. Dispatch by
+    // name so the full ladder (host bindings, extension properties, anon
+    // methods) serves; a SAM conversion keeps the slot path (its stored
+    // lambda is served below by target signature).
+    if (linked == .main_func) {
+        const anon_recv = blk: {
+            const class = runtime_def.borrow();
+            defer class.deinit();
+            break :blk class.get().is_anonymous;
+        };
+        if (anon_recv) {
+            const sam = blk: {
+                const instance = receiver.Instance.borrow();
+                defer instance.deinit();
+                break :blk instance.get().get("__sam_target__");
+            };
+            if (sam == null) {
+                if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+            }
+        }
+    }
     const target = FuncId.from(linked.main_func);
 
     // The slot resolved, but to a declaration with nothing behind it: no

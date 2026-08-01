@@ -3189,3 +3189,26 @@ compose_ui_text, mosaic_hello, select_on_timeout_loses remain); sweep
 117/0; pinned 145/146. The [bare] collect -> NONE static gap (the
 tower consult) is still the census lever, but no longer blocks
 correctness here.
+
+
+### IN PROGRESS: select_on_timeout_loses — the clause property reads upstream
+
+Diagnosed to the fix point. KLIO_PUMP_DIAG shows the deadlock: the
+select parks in UPSTREAM SelectImplementation.waitUntilSelected, the
+sender parks on the native rendezvous slot, and the native
+`select_recv_waiters` list never gets the select —
+`klioRegReceive` (the pack's clause glue) NEVER RUNS ([fn-entry] count
+0). `ch.onReceive` resolves through the FIELD walk's supertype chain to
+upstream BufferedChannel's member getter (`instance_prop_getters` hop
+on the nominal supertype), bypassing the pack's shadowing extension
+property `ReceiveChannel<E>.onReceive` in KlioChannelClauses.kt.
+
+Fix point: host_fields' getter chain walk — for an ANONYMOUS receiver
+class (a host synth), an extension property keyed on a supertype head
+(extension_props / resolveExtensionPropImpl) must outrank a
+supertype-walked member getter, mirroring the invokeVirtualMember rule.
+The sibling method-side reroute (anonymous receiver + foreign main_func
+slot link + no __sam_target__ -> dispatch by name) is implemented in
+invokeVirtualMember in this commit — correct but insufficient alone,
+since the clause is a PROPERTY read. onSend/onReceiveCatching will
+recover with the same fix. interp_ir 117/117 with the reroute in.
