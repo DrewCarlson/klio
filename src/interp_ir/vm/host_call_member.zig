@@ -3969,6 +3969,17 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
 /// Shared flat-request tail: resolve `target`, admit only the fully-applied
 /// no-vararg shape, and build the `[receiver] ++ args` frame vector with the
 /// threaded-composer push the recursive invoker would perform.
+/// A cached by-name extension resolution must never serve the frame that
+/// is currently EXECUTING it: the bare call inside `Iterable.contains`'s
+/// own body hitting the same (receiver-class, name, argc) key as the call
+/// that entered it is an unconditional self-loop, and kotlinc resolves
+/// that inner call to the receiver's member. Skipping the serve falls
+/// down the ladder to the member probes.
+fn cacheServesExecutingFrame(raw_fid: u32) bool {
+    const cf = ir.eval.currentFrameFunc() orelse return false;
+    return cf.id.int() == raw_fid;
+}
+
 fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value, target: FuncId) Allocator.Error!?ir.eval.FlatCallReq {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -4068,14 +4079,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     // member invoker binds `[receiver] ++ args` correctly — and
                     // it builds the frame args in one allocation (no prepend
                     // scratch slice), matching the member fast path's speed.
-                    if (fid != METHOD_MISS) {
+                    if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
                         if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                     }
                 }
             } else if (!strict_ext and !no_ext) {
                 if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k2| {
                     if (extMethodCacheGet(self, k2)) |fid| {
-                        if (fid != METHOD_MISS) {
+                        if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
                             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                         }
                     }
@@ -4090,7 +4101,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* != .Instance and !strict_ext and !no_ext) {
         if (instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv)) |k| {
             if (extMethodCacheGet(self, k)) |fid| {
-                if (fid != METHOD_MISS) {
+                if (fid != METHOD_MISS and !cacheServesExecutingFrame(fid)) {
                     if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
                 }
             }

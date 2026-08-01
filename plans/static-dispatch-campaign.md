@@ -2699,3 +2699,18 @@ at every commit point inside `callMemberNamedInner` (the ext-cache
 serve and each tail) for name==contains — one armed run pins the line,
 the member-first rule lands there, then flip KLIO_HDR_BOUNDS and
 delete the gate.
+
+
+Tenth elimination: the by-name ext-cache serves (all three, plus the
+new `cacheServesExecutingFrame` guard — a cached resolution never serves
+the frame currently executing it, which closes every cache-driven
+self-loop categorically) — and the armed residual STILL reproduces. Ten
+routes are now guarded or eliminated; the recursion enters through a
+commit point inside `callMemberNamedInner`'s remaining ladder (member
+fast path? the builtin probe ladder? `userMethodNamed`?) that none of
+the instrumented arms cover. The next session instruments
+callMemberNamedInner's interior: an env-gated route print before every
+`invokeMethodFuncId`/`callFunc`-by-fid line in that fn, one armed run,
+and the member-first rule lands on the printed line. Every guard landed
+during this hunt is independently Kotlin-true and validated; the
+default path has stayed green throughout.
