@@ -1005,6 +1005,18 @@ member — and kept anyway, because it is a wrong ANSWER rather than a missed
 binding. `null_check_through_and_chain` pins all four shapes plus the
 unguarded control, and gets three of them wrong when `KLIO_NULL_CHAIN=0`.
 
+### A factory call names a property's type as a constructor does
+
+An un-annotated property took its type head from a CONSTRUCTOR call and from
+nothing else, so `val made = newBase()` registered none and every read through
+it bound against the runtime class rather than the declared one. Accept a call
+to a uniquely-named declaration with a declared return type, which is the same
+evidence a constructor gives.
+
+Worth ZERO on both censuses and kept for the same reason as the null-narrowing
+entry: `property_typed_from_a_factory_call` prints `derived` where kotlinc
+prints `base`, so it was a wrong ANSWER, not a missed binding.
+
 ### Measured dead ends, all three with the reason
 
 Recorded so none is retried. Each was built, measured on BOTH file sets, and

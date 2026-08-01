@@ -1240,11 +1240,27 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]c
     const callee = src.Call.callee;
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
-    if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
-    for (decls) |*d| {
-        if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
+    if (nm.len == 0) return null;
+    if (std.ascii.isUpper(nm[0])) {
+        for (decls) |*d| {
+            if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
+        }
+        return null;
     }
-    return null;
+    // A FACTORY call names its type just as a constructor does, as long as
+    // exactly one declaration answers to the name and it declares a return
+    // type: `val cache = newCache()` is whatever `newCache` returns.
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0")) return null;
+    var found: ?[]const u8 = null;
+    for (decls) |*d| {
+        if (d.* != .Function) continue;
+        if (!std.mem.eql(u8, d.Function.name.name, nm)) continue;
+        if (found != null) return null;
+        const rt = d.Function.return_type orelse return null;
+        if (rt.nullable or rt.function != null or rt.qualified_path != null) return null;
+        found = rt.name.name;
+    }
+    return found;
 }
 
 /// The materialized array head a `vararg` property has (mirrors the body-side
