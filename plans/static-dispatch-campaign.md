@@ -3371,3 +3371,28 @@ residual prerequisite is expression-body return inference for that
 shape (a safe-call invoke of a nullable function-typed property), or
 any equivalent decidable discriminator; everything downstream is
 verified ready. select_on_timeout_loses stays the driving repro.
+
+
+The last link's implementation ladder (three bounded derivations, in
+dependency order — each verifiable by the smac/member-static traces):
+
+1. `staticExprTypeRef` grows a safe-invoke arm: `x?.invoke(args)` where
+   `x` is a property/local whose DECLARED type is function-typed
+   (typealias-resolved) derives the function type's RETURN, nullable.
+   `onCancellationConstructor?.invoke(select, internalResult)` then
+   types as the returned handler function.
+2. Expression-body function decls record their INFERRED return through
+   the same derivation at decl time (`fun createOnCancellationAction(
+   ...) = <safe-invoke>` gets its function-typed return in decl_sigs)
+   — today inferred returns stay Unit-annotated-as-unknown.
+3. The n-ary member-call arm of `staticExprTypeRef` (the site's
+   `val onCancellation = clause.createOnCancellationAction(a, b)`)
+   reads the callee's (now recorded) declared return — verify whether
+   the arm already exists for n-ary calls or only nullary
+   (`nullaryMemberReturnTypeRef`).
+
+With those, the arg shape carries a Function head, the landed
+callable-vs-builtin refutation drops member #79, and the file-private
+extension binds: `dbg-tsi: tryResume=true`, `got 99`. All three
+downstream pieces (cast typing, call-typed locals, the refutation) are
+landed and gate-validated (sweep 117/0, drift 262/266, pinned 145/146).
