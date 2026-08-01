@@ -3238,3 +3238,11 @@ through a cast function type dispatches (KLIO_MISS_TRACE=regFunc showed
 `runSafely` misses on kotlin.Function — the reference may be wrapped),
 and whether SelectClause1Impl's field read loses the reference.
 klioRegReceive [fn-entry] stays the ground-truth signal.
+
+
+Standalone negative: a `::fn as FnType` reference stored in a class val
+and invoked through the cast runs fine. The regFunc break needs the
+pack context — next: probe upstream SelectImplementation.register's
+actual invoke site with KLIO_CALLVALUE_TRACE / a pack-source print in
+Select.kt (the memory's pack-instrumentation recipe), checking whether
+`clause.regFunc` reads the stored reference or a mis-resolved member.
