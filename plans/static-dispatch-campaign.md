@@ -2368,3 +2368,30 @@ outputs before they can be attributed. The e2e suite has been red since
 e7f76632 (the GC test-profile alignment, ~534 commits ago), so these
 failures accumulated unseen; `KLIO_E2E_FILTER`/`KLIO_E2E_SHARD` are the
 narrowing tools.
+
+
+### The gate's honest ledger after the recovery (first full read since e7f76632)
+
+Gate wall time is now ~10 minutes with per-phase attribution. Green: unit,
+lambdas_and_dispatch 50/50, inheritance_dispatch 13/13,
+extension_resolution 26/26, object_init 35/35, ktor_channel_async,
+concurrency_stress, bundle_smoke, and the dual eager sweep (117/0 in BOTH
+modes, outputs identical — the eager gate's first clean read).
+
+Red, all pre-dating this session (the suites crashed outright before the
+allocator fixes, so these accumulated unseen; every one verified to fail
+identically with all four session gates off):
+
+- parity_corpus_pinned 126/134: local_extension_generic_applicability_matrix,
+  generic_factory_return_extension (NaN — reproduces in the harness, fast
+  loop available), qualified_alias_static_applicability,
+  member_factory_constructor_shadow, unimported_object_member_extension,
+  member_extension_foreign_field_shadow, backtick_this_param_not_receiver
+  (unresolved global `show` — reproduces in the harness),
+  tier5_loose_member_redispatch_resolves. These are extension-resolution
+  wrong answers — campaign-domain bugs with pinned expected outputs, the
+  next concrete work items.
+- parity_threaded_litmus 43/44 (1 crash), check_examples 3/4
+  (vararg_spread duplicate-declaration), ktor_server 1/2 (expected 200,
+  found null), e2e 1/3 (the deep-corpus segfault above plus masked
+  program-level failures).
