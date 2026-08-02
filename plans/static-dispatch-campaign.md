@@ -3639,3 +3639,19 @@ gated print at its deferral points) — the file-private
 receiver must commit; whichever deferral condition holds it (receiver
 type-arg proof, same-file tier, private visibility) is the fix line.
 Remaining: select + compose_nodes + compose_ui_text.
+
+
+Ext-commit probe result: the classifier-path proof block (the
+KLIO_DISPROOF_TRACE site) NEVER RUNS for the select site — zero
+disproof lines — so the candidate's compatibility settles UNKNOWN on
+an earlier branch of the receiver-compat chain (before
+known_classifier_path), leaving applicable=true target=null. NEXT
+PROBE (one gated print): at resolveExtensionCall's candidate loop, on
+name match print each candidate's fid + which branch set
+`compatibility` (initial/unknown/compatible/incompatible) + the
+scoped_receiver/scoped_recv_param names-with-arg-counts — that shows
+which condition (`known_classifier_path or same_known_classifier or
+typeContainsBoundParam`) fails for declared
+`CancellableContinuation<Unit>` vs actual `CancellableContinuation<
+Unit>` — the exact-match case must prove. Then the commit follows and
+select closes.
