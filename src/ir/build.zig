@@ -312,6 +312,31 @@ pub fn anonScopeRename(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A property type head carried into a runtime anon-object member-body
+/// lowering: `val iterator = sequence.iterator()` inside `object :
+/// Iterator<T>` records `iterator -> Iterator` (declared annotations as
+/// written, un-annotated initializers derived at `buildObject` from the
+/// captured values' runtime classes), and the sibling `hasNext()` body's
+/// bare-receiver walk then types the read.
+pub const AnonPropHead = struct { owner: []const u8, name: []const u8, head: []const u8 };
+
+threadlocal var lower_anon_prop_heads: []const AnonPropHead = &.{};
+
+pub fn setLowerAnonPropHeads(hs: []const AnonPropHead) []const AnonPropHead {
+    const prev = lower_anon_prop_heads;
+    lower_anon_prop_heads = hs;
+    return prev;
+}
+
+/// The installed head for `owner.name`, or null. Owner-keyed so a named
+/// nested class lowering inside the window cannot read the anon's records.
+pub fn anonPropHead(owner: []const u8, name: []const u8) ?[]const u8 {
+    for (lower_anon_prop_heads) |h| {
+        if (std.mem.eql(u8, h.owner, owner) and std.mem.eql(u8, h.name, name)) return h.head;
+    }
+    return null;
+}
+
 /// Classifier identities carried into runtime anonymous-object lowering.
 threadlocal var lower_anon_scope_classes: []const ir.ScopeClassRef = &.{};
 
@@ -2042,6 +2067,34 @@ pub const FuncBuilder = struct {
     /// such a receiver name a class at all.
     pub fn typeParamBound(self: *const FuncBuilder, name: []const u8) ?ir.ModuleRegistry.TypeParamBound {
         return self.type_param_bounds.get(name);
+    }
+    /// Bind a SPLICED inline callee's type-parameter bound for the splice
+    /// window: the callee's param types reach the caller's builder through
+    /// `spliceParamTy` (`destination: M`), and without the bound the head
+    /// `M` names nothing. Returns what the caller restores on exit.
+    pub const SpliceBoundRestore = struct {
+        name: []const u8,
+        prev_bound: ?ir.ModuleRegistry.TypeParamBound,
+        was_name: bool,
+    };
+    pub fn bindSpliceTypeParamBound(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: ir.ModuleRegistry.TypeParamBound,
+    ) Allocator.Error!SpliceBoundRestore {
+        const prev = self.type_param_bounds.get(name);
+        const was_name = self.type_param_names.contains(name);
+        try self.type_param_names.put(name, {});
+        try self.type_param_bounds.put(name, bound);
+        return .{ .name = name, .prev_bound = prev, .was_name = was_name };
+    }
+    pub fn restoreSpliceTypeParamBound(self: *FuncBuilder, r: SpliceBoundRestore) void {
+        if (r.prev_bound) |p| {
+            self.type_param_bounds.put(r.name, p) catch {};
+        } else {
+            _ = self.type_param_bounds.remove(r.name);
+        }
+        if (!r.was_name) _ = self.type_param_names.remove(r.name);
     }
     /// Record the fully lowered upper bound of `name`, keeping its type
     /// arguments. Takes ownership of `ref`.

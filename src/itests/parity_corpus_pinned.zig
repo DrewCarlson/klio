@@ -1560,6 +1560,33 @@ test "local_fn_default_beats_stdlib_sibling" {
     );
 }
 
+test "anon_object_outer_prop_iterator" {
+    try check("anon_object_outer_prop_iterator",
+        \\6
+        \\a-b
+        \\
+    );
+}
+
+test "ext_body_bare_iterator_star" {
+    try check("ext_body_bare_iterator_star",
+        \\3
+        \\b
+        \\null
+        \\
+    );
+}
+
+test "splice_bounded_type_param_receiver" {
+    try check("splice_bounded_type_param_receiver",
+        \\[a, b, c]
+        \\[(1, a)]
+        \\[1, 2]
+        \\[3]
+        \\
+    );
+}
+
 test "exit_guard_negated_is_narrows_overload" {
     try check("exit_guard_negated_is_narrows_overload",
         \\18

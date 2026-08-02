@@ -2411,7 +2411,9 @@ fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[
     for (chain) |cls| {
         if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
-    return null;
+    // A runtime anon-object member body's own property heads travel in the
+    // installed snapshot — the synthesized class has no registry entries.
+    return build.anonPropHead(owner, name);
 }
 
 /// Whether `ty` (or a supertype) declares a member property named `name`.
@@ -12818,6 +12820,12 @@ pub fn typeHead(s: []const u8) []const u8 {
     var t = s;
     if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
     if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
+    // A use-site projection keeps the underlying name as its head: an
+    // `out#T` receiver is a `T` for class/bound lookups.
+    if (std.mem.startsWith(u8, t, "in#"))
+        t = t["in#".len..]
+    else if (std.mem.startsWith(u8, t, "out#"))
+        t = t["out#".len..];
     return std.mem.trim(u8, t, " ");
 }
 
@@ -13311,14 +13319,25 @@ fn lowerResolvedMemberCall(
                 .simple_unknown;
             lm_noclass[@intFromEnum(k)] += 1;
             if (runtime.getenvSlice("KLIO_NOCLASS_HEADS") != null) {
-                std.debug.print("[no-class-head] {s}\n", .{head});
+                if (b.typeParamBound(head)) |tpb| {
+                    std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
+                } else {
+                    std.debug.print("[no-class-head] {s} no-bound-record tp={}\n", .{ head, b.isTypeParam(head) });
+                }
             }
         }
         return .none;
     };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
         const receiver_name = receiver.Path.segments[receiver.Path.segments.len - 1].name;
+        // A bare name resolving to nothing lexically is a CLASS-name access
+        // (whose members live on the companion) only when no enclosing
+        // receiver declares a property of the name: `iterator` inside
+        // `object : Iterator<T> { val iterator = ... }` is a `this` property
+        // read typed by the head channel, and redirecting it to a companion
+        // silently dropped the whole resolution.
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
+            !enclosingHasMemberNamed(b, receiver_name) and
             static_owner.int() < b.module.classes.items.len)
         {
             const classifier = &b.module.classes.items[static_owner.int()];
