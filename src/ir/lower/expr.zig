@@ -8418,6 +8418,12 @@ fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef
 /// terminate on mutual recursion.
 threadlocal var od_depth: u8 = 0;
 
+/// The user-argument count of a `.Call` expression (named or not).
+fn memberArgCount(call_expr: *const Expr) usize {
+    if (call_expr.* != .Call) return 0;
+    return call_expr.Call.args.len;
+}
+
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
@@ -8911,6 +8917,20 @@ fn staticCallReturnTypeRef(
                         break :blk t;
                     }
                 }
+                // Same-class FORWARD reference: while a class's own bodies
+                // lower its method list is incomplete, so a member declared
+                // LATER (`findClause` below trySelectInternal) resolves to
+                // nothing. The pre-pass AST registry answers the DECLARED
+                // return directly.
+                if (bare_resolved.target == null) {
+                    if (inline_state.exprBodyMemberAst(bare_head, name.name, call.args.len)) |fa| {
+                        if (fa.return_type) |*rt| {
+                            const fwd = try loweredOwnedLocalTypeRef(b, rt);
+                            if (bt) std.debug.print("[bareret] {s} on {s} ast-declared return={s}\n", .{ name.name, ident, fwd.name });
+                            return fwd;
+                        }
+                    }
+                }
                 break :blk sole_global orelse return null;
             };
             // A plain lambda that captures its lexical class receiver makes
@@ -9027,7 +9047,41 @@ fn staticCallReturnTypeRef(
                 // (the same rule nullaryMemberReturnTypeRef applies).
                 resolved_target = resolved.target;
             }
+            // Same-class FORWARD references: while a class's own bodies
+            // lower, its IR method list is incomplete, so a member declared
+            // LATER in the class resolves to nothing. The pre-pass AST
+            // registry answers the return type directly — a declared
+            // annotation as-is, an un-annotated expression body by on-demand
+            // derivation.
             if (resolved_target == null) {
+                if (inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr))) |fa| {
+                    if (fa.return_type) |*rt| {
+                        var out = try loweredOwnedLocalTypeRef(b, rt);
+                        if (member.safe) out.nullable = true;
+                        if (mt) std.debug.print("[bareret] .{s} on {s} ast-declared return={s}\n", .{ member.name.name, head, out.name });
+                        return out;
+                    }
+                    if (fa.body) |*fbody| {
+                        if (fbody.* == .Expr and od_depth < 3) {
+                            od_depth += 1;
+                            defer od_depth -= 1;
+                            var nb = try FuncBuilder.init(b.allocator, b.module);
+                            defer nb.deinit();
+                            nb.setOwnerClass(head);
+                            nb.setRecvTy(head);
+                            for (fa.params) |*ap| {
+                                try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
+                                if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
+                            }
+                            if (try staticExprTypeRef(&nb, &fbody.Expr)) |derived| {
+                                var out = derived;
+                                if (member.safe) out.nullable = true;
+                                if (mt) std.debug.print("[bareret] .{s} on {s} ast-derived return={s}\n", .{ member.name.name, head, out.name });
+                                return out;
+                            }
+                        }
+                    }
+                }
                 if (member_applicable) {
                     if (mt) std.debug.print("[bareret] .{s} on {s} member applicable but deferred\n", .{ member.name.name, head });
                     return null;

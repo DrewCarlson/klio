@@ -3544,3 +3544,21 @@ the two phases (print b.module identity + a phase tag alongside
 the first phase too, or (b) make the kept module the second phase's.
 Everything downstream is proven: with the typed lowering, derivation
 returns Function3 and the refutation chain is verified ready.
+
+
+Forward-reference fallbacks LANDED on both branches (validated: sweep
+117/0, drift 262/266 unchanged): the pre-pass registry now holds ALL
+bodied members, the Member arm serves declared returns or derives
+un-annotated expression bodies, and the BARE branch serves declared
+returns for same-class forward references (`findClause` below its
+caller). Site facts pinned by probes: our `val onCancellation` DOES
+enter lowerPropertyDecl (init_tag=Call) and records Function3 in ONE
+pass; `val clause = findClause(x) ?: continue` NEVER enters
+lowerPropertyDecl (the elvis-jump initializer lowers through a
+control-flow arm with no decl-type recording); and the EMITTING pass's
+tryResume shape still reads `arg_ty=-`. Next discriminator: a pass
+counter printed with [smac]/[valty] to identify the emitting pass, then
+either record decl types in the elvis-jump statement arm (find it —
+it is not lowerPropertyDecl) or make the emitting pass the recording
+one. The refutation fires the moment the shape carries Function3
+(`inst=Unit` awaits it).

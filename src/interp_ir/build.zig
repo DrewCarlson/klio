@@ -3953,7 +3953,7 @@ fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void {
                 // Un-annotated expression bodies register for on-demand
                 // return derivation: a caller lowered before this member's
                 // own pass still types its locals from the inferred return.
-                if (f.body != null and f.body.? == .Expr and f.return_type == null) {
+                if (f.body != null) {
                     ir.lower.registerExprBodyMember(owner, f) catch {};
                 }
             },
