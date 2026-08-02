@@ -552,10 +552,15 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         // `fun MockViewValidator.value() { Text(…) }` must pick the
         // MockViewValidator ext over a same-named top-level fn), else the
         // enclosing receiver, exactly as a receiver lambda carries it.
-        b.module.pending_lambda_receiver_tower = try b.collectImplicitReceiverTower(
+        b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(
             b.allocator,
             if (f.receiver_type) |r| r.name.name else null,
+            if (f.receiver_type != null) f.name.name else null,
         );
+        // The local extension fn's receiver answers to `this@<name>` exactly
+        // as a top-level extension's does; the body binds the label so
+        // nested scopes (and the tower emission path) reach the value.
+        if (f.receiver_type != null) b.module.pending_lambda_this_label = f.name.name;
         b.module.pending_lambda_enclosing_recv = if (f.receiver_type) |r|
             r.name.name
         else

@@ -81,6 +81,16 @@ pub const Reg = enum(u32) {
     }
 };
 
+/// One implicit-receiver tower entry: the receiver's type head, plus the
+/// label under which its VALUE is addressable from nested scopes
+/// (`this@<label>` — the extension fn or receiver lambda name), when one
+/// is bound. A null label still serves resolution/derivation; only static
+/// EMISSION with an outer receiver needs the value channel.
+pub const ReceiverTowerEntry = struct {
+    head: []const u8,
+    label: ?[]const u8 = null,
+};
+
 /// Identifier for a basic block inside one function body.
 pub const BlockId = enum(u32) {
     _,
@@ -1462,7 +1472,7 @@ pub const Module = struct {
     pending_lambda_enclosing_recv: ?[]const u8 = null,
     /// Full implicit receiver tower for the lambda body about to lower,
     /// innermost first. Not serialized.
-    pending_lambda_receiver_tower: ?[]const []const u8 = null,
+    pending_lambda_receiver_tower: ?[]const ReceiverTowerEntry = null,
     /// Structural type of `pending_lambda_own_recv`, transferred into the
     /// lambda body's builder. Not serialized.
     pending_lambda_own_recv_type: ?TypeRef = null,

@@ -3766,3 +3766,59 @@ Remaining census work: the outer-receiver EMISSION commit (binding the
 outer `this` capture at the call site), the no_class_id population the
 naming progression feeds (300 stdlib / 3,816 examples), and the
 resolver_declined pairs (465 / 3,775).
+
+
+### LANDED: the tower emission commit (KLIO_TOWER_EMIT, default on)
+
+The derivation slice's named seam is closed: a bare call whose innermost
+receiver serves neither a member nor an extension now walks the OUTER
+tower entries at the EMISSION site too, and a resolving extension
+commits statically with its receiver bound through the entry's
+`this@<label>` slot — the same capture channel an explicit `this@drop`
+reference lowers through — so the call runs without the runtime
+implicit-receiver walk. The pieces:
+
+- Tower entries are now `(head, label)` pairs (`ir.ReceiverTowerEntry`):
+  the label is the `this@<x>` name under which the receiver VALUE is
+  addressable from nested scopes. Extension declarations record theirs
+  at the entry bind (`this@<fnName>`, decl.zig); receiver lambdas bind
+  their implicit label unconditionally when the receiver is their own
+  binding (previously only when the source referenced it — the bind is
+  free and makes the value reachable by name), and LOCAL extension fns
+  now bind `this@<name>` exactly as top-level ones do (previously they
+  never did — an explicit `this@localFn` in a nested lambda fell to the
+  class-name runtime walk and missed).
+- The emission walk (expr.zig, after the innermost extension miss in
+  the bare-member arm): per outer entry, an applicable same-name MEMBER
+  on the outer receiver stops the walk and keeps the call dynamic —
+  Kotlin gives a level's members precedence over its extensions, and
+  `collect {}` on an outer `Flow` must stay with the level that owns
+  it. Only a member-refuted level commits its extension, receiver
+  lowered as a synthetic `this@<label>` expression through the existing
+  qualified-this channel (resolve → capture-hoist → anon capture), with
+  unreachable labels left dynamic.
+
+Census: both fixed sets measure UNCHANGED (stdlib 1,872 no_receiver_type
+/ 57.1% bound; examples 15,475 / 64.7%) — recorded as a zero honestly.
+The member-site census does not bucket this slice's conversions (a
+CallMemberOrGlobal deferral becoming a direct `Call` is not a member
+site), and the fixed sets' bare calls in receiver lambdas either
+resolve innermost or hit the outer-member guard. The slice's claim is
+the channel, not bulk movement: derivation-resolved outer targets now
+EMIT (leaving them dynamic after deriving their types was strictly
+worse), the `[KLIO_OR_AUDIT] Call/bare-tower-extension` tag counts the
+commits, and every statically-emitted site is one fewer consumer of the
+runtime receiver walk whose stale-subject failure family the
+resolution-unification plan owns (the pausable pause/resume clobber).
+
+Pins: `tower_outer_receiver_extension` (nested receiver lambdas, one
+and two levels, committing an outer top-level extension) and
+`tower_local_extension_label` (the local-extension-fn shapes: a bare
+call in a receiver lambda committing the enclosing local ext fn's
+receiver's top-level extension, and an explicit `this@localFn` through
+a nested lambda), plus the module test "bare call commits an outer
+tower extension through its label slot" asserting the exact `.Call`
+emission against the labeled slot register. A/B (`KLIO_TOWER_EMIT=0`)
+byte-identical on both fixtures. Gates: ir 236/236, unit suite green,
+sweep 117/0, corpus 266/266 (headless runner, `.klio-local` home),
+pinned 148 with the standing backtick red as the only failure.
