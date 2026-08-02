@@ -12820,6 +12820,12 @@ pub fn typeHead(s: []const u8) []const u8 {
     var t = s;
     if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
     if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
+    // A use-site projection keeps the underlying name as its head: an
+    // `out#T` receiver is a `T` for class/bound lookups.
+    if (std.mem.startsWith(u8, t, "in#"))
+        t = t["in#".len..]
+    else if (std.mem.startsWith(u8, t, "out#"))
+        t = t["out#".len..];
     return std.mem.trim(u8, t, " ");
 }
 

@@ -527,6 +527,25 @@ unless noted. Chronological.
 
 ## Measured dead ends and falsified theories — do not retry
 
+- Shipping the unsigned value-class declarations (2026-08-02): adding
+  `unsigned/src/kotlin/U{Byte,Short,Int,Long}{,Array}.kt` to the
+  curated manifest creates the class rows the 168 `no_class_id`
+  unsigned sites need — but it flips THREE representation-coupled
+  channels at once and broke UIntTest/UnsignedArraysTest/MinMax*:
+  companion constants (`UInt.MAX_VALUE`) resolve to the source
+  companion and construct INTERPRETED `UInt(data=...)` instances that
+  collide with host unsigned values; inline members
+  (`toDouble() = uintToDouble(data)`) splice bodies that read `data` on
+  the host repr; and direct-bound member bodies execute interpreted.
+  An `invokeResolvedMember` intrinsic-preference guard (mirroring the
+  virtual-path rule) did NOT fix it — the failing path is constant
+  construction, not member dispatch. Prerequisite: unify the unsigned
+  representation (companion constants and ctors must produce host
+  values, inline splices suppressed for host-repr owners) — then
+  re-add the manifest entries. Remaining `no_class_id` split for
+  targeting: unsigned 168, incomplete type-param bounds (`M`/`C`) 81,
+  `out#T` projection-prefix artifact 26.
+
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):
   a `memberPromotionProven` (member `.compatible` + every chain-related
   extension `.incompatible`, all-args-authoritative gate, mirroring the
