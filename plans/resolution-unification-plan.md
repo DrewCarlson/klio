@@ -90,27 +90,38 @@ The two bugs before the 1210 ratchet, re-verified 2026-08-02:
    diagnostic gap the old entry named is closed anyway: the `[frame-params]`
    dump and the `[fn-entry]` arg dump now print an Instance's concrete
    class name, not just the tag.
-2. **Lost-wakeup hang — STILL LIVE, now bounded and narrowed.** Repro:
-   `SnapshotStateMapTests.concurrentMixingWriteApply_set` — no longer a
-   forever-hang: runTest's 30 s cap fires and it fails with
-   `UncompletedCoroutinesError` in ~33 s. `KLIO_PUMP_DIAG` trace
-   (scratchpad `cmwa_pump.log`): the stall parks four tokens forever
-   (the test body's `coroutineScope` at SnapshotStateMapTests.kt:535, the
-   scheduler's `receiveDispatchEvent`, `JobSupport.join`, and the
-   runBlocking root), `ready=0`. The narrowing: a worker posts
-   `[PUMP] resumeExternal slot=281474976710681 tid=…` and NO
-   `drain slot=… routed=true` follows — the pump then sits 605 idle
-   rounds until the wall deadline. Every successful external resume in the
-   same log shows the `resumeExternal → [sync] post → drain routed=true`
-   sequence. So the lost wakeup is an external (cross-thread) resume that
-   never routes to a ready token — most likely a race between the worker's
-   resume post and the park/persist binding of that slot on the pump side.
-   After the deadline fires, two `[tok] take tok=7 MISSING` lines show
-   stale re-fires of the consumed timer token — residue, not the cause.
-   Next: find slot 281474976710681's persist/park binding in the same log
-   (whether the resume arrived BEFORE the slot was bound), then inspect the
-   mailbox hold path for cross-thread posts against unbound slots
-   (`coroutines.zig`'s resumeExternal/drain pairing).
+2. **Lost-wakeup hang — STILL LIVE; one real routing defect found and
+   fixed, the test's own stall remains.** Repro:
+   `SnapshotStateMapTests.concurrentMixingWriteApply_set` — fails with
+   `UncompletedCoroutinesError` at ~33 s (the test declares
+   `runTest(timeout = 30.seconds)` explicitly, so the env alias cannot
+   stretch it). The silent-arm probes in `coroutineResumeExternal`
+   (landed, `KLIO_PUMP_DIAG`-gated: inline-samethread / stashed-unowned /
+   DROPPED mailbox-closed) answered the earlier narrowing: the
+   single-line `resumeExternal slot=…681` was the SAME-THREAD INLINE arm
+   claiming the slot. That exposed a real defect: a coroutine that parks
+   on one pump, persists, and re-parks on another leaves its old
+   slot→token binding on the first pump, and the local-stack probe ran
+   BEFORE the global owner registry — a worker's stale binding claimed
+   the runBlocking root's completion slot (656) while the re-parked root
+   starved. FIXED: with a registered owner, only the owner's pump may
+   serve inline (`coroutineResumeExternal` owner gate). Gates: interp_ir
+   117/117, sweep 117/0, drift 266/266; threaded litmus at its CURRENT
+   baseline — note the plan's recorded litmus set has drifted:
+   `tl_io_elastic` now passes and `tl_thread_resume_child` ABORTS
+   (exit 134, pre-existing — A/B-verified against the pre-change binary;
+   `vm.deinit` in `workerEntry`, intrinsic_host.zig:931).
+   The TEST still stalls identically (four tokens parked, `ready=0`:
+   the body's `coroutineScope`, the scheduler's `receiveDispatchEvent`,
+   `JobSupport.join`, the root). ~36 external resumes arrive over the
+   whole run — the outer `repeat(10)` iterations WERE cycling — and a
+   late `[sync] done … spins=4600` (maxed) shows a worker posting while
+   the main pump idles. Remaining suspicion is WORKER-side progress:
+   the mutator/consumer pair (`trySend`/`consumeEach` over a CONFLATED
+   channel, 100k interpreted snapshot writes) either grinds past 30 s or
+   wedges between the two worker pumps. Next: per-worker progress
+   tracing (worker pump loop counters, a trySend/receive counter) to
+   split throughput-too-slow from a worker-to-worker lost handoff.
 
 Then: the remaining named clusters (15× `exception`, 11× wall-cap, 7+6×
 mock-text asserts, 6× LabeledReturn on `movableContentParameters_*` —

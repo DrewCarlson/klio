@@ -3185,12 +3185,31 @@ fn resumePersistedOnTop(self: *VmIntrinsicHost, pe: PersistedParked.Entry, value
 pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
     if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} tid={d}\n", .{ slot, std.Thread.getCurrentId() });
     // A live cooperative driver on THIS thread still holding the slot?
-    // Enqueue there — its drive loop runs the activation.
+    // Enqueue there — its drive loop runs the activation. When the global
+    // registry names an owner, only THAT owner's pump may serve inline: a
+    // coroutine that parked on one pump, persisted, and re-parked on
+    // another leaves its old slot->token binding behind on the first, and
+    // the stale binding otherwise eats the resume while the re-parked
+    // waiter starves (observed: a worker's leftover binding claimed the
+    // runBlocking root's completion slot; the root, re-parked on the main
+    // pump, waited out runTest's whole 30s cap).
     {
+        const owner = lookupSlotOwner(slot);
+        defer if (owner) |w| {
+            var ww = w;
+            ww.deinit();
+        };
         var i: usize = coro_stack.items.len;
         while (i > 0) {
             i -= 1;
-            if (coro_stack.items[i].resumeSlotValue(slot, value) catch false) return;
+            const p = &coro_stack.items[i];
+            if (owner) |w| {
+                if (p.wakeup.cell != w.cell) continue;
+            }
+            if (p.resumeSlotValue(slot, value) catch false) {
+                if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} routed=inline-samethread\n", .{slot});
+                return;
+            }
         }
     }
     // Cross-thread: the slot is owned by a live driver on another OS
@@ -3257,6 +3276,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             }
             // No persisted state either: the waiter was abandoned with
             // its driver (a runBlocking exit) — nowhere to land.
+            if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} DROPPED mailbox-closed no-persist\n", .{slot});
             return;
         }
         // The coroutine parked inside a driven root that already
@@ -3277,7 +3297,10 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
             coroStackAllocator().free(pe.scope_delta);
             return;
         }
-        if (try SlotOwners.stashPendingIfUnowned(slot, value)) return;
+        if (try SlotOwners.stashPendingIfUnowned(slot, value)) {
+            if (pumpDiagEnabled()) std.debug.print("[PUMP] resumeExternal slot={d} stashed-unowned\n", .{slot});
+            return;
+        }
         // An owner registered between the miss and the stash; retry the
         // owner route.
     }
