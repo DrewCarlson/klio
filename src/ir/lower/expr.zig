@@ -8903,6 +8903,26 @@ fn staticCallReturnTypeRef(
                         .args = &.{},
                     };
                 }
+                // The bare receiver may be a TYPE PARAMETER (`C.drain`'s
+                // bare `iterator()` inside `C : MutableCollection<T>`):
+                // resolve against its full declared bound so instantiation
+                // carries the bound's type arguments — the same substitution
+                // the `.Member` arm applies. Head-only heads keep today's
+                // path.
+                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0")) {
+                    const cur_head = typeHead(std.mem.trimEnd(u8, bare_recv.name, "?"));
+                    const head_names_class = (if (std.mem.indexOfScalar(u8, cur_head, '.') != null)
+                        b.module.classIdByFqn(cur_head)
+                    else
+                        b.module.uniqueClassIdBySimpleName(cur_head)) != null;
+                    if (!head_names_class) {
+                        if (b.typeParamBoundRef(cur_head)) |bref| {
+                            bare_recv.deinit(b.allocator);
+                            bare_recv = try bref.clone(b.allocator);
+                            try stripUseSiteProjections(b.allocator, &bare_recv);
+                        }
+                    }
+                }
                 receiver = bare_recv;
                 var ident = std.mem.trimEnd(u8, bare_recv.name, "?");
                 if (std.mem.indexOfScalar(u8, ident, '<')) |lt| ident = ident[0..lt];

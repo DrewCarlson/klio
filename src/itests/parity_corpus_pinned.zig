@@ -1544,6 +1544,13 @@ test "tower_outer_receiver_extension" {
     );
 }
 
+test "bound_receiver_bare_iterator" {
+    try check("bound_receiver_bare_iterator",
+        \\3
+        \\
+    );
+}
+
 test "local_fn_default_beats_stdlib_sibling" {
     try check("local_fn_default_beats_stdlib_sibling",
         \\local 1.5 0.5 null

@@ -413,6 +413,19 @@ unless noted. Chronological.
   Next refinement: commit multi-candidate picks when the shapes prove
   the target applicable and refute every competitor.
 
+- **Bare receivers typed by a type-param bound substitute the FULL
+  bound ref** — the bare-call derivation arm mirrors the `.Member`
+  arm's third-slice rule: a receiver head naming no class resolves
+  through `typeParamBoundRef` (projections stripped), so `val iter =
+  iterator()` inside `C : MutableCollection<T>` derives
+  `MutableIterator<T>` and the downstream `hasNext()`/`next()` flip
+  CallMember → CallVirtual. Census ZERO on both fixed sets (their
+  iterator misses live in lambda/`with` bodies with no declared
+  receiver — the twice-measured head-only dead end's population), kept
+  under the wrong-answer precedent: the repro's dispatch forms improve
+  demonstrably. Pin `bound_receiver_bare_iterator`; `KLIO_TP_RECV=0`
+  disables with the member-arm slice.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):
