@@ -552,6 +552,29 @@ unless noted. Chronological.
 
 ## Measured dead ends and falsified theories — do not retry
 
+- **Unsigned representation unification, first arc landed**: the real
+  `unsigned/src/kotlin/U*{,Array}.kt` + `UnsignedCommon.kt` ship, with
+  execution host-repr end to end — `kotlin.U*` constructor intrinsics
+  reinterpret the signed payload as the host value (companion constants
+  and source-body `UInt(...)` wraps never build an interpreted
+  instance; the scalar types joined `isIntrinsicClass`), the
+  `UnsignedCommon` expect surface (uintDivide/uintCompare/…toString)
+  is implemented as host intrinsics, `data`/`storage` reads were
+  already host-served, and `ArrayList(<array>)` routes through its
+  ctor intrinsic instead of building a hollow expect-class shell (the
+  `first_is_array` guard now exempts collection ctors). All unsigned
+  scalar suites green. STANDING RED (immediate follow-up): 15
+  UnsignedArraysTest tests fail `unresolved global indices/lastIndex`
+  — a bare receiver-extension-property read inside an inline body
+  spliced into a lambda context executes as
+  `$sgetter$<TestClass>␟indices` against the LEXICAL owner instead of
+  the splice receiver (host getField serves indices/lastIndex on
+  arrays fine; the read never reaches the array). Evidence:
+  `KLIO_OR_AUDIT` shows `bare_name_fallthrough LoadFromThisOrGlobal`,
+  `[ltg-tail] raw=$sgetter$UnsignedArraysTest␟indices in_fn=<lambda>`,
+  `[splice] getOrElse entered` confirms the splice runs. Next probe:
+  dump the lambda fn to identify the emitting arm.
+
 - Shipping the unsigned value-class declarations (2026-08-02): adding
   `unsigned/src/kotlin/U{Byte,Short,Int,Long}{,Array}.kt` to the
   curated manifest creates the class rows the 168 `no_class_id`

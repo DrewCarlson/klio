@@ -154,6 +154,21 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "unsigned/src/kotlin/UIntRange.kt",
     "unsigned/src/kotlin/ULongRange.kt",
     "unsigned/src/kotlin/UMath.kt",
+    // The unsigned value-class declarations. Execution stays host-repr
+    // end to end: the `kotlin.U*` constructor intrinsics reinterpret the
+    // signed payload as the host value (so the companion constants and
+    // the source bodies' `UInt(...)` wraps never build an interpreted
+    // instance), and `data`/`storage` reads on host values are served by
+    // the host field path.
+    "unsigned/src/kotlin/UnsignedCommon.kt",
+    "unsigned/src/kotlin/UByte.kt",
+    "unsigned/src/kotlin/UShort.kt",
+    "unsigned/src/kotlin/UInt.kt",
+    "unsigned/src/kotlin/ULong.kt",
+    "unsigned/src/kotlin/UByteArray.kt",
+    "unsigned/src/kotlin/UShortArray.kt",
+    "unsigned/src/kotlin/UIntArray.kt",
+    "unsigned/src/kotlin/ULongArray.kt",
     "src/kotlin/util/KotlinVersion.kt",
     "src/kotlin/collections/PrimitiveIterators.kt",
     "src/kotlin/collections/Arrays.kt",

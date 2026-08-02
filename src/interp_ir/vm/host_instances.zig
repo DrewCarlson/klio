@@ -1357,7 +1357,13 @@ pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, arg
                 // constructor (an unsigned VIEW over the signed buffer),
                 // which the source value-class instance cannot represent.
                 const unsigned_wrap = std.mem.startsWith(u8, f, "kotlin.U") and std.mem.endsWith(u8, f, "Array");
-                const first_is_array = args.len > 0 and args[0] == .Array and !unsigned_wrap and !std.mem.eql(u8, f, "kotlin.String");
+                // A collection constructor takes a collection/array argument
+                // legitimately (`ArrayList(this)` in `toMutableList`); routing
+                // it past the intrinsic built a HOLLOW interpreted instance of
+                // the expect-class shell that serves no member at all.
+                const collection_ctor = std.mem.startsWith(u8, f, "kotlin.collections.");
+                const first_is_array = args.len > 0 and args[0] == .Array and
+                    !unsigned_wrap and !collection_ctor and !std.mem.eql(u8, f, "kotlin.String");
                 if (!first_is_array) {
                     if (lookupIntrinsic(self, f)) |intrinsic| {
                         return dispatchIntrinsic(self, f, intrinsic, args);
@@ -1718,7 +1724,9 @@ fn isIntrinsicClass(fqn: []const u8) bool {
         "kotlin.CharArray",                 "kotlin.UIntArray",
         "kotlin.ULongArray",                "kotlin.UShortArray",
         "kotlin.UByteArray",                "kotlin.Array",
-        "kotlin.String",
+        "kotlin.String",                    "kotlin.UByte",
+        "kotlin.UShort",                    "kotlin.UInt",
+        "kotlin.ULong",
     };
     for (names) |n| {
         if (std.mem.eql(u8, fqn, n)) return true;

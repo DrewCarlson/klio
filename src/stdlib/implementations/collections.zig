@@ -2709,6 +2709,21 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
                 },
                 .List => |l| return ok(try makeListVL(a, l.items, true)),
                 .Set => |s| return ok(try makeListVL(a, s.items, true)),
+                // An ARRAY collection argument: `ArrayList(this)` inside
+                // `toMutableList` receives the primitive/unsigned array
+                // value itself.
+                .Array => |arr| {
+                    var list: std.ArrayList(Value) = .empty;
+                    const n = arr.len();
+                    try list.ensureTotalCapacityPrecise(a, n);
+                    var i: usize = 0;
+                    while (i < n) : (i += 1) {
+                        const v = arr.get(i);
+                        v.retain();
+                        list.appendAssumeCapacity(v);
+                    }
+                    return ok(try makeListFromArrayList(a, list, true));
+                },
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,

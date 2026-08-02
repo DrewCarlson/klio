@@ -377,6 +377,196 @@ pub fn unsigned_to_byte(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     return ok(Value.newByte(@bitCast(v)));
 }
+
+/// The unsigned value-class constructors: `UInt(data)` reinterprets the
+/// signed counterpart as the HOST unsigned value, so the shipped upstream
+/// source bodies (`UInt(this.data.plus(other.data))`, the companion's
+/// `UInt(-1)` constants) produce the same representation literals and host
+/// operators do — never an interpreted instance.
+fn unsignedCtorArg(args: []const Value) ?i64 {
+    // A bare ctor call inside a member body routes through the member walk,
+    // which prepends the implicit receiver; the ctor itself takes one value.
+    const v = switch (args.len) {
+        1 => args[0],
+        2 => args[1],
+        else => return null,
+    };
+    return v.asI64();
+}
+
+/// The `UnsignedCommon.kt` expect surface: the shipped unsigned source
+/// bodies delegate their arithmetic/conversion/rendering cores to these
+/// (`div` is `uintDivide(this, other)`), and the actuals are wasm/js/jvm
+/// intrinsics upstream — here they are host intrinsics keyed by their
+/// top-level FQN.
+fn twoArgVals(args: []const Value) ?struct { i64, i64 } {
+    if (args.len != 2) return null;
+    const a = args[0].asI64() orelse return null;
+    const b = args[1].asI64() orelse return null;
+    return .{ a, b };
+}
+
+pub fn helper_uint_divide(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "uintDivide requires two integers" } };
+    const a: u32 = @truncate(@as(u64, @bitCast(ab[0])));
+    const b: u32 = @truncate(@as(u64, @bitCast(ab[1])));
+    if (b == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(.{ .UInt = a / b });
+}
+pub fn helper_uint_remainder(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "uintRemainder requires two integers" } };
+    const a: u32 = @truncate(@as(u64, @bitCast(ab[0])));
+    const b: u32 = @truncate(@as(u64, @bitCast(ab[1])));
+    if (b == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(.{ .UInt = a % b });
+}
+pub fn helper_ulong_divide(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "ulongDivide requires two integers" } };
+    const a: u64 = @bitCast(ab[0]);
+    const b: u64 = @bitCast(ab[1]);
+    if (b == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(.{ .ULong = a / b });
+}
+pub fn helper_ulong_remainder(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "ulongRemainder requires two integers" } };
+    const a: u64 = @bitCast(ab[0]);
+    const b: u64 = @bitCast(ab[1]);
+    if (b == 0) {
+        const e = try makeException(ctx.allocator, "kotlin.ArithmeticException", "/ by zero");
+        return .{ .err = .{ .Thrown = e } };
+    }
+    return ok(.{ .ULong = a % b });
+}
+pub fn helper_uint_compare(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "uintCompare requires two integers" } };
+    const a: u32 = @truncate(@as(u64, @bitCast(ab[0])));
+    const b: u32 = @truncate(@as(u64, @bitCast(ab[1])));
+    return ok(Value.newInt(if (a < b) -1 else if (a > b) @as(i32, 1) else 0));
+}
+pub fn helper_ulong_compare(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const ab = twoArgVals(ctx.args) orelse return .{ .err = .{ .Type = "ulongCompare requires two integers" } };
+    const a: u64 = @bitCast(ab[0]);
+    const b: u64 = @bitCast(ab[1]);
+    return ok(Value.newInt(if (a < b) -1 else if (a > b) @as(i32, 1) else 0));
+}
+pub fn helper_uint_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "uintToULong requires an integer" } };
+    return ok(.{ .ULong = @as(u32, @truncate(@as(u64, @bitCast(x)))) });
+}
+pub fn helper_uint_to_long(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "uintToLong requires an integer" } };
+    return ok(.{ .Long = @as(u32, @truncate(@as(u64, @bitCast(x)))) });
+}
+pub fn helper_uint_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "uintToFloat requires an integer" } };
+    return ok(.{ .Float = @floatFromInt(@as(u32, @truncate(@as(u64, @bitCast(x))))) });
+}
+pub fn helper_uint_to_double(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "uintToDouble requires an integer" } };
+    return ok(.{ .Double = @floatFromInt(@as(u32, @truncate(@as(u64, @bitCast(x))))) });
+}
+pub fn helper_ulong_to_float(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "ulongToFloat requires an integer" } };
+    return ok(.{ .Float = @floatFromInt(@as(u64, @bitCast(x))) });
+}
+pub fn helper_ulong_to_double(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asI64() else null;
+    const x = v orelse return .{ .err = .{ .Type = "ulongToDouble requires an integer" } };
+    return ok(.{ .Double = @floatFromInt(@as(u64, @bitCast(x))) });
+}
+fn clampedFloatToUnsigned(comptime U: type, f: f64) U {
+    if (std.math.isNan(f) or f <= 0) return 0;
+    const max: f64 = @floatFromInt(std.math.maxInt(U));
+    if (f >= max) return std.math.maxInt(U);
+    return @intFromFloat(f);
+}
+pub fn helper_float_to_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asF64() else null;
+    const f = v orelse return .{ .err = .{ .Type = "floatToUInt requires a number" } };
+    return ok(.{ .UInt = clampedFloatToUnsigned(u32, f) });
+}
+pub fn helper_double_to_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asF64() else null;
+    const f = v orelse return .{ .err = .{ .Type = "doubleToUInt requires a number" } };
+    return ok(.{ .UInt = clampedFloatToUnsigned(u32, f) });
+}
+pub fn helper_float_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asF64() else null;
+    const f = v orelse return .{ .err = .{ .Type = "floatToULong requires a number" } };
+    return ok(.{ .ULong = clampedFloatToUnsigned(u64, f) });
+}
+pub fn helper_double_to_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = if (ctx.args.len == 1) ctx.args[0].asF64() else null;
+    const f = v orelse return .{ .err = .{ .Type = "doubleToULong requires a number" } };
+    return ok(.{ .ULong = clampedFloatToUnsigned(u64, f) });
+}
+pub fn helper_uint_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 1 or ctx.args.len > 2)
+        return .{ .err = .{ .Type = "uintToString requires (value) or (value, base)" } };
+    const x = ctx.args[0].asI64() orelse return .{ .err = .{ .Type = "uintToString requires an integer" } };
+    const base: u32 = if (ctx.args.len == 2)
+        @intCast(ctx.args[1].asI64() orelse 10)
+    else
+        10;
+    const v: u32 = @truncate(@as(u64, @bitCast(x)));
+    if (base == 10) {
+        const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
+        return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+    }
+    const rendered = try uintToRadixString(ctx.allocator, v, base);
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, rendered) });
+}
+pub fn helper_ulong_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (ctx.args.len < 1 or ctx.args.len > 2)
+        return .{ .err = .{ .Type = "ulongToString requires (value) or (value, base)" } };
+    const x = ctx.args[0].asI64() orelse return .{ .err = .{ .Type = "ulongToString requires an integer" } };
+    const base: u32 = if (ctx.args.len == 2)
+        @intCast(ctx.args[1].asI64() orelse 10)
+    else
+        10;
+    const v: u64 = @bitCast(x);
+    if (base == 10) {
+        const s = try std.fmt.allocPrint(ctx.allocator, "{d}", .{v});
+        return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
+    }
+    const rendered = try uintToRadixString(ctx.allocator, v, base);
+    return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, rendered) });
+}
+
+pub fn ctor_ubyte(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = unsignedCtorArg(ctx.args) orelse
+        return .{ .err = .{ .Type = "UByte constructor requires an integer" } };
+    return ok(.{ .UByte = @truncate(@as(u64, @bitCast(v))) });
+}
+pub fn ctor_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = unsignedCtorArg(ctx.args) orelse
+        return .{ .err = .{ .Type = "UShort constructor requires an integer" } };
+    return ok(.{ .UShort = @truncate(@as(u64, @bitCast(v))) });
+}
+pub fn ctor_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = unsignedCtorArg(ctx.args) orelse
+        return .{ .err = .{ .Type = "UInt constructor requires an integer" } };
+    return ok(.{ .UInt = @truncate(@as(u64, @bitCast(v))) });
+}
+pub fn ctor_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {
+    const v = unsignedCtorArg(ctx.args) orelse
+        return .{ .err = .{ .Type = "ULong constructor requires an integer" } };
+    return ok(.{ .ULong = @bitCast(v) });
+}
 pub fn unsigned_to_double(ctx: *CallCtx) Allocator.Error!EvalResult {
     const v = switch (try recvUnsigned(ctx.allocator, ctx.args, "toDouble")) {
         .ok => |x| x,
