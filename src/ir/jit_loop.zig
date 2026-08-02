@@ -118,6 +118,12 @@ pub const TrampCtx = extern struct {
     slots: [*]i64,
     compiled: *const CompiledLoop,
     user: *anyopaque,
+    /// Runtime value-kind tag per `.i32` register (see `CompiledLoop.box_tags`).
+    /// Seeded from `box_tags` + the live entry values; a trampolined call's
+    /// result write refreshes its dst's tag, so an intrinsic member whose
+    /// return kind is unknowable statically (`toChar` on `Int`) still reboxes
+    /// with the kind it actually produced.
+    tags: [*]u8,
 };
 /// `fn(trampctx, call_site_index) -> 0 to continue native, else a resume code`.
 pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
@@ -238,6 +244,14 @@ pub const CompiledLoop = struct {
     n_regs: u32,
     n_slots: u32, // register slots + 2 per indexed array (ptr,len)
     reg_types: []RegType,
+    /// Value tag (`@intFromEnum(std.meta.Tag(Value))`) each `.i32` register
+    /// boxes back to. `.i32` covers `Int`/`Char`/`Short`/`Byte` in machine
+    /// terms, but a rebox must restore the ORIGINAL tag: `valueFromSlot(.i32)`
+    /// always minted `.Int`, so a `Char` crossing a trampoline or loop exit
+    /// re-emerged as an `Int` (a trampolined `append(c)` printed the char's
+    /// CODE as digits). Defaults to the `Int` tag; refined from resolved
+    /// callee return types and live samples.
+    box_tags: []u8,
     read_set: []bool, // reg is read somewhere in the loop (must unbox at entry)
     def_set: []bool, // reg is written somewhere in the loop (rebox at exit)
     arrays: []ArrayUnbox,
@@ -269,6 +283,7 @@ pub const CompiledLoop = struct {
     pub fn deinit(self: *CompiledLoop) void {
         self.exec.deinit();
         self.allocator.free(self.reg_types);
+        self.allocator.free(self.box_tags);
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
         self.allocator.free(self.arrays);
@@ -2595,6 +2610,65 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     defer if (!ok) a.free(types);
     if (debugEnabled()) std.debug.print("[jit]   types inferred for {s} b{d}\n", .{ func.name, header.int() });
 
+    // Original value kind each `.i32` register boxes back to (see `box_tags`).
+    // Live-in registers keep their sampled kind; an in-loop definition
+    // overrides it — `Int` unless the defining instruction names the kind (a
+    // resolved callee's declared `Char`/`Short`/`Byte` return, a `Const`).
+    const tags = a.alloc(u8, total_regs) catch return null;
+    var tags_ok = false;
+    defer if (!tags_ok) a.free(tags);
+    @memset(tags, INT_TAG);
+    {
+        const T = std.meta.Tag(Value);
+        for (regs[0..@min(regs.len, n_regs)], 0..) |v, i| {
+            switch (v) {
+                .Char => tags[i] = @intFromEnum(@as(T, .Char)),
+                .Short => tags[i] = @intFromEnum(@as(T, .Short)),
+                .Byte => tags[i] = @intFromEnum(@as(T, .Byte)),
+                else => {},
+            }
+        }
+        for (body) |bid| {
+            for (func.blocks[bid.int()].insts) |*inst| {
+                const def = instAnyDst(inst) orelse continue;
+                if (def.int() >= total_regs) continue;
+                var t: u8 = INT_TAG;
+                switch (inst.*) {
+                    .Move => |mv| {
+                        if (mv.src.int() < total_regs) t = tags[mv.src.int()];
+                    },
+                    .Const => |c2| {
+                        if (c2.value.int() < module.consts.items.len) {
+                            switch (module.consts.items[c2.value.int()]) {
+                                .Char => t = @intFromEnum(@as(T, .Char)),
+                                .Short => t = @intFromEnum(@as(T, .Short)),
+                                .Byte => t = @intFromEnum(@as(T, .Byte)),
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {
+                        if (trampolinableMemberOf(module, inst)) |mc| {
+                            if (mc.resolved) |fid| {
+                                if (module.funcById(fid)) |f2| {
+                                    const rn = f2.return_ty.name;
+                                    if (std.mem.eql(u8, rn, "Char")) {
+                                        t = @intFromEnum(@as(T, .Char));
+                                    } else if (std.mem.eql(u8, rn, "Short")) {
+                                        t = @intFromEnum(@as(T, .Short));
+                                    } else if (std.mem.eql(u8, rn, "Byte")) {
+                                        t = @intFromEnum(@as(T, .Byte));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+                tags[def.int()] = t;
+            }
+        }
+    }
+
     // A cell register's slot caches a scalar, so it must not be read or written
     // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
     // if any other instruction (or a branch cond) touches a cell register.
@@ -3173,6 +3247,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         return null;
     };
     ok = true;
+    tags_ok = true;
     return CompiledLoop{
         .exec = exec,
         // Inlined-callee registers extend the register space; the unbox/rebox
@@ -3180,6 +3255,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .n_regs = total_regs,
         .n_slots = n_slots,
         .reg_types = types,
+        .box_tags = tags,
         .read_set = sets.read,
         .def_set = sets.def,
         .arrays = arrays_owned,
@@ -3202,7 +3278,8 @@ pub const RunResult = union(enum) {
     bail,
 };
 
-pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?TrampFn, user: ?*anyopaque) RunResult {
+pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) RunResult {
+    @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
     var r: usize = 0;
     while (r < self.n_regs) : (r += 1) {
         slots[r] = 0;
@@ -3212,9 +3289,20 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         switch (self.reg_types[r]) {
             .i32 => switch (v) {
                 .Int => |x| slots[r] = x,
-                .Char => |x| slots[r] = x,
-                .Short => |x| slots[r] = x,
-                .Byte => |x| slots[r] = x,
+                .Char => |x| {
+                    slots[r] = x;
+                    // A live-in char read-only in the loop reboxes as itself;
+                    // a redefined register keeps its statically-derived kind.
+                    if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Char));
+                },
+                .Short => |x| {
+                    slots[r] = x;
+                    if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Short));
+                },
+                .Byte => |x| {
+                    slots[r] = x;
+                    if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Byte));
+                },
                 else => return .bail,
             },
             .i64 => switch (v) {
@@ -3310,7 +3398,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
             slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
             g.deinit();
         }
-        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.? };
+        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
         slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
     }
@@ -3325,7 +3413,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
         if (!self.def_set[r]) continue;
         if (r >= regs.len) continue;
         regs[r] = switch (self.reg_types[r]) {
-            .i32 => .{ .Int = @truncate(slots[r]) },
+            .i32 => valueFromSlotTagged(.i32, tags[r], slots[r]),
             .i64 => .{ .Long = slots[r] },
             .f64 => .{ .Double = @bitCast(slots[r]) },
             .f32 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(slots[r]))))) },
@@ -3340,13 +3428,16 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
     }
 
     // Write each cell's final cached scalar back through its box. The old inner
-    // value is a primitive of the same kind, so its release is a no-op.
+    // value is a primitive of the same kind, so its release is a no-op — and
+    // its TAG is the kind the writeback must restore (a captured `Char` var
+    // must not come back as an `Int`; cells are type-stable in Kotlin).
     for (self.cells) |cu| {
         if (cu.reg.int() >= regs.len) continue;
         const v = regs[cu.reg.int()];
         if (v != .Cell) continue;
         const g = v.Cell.borrowMut();
-        g.get().* = valueFromSlot(cu.rt, slots[cu.reg.int()]);
+        const prev_tag: u8 = @intFromEnum(std.meta.activeTag(g.get().*));
+        g.get().* = valueFromSlotTagged(cu.rt, prev_tag, slots[cu.reg.int()]);
         g.deinit();
     }
 
@@ -3354,7 +3445,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tramp: ?T
     // otherwise the scalar value is reboxed.
     for (self.nullables) |nu| {
         if (!nu.live_out or nu.reg.int() >= regs.len) continue;
-        regs[nu.reg.int()] = if (slots[nu.flag_slot] != 0) .Null else valueFromSlot(nu.rt, slots[nu.reg.int()]);
+        regs[nu.reg.int()] = if (slots[nu.flag_slot] != 0) .Null else valueFromSlotTagged(nu.rt, tags[nu.reg.int()], slots[nu.reg.int()]);
     }
     return .{ .resume_at = .{ .block = target, .inst = inst } };
 }
@@ -3399,6 +3490,24 @@ pub fn valueFromSlot(rt: RegType, s: i64) Value {
         .boolean => .{ .Bool = s != 0 },
         else => .Unit,
     };
+}
+
+/// The default box tag for `box_tags`: `.Int`.
+pub const INT_TAG: u8 = @intFromEnum(@as(std.meta.Tag(Value), .Int));
+
+/// As `valueFromSlot`, but an `.i32` slot boxes back to its register's
+/// ORIGINAL value kind (`Char`/`Short`/`Byte`) instead of always `.Int`.
+pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
+    if (rt == .i32) {
+        const T = std.meta.Tag(Value);
+        return switch (@as(T, @enumFromInt(tag))) {
+            .Char => .{ .Char = @truncate(@as(u64, @bitCast(s))) },
+            .Short => .{ .Short = @truncate(s) },
+            .Byte => .{ .Byte = @truncate(s) },
+            else => .{ .Int = @truncate(s) },
+        };
+    }
+    return valueFromSlot(rt, s);
 }
 
 // --- per-function JIT state + the interpreter hook --------------------------
@@ -3834,12 +3943,20 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
 
     const exec = jit.finalize(c.em.code()) catch return null;
     const sites_owned = call_sites.toOwnedSlice(a) catch return null;
+    // Function mode restricts returns/params to exact `Int`-boxing kinds (see
+    // `exact_ret`), so the default `Int` tag is correct for every register.
+    const fn_tags = a.alloc(u8, n_regs) catch {
+        a.free(sites_owned);
+        return null;
+    };
+    @memset(fn_tags, INT_TAG);
     ok = true;
     return CompiledLoop{
         .exec = exec,
         .n_regs = n_regs,
         .n_slots = n_slots,
         .reg_types = types,
+        .box_tags = fn_tags,
         .read_set = read,
         .def_set = def,
         .arrays = &.{},
@@ -3866,8 +3983,9 @@ pub const FuncOutcome = struct { code: Resume, value: Value };
 
 /// Run a compiled function body. Fills the param slots from `params` (deopting if
 /// a kind no longer matches), runs the native code, and returns its outcome.
-pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, slots: []i64, tramp: ?TrampFn, user: ?*anyopaque) ?FuncOutcome {
+pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) ?FuncOutcome {
     @memset(slots[0..self.n_slots], 0);
+    @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
     var i: u32 = 0;
     while (i < self.n_params) : (i += 1) {
         if (i >= params.len) return null;
@@ -3877,7 +3995,7 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     var tctx: TrampCtx = undefined;
     if (self.call_sites.len != 0) {
         if (tramp == null or user == null) return null;
-        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.? };
+        tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
         slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
     }
@@ -3937,7 +4055,16 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         heap_slots = metadata_allocator.alloc(i64, cl.n_slots) catch return null;
         break :blk heap_slots.?;
     };
-    return runFunc(cl, regs.items, params, slots, tramp, user);
+    var stack_tags: [128]u8 = undefined;
+    var heap_tags: ?[]u8 = null;
+    defer if (heap_tags) |ht| metadata_allocator.free(ht);
+    const rtags: []u8 = if (cl.n_regs <= stack_tags.len)
+        stack_tags[0..cl.n_regs]
+    else blk: {
+        heap_tags = metadata_allocator.alloc(u8, cl.n_regs) catch return null;
+        break :blk heap_tags.?;
+    };
+    return runFunc(cl, regs.items, params, slots, rtags, tramp, user);
 }
 
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
@@ -3989,7 +4116,16 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
         heap_slots = metadata_allocator.alloc(i64, cl.n_slots) catch return null;
         break :blk heap_slots.?;
     };
-    return switch (runLoop(cl, regs.items, slots, tramp, user)) {
+    var stack_tags: [128]u8 = undefined;
+    var heap_tags: ?[]u8 = null;
+    defer if (heap_tags) |ht| metadata_allocator.free(ht);
+    const rtags: []u8 = if (cl.n_regs <= stack_tags.len)
+        stack_tags[0..cl.n_regs]
+    else blk: {
+        heap_tags = metadata_allocator.alloc(u8, cl.n_regs) catch return null;
+        break :blk heap_tags.?;
+    };
+    return switch (runLoop(cl, regs.items, slots, rtags, tramp, user)) {
         .resume_at => |res| res,
         .bail => null,
     };

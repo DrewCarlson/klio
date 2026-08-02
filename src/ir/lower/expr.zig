@@ -10031,12 +10031,56 @@ fn resolveCtxFor(
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
         .owner_class = b.ownerClass(),
-        .receiver_scope_complete = receiverScopeComplete(b),
+        .receiver_scope_complete = receiverScopeKind(b) != .no,
+        .tower_scope = receiverScopeKind(b) == .tower,
+        .tower = b.implicit_receiver_tower.items,
     };
 }
 
-fn receiverScopeComplete(b: *FuncBuilder) bool {
-    if (b.capturesThisSlot() or b.isParamThunk()) return false;
+/// A lambda/thunk body's receiver scope is complete when its
+/// implicit-receiver TOWER enumerates every level and each entry's class is
+/// free of the outer-receiver escapes (enclosing-class instances, companion
+/// pairing) with a complete hierarchy shadow set — the same tests the
+/// plain-method owner path applies, per tower entry.
+fn towerScopeComplete(b: *FuncBuilder) bool {
+    const items = b.implicit_receiver_tower.items;
+    if (items.len == 0) return false;
+    for (items) |entry| {
+        var head = std.mem.trimEnd(u8, entry.head, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        const cid = (if (std.mem.indexOfScalar(u8, head, '.') != null)
+            b.module.classIdByFqn(head)
+        else
+            b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return false;
+        if (cid.int() >= b.module.classes.items.len) return false;
+        const lifted = b.module.classes.items[cid.int()].name;
+        const fqn = b.module.classes.items[cid.int()].fqn;
+        if (b.module.registry.enclosing_class.get(lifted) != null or
+            b.module.registry.enclosing_class.get(fqn) != null)
+        {
+            return false;
+        }
+        if (b.module.registry.companion_singletons.contains(lifted) or
+            b.module.registry.companion_singletons.contains(fqn))
+        {
+            return false;
+        }
+        if (ownerChainShadowContains(b, lifted, "") == null) return false;
+    }
+    return true;
+}
+
+const ScopeCompleteness = enum { no, plain, tower };
+
+fn receiverScopeKind(b: *FuncBuilder) ScopeCompleteness {
+    if (b.capturesThisSlot() or b.isParamThunk()) {
+        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_SCOPE") orelse "1", "0")) return .no;
+        return if (towerScopeComplete(b)) .tower else .no;
+    }
+    return if (receiverScopeCompletePlain(b)) .plain else .no;
+}
+
+fn receiverScopeCompletePlain(b: *FuncBuilder) bool {
     const recv = b.recvTypeRef();
     const owner = b.ownerClass();
     if (recv) |receiver| {
@@ -11853,6 +11897,89 @@ fn lowerImplicitThisCall(
             .exact = true,
         } });
         return dst;
+    }
+    // A member the receiver type PROVABLY declares wins over any same-named
+    // top-level in Kotlin's scope order, so a resolved target commits
+    // statically here — direct for final/private, a virtual slot otherwise.
+    // Only an UNPROVEN member keeps the OrGlobal fallback below (a
+    // non-callable property, an arity miss the runtime resolves to the
+    // global). `KLIO_ITC_MEMBER=0` disables for single-binary A/B.
+    const itc_gate = runtime.getenvSlice("KLIO_ITC_MEMBER") orelse "1";
+    const itc_on = blk: {
+        if (std.mem.eql(u8, itc_gate, "0")) break :blk false;
+        if (std.mem.eql(u8, itc_gate, "1")) break :blk true;
+        var it = std.mem.splitScalar(u8, itc_gate, ',');
+        while (it.next()) |n| {
+            if (std.mem.eql(u8, n, name0)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (itc_on) attempt: {
+        const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse break :attempt;
+        // A same-named FUNCTION-TYPED property on the receiver is an
+        // invoke-convention peer the member resolver cannot rank (it ranks
+        // functions only): `class C(val f: (A) -> T) { fun f(vararg s: A) =
+        // f(s) }` binds the PROPERTY's invoke in Kotlin when the member's
+        // vararg refuses the array. Leave such calls to the runtime walk.
+        if (b.module.registry.class_prop_type_heads.get(.{ .a = typeHead(head_name), .b = name0 })) |ph| {
+            if (std.mem.startsWith(u8, ph, "Function")) break :attempt;
+        }
+        {
+            const guard_cid = if (std.mem.indexOfScalar(u8, head_name, '.') != null)
+                b.module.classIdByFqn(head_name)
+            else
+                b.module.classIdIndexed(typeHead(head_name), b.self_package, segments[0].span.file) orelse
+                    b.module.classId(typeHead(head_name));
+            if (guard_cid) |gc| {
+                if (gc.int() < b.module.classes.items.len) {
+                    for (b.module.classes.items[gc.int()].primary_params) |pp| {
+                        if (std.mem.eql(u8, pp.name, name0) and
+                            std.mem.startsWith(u8, typeHead(pp.ty.name), "Function"))
+                        {
+                            break :attempt;
+                        }
+                    }
+                }
+            }
+        }
+        var owned_head_ty: ?TypeRef = null;
+        defer if (owned_head_ty) |*t| t.deinit(b.allocator);
+        const recv_ty = blk: {
+            if (b.recvTypeRef()) |declared| {
+                if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
+            }
+            const head_fqn = blk2: {
+                if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk2 head_name;
+                const cid = b.module.classIdIndexed(head_name, b.self_package, segments[0].span.file) orelse
+                    b.module.classId(head_name) orelse break :attempt;
+                if (cid.int() >= b.module.classes.items.len) break :attempt;
+                break :blk2 b.module.classes.items[cid.int()].fqn;
+            };
+            owned_head_ty = TypeRef{
+                .name = try b.allocator.dupe(u8, head_fqn),
+                .nullable = false,
+                .args = &.{},
+            };
+            break :blk owned_head_ty.?;
+        };
+        var this_path = [_]ast.Ident{.{ .name = "this", .span = segments[0].span }};
+        const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = segments[0].span } };
+        switch (try lowerResolvedMemberCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+            .{ .reg = this_reg, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                orEmitAudit(b, "implicit_this_call_member_bound", "Call/implicit-member", name0);
+                return reg;
+            },
+            .deferred, .none => {},
+        }
     }
     b.pending_arg_broad_masks = itc_broad;
     var member_arity: ?[]i16 = null;
@@ -15832,35 +15959,35 @@ test "receiver scope completeness requires a complete static receiver tower" {
     var owner_builder = try FuncBuilder.init(testing.allocator, &m);
     defer owner_builder.deinit();
     owner_builder.setOwnerClass("Owner");
-    try testing.expect(receiverScopeComplete(&owner_builder));
+    try testing.expect(receiverScopeCompletePlain(&owner_builder));
 
     m.registry.hierarchy_shadow_names.getPtr("Owner").?.complete = false;
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     m.registry.hierarchy_shadow_names.getPtr("Owner").?.complete = true;
 
     try m.registry.enclosing_class.put("Owner", "Outer");
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     _ = m.registry.enclosing_class.remove("Owner");
 
     try m.registry.companion_singletons.put("Owner", "Owner$Companion");
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     _ = m.registry.companion_singletons.remove("Owner");
 
     var extension_builder = try FuncBuilder.init(testing.allocator, &m);
     defer extension_builder.deinit();
     extension_builder.setRecvTy("String");
-    try testing.expect(!receiverScopeComplete(&extension_builder));
+    try testing.expect(!receiverScopeCompletePlain(&extension_builder));
     const string_names = std.StringHashMap(void).init(testing.allocator);
     try m.registry.hierarchy_shadow_names.put("String", .{
         .names = string_names,
         .complete = true,
     });
-    try testing.expect(receiverScopeComplete(&extension_builder));
+    try testing.expect(receiverScopeCompletePlain(&extension_builder));
     m.registry.hierarchy_shadow_names.getPtr("String").?.complete = false;
-    try testing.expect(!receiverScopeComplete(&extension_builder));
+    try testing.expect(!receiverScopeCompletePlain(&extension_builder));
     m.registry.hierarchy_shadow_names.getPtr("String").?.complete = true;
     extension_builder.setOwnerClass("Owner");
-    try testing.expect(receiverScopeComplete(&extension_builder));
+    try testing.expect(receiverScopeCompletePlain(&extension_builder));
 }
 
 test "bare enclosing property lowers with its outer getter owner" {

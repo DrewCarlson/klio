@@ -35,6 +35,20 @@ fn monotonicNanos() i128 {
 }
 
 /// Block the calling thread for `millis` milliseconds.
+/// Event-wait one idle slice on the pump's own wakeup gate instead of a
+/// blind sleep: a cross-thread `postResume` rings the gate, so the pump
+/// reacts within microseconds while keeping the same worst-case cadence.
+/// The epoch is read BEFORE the emptiness check so a post landing between
+/// the two returns the wait immediately.
+fn gateWaitBrief(wakeup: *const ObjRef(DriverWakeup), cap_us: u64) void {
+    const w = wakeup.borrowMut();
+    const gp = &w.get().gate;
+    const seen = gp.epochNow();
+    const nonempty = w.get().mailboxNonEmpty();
+    w.deinit();
+    if (!nonempty) gp.waitFrom(seen, cap_us);
+}
+
 fn sleepMillis(millis: u64) void {
     runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
@@ -2358,7 +2372,7 @@ fn pumpLoop(
         }
         if (pending > 0) {
             countSleep(.wakeup_pending);
-            sleepMillis(1);
+            gateWaitBrief(&wakeup, 1_000);
             _ = try drainWakeupInto(a, &wakeup, coroTop().?);
             continue;
         }
@@ -2427,7 +2441,7 @@ fn pumpLoop(
                 }
             }
             countSleep(.root_parked);
-            sleepMillis(1);
+            gateWaitBrief(&wakeup, 1_000);
             continue;
         }
 
@@ -3101,6 +3115,23 @@ fn resumeInlineOnce(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output
 /// with the resumed coroutine still queued and never run it.
 threadlocal var kotlin_resume_delivery: bool = false;
 
+/// Whether a cross-thread Kotlin `resumeWith` post WAITS (bounded) for the
+/// owner pump to run the routed step before the caller continues. Upstream's
+/// dispatched resume is fire-and-forget — the dispatcher queue orders it, the
+/// caller never observes the body synchronously — and the wait serializes the
+/// worker pool against the owner's interpreted stretches (~170 ms per post in
+/// the SnapshotStateList concurrency tests, most of their runtime).
+/// `KLIO_SYNC_RESUME=1` restores the wait for A/B.
+var sync_resume_checked: bool = false;
+var sync_resume_on: bool = false;
+fn syncResumeDelivery() bool {
+    if (!sync_resume_checked) {
+        sync_resume_checked = true;
+        sync_resume_on = std.mem.eql(u8, runtime.getenvSlice("KLIO_SYNC_RESUME") orelse "0", "1");
+    }
+    return sync_resume_on;
+}
+
 pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
     // KLIO_RESUME_TRACE: name the RESUMER — the route prints below show the
     // frames a delivery re-runs, but a double-delivery diagnosis needs to know
@@ -3238,7 +3269,7 @@ pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, 
                 // drive turns past the post so the routed step has actually
                 // run. Timeout falls back to the fire-and-forget behavior.
                 if (pumpDiagEnabled()) std.debug.print("[sync] post slot={d} krd={} t0={d}\n", .{ slot, kotlin_resume_delivery, turns0 });
-                if (kotlin_resume_delivery) {
+                if (kotlin_resume_delivery and syncResumeDelivery()) {
                     // Adaptive: the owner pump normally turns within
                     // microseconds, so spin/yield first and only then
                     // park in 100µs slices — the fixed 1ms cadence put a

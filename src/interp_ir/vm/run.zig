@@ -639,6 +639,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 for (blk.insts) |inst| {
                     switch (inst) {
                         .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
+                        .Call => |c| std.debug.print("[dumpfn]   Call func=#{d} n_args={d} exact={}\n", .{ c.func.int(), c.n_args, c.exact }),
                         else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
                     }
                 }
