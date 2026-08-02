@@ -3599,3 +3599,22 @@ arg name matching KLIO_VALTY_TRACE) — that shows whether the builder
 stores the type and resolveMemberCall receives it, isolating the strip
 between builder and candidate loop (the only remaining segment).
 select stays red; all seven landed pieces hold their gates.
+
+
+Shape probe conclusive: `[valty] SHAPE onCancellation ty=<null>
+in=trySelectInternal` — exactly one shape build stores null, in our
+function, while five sibling functions store Function3. Combined with
+the enter-prints: in the KEPT pass, `val onCancellation` ENTERS
+lowerPropertyDecl (and pass B records Function3), but `val clause =
+findClause(x) ?: continue` never enters it in that pass — the
+elvis-JUMP initializer lowers through a separate statement arm that
+records no decl type, so the chain in the kept pass starts untyped and
+the tryResume shape stays null. Ctor-property seeding was added to the
+Member-arm forward-ref fallback (landed, gates hold). THE FIX NOW HAS
+ONE NAMED HOME: find the elvis-jump val-lowering arm (it is NOT
+lowerPropertyDecl's switch — search for the branch that lowers
+`Property` with a Binary/Elvis init whose rhs is a jump, likely in the
+block/statement lowering that splits control flow) and record the
+decl type there exactly as lowerPropertyDecl's `.Binary` arm now does.
+All reader channels, the derivation registry, the substitution, and
+the refutation are proven; this recording is the last dead link.

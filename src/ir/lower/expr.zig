@@ -9079,6 +9079,17 @@ fn staticCallReturnTypeRef(
                             defer nb.deinit();
                             nb.setOwnerClass(head);
                             nb.setRecvTy(head);
+                            // The owner's ctor properties are the body's
+                            // lexical bindings (`onCancellationConstructor`
+                            // inside ClauseData's members).
+                            if (b.module.uniqueClassIdBySimpleName(head)) |ocid| {
+                                if (ocid.int() < b.module.classes.items.len) {
+                                    for (b.module.classes.items[ocid.int()].primary_params) |*pp| {
+                                        try nb.setLocalDeclTypeOwned(pp.name, try pp.ty.clone(b.allocator));
+                                        if (pp.ty.nullable) try nb.setLocalDeclNullable(pp.name);
+                                    }
+                                }
+                            }
                             for (fa.params) |*ap| {
                                 try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
                                 if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
@@ -9288,6 +9299,11 @@ fn buildStaticArgShapes(
     const shapes = try buildArgShapes(b, args, arg_names);
     for (args, shapes) |*arg, *shape| {
         shape.ty = argDeclTypeRefLazy(b, arg);
+        if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+            if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+                std.debug.print("[valty] SHAPE {s} ty={s} in={s}\n", .{ w, if (shape.ty) |t| t.name else "<null>", build.currentRealFn() orelse "-" });
+            }
+        }
         shape.ty_authoritative = shape.ty != null;
     }
     return shapes;
