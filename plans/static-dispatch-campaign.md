@@ -538,6 +538,18 @@ unless noted. Chronological.
   pin: `toSortedMap { cmp }` (comparator lambda) and
   `toSortedMap(compareBy { ... })` both unimplemented.
 
+- **Top-level property declared types flow to bare-receiver reads**
+  (`top_level_prop_type_heads`, keyed by FQN; baked through the image's
+  `TopPropImage` rows, format 37): `asserter.assertEquals(...)` had no
+  channel at all for the top-level `val asserter: Asserter`'s declared
+  type — the bare-read walk covered locals, captures, and enclosing
+  members only. `topLevelPropTypeHead` picks the best-tier declaration
+  under the same scoping walk a bare call ranks by, and types nothing
+  on a same-tier cross-package head disagreement. Census:
+  no_receiver_type 1,772→1,714, most converting to statically bound
+  extension calls (total 8,230→8,174; 71.9% bound). Pin
+  `toplevel_prop_bare_receiver`.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Shipping the unsigned value-class declarations (2026-08-02): adding

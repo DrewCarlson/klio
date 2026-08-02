@@ -8391,6 +8391,35 @@ pub const Module = struct {
         return best_tier;
     }
 
+    /// The declared type head of the top-level property a bare read of
+    /// `name` resolves to under Kotlin scoping — the best-tier declaration,
+    /// and only when every declaration AT that tier agrees on the head (a
+    /// cross-package name clash types nothing).
+    pub fn topLevelPropTypeHead(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?[]const u8 {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var head: ?[]const u8 = null;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t == 255) continue;
+            const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
+            if (t < best_tier) {
+                best_tier = t;
+                head = h;
+            } else if (t == best_tier) {
+                const cur = head orelse return null;
+                const new = h orelse return null;
+                if (!std.mem.eql(u8, cur, new)) return null;
+            }
+        }
+        return head;
+    }
+
     /// Resolve a top-level callable extension property at an explicit
     /// receiver call site. A member function has already been ruled out by
     /// the caller; this query applies receiver, arity, visibility, and normal
@@ -9136,6 +9165,10 @@ pub const ModuleRegistry = struct {
     /// ranks the read's tier the same way it ranks a bare call: a read
     /// whose only declaration is in an unimported package is unresolved.
     top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
+    /// Top-level property FQN -> declared type head, so a bare read used as
+    /// a RECEIVER (`asserter.assertEquals(...)`) types statically. Only
+    /// annotated declarations record; the head is the annotation as written.
+    top_level_prop_type_heads: std.StringHashMap([]const u8),
     /// Top-level extension properties whose values are directly callable.
     /// Registered before body lowering so `receiver.property(args)` can be
     /// classified as a property read followed by `invoke`.
@@ -9243,6 +9276,7 @@ pub const ModuleRegistry = struct {
             .mangled_nested = std.StringHashMap([]const u8).init(allocator),
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
+            .top_level_prop_type_heads = std.StringHashMap([]const u8).init(allocator),
             .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
@@ -9358,6 +9392,7 @@ pub const ModuleRegistry = struct {
             while (it.next()) |list| list.deinit(a);
             self.top_level_prop_pkgs.deinit();
         }
+        self.top_level_prop_type_heads.deinit();
         {
             var it = self.callable_extension_props.valueIterator();
             while (it.next()) |list| list.deinit(a);
@@ -9524,6 +9559,10 @@ pub const ModuleRegistry = struct {
                 try list.appendSlice(a, e.value_ptr.items);
                 try out.top_level_prop_pkgs.put(e.key_ptr.*, list);
             }
+        }
+        {
+            var it = self.top_level_prop_type_heads.iterator();
+            while (it.next()) |e| try out.top_level_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.callable_extension_props.iterator();

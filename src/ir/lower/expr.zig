@@ -8218,6 +8218,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and b.module.classId(nm) != null) {
         return .{ .name = nm, .nullable = false, .args = &.{} };
     }
+    // A bare read of a TOP-LEVEL property carries its declared type head
+    // (`asserter.assertEquals(...)` resolves against `Asserter`): the same
+    // scoping walk a bare call ranks by picks the declaration.
+    if (b.resolve(nm) == null and !b.knowsOuter(nm) and !enclosingHasMemberNamed(b, nm)) {
+        const file = p.segments[0].span.file;
+        const pkg = b.module.packageOfFile(file) orelse b.self_package;
+        if (b.module.topLevelPropTypeHead(nm, pkg, file)) |head| {
+            return .{ .name = head, .nullable = false, .args = &.{} };
+        }
+    }
     return null;
 }
 

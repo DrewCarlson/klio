@@ -1014,6 +1014,13 @@ fn notePropScope(
         if (std.mem.eql(u8, existing.fqn, fqn)) return;
     }
     try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
+    // The declared type head, so a bare read used as a receiver types
+    // statically (`asserter.assertEquals(...)`).
+    if (p.ty) |*ty| {
+        if (ty.function == null and ty.name.name.len != 0) {
+            try module.registry.top_level_prop_type_heads.put(fqn, ty.name.name);
+        }
+    }
     // A `const val` with a literal initializer records its value so the
     // lowering can inline the constant at reference sites, exactly as
     // kotlinc does.
@@ -2204,6 +2211,9 @@ fn buildModuleWithOverrides(
                         if (std.mem.eql(u8, existing.fqn, tp.fqn)) dup = true;
                     }
                     if (!dup) try gop.value_ptr.append(a, .{ .fqn = tp.fqn, .package = tp.package });
+                    if (tp.type_head.len != 0) {
+                        try module.registry.top_level_prop_type_heads.put(tp.fqn, tp.type_head);
+                    }
                 }
             } else {
                 for (bs.lifted_decls) |*d| {
@@ -4541,7 +4551,7 @@ pub const StdlibBase = struct {
     /// One class simple name -> its base-class forest ref.
     pub const ClassRef = struct { k: []const u8, v: runtime.forest.ForestRef };
     /// One base top-level property's scope identity.
-    pub const TopProp = struct { name: []const u8, fqn: []const u8, package: []const u8 };
+    pub const TopProp = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The

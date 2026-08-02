@@ -1577,6 +1577,15 @@ test "ext_body_bare_iterator_star" {
     );
 }
 
+test "toplevel_prop_bare_receiver" {
+    try check("toplevel_prop_bare_receiver",
+        \\hello, klio
+        \\42
+        \\hello, again
+        \\
+    );
+}
+
 test "splice_bounded_type_param_receiver" {
     try check("splice_bounded_type_param_receiver",
         \\[a, b, c]

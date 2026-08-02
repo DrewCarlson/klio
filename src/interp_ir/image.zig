@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 36;
+pub const FORMAT_VERSION: u32 = 37;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -963,7 +963,7 @@ fn funcRefsAst(func: *const ir.Func) bool {
 const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
 const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 const ClassRefImage = struct { k: []const u8, v: runtime.forest.ForestRef };
-const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []const u8 };
+const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -1153,7 +1153,12 @@ pub fn bake(
         var it = mg.get().registry.top_level_prop_pkgs.iterator();
         while (it.next()) |e| {
             for (e.value_ptr.items) |pd| {
-                try list.append(a, .{ .name = e.key_ptr.*, .fqn = pd.fqn, .package = pd.package });
+                try list.append(a, .{
+                    .name = e.key_ptr.*,
+                    .fqn = pd.fqn,
+                    .package = pd.package,
+                    .type_head = mg.get().registry.top_level_prop_type_heads.get(pd.fqn) orelse "",
+                });
             }
         }
         root.top_props = try list.toOwnedSlice(a);
@@ -2004,7 +2009,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
         .top_props = blk: {
             const out = try a.alloc(StdlibBase.TopProp, root.top_props.len);
             for (root.top_props, 0..) |entry, i| {
-                out[i] = .{ .name = entry.name, .fqn = entry.fqn, .package = entry.package };
+                out[i] = .{ .name = entry.name, .fqn = entry.fqn, .package = entry.package, .type_head = entry.type_head };
             }
             break :blk out;
         },
