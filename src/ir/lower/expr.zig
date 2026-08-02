@@ -1865,6 +1865,17 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0)) {
+                std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s}\n", .{
+                    name0,
+                    b.resolve("this") != null,
+                    b.spliceRecvTy() orelse "-",
+                    b.lambda_splice_resolve != null,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (b.resolve("this")) |this_reg| {
             // A bare name resolving to a known top-level fn is a
             // value-position function reference; skip the GetField shortcut.
@@ -8217,6 +8228,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     const nm = p.segments[0].name;
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and b.module.classId(nm) != null) {
         return .{ .name = nm, .nullable = false, .args = &.{} };
+    }
+    // A bare read of a TOP-LEVEL property carries its declared type head
+    // (`asserter.assertEquals(...)` resolves against `Asserter`): the same
+    // scoping walk a bare call ranks by picks the declaration.
+    if (b.resolve(nm) == null and !b.knowsOuter(nm) and !enclosingHasMemberNamed(b, nm)) {
+        const file = p.segments[0].span.file;
+        const pkg = b.module.packageOfFile(file) orelse b.self_package;
+        if (b.module.topLevelPropTypeHead(nm, pkg, file)) |head| {
+            return .{ .name = head, .nullable = false, .args = &.{} };
+        }
     }
     return null;
 }

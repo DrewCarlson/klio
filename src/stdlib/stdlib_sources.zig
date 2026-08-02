@@ -154,6 +154,21 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "unsigned/src/kotlin/UIntRange.kt",
     "unsigned/src/kotlin/ULongRange.kt",
     "unsigned/src/kotlin/UMath.kt",
+    // The unsigned value-class declarations. Execution stays host-repr
+    // end to end: the `kotlin.U*` constructor intrinsics reinterpret the
+    // signed payload as the host value (so the companion constants and
+    // the source bodies' `UInt(...)` wraps never build an interpreted
+    // instance), and `data`/`storage` reads on host values are served by
+    // the host field path.
+    "unsigned/src/kotlin/UnsignedCommon.kt",
+    "unsigned/src/kotlin/UByte.kt",
+    "unsigned/src/kotlin/UShort.kt",
+    "unsigned/src/kotlin/UInt.kt",
+    "unsigned/src/kotlin/ULong.kt",
+    "unsigned/src/kotlin/UByteArray.kt",
+    "unsigned/src/kotlin/UShortArray.kt",
+    "unsigned/src/kotlin/UIntArray.kt",
+    "unsigned/src/kotlin/ULongArray.kt",
     "src/kotlin/util/KotlinVersion.kt",
     "src/kotlin/collections/PrimitiveIterators.kt",
     "src/kotlin/collections/Arrays.kt",
@@ -162,13 +177,12 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
     // kotlin.concurrent.atomics: the common `expect`s carry the size+init
-    // factories and the increment/update extension family; the wasm `actual`s
-    // carry the cell/array-backing class shapes. RMW methods are made atomic by
-    // host bindings (see implementations/atomics.zig).
+    // factories; the klio-authored `actual`s (KLIO_STDLIB_ACTUAL_FILES) carry
+    // the cell/array-backing class shapes with thread-correct CAS-loop inline
+    // extensions. Non-inline RMW methods are made atomic by host bindings
+    // (see implementations/atomics.zig).
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
-    "wasm/src/kotlin/concurrent/atomics/Atomics.wasm.kt",
     "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
-    "wasm/src/kotlin/concurrent/atomics/AtomicArrays.wasm.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",
     "common/src/kotlin/ioH.kt",
@@ -227,6 +241,8 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-io/encoding/Base64Actuals.kt",
     "kotlin-internal/SerializationActuals.kt",
     "kotlin-internal/ConcurrentActuals.kt",
+    "kotlin-concurrent/AtomicsActuals.kt",
+    "kotlin-concurrent/AtomicArraysActuals.kt",
     "kotlin-util/LazyActuals.kt",
     "kotlin-random/RandomActuals.kt",
     "kotlin-text/TextActuals.kt",

@@ -3064,7 +3064,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .GetField => |x| std.debug.print(" field={s} recv=r{d} dst=r{d}", .{ constStr(module, x.field) orelse "?", x.receiver.int(), x.dst.int() }),
                 .LoadFromThisOrGlobal => |x| std.debug.print(" name={s} func={?}", .{ constStr(module, x.name) orelse "?", if (x.func) |f| f.int() else null }),
                 .CallMemberOrGlobal => |x| std.debug.print(" name={s} recv={?d} this_idx={d} dst=r{d}", .{ constStr(module, x.name) orelse "?", if (x.recv) |r| r.int() else null, x.this_idx, x.dst.int() }),
-                .CallMember => |x| std.debug.print(" name={s} recv=r{d}", .{ constStr(module, x.name) orelse "?", x.receiver.int() }),
+                .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
                 else => {},
@@ -7423,7 +7423,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {
-                            std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
+                            std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}#{d}\n", .{
                                 bare_name,
                                 name_str,
                                 if (lt.func) |f| f.int() else null,
@@ -7432,6 +7432,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                                 if (frame.cur_span) |sp| sp.file.int() else 0,
                                 if (frame.cur_span) |sp| sp.start else 0,
                                 frame.func.name,
+                                frame.func.id.int(),
                             });
                         }
                     }

@@ -1594,6 +1594,9 @@ pub fn tryInlineCallWithTypeArgs(
         }
     };
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
+    if (inline_state.runtime.getenvSlice("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
+    }
     if (explicit_receiver) |receiver| {
         try b.bind("this", receiver);
         // `this@<fn>` inside the spliced body (including an anon object's
