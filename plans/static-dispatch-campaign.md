@@ -564,14 +564,28 @@ unless noted. Chronological.
   `Function{N}` family (no class row backs the head; positional
   arg-binding now proceeds), and the enrichment plumbing. Census with
   the gate ON: stdlib no_receiver_type 1,524→1,403, 80.0% bound.
-  GATED OFF because ArraysTest.shuffle broke: with the channel on,
-  XorWowRandom's on-demand lowering emitted its bare `require(...)`
-  as a FIELD READ (`[getfield-miss] name=require`) and a `UInt
-  constructor requires an integer` surfaced from `checkInvariants` —
-  a scratch-derivation side effect on the enclosing lowering context
-  not yet isolated (`FuncBuilder.init/deinit` global-state suspects:
-  currentRealFn / pending channels). Isolate that, then flip ON for
-  the −121 sites.
+  GATED OFF; the failure is now fully characterized and is NOT a
+  lowering-context corruption: the lowered `checkInvariants` body is
+  BYTE-IDENTICAL in passing and failing processes (CallMember `or` ×4
+  + CallMemberOrGlobal `require`). The break is RUNTIME DISPATCH
+  ORDER: reproduce with the batch-shaped child (`--only-file` for
+  BOTH ArraysTest and UnsignedArraysTest, `--filter=ArraysTest`
+  substring-matches both, all dir siblings + the three cross-dir
+  providers) — the unsigned tests execute FIRST, their on-demand
+  lowerings (with the gate on) shift what registers before
+  `XorWowRandom` lowers, and the dynamic `or` dispatch on an Int
+  receiver then runs `UInt.or`'s interpreted body (`UInt(this.data or
+  other.data)` → the ctor intrinsic rejects the garbage `data` read).
+  A single-test run of the same file set passes — the trigger is the
+  unsigned TESTS executing beforehand. An owner-chain guard on the
+  total-miss member tail (committed — correct hardening regardless)
+  did NOT fix it, so the accepting path is one of the earlier dispatch
+  tails (the extension fallback / lenient rank accepting a UInt-owned
+  member for an Int receiver under the shifted candidate order). Next:
+  trace WHICH tail serves that `or` (`KLIO_MISS_TRACE=or` +
+  `KLIO_NU_TRACE=or` on the repro), fix its receiver filter, flip the
+  gate for the −121 sites. The pinned repro command lives in this
+  entry's history.
 
 ## Measured dead ends and falsified theories — do not retry
 

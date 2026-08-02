@@ -9466,6 +9466,14 @@ fn enrichLambdaArgShapes(
         const stmts = lam.body.stmts;
         if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) continue;
         const tail = &stmts[stmts.len - 1].Expr;
+        // Only self-contained tail kinds derive: a Call tail re-enters the
+        // resolution machinery, and doing that from a scratch builder while
+        // a class's methods are mid-lowering corrupted the enclosing
+        // context (XorWowRandom's `require` emission).
+        switch (tail.*) {
+            .Path, .Binary, .StringTemplate, .IntLit, .FloatLit, .BoolLit, .CharLit => {},
+            else => continue,
+        }
         const value_params = pty.args.len - 1;
         var nb = try FuncBuilder.init(b.allocator, b.module);
         defer nb.deinit();
