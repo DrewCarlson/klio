@@ -42,18 +42,18 @@ Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
     stdlib:   total 8,139 member sites
-              549   6.75%  bound_static
+              575   7.06%  bound_static
             4,733  58.15%  bound_virtual     (64.9% bound; 2.34% at campaign start)
             1,872  23.00%  no_receiver_type
-              565   6.94%  resolver_declined
+              539   6.62%  resolver_declined
               300   3.69%  no_class_id
               120   1.47%  nullable_or_generic
 
     examples: total 87,715
-            4,324   4.93%  bound_static
+            4,377   4.99%  bound_static
            58,361  66.53%  bound_virtual     (71.5% bound; 37.4% at start)
            15,475  17.64%  no_receiver_type
-            4,461   5.09%  resolver_declined
+            4,408   5.03%  resolver_declined
             3,816   4.35%  no_class_id
             1,278   1.46%  nullable_or_generic
 
@@ -425,6 +425,17 @@ unless noted. Chronological.
   under the wrong-answer precedent: the repro's dispatch forms improve
   demonstrably. Pin `bound_receiver_bare_iterator`; `KLIO_TP_RECV=0`
   disables with the member-arm slice.
+
+- **Final stub/value members bind DIRECT** — `dispatchForTarget`
+  answered `.virtual` unconditionally for stub/value owners, which is
+  exactly the emission a vtable-less host shell cannot run; a FINAL
+  method on a closed stub/value class now answers `.direct` (the fid
+  call runs the Kotlin body or its resolved-native form regardless of
+  the host representation), and the deferral site accepts a direct
+  answer for blocked-class receivers — with the extension-shadow
+  question now computed for them too (String and the unsigned shells
+  carry extension families everywhere). stdlib bound_static 549→575,
+  resolver_declined 565→539; examples 4,324→4,377 / 4,461→4,408.
 
 ## Measured dead ends and falsified theories — do not retry
 

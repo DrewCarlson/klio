@@ -4360,7 +4360,17 @@ pub const Module = struct {
         if (!ds.has_body) return .virtual;
         if (ds.visibility == .Private) return .direct;
         const f = self.funcById(target) orelse return null;
-        if (class.is_stub or class.is_value) return .virtual;
+        if (class.is_stub or class.is_value) {
+            // A host-backed shell has no vtable to index, so `.virtual` for
+            // one is exactly the emission that cannot run. A FINAL method on
+            // a closed stub/value class needs no slot: the direct fid call
+            // runs the Kotlin body — or its resolved-native form — whatever
+            // the receiver's host representation.
+            if (!class.is_interface and !class.is_open and !class.is_abstract and methodIsFinal(f)) {
+                return .direct;
+            }
+            return .virtual;
+        }
         const declaring_class = if (ds.enclosing_class) |decl_owner|
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else

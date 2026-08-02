@@ -13392,8 +13392,11 @@ fn lowerResolvedMemberCall(
         (static_owner.int() >= b.module.classes.items.len or
             b.module.classes.items[static_owner.int()].is_stub or
             b.module.classes.items[static_owner.int()].is_value);
+    // Computed for stub/value receivers too: their direct-dispatch escape
+    // below still requires the extension-shadow question answered — String
+    // and the unsigned shells carry extension families everywhere.
     const promo_ext_why: ir.Module.ExtCouldApplyWhy =
-        if (resolved.dispatch == .deferred and resolved.target != null and !promo_blocked_by_class)
+        if (resolved.dispatch == .deferred and resolved.target != null)
             b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
         else
             .none;
@@ -13414,15 +13417,18 @@ fn lowerResolvedMemberCall(
             .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
         }
     }
-    if (!promo_blocked_by_class and promo_ext_why == .none and
+    if (promo_ext_why == .none and
         resolved.dispatch == .deferred and resolved.target != null)
     {
         // Ask the resolver's own direct-vs-virtual rule rather than assuming
         // virtual: a final or private method has no vtable slot, and a virtual
         // emission for one fails at runtime even when the receiver's class is
-        // exactly the declaring class.
+        // exactly the declaring class. A stub/value receiver (no vtable at
+        // all) still takes a DIRECT answer — a final method on a closed
+        // host-backed class binds by fid; only a virtual answer stays
+        // deferred for it.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
-            resolved.dispatch = d;
+            if (!promo_blocked_by_class or d == .direct) resolved.dispatch = d;
         }
     }
     if (resolved.dispatch == .deferred) {
