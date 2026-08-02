@@ -550,6 +550,29 @@ unless noted. Chronological.
   extension calls (total 8,230→8,174; 71.9% bound). Pin
   `toplevel_prop_bare_receiver`.
 
+- **Lambda-return inference for the RETURN channel** (built, gated
+  `KLIO_LAMBDA_RET`, currently default OFF): when a resolved call's
+  declared parameter is `Function{N}` with a bare type-param return
+  and concrete value-param types, an unannotated lambda literal's
+  single-block tail derives in a scratch builder under those param
+  types, the shape gains the full function type, and `bindCallType`
+  binds the callee's `T` from it — `List(3) { it * 2 }` types
+  `List<Int>`. Three sub-fixes landed en route, ACTIVE regardless of
+  the gate: primitive binary arithmetic result typing
+  (`primitiveBinResultHead`, Kotlin numeric promotion + `String +`),
+  same-head structural binding in `bindCallType` for the synthetic
+  `Function{N}` family (no class row backs the head; positional
+  arg-binding now proceeds), and the enrichment plumbing. Census with
+  the gate ON: stdlib no_receiver_type 1,524→1,403, 80.0% bound.
+  GATED OFF because ArraysTest.shuffle broke: with the channel on,
+  XorWowRandom's on-demand lowering emitted its bare `require(...)`
+  as a FIELD READ (`[getfield-miss] name=require`) and a `UInt
+  constructor requires an integer` surfaced from `checkInvariants` —
+  a scratch-derivation side effect on the enclosing lowering context
+  not yet isolated (`FuncBuilder.init/deinit` global-state suspects:
+  currentRealFn / pending channels). Isolate that, then flip ON for
+  the −121 sites.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Invoke-convention return typing for enclosing fn-typed ctor

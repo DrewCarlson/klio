@@ -8695,7 +8695,15 @@ fn staticCallReturnTypeRef(
             inferred_receiver = try staticCallReturnTypeRef(b, bin.lhs);
             break :blk inferred_receiver orelse return null;
         };
-        if (isPrimitiveTypeName(typeHead(receiver.name))) return null;
+        if (isPrimitiveTypeName(typeHead(receiver.name))) {
+            // A primitive operand's arithmetic RESULT type is table-driven —
+            // no operator resolution needed. `it * 2` in a `List(3) { … }`
+            // init lambda must derive `Int` for the lambda-return channel.
+            if (primitiveBinResultHead(b, typeHead(std.mem.trimEnd(u8, receiver.name, "?")), bin)) |head| {
+                return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+            }
+            return null;
+        }
 
         const args = bin.rhs[0..1];
         var shape_set = try buildStaticReturnArgShapes(b, args, &.{});
@@ -9230,6 +9238,7 @@ fn staticCallReturnTypeRef(
         else => return null,
     }
 
+    try enrichLambdaArgShapes(b, target, call.args, &shape_set);
     const explicit = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
     defer {
         for (explicit) |*ty| ty.deinit(b.allocator);
@@ -9253,6 +9262,12 @@ fn staticCallReturnTypeRef(
         shape_set.shapes,
         explicit,
     );
+    if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null and call.callee.* == .Path) {
+        std.debug.print("[lamret-inst] callee={s} inferred={s}\n", .{
+            call.callee.Path.segments[0].name,
+            if (inferred) |t| t.name else "<null>",
+        });
+    }
     // Declaration order must not decide whether a caller's local types:
     // when the target is an un-annotated EXPRESSION body whose own decl
     // pass has not run yet (its return still the Unit placeholder),
@@ -9345,6 +9360,165 @@ const StaticReturnArgShapes = struct {
 /// Unlike the eager type-head channel, every inferred entry here comes from a
 /// unique declaration identity and can therefore participate in exact
 /// overload selection.
+/// Enrich a resolved call's argument shapes with LAMBDA RETURN types: when
+/// the target's declared parameter is a `Function{N}` whose return names a
+/// bare type parameter and whose value-parameter types are all concrete, an
+/// unannotated lambda literal's single-block tail is derived in a scratch
+/// builder under those parameter types, and the shape gains the full
+/// instantiated function type — `bindCallType` then binds the callee's `T`
+/// from it (`List(3) { it * 2 }` yields `List<Int>`). Evidence for the
+/// RETURN channel only; never a dispatch commitment.
+/// The result-type head of a primitive-operand binary arithmetic op, by
+/// Kotlin's numeric promotion (Byte/Short promote to Int; the wider of the
+/// two otherwise; unsigned only same-kind; `String + x` is String). Null
+/// where the table does not decide (Char arithmetic, mixed unsigned).
+fn primitiveBinResultHead(b: *FuncBuilder, lhs_head: []const u8, bin: anytype) ?[]const u8 {
+    switch (bin.op) {
+        .Add, .Sub, .Mul, .Div, .Rem => {},
+        else => return null,
+    }
+    if (std.mem.eql(u8, lhs_head, "String"))
+        return if (bin.op == .Add) "String" else null;
+    const rhs_head = binOperandHead(b, bin.rhs) orelse return null;
+    return numericPromoteHead(lhs_head, rhs_head);
+}
+
+fn binOperandHead(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
+    switch (e.*) {
+        .IntLit => |il| return switch (il.kind) {
+            .Long => "Long",
+            .UInt => "UInt",
+            .ULong => "ULong",
+            else => "Int",
+        },
+        .FloatLit => |fl| return switch (fl.kind) {
+            .Float => "Float",
+            .Double => "Double",
+        },
+        else => {},
+    }
+    if (argDeclTypeRefLazy(b, e)) |ty| return typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+    return null;
+}
+
+fn numericRank(head: []const u8) ?u8 {
+    if (std.mem.eql(u8, head, "Byte") or std.mem.eql(u8, head, "Short") or
+        std.mem.eql(u8, head, "Int")) return 2;
+    if (std.mem.eql(u8, head, "Long")) return 3;
+    if (std.mem.eql(u8, head, "Float")) return 4;
+    if (std.mem.eql(u8, head, "Double")) return 5;
+    return null;
+}
+
+fn numericPromoteHead(a: []const u8, c: []const u8) ?[]const u8 {
+    const unsigned_a = a.len > 1 and a[0] == 'U' and numericRank(a[1..]) != null;
+    const unsigned_c = c.len > 1 and c[0] == 'U' and numericRank(c[1..]) != null;
+    if (unsigned_a or unsigned_c) {
+        return if (std.mem.eql(u8, a, c)) a else null;
+    }
+    const ra = numericRank(a) orelse return null;
+    const rc = numericRank(c) orelse return null;
+    const r = @max(ra, rc);
+    return switch (r) {
+        2 => "Int",
+        3 => "Long",
+        4 => "Float",
+        else => "Double",
+    };
+}
+
+fn enrichLambdaArgShapes(
+    b: *FuncBuilder,
+    target: FuncId,
+    args: []const Expr,
+    shape_set: *StaticReturnArgShapes,
+) Allocator.Error!void {
+    if (od_depth >= 3) return;
+    // Default OFF: with the channel on, XorWowRandom's on-demand
+    // lowering emitted its bare `require(...)` as a FIELD READ and a UInt
+    // constructor call surfaced in checkInvariants — a side effect of the
+    // scratch derivation not yet isolated. Opt in with =1; the toy chain
+    // (`List(3) { it * 2 }` typing `List<Int>`) works end to end.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "0", "1")) return;
+    const tf = b.module.funcById(target) orelse return;
+    const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
+    const first = @intFromBool(has_this);
+    for (args, 0..) |*arg, i| {
+        if (arg.* != .Lambda) continue;
+        if (shape_set.shapes[i].ty != null or shape_set.inferred[i] != null) continue;
+        const pi = first + i;
+        if (pi >= tf.params.len) break;
+        const pty = tf.params[pi].ty;
+        if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len == 0) continue;
+        const ret = pty.args[pty.args.len - 1];
+        // Only a bare type-parameter return needs the body, and only
+        // concrete value-parameter types can seed it.
+        if (staticTypeClassId(b, ret) != null) continue;
+        var params_concrete = true;
+        for (pty.args[0 .. pty.args.len - 1]) |pa| {
+            if (staticTypeClassId(b, pa) == null) {
+                params_concrete = false;
+                break;
+            }
+        }
+        if (!params_concrete) continue;
+        const lam = arg.Lambda;
+        const stmts = lam.body.stmts;
+        if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) continue;
+        const tail = &stmts[stmts.len - 1].Expr;
+        const value_params = pty.args.len - 1;
+        var nb = try FuncBuilder.init(b.allocator, b.module);
+        defer nb.deinit();
+        if (lam.params.len == 0 and value_params == 1) {
+            try nb.setLocalDeclTypeOwned("it", try pty.args[0].clone(b.allocator));
+        } else {
+            const n = @min(lam.params.len, value_params);
+            for (lam.params[0..n], pty.args[0..n]) |p, pa| {
+                try nb.setLocalDeclTypeOwned(p.name, try pa.clone(b.allocator));
+            }
+        }
+        od_depth += 1;
+        const derived = staticExprTypeRef(&nb, tail) catch null;
+        od_depth -= 1;
+        if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null) {
+            std.debug.print("[lamret] target={s} arg#{d} pty={s} tail={s} p0={s} derived={s}\n", .{
+                tf.name, i, pty.name,
+                @tagName(std.meta.activeTag(tail.*)),
+                pty.args[0].name,
+                if (derived) |d| d.name else "<null>",
+            });
+        }
+        var body_ty = derived orelse continue;
+        const fn_args = b.allocator.alloc(ir.TypeRef, pty.args.len) catch {
+            body_ty.deinit(b.allocator);
+            return error.OutOfMemory;
+        };
+        var ok_args = true;
+        var filled: usize = 0;
+        for (pty.args[0 .. pty.args.len - 1], 0..) |pa, k| {
+            fn_args[k] = pa.clone(b.allocator) catch {
+                ok_args = false;
+                break;
+            };
+            filled += 1;
+        }
+        if (!ok_args) {
+            for (fn_args[0..filled]) |*t| t.deinit(b.allocator);
+            b.allocator.free(fn_args);
+            body_ty.deinit(b.allocator);
+            return error.OutOfMemory;
+        }
+        fn_args[pty.args.len - 1] = body_ty;
+        const fn_name = b.allocator.dupe(u8, pty.name) catch {
+            for (fn_args) |*t| t.deinit(b.allocator);
+            b.allocator.free(fn_args);
+            return error.OutOfMemory;
+        };
+        shape_set.inferred[i] = .{ .name = fn_name, .nullable = false, .args = fn_args };
+        shape_set.shapes[i].ty = shape_set.inferred[i].?;
+    }
+}
+
 fn buildStaticReturnArgShapes(
     b: *FuncBuilder,
     args: []const Expr,

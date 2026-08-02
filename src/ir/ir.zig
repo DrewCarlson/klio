@@ -4643,12 +4643,19 @@ pub const Module = struct {
         if (pattern_args.len == 0) return true;
         var projected_actual = actual;
         if (!self.staticTypesShareClassifier(pattern, actual)) {
-            const pattern_id = self.staticTypeClassId(pattern) orelse return false;
-            projected_actual = (try self.projectTypeToClass(
-                allocator,
-                actual,
-                pattern_id,
-            )) orelse return false;
+            // Same-head types with no class row behind the head (the
+            // synthetic `Function{N}` family) bind structurally by
+            // position: `Function1<Int, T>` against `Function1<Int, Int>`
+            // binds `T` even though no classifier backs `Function1`.
+            const same_head = std.mem.eql(u8, pattern_head, staticTypeHead(actual.name));
+            if (!same_head or self.staticTypeClassId(pattern) != null) {
+                const pattern_id = self.staticTypeClassId(pattern) orelse return false;
+                projected_actual = (try self.projectTypeToClass(
+                    allocator,
+                    actual,
+                    pattern_id,
+                )) orelse return false;
+            }
         }
         if (projected_actual.nullable and !pattern.nullable) return false;
         const actual_args = overrideArgs(projected_actual);
