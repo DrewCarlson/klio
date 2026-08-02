@@ -5902,6 +5902,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 args,
                 ast_arg_names,
             ));
+            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} decls={d} inapplicable={} plain={} mangled_cell={} mangled_outer={} splice_win={}\n", .{
+                    bare,
+                    decls.len,
+                    local_fn_inapplicable,
+                    b.resolve(bare) != null,
+                    if (decls.len > 0) b.resolve(decls[0].mangled) != null else false,
+                    if (decls.len > 0) b.knowsOuter(decls[0].mangled) else false,
+                    b.lambda_splice_resolve != null,
+                });
             // A LONE local fn reached from a NESTED body (its own body, or
             // a local fn declared inside it): the mangled overload cell
             // binds BEFORE the body lowers exactly so nested calls can
@@ -8892,6 +8902,26 @@ fn staticCallReturnTypeRef(
                         .nullable = false,
                         .args = &.{},
                     };
+                }
+                // The bare receiver may be a TYPE PARAMETER (`C.drain`'s
+                // bare `iterator()` inside `C : MutableCollection<T>`):
+                // resolve against its full declared bound so instantiation
+                // carries the bound's type arguments — the same substitution
+                // the `.Member` arm applies. Head-only heads keep today's
+                // path.
+                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0")) {
+                    const cur_head = typeHead(std.mem.trimEnd(u8, bare_recv.name, "?"));
+                    const head_names_class = (if (std.mem.indexOfScalar(u8, cur_head, '.') != null)
+                        b.module.classIdByFqn(cur_head)
+                    else
+                        b.module.uniqueClassIdBySimpleName(cur_head)) != null;
+                    if (!head_names_class) {
+                        if (b.typeParamBoundRef(cur_head)) |bref| {
+                            bare_recv.deinit(b.allocator);
+                            bare_recv = try bref.clone(b.allocator);
+                            try stripUseSiteProjections(b.allocator, &bare_recv);
+                        }
+                    }
                 }
                 receiver = bare_recv;
                 var ident = std.mem.trimEnd(u8, bare_recv.name, "?");
@@ -13362,8 +13392,11 @@ fn lowerResolvedMemberCall(
         (static_owner.int() >= b.module.classes.items.len or
             b.module.classes.items[static_owner.int()].is_stub or
             b.module.classes.items[static_owner.int()].is_value);
+    // Computed for stub/value receivers too: their direct-dispatch escape
+    // below still requires the extension-shadow question answered — String
+    // and the unsigned shells carry extension families everywhere.
     const promo_ext_why: ir.Module.ExtCouldApplyWhy =
-        if (resolved.dispatch == .deferred and resolved.target != null and !promo_blocked_by_class)
+        if (resolved.dispatch == .deferred and resolved.target != null)
             b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
         else
             .none;
@@ -13384,15 +13417,18 @@ fn lowerResolvedMemberCall(
             .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
         }
     }
-    if (!promo_blocked_by_class and promo_ext_why == .none and
+    if (promo_ext_why == .none and
         resolved.dispatch == .deferred and resolved.target != null)
     {
         // Ask the resolver's own direct-vs-virtual rule rather than assuming
         // virtual: a final or private method has no vtable slot, and a virtual
         // emission for one fails at runtime even when the receiver's class is
-        // exactly the declaring class.
+        // exactly the declaring class. A stub/value receiver (no vtable at
+        // all) still takes a DIRECT answer — a final method on a closed
+        // host-backed class binds by fid; only a virtual answer stays
+        // deferred for it.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
-            resolved.dispatch = d;
+            if (!promo_blocked_by_class or d == .direct) resolved.dispatch = d;
         }
     }
     if (resolved.dispatch == .deferred) {
@@ -13428,7 +13464,14 @@ fn lowerResolvedMemberCall(
         // receiver's own class (honouring a user subtype's override) and
         // falls back to the member's name only for a host-backed value, which
         // is what the site did unconditionally before.
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0)
+        // `KLIO_VOWN=1` emits the virtual slot for stub/value owners (the
+        // comment above argues the runtime handles both representations).
+        // Measured NOT wholesale-safe: UuidTest's throwing validators
+        // returned their IllegalArgumentException as a VALUE under it —
+        // held OFF until that family is root-caused.
+        const vown_hold = (owner.is_value or owner.is_stub) and
+            !std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "0", "1");
+        if (vown_hold or ast_type_args.len != 0)
         {
             declineNote(if (owner.is_value)
                 .virtual_owner_value

@@ -640,6 +640,15 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                     switch (inst) {
                         .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
                         .Call => |c| std.debug.print("[dumpfn]   Call func=#{d} n_args={d} exact={}\n", .{ c.func.int(), c.n_args, c.exact }),
+                        .MakeCell => |mc| std.debug.print("[dumpfn]   MakeCell dst=r{d}\n", .{mc.dst.int()}),
+                        .CellSet => |cs| std.debug.print("[dumpfn]   CellSet cell=r{d} value=r{d}\n", .{ cs.cell.int(), cs.value.int() }),
+                        .CellGet => |cg2| std.debug.print("[dumpfn]   CellGet dst=r{d} cell=r{d}\n", .{ cg2.dst.int(), cg2.cell.int() }),
+                        .LoadCapture => |lc| std.debug.print("[dumpfn]   LoadCapture dst=r{d} idx={d}\n", .{ lc.dst.int(), lc.idx }),
+                        .AstLambda => |al| {
+                            std.debug.print("[dumpfn]   AstLambda dst=r{d} body=#{?d} caps=", .{ al.dst.int(), if (al.body_func) |bf| bf.int() else null });
+                            for (al.captures) |cr| std.debug.print("r{d} ", .{cr.int()});
+                            std.debug.print("\n", .{});
+                        },
                         else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
                     }
                 }
