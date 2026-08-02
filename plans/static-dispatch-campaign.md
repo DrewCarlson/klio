@@ -415,6 +415,18 @@ unless noted. Chronological.
 
 ## Measured dead ends and falsified theories — do not retry
 
+- Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):
+  a `memberPromotionProven` (member `.compatible` + every chain-related
+  extension `.incompatible`, all-args-authoritative gate, mirroring the
+  tower proof) was built, wired at the deferral, and measured ZERO on
+  both fixed sets AND on a synthetic member/ext literal pair — the
+  synthetic was already bound by the existing literal-disproof channel,
+  and the real blocked pairs carry no authoritative arguments (the
+  plan's standing `[extlit]` evidence). Reverted. The 185 ext_* pairs
+  wait on the generic-argument project; re-derive the helper from this
+  entry when argument authority exists.
+
+
 - Boolean operator results; cast (`.As`) initializers; the `storage`
   splice hint (UByteArray has no IR class — host-symbol category);
   type-aware `extCouldApply` literal disproof (`[extlit]` zero
