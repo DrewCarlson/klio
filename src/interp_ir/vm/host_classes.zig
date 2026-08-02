@@ -663,10 +663,11 @@ fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?Ob
     return best;
 }
 
-/// Lower each member function of `class` into a per-method side module and
-/// register it in `anon_methods` under both the arity-qualified and bare
-/// keys, with `capture_pairs` bound. `own_members` scopes bare-name
-/// resolution inside the bodies.
+/// Lower each member function of `class` into the class's shared side
+/// module (an image clone — see `anonSiteModule`) and register it in
+/// `anon_methods` under both the arity-qualified and bare keys, with
+/// `capture_pairs` bound. `own_members` scopes bare-name resolution inside
+/// the bodies.
 fn lowerAndRegisterMethods(
     self: *VmHost,
     allocator: Allocator,
@@ -674,11 +675,13 @@ fn lowerAndRegisterMethods(
     own_members: *const StringSet,
     capture_pairs: []const NameValue,
 ) Allocator.Error!void {
+    var site_mod: ?ObjRef(Module) = null;
+    defer if (site_mod) |m| m.deinit();
     for (class.members) |*m| {
         switch (m.*) {
             .Function => |*f| {
                 if (f.body == null) continue;
-                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
                 const fid = func.id;
                 const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -699,7 +702,7 @@ fn lowerAndRegisterMethods(
                     // accessor dispatch exactly like a module class's.
                     const gbody = try rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
                     const thunk = host_instances.synthThunk(p.name, gbody, getter.return_type, p.is_override);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -715,7 +718,7 @@ fn lowerAndRegisterMethods(
                     const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
                     const sbody = try rewriteAccessorFieldRefs(allocator, setter.body, p.name.name);
                     const thunk = try host_instances.synthSetterThunk(allocator, p.name, vp, sbody, p.is_override);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -751,7 +754,7 @@ fn lowerAndRegisterMethods(
                         };
                     }
                     thunk.params = tparams;
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -782,7 +785,7 @@ fn lowerAndRegisterMethods(
                         };
                     }
                     thunk.params = tparams;
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -805,7 +808,7 @@ fn lowerAndRegisterMethods(
             .span = blk.span,
         };
         const thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
-        const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+        const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
         const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
         const caps = try allocator.dupe(NameValue, capture_pairs);
         const tbl = self.anon_methods.borrowMut();
@@ -833,6 +836,8 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     // Local classes declared inside fn bodies arrive here at runtime.
     // Synthesise the same ClassDef shape build_module produces and stash
     // it in the Vm's class table.
+    var site_mod: ?ObjRef(Module) = null;
+    defer if (site_mod) |m| m.deinit();
     const def = try synthLocalClassDef(self, allocator, class);
     {
         const g = self.classes.borrowMut();
@@ -870,7 +875,7 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
                 };
             }
             thunk.params = tparams;
-            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
             const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, &own_members);
             const tbl = self.anon_methods.borrowMut();
             defer tbl.deinit();

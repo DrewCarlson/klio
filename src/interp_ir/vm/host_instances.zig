@@ -3770,7 +3770,7 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
 /// section serves ids below the append range). `Module.default` (the old
 /// empty side module) left every call in every anon body name-dynamic.
 /// `KLIO_ANON_BASE=0` restores the empty side module.
-fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
+pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
     if (cache.*) |m| return m.clone();
     if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_BASE") orelse "1", "0")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
