@@ -7423,7 +7423,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {
-                            std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}\n", .{
+                            std.debug.print("[ltg-tail] name={s} raw={s} func={?} class={?} shadow={} span={d}:{d} in_fn={s}#{d}\n", .{
                                 bare_name,
                                 name_str,
                                 if (lt.func) |f| f.int() else null,
@@ -7432,6 +7432,7 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                                 if (frame.cur_span) |sp| sp.file.int() else 0,
                                 if (frame.cur_span) |sp| sp.start else 0,
                                 frame.func.name,
+                                frame.func.id.int(),
                             });
                         }
                     }

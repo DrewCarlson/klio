@@ -572,8 +572,21 @@ unless noted. Chronological.
   arrays fine; the read never reaches the array). Evidence:
   `KLIO_OR_AUDIT` shows `bare_name_fallthrough LoadFromThisOrGlobal`,
   `[ltg-tail] raw=$sgetter$UnsignedArraysTest␟indices in_fn=<lambda>`,
-  `[splice] getOrElse entered` confirms the splice runs. Next probe:
-  dump the lambda fn to identify the emitting arm.
+  `[splice] getOrElse entered` confirms the splice runs. Narrowed
+  further: the emitting arm is the bare-read FALLTHROUGH at the ltg
+  emission (`this` resolves, but `is_known_global` is true — the
+  `indices` getters populate the bare-call index — and
+  `splice_receiver_first` is false because `spliceRecvTy()` is UNSET
+  in the failing context, even though the splice sets it
+  unconditionally for receiver-typed fns and `[splice] recv=true
+  ext=true` confirms the bind path ran). The `[bare-read-pre]` probe
+  (KLIO_BARE_TRACE) shows NO row for the failing lambda context —
+  the read lowers through a path where the splice channels are
+  absent; candidate: the lambda body's SECOND lowering (eager pass or
+  the deferred AstLambda body_func lowering) re-lowers the spliced
+  content without the splice state. Next: trace which lowering pass
+  produced fn `<lambda>#7092`'s instructions (KLIO_LFN_TRACE / add a
+  pass tag to dump-fn).
 
 - Shipping the unsigned value-class declarations (2026-08-02): adding
   `unsigned/src/kotlin/U{Byte,Short,Int,Long}{,Array}.kt` to the

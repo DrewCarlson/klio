@@ -1865,6 +1865,17 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
+        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0)) {
+                std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s}\n", .{
+                    name0,
+                    b.resolve("this") != null,
+                    b.spliceRecvTy() orelse "-",
+                    b.lambda_splice_resolve != null,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (b.resolve("this")) |this_reg| {
             // A bare name resolving to a known top-level fn is a
             // value-position function reference; skip the GetField shortcut.
