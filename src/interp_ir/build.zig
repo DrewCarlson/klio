@@ -1946,6 +1946,17 @@ fn buildModuleWithOverrides(
                         if (fm.Function.return_type) |*rt| break :blk rt;
                         break :blk null;
                     }
+                    // A FUNCTION-TYPED ctor property invoked as the
+                    // initializer: `val data = createFrom(...)` beside
+                    // `class C<T>(val createFrom: (...) -> T)` is the
+                    // function type's declared return — with the class's
+                    // own parameter substituted by its bound below, the
+                    // same rule an annotated `T` property already gets.
+                    for (c.primary_params) |*pp| {
+                        if (!std.mem.eql(u8, pp.name.name, fname)) continue;
+                        if (pp.ty.function) |ft| break :blk &ft.ret;
+                        break :blk null;
+                    }
                     break :blk null;
                 };
                 if (ty_opt) |ty| {
