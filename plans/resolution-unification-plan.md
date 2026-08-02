@@ -75,35 +75,42 @@ target is 1210 (verified 2026-07-19 at 1252 on an earlier baseline).
 
 ## Continuation entry point — the active queue
 
-The two bugs before the 1210 ratchet, in fix order:
+The two bugs before the 1210 ratchet, re-verified 2026-08-02:
 
-1. **Pause/resume receiver clobber** — repro:
+1. **Pause/resume receiver clobber — RESOLVED by intervening work.**
    `scripts/compose-test.sh PausableCompositionTests.canRecordAComposition`
-   (bounded ~96 s). The walk defense (72faad4d) advanced it past
-   `unresolved global next` into the hang; the open question is whether the
-   CallMemberOrGlobal recv register holds the stale ComposableLambdaImpl
-   (rebuild clobber) or the `view` frame's receiver PARAM itself is the
-   lambda (wrong-receiver call) — the frame-params dump prints the tag but
-   not the class; extend it with the instance class name first, then trace
-   accordingly. Diagnosis so far: in `MockViewValidator.view`'s bare
-   `next()`, the frame's receiver facts are intact
-   (`has_receiver_param=true`, `implicitThisValue=Instance`) yet the
-   candidate list is `[ComposableLambdaImpl]` alone — the `direct_this`
-   path: the lowered `recv` register (from `b.resolve("this")`) holds the
-   stale lambda and `sameReceiver`-dedups/REPLACES the frame receiver. Fix
-   order: (1) trace the register snapshot/rebuild for the paused `view`
-   frame (`snapshotRegisters` dense/sparse forms and `resumeContinuation`'s
-   restore); (2) make `implicitCandidatesAlloc` refuse a `direct_this` that
-   dedups against a SUBJECT entry while the frame's own receiver param
-   differs — prefer the param; (3) the enclosing-subject push/pop pairing
-   audit across pause/resume. Related: the static-dispatch campaign's tower
-   emission commit (`KLIO_TOWER_EMIT`) removes runtime-walk consumers of
-   exactly this failure family — every bare call statically committed is
-   one fewer site the clobber can reach.
-2. **Lost-wakeup hang** — repro: same test (it now parks at the wall cap),
-   or `SnapshotStateMapTests.concurrentMixingWriteApply_set`. The main
-   thread polls an interpreted wait whose wakeup never fires;
-   `KLIO_PUMP_DIAG` park/resume traces around the last park are the tool.
+   PASSES (113 ms; no hang, no `unresolved global next`). The full class
+   runs 23/25; both residuals are explained:
+   `markInvalidFromBackgroundThread` fails only under the script's 10 s
+   default coroutine timeout and PASSES with
+   `kotlinx_coroutines_test_default_timeout=60s` (it needs ~15 s); and
+   `resumeOnBackgroundThread` (rob, ~47 s of real compute) still fails at
+   ~76 s even with 60 s — throughput-shaped, the flat-eval workstream's
+   case, plus whatever its `exception` tail shows under a longer cap. The
+   diagnostic gap the old entry named is closed anyway: the `[frame-params]`
+   dump and the `[fn-entry]` arg dump now print an Instance's concrete
+   class name, not just the tag.
+2. **Lost-wakeup hang — STILL LIVE, now bounded and narrowed.** Repro:
+   `SnapshotStateMapTests.concurrentMixingWriteApply_set` — no longer a
+   forever-hang: runTest's 30 s cap fires and it fails with
+   `UncompletedCoroutinesError` in ~33 s. `KLIO_PUMP_DIAG` trace
+   (scratchpad `cmwa_pump.log`): the stall parks four tokens forever
+   (the test body's `coroutineScope` at SnapshotStateMapTests.kt:535, the
+   scheduler's `receiveDispatchEvent`, `JobSupport.join`, and the
+   runBlocking root), `ready=0`. The narrowing: a worker posts
+   `[PUMP] resumeExternal slot=281474976710681 tid=…` and NO
+   `drain slot=… routed=true` follows — the pump then sits 605 idle
+   rounds until the wall deadline. Every successful external resume in the
+   same log shows the `resumeExternal → [sync] post → drain routed=true`
+   sequence. So the lost wakeup is an external (cross-thread) resume that
+   never routes to a ready token — most likely a race between the worker's
+   resume post and the park/persist binding of that slot on the pump side.
+   After the deadline fires, two `[tok] take tok=7 MISSING` lines show
+   stale re-fires of the consumed timer token — residue, not the cause.
+   Next: find slot 281474976710681's persist/park binding in the same log
+   (whether the resume arrived BEFORE the slot was bound), then inspect the
+   mailbox hold path for cross-thread posts against unbound slots
+   (`coroutines.zig`'s resumeExternal/drain pairing).
 
 Then: the remaining named clusters (15× `exception`, 11× wall-cap, 7+6×
 mock-text asserts, 6× LabeledReturn on `movableContentParameters_*` —

@@ -1491,6 +1491,13 @@ fn composableEval(
                 if (v.* == .Int) std.debug.print(":{d}", .{v.Int});
                 if (v.* == .Long) std.debug.print(":{d}", .{v.Long});
                 if (v.* == .ULong) std.debug.print(":{x}", .{v.ULong});
+                if (v.* == .Instance) {
+                    const ig = v.Instance.borrow();
+                    const cg = ig.get().class.borrow();
+                    std.debug.print(":{s}", .{cg.get().name});
+                    cg.deinit();
+                    ig.deinit();
+                }
             }
             std.debug.print("\n", .{});
         }
