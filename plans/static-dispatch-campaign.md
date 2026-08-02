@@ -437,6 +437,17 @@ unless noted. Chronological.
   carry extension families everywhere). stdlib bound_static 549→575,
   resolver_declined 565→539; examples 4,324→4,377 / 4,461→4,408.
 
+- Wholesale virtual emission for stub/value owners (`KLIO_VOWN`,
+  default OFF): the deferral site's own comment argues the runtime
+  handles both receiver representations (slot against interpreted
+  class, name-fallback for host values), and flipping it binds the
+  208+92 `virtual_owner_*` sites — but UuidTest's throwing validators
+  (`fromByteArray`/`fromUByteArray`/`parseInvalid`, a VALUE-class
+  owner) then RETURNED their IllegalArgumentException as a value
+  instead of raising. Root-cause that family (the virtual-slot path on
+  a value-class receiver swallowing a Throw into a result) before
+  re-flipping; the gate and this note are the seam.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):

@@ -13464,7 +13464,14 @@ fn lowerResolvedMemberCall(
         // receiver's own class (honouring a user subtype's override) and
         // falls back to the member's name only for a host-backed value, which
         // is what the site did unconditionally before.
-        if (owner.is_value or owner.is_stub or ast_type_args.len != 0)
+        // `KLIO_VOWN=1` emits the virtual slot for stub/value owners (the
+        // comment above argues the runtime handles both representations).
+        // Measured NOT wholesale-safe: UuidTest's throwing validators
+        // returned their IllegalArgumentException as a VALUE under it —
+        // held OFF until that family is root-caused.
+        const vown_hold = (owner.is_value or owner.is_stub) and
+            !std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "0", "1");
+        if (vown_hold or ast_type_args.len != 0)
         {
             declineNote(if (owner.is_value)
                 .virtual_owner_value
