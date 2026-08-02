@@ -1932,6 +1932,10 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         if (b.resolve("this")) |this_reg| {
             const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
             try b.bind(label, this_reg);
+            // An extension declaration's receiver is addressable from any
+            // nested scope under this label; record it so the tower entry
+            // this body pushes for nested lambdas carries the value channel.
+            if (f.receiver_type != null) b.setOwnThisLabel(f.name.name);
             // A method also answers to `this@<OwnerClass>`: the class-name
             // label names the class's dispatch receiver, NOT a nested lambda's
             // own receiver even when that receiver happens to be the same

@@ -463,9 +463,15 @@ pub const FuncBuilder = struct {
     /// receiver still fires inside nested lambdas. Distinct from `recv_ty`
     /// so the two never conflate a decl receiver with a captured one.
     enclosing_recv_ty: ?[]const u8 = null,
-    /// Ordered implicit receiver heads, innermost first. Receiver lambdas
-    /// prepend their own head and retain the complete outer tower.
-    implicit_receiver_tower: std.ArrayList([]const u8) = .empty,
+    /// Ordered implicit receiver entries, innermost first. Receiver lambdas
+    /// prepend their own head and retain the complete outer tower. Each
+    /// entry may carry the `this@<label>` name that reaches its value from
+    /// nested scopes (see `ir.ReceiverTowerEntry`).
+    implicit_receiver_tower: std.ArrayList(ir.ReceiverTowerEntry) = .empty,
+    /// The label naming THIS body's own receiver (`this@<label>` bound at
+    /// entry): the fn name for an extension declaration, the callee name
+    /// for a receiver lambda. Null when the body owns no labeled receiver.
+    own_this_label: ?[]const u8 = null,
     /// The LOCAL `fun` this builder is lowering the body of (or a lambda
     /// nested inside that body). A bare call to `self_local_fn.name` binds
     /// the fn ITSELF through its mangled cell — the shared plain-name slot
@@ -1373,40 +1379,67 @@ pub const FuncBuilder = struct {
     pub fn setEnclosingRecvTy(self: *FuncBuilder, name: ?[]const u8) void {
         self.enclosing_recv_ty = name;
     }
-    pub fn setImplicitReceiverTower(self: *FuncBuilder, heads: []const []const u8) Allocator.Error!void {
+    pub fn setImplicitReceiverTower(self: *FuncBuilder, entries: []const ir.ReceiverTowerEntry) Allocator.Error!void {
         self.implicit_receiver_tower.clearRetainingCapacity();
-        try self.implicit_receiver_tower.appendSlice(self.allocator, heads);
+        try self.implicit_receiver_tower.appendSlice(self.allocator, entries);
     }
+    pub fn setOwnThisLabel(self: *FuncBuilder, label: ?[]const u8) void {
+        self.own_this_label = label;
+    }
+    /// Append `entry` unless its head is already present; a duplicate head
+    /// BACKFILLS a missing label so the labeled occurrence always survives
+    /// (the current-scope head often re-appears without one).
+    fn appendTowerEntry(
+        out: *std.ArrayList(ir.ReceiverTowerEntry),
+        allocator: Allocator,
+        entry: ir.ReceiverTowerEntry,
+    ) Allocator.Error!void {
+        for (out.items) |*existing| {
+            if (std.mem.eql(u8, existing.head, entry.head)) {
+                if (existing.label == null) existing.label = entry.label;
+                return;
+            }
+        }
+        try out.append(allocator, entry);
+    }
+    /// The tower as it stands for a body nested at this point, innermost
+    /// first, with each entry's value label where one is known. `innermost`
+    /// is the receiver the NEW body itself introduces (with `innermost_label`
+    /// the name its `this@<label>` binds under).
+    pub fn collectReceiverTowerLabeled(
+        self: *const FuncBuilder,
+        allocator: Allocator,
+        innermost: ?[]const u8,
+        innermost_label: ?[]const u8,
+    ) Allocator.Error![]const ir.ReceiverTowerEntry {
+        var out: std.ArrayList(ir.ReceiverTowerEntry) = .empty;
+        errdefer out.deinit(allocator);
+        if (innermost) |head| try appendTowerEntry(&out, allocator, .{
+            .head = head,
+            .label = innermost_label,
+        });
+        const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
+        if (current) |head| {
+            const label: ?[]const u8 = if (self.recv_ty != null) self.own_this_label else null;
+            try appendTowerEntry(&out, allocator, .{ .head = head, .label = label });
+        }
+        for (self.implicit_receiver_tower.items) |entry| {
+            try appendTowerEntry(&out, allocator, entry);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+    /// Head-only view of `collectReceiverTowerLabeled`, for resolution
+    /// contexts that rank by type alone.
     pub fn collectImplicitReceiverTower(
         self: *const FuncBuilder,
         allocator: Allocator,
         innermost: ?[]const u8,
     ) Allocator.Error![]const []const u8 {
-        var out: std.ArrayList([]const u8) = .empty;
-        errdefer out.deinit(allocator);
-        if (innermost) |head| try out.append(allocator, head);
-        const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
-        if (current) |head| {
-            var seen = false;
-            for (out.items) |existing| {
-                if (std.mem.eql(u8, existing, head)) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) try out.append(allocator, head);
-        }
-        for (self.implicit_receiver_tower.items) |head| {
-            var seen = false;
-            for (out.items) |existing| {
-                if (std.mem.eql(u8, existing, head)) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) try out.append(allocator, head);
-        }
-        return try out.toOwnedSlice(allocator);
+        const entries = try self.collectReceiverTowerLabeled(allocator, innermost, null);
+        defer allocator.free(entries);
+        const out = try allocator.alloc([]const u8, entries.len);
+        for (entries, out) |entry, *head| head.* = entry.head;
+        return out;
     }
     pub fn selfLocalFn(self: *const FuncBuilder) ?ir.SelfLocalFn {
         return self.self_local_fn;

@@ -2800,7 +2800,11 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // A receiver-lambda ARGUMENT whose receiver type the resolved callee made
     // concrete (recorded by `recordLambdaArgReceivers`) — reached when the
     // call is deferred so no expected type carries the receiver to lowerLambda.
-    b.module.pending_lambda_receiver_tower = try b.collectImplicitReceiverTower(b.allocator, receiver_head);
+    b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(
+        b.allocator,
+        receiver_head,
+        b.pending_lambda_label,
+    );
     b.module.pending_lambda_enclosing_recv = blk: {
         if (receiver_head) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
@@ -2940,7 +2944,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     const inherited_lef = try b.localExtFnNames();
     const inherited_erp = try b.erasedRecvParamNames();
-    b.module.pending_lambda_receiver_tower = try b.collectImplicitReceiverTower(b.allocator, receiver_head);
+    b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(b.allocator, receiver_head, null);
     if (receiver_head) |head| {
         b.module.pending_lambda_enclosing_recv = head;
         b.module.pending_lambda_own_recv = head;
@@ -8402,9 +8406,9 @@ fn bareExtensionTarget(
     // Derivation-side only; gated for single-binary A/B.
     if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EXT") orelse "1", "0")) {
         const recv_head = typeHead(std.mem.trimEnd(u8, recv.name, "?"));
-        for (b.implicit_receiver_tower.items) |outer_head| {
-            if (std.mem.eql(u8, outer_head, recv_head)) continue;
-            const outer_ref = ir.TypeRef{ .name = outer_head, .nullable = false, .args = &.{} };
+        for (b.implicit_receiver_tower.items) |entry| {
+            if (std.mem.eql(u8, entry.head, recv_head)) continue;
+            const outer_ref = ir.TypeRef{ .name = entry.head, .nullable = false, .args = &.{} };
             if (b.module.resolveExtensionCall(name.name, outer_ref, shapes, ctx).target) |t| return t;
         }
     }
@@ -12121,7 +12125,11 @@ fn lowerUnresolvedBareCall(
         const head_fqn = blk: {
             if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
             const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
-                b.module.classId(head_name) orelse break :bare_member;
+                b.module.classId(head_name) orelse {
+                if (runtime.getenvSlice("KLIO_BAREARM") != null)
+                    std.debug.print("[barearm-break] {s} no class id for {s}\n", .{ name0, head_name });
+                break :bare_member;
+            };
             if (cid.int() >= b.module.classes.items.len) break :bare_member;
             break :blk b.module.classes.items[cid.int()].fqn;
         };
@@ -12153,8 +12161,11 @@ fn lowerUnresolvedBareCall(
             r
         else if (b.capturesThisSlot() or b.knowsOuter("this"))
             try lambda_body.resolveCapture(b, "this")
-        else
+        else {
+            if (runtime.getenvSlice("KLIO_BAREARM") != null)
+                std.debug.print("[barearm-break] {s} no this reg\n", .{name0});
             break :bare_member;
+        };
         var this_path = [_]ast.Ident{.{ .name = "this", .span = callee.Path.segments[0].span }};
         const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = callee.Path.segments[0].span } };
         const bare_member = try lowerResolvedMemberCall(
@@ -12197,6 +12208,69 @@ fn lowerUnresolvedBareCall(
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
         };
+        // Kotlin then tries the OUTER implicit receivers, innermost first.
+        // An extension serving an outer tower entry commits statically with
+        // its receiver bound through the entry's `this@<label>` slot — the
+        // same capture channel an explicit `this@drop` reference lowers
+        // through — so the call needs no runtime receiver walk. Entries
+        // without a reachable label stay dynamic.
+        if (bare_member != .deferred and
+            !std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EMIT") orelse "1", "0"))
+        {
+            const inner_tail = if (std.mem.lastIndexOfScalar(u8, head_name, '.')) |i|
+                head_name[i + 1 ..]
+            else
+                head_name;
+            for (b.implicit_receiver_tower.items) |entry| {
+                const lbl = entry.label orelse continue;
+                const entry_tail = if (std.mem.lastIndexOfScalar(u8, entry.head, '.')) |i|
+                    entry.head[i + 1 ..]
+                else
+                    entry.head;
+                if (std.mem.eql(u8, entry_tail, inner_tail)) continue;
+                var slot_buf: [160]u8 = undefined;
+                const slot = std.fmt.bufPrint(&slot_buf, "this@{s}", .{lbl}) catch continue;
+                if (b.resolve(slot) == null and !b.knowsOuter(slot) and
+                    !decl_mod.isLowerAnonCapture(slot)) continue;
+                const outer_fqn = blk2: {
+                    if (std.mem.indexOfScalar(u8, entry.head, '.') != null) break :blk2 entry.head;
+                    const cid = b.module.classIdIndexed(entry.head, b.self_package, callee.Path.segments[0].span.file) orelse
+                        b.module.classId(entry.head) orelse break :blk2 entry.head;
+                    if (cid.int() >= b.module.classes.items.len) break :blk2 entry.head;
+                    break :blk2 b.module.classes.items[cid.int()].fqn;
+                };
+                const outer_ty = TypeRef{ .name = outer_fqn, .nullable = false, .args = &.{} };
+                // A member the outer receiver declares beats every extension
+                // at its own level. An applicable (even unproven) member
+                // keeps the call dynamic AND stops the walk: this level owns
+                // the call.
+                if (b.module.classIdByFqn(outer_fqn) orelse b.module.classId(entry_tail)) |ocid| {
+                    var outer_shapes = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+                    defer outer_shapes.deinit(b.allocator);
+                    const om = b.module.resolveMemberCall(ocid, name0, outer_shapes.shapes, .{
+                        .caller_file = callee.Path.segments[0].span.file,
+                        .receiver_type = outer_ty,
+                    });
+                    if (om.target != null or om.applicable) break;
+                }
+                const outer_this = Expr{ .This = .{
+                    .qualifier = .{ .name = lbl, .span = callee.Path.segments[0].span },
+                    .span = callee.Path.segments[0].span,
+                } };
+                if (try lowerResolvedExtensionCall(
+                    b,
+                    &outer_this,
+                    .{ .name = name0, .span = callee.Path.segments[0].span },
+                    args,
+                    ast_arg_names,
+                    ast_type_args,
+                    outer_ty,
+                )) |reg| {
+                    orEmitAudit(b, "unresolved_bare_call", "Call/bare-tower-extension", name0);
+                    return reg;
+                }
+            }
+        }
         if (runtime.getenvSlice("KLIO_BAREARM") != null) {
             var loc_buf: [256]u8 = undefined;
             const cs = callee.Path.segments[0].span;
@@ -16971,4 +17045,108 @@ test "declared member property chains retain static receiver types" {
     const chained = argDeclTypeRefLazy(&b, &nodes) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqualStrings("NodeChain", chained.name);
+}
+
+test "bare call commits an outer tower extension through its label slot" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    try m.registry.file_packages.put(sp.file, "sample");
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Inner",
+        .fqn = "sample.Inner",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(1),
+        .name = "Outer",
+        .fqn = "sample.Outer",
+        .package = "sample",
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+        .is_object = false,
+    });
+    const ext = m.nextFuncId();
+    const ext_params = try a.dupe(ir.Param, &.{.{
+        .name = "this",
+        .ty = .{ .name = "Outer", .nullable = false, .args = &.{} },
+        .default = null,
+    }});
+    try m.funcs.append(a, .{
+        .id = ext,
+        .name = "describe",
+        .fqn = "sample.describe",
+        .package = "sample",
+        .params = ext_params,
+        .return_ty = build.typeUnit(),
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+        .has_receiver_param = true,
+    });
+    try m.func_index.append(a, .{ .name = "describe", .id = ext });
+    try m.decl_sigs.put(ext.int(), .{
+        .receiver_ty = .{ .name = "Outer", .nullable = false, .args = &.{} },
+        .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+        .kind = .top_level_extension,
+        .has_body = true,
+    });
+    try m.rebuildFuncNameIndex(a);
+
+    const previous_package = build.setLowerSelfPackage("sample");
+    defer _ = build.setLowerSelfPackage(previous_package);
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    // A lambda body whose own receiver is Inner; the enclosing extension
+    // fn's Outer receiver sits one tower level out under `this@probe`.
+    b.setRecvTy("Inner");
+    try b.bind("this", b.allocReg());
+    const outer_reg = b.allocReg();
+    try b.bind("this@probe", outer_reg);
+    try b.setImplicitReceiverTower(&.{
+        .{ .head = "Inner", .label = null },
+        .{ .head = "Outer", .label = "probe" },
+    });
+
+    var callee_segments = [_]ast.Ident{.{ .name = "describe", .span = sp }};
+    var callee = Expr{ .Path = .{ .segments = &callee_segments, .span = sp } };
+    const call = Expr{ .Call = .{
+        .callee = &callee,
+        .args = &.{},
+        .arg_names = &.{},
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &call);
+    const insts = b.blocks.items[b.cur.int()].insts;
+    const inst = insts[insts.len - 1];
+    try testing.expect(inst == .Call);
+    try testing.expectEqual(ext, inst.Call.func);
+    try testing.expect(inst.Call.exact);
+    // The receiver argument is the labeled outer slot, not the lambda's
+    // own `this`.
+    var moved_from_outer = false;
+    for (insts) |candidate| {
+        if (candidate != .Move) continue;
+        if (candidate.Move.src == outer_reg) {
+            moved_from_outer = true;
+            break;
+        }
+    }
+    try testing.expect(moved_from_outer);
 }

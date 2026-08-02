@@ -442,15 +442,24 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // resolving to the innermost `this` (the anon instance).
     const this_label = module.pending_lambda_this_label;
     module.pending_lambda_this_label = null;
-    if (is_lambda and this_label != null and
-        ast_scan.referencesQualifiedThis(body.stmts, this_label.?))
-    {
+    if (is_lambda and this_label != null) {
         const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{this_label.?});
         if (b.resolve(label) == null) {
-            const this_reg: ?Reg = if (b.resolve("this")) |r| r else blk: {
-                break :blk try b.loadCaptureHoisted("this");
-            };
-            if (this_reg) |tr| try b.bind(label, tr);
+            // A body whose receiver is its own binding gets the label
+            // unconditionally — the bind is free, and it makes the receiver
+            // reachable by name from nested scopes (the tower emission path
+            // resolves an outer receiver through exactly this slot). A body
+            // whose `this` would need a CAPTURE only binds when the source
+            // references the label, so capture lists stay unchanged.
+            if (b.resolve("this")) |tr| {
+                try b.bind(label, tr);
+                if (b.recvTy() != null) b.setOwnThisLabel(this_label.?);
+            } else if (ast_scan.referencesQualifiedThis(body.stmts, this_label.?)) {
+                const this_reg: ?Reg = blk: {
+                    break :blk try b.loadCaptureHoisted("this");
+                };
+                if (this_reg) |tr| try b.bind(label, tr);
+            }
         }
     }
     // A lambda parameter (including the implicit `it`) statically typed as a

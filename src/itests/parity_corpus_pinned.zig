@@ -1536,6 +1536,22 @@ test "throwable_suppressed_user_instance" {
     );
 }
 
+test "tower_outer_receiver_extension" {
+    try check("tower_outer_receiver_extension",
+        \\outer-extension:a
+        \\outer-extension:b
+        \\
+    );
+}
+
+test "tower_local_extension_label" {
+    try check("tower_local_extension_label",
+        \\top-ext:z
+        \\w
+        \\
+    );
+}
+
 test "reified_from_lambda_annotation" {
     try check("reified_from_lambda_annotation",
         \\is
