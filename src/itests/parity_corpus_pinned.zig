@@ -1568,6 +1568,15 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "ext_body_bare_iterator_star" {
+    try check("ext_body_bare_iterator_star",
+        \\3
+        \\b
+        \\null
+        \\
+    );
+}
+
 test "exit_guard_negated_is_narrows_overload" {
     try check("exit_guard_negated_is_narrows_overload",
         \\18

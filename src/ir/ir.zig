@@ -4806,10 +4806,23 @@ pub const Module = struct {
                 // carries no type arguments to project — but a return that
                 // never mentions the class's parameters is complete without
                 // them (`findClause(...): ClauseData?` on a bare
-                // SelectImplementation head). Only a param-mentioning return
-                // still refuses.
+                // SelectImplementation head). A param-mentioning return
+                // erases the unknown parameters to star projections instead
+                // of refusing: `iterator()` on a bare `Iterable` head yields
+                // `Iterator<*>`, whose HEAD is what the initialized local
+                // needs to bind its `hasNext()`/`next()`, and `*` is
+                // applicability-neutral downstream. `KLIO_STAR_RET=0`
+                // disables.
                 if (!projected_ok) {
-                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) return null;
+                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) {
+                        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
+                        for (owner_class.type_params) |param| {
+                            try bindings.append(a, .{
+                                .name = try classTypeParamIdentity(a, owner, param),
+                                .ty = .{ .name = "*", .nullable = false, .args = &.{} },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -4821,6 +4834,11 @@ pub const Module = struct {
             type_params;
 
         const first_param: usize = @intFromBool(funcHasImplicitThis(f));
+        // An extension receiver written head-only (a bare implicit `this`)
+        // cannot bind the declared receiver's type parameters; erase the
+        // still-unbound ones to `*` at the end instead of refusing, exactly
+        // as the owner-projection arm above does for members.
+        var recv_bind_failed = false;
         if (first_param != 0 and
             (decl_sig == null or decl_sig.?.kind != .instance_method))
         {
@@ -4832,7 +4850,17 @@ pub const Module = struct {
                     function_type_params,
                     &bindings,
                     0,
-                )) return null;
+                )) {
+                    if (actual_receiver.args.len != 0 or
+                        std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0"))
+                        return null;
+                    recv_bind_failed = true;
+                }
+            } else {
+                // A receiver-less top-level pick (a bare call resolved by
+                // name alone) binds no receiver params at all; same erasure.
+                recv_bind_failed =
+                    !std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0");
             }
         }
         const params = f.params[first_param..];
@@ -4915,8 +4943,26 @@ pub const Module = struct {
             }
         }
 
+        if (recv_bind_failed) {
+            for (function_type_params) |tp| {
+                var bound = false;
+                for (bindings.items) |bd| {
+                    if (std.mem.eql(u8, bd.name, tp)) {
+                        bound = true;
+                        break;
+                    }
+                }
+                if (!bound) try bindings.append(a, .{
+                    .name = tp,
+                    .ty = .{ .name = "*", .nullable = false, .args = &.{} },
+                });
+            }
+        }
         if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) return null;
         const substituted = try substituteType(a, f.return_ty, bindings.items);
+        // A return erased to a bare `*` head names nothing a caller can bind
+        // against; it would only pollute the local's declared-type record.
+        if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) return null;
         return try substituted.clone(allocator);
     }
 

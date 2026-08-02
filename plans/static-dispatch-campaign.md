@@ -509,6 +509,21 @@ unless noted. Chronological.
   runtime synthesis) still lower into empty side modules — same
   treatment is the follow-up.
 
+- **Unbindable return-type params erase to star projections**
+  (`KLIO_STAR_RET=0` disables): `instantiatedCallReturnType` refused
+  whenever the receiver couldn't bind the declared params — a bare
+  owner head with no args to project, a head-only extension receiver
+  failing `bindCallType`, and (the actual stdlib mass) a bare
+  `iterator()` resolved through the receiver-less top-level pick. All
+  three now substitute `*` for the still-unbound parameters after
+  argument binding has had its chance, so `val iterator = iterator()`
+  inside an `Iterable<T>` extension body types the local `Iterator<*>`
+  — the HEAD binds its `hasNext()`/`next()`, and `*` is
+  applicability-neutral so the erased arguments prove and refute
+  nothing. A result erased to a bare `*` head is still refused. Census:
+  no_receiver_type 1,870→1,774, bound_virtual 5,121 (+96), 70.2% bound.
+  Battery green. Pin `ext_body_bare_iterator_star`.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):
@@ -539,18 +554,14 @@ unless noted. Chronological.
   is committed separately). CLOSED as a direction.
 - Head-only receiver evidence for lambda bodies, twice: the target
   population has no recv head at all (`with(xs) { iterator() }`).
-- Star-erased returns on bare receiver heads (2026-08-02): substituting
-  `*` for unprojectable owner params in `instantiatedCallReturnType`
-  (so bare `iterator()` on an argument-less `Iterable` head yields
-  `Iterator<*>`) measured an IDENTICAL census — the toy shapes that
-  motivated it (member-extension bare calls, plain extension bodies)
-  already bind through the ast-declared/od fallbacks. The
-  `[no-recv-name] iterator` mass actually lives in OBJECT-EXPRESSION
-  bodies (`Sequences.kt`: `val iterator = sequence.iterator()` inside
-  `object : Iterator<T>`), where the blocker is upstream: `sequence`
-  is an outer-class ctor property whose TYPE the nested builder never
-  sees, so the receiver chain nulls before any return instantiation
-  runs. Fix the enclosing-property type channel, not the return side.
+- Star-erased returns, first attempt (2026-08-02): the owner-projection
+  arm alone measured an IDENTICAL census. The reason was mislocated
+  twice — the real null was the EXTENSION arm: bare `iterator()`
+  resolves through the top-level pick with `receiver == null`, so
+  `bindCallType` never runs, no receiver param binds, and
+  `returnTypeBindingsComplete` refuses. LANDED once all three refusal
+  points erase (owner projection, head-only receiver bind failure,
+  receiver-less top-level pick): see the star-erasure ledger entry.
 - Anon-object property type heads via a thread-local snapshot
   (2026-08-02): built and verified end-to-end — `buildObject` derived
   `iterator -> Iterator` from the captured `this`'s field value's
