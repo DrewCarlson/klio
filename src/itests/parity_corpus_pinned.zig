@@ -1560,6 +1560,14 @@ test "local_fn_default_beats_stdlib_sibling" {
     );
 }
 
+test "anon_object_outer_prop_iterator" {
+    try check("anon_object_outer_prop_iterator",
+        \\6
+        \\a-b
+        \\
+    );
+}
+
 test "exit_guard_negated_is_narrows_overload" {
     try check("exit_guard_negated_is_narrows_overload",
         \\18

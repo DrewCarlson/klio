@@ -2411,7 +2411,9 @@ fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[
     for (chain) |cls| {
         if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
-    return null;
+    // A runtime anon-object member body's own property heads travel in the
+    // installed snapshot — the synthesized class has no registry entries.
+    return build.anonPropHead(owner, name);
 }
 
 /// Whether `ty` (or a supertype) declares a member property named `name`.
@@ -13318,7 +13320,14 @@ fn lowerResolvedMemberCall(
     };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
         const receiver_name = receiver.Path.segments[receiver.Path.segments.len - 1].name;
+        // A bare name resolving to nothing lexically is a CLASS-name access
+        // (whose members live on the companion) only when no enclosing
+        // receiver declares a property of the name: `iterator` inside
+        // `object : Iterator<T> { val iterator = ... }` is a `this` property
+        // read typed by the head channel, and redirecting it to a companion
+        // silently dropped the whole resolution.
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
+            !enclosingHasMemberNamed(b, receiver_name) and
             static_owner.int() < b.module.classes.items.len)
         {
             const classifier = &b.module.classes.items[static_owner.int()];

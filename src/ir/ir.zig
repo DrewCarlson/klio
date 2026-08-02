@@ -1615,6 +1615,11 @@ pub const Module = struct {
     /// `Span(call) -> decl_span` record, this gives lowering an exact,
     /// type-derived target per call site with no shared symbol table.
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
+    /// A per-anon-site image clone runtime-synthesized members lower into.
+    /// Decl-span reservations are disabled on it: synthesized getter/setter
+    /// thunks share their property ident's span, and the reservation channel
+    /// made the second thunk OVERWRITE the first at the adopted id.
+    anon_side: bool = false,
     /// The eager pipeline's per-call resolution: `Span(callee) ->
     /// Span(decl)` converted from typeck's records by the driver
     /// Lowering composes it with `func_by_decl_span`;
@@ -5894,6 +5899,7 @@ pub const Module = struct {
 
     /// Record a lowered declaration's identity (its AST name-span).
     pub fn recordFuncDeclSpan(self: *Module, allocator: Allocator, decl_span: span.Span, id: FuncId) Allocator.Error!void {
+        if (self.anon_side) return;
         if (self.func_by_decl_span == null) {
             self.func_by_decl_span = std.AutoHashMap(span.Span, FuncId).init(allocator);
         }
@@ -5901,6 +5907,7 @@ pub const Module = struct {
     }
     /// The FuncId lowered for the declaration at `decl_span`, if any.
     pub fn funcByDeclSpan(self: *const Module, decl_span: span.Span) ?FuncId {
+        if (self.anon_side) return null;
         const m = &(self.func_by_decl_span orelse return null);
         return m.get(decl_span);
     }

@@ -312,6 +312,31 @@ pub fn anonScopeRename(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A property type head carried into a runtime anon-object member-body
+/// lowering: `val iterator = sequence.iterator()` inside `object :
+/// Iterator<T>` records `iterator -> Iterator` (declared annotations as
+/// written, un-annotated initializers derived at `buildObject` from the
+/// captured values' runtime classes), and the sibling `hasNext()` body's
+/// bare-receiver walk then types the read.
+pub const AnonPropHead = struct { owner: []const u8, name: []const u8, head: []const u8 };
+
+threadlocal var lower_anon_prop_heads: []const AnonPropHead = &.{};
+
+pub fn setLowerAnonPropHeads(hs: []const AnonPropHead) []const AnonPropHead {
+    const prev = lower_anon_prop_heads;
+    lower_anon_prop_heads = hs;
+    return prev;
+}
+
+/// The installed head for `owner.name`, or null. Owner-keyed so a named
+/// nested class lowering inside the window cannot read the anon's records.
+pub fn anonPropHead(owner: []const u8, name: []const u8) ?[]const u8 {
+    for (lower_anon_prop_heads) |h| {
+        if (std.mem.eql(u8, h.owner, owner) and std.mem.eql(u8, h.name, name)) return h.head;
+    }
+    return null;
+}
+
 /// Classifier identities carried into runtime anonymous-object lowering.
 threadlocal var lower_anon_scope_classes: []const ir.ScopeClassRef = &.{};
 

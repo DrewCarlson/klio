@@ -474,6 +474,41 @@ unless noted. Chronological.
   compose SnapshotStateListTests 61/65 with exactly the four known
   throughput-bound concurrent tests.
 
+- **Anon-object bodies lower against an image clone** (`KLIO_ANON_BASE=0`
+  restores the empty side module): `buildObject` gives every
+  runtime-synthesized member/thunk lowering ONE shared `cloneForExtend`
+  of the main module instead of an empty `Module.default`, so anon
+  bodies resolve classes/members/extensions exactly as build-time
+  lowering does — and their emitted main-space slots and fids execute
+  correctly both through the host and through the side module itself
+  (the cloned lazy header section serves ids below the append range).
+  Three companion pieces:
+  1. The anon class's own property heads travel via a thread-local
+     snapshot (`setLowerAnonPropHeads`, gate `KLIO_ANON_PROP`) —
+     declared annotations as written, un-annotated initializers derived
+     from the CAPTURED value's runtime class (including through a
+     captured `this`'s field, the `Sequences.kt` shape) — consumed by
+     `propTypeHeadOn` since the synthesized class has no registry rows.
+  2. The companion-object redirect in `lowerResolvedMemberCall` stands
+     down when an enclosing receiver declares a property of the bare
+     receiver's name (`iterator` inside `object : Iterator<T>` is a
+     `this` property read, not a class-name access; the redirect
+     silently returned `.none` for it).
+  3. Decl-span reservations are DISABLED on the clone
+     (`Module.anon_side`): synthesized getter/setter thunks share their
+     property ident's span, and the reservation channel made the setter
+     overwrite the getter at the adopted id (anon_object_setter's
+     read-back returned Unit).
+  The previously-invisible anon population now enters the lower-site
+  census and mostly binds: total 8,135→8,273, bound_virtual
+  4,935→5,025, bound_static 671→691, resolver_declined 239→267 (anon
+  deferrals now countable). Battery green (sweep 117/0, drift 266/266,
+  litmus baseline, compose 61/65 known-four). Pin
+  `anon_object_outer_prop_iterator`; `examples/anon_object_setter.kt`
+  pins the thunk-collision regression. Local classes (`host_classes.zig`
+  runtime synthesis) still lower into empty side modules — same
+  treatment is the follow-up.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):

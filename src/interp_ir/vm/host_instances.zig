@@ -3760,6 +3760,30 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
     return entry;
 }
 
+/// The side module a runtime-synthesized class's members lower into: a
+/// `cloneForExtend` of the main module, built lazily ONCE per synthesis call
+/// and shared by every member/thunk lowering of that site. The clone sees the
+/// whole image — classes, registries, the shared lazy func-id space — so a
+/// member body's calls resolve and bind statically exactly as build-time
+/// lowering would, and an emitted main-space FuncId/slot resolves both
+/// through the host and through the side module itself (the cloned header
+/// section serves ids below the append range). `Module.default` (the old
+/// empty side module) left every call in every anon body name-dynamic.
+/// `KLIO_ANON_BASE=0` restores the empty side module.
+fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
+    if (cache.*) |m| return m.clone();
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_BASE") orelse "1", "0")) {
+        return ObjRef(Module).init(allocator, Module.default(allocator));
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    var cloned = try mg.get().cloneForExtend(allocator);
+    cloned.anon_side = true;
+    const ref = try ObjRef(Module).init(allocator, cloned);
+    cache.* = ref;
+    return ref.clone();
+}
+
 pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename, scope_classes: []const ir.ScopeClassRef) Allocator.Error!EvalResult {
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
@@ -3798,6 +3822,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         defer g.deinit();
         break :blk g.get().contains(synth_class_name);
     };
+
+    // One image clone per synthesis call, shared by every lowering below.
+    var site_mod: ?ObjRef(Module) = null;
+    defer if (site_mod) |m| m.deinit();
 
     // Collect the anon object's own + inherited + enclosing member names so
     // bare identifiers inside method bodies resolve through `this`.
@@ -3870,6 +3898,87 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     ir.lower.setLowerAnonCaptures(anon_cap_set);
     // `setLowerAnonCaptures` takes ownership; clear it after lowering.
 
+    // The anon class's property type heads, carried into the member
+    // lowerings: a declared annotation as written, an un-annotated
+    // initializer derived from the CAPTURED value's runtime class —
+    // `val iterator = sequence.iterator()` resolves `iterator` on the
+    // captured sequence's class and records the declared return's head, so
+    // the sibling `hasNext()`/`next()` bodies type their bare `iterator`
+    // reads and bind statically. `KLIO_ANON_PROP=0` disables.
+    var prop_heads: std.ArrayList(ir.build.AnonPropHead) = .empty;
+    defer prop_heads.deinit(allocator);
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_PROP") orelse "1", "0")) {
+        for (members) |*m| {
+            if (m.* != .Property) continue;
+            const p = m.Property;
+            if (p.ty) |*ty| {
+                try prop_heads.append(allocator, .{
+                    .owner = synth_class_name,
+                    .name = p.name.name,
+                    .head = ty.name.name,
+                });
+                continue;
+            }
+            const init_expr: *const ast.Expr = if (p.init) |*e| e else continue;
+            const head: ?[]const u8 = blk: {
+                if (init_expr.* == .Path and init_expr.Path.segments.len == 1) {
+                    const v = findCapture(capture_pairs, init_expr.Path.segments[0].name) orelse break :blk null;
+                    break :blk v.typeFqn();
+                }
+                if (init_expr.* != .Call) break :blk null;
+                const callee = init_expr.Call.callee;
+                if (callee.* != .Member) break :blk null;
+                const recv = callee.Member.receiver;
+                if (recv.* != .Path or recv.Path.segments.len != 1) break :blk null;
+                // The receiver reaches the body either as a direct value
+                // capture or as a FIELD of the captured enclosing `this`
+                // (an outer-class ctor property like `sequence`).
+                const rv: Value = findCapture(capture_pairs, recv.Path.segments[0].name) orelse rblk: {
+                    const tv = findCapture(capture_pairs, "this") orelse break :blk null;
+                    if (tv != .Instance) break :blk null;
+                    const ig = tv.Instance.borrow();
+                    defer ig.deinit();
+                    for (ig.get().fields.items) |fld| {
+                        if (std.mem.eql(u8, fld.name, recv.Path.segments[0].name)) break :rblk fld.value;
+                    }
+                    break :blk null;
+                };
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const module = mg.get();
+                const owner_cid = module.classIdByFqn(rv.typeFqn()) orelse break :blk null;
+                const recv_ref: ir.TypeRef = .{ .name = rv.typeFqn(), .nullable = false, .args = &.{} };
+                const resolved = module.resolveMemberCall(owner_cid, callee.Member.name.name, &.{}, .{
+                    .caller_file = obj.span.file,
+                    .lexical_owner = null,
+                    .actual_type_param_bounds = &.{},
+                    .receiver_type = recv_ref,
+                });
+                const target = resolved.target orelse break :blk null;
+                const f = module.funcById(target) orelse break :blk null;
+                var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                if (h.len == 0 or std.mem.eql(u8, h, "Unit")) break :blk null;
+                // A return left as the owner's own type parameter names no
+                // class and types nothing.
+                if (module.classIdByFqn(h) == null and module.uniqueClassIdBySimpleName(h) == null) break :blk null;
+                break :blk h;
+            };
+            if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+                std.debug.print("[ANON] prop {s}.{s} head={s}\n", .{ synth_class_name, p.name.name, head orelse "<none>" });
+            }
+            if (head) |h| {
+                try prop_heads.append(allocator, .{
+                    .owner = synth_class_name,
+                    .name = p.name.name,
+                    .head = h,
+                });
+            }
+        }
+    }
+    const prev_prop_heads = ir.build.setLowerAnonPropHeads(prop_heads.items);
+    defer _ = ir.build.setLowerAnonPropHeads(prev_prop_heads);
+
     // Lower each method + getter into the shared `anon_methods` registry
     // (once per site, on the first instantiation).
     for (members) |*m| {
@@ -3877,7 +3986,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             .Function => |*f| {
                 if (f.body == null) continue;
                 if (site_built) continue; // methods already registered for this site
-                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, synth_class_name, &own_members);
                 const fid = func.id;
                 const tbl = self.anon_methods.borrowMut();
@@ -3893,9 +4002,12 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             .Property => |p| {
                 if (p.getter) |getter| if (!site_built) {
                     const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;
+                    if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+                        std.debug.print("[ANON] getter {s}.{s} fid={d}\n", .{ synth_class_name, p.name.name, fid.int() });
+                    }
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
                     const tbl = self.anon_methods.borrowMut();
                     tbl.get().put(try anonKey(allocator, synth_class_name, key), .{ .module = sub_ref, .func = fid, .captures = &.{} }) catch {};
@@ -3934,7 +4046,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                         .span = p.name.span,
                     } };
                     const thunk = synthThunk(p.name, .{ .Expr = body_expr }, p.ty, p.is_override);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});
                     const tbl = self.anon_methods.borrowMut();
@@ -3948,7 +4060,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 if (p.setter) |setter| if (!site_built) {
                     const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
                     const thunk = try synthSetterThunk(allocator, p.name, vp, setter.body, p.is_override);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;
                     const key = try std.fmt.allocPrint(allocator, "$set${s}", .{p.name.name});
@@ -3987,7 +4099,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     .span = p.name.span,
                 };
                 const thunk = synthThunk(thunk_name, .{ .Expr = dexpr.*.* }, null, false);
-                const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                 try complex_local.append(allocator, .{ .name = dfield, .module = sub_ref, .func = func.id });
                 continue;
@@ -4011,7 +4123,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .span = p.name.span,
             };
             const thunk = synthThunk(thunk_name, .{ .Expr = init_expr.* }, null, false);
-            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const sub_ref = try anonSiteModule(self, allocator, &site_mod);
             const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
             try complex_local.append(allocator, .{ .name = p.name.name, .module = sub_ref, .func = func.id });
         }
@@ -4033,7 +4145,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .span = blk.span,
             };
             const thunk = synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
-            const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+            const sub_ref = try anonSiteModule(self, allocator, &site_mod);
             const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
             try init_local.append(allocator, .{ .module = sub_ref, .func = func.id, .prop_pos = prop_pos });
         }
@@ -4077,7 +4189,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                         .span = obj.span,
                     };
                     const thunk = synthThunk(thunk_name, .{ .Expr = ae.* }, null, false);
-                    const sub_ref = try ObjRef(Module).init(allocator, Module.default(allocator));
+                    const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &no_members);
                     slots[ai] = .{ .module = sub_ref, .func = func.id };
                 }
