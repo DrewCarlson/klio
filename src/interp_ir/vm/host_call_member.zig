@@ -5449,6 +5449,53 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
+    // A host-backed value whose runtime class ships interpreted SOURCE
+    // (`UByteArray : Collection<UByte>` declares `isEmpty`): resolve the
+    // member against that class and run its body — the representation
+    // reads inside (`storage`) are host-served. Sits at the total-miss
+    // tail so every intrinsic and operator tail above still wins.
+    {
+        const target: ?FuncId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const cid = module.classIdByFqn(receiver.typeFqn()) orelse break :blk null;
+            const caller_file = if (ir.eval.currentCallSiteSpan()) |sp| sp.file else ir.FileId.from(0);
+            const resolved = module.resolveMemberCall(cid, name, &.{}, .{
+                .caller_file = caller_file,
+                .lexical_owner = null,
+                .actual_type_param_bounds = &.{},
+            });
+            const t = resolved.target orelse break :blk null;
+            // Only a member the receiver's OWN class hierarchy declares may
+            // run here: a same-named member of an unrelated class (UInt.or
+            // for an Int receiver) reads representation the value does not
+            // have.
+            const sig = module.decl_sigs.get(t.int()) orelse break :blk null;
+            const owner = sig.enclosing_class orelse break :blk null;
+            if (owner.int() != cid.int()) {
+                if (owner.int() >= module.classes.items.len) break :blk null;
+                const owner_fqn = module.classes.items[owner.int()].fqn;
+                const recv_class = &module.classes.items[cid.int()];
+                var in_chain = false;
+                if (module.registry.class_super_names.get(recv_class.name)) |chain| {
+                    for (chain) |cn| {
+                        if (std.mem.eql(u8, cn, owner_fqn) or
+                            std.mem.eql(u8, typeHeadLast(cn), typeHeadLast(owner_fqn)))
+                        {
+                            in_chain = true;
+                            break;
+                        }
+                    }
+                }
+                if (!in_chain) break :blk null;
+            }
+            break :blk t;
+        };
+        if (target) |t| {
+            if (try invokeMethodFuncId(self, allocator, receiver, t, args)) |r| return r;
+        }
+    }
     missTraceMaybe(name);
     if (missTraceEnv() != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });
@@ -9256,6 +9303,12 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
 /// resolution, applicability walk, or FQN scan. Missing targets are image/link
 /// errors and remain errors rather than changing the declaration selected by
 /// lowering.
+fn typeHeadLast(s: []const u8) []const u8 {
+    const t = std.mem.trimEnd(u8, s, "?");
+    if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| return t[d + 1 ..];
+    return t;
+}
+
 pub fn invokeResolvedMember(
     self: *VmHost,
     allocator: Allocator,

@@ -537,7 +537,14 @@ pub fn spliceInlineLambda(
             }
         }
     }
+    // The lambda body is CALLER code in the caller's MEMBER scope too: an
+    // active extension splice parked the caller's own/enclosing member sets
+    // for its body; the lambda content swaps them back in so a bare member
+    // call resolves against the caller's class exactly as it would outside
+    // the splice.
+    const caller_scope = try b.enterCallerMemberScope();
     const v = try lowerBlock(b, &body);
+    if (caller_scope) |cs| b.exitCallerMemberScope(cs);
     for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
@@ -1593,6 +1600,18 @@ pub fn tryInlineCallWithTypeArgs(
             b.enclosing_members = pm;
         }
     };
+    // A TOP-LEVEL extension's spliced body resolves in its declaration
+    // scope: park the caller's member sets and lexical owner so a bare
+    // `indices` inside a spliced `UByteArray.getOrElse` is the receiver's
+    // extension property, not a same-named METHOD of the calling class.
+    // Spliced caller-lambda content swaps the parked scope back in
+    // (`enterCallerMemberScope` in spliceInlineLambda). `KLIO_SPLICE_HYG=0`
+    // disables.
+    var hyg_snap: build.FuncBuilder.MemberScopeSnapshot = undefined;
+    const hyg_active = ext_splice and !member_splice and
+        !std.mem.eql(u8, inline_state.runtime.getenvSlice("KLIO_SPLICE_HYG") orelse "1", "0");
+    if (hyg_active) b.beginSpliceDeclScope(&hyg_snap);
+    defer if (hyg_active) b.endSpliceDeclScope(&hyg_snap);
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
     if (inline_state.runtime.getenvSlice("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
