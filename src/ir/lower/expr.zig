@@ -8180,6 +8180,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (init != arg and pushInitChain(p.segments[0].name)) {
             defer popInitChain();
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
+            // A MEMBER-call or elvis initializer needs the full derivation
+            // the lazy reader lacks (`val clause = findClause(x) ?:
+            // continue; val onCancellation = clause.create...(a, b)`), so a
+            // pass whose statement arm recorded nothing still types the
+            // shape. Depth-guarded with the on-demand counter.
+            if (od_depth < 3) {
+                od_depth += 1;
+                defer od_depth -= 1;
+                if (staticExprTypeRef(b, init) catch null) |derived| return derived;
+            }
         }
     }
     if (staticBareReceiverType(b, p.segments[0].name)) |head| {

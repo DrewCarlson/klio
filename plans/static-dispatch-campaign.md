@@ -3618,3 +3618,24 @@ block/statement lowering that splits control flow) and record the
 decl type there exactly as lowerPropertyDecl's `.Binary` arm now does.
 All reader channels, the derivation registry, the substitution, and
 the refutation are proven; this recording is the last dead link.
+
+
+MILESTONE — the refutation FIRES and mosaic_hello is GREEN (263/266;
+sweep 117/0; pinned unchanged): the lazy reader's initializer tail now
+falls to the FULL derivation (staticExprTypeRef, depth-guarded) when
+the local's statement arm recorded nothing, so the kept pass types
+`clause` -> `onCancellation` -> the tryResume shape end to end:
+`[smac-arg] inst=Unit arg_ty=Function3 -> incompatible` and
+`[member-static] target=null applicable=false` — the member DROPS at
+lowering, exactly as kotlinc resolves. The same reader fix cured
+mosaic_hello's pack-context `appendCodePoint` chain outright.
+
+select's LAST gate (one line of evidence away): the extension leg
+reports `[ext-static] recv=CancellableContinuation args=1 target=null
+applicable=TRUE` — an applicable extension without a commit. Next:
+probe resolveExtensionCall's per-candidate verdicts for the site (a
+gated print at its deferral points) — the file-private
+`CancellableContinuation<Unit>.tryResume` with an exactly-matching
+receiver must commit; whichever deferral condition holds it (receiver
+type-arg proof, same-file tier, private visibility) is the fix line.
+Remaining: select + compose_nodes + compose_ui_text.
