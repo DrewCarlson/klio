@@ -3728,3 +3728,20 @@ tower-consult census lever (bare-call resolution over outer lambda
 receivers — a coverage lever, not a correctness gap) and eager-mode
 readiness (the NaN total-order pair), both specified earlier in this
 document.
+
+
+### Eager-mode readiness: RETIRED as already delivered, verified today
+
+The backlog entry was stale on two counts. (1) The pipeline was
+unified in `cli: eager is the only pipeline` (43e8a1f4) — there is no
+KLIO_EAGER gate or non-eager branch left to delete;
+`commontest-sweep.py --eager` is accepted-and-ignored. (2) The entry's
+named blockers are fixed: NaNPropagationTest's total-order trio
+(arrayTMinOrNull / listTMinOrNull / sequenceTMinOrNull) runs green —
+the element-type evidence the eager head used to lose is carried by
+this campaign's receiver-substitution and derivation channels — and
+DurationTest was fixed earlier (varargParamType). Verified today: the
+numbers directory 7 files 0 failures, and the FULL sweep 117/0 twice
+with byte-identical output. The campaign's remaining open item is the
+tower-consult census lever (bare-call resolution over outer lambda
+receivers), plus the smaller resolver_declined residual pairs.
