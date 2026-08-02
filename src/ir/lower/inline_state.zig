@@ -232,15 +232,25 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
         expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
     }
     const key = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{d}", .{ owner, f.name.name, f.params.len });
+    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, f.name.name, "createOnCancellationAction"))
+        std.debug.print("[ebm] register owner={s} arity={d}\n", .{ owner, f.params.len });
     try expr_body_members.?.put(key, FnField.fromPtr(f));
 }
 
 /// The registered expression body for (owner, name, arity), or null.
 pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
     var buf: [256]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
+    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, name, "createOnCancellationAction"))
+        std.debug.print("[ebm] lookup owner={s} arity={d} n={d}\n", .{ owner, nparams, if (expr_body_members) |m| m.count() else 0 });
     if (expr_body_members) |*m| {
+        const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
         if (m.get(key)) |ff| return ff.get();
+        // A LIFTED nested class spells `Outer$Inner`; the registration walk
+        // spells the source-simple `Inner`. Normalize on miss.
+        if (std.mem.lastIndexOfScalar(u8, owner, '$')) |d| {
+            const key2 = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner[d + 1 ..], name, nparams }) catch return null;
+            if (m.get(key2)) |ff| return ff.get();
+        }
     }
     return null;
 }

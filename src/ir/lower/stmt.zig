@@ -297,10 +297,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // destructuring arm already trusts. Argument shapes built from
             // the local then refute inapplicable members.
             .Call => {
+                const vt = runtime.getenvSlice("KLIO_VALTY_TRACE");
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
+                        std.debug.print("[valty] {s} = {s}\n", .{ p.name.name, ct.name });
                     const was_nullable = ct.nullable;
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                } else if (vt) |w| {
+                    if (std.mem.eql(u8, w, p.name.name))
+                        std.debug.print("[valty] {s} = <null>\n", .{p.name.name});
                 }
             },
             // `val clause = findClause(x) ?: continue` — the elvis arm of

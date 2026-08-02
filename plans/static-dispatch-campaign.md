@@ -3527,3 +3527,20 @@ DIFFERENT 1-arg site (Mutex's CancellableContinuationWithOwner wrapper
 when-arm block inside `while(true)` (verify with a gated print in the
 arm for name=onCancellation). Whichever, the fix is mechanical once
 seen. Gates: sweep 117/0, drift 262/266 unchanged.
+
+
+EBM probe (gated, kept): registration fires in BOTH phases
+(`register owner=ClauseData arity=2` twice) and the one lookup that
+runs HITS (n=107). The valty <null> therefore belongs to an EARLIER
+LOWERING PHASE of the same statement that dies BEFORE the fallback —
+its `clause` receiver chain fails upstream (the phase lowers before
+class registrations complete, so findClause/ClauseData resolution is
+unavailable and the Member arm answers `no receiver type`). Select.kt's
+body lowers TWICE in one process (two builds/phases — likely the
+dependency-base build then the program build, or the eager pre-pass);
+the EXECUTED module keeps the FIRST, untyped lowering. NEXT: identify
+the two phases (print b.module identity + a phase tag alongside
+[valty]), then either (a) run the class/member registration pre-pass in
+the first phase too, or (b) make the kept module the second phase's.
+Everything downstream is proven: with the typed lowering, derivation
+returns Function3 and the refutation chain is verified ready.
