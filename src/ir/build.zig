@@ -2068,6 +2068,34 @@ pub const FuncBuilder = struct {
     pub fn typeParamBound(self: *const FuncBuilder, name: []const u8) ?ir.ModuleRegistry.TypeParamBound {
         return self.type_param_bounds.get(name);
     }
+    /// Bind a SPLICED inline callee's type-parameter bound for the splice
+    /// window: the callee's param types reach the caller's builder through
+    /// `spliceParamTy` (`destination: M`), and without the bound the head
+    /// `M` names nothing. Returns what the caller restores on exit.
+    pub const SpliceBoundRestore = struct {
+        name: []const u8,
+        prev_bound: ?ir.ModuleRegistry.TypeParamBound,
+        was_name: bool,
+    };
+    pub fn bindSpliceTypeParamBound(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: ir.ModuleRegistry.TypeParamBound,
+    ) Allocator.Error!SpliceBoundRestore {
+        const prev = self.type_param_bounds.get(name);
+        const was_name = self.type_param_names.contains(name);
+        try self.type_param_names.put(name, {});
+        try self.type_param_bounds.put(name, bound);
+        return .{ .name = name, .prev_bound = prev, .was_name = was_name };
+    }
+    pub fn restoreSpliceTypeParamBound(self: *FuncBuilder, r: SpliceBoundRestore) void {
+        if (r.prev_bound) |p| {
+            self.type_param_bounds.put(r.name, p) catch {};
+        } else {
+            _ = self.type_param_bounds.remove(r.name);
+        }
+        if (!r.was_name) _ = self.type_param_names.remove(r.name);
+    }
     /// Record the fully lowered upper bound of `name`, keeping its type
     /// arguments. Takes ownership of `ref`.
     pub fn addTypeParamBoundRef(self: *FuncBuilder, name: []const u8, ref: TypeRef) Allocator.Error!void {

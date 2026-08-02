@@ -1729,6 +1729,34 @@ pub fn tryInlineCallWithTypeArgs(
             if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bound {s}: {s}\n", .{ fname, p.name.name, sub.name.name });
         }
     }
+    // The callee's non-reified type-parameter BOUNDS ride along with its
+    // param types: `destination: M` reaches the caller's builder through the
+    // splice-ty channel, and without `M : MutableMap<...>` the head names
+    // nothing and every member call on `destination` stays dynamic. Marked
+    // incomplete — the record supports the receiver-owner lookup, never a
+    // negative proof.
+    var splice_bound_restores: std.ArrayList(build.FuncBuilder.SpliceBoundRestore) = .empty;
+    defer splice_bound_restores.deinit(b.allocator);
+    defer for (splice_bound_restores.items) |sb| b.restoreSpliceTypeParamBound(sb);
+    for (f.type_params) |*tp| {
+        if (tp.is_reified) continue;
+        const bound_ty: ?*const ast.TypeRef = blk: {
+            if (tp.upper_bound) |*ub| break :blk ub;
+            for (f.where_bounds) |*wb| {
+                if (std.mem.eql(u8, wb.name.name, tp.name.name)) break :blk &wb.bound;
+            }
+            break :blk null;
+        };
+        const ub = bound_ty orelse continue;
+        if (ub.function != null or ub.qualified_path != null or ub.name.name.len == 0) continue;
+        const r = try b.bindSpliceTypeParamBound(tp.name.name, .{
+            .param = tp.name.name,
+            .bound = ub.name.name,
+            .complete = false,
+            .head_only = !ub.nullable,
+        });
+        try splice_bound_restores.append(b.allocator, r);
+    }
     // Mark body-declared `var`s that a nested closure writes as boxed so
     // their decl emits `MakeCell` and the closure's write lands on the
     // shared cell. (Params were boxed at bind time above; this covers

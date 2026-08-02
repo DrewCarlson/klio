@@ -13319,7 +13319,11 @@ fn lowerResolvedMemberCall(
                 .simple_unknown;
             lm_noclass[@intFromEnum(k)] += 1;
             if (runtime.getenvSlice("KLIO_NOCLASS_HEADS") != null) {
-                std.debug.print("[no-class-head] {s}\n", .{head});
+                if (b.typeParamBound(head)) |tpb| {
+                    std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
+                } else {
+                    std.debug.print("[no-class-head] {s} no-bound-record tp={}\n", .{ head, b.isTypeParam(head) });
+                }
             }
         }
         return .none;

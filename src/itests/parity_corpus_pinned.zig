@@ -1577,6 +1577,16 @@ test "ext_body_bare_iterator_star" {
     );
 }
 
+test "splice_bounded_type_param_receiver" {
+    try check("splice_bounded_type_param_receiver",
+        \\[a, b, c]
+        \\[(1, a)]
+        \\[1, 2]
+        \\[3]
+        \\
+    );
+}
+
 test "exit_guard_negated_is_narrows_overload" {
     try check("exit_guard_negated_is_narrows_overload",
         \\18

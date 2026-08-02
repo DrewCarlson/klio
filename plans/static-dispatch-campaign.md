@@ -525,6 +525,19 @@ unless noted. Chronological.
   no_receiver_type 1,870→1,774, bound_virtual 5,121 (+96), 70.2% bound.
   Battery green. Pin `ext_body_bare_iterator_star`.
 
+- **Spliced inline callees carry their type-param bounds**
+  (`bindSpliceTypeParamBound`, restored on splice exit): a callee's
+  param types reach the caller's builder through `spliceParamTy`
+  (`destination: M`), but `M`'s bound stayed behind, so the head named
+  nothing and every member call on such a receiver was `no_class_id`
+  (the whole `M`/`C` family — `getOrPut` on `groupByTo`'s destination).
+  Recorded incomplete: the bound supports the receiver-owner lookup,
+  never a negative proof. With the projection-head fix the same tick:
+  no_class_id 300→193, bound_virtual 5,187, 71.4% stdlib bound. Pin
+  `splice_bounded_type_param_receiver`. Long-tail found writing the
+  pin: `toSortedMap { cmp }` (comparator lambda) and
+  `toSortedMap(compareBy { ... })` both unimplemented.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Shipping the unsigned value-class declarations (2026-08-02): adding
