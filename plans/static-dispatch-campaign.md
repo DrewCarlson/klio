@@ -3745,3 +3745,24 @@ numbers directory 7 files 0 failures, and the FULL sweep 117/0 twice
 with byte-identical output. The campaign's remaining open item is the
 tower-consult census lever (bare-call resolution over outer lambda
 receivers), plus the smaller resolver_declined residual pairs.
+
+
+### LANDED: the tower consult, derivation slice (KLIO_TOWER_EXT, default on)
+
+`bareExtensionTarget` now walks the implicit-receiver TOWER, innermost
+first: when the innermost head serves no extension, each outer entry is
+resolved in turn — Kotlin's actual bare-call scope order, feeding every
+derivation consumer (bareret returns, local typing, shape evidence).
+Derivation-side only; the emission commit with an outer-receiver
+binding remains a future slice. Census movement:
+
+    stdlib    no_receiver_type 1,964 -> 1,872 (30.65% -> 29.14%),
+              bound_virtual +34, bound member sites 57.1%
+    examples  no_receiver_type 16,424 -> 15,475 (-949, 23.9% -> 22.45%),
+              bound_virtual +400, bound 64.7%
+
+Gates: sweep 117/0, corpus 266/266 (headless runner), pinned 146/147.
+Remaining census work: the outer-receiver EMISSION commit (binding the
+outer `this` capture at the call site), the no_class_id population the
+naming progression feeds (300 stdlib / 3,816 examples), and the
+resolver_declined pairs (465 / 3,775).

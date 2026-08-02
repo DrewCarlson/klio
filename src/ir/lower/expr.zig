@@ -8386,19 +8386,29 @@ fn bareExtensionTarget(
         eagerLambdaRecvHead(b),
     );
     defer b.allocator.free(implicit_owners);
-    return b.module.resolveExtensionCall(
-        name.name,
-        recv,
-        shapes,
-        .{
-            .caller_file = name.span.file,
-            .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
-            .implicit_dispatch_owners = implicit_owners,
-            .lexical_owner = b.ownerClass(),
-            .call_name = name.name,
-            .actual_type_param_bounds = bounds orelse &.{},
-        },
-    ).target;
+    const ctx = ir.Module.ExtensionResolveCtx{
+        .caller_file = name.span.file,
+        .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+        .implicit_dispatch_owners = implicit_owners,
+        .lexical_owner = b.ownerClass(),
+        .call_name = name.name,
+        .actual_type_param_bounds = bounds orelse &.{},
+    };
+    if (b.module.resolveExtensionCall(name.name, recv, shapes, ctx).target) |t| return t;
+    // Kotlin resolves a bare call against EVERY implicit receiver,
+    // innermost first. When the innermost head serves no extension, the
+    // OUTER tower entries are the remaining candidates (`collect {}`
+    // inside an operator's flow-lambda belongs to `this@drop : Flow`).
+    // Derivation-side only; gated for single-binary A/B.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EXT") orelse "1", "0")) {
+        const recv_head = typeHead(std.mem.trimEnd(u8, recv.name, "?"));
+        for (b.implicit_receiver_tower.items) |outer_head| {
+            if (std.mem.eql(u8, outer_head, recv_head)) continue;
+            const outer_ref = ir.TypeRef{ .name = outer_head, .nullable = false, .args = &.{} };
+            if (b.module.resolveExtensionCall(name.name, outer_ref, shapes, ctx).target) |t| return t;
+        }
+    }
+    return null;
 }
 
 /// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
