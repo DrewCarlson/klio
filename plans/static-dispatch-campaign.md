@@ -552,6 +552,21 @@ unless noted. Chronological.
 
 ## Measured dead ends and falsified theories — do not retry
 
+- Invoke-convention return typing for enclosing fn-typed ctor
+  properties (2026-08-03): two forms built — a chain walk answering
+  the fn type's last argument for a bare `createFrom(...)` whose
+  member resolution finds nothing, and an unwrap at the final
+  fallback when the resolved target is the property GETTER (zero
+  params, args present, `Function` return head). Derivation-level
+  effect confirmed (`[valty] data = List` stores appear; the
+  `[no-recv-name] data` rows collapse 30→3) yet BOTH censuses
+  identical: the consuming reads sit inside expect-style LAMBDAS,
+  classified `captured`, where the local decl-type inheritance already
+  fails to convert the site. Reverted. Re-derive only after the
+  captured-receiver/lambda channel converts sites at all — the
+  unwrap's guard (`value_params == 0 and call.args.len != 0`) is the
+  correct discriminator against fn-returning functions.
+
 - **Unsigned representation unification, first arc landed**: the real
   `unsigned/src/kotlin/U*{,Array}.kt` + `UnsignedCommon.kt` ship, with
   execution host-repr end to end — `kotlin.U*` constructor intrinsics
