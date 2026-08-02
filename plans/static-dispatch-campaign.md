@@ -3678,3 +3678,20 @@ REMAINING: compose_nodes (recomposition identity, nodesCreated 10 vs
 7) and compose_ui_text (text metrics, height 48 vs 68) — the last two
 corpus residuals — plus the tower-consult census lever and eager-mode
 readiness from the campaign backlog.
+
+
+### compose_nodes GREEN — 265/266
+
+The keyed-reorder recreation root: `wrapLoopContent`'s per-iteration
+REPLACE group. When a loop body IS a `key(...)` call, the movable group
+must sit as a DIRECT SIBLING of the other iterations' groups so a
+reorder MOVES it; the per-iteration wrapper paired old and new
+iterations positionally instead, leaving each Pending with a single
+foreign key (`dbg-getnext: pending{a} asked for c, mapSize=1` — the
+pack-probe chain through Pending.getNext/keyMap add) and recreating
+every node. The pass now skips the body wrap for sole-`key` bodies —
+matching both the pre-rewrite call and the already-rewritten
+startMovableGroup block, since the key rewrite runs child-first — and
+the movable bracket itself covers the remember-shift rationale the
+wrapper existed for. compose_nodes matches; sweep 117/0; drift
+264 -> 265/266. ONE residual: compose_ui_text (text metrics).

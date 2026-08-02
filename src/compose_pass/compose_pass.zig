@@ -2122,11 +2122,37 @@ const Walker = struct {
     /// loop (a growing `for { remember(...) }` must not displace the
     /// remembers after it). Bodies that jump out (`break`/`continue`/
     /// `return`) are left unbracketed: the jump would skip the end call.
+    /// Whether a loop body is exactly one bare `key(...)` call (directly or
+    /// as a single-statement block).
+    fn bodyIsSoleKeyCall(e: *const Expr) bool {
+        switch (e.*) {
+            .Call => |c| return c.callee.* == .Path and
+                c.callee.Path.segments.len == 1 and
+                std.mem.eql(u8, c.callee.Path.segments[0].name, "key"),
+            .Block => |blk| {
+                // The rewritten form: { startMovableGroup(...); ...; endMovableGroup(); ... }.
+                if (blk.stmts.len != 0 and isComposerCallStmt(&blk.stmts[0], "startMovableGroup")) return true;
+                if (blk.stmts.len != 1) return false;
+                if (blk.stmts[0] != .Expr) return false;
+                return bodyIsSoleKeyCall(&blk.stmts[0].Expr);
+            },
+            else => return false,
+        }
+    }
+
     fn wrapLoopContent(w: *Walker, loop: *Expr, body: *Expr) void {
         if (!(w.thread and !w.explicit_groups)) return;
         if (!w.branchHasComposable(body)) return;
         if (loopBodyEscapes(body)) return;
-        w.wrapBranchBoxed(body);
+        // A body that IS a `key(...)` call brings its own MOVABLE group,
+        // and that group must sit as a direct sibling of the other
+        // iterations' groups so a reorder MOVES it. A per-iteration
+        // replace wrapper would pair old and new iterations positionally,
+        // leaving each pending with a single foreign key and recreating
+        // every node (compose_nodes' reorder). The movable group already
+        // gives each iteration its own bracket, so the remember-shift
+        // rationale below is covered too.
+        if (!bodyIsSoleKeyCall(body)) w.wrapBranchBoxed(body);
         const sp = exprSpanOf(loop);
         const key = positionalKey(sp);
         const start_args = w.a.alloc(Expr, 1) catch @panic("oom");
