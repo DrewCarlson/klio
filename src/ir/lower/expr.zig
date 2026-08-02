@@ -7883,6 +7883,11 @@ fn narrowNullCheck(
 }
 
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+            std.debug.print("[valty] READ {s} decl={s}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>" });
+        }
+    }
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
     // NOT feed evidence yet: typeck's permissive inference can hand back
     // a wrong container head (a ByteArray value typed Iterable), and a

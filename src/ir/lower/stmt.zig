@@ -171,7 +171,7 @@ fn isSafeMemberTarget(target: *const Expr) bool {
 fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?Reg {
     if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
         if (std.mem.eql(u8, w, p.name.name))
-            std.debug.print("[valty] enter {s} annotated={} init_tag={s}\n", .{ p.name.name, p.ty != null, if (p.init) |*e| @tagName(std.meta.activeTag(e.*)) else "-" });
+            std.debug.print("[valty] enter {s} annotated={} init_tag={s} nf={d}\n", .{ p.name.name, p.ty != null, if (p.init) |*e| @tagName(std.meta.activeTag(e.*)) else "-", b.module.funcs.items.len });
     }
     // `val x = expr` / `var x = expr`. The init is lowered
     // into a fresh register and bound in the current scope;

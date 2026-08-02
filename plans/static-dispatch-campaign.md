@@ -3562,3 +3562,25 @@ either record decl types in the elvis-jump statement arm (find it —
 it is not lowerPropertyDecl) or make the emitting pass the recording
 one. The refutation fires the moment the shape carries Function3
 (`inst=Unit` awaits it).
+
+
+Alignment probes conclusive on the store/read side: the local RECORDS
+Function3 in the emitting pass (valty enter nf=7832 -> Function3), and
+EVERY reader channel (strict argDeclTypeRef probe, the lazy Path arm's
+localDeclTypeRef) answers Function3 — the guards between (splice-param,
+two-segment) do not apply. Yet the [smac] nargs=1 evaluation consumes
+arg_ty=- at nf=7832, which EQUALS the post-lowering func count: that
+evaluation is most plausibly a RUNTIME re-resolution
+(module.resolveMemberCall invoked from the dispatch path with
+runtime-built, typeless shapes), not the lowering emission — and no
+second nargs=1 smac with a typed arg appears, so the LOWERING's member
+resolution for the site either never re-evaluates #79 with the typed
+shapes or its result is not what emits. NEXT (one discriminator): tag
+[smac] with a lowering-vs-runtime bit (thread a `static` flag or check
+ir.eval.currentFrameFunc() != null) — if the untyped evaluation is
+runtime-only, the fix is to make the LOWERING commit (find why its
+compat pass is absent for the site: possibly the memoized
+[member-static] deferred answer from the FIRST pass is CACHED and
+served to the second — resolveMemberCall memo keyed without shapes
+would explain everything). The memo hypothesis is checkable by
+searching resolveMemberCall for a resolve cache and printing hits.
