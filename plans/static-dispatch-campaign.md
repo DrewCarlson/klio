@@ -3510,3 +3510,20 @@ class (`setLocalDeclType` for each primary param, as
 lowerPropertyInitExpr's declared_params path does) before running
 staticExprTypeRef. Then the invoke arm fires (proven live), the local
 types Function3, and `inst=Unit` refutes — the verified-ready tail.
+
+
+Builder seeding LANDED (owner ctor-property types + the fn's own param
+types, the lowerPropertyInitExpr pattern; a Member-callee `return=`
+trace joined the bareret prints). The site derivation is now PROVEN
+LIVE end to end: `[bareret] .createOnCancellationAction on ClauseData
+target ok` + `return=Function3`. Yet the runtime still fails
+(trySelect err=CalleeFailed) and the 1-arg smac still shows `arg_ty=-`:
+the DERIVATION works when probed, but the local's type is absent at
+the EMISSION of `cont.tryResume(onCancellation)` in the same body.
+The one open disconnect: either the smac nargs=1 line belongs to a
+DIFFERENT 1-arg site (Mutex's CancellableContinuationWithOwner wrapper
+— check by printing the caller file/span in smac), or the stmt.zig
+`.Call` recording arm is not reached for a `val` declared inside a
+when-arm block inside `while(true)` (verify with a gated print in the
+arm for name=onCancellation). Whichever, the fix is mechanical once
+seen. Gates: sweep 117/0, drift 262/266 unchanged.

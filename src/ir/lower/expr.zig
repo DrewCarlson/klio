@@ -9105,6 +9105,20 @@ fn staticCallReturnTypeRef(
                                     defer nb.deinit();
                                     nb.setOwnerClass(oc.name);
                                     nb.setRecvTy(oc.name);
+                                    // The owner's ctor properties are the
+                                    // body's lexical bindings — seed their
+                                    // declared types so a bare property read
+                                    // (`onCancellationConstructor?.invoke`)
+                                    // resolves, the pattern
+                                    // lowerPropertyInitExpr already uses.
+                                    for (oc.primary_params) |*pp| {
+                                        try nb.setLocalDeclTypeOwned(pp.name, try pp.ty.clone(b.allocator));
+                                        if (pp.ty.nullable) try nb.setLocalDeclNullable(pp.name);
+                                    }
+                                    for (fa.params) |*ap| {
+                                        try nb.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb, &ap.ty));
+                                        if (ap.ty.nullable) try nb.setLocalDeclNullable(ap.name.name);
+                                    }
                                     inferred = try staticExprTypeRef(&nb, &fbody.Expr);
                                 }
                             }
@@ -9124,6 +9138,12 @@ fn staticCallReturnTypeRef(
     {
         std.debug.print("[bareret] {s} return={s}\n", .{
             call.callee.Path.segments[0].name,
+            if (inferred) |i| i.name else "<null>",
+        });
+    }
+    if (call.callee.* == .Member and bareRetTraceFor(b, call.callee.Member.name.name)) {
+        std.debug.print("[bareret] .{s} return={s}\n", .{
+            call.callee.Member.name.name,
             if (inferred) |i| i.name else "<null>",
         });
     }
