@@ -7993,6 +7993,11 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
 }
 
 pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
+            std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
+        }
+    }
     if (arg.* == .This and arg.This.qualifier == null) {
         // An extension body spliced into a member function binds a new `this`
         // register while the builder's flat declaration metadata still names

@@ -3584,3 +3584,18 @@ compat pass is absent for the site: possibly the memoized
 served to the second — resolveMemberCall memo keyed without shapes
 would explain everything). The memo hypothesis is checkable by
 searching resolveMemberCall for a resolve cache and printing hits.
+
+
+Discriminators run: NO memo exists on resolveMemberCall; the untyped
+nargs=1 evaluation is rt=false — the LOWERING itself. Yet the LAZY
+reader probe (argDeclTypeRefLazy entry, gated) prints
+`decl=Function3 splice=false lsr=false` on EVERY call for the name,
+and in the fully-traced run the untyped smac line does not appear at
+all while the untraced run still hangs. The remaining contradiction is
+therefore confined to ONE probe: dump the SHAPE actually built for the
+`cont.tryResume(onCancellation)` site inside buildStaticReturnArgShapes
+(print each arg's tag + the ty the builder stores, keyed on the Path
+arg name matching KLIO_VALTY_TRACE) — that shows whether the builder
+stores the type and resolveMemberCall receives it, isolating the strip
+between builder and candidate loop (the only remaining segment).
+select stays red; all seven landed pieces hold their gates.

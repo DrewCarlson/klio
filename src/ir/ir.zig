@@ -3359,7 +3359,8 @@ pub const Module = struct {
         const params = f.params[skip..];
         if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
             if (std.mem.eql(u8, std.mem.span(w), f.name)) {
-                std.debug.print("[smac] {s}#{d} nargs={d} recv={s} recv_args={d} nf={d}\n", .{
+                std.debug.print("[smac] rt={} {s}#{d} nargs={d} recv={s} recv_args={d} nf={d}\n", .{
+                    eval.currentFrameFunc() != null,
                     f.fqn,
                     fid.int(),
                     args.len,
