@@ -393,6 +393,26 @@ unless noted. Chronological.
   (six-call sequence; corrupts only on the 6th, at the OSR checkpoint
   after a cold-entry compile).
 
+- **Tower-complete receiver scope (`KLIO_TOWER_SCOPE`)** — a lambda/thunk
+  body's receiver scope is COMPLETE when its implicit-receiver tower
+  enumerates every level and each entry's class passes the plain-method
+  tests (no enclosing-class instance, no companion pairing, complete
+  hierarchy shadow set per lifted-outer chain). `ResolveCtx` carries the
+  tower; `knownReceiverApplicability` consults every tower head like the
+  owner path (symbolic instantiation + bounds). Unlocks the
+  `bare_call_member_shadowable` deferral family — BUT a tower-unlocked
+  static commit requires a SOLE candidate: the old deferral was the
+  runtime's overload/tier safety net for unproven argument types, and
+  the unguarded unlock let same-package
+  `test.text.assertContentEquals(String, CharSequence)` beat the
+  star-imported applicable Sequence overload (StringTest.
+  splitToLineSequence caught it — tier picks without type proof are not
+  commitments). Guarded yield on the stdlib set: 8 of the 186 reachable
+  sites; the rest wait on argument-type authority (each arg-typing gain
+  auto-widens this) or the ranker learning to REFUTE competing tiers.
+  Next refinement: commit multi-candidate picks when the shapes prove
+  the target applicable and refute every competitor.
+
 ## Measured dead ends and falsified theories — do not retry
 
 - Boolean operator results; cast (`.As`) initializers; the `storage`

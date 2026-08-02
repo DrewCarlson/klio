@@ -7024,6 +7024,22 @@ pub const Module = struct {
         /// bodies and declarations with outer or companion receivers leave
         /// this false.
         receiver_scope_complete: bool = false,
+        /// The full implicit-receiver tower's heads (innermost first) when
+        /// the lowering context carries one. With `receiver_scope_complete`,
+        /// these are the receivers beyond `recv_type`/`owner_class` that the
+        /// known-receiver applicability probe must also consult — a lambda
+        /// body's scope is complete exactly when its tower enumerates every
+        /// level.
+        tower: []const ReceiverTowerEntry = &.{},
+        /// `receiver_scope_complete` was proven by the TOWER (a lambda/thunk
+        /// context), not a plain method body. A tower-unlocked static commit
+        /// additionally requires a SOLE candidate: the pre-existing deferral
+        /// was the runtime's overload/tier safety net for unproven argument
+        /// types, and unlocking it must not let a near-tier pick beat an
+        /// applicable far-tier import (`test.text.assertContentEquals(String,
+        /// CharSequence)` vs the star-imported Sequence form was the live
+        /// break).
+        tower_scope: bool = false,
     };
 
     fn funcIsInline(self: *const Module, id: FuncId) bool {
@@ -7763,10 +7779,11 @@ pub const Module = struct {
         include_extensions: bool,
     ) ?bool {
         if (!ctx.receiver_scope_complete) return null;
-        var receivers: [2]TypeRef = undefined;
-        var receiver_complete: [2]bool = undefined;
-        var receiver_bounds: [2][]const ModuleRegistry.TypeParamBound = undefined;
+        var receivers: [8]TypeRef = undefined;
+        var receiver_complete: [8]bool = undefined;
+        var receiver_bounds: [8][]const ModuleRegistry.TypeParamBound = undefined;
         var owner_args: [32]TypeRef = undefined;
+        var tower_args: [6][32]TypeRef = undefined;
         var receiver_count: usize = 0;
         if (ctx.recv_type orelse if (ctx.recv_ty) |head|
             TypeRef{ .name = head, .nullable = false, .args = &.{} }
@@ -7826,8 +7843,59 @@ pub const Module = struct {
                 receiver_count += 1;
             }
         }
+        // Tower receivers beyond recv/owner: each head becomes a symbolic
+        // instantiation exactly like the owner path. A head that resolves no
+        // class, exceeds the fixed capacity, or carries an incomplete proof
+        // marks the scope incomplete (the probe then abstains rather than
+        // proving a negative it cannot see).
+        var tower_incomplete = false;
+        var tower_slot: usize = 0;
+        for (ctx.tower) |tower_entry| {
+            var tref = TypeRef{ .name = tower_entry.head, .nullable = false, .args = &.{} };
+            const tid = self.staticTypeClassId(tref) orelse {
+                tower_incomplete = true;
+                continue;
+            };
+            var dup = false;
+            var i: usize = 0;
+            while (i < receiver_count) : (i += 1) {
+                if (self.staticTypeClassId(receivers[i])) |seen_id| {
+                    if (seen_id.int() == tid.int()) {
+                        dup = true;
+                        break;
+                    }
+                }
+            }
+            if (dup) continue;
+            if (receiver_count >= receivers.len or tower_slot >= tower_args.len) {
+                tower_incomplete = true;
+                break;
+            }
+            var complete = false;
+            var bounds: []const ModuleRegistry.TypeParamBound = &.{};
+            if (tid.int() < self.classes.items.len) {
+                const class = &self.classes.items[tid.int()];
+                if (class.type_params.len <= tower_args[tower_slot].len) {
+                    for (class.type_params, 0..) |param, k| {
+                        tower_args[tower_slot][k] = .{ .name = param, .nullable = false, .args = &.{} };
+                    }
+                    tref = .{
+                        .name = class.fqn,
+                        .nullable = false,
+                        .args = tower_args[tower_slot][0..class.type_params.len],
+                    };
+                    bounds = self.registry.class_type_param_bounds.get(class.fqn) orelse &.{};
+                    complete = self.staticTypeProofComplete(tref, bounds);
+                }
+            }
+            receivers[receiver_count] = tref;
+            receiver_complete[receiver_count] = complete;
+            receiver_bounds[receiver_count] = bounds;
+            receiver_count += 1;
+            tower_slot += 1;
+        }
         if (receiver_count == 0) return null;
-        var has_incomplete_receiver = false;
+        var has_incomplete_receiver = tower_incomplete;
         const lexical_owner: ?ClassId = if (ctx.owner_class) |lexical|
             self.staticTypeClassId(.{ .name = lexical, .nullable = false, .args = &.{} })
         else
@@ -8020,6 +8088,17 @@ pub const Module = struct {
                 if (std.mem.eql(u8, w, name)) std.debug.print("[ef] {s} t={d} inline={} nlr={} recvctx={} shadowable={} shadow={} file={d}\n", .{ name, t.int(), self.funcIsInline(t), ctx.nonlocal_return_lambda, ctx.in_receiver_context, member_shadowable, shadow, caller_file.int() });
             }
             if (!shadow) {
+                if (ctx.tower_scope and candidates.len > 1) {
+                    const cs = try self.candidateSet(
+                        alloc,
+                        name,
+                        candidates,
+                        caller_pkg,
+                        caller_file,
+                        tier,
+                    );
+                    return .{ .target = t, .confidence = .virtual, .emit_form = .CallMemberOrGlobal, .candidate_set = cs, .reason = reason, .tier = tier, .tier_count = tier_count };
+                }
                 return .{ .target = t, .confidence = .exact, .emit_form = .Call, .reason = reason, .tier = tier, .tier_count = tier_count };
             }
             const cs = try self.candidateSet(

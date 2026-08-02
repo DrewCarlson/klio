@@ -10031,12 +10031,56 @@ fn resolveCtxFor(
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
         .owner_class = b.ownerClass(),
-        .receiver_scope_complete = receiverScopeComplete(b),
+        .receiver_scope_complete = receiverScopeKind(b) != .no,
+        .tower_scope = receiverScopeKind(b) == .tower,
+        .tower = b.implicit_receiver_tower.items,
     };
 }
 
-fn receiverScopeComplete(b: *FuncBuilder) bool {
-    if (b.capturesThisSlot() or b.isParamThunk()) return false;
+/// A lambda/thunk body's receiver scope is complete when its
+/// implicit-receiver TOWER enumerates every level and each entry's class is
+/// free of the outer-receiver escapes (enclosing-class instances, companion
+/// pairing) with a complete hierarchy shadow set — the same tests the
+/// plain-method owner path applies, per tower entry.
+fn towerScopeComplete(b: *FuncBuilder) bool {
+    const items = b.implicit_receiver_tower.items;
+    if (items.len == 0) return false;
+    for (items) |entry| {
+        var head = std.mem.trimEnd(u8, entry.head, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        const cid = (if (std.mem.indexOfScalar(u8, head, '.') != null)
+            b.module.classIdByFqn(head)
+        else
+            b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return false;
+        if (cid.int() >= b.module.classes.items.len) return false;
+        const lifted = b.module.classes.items[cid.int()].name;
+        const fqn = b.module.classes.items[cid.int()].fqn;
+        if (b.module.registry.enclosing_class.get(lifted) != null or
+            b.module.registry.enclosing_class.get(fqn) != null)
+        {
+            return false;
+        }
+        if (b.module.registry.companion_singletons.contains(lifted) or
+            b.module.registry.companion_singletons.contains(fqn))
+        {
+            return false;
+        }
+        if (ownerChainShadowContains(b, lifted, "") == null) return false;
+    }
+    return true;
+}
+
+const ScopeCompleteness = enum { no, plain, tower };
+
+fn receiverScopeKind(b: *FuncBuilder) ScopeCompleteness {
+    if (b.capturesThisSlot() or b.isParamThunk()) {
+        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_SCOPE") orelse "1", "0")) return .no;
+        return if (towerScopeComplete(b)) .tower else .no;
+    }
+    return if (receiverScopeCompletePlain(b)) .plain else .no;
+}
+
+fn receiverScopeCompletePlain(b: *FuncBuilder) bool {
     const recv = b.recvTypeRef();
     const owner = b.ownerClass();
     if (recv) |receiver| {
@@ -15915,35 +15959,35 @@ test "receiver scope completeness requires a complete static receiver tower" {
     var owner_builder = try FuncBuilder.init(testing.allocator, &m);
     defer owner_builder.deinit();
     owner_builder.setOwnerClass("Owner");
-    try testing.expect(receiverScopeComplete(&owner_builder));
+    try testing.expect(receiverScopeCompletePlain(&owner_builder));
 
     m.registry.hierarchy_shadow_names.getPtr("Owner").?.complete = false;
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     m.registry.hierarchy_shadow_names.getPtr("Owner").?.complete = true;
 
     try m.registry.enclosing_class.put("Owner", "Outer");
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     _ = m.registry.enclosing_class.remove("Owner");
 
     try m.registry.companion_singletons.put("Owner", "Owner$Companion");
-    try testing.expect(!receiverScopeComplete(&owner_builder));
+    try testing.expect(!receiverScopeCompletePlain(&owner_builder));
     _ = m.registry.companion_singletons.remove("Owner");
 
     var extension_builder = try FuncBuilder.init(testing.allocator, &m);
     defer extension_builder.deinit();
     extension_builder.setRecvTy("String");
-    try testing.expect(!receiverScopeComplete(&extension_builder));
+    try testing.expect(!receiverScopeCompletePlain(&extension_builder));
     const string_names = std.StringHashMap(void).init(testing.allocator);
     try m.registry.hierarchy_shadow_names.put("String", .{
         .names = string_names,
         .complete = true,
     });
-    try testing.expect(receiverScopeComplete(&extension_builder));
+    try testing.expect(receiverScopeCompletePlain(&extension_builder));
     m.registry.hierarchy_shadow_names.getPtr("String").?.complete = false;
-    try testing.expect(!receiverScopeComplete(&extension_builder));
+    try testing.expect(!receiverScopeCompletePlain(&extension_builder));
     m.registry.hierarchy_shadow_names.getPtr("String").?.complete = true;
     extension_builder.setOwnerClass("Owner");
-    try testing.expect(receiverScopeComplete(&extension_builder));
+    try testing.expect(receiverScopeCompletePlain(&extension_builder));
 }
 
 test "bare enclosing property lowers with its outer getter owner" {
