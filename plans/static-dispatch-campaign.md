@@ -3695,3 +3695,36 @@ startMovableGroup block, since the key rewrite runs child-first — and
 the movable bracket itself covers the remember-shift rationale the
 wrapper existed for. compose_nodes matches; sweep 117/0; drift
 264 -> 265/266. ONE residual: compose_ui_text (text metrics).
+
+
+### THE CORPUS IS GREEN — 266/266
+
+compose_ui_text was never an interpreter defect: `__composeui_
+measureText` loads the REAL Skia shim when the binary sits beside
+`zig-out/lib/libklio_skia.dylib` (the exe-relative `../lib` probe), so
+the out-of-process drift runner measured real font metrics while the
+corpus expectations are HEADLESS (captured with the nominal mono-
+advance estimate, exactly as the in-process e2e binary runs from the
+cache directory with no shim in reach). A harness copy relocated away
+from zig-out renders headless and MATCHES — and the full drift sweep
+with the relocated runner reports 266 OK, 0 bad.
+
+FINAL LEDGER for the drift campaign: 249 -> 266/266. Every residual
+closed by root cause: the channel host-binding override, getter
+expected types, the kotlin.io any-member removal, the SAM-guard
+builtin/anon-chain blindness, the alias inline splice, F-bounded local
+extensions, the Iterable-fallback arity, defaulted post-vararg
+positionals, range-in-range deferral, the finally-leaf classification,
+Any-parameter evidence, suppressed-exception intrinsics, virtual-
+fallback arg names, the flow-builder object identity, mosaic's
+initializer-derivation typing, select's eleven-piece
+resolution-and-commit chain, compose_nodes' keyed-loop sibling
+movement — and the compose_ui_text environment note above. Sweep
+117/0 throughout; pinned suite 147 (the backtick strictness fixture
+stays owned by the resolution-unification plan).
+
+The campaign backlog that remains OUTSIDE the corpus ledger: the
+tower-consult census lever (bare-call resolution over outer lambda
+receivers — a coverage lever, not a correctness gap) and eager-mode
+readiness (the NaN total-order pair), both specified earlier in this
+document.
