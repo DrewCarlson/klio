@@ -9596,6 +9596,20 @@ pub fn invokeVirtualMember(
             const mname: ?[]const u8 = if (module.funcById(root)) |f| f.name else null;
             const runtime_class = module.classIdByFqn(receiver.typeFqn()) orelse
                 break :blk .{ .target = null, .name = mname };
+            // A host-backed receiver executes its members as native
+            // intrinsics keyed by its runtime class's FQN, and that binding
+            // is the most-derived override of the slot: the interpreted
+            // source body reads a source-level representation the host value
+            // never materializes (`Result.toString` matches on the `Failure`
+            // wrapper; the host Result stores a discriminant and the raw
+            // payload). Same rule as the host-synth Instance probe below.
+            if (mname) |n| {
+                var fqn_buf: [192]u8 = undefined;
+                if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ receiver.typeFqn(), n })) |member_fqn| {
+                    if (lookupIntrinsic(self, member_fqn) != null)
+                        break :blk .{ .target = null, .name = n };
+                } else |_| {}
+            }
             const target = module.methodSlotTarget(runtime_class, slot) orelse
                 break :blk .{ .target = null, .name = mname };
             // A bodyless declaration linked to a host symbol is executable —

@@ -41,19 +41,18 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 8,139 member sites
-              575   7.06%  bound_static
-            4,733  58.15%  bound_virtual     (64.9% bound; 2.34% at campaign start)
-            1,872  23.00%  no_receiver_type
-              539   6.62%  resolver_declined
+    stdlib:   total 8,135 member sites
+              671   8.25%  bound_static
+            4,935  60.66%  bound_virtual     (68.9% bound; 2.34% at campaign start)
+            1,870  22.99%  no_receiver_type
+              239   2.94%  resolver_declined (all target_known_deferred)
               300   3.69%  no_class_id
-              120   1.47%  nullable_or_generic
 
-    examples: total 87,715
-            4,377   4.99%  bound_static
-           58,361  66.53%  bound_virtual     (71.5% bound; 37.4% at start)
-           15,475  17.64%  no_receiver_type
-            4,408   5.03%  resolver_declined
+    examples: total 87,663
+            4,745   5.41%  bound_static
+           59,469  67.84%  bound_virtual     (73.2% bound; 37.4% at start)
+           15,449  17.62%  no_receiver_type
+            2,906   3.31%  resolver_declined
             3,816   4.35%  no_class_id
             1,278   1.46%  nullable_or_generic
 
@@ -437,16 +436,43 @@ unless noted. Chronological.
   carry extension families everywhere). stdlib bound_static 549→575,
   resolver_declined 565→539; examples 4,324→4,377 / 4,461→4,408.
 
-- Wholesale virtual emission for stub/value owners (`KLIO_VOWN`,
-  default OFF): the deferral site's own comment argues the runtime
-  handles both receiver representations (slot against interpreted
-  class, name-fallback for host values), and flipping it binds the
-  208+92 `virtual_owner_*` sites — but UuidTest's throwing validators
-  (`fromByteArray`/`fromUByteArray`/`parseInvalid`, a VALUE-class
-  owner) then RETURNED their IllegalArgumentException as a value
-  instead of raising. Root-cause that family (the virtual-slot path on
-  a value-class receiver swallowing a Throw into a result) before
-  re-flipping; the gate and this note are the seam.
+- **Stub/value owners emit their virtual slot** (`KLIO_VOWN`, default
+  ON; `=0` disables): binds the `virtual_owner_stub`/`virtual_owner_value`
+  deferral families. The flip needed three prerequisites, each a real
+  bug the emission exposed:
+  1. *Final members downgrade `.virtual` → `.direct` at the deferral
+     site* when `dispatchForTarget` proves it — `Result.exceptionOrNull`
+     as a virtual slot misdispatched on the value representation and
+     `runCatching { }.fold` took the success arm holding the thrown
+     exception (assertFailsWith is built on exactly that shape).
+  2. *Exit-guard `!is` narrowing* (`narrowNegatedIsCheckAll`): after
+     `if (x !is T) throw ...`, `x` is `T` below, including through the
+     `||` chain — `ValueTimeMark.minus(ComparableTimeMark)` guards then
+     calls `this.minus(other)` meaning the ValueTimeMark overload, and
+     the static bind without the narrow resolved the call back to the
+     enclosing overload and recursed until the stack ran out
+     (TimeMarkTest adjustmentBig/Infinite). Pin
+     `exit_guard_negated_is_narrows_overload`.
+  3. *Host-repr receivers prefer their FQN-keyed intrinsic over the
+     interpreted slot target* (`invokeVirtualMember` non-Instance path):
+     the source `Result.toString` matches on the `Failure` wrapper the
+     host `.Result{ok, payload}` never materializes, so the slot entered
+     a representation-mismatched body and printed `Success(...)` for a
+     failure (coroutines ResultTest). Same most-derived rule the
+     host-synth Instance probe already applied. Fixed alongside two
+     VOWN-independent render gaps the investigation surfaced: `println`
+     and template stringify now dispatch a host Result's `toString`, so
+     `Failure($exception)` uses the payload's override. Pin
+     `result_host_render_custom_tostring`.
+
+  Census: stdlib resolver_declined 539→239 (every `virtual_owner_stub`
+  208 + `virtual_owner_value` 92 site converted; the 239 remainder is
+  all `target_known_deferred`), bound_static 575→671, bound_virtual
+  4,733→4,935 (65.2%→68.9% bound). Examples resolver_declined
+  4,408→2,906, bound 71.5%→73.2%. Full battery green: sweep 117/0,
+  corpus drift 266/266, threaded litmus at its 3-failure baseline,
+  compose SnapshotStateListTests 61/65 with exactly the four known
+  throughput-bound concurrent tests.
 
 ## Measured dead ends and falsified theories — do not retry
 

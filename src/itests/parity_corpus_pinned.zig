@@ -1560,6 +1560,27 @@ test "local_fn_default_beats_stdlib_sibling" {
     );
 }
 
+test "exit_guard_negated_is_narrows_overload" {
+    try check("exit_guard_negated_is_narrows_overload",
+        \\18
+        \\5
+        \\
+    );
+}
+
+test "result_host_render_custom_tostring" {
+    try check("result_host_render_custom_tostring",
+        \\Failure(CustomException: F)
+        \\tpl: Failure(CustomException: F)
+        \\Failure(CustomException: F)
+        \\true
+        \\CustomException: F
+        \\Success(OK)
+        \\Failure(CustomException: G)
+        \\
+    );
+}
+
 test "inherited_overload_beats_own_predicate" {
     try check("inherited_overload_beats_own_predicate",
         \\[0, 1, 3, 5]
