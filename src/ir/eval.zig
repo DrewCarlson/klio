@@ -9157,9 +9157,10 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
 fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
     // Instances dispatch their `toString()` override; List/Set/Map dispatch too
     // so their element `toString()` fires (the fast `renderValue`/`display`
-    // formatter prints `ClassName@id` for a user element). Arrays keep Kotlin's
-    // identity `toString`, so they are not included.
-    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map) {
+    // formatter prints `ClassName@id` for a user element), and `Result` so
+    // `Failure($exception)` interpolates the payload's override. Arrays keep
+    // Kotlin's identity `toString`, so they are not included.
+    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map or v.* == .Result) {
         switch (try host.callMember(allocator, v, "toString", &.{})) {
             .ok => |result| {
                 if (result == .String) {

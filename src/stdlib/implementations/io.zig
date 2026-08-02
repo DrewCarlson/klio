@@ -28,7 +28,11 @@ fn ok(v: Value) EvalResult {
 ///
 /// The returned bytes are owned by `ctx.allocator`; the caller frees them.
 pub fn renderViaUserToString(ctx: *CallCtx, v: *const Value) std.mem.Allocator.Error![]u8 {
-    if (v.* == .Instance) {
+    // A host `Result` renders through its `toString` intrinsic rather than
+    // the structural Display shape: the intrinsic interpolates the payload
+    // via ITS overridden `toString()`, so `Failure($exception)` shows a
+    // custom exception rendering exactly as Kotlin prints it.
+    if (v.* == .Instance or v.* == .Result) {
         if (try ctx.host.invokeMethod(v, "toString", &.{}, ctx.out)) |res| {
             if (res == .ok and res.ok == .String) {
                 const g = res.ok.String.borrow();

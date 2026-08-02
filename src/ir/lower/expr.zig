@@ -13449,6 +13449,20 @@ fn lowerResolvedMemberCall(
         if (norecvCensusOn()) lm_decline[@intFromEnum(DeclineKind.target_unresolvable)] += 1;
         return .deferred;
     };
+    if (resolved.dispatch == .virtual) {
+        const owner = &b.module.classes.items[static_owner.int()];
+        // A stub/value owner whose target is FINAL on a closed class never
+        // needs the slot — and its vtable-less representation cannot serve
+        // one. Downgrade to the direct fid call (`Result.exceptionOrNull`
+        // as a virtual slot misdispatched on the value representation and
+        // `runCatching { }.fold` took the success arm holding the thrown
+        // exception).
+        if (owner.is_value or owner.is_stub) {
+            if (b.module.dispatchForTarget(static_owner, func_id)) |d2| {
+                if (d2 == .direct) resolved.dispatch = .direct;
+            }
+        }
+    }
     const has_spread = anySpread(args);
     if (resolved.dispatch == .direct and has_spread) { declineNote(.direct_spread); return .deferred; }
     if (resolved.dispatch == .virtual) {
@@ -13464,13 +13478,15 @@ fn lowerResolvedMemberCall(
         // receiver's own class (honouring a user subtype's override) and
         // falls back to the member's name only for a host-backed value, which
         // is what the site did unconditionally before.
-        // `KLIO_VOWN=1` emits the virtual slot for stub/value owners (the
-        // comment above argues the runtime handles both representations).
-        // Measured NOT wholesale-safe: UuidTest's throwing validators
-        // returned their IllegalArgumentException as a VALUE under it —
-        // held OFF until that family is root-caused.
+        // Stub/value owners emit their virtual slot (`KLIO_VOWN=0`
+        // disables): the runtime resolves the slot against an interpreted
+        // receiver's class and name-falls-back for host values. The
+        // prerequisite was the FINAL-member direct downgrade above — the
+        // Uuid/Result family broke precisely because a final value-class
+        // member (`Result.exceptionOrNull`) rode a slot its value
+        // representation could not serve.
         const vown_hold = (owner.is_value or owner.is_stub) and
-            !std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "0", "1");
+            std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "1", "0");
         if (vown_hold or ast_type_args.len != 0)
         {
             declineNote(if (owner.is_value)
@@ -14355,6 +14371,36 @@ fn narrowAfterExitGuard(
     if (f.else_branch != null) return;
     if (!exprAlwaysExits(f.then_branch)) return;
     try narrowNullCheckAll(b, f.cond, false, out);
+    try narrowNegatedIsCheckAll(b, f.cond, out);
+}
+
+/// Every `!is` fact a failed exit guard proves for the code below it. The
+/// negation of `x !is T || y !is U` proves both `x is T` and `y is U`,
+/// mirroring the null walk's `||` polarity. Kotlin narrows here and stdlib
+/// leans on it: `ValueTimeMark.minus(ComparableTimeMark)` throws unless
+/// `other is ValueTimeMark`, then calls `this.minus(other)` meaning the
+/// ValueTimeMark overload — without the narrow the static bind resolved the
+/// call back to the enclosing overload and recursed.
+fn narrowNegatedIsCheckAll(
+    b: *FuncBuilder,
+    cond: *const Expr,
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (cond.* == .Binary and cond.Binary.op == .Or) {
+        try narrowNegatedIsCheckAll(b, cond.Binary.lhs, out);
+        try narrowNegatedIsCheckAll(b, cond.Binary.rhs, out);
+        return;
+    }
+    if (cond.* != .IsCheck) return;
+    const ck = cond.IsCheck;
+    if (!ck.negated) return;
+    const head = loweredCheckTypeName(b, &ck.ty);
+    if (head.len == 0) return;
+    if (ck.expr.* == .Path and ck.expr.Path.segments.len == 1) {
+        try out.append(b.allocator, try b.narrowLocal(ck.expr.Path.segments[0].name, head));
+    } else if (ck.expr.* == .This and ck.expr.This.qualifier == null) {
+        try out.append(b.allocator, try b.narrowLocal("this", head));
+    }
 }
 
 /// Whether control cannot fall out of this expression: it returns, throws,
