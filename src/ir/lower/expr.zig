@@ -12973,6 +12973,7 @@ fn lowerResolvedMemberCall(
     recv_state: ReceiverState,
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
+    last_member_refuted = false;
     const ty = declared_ty orelse {
         if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
             if (std.mem.eql(u8, wanted, name.name)) {
@@ -13124,8 +13125,10 @@ fn lowerResolvedMemberCall(
             }
         }
     }
-    const func_id = resolved.target orelse
+    const func_id = resolved.target orelse {
+        last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
+    };
     // The resolver identifies a single candidate but withholds dispatch when an
     // argument's type is unknown, so its applicability is unproven. Measured,
     // that is EVERY deferral reaching this point — sites with a fully proven
@@ -13546,6 +13549,11 @@ fn lowerResolvedExtensionCall(
     return dst;
 }
 
+/// Whether the immediately preceding member resolution statically refuted
+/// every candidate (consumed by the extension leg that runs next, so a
+/// sole receiver-proven extension can commit).
+threadlocal var last_member_refuted: bool = false;
+
 fn resolveExtensionCallForArgs(
     b: *FuncBuilder,
     recv_ty: TypeRef,
@@ -13561,6 +13569,8 @@ fn resolveExtensionCallForArgs(
     defer b.allocator.free(implicit_owners);
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
+    const member_refuted = last_member_refuted;
+    last_member_refuted = false;
     const resolve_ctx = ir.Module.ExtensionResolveCtx{
         .caller_file = caller_file,
         .caller_package = b.module.packageOfFile(caller_file) orelse b.self_package,
@@ -13568,6 +13578,7 @@ fn resolveExtensionCallForArgs(
         .lexical_owner = b.ownerClass(),
         .call_name = name.name,
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+        .member_refuted = member_refuted,
     };
     // Diagnostic only; see `applicability.trace_call_span`.
     if (applicability.extKeyTraceEnabled()) {

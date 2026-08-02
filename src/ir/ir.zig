@@ -1770,6 +1770,10 @@ pub const Module = struct {
     };
 
     pub const ExtensionResolveCtx = struct {
+        /// The caller's MEMBER resolution statically refuted every member
+        /// candidate: kotlinc's answer can only be an extension, so a sole
+        /// receiver-proven survivor commits even with unknown args.
+        member_refuted: bool = false,
         caller_file: FileId,
         caller_package: []const u8,
         /// Ordered implicit receiver heads that can supply a member
@@ -4134,9 +4138,18 @@ pub const Module = struct {
             std.mem.eql(u8, std.mem.span(v), "0")
         else
             false;
+        // A member-refuted call may commit its sole survivor only when the
+        // candidate is declared in the CALLER'S OWN FILE — the file-private
+        // shape (Select.kt's tryResume) kotlinc must bind, and narrow
+        // enough that cross-file stdlib chains keep their deferral
+        // (a wider member_refuted commit re-broke trimIndent).
+        const sole_same_file = ids.items.len == 1 and blk: {
+            const sp = self.decl_span.get(ids.items[0].int()) orelse break :blk false;
+            break :blk sp.file.int() == ctx.caller_file.int();
+        };
         const sole_survivor = !sole_off and ids.items.len == 1 and
             ranked_sigs.items.len == 1 and scoped_receiver.args.len != 0 and
-            receiver_pruned != 0;
+            (receiver_pruned != 0 or (ctx.member_refuted and sole_same_file));
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
                 !sole_survivor))

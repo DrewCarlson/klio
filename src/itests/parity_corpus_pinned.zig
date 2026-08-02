@@ -1567,3 +1567,10 @@ test "flow_builder_object_identity" {
         \\
     );
 }
+
+test "select_receive_beats_timeout" {
+    try check("select_receive_beats_timeout",
+        \\got 99
+        \\
+    );
+}

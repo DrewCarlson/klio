@@ -3655,3 +3655,26 @@ typeContainsBoundParam`) fails for declared
 `CancellableContinuation<Unit>` vs actual `CancellableContinuation<
 Unit>` — the exact-match case must prove. Then the commit follows and
 select closes.
+
+
+### SELECT IS GREEN — 264/266
+
+The final commit rule landed: a MEMBER-REFUTED call commits its sole
+surviving extension when that candidate is declared in the CALLER'S OWN
+FILE (`member_refuted` threaded from the member leg through a
+cleared-at-entry, consumed-once flag into ExtensionResolveCtx;
+sole_survivor gains `or (ctx.member_refuted and sole_same_file)`).
+That is exactly kotlinc's answer for Select.kt's file-private
+`CancellableContinuation<Unit>.tryResume` once the member drops — and
+narrow enough that cross-file stdlib chains keep their deferral: the
+first (file-blind) widening re-broke trimIndent, bisected via stash
+(HEAD green -> widening the breaker) and refined; the speculative
+private-registry decl_span fallback was reverted the same way. Both
+repros green together, sweep 117/0, corpus 262 -> 264/266, pinned +
+select_receive_beats_timeout (147 total, the backtick fixture the one
+red). select_on_timeout_loses MATCHES its expected output.
+
+REMAINING: compose_nodes (recomposition identity, nodesCreated 10 vs
+7) and compose_ui_text (text metrics, height 48 vs 68) — the last two
+corpus residuals — plus the tower-consult census lever and eager-mode
+readiness from the campaign backlog.
