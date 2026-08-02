@@ -57,14 +57,6 @@ and not the other and still be right.
               436   0.43%  no_class_id
             1,278   1.26%  nullable_or_generic
 
-    examples: total 88,609
-            4,856   5.48%  bound_static
-           61,232  69.10%  bound_virtual     (74.6% bound; 37.4% at start)
-           15,399  17.38%  no_receiver_type
-            3,315   3.74%  resolver_declined
-            2,529   2.85%  no_class_id
-            1,278   1.44%  nullable_or_generic
-
 The member-site TOTAL moves in both directions: bare calls becoming
 statically bound EXTENSION calls leave the member census (denominator
 falls), and former OrGlobal deferrals becoming member binds join it
