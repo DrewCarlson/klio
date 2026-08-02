@@ -3778,18 +3778,57 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
 /// section serves ids below the append range). `Module.default` (the old
 /// empty side module) left every call in every anon body name-dynamic.
 /// `KLIO_ANON_BASE=0` restores the empty side module.
+/// One process-wide side module shared by every synthesis site: a compose
+/// run synthesizes hundreds of sites, and per-site clones of the image's
+/// registry/indices blew the RSS cap. Appends serialize under
+/// `anonLowerEnter`/`anonLowerExit`, held by callers around LOWERING
+/// sections only (never around thunk execution).
+var shared_anon_module: ?ObjRef(Module) = null;
+var anon_lower_mutex: runtime.SpinMutex = .{};
+var anon_lower_owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var anon_lower_depth: usize = 0;
+
+pub fn anonLowerEnter() void {
+    const me: u64 = @as(u64, @intCast(std.Thread.getCurrentId())) +% 1;
+    if (anon_lower_owner.load(.acquire) == me) {
+        anon_lower_depth += 1;
+        return;
+    }
+    anon_lower_mutex.lock();
+    anon_lower_owner.store(me, .release);
+    anon_lower_depth = 1;
+}
+
+pub fn anonLowerExit() void {
+    anon_lower_depth -= 1;
+    if (anon_lower_depth == 0) {
+        anon_lower_owner.store(0, .release);
+        anon_lower_mutex.unlock();
+    }
+}
+
+/// Caller must hold the anon-lower lock across this call AND every
+/// `lowerMethod` into the returned module.
 pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
     if (cache.*) |m| return m.clone();
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_BASE") orelse "1", "0")) {
+    // Default OFF: the image-clone side module makes anon bodies resolve
+    // and bind statically, but each runtime lowering then pays
+    // full-image resolution allocation out of the run arena, and a
+    // compose suite (hundreds of sites) blew the 6GB RSS cap. Flip to
+    // ON (=1) once runtime lowering gets scratch-arena discipline.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_BASE") orelse "0", "1")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
-    const mg = self.module.borrow();
-    defer mg.deinit();
-    var cloned = try mg.get().cloneForExtend(allocator);
-    cloned.anon_side = true;
-    const ref = try ObjRef(Module).init(allocator, cloned);
-    cache.* = ref;
-    return ref.clone();
+    if (shared_anon_module == null) {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        var cloned = try mg.get().cloneForExtend(allocator);
+        cloned.anon_side = true;
+        shared_anon_module = try ObjRef(Module).init(allocator, cloned);
+    }
+    const ref = shared_anon_module.?.clone();
+    cache.* = ref.clone();
+    return ref;
 }
 
 pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, captured_names: []const []const u8, captures: []const Value, scope_renames: []const ir.ScopeRename, scope_classes: []const ir.ScopeClassRef) Allocator.Error!EvalResult {
@@ -3988,7 +4027,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     defer _ = ir.build.setLowerAnonPropHeads(prev_prop_heads);
 
     // Lower each method + getter into the shared `anon_methods` registry
-    // (once per site, on the first instantiation).
+    // (once per site, on the first instantiation). The shared side module's
+    // appends serialize under the anon-lower lock, held for the lowering
+    // sections only.
+    anonLowerEnter();
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -4081,6 +4123,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
     }
 
+    anonLowerExit();
+
     // The complex property-init / `init { … }` / supertype-ctor-arg thunks are
     // site-stable: lower them once and cache (keyed by the AST site), reuse
     // after. The cached sub-modules are kept alive by `gcMarkAnonSites`.
@@ -4094,6 +4138,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         super_arg_thunks = cached.super_arg_thunks;
         ir.lower.setLowerAnonCaptures(null);
     } else {
+        anonLowerEnter();
+        defer anonLowerExit();
         // Complex property initializers: anything past a literal or a bare
         // captured name evaluates through a lowered thunk.
         var complex_local: std.ArrayList(AnonComplexInit) = .empty;

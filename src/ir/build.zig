@@ -676,6 +676,10 @@ pub const FuncBuilder = struct {
     /// would otherwise shadow a same-named caller variable the lambda
     /// body references. Null when no such splice is in progress.
     lambda_splice_resolve: ?struct { caller_depth: usize, own_base: usize } = null,
+    /// See `MemberScopeSnapshot`: the caller member scope parked by an
+    /// active top-level-extension splice, restored around spliced
+    /// caller-lambda content.
+    caller_member_scope: ?*MemberScopeSnapshot = null,
     /// Labeled-return targets for spliced inline-argument lambdas.
     inline_lambda_ret: std.ArrayList(InlineLambdaRet) = .empty,
     /// Simple name of the call whose arguments are currently being
@@ -1489,6 +1493,77 @@ pub const FuncBuilder = struct {
     pub fn setOwnMembers(self: *FuncBuilder, set: StringSet) void {
         self.own_members.deinit();
         self.own_members = set;
+    }
+    /// The caller's member scope, parked while a TOP-LEVEL-EXTENSION splice
+    /// lowers its body: the spliced body resolves in its declaration scope,
+    /// where no caller class member exists (`indices` inside a spliced
+    /// `UByteArray.getOrElse` is the receiver's extension property even when
+    /// the calling test class declares a METHOD named `indices`). A spliced
+    /// caller-LAMBDA inside the body swaps the caller scope back in — its
+    /// free names are caller code.
+    pub const MemberScopeSnapshot = struct {
+        own: StringSet,
+        encl: StringSet,
+        owner: ?[]const u8,
+        prev: ?*MemberScopeSnapshot,
+    };
+    pub fn beginSpliceDeclScope(self: *FuncBuilder, snap: *MemberScopeSnapshot) void {
+        snap.* = .{
+            .own = self.own_members,
+            .encl = self.enclosing_members,
+            .owner = self.owner_class,
+            .prev = self.caller_member_scope,
+        };
+        self.own_members = StringSet.init(self.allocator);
+        self.enclosing_members = StringSet.init(self.allocator);
+        self.owner_class = null;
+        self.caller_member_scope = snap;
+    }
+    pub fn endSpliceDeclScope(self: *FuncBuilder, snap: *MemberScopeSnapshot) void {
+        self.own_members.deinit();
+        self.enclosing_members.deinit();
+        self.own_members = snap.own;
+        self.enclosing_members = snap.encl;
+        self.owner_class = snap.owner;
+        self.caller_member_scope = snap.prev;
+    }
+    pub const CallerScopeRestore = struct {
+        own: StringSet,
+        encl: StringSet,
+        owner: ?[]const u8,
+        snap: *MemberScopeSnapshot,
+    };
+    /// Swap the parked caller member scope back in for spliced caller-lambda
+    /// content. Null when no extension splice is active.
+    pub fn enterCallerMemberScope(self: *FuncBuilder) Allocator.Error!?CallerScopeRestore {
+        const snap = self.caller_member_scope orelse return null;
+        const restore = CallerScopeRestore{
+            .own = self.own_members,
+            .encl = self.enclosing_members,
+            .owner = self.owner_class,
+            .snap = snap,
+        };
+        var own = StringSet.init(self.allocator);
+        errdefer own.deinit();
+        var oit = snap.own.keyIterator();
+        while (oit.next()) |k| try own.put(k.*, {});
+        var encl = StringSet.init(self.allocator);
+        errdefer encl.deinit();
+        var eit = snap.encl.keyIterator();
+        while (eit.next()) |k| try encl.put(k.*, {});
+        self.own_members = own;
+        self.enclosing_members = encl;
+        self.owner_class = snap.owner;
+        self.caller_member_scope = snap.prev;
+        return restore;
+    }
+    pub fn exitCallerMemberScope(self: *FuncBuilder, restore: CallerScopeRestore) void {
+        self.own_members.deinit();
+        self.enclosing_members.deinit();
+        self.own_members = restore.own;
+        self.enclosing_members = restore.encl;
+        self.owner_class = restore.owner;
+        self.caller_member_scope = restore.snap;
     }
     pub fn ownMembers(self: *const FuncBuilder) *const StringSet {
         return &self.own_members;

@@ -1867,13 +1867,25 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
             if (std.mem.eql(u8, w, name0)) {
-                std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s}\n", .{
+                std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s} own={} encl={} owner={s}\n", .{
                     name0,
                     b.resolve("this") != null,
                     b.spliceRecvTy() orelse "-",
                     b.lambda_splice_resolve != null,
                     build.currentRealFn() orelse "-",
+                    b.hasOwnMember(name0),
+                    b.enclosing_members.contains(name0),
+                    b.ownerClass() orelse "-",
                 });
+                if (b.enclosing_members.contains(name0)) {
+                    std.debug.print("[bare-read-encl]", .{});
+                    var eit = b.enclosing_members.keyIterator();
+                    var n: usize = 0;
+                    while (eit.next()) |k| : (n += 1) {
+                        if (n < 40) std.debug.print(" {s}", .{k.*});
+                    }
+                    std.debug.print(" (total {d})\n", .{n});
+                }
             }
         }
         if (b.resolve("this")) |this_reg| {
@@ -5623,8 +5635,14 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (!hs.complete) break :blk false;
                 break :blk hs.names.contains(nm);
             };
-            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv or
-                (recv_chain != null and nameHasReceiverCandidate(b, nm, recv_chain)));
+            // An extension NAMESAKE on the receiver chain does not pin the
+            // walk: the static bare-extension resolution below ranks the
+            // overload set with argument evidence (`plus(element)` inside a
+            // spliced `plusElement` must pick the `element: T` overload; the
+            // walk's member-first runtime pick took the Iterable one), and
+            // its own deferral remains the fallback when the shapes cannot
+            // prove a pick.
+            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
             if (runtime.getenvSlice("KLIO_BINDS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, nm)) {
                     const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";

@@ -5449,6 +5449,29 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
+    // A host-backed value whose runtime class ships interpreted SOURCE
+    // (`UByteArray : Collection<UByte>` declares `isEmpty`): resolve the
+    // member against that class and run its body — the representation
+    // reads inside (`storage`) are host-served. Sits at the total-miss
+    // tail so every intrinsic and operator tail above still wins.
+    {
+        const target: ?FuncId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const module = mg.get();
+            const cid = module.classIdByFqn(receiver.typeFqn()) orelse break :blk null;
+            const caller_file = if (ir.eval.currentCallSiteSpan()) |sp| sp.file else ir.FileId.from(0);
+            const resolved = module.resolveMemberCall(cid, name, &.{}, .{
+                .caller_file = caller_file,
+                .lexical_owner = null,
+                .actual_type_param_bounds = &.{},
+            });
+            break :blk resolved.target;
+        };
+        if (target) |t| {
+            if (try invokeMethodFuncId(self, allocator, receiver, t, args)) |r| return r;
+        }
+    }
     missTraceMaybe(name);
     if (missTraceEnv() != null) {
         std.debug.print("[member-miss] `{s}` on `{s}` span={any}\n", .{ name, receiver.typeFqn(), ir.eval.currentCallSiteSpan() });

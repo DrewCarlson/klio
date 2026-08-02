@@ -677,6 +677,8 @@ fn lowerAndRegisterMethods(
 ) Allocator.Error!void {
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
+    host_instances.anonLowerEnter();
+    defer host_instances.anonLowerExit();
     for (class.members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -838,6 +840,8 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     // it in the Vm's class table.
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
+    host_instances.anonLowerEnter();
+    defer host_instances.anonLowerExit();
     const def = try synthLocalClassDef(self, allocator, class);
     {
         const g = self.classes.borrowMut();
@@ -899,6 +903,8 @@ fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: 
 }
 
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
+    host_instances.anonLowerEnter();
+    defer host_instances.anonLowerExit();
     switch (try registerClass(self, allocator, class)) {
         .ok => {},
         .err => |e| return .{ .err = e },

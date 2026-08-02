@@ -1586,6 +1586,16 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "splice_hygiene_caller_members" {
+    try check("splice_hygiene_caller_members",
+        \\[6, 7]
+        \\400
+        \\17
+        \\[[s], [a]]
+        \\
+    );
+}
+
 test "splice_bounded_type_param_receiver" {
     try check("splice_bounded_type_param_receiver",
         \\[a, b, c]

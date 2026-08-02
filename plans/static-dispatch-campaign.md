@@ -572,21 +572,37 @@ unless noted. Chronological.
   arrays fine; the read never reaches the array). Evidence:
   `KLIO_OR_AUDIT` shows `bare_name_fallthrough LoadFromThisOrGlobal`,
   `[ltg-tail] raw=$sgetter$UnsignedArraysTest␟indices in_fn=<lambda>`,
-  `[splice] getOrElse entered` confirms the splice runs. Narrowed
-  further: the emitting arm is the bare-read FALLTHROUGH at the ltg
-  emission (`this` resolves, but `is_known_global` is true — the
-  `indices` getters populate the bare-call index — and
-  `splice_receiver_first` is false because `spliceRecvTy()` is UNSET
-  in the failing context, even though the splice sets it
-  unconditionally for receiver-typed fns and `[splice] recv=true
-  ext=true` confirms the bind path ran). The `[bare-read-pre]` probe
-  (KLIO_BARE_TRACE) shows NO row for the failing lambda context —
-  the read lowers through a path where the splice channels are
-  absent; candidate: the lambda body's SECOND lowering (eager pass or
-  the deferred AstLambda body_func lowering) re-lowers the spliced
-  content without the splice state. Next: trace which lowering pass
-  produced fn `<lambda>#7092`'s instructions (KLIO_LFN_TRACE / add a
-  pass tag to dump-fn).
+  RESOLVED — root cause was none of the earlier candidates: the test
+  class's own METHODS are named after the operations (`fun indices()`,
+  `fun lastIndex()`, `fun sumOf()`...), so `enclosing_only_member`
+  blocked the splice's receiver shortcut and the runtime walk found
+  the caller's method instead of the receiver's extension property.
+  Fixed by SPLICE SCOPE HYGIENE (`KLIO_SPLICE_HYG=0` disables): a
+  top-level extension's spliced body parks the caller's own/enclosing
+  member sets and lexical owner (`beginSpliceDeclScope`) — the body
+  resolves in its declaration scope, as Kotlin scopes it — and
+  spliced caller-LAMBDA content swaps the caller scope back in
+  (`enterCallerMemberScope` around `spliceInlineLambda`'s body). Two
+  follow-on fixes the hygiene surfaced: the inline-splice receiver
+  WALK no longer captures extension NAMESAKES (the static
+  bare-extension resolution ranks `plus(element)` correctly inside a
+  spliced `plusElement`; the walk's member-first runtime pick took the
+  Iterable overload — plusCollectionInference), and a total-miss
+  member tail resolves host-value members against the runtime class's
+  shipped source (`UByteArray.isEmpty` runs its interpreted body over
+  the host-served `storage`). `sumOf` on unsigned arrays routes to
+  the dynamic-sum intrinsic like the List family. Pin
+  `splice_hygiene_caller_members` (also pins the plusElement pick).
+  Memory: per-site image clones blew compose's 6GiB RSS watchdog; the
+  side-module clone is now SHARED process-wide behind a reentrant
+  anon-lower lock, but even one clone's runtime-lowering resolution
+  churn keeps compose near the edge, so `KLIO_ANON_BASE` is default
+  OFF (=1 opts in) until runtime lowering gets scratch-arena
+  discipline, and `scripts/compose-test.sh` runs under an 8GiB cap
+  (64GB box; the unsigned image legitimately grew the suite ~300MB
+  past the old 6GiB edge). One-off worker panic seen once in
+  SnapshotStateMapTests (`acquireRegs` torn func read under
+  concurrent on-demand lowering) — not reproduced; candidates noted.
 
 - Shipping the unsigned value-class declarations (2026-08-02): adding
   `unsigned/src/kotlin/U{Byte,Short,Int,Long}{,Array}.kt` to the
