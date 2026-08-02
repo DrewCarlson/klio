@@ -1544,6 +1544,25 @@ test "tower_outer_receiver_extension" {
     );
 }
 
+test "invoke_convention_peer_vararg_member" {
+    try check("invoke_convention_peer_vararg_member",
+        \\[a, b]
+        \\
+    );
+}
+
+test "jit_char_append_tag" {
+    try check("jit_char_append_tag",
+        \\ABCDEFGHIJKLMNOPQRST
+        \\ABCDEFGH
+        \\ABCDEFGH
+        \\ABCD
+        \\ABC
+        \\ABCDEFGHIJKLMNOPQRSTUVWX
+        \\
+    );
+}
+
 test "tower_local_extension_label" {
     try check("tower_local_extension_label",
         \\top-ext:z

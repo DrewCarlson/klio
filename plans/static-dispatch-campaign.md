@@ -41,25 +41,26 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 6,425 member sites
-              146   2.27%  bound_static
-            3,522  54.82%  bound_virtual     (57.1% bound; 2.34% at campaign start)
-            1,872  29.14%  no_receiver_type
-              465   7.24%  resolver_declined
-              300   4.67%  no_class_id
-              120   1.87%  nullable_or_generic
+    stdlib:   total 8,139 member sites
+              549   6.75%  bound_static
+            4,733  58.15%  bound_virtual     (64.9% bound; 2.34% at campaign start)
+            1,872  23.00%  no_receiver_type
+              565   6.94%  resolver_declined
+              300   3.69%  no_class_id
+              120   1.47%  nullable_or_generic
 
-    examples: total 68,928
-            1,456   2.11%  bound_static
-           43,128  62.57%  bound_virtual     (64.7% bound; 37.4% at start)
-           15,475  22.45%  no_receiver_type
-            3,775   5.48%  resolver_declined
-            3,816   5.54%  no_class_id
-            1,278   1.85%  nullable_or_generic
+    examples: total 87,715
+            4,324   4.93%  bound_static
+           58,361  66.53%  bound_virtual     (71.5% bound; 37.4% at start)
+           15,475  17.64%  no_receiver_type
+            4,461   5.09%  resolver_declined
+            3,816   4.35%  no_class_id
+            1,278   1.46%  nullable_or_generic
 
-The member-site TOTAL shrinks as bare calls become statically bound
-extension calls and leave the member census entirely — a gain can show
-as the denominator falling.
+The member-site TOTAL moves in both directions: bare calls becoming
+statically bound EXTENSION calls leave the member census (denominator
+falls), and former OrGlobal deferrals becoming member binds join it
+(the implicit-this commit grew it 6,425→8,139 / 68,928→87,715).
 
 Flipped defaults (each `=0` disables for single-binary A/B):
 `KLIO_HDR_BOUNDS`, `KLIO_THIS_NARROW`, `KLIO_BARE_EXT`,
@@ -70,7 +71,7 @@ the ledger below. The eager pipeline is the ONLY pipeline
 
 Standing gates, all green at HEAD: sweep 117/0
 (`python3 scripts/commontest-sweep.py zig-out/bin/klio-harness`), corpus
-drift 266/266 (out-of-process headless runner), parity pinned 148/149
+drift 266/266 (out-of-process headless runner), parity pinned 150/151
 (the one red is `backtick_this_param_not_receiver`, owned by
 `resolution-unification-plan.md`), ir unit tests, `zig build test`.
 
@@ -349,6 +350,48 @@ unless noted. Chronological.
   counts the commits. Pins `tower_outer_receiver_extension`,
   `tower_local_extension_label`, and the module test asserting the
   labeled-slot `.Call`.
+- **The implicit-this member commit (`KLIO_ITC_MEMBER`)** — the largest
+  single jump since the self-shadow fix. `lowerImplicitThisCall`
+  (the `hasOwnMember` bare-call path) emitted the OrGlobal deferral
+  without ever attempting a static member bind; it now runs the full
+  `lowerResolvedMemberCall` (direct for final/private, virtual slot
+  otherwise) before deferring — a member the receiver provably declares
+  beats any same-named top-level in Kotlin's scope order, so only the
+  UNPROVEN cases keep the fallback. Census: stdlib bound 57.1% → 64.9%
+  (bound_static 146→549, bound_virtual 3,522→4,733; member-site total
+  6,425→8,139 as former deferrals became countable member sites);
+  examples bound 64.7% → 71.5% (bound_static 1,456→4,324,
+  bound_virtual 43,128→58,361; total 68,928→87,715). no_receiver_type
+  share 29.14%→23.00% / 22.45%→17.64%. Two regressions root-caused and
+  fixed before landing:
+  - Invoke-convention peers: `class C(val f: (A) -> T) { fun
+    f(vararg s: A) = f(s) }` — the member resolver ranks FUNCTIONS
+    only, so the sole-member promotion bound the vararg member back to
+    itself (kotlinc binds the property's `invoke`; a non-spread array
+    cannot feed a vararg). The arm stands down when the receiver
+    declares a same-named function-typed property (registry head or
+    primary-ctor param). Pin `invoke_convention_peer_vararg_member`;
+    IterableTests' `createFrom` family was the live case.
+  - The loop JIT dropped `Char` tags (latent interpreter bug the new
+    static binds exposed — next entry).
+  Gate `KLIO_ITC_MEMBER=0`/`=name,name` for A/B and per-name bisection.
+- **Loop-JIT rebox preserves value kinds (`box_tags`)** — `RegType.i32`
+  covers `Int`/`Char`/`Short`/`Byte`, and every rebox
+  (`valueFromSlot(.i32)`) minted `.Int`: a trampolined `append(c)`
+  appended the char's CODE as digits (Base64's aladdin credential
+  encoded the missing chars' codes as digit soup, byte-exact). The
+  compile-time `CompiledLoop.box_tags` (from resolved callee returns,
+  Consts, Moves, live samples) plus a runtime `TrampCtx.tags` buffer
+  refreshed by trampoline RESULT writes (an intrinsic `toChar` has no
+  static return to read) restore the original kind at every boxing site
+  (tramp args, loop/func exit, nullables; cell writeback restores the
+  cell's own previous tag). The trigger: call-count-accumulated
+  compilation firing at a COLD loop entry, sampling stale frame
+  registers. OPEN hardening: a cold sample can also miss a packed-array
+  receiver and accept a trampoline shape the warm compile rejects —
+  gate compile sampling on a warm entry. Pin `jit_char_append_tag`
+  (six-call sequence; corrupts only on the 6th, at the OSR checkpoint
+  after a cold-entry compile).
 
 ## Measured dead ends and falsified theories — do not retry
 

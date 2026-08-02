@@ -4174,7 +4174,7 @@ fn LoopTramp(comptime H: type) type {
                 const v = switch (cl.reg_types[site.src_reg]) {
                     .object => lc.frame.regs.items[site.src_reg],
                     .null_ => Value.Null,
-                    else => jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.src_reg], tctx.tags[site.src_reg], tctx.slots[site.src_reg]),
                 };
                 const g = recv.Instance.borrowMut();
                 if (site.field_idx < g.get().fields.items.len) {
@@ -4195,7 +4195,7 @@ fn LoopTramp(comptime H: type) type {
             // (a side-effect-free read) and raises the proper exception on OOB.
             if (site.is_obj_index) {
                 const recv = lc.frame.regs.items[site.recv_reg];
-                const idx_v = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const idx_v = jit_loop.valueFromSlotTagged(cl.reg_types[site.args_reg], tctx.tags[site.args_reg], tctx.slots[site.args_reg]);
                 const idx: i64 = switch (idx_v) {
                     .Int => |x| x,
                     .Long => |x| x,
@@ -4227,7 +4227,7 @@ fn LoopTramp(comptime H: type) type {
                     argbuf2[k2] = switch (cl.reg_types[ar]) {
                         .object => lc.frame.regs.items[ar],
                         .null_ => .Null,
-                        else => jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]),
+                        else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[ar], tctx.slots[ar]),
                     };
                 }
                 // Plain exact-arity closure: skip the value-dispatch preamble
@@ -4265,8 +4265,8 @@ fn LoopTramp(comptime H: type) type {
                 if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
                 if (site.span) |sp| lc.frame.cur_span = sp;
                 const m = lc.frame.regs.items[site.recv_reg];
-                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
-                const val = jit_loop.valueFromSlot(cl.reg_types[site.src_reg], tctx.slots[site.src_reg]);
+                const key = jit_loop.valueFromSlotTagged(cl.reg_types[site.args_reg], tctx.tags[site.args_reg], tctx.slots[site.args_reg]);
+                const val = jit_loop.valueFromSlotTagged(cl.reg_types[site.src_reg], tctx.tags[site.src_reg], tctx.slots[site.src_reg]);
                 var names: [2]?[]const u8 = .{ null, null };
                 const r = lc.host.callMemberNamed(lc.allocator, &m, "set", &.{ key, val }, names[0..2]) catch {
                     lc.pending = .{ .Type = "out of memory in JIT map store" };
@@ -4285,7 +4285,7 @@ fn LoopTramp(comptime H: type) type {
                 if (comptime !@hasDecl(H, "callMemberNamed")) return jit_loop.deoptCode(site.block);
                 if (site.span) |sp| lc.frame.cur_span = sp;
                 const m = lc.frame.regs.items[site.recv_reg];
-                const key = jit_loop.valueFromSlot(cl.reg_types[site.args_reg], tctx.slots[site.args_reg]);
+                const key = jit_loop.valueFromSlotTagged(cl.reg_types[site.args_reg], tctx.tags[site.args_reg], tctx.slots[site.args_reg]);
                 var names: [1]?[]const u8 = .{null};
                 const r = lc.host.callMemberNamed(lc.allocator, &m, "get", &.{key}, names[0..1]) catch {
                     lc.pending = .{ .Type = "out of memory in JIT map load" };
@@ -4392,6 +4392,9 @@ fn LoopTramp(comptime H: type) type {
                 const s = if (fv) |v| jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) else null;
                 if (s) |sv| {
                     tctx.slots[site.dst_reg] = sv;
+                    if (cl.reg_types[site.dst_reg] == .i32) {
+                        tctx.tags[site.dst_reg] = @intFromEnum(std.meta.activeTag(fv.?));
+                    }
                     return 0;
                 }
                 // Field no longer the cached scalar (e.g. a nullable field went
@@ -4418,7 +4421,7 @@ fn LoopTramp(comptime H: type) type {
                 argbuf[k] = switch (cl.reg_types[ar]) {
                     .object => lc.frame.regs.items[ar],
                     .null_ => .Null,
-                    else => jit_loop.valueFromSlot(cl.reg_types[ar], tctx.slots[ar]),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[ar], tctx.slots[ar]),
                 };
             }
             // Native recursion: a compiled body calling a compiled (scalar)
@@ -4430,8 +4433,9 @@ fn LoopTramp(comptime H: type) type {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
                         if (evtls.jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
                             var fslots: [192]i64 = undefined;
+                            var ftags: [192]u8 = undefined;
                             evtls.jit_native_depth += 1;
-                            const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], &call, tctx.user);
+                            const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], ftags[0..callee_cl.n_regs], &call, tctx.user);
                             evtls.jit_native_depth -= 1;
                             if (fo) |o| {
                                 if (o.code.inst == jit_loop.RETURN_INST) {
@@ -4458,10 +4462,7 @@ fn LoopTramp(comptime H: type) type {
                 var recv = switch (cl.reg_types[site.recv_reg]) {
                     .object, .unknown => lc.frame.regs.items[site.recv_reg],
                     .null_ => Value.Null,
-                    else => jit_loop.valueFromSlot(
-                        cl.reg_types[site.recv_reg],
-                        tctx.slots[site.recv_reg],
-                    ),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[site.recv_reg], tctx.slots[site.recv_reg]),
                 };
                 // A varying boxed receiver may be a different class this iteration;
                 // deopt unless it matches the class the return type was resolved for.
@@ -4481,10 +4482,7 @@ fn LoopTramp(comptime H: type) type {
                         switch (cl.reg_types[reg]) {
                             .object, .unknown => lc.frame.regs.items[reg],
                             .null_ => Value.Null,
-                            else => jit_loop.valueFromSlot(
-                                cl.reg_types[reg],
-                                tctx.slots[reg],
-                            ),
+                            else => jit_loop.valueFromSlotTagged(cl.reg_types[reg], tctx.tags[reg], tctx.slots[reg]),
                         }
                     else
                         null;
@@ -4548,6 +4546,12 @@ fn LoopTramp(comptime H: type) type {
                                 return jit_loop.deoptCode(site.block);
                             };
                             tctx.slots[site.dst_reg] = s;
+                            // The call's ACTUAL result kind governs how this
+                            // register reboxes (an intrinsic `toChar` has no
+                            // static return to read).
+                            if (cl.reg_types[site.dst_reg] == .i32) {
+                                tctx.tags[site.dst_reg] = @intFromEnum(std.meta.activeTag(v));
+                            }
                         }
                     }
                     return 0;

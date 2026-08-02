@@ -11854,6 +11854,89 @@ fn lowerImplicitThisCall(
         } });
         return dst;
     }
+    // A member the receiver type PROVABLY declares wins over any same-named
+    // top-level in Kotlin's scope order, so a resolved target commits
+    // statically here — direct for final/private, a virtual slot otherwise.
+    // Only an UNPROVEN member keeps the OrGlobal fallback below (a
+    // non-callable property, an arity miss the runtime resolves to the
+    // global). `KLIO_ITC_MEMBER=0` disables for single-binary A/B.
+    const itc_gate = runtime.getenvSlice("KLIO_ITC_MEMBER") orelse "1";
+    const itc_on = blk: {
+        if (std.mem.eql(u8, itc_gate, "0")) break :blk false;
+        if (std.mem.eql(u8, itc_gate, "1")) break :blk true;
+        var it = std.mem.splitScalar(u8, itc_gate, ',');
+        while (it.next()) |n| {
+            if (std.mem.eql(u8, n, name0)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (itc_on) attempt: {
+        const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse break :attempt;
+        // A same-named FUNCTION-TYPED property on the receiver is an
+        // invoke-convention peer the member resolver cannot rank (it ranks
+        // functions only): `class C(val f: (A) -> T) { fun f(vararg s: A) =
+        // f(s) }` binds the PROPERTY's invoke in Kotlin when the member's
+        // vararg refuses the array. Leave such calls to the runtime walk.
+        if (b.module.registry.class_prop_type_heads.get(.{ .a = typeHead(head_name), .b = name0 })) |ph| {
+            if (std.mem.startsWith(u8, ph, "Function")) break :attempt;
+        }
+        {
+            const guard_cid = if (std.mem.indexOfScalar(u8, head_name, '.') != null)
+                b.module.classIdByFqn(head_name)
+            else
+                b.module.classIdIndexed(typeHead(head_name), b.self_package, segments[0].span.file) orelse
+                    b.module.classId(typeHead(head_name));
+            if (guard_cid) |gc| {
+                if (gc.int() < b.module.classes.items.len) {
+                    for (b.module.classes.items[gc.int()].primary_params) |pp| {
+                        if (std.mem.eql(u8, pp.name, name0) and
+                            std.mem.startsWith(u8, typeHead(pp.ty.name), "Function"))
+                        {
+                            break :attempt;
+                        }
+                    }
+                }
+            }
+        }
+        var owned_head_ty: ?TypeRef = null;
+        defer if (owned_head_ty) |*t| t.deinit(b.allocator);
+        const recv_ty = blk: {
+            if (b.recvTypeRef()) |declared| {
+                if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
+            }
+            const head_fqn = blk2: {
+                if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk2 head_name;
+                const cid = b.module.classIdIndexed(head_name, b.self_package, segments[0].span.file) orelse
+                    b.module.classId(head_name) orelse break :attempt;
+                if (cid.int() >= b.module.classes.items.len) break :attempt;
+                break :blk2 b.module.classes.items[cid.int()].fqn;
+            };
+            owned_head_ty = TypeRef{
+                .name = try b.allocator.dupe(u8, head_fqn),
+                .nullable = false,
+                .args = &.{},
+            };
+            break :blk owned_head_ty.?;
+        };
+        var this_path = [_]ast.Ident{.{ .name = "this", .span = segments[0].span }};
+        const this_expr = Expr{ .Path = .{ .segments = &this_path, .span = segments[0].span } };
+        switch (try lowerResolvedMemberCall(
+            b,
+            &this_expr,
+            .{ .name = name0, .span = segments[0].span },
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_ty,
+            .{ .reg = this_reg, .non_null = true },
+        )) {
+            .lowered => |reg| {
+                orEmitAudit(b, "implicit_this_call_member_bound", "Call/implicit-member", name0);
+                return reg;
+            },
+            .deferred, .none => {},
+        }
+    }
     b.pending_arg_broad_masks = itc_broad;
     var member_arity: ?[]i16 = null;
     var member_fn_generic: ?[]bool = null;
