@@ -5902,6 +5902,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 args,
                 ast_arg_names,
             ));
+            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                std.debug.print("[lfn] {s} decls={d} inapplicable={} plain={} mangled_cell={} mangled_outer={} splice_win={}\n", .{
+                    bare,
+                    decls.len,
+                    local_fn_inapplicable,
+                    b.resolve(bare) != null,
+                    if (decls.len > 0) b.resolve(decls[0].mangled) != null else false,
+                    if (decls.len > 0) b.knowsOuter(decls[0].mangled) else false,
+                    b.lambda_splice_resolve != null,
+                });
             // A LONE local fn reached from a NESTED body (its own body, or
             // a local fn declared inside it): the mangled overload cell
             // binds BEFORE the body lowers exactly so nested calls can

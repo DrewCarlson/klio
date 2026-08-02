@@ -1060,8 +1060,31 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             };
             const sibling_count = module.funcsBySimpleName(src_name).len +
                 @intFromBool(src_name.len != func.name.len);
+            // A LOCAL fn's defaults live only as registered thunks — its
+            // lowered params carry no `has_default` flag and it has no
+            // DeclSig — so `globalArityCanBind` under-counts and the
+            // sibling redirect stole `check(1)` on a local
+            // `check(a, b = 5)` for `kotlin.check`. The same thunk table
+            // `padArgsWithDefaults` pads from decides bindability here.
+            const binds_with_defaults = blk: {
+                if (module.globalArityCanBind(func.id, func, args.len)) break :blk true;
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                const defs = pg.get().func_defaults.get(func.id.int()) orelse break :blk false;
+                var required: usize = 0;
+                var has_vararg = false;
+                for (func.params, 0..) |p, i| {
+                    if (p.is_vararg) {
+                        has_vararg = true;
+                        continue;
+                    }
+                    const has_thunk = i < defs.len and defs[i] != null;
+                    if (!has_thunk) required += 1;
+                }
+                break :blk args.len >= required and (has_vararg or args.len <= func.params.len);
+            };
             if (args.len != info.n_params and info.capture_names.len == 0 and
-                !module.globalArityCanBind(func.id, func, args.len) and
+                !binds_with_defaults and
                 sibling_count > 1)
             {
                 if (module.funcsBySimpleName(src_name).len > 1) {

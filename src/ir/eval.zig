@@ -5389,6 +5389,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
                         std.debug.print("[not-miss] in={s} kind={s} span={?any}\n", .{
                             frame.func.name, @tagName(std.meta.activeTag(v)), frame.cur_span,
                         });
+                        dumpCurrentFrameParamsForDiag();
                         dumpFrameChainForDiagAlways();
                     }
                     return raiseStep(frame, .{ .Type = "Not on non-bool" });
@@ -6364,6 +6365,13 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
 noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_value);
     const callee_v = frame.read(cv.callee);
+    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+        if (callee_v == .IrClosure) {
+            std.debug.print("[cv-callee] in={s} kind=IrClosure id={d}\n", .{ frame.func.name, callee_v.IrClosure.id });
+        } else {
+            std.debug.print("[cv-callee] in={s} kind={s}\n", .{ frame.func.name, @tagName(std.meta.activeTag(callee_v)) });
+        }
+    }
     var arg_values_list: std.ArrayList(Value) = .empty;
     defer arg_values_list.deinit(allocator);
     {

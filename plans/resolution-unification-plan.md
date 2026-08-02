@@ -266,24 +266,22 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 - **Pack-build trap**: `klio pack build kotlin-klio/klio-compose-runtime`
   yields a broken pack; the real source dir is `klio-compose-runtime-engine`.
 
-## Open finding (2026-08-02): inline-lambda splice hygiene
+## Resolved finding (2026-08-02): the closure sibling redirect ignored thunk defaults
 
-A caller-supplied lambda body spliced into an INLINE stdlib callee
-resolves its bare names in the CALLEE's package scope: `fun main() {
-fun check(a: Float, b: Float, c: Float? = null) {…}; repeat(2) {
-check(1.5f, 0.5f) } }` binds `kotlin.check` DIRECT (`Call exact=true`,
-no [ef]/[bare]/eager rows — the splice arm committed it), while the
-same call outside the lambda binds the local. Kotlin's inline lambdas
-are hygienic: the argument body resolves in the CALLER's scope. In
-receiver contexts the shadow deferral masks it (the runtime cell probe
-finds the local — FloorDivModTest.floatMod's `check` survives this
-way); in a non-receiver `main` the package-scoped direct commit wins
-and the local is lost. Repro: the fixture text above (10 lines).
-Fix direction: the splice must restore the caller's resolution context
-(self_package + local-fn tables) when lowering the LAMBDA-ARGUMENT
-portion of a spliced body — the per-layer hint restoration already
-exists for receiver channels; package/local-scope needs the same
-treatment.
+What first presented as inline-splice hygiene was a `callValue` defect:
+a zero-capture closure whose ARITY doesn't match reroutes to same-name
+siblings ("a call its arity cannot bind belongs to a same-name
+sibling"), but the bindability test (`globalArityCanBind`) only reads
+`Param.has_default` / DeclSig — and a LOCAL fn's defaults exist only as
+registered thunks (no flag, no DeclSig). `fun check(a: Float, b: Float,
+c: Float? = null)` called `check(1.5f, 0.5f)` through its captured cell
+inside `repeat { }` was declared arity-unbindable and rerouted to
+`kotlin.check` (any local fn sharing a default-import name with a
+defaulted tail hit this). FIXED: the redirect gate now consults the
+same `func_defaults` thunk table `padArgsWithDefaults` pads from. Pin
+`local_fn_default_beats_stdlib_sibling`. Diagnostics kept: `[cv-callee]`
+(closure id per value call, `KLIO_TRACE_PATH`), operand-level `[dumpfn]`
+rows (MakeCell/CellSet/CellGet/LoadCapture/AstLambda captures).
 
 ## The three-tier static/dynamic boundary
 
