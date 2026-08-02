@@ -2927,6 +2927,14 @@ fn isScalarKindName(n: []const u8) bool {
 
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
+    // A QUALIFIED function-type head (`kotlin.Function1`) must reach the
+    // Function arm below, not the qualified-name early-out: the callable
+    // disproof is head-shaped and package-independent.
+    if (std.mem.indexOfScalar(u8, pn, '.') != null and
+        std.mem.startsWith(u8, simpleName(pn), "Function"))
+    {
+        pn = simpleName(pn);
+    }
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
     // class whose registered name the supertype walk cannot relate;
     // decline to adjudicate.
@@ -2958,12 +2966,19 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // (kotlinc resolves the extension; the member is inapplicable).
     if (isCallable(arg) and isDefinitelyNonFunctionTypeName(pn)) return true;
     if (std.mem.startsWith(u8, pn, "Function")) {
-        // Callables and Null stay non-definite; a plain data value is
-        // definite, and so is an instance with no `invoke` surface (a
-        // `JobNode` is not a `CompletionHandler` — kotlinc drops the
-        // member and binds the JobNode-typed extension).
+        // Callables and Null stay non-definite; a value kind that PLAINLY
+        // carries no invoke surface is definite — a `List` is not a
+        // predicate, so `removeAll(listOf(2, 4))` must fall past a
+        // subclass's lone `removeAll(predicate)` to the inherited
+        // `removeAll(Collection)` (SmallPersistentVector under
+        // SnapshotStateList was the live case). Kinds that CAN be invoked
+        // without being tagged callable — a `Class` constructor reference
+        // fed to a factory param, a bound member — stay non-definite
+        // (`FixupList.createAndInsertNode`'s factory broke on the broad
+        // form of this arm).
         return switch (arg.*) {
             .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => true,
+            .List, .Map, .Set, .Array, .Range, .Sequence, .Pair, .Triple, .MapEntry => true,
             .Instance => !instanceHasInvokeSurface(self, arg),
             else => false,
         };

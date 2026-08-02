@@ -1544,6 +1544,14 @@ test "tower_outer_receiver_extension" {
     );
 }
 
+test "inherited_overload_beats_own_predicate" {
+    try check("inherited_overload_beats_own_predicate",
+        \\[0, 1, 3, 5]
+        \\[0, 1, 3]
+        \\
+    );
+}
+
 test "invoke_convention_peer_vararg_member" {
     try check("invoke_convention_peer_vararg_member",
         \\[a, b]

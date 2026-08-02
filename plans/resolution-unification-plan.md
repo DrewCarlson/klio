@@ -131,6 +131,30 @@ the ratchet gate, and the flat-eval restructure
 (`interpreter-performance-plan.md`) as the standing top-priority
 interpreter workstream.
 
+2026-08-02 addendum — the SnapshotStateList/Map concurrency family:
+`canRemoveAllFromAStateList` FIXED (an inherited `removeAll(Collection)`
+must beat a subclass's lone `removeAll(predicate)` for a List argument —
+the definite-mismatch disproof now refutes container/scalar values
+against `Function*` params, with invokable-but-untagged kinds like
+`Class` ctor refs kept non-definite after mosaic's FixupList factory
+caught the broad form; qualified `kotlin.FunctionN` heads reach the
+disproof; pin `inherited_overload_beats_own_predicate`). Latency fixes
+landed (all A/B'd, litmus IMPROVED — `tl_io_elastic` and
+`tl_thread_resume_child` now pass, 3 remain): the pool workers park on
+an EventGate instead of 1 ms queue polling; the pump's
+`.wakeup_pending`/`.root_parked` idle slices event-wait on the wakeup
+gate; the cross-thread Kotlin-resume two-turn wait is OFF by default
+(`KLIO_SYNC_RESUME=1` restores — upstream's dispatched resume is
+fire-and-forget, and the wait serialized the pool ~170 ms per post).
+The four still-red concurrent tests are THROUGHPUT-bound, not
+lost-wakeup: profiled at ~85 % blocking gone, the test thread saturates
+in the interpreted dispatch ladder (callFuncTyped→Named preamble per
+call, CMG ladders); `concurrentGlobalModification_add` PASSES at ~20 s
+against its 10 s cap, the `runTest(timeout = 30.seconds)` pair need
+1.5–2.6× throughput. That is the flat-eval restructure's case plus the
+dispatch campaign's ladder retirement — no timeout can be raised
+(explicit in-test values).
+
 ## Open work, in order
 
 ### The implementation order (architecture checkpoint)

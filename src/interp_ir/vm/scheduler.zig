@@ -63,6 +63,11 @@ pub fn onPoolWorker() bool {
 /// instance below.
 pub const Pool = struct {
     mutex: runtime.SpinMutex = .{},
+    /// Rung on every post, task completion (a Default cap slot frees), and
+    /// stop, so an idle worker parks on an event instead of polling the
+    /// queue at a millisecond cadence — the 1ms pickup tax serialized
+    /// dispatch-heavy tests (10k launches paid ~half of it each).
+    gate: runtime.EventGate = .{},
     /// FIFO queues per view. Head-index pops keep posting O(1) without
     /// shifting; the spine compacts when the head crosses half.
     queue_default: Fifo = .{},
@@ -203,6 +208,7 @@ pub const Pool = struct {
                 }
             }
         }
+        self.gate.ring();
     }
 
     /// Queued + running tasks, excluding the task the calling thread is
@@ -249,6 +255,8 @@ pub const Pool = struct {
             }
             self.stopping = true;
         }
+        // Wake every idle worker so it observes `stopping` immediately.
+        self.gate.ring();
         runtime.requestAbandon();
         defer runtime.clearAbandon();
         {
@@ -306,6 +314,10 @@ pub const Pool = struct {
         while (true) {
             var task: Task = blk: {
                 while (true) {
+                    // Epoch BEFORE the emptiness check: a post landing
+                    // between the check and the wait bumps it, so the wait
+                    // returns immediately (same protocol as the pumps).
+                    const seen = self.gate.epochNow();
                     {
                         self.mutex.lock();
                         defer self.mutex.unlock();
@@ -315,12 +327,12 @@ pub const Pool = struct {
                         if (self.stopping) return;
                         if (self.takeEligible()) |t| break :blk t;
                     }
-                    // Idle park: poll at a millisecond cadence until a
-                    // task arrives, a Default cap slot frees, or the run
-                    // ends. The sleep itself brackets the GC blocking-safe
-                    // region (clock.sleepMillis), so an idle worker never
-                    // stalls a concurrent collection's rendezvous.
-                    runtime.clockSleepMillis(1);
+                    // Idle park: event-wait until a task arrives, a
+                    // Default cap slot frees, or the run ends; the 1ms cap
+                    // keeps the abandon poll cadence. The gate wait
+                    // brackets the GC blocking-safe region, so an idle
+                    // worker never stalls a collection's rendezvous.
+                    self.gate.waitFrom(seen, 1_000);
                 }
             };
             in_pool_task = true;
@@ -332,13 +344,17 @@ pub const Pool = struct {
             const abandoned = runtime.shouldAbandon();
             runtime.setThreadAbandonable(false);
             in_pool_task = false;
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.running -= 1;
-            if (task.kind == .default) self.running_default -= 1;
-            if (err) |e| {
-                if (!abandoned and self.first_error == null) self.first_error = e;
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.running -= 1;
+                if (task.kind == .default) self.running_default -= 1;
+                if (err) |e| {
+                    if (!abandoned and self.first_error == null) self.first_error = e;
+                }
             }
+            // A freed Default cap slot may unblock a parked sibling.
+            self.gate.ring();
         }
     }
 };
