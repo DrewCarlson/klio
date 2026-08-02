@@ -5384,7 +5384,15 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             }
             const b = switch (v) {
                 .Bool => |bv| !bv,
-                else => return raiseStep(frame, .{ .Type = "Not on non-bool" }),
+                else => {
+                    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                        std.debug.print("[not-miss] in={s} kind={s} span={?any}\n", .{
+                            frame.func.name, @tagName(std.meta.activeTag(v)), frame.cur_span,
+                        });
+                        dumpFrameChainForDiagAlways();
+                    }
+                    return raiseStep(frame, .{ .Type = "Not on non-bool" });
+                },
             };
             try frame.write(n.dst, .{ .Bool = b });
         },

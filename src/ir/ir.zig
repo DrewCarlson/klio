@@ -7981,6 +7981,53 @@ pub const Module = struct {
         );
     }
 
+    /// Whether a tower-unlocked static commit is argument-PROVEN over its
+    /// whole candidate set: the target judges `.compatible` on every
+    /// supplied argument and every competitor is structurally inapplicable
+    /// or judges `.incompatible`. An `.unknown` anywhere keeps the deferral
+    /// — the runtime re-pick stays the safety net exactly where the static
+    /// shapes cannot decide (a tier pick without type proof is not a
+    /// commitment).
+    fn towerPickProven(
+        self: *const Module,
+        target: FuncId,
+        candidates: []const FuncId,
+        args: []const applicability.ArgShape,
+        bounds: []const ModuleRegistry.TypeParamBound,
+    ) bool {
+        // POSITIVE evidence only: `.compatible` from the judge means "not
+        // refuted", so a proof additionally demands every argument carry an
+        // authoritative shape (a literal kind or an authoritative type) —
+        // an unjudgeable argument keeps the deferral.
+        for (args) |arg| {
+            if (arg.literal_kind == null and (arg.ty == null or !arg.ty_authoritative)) return false;
+        }
+        var saw_target = false;
+        for (candidates) |cand| {
+            const is_target = cand.int() == target.int();
+            if (is_target) saw_target = true;
+            const sv = self.sigViewForApplicability(cand, callShapesHaveComposerPair(args)) orelse {
+                if (is_target) return false;
+                continue;
+            };
+            const named = !allShapeNamesNull(args);
+            const score = applicability.applicable(&sv, args, .{
+                .named = named,
+                .recv_external = named,
+            }) orelse {
+                if (is_target) return false;
+                continue;
+            };
+            const compat = self.staticBareArgsCompatibility(cand, sv, args, score, bounds);
+            if (is_target) {
+                if (compat != .compatible) return false;
+            } else if (compat != .incompatible) {
+                return false;
+            }
+        }
+        return saw_target;
+    }
+
     /// The single member-vs-global decision, folding the receiver
     /// gates once. `Call → exact`, `CallMember`/`CallMemberOrGlobal → virtual`
     /// (target non-null) or `deferred` (target null), `CallValue → deferred`.
@@ -8088,7 +8135,15 @@ pub const Module = struct {
                 if (std.mem.eql(u8, w, name)) std.debug.print("[ef] {s} t={d} inline={} nlr={} recvctx={} shadowable={} shadow={} file={d}\n", .{ name, t.int(), self.funcIsInline(t), ctx.nonlocal_return_lambda, ctx.in_receiver_context, member_shadowable, shadow, caller_file.int() });
             }
             if (!shadow) {
-                if (ctx.tower_scope and candidates.len > 1) {
+                // A tower-unlocked commit also stands down for a VALUE
+                // CAPTURE in scope: an outer local fn shares the name, lives
+                // in a capture cell no candidate tier can see, and Kotlin
+                // binds it over every global (`fun check(a, b, m) {...};
+                // repeat(1000) { check(a, b) }` bound `kotlin.check`).
+                if (ctx.tower_scope and (ctx.is_value_capture or
+                    (candidates.len > 1 and
+                        !self.towerPickProven(t, candidates, args, ctx.actual_type_param_bounds))))
+                {
                     const cs = try self.candidateSet(
                         alloc,
                         name,

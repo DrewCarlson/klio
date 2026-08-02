@@ -266,6 +266,25 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 - **Pack-build trap**: `klio pack build kotlin-klio/klio-compose-runtime`
   yields a broken pack; the real source dir is `klio-compose-runtime-engine`.
 
+## Open finding (2026-08-02): inline-lambda splice hygiene
+
+A caller-supplied lambda body spliced into an INLINE stdlib callee
+resolves its bare names in the CALLEE's package scope: `fun main() {
+fun check(a: Float, b: Float, c: Float? = null) {…}; repeat(2) {
+check(1.5f, 0.5f) } }` binds `kotlin.check` DIRECT (`Call exact=true`,
+no [ef]/[bare]/eager rows — the splice arm committed it), while the
+same call outside the lambda binds the local. Kotlin's inline lambdas
+are hygienic: the argument body resolves in the CALLER's scope. In
+receiver contexts the shadow deferral masks it (the runtime cell probe
+finds the local — FloorDivModTest.floatMod's `check` survives this
+way); in a non-receiver `main` the package-scoped direct commit wins
+and the local is lost. Repro: the fixture text above (10 lines).
+Fix direction: the splice must restore the caller's resolution context
+(self_package + local-fn tables) when lowering the LAMBDA-ARGUMENT
+portion of a spliced body — the per-layer hint restoration already
+exists for receiver channels; package/local-scope needs the same
+treatment.
+
 ## The three-tier static/dynamic boundary
 
 Every call and access lowers to exactly one tier. The tiers *are* the boundary
