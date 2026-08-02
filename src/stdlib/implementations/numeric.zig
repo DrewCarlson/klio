@@ -558,8 +558,14 @@ pub fn ctor_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(.{ .UShort = @truncate(@as(u64, @bitCast(v))) });
 }
 pub fn ctor_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
-    const v = unsignedCtorArg(ctx.args) orelse
+    const v = unsignedCtorArg(ctx.args) orelse {
+        if (runtime.getenvSlice("KLIO_UCTOR_TRACE") != null) {
+            std.debug.print("[uctor] nargs={d} tags=", .{ctx.args.len});
+            for (ctx.args) |a| std.debug.print("{s},", .{@tagName(std.meta.activeTag(a))});
+            std.debug.print("\n", .{});
+        }
         return .{ .err = .{ .Type = "UInt constructor requires an integer" } };
+    };
     return ok(.{ .UInt = @truncate(@as(u64, @bitCast(v))) });
 }
 pub fn ctor_ulong(ctx: *CallCtx) Allocator.Error!EvalResult {

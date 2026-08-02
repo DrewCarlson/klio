@@ -579,13 +579,26 @@ unless noted. Chronological.
   A single-test run of the same file set passes — the trigger is the
   unsigned TESTS executing beforehand. An owner-chain guard on the
   total-miss member tail (committed — correct hardening regardless)
-  did NOT fix it, so the accepting path is one of the earlier dispatch
-  tails (the extension fallback / lenient rank accepting a UInt-owned
-  member for an Int receiver under the shifted candidate order). Next:
-  trace WHICH tail serves that `or` (`KLIO_MISS_TRACE=or` +
-  `KLIO_NU_TRACE=or` on the repro), fix its receiver filter, flip the
-  gate for the −121 sites. The pinned repro command lives in this
-  entry's history.
+  did NOT fix it. Session-3 facts: the failing site is
+  ArraysTest.shuffle/shufflePredictably's OWN body (fails in ~5ms),
+  whose first statements are `val numbers = List(100) { it }` (the
+  gate's own feature types it) then
+  `testShuffle(numbers.map(Int::toUInt).toUIntArray(), ...)`; the
+  thrown error is `ctor_uint` receiving exactly ONE argument of tag
+  INSTANCE (`[uctor] nargs=1 tags=Instance`, KLIO_UCTOR_TRACE); the
+  `or`-dispatch theory is DEAD (checkInvariants executes fine, no
+  or/nextInt/shuffle dispatch rows precede the error), and
+  `resolved=null` on its CallMembers rules out baked-fid staleness
+  there. Toy repros of every suspected shape (List-factory +
+  `map(Int::toUInt)` + `toUIntArray` + testShuffle generic
+  receiver-lambdas, unsigned lowerings primed first) PASS — only the
+  full batch-shaped child with the unsigned suite executing
+  beforehand reproduces (the --only-file pair + dir siblings + the 3
+  cross-dir providers, `--filter=ArraysTest`, `KLIO_LAMBDA_RET=1`,
+  cold cache — deterministic there). NEXT PROBE (decisive): dump the
+  frame chain at the `[uctor]` site (or make the ctor failure a
+  Thrown exception so errtrace prints it) — that names the mis-bound
+  call in one run.
 
 ## Measured dead ends and falsified theories — do not retry
 
