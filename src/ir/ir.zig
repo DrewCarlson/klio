@@ -5616,8 +5616,14 @@ pub const Module = struct {
         }
         var found: ?ClassId = null;
         for (self.classes.items) |class| {
-            if (!std.mem.eql(u8, class.name, name) and
-                !std.mem.eql(u8, applicability.simpleName(class.fqn), name)) continue;
+            const name_match = std.mem.eql(u8, class.name, name);
+            if (!name_match) {
+                if (!std.mem.eql(u8, applicability.simpleName(class.fqn), name)) continue;
+                // Nested classes are not bare-name-visible; see the cache
+                // builder above.
+                if (self.registry.enclosing_class.get(class.name) != null or
+                    self.registry.enclosing_class.get(class.fqn) != null) continue;
+            }
             if (found) |id| {
                 if (id != class.id and
                     !std.mem.eql(u8, self.classes.items[id.int()].fqn, class.fqn)) return null;
@@ -5637,7 +5643,14 @@ pub const Module = struct {
             try self.uniqueSimpleInsert(gpa, c.name, c.id, c.fqn, non_kotlin);
             const seg = applicability.simpleName(c.fqn);
             if (!std.mem.eql(u8, seg, c.name)) {
-                try self.uniqueSimpleInsert(gpa, seg, c.id, c.fqn, non_kotlin);
+                // A NESTED class is not bare-name-visible outside its
+                // enclosing declaration, so its trailing FQN segment must
+                // not create simple-name ambiguity (the four unsigned
+                // arrays each nest a private `Iterator`, which killed every
+                // bare `Iterator` head lookup module-wide).
+                const nested = self.registry.enclosing_class.get(c.name) != null or
+                    self.registry.enclosing_class.get(c.fqn) != null;
+                if (!nested) try self.uniqueSimpleInsert(gpa, seg, c.id, c.fqn, non_kotlin);
             }
         }
     }
