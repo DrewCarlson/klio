@@ -504,6 +504,34 @@ unless noted. Chronological.
   is committed separately). CLOSED as a direction.
 - Head-only receiver evidence for lambda bodies, twice: the target
   population has no recv head at all (`with(xs) { iterator() }`).
+- Star-erased returns on bare receiver heads (2026-08-02): substituting
+  `*` for unprojectable owner params in `instantiatedCallReturnType`
+  (so bare `iterator()` on an argument-less `Iterable` head yields
+  `Iterator<*>`) measured an IDENTICAL census — the toy shapes that
+  motivated it (member-extension bare calls, plain extension bodies)
+  already bind through the ast-declared/od fallbacks. The
+  `[no-recv-name] iterator` mass actually lives in OBJECT-EXPRESSION
+  bodies (`Sequences.kt`: `val iterator = sequence.iterator()` inside
+  `object : Iterator<T>`), where the blocker is upstream: `sequence`
+  is an outer-class ctor property whose TYPE the nested builder never
+  sees, so the receiver chain nulls before any return instantiation
+  runs. Fix the enclosing-property type channel, not the return side.
+- Anon-object property type heads via a thread-local snapshot
+  (2026-08-02): built and verified end-to-end — `buildObject` derived
+  `iterator -> Iterator` from the captured `this`'s field value's
+  runtime class plus main-module member resolution, installed it
+  `setLowerAnonScopeRenames`-style, and `propTypeHeadOn` consulted it —
+  and the body STILL emitted `CallMember`, because anon member bodies
+  lower into `Module.default` side modules with NO class table:
+  `uniqueClassIdBySimpleName("Iterator")` is null there, so every
+  member call in every anon body is name-dynamic regardless of receiver
+  evidence. Reverted. The real project is side-module lowering
+  visibility into the main image (a base-module reference consulted by
+  the class/registry lookups, or lowering anon members against the main
+  module under its write lock); the prop-head snapshot is the right
+  evidence channel to rebuild AFTER that lands. The anon-body population
+  is the top of `[no-recv-name]` (`Sequences.kt` object expressions) and
+  also feeds `no_class_id` (296 simple_unknown).
 - `plusCollectionInference` five falsified theories:
   instantiation-dependent recordings (29,517 excluded, still fails);
   unbound splice param (`KLIO_SPLICE_TRACE`: `bound element: T`);
