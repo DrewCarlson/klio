@@ -138,6 +138,32 @@ unchanged):
   instantiatedCallReturnType's owner-projection arm. The unsigned
   splice family rides the storage-mapped contexts.
 
+- **Receiver channels for the generic test-class family** (dd727310,
+  a1b446b5): TypeParamBound carries concrete bound ARGS (image format
+  39); method bodies register the full bound ref; the lambda-param
+  channel substitutes from the receiver
+  (Module.instantiatedTypeFromReceiver + substitutionRecv resolving
+  T-heads through the bound ref); bound refs cross into lambda/local-fn
+  bodies (pending_lambda_type_param_bound_refs); the invoke-convention
+  unwrap types `createFrom(...)` calls from the fn-typed property's
+  return; and instantiatedCallReturnTypeScoped keeps owner params as
+  THEMSELVES when the caller is inside the owner (the star-fill erased
+  `val data = createFrom(...)` to a refused bare `*`). stdlib
+  no_receiver_type 1,163 -> 1,124 (83.1% bound; 82.3% at session
+  start; 1,211 at handoff). Pins `bound_args_lambda_param`.
+  **MEASURED AND REVERTED — the next ranker gap**: flipping
+  classPropHead to return the PARAM name (another -11) broke
+  LinkedStringSetTest.minus* with Expected<[bar]> actual<[bar]>: a
+  T-headed receiver reaches resolveExtensionCall's RANKER unresolved,
+  so Set.minus stays applicable where kotlinc refutes it against the
+  Iterable<String> bound and the SET result breaks List equality. The
+  ranker (and the operator Binary arm) need the typeParamBoundRef hop
+  applied to the receiver BEFORE ranking; land that, then re-flip
+  classPropHead. Remaining stdlib `it` (169) is a long tail of
+  stdlib-bake lambda contexts (Duration takeIf-chains, unsigned splice
+  contexts, windowed/joinToString shapes) — per-family, not one
+  design.
+
 ## Handoff — exact state as of 2026-08-03 (session end)
 
 Everything below is committed on `main` at `730200c7`; the working tree
