@@ -3064,6 +3064,50 @@ fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root
     pg.get().field_read_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
 }
 
+/// Insert into the field-WRITE memo. Main-module classes only: a runtime /
+/// anonymous class can gain `$set$` overrides after the first write, and its
+/// fqn key does not outlive the class def.
+fn fieldWriteCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
+    if (!ir.eval.dispatchCacheStable()) return;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().classIdByFqn(fqn) == null) return;
+    }
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    if (pg.get().field_write_cache.count() >= 65536) return;
+    pg.get().field_write_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
+}
+
+/// The terminal plain store: write through a boxed-capture Cell when the
+/// slot holds one, else (re)define the field owning its own reference.
+fn storePlainField(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), store_name: []const u8, value: Value) Allocator.Error!UnitResult {
+    _ = self;
+    const existing: ?Value = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().get(store_name);
+    };
+    if (existing) |ev| {
+        if (ev == .Cell) {
+            const cg = ev.Cell.borrowMut();
+            defer cg.deinit();
+            if (runtime.reclaimEnabled()) {
+                value.retain();
+                cg.get().release(allocator);
+            }
+            cg.get().* = value;
+            return .{ .ok = {} };
+        }
+    }
+    value.retain();
+    const g = inst.borrowMut();
+    defer g.deinit();
+    try g.get().define(allocator, store_name, value);
+    return .{ .ok = {} };
+}
+
 /// Whether a `$sgetter$` resolution for (receiver class, scoped name) is a
 /// pure function of the class — every execution mode (member probe or
 /// direct read) reaches the same terminal — so the (class, name) memo may
@@ -3606,6 +3650,30 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     const bypass_setter = std.mem.startsWith(u8, name, "__klio_field__");
     const real_name = if (bypass_setter) name["__klio_field__".len..] else name;
+    // Field-write memo: one probe replaces the whole ext-setter / delegated /
+    // custom-setter / override-cell ladder below for a (class, name) pair the
+    // ladder has already classified from class-static facts alone.
+    const write_cache_ok = receiver.* == .Instance and !bypass_setter and
+        super_owner == null and ir.eval.dispatchCacheStable();
+    if (write_cache_ok) {
+        const rf_c = classFqnOf(receiver.Instance);
+        const hit: ?root.ProgramImage.FieldWriteHit = blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().field_write_cache.get(.{ .a = rf_c, .b = real_name });
+        };
+        if (hit) |h| {
+            if (h.setter != root.ProgramImage.FieldWriteHit.NONE) {
+                switch (try evalSetter(self, allocator, FuncId.from(h.setter), receiver.*, value)) {
+                    .ok => return .{ .ok = {} },
+                    .err => |e| return .{ .err = e },
+                }
+            }
+            return storePlainField(self, allocator, receiver.Instance, h.store_name, value);
+        }
+    }
+    var write_cacheable = write_cache_ok;
+    var plain_recordable = false;
     // Extension-property setter — `var T.x set(value) {…}`. A member property
     // of the same name shadows the extension, so skip it when the receiver
     // declares its own `real_name` (else `this.x = …` recurses through the
@@ -3681,6 +3749,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk false;
             };
             if (is_delegated) {
+                write_cacheable = false;
                 const raw: ?Value = blk: {
                     const g = inst.borrow();
                     defer g.deinit();
@@ -3780,6 +3849,12 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     const msg = try std.fmt.allocPrint(allocator, "setter FuncId {d} out of range", .{fid.int()});
                     return .{ .err = .{ .Type = msg } };
                 }
+                if (write_cacheable) {
+                    fieldWriteCachePut(self, classFqnOf(inst), real_name, .{
+                        .setter = fid.int(),
+                        .store_name = "",
+                    });
+                }
                 switch (try evalSetter(self, allocator, fid, receiver.*, value)) {
                     .ok => return .{ .ok = {} },
                     .err => |e| return .{ .err = e },
@@ -3823,6 +3898,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 }
                 break :blk false;
             };
+            if (is_own_member) plain_recordable = true;
             if (!has_own and !is_own_member) {
                 // Interface-delegation forwarding for writes: a `var` the
                 // delegated interface declares routes the write to the delegate
@@ -3883,36 +3959,14 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 }
                 break :blk real_name;
             };
-            // A boxed capture (an anon-object method writing a captured
-            // outer `var` held in its capture env as a shared Cell) takes
-            // the write THROUGH the cell so the outer scope observes it.
-            const existing: ?Value = blk: {
-                const g = inst.borrow();
-                defer g.deinit();
-                break :blk g.get().get(store_name);
-            };
-            if (existing) |ev| {
-                if (ev == .Cell) {
-                    const cg = ev.Cell.borrowMut();
-                    defer cg.deinit();
-                    if (runtime.reclaimEnabled()) {
-                        value.retain();
-                        cg.get().release(allocator);
-                    }
-                    cg.get().* = value;
-                    return .{ .ok = {} };
-                }
+            if (write_cacheable and plain_recordable) {
+                fieldWriteCachePut(self, classFqnOf(inst), real_name, .{
+                    .setter = root.ProgramImage.FieldWriteHit.NONE,
+                    .store_name = store_name,
+                });
             }
-            // `define` adopts one owned reference, but `value` here is the
-            // caller's borrow (the `SetField` opcode reads it straight out of a
-            // register). Retain so the field owns its own reference and the
-            // instance's teardown release is balanced. No-op under the arena.
-            value.retain();
-            const g = inst.borrowMut();
-            defer g.deinit();
-            try g.get().define(allocator, store_name, value);
+            return storePlainField(self, allocator, inst, store_name, value);
         }
-        return .{ .ok = {} };
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
     if (missTraceEnvCached() != null) {

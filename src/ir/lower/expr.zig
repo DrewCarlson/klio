@@ -6899,6 +6899,96 @@ fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
     }
 }
 
+/// Whether any of `f`'s value parameters is a RECEIVER-formed function type
+/// (`block: R.() -> T`).
+fn anyReceiverFormedFnParam(f: *const ast.Function) bool {
+    for (f.params) |*p| {
+        if (p.ty.function) |ft| {
+            if (ft.receiver != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `f`'s body contains a `this` reference INSIDE a nested lambda /
+/// anon-fun. Such a `this` may belong to a receiver-formed block invoked
+/// dynamically (`withCurrent { this }`), which a member-body splice would
+/// statically capture to the wrong receiver.
+fn bodyLambdaBindsThis(f: *const ast.Function) bool {
+    const body = &(f.body orelse return false);
+    return switch (body.*) {
+        .Block => |*blk| thisScanStmts(blk.stmts, false),
+        .Expr => |*e| thisScan(e, false),
+    };
+}
+
+fn thisScanStmts(stmts: []const ast.Stmt, in_lambda: bool) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| thisScan(e, in_lambda),
+            .Assign => |asg| thisScan(&asg.target, in_lambda) or thisScan(&asg.value, in_lambda),
+            .DestructuringDecl => |d| thisScan(&d.init, in_lambda),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| if (pr.init) |*init| thisScan(init, in_lambda) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+fn thisScanArgs(args: []const Expr, in_lambda: bool) bool {
+    for (args) |*a| {
+        if (thisScan(a, in_lambda)) return true;
+    }
+    return false;
+}
+
+fn thisScan(e: *const Expr, in_lambda: bool) bool {
+    return switch (e.*) {
+        .This => in_lambda,
+        .Lambda => |l| thisScanStmts(l.body.stmts, true),
+        .AnonFun => true,
+        .ObjectExpr => true,
+        .Member => |m| thisScan(m.receiver, in_lambda),
+        .Unary => |u| thisScan(u.expr, in_lambda),
+        .Postfix => |po| thisScan(po.expr, in_lambda),
+        .Spread => |sp| thisScan(sp.expr, in_lambda),
+        .Throw => |t| thisScan(t.value, in_lambda),
+        .Labeled => |l| thisScan(l.expr, in_lambda),
+        .As => |a| thisScan(a.expr, in_lambda),
+        .IsCheck => |c| thisScan(c.expr, in_lambda),
+        .MemberRef => |r| thisScan(r.receiver, in_lambda),
+        .Return => |r| if (r.value) |v| thisScan(v, in_lambda) else false,
+        .Call => |c| thisScan(c.callee, in_lambda) or thisScanArgs(c.args, in_lambda),
+        .Index => |i| thisScan(i.receiver, in_lambda) or thisScanArgs(i.args, in_lambda),
+        .Binary => |bin| thisScan(bin.lhs, in_lambda) or thisScan(bin.rhs, in_lambda),
+        .If => |i| thisScan(i.cond, in_lambda) or thisScan(i.then_branch, in_lambda) or
+            (if (i.else_branch) |eb| thisScan(eb, in_lambda) else false),
+        .While => |w| thisScan(w.cond, in_lambda) or thisScan(w.body, in_lambda),
+        .DoWhile => |dw| (if (dw.body) |db| thisScan(db, in_lambda) else false) or thisScan(dw.cond, in_lambda),
+        .For => |fl| thisScan(fl.iter, in_lambda) or thisScan(fl.body, in_lambda),
+        .Block => |blk| thisScanStmts(blk.stmts, in_lambda),
+        .When => |w| (if (w.subject) |sub| thisScan(sub, in_lambda) else false) or blk: {
+            for (w.branches) |*br| {
+                if (thisScan(&br.body, in_lambda)) break :blk true;
+            }
+            break :blk false;
+        },
+        .StringTemplate => |t| blk: {
+            for (t.parts) |*p| {
+                if (p.* == .Interp) {
+                    if (thisScan(p.Interp, in_lambda)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .Try => true,
+        else => false,
+    };
+}
+
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
@@ -6935,10 +7025,27 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         break :blk companionOwnerInEnclosingHierarchy(b, owner);
     };
+    // A bare inline-EXT call inside a class MEMBER body: `this` there is
+    // always an interpreted Instance, so the no-splice route's host binding
+    // can only serve it by draining the whole receiver into a host value
+    // per call (`indexOfFirst` inside `AbstractList.indexOf` drained the
+    // list on every `contains`). The splice keeps the operation in place,
+    // exactly as kotlinc inlines it. Ext-body contexts (recvTy set) keep
+    // the host fast path — their values are host-repr. RECEIVER-formed
+    // lambda params (`block: R.() -> T`) are excluded: a nested splice of
+    // `withCurrent { this }` bound the block's `this` to the OUTER member
+    // receiver (`current.modification` read off the list instead of the
+    // record) — those keep the dynamic route until the nested receiver
+    // rebinding is fixed.
+    const member_body_ext = f.receiver_type != null and
+        b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
+        b.recvTy() == null and b.ownerClass() != null and
+        !anyReceiverFormedFnParam(f) and !bodyLambdaBindsThis(f) and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
-            companion_super_member);
+            companion_super_member or member_body_ext);
 }
 
 /// True when `owner` names a companion object (a `$Companion`-mangled

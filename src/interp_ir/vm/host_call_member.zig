@@ -5210,6 +5210,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (std.mem.eql(u8, name, "toTypedArray")) {
                     return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
                 }
+                if (std.c.getenv("KLIO_DRAIN_TRACE") != null) {
+                    std.debug.print("[drain] {s} on {s} caller={s} span={?any}\n", .{
+                        name,
+                        receiver.typeFqn(),
+                        if (ir.eval.currentFrameFunc()) |cfn| cfn.fqn else "<none>",
+                        ir.eval.currentCallSiteSpan(),
+                    });
+                }
                 const drained = blk: {
                     iterable_fallback_active = true;
                     defer iterable_fallback_active = false;
@@ -8617,15 +8625,25 @@ fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) All
 fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8, name: []const u8) ?AnonMethodEntry {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
-    // The lookup keys are scratch — the map copies what it needs, so free them
-    // on exit. The GC does not manage these raw allocations; leaving them (the
-    // old arena-only assumption) leaks per dispatch under the freeing backends.
-    const ak = anonKey(allocator, class_name, arity_name) catch return null;
-    defer allocator.free(ak);
-    if (tbl.get().get(ak)) |e| return e;
-    const pk = anonKey(allocator, class_name, name) catch return null;
-    defer allocator.free(pk);
-    if (tbl.get().get(pk)) |e| return e;
+    if (tbl.get().count() == 0) return null;
+    // Probe keys live in a stack buffer — this runs per dynamic dispatch, and
+    // the old per-probe allocPrint pair was measurable in the profile. The
+    // heap fallback covers pathological name lengths.
+    var kb: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |ak| {
+        if (tbl.get().get(ak)) |e| return e;
+    } else |_| {
+        const ak = anonKey(allocator, class_name, arity_name) catch return null;
+        defer allocator.free(ak);
+        if (tbl.get().get(ak)) |e| return e;
+    }
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, name })) |pk| {
+        if (tbl.get().get(pk)) |e| return e;
+    } else |_| {
+        const pk = anonKey(allocator, class_name, name) catch return null;
+        defer allocator.free(pk);
+        if (tbl.get().get(pk)) |e| return e;
+    }
     return null;
 }
 
@@ -8635,6 +8653,11 @@ fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8,
 fn lookupAnonMethodExact(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8) ?AnonMethodEntry {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
+    if (tbl.get().count() == 0) return null;
+    var kb: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |key| {
+        return tbl.get().get(key);
+    } else |_| {}
     const key = anonKey(allocator, class_name, arity_name) catch return null;
     defer allocator.free(key);
     return tbl.get().get(key);
@@ -10478,6 +10501,9 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+        std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
+    }
     runtime.prof.opRoute(9);
     // Inline cache: memoize the (class, method-name, arg-type-signature) →
     // FuncId resolution. The signature captures the argument primitive types the
@@ -11756,6 +11782,9 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
 /// every single call (half of a recompose workload's runtime), and a walk
 /// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+        std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} declared={s}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", declared_recv orelse "-" });
+    }
     runtime.prof.opRoute(3);
     var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
         instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv);
