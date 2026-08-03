@@ -2309,6 +2309,16 @@ pub const Module = struct {
         return result;
     }
 
+    fn recvRefuteOn() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |v| return v;
+        const on = std.c.getenv("KLIO_RECV_REFUTE") != null;
+        S.cached = on;
+        return on;
+    }
+
     fn arrayVsCollectionParam(actual_head: []const u8, param_head: []const u8) bool {
         const is_array = std.mem.eql(u8, actual_head, "Array") or
             for ([_][]const u8{
@@ -3934,8 +3944,31 @@ pub const Module = struct {
                 scoped_receiver,
                 scoped_recv_param,
             );
+            // KLIO_RECV_REFUTE=1 (A/B, default OFF): kotlinc's static
+            // receiver semantics — a candidate whose declared receiver
+            // classifier is provably unrelated to the PROVEN static receiver
+            // is not a candidate at all (`Map.minus` never binds an
+            // Iterable-typed receiver). The lazy default keeps the
+            // runtime-polymorphic leniency until the audit adjudicates.
+            if (compatibility == .unknown and scoped_receiver.args.len != 0 and
+                recvRefuteOn())
+            {
+                const rh = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+                const ph = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
+                if (!std.mem.eql(u8, rh, ph) and
+                    self.staticBuiltinIdentity(scoped_receiver, rh) == .yes and
+                    self.staticBuiltinIdentity(scoped_recv_param, ph) == .yes and
+                    !evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, ph))
+                {
+                    compatibility = .incompatible;
+                }
+            }
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
-            if (rex_trace) std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}\n", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
+            if (rex_trace) {
+                std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
+                for (declared_bounds) |db| std.debug.print(" {s}<:{s}", .{ db.param, db.bound });
+                std.debug.print("\n", .{});
+            }
             if (declared_bounds.len != 0) {
                 const generic_applies = self.staticGenericReceiverApplicable(
                     sa,
@@ -4775,18 +4808,28 @@ pub const Module = struct {
         const params = self.registry.func_type_params.get(fid) orelse return &.{};
         const bounds = try allocator.alloc(ModuleRegistry.TypeParamBound, params.items.len);
         const explicit = self.registry.func_type_param_bounds.get(fid) orelse &.{};
-        for (params.items, bounds) |param, *out| {
-            out.* = .{ .param = param, .bound = "kotlin.Any" };
+        // The param list can carry a DUPLICATE name when a declaration
+        // registered through both the header phase and body placement; one
+        // record per NAME, or the multi-bound arms downstream refuse a
+        // single-parameter declaration (`Iterable<T>.minus` read bounds=2
+        // and staticGenericReceiverApplicable declined every candidate).
+        var n: usize = 0;
+        outer: for (params.items) |param| {
+            for (bounds[0..n]) |seen| {
+                if (std.mem.eql(u8, seen.param, param)) continue :outer;
+            }
+            bounds[n] = .{ .param = param, .bound = "kotlin.Any" };
             for (explicit) |bound| {
                 if (std.mem.eql(u8, bound.param, param)) {
-                    out.bound = bound.bound;
-                    out.complete = bound.complete;
-                    out.head_only = bound.head_only;
+                    bounds[n].bound = bound.bound;
+                    bounds[n].complete = bound.complete;
+                    bounds[n].head_only = bound.head_only;
                     break;
                 }
             }
+            n += 1;
         }
-        return bounds;
+        return bounds[0..n];
     }
 
     /// Instantiate the structural return type of an already-resolved call.
