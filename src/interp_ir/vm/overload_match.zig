@@ -271,6 +271,27 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         if (instanceDefinitelyNot(self, v, head)) return .disproven;
         return .unknown;
     }
+
+    // A bare callable value against a REGISTERED class/interface that is not
+    // a `fun interface` is a definite mismatch: no SAM conversion applies, so
+    // a lambda argument can never satisfy `FlowCollector` — the member
+    // `collect(FlowCollector)` must stand aside for the extension
+    // `collect(action)` exactly as kotlinc resolves it. A head that names no
+    // registered class (a typealias of a function type, an unseen import)
+    // stays unknown.
+    switch (v.*) {
+        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod => {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(head)) |d| {
+                const dg = d.borrow();
+                defer dg.deinit();
+                if (!dg.get().is_fun_interface) return .disproven;
+            }
+            return .unknown;
+        },
+        else => {},
+    }
     return .unknown;
 }
 

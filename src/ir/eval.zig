@@ -2444,6 +2444,15 @@ const Frame = struct {
         }
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
+        if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+            for (params.items, 0..) |*pv, pi| {
+                std.debug.print("[frame-bind] fn={s} #{d} kind={s}\n", .{
+                    if (func.fqn.len != 0) func.fqn else func.name,
+                    pi,
+                    @tagName(std.meta.activeTag(pv.*)),
+                });
+            }
+        }
         const regs = try acquireRegs(ev, allocator, func.n_locals);
         return .{
             .module = module,
@@ -6443,6 +6452,11 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
         const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
         defer allocator.free(tmp);
         try names_list.appendSlice(allocator, tmp);
+    }
+    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+        for (arg_values_list.items, 0..) |*av, ai| {
+            std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
+        }
     }
     // Receiver-typed lambda bare invocation: prepend the calling
     // frame's `this` when the closure expects a leading `this`.

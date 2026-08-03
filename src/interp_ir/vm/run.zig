@@ -649,6 +649,27 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                             for (al.captures) |cr| std.debug.print("r{d} ", .{cr.int()});
                             std.debug.print("\n", .{});
                         },
+                        .CallMember => |cm| {
+                            const nm = blk: {
+                                const cs = dmg.get().consts.items;
+                                if (cm.name.int() < cs.len and cs[cm.name.int()] == .String)
+                                    break :blk cs[cm.name.int()].String;
+                                break :blk "?";
+                            };
+                            std.debug.print("[dumpfn]   CallMember dst=r{d} recv=r{d} name={s} n={d} trailing={} static_recv={} declared_recv={} resolved={?d}\n", .{
+                                cm.dst.int(),
+                                cm.receiver.int(),
+                                nm,
+                                cm.n_args,
+                                cm.trailing_lambda,
+                                cm.static_recv != null,
+                                cm.declared_recv != null,
+                                if (cm.resolved) |r| r.int() else null,
+                            });
+                        },
+                        .CallValue => |cv| std.debug.print("[dumpfn]   CallValue dst=r{d} callee=r{d} args=r{d} n={d}\n", .{ cv.dst.int(), cv.callee.int(), cv.args.int(), cv.n_args }),
+                        .Move => |mv| std.debug.print("[dumpfn]   Move dst=r{d} src=r{d}\n", .{ mv.dst.int(), mv.src.int() }),
+                        .UnOp => |uo| std.debug.print("[dumpfn]   UnOp dst=r{d} op={s} operand=r{d}\n", .{ uo.dst.int(), @tagName(uo.op), uo.operand.int() }),
                         else => std.debug.print("[dumpfn]   {s}\n", .{@tagName(std.meta.activeTag(inst))}),
                     }
                 }

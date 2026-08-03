@@ -401,6 +401,11 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    // Parameter names shadow inherited enclosing-local records: without
+    // this, `let { it.sortedBy { it.nonEmptyLength() } }` typed the inner
+    // lambda's `it` from the OUTER `it`'s List record and refuted the
+    // local String extension.
+    for (names.items) |nm| b.clearLocalDeclType(nm);
     if (module.pending_lambda_param_types) |expected_types| {
         module.pending_lambda_param_types = null;
         defer moduleAllocator(module).free(expected_types);
