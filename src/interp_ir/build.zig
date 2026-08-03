@@ -1310,8 +1310,8 @@ fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     const head = ty.name.name;
     for (c.type_params) |*tp| {
         if (std.mem.eql(u8, tp.name.name, head)) {
-            const ub = tp.upper_bound orelse return null;
-            return ub.name.name;
+            if (tp.upper_bound == null) return null;
+            return tp.name.name;
         }
     }
     return head;

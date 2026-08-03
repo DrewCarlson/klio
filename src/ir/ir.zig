@@ -2219,7 +2219,17 @@ pub const Module = struct {
         ty: TypeRef,
     ) bool {
         if (overrideQualifiedPath(ty) != null) return false;
-        if (self.funcTypeParamIndex(fid, staticTypeHead(ty.name)) != null) return true;
+        // A use-site projection hides the parameter from the raw head:
+        // `Array<out T>` contains T even though its argument's head spells
+        // `out#T` — without the strip the whole parameter routed through
+        // receiver compatibility and the generic proof never ran.
+        var head = staticTypeHead(ty.name);
+        if (std.mem.startsWith(u8, head, "out#")) {
+            head = head["out#".len..];
+        } else if (std.mem.startsWith(u8, head, "in#")) {
+            head = head["in#".len..];
+        }
+        if (self.funcTypeParamIndex(fid, head) != null) return true;
         for (overrideArgs(ty)) |arg| {
             if (self.staticTypeContainsFuncParam(fid, arg)) return true;
         }
@@ -3334,6 +3344,10 @@ pub const Module = struct {
         return self.staticTypeIsSubtypeInner(a, actual, substituted, actual_bounds, 0);
     }
 
+    /// Diagnostic: the last route staticArgCompatibility answered through,
+    /// for the rex-arg row. Set on every return path below.
+    threadlocal var sac_route: []const u8 = "-";
+
     fn staticArgCompatibility(
         self: *const Module,
         fid: FuncId,
@@ -3341,17 +3355,22 @@ pub const Module = struct {
         param: TypeRef,
         actual_bounds: []const ModuleRegistry.TypeParamBound,
     ) StaticCompatibility {
+        sac_route = "-";
         const declared = staticTypeHead(param.name);
         if (overrideQualifiedPath(param) == null and
             self.funcTypeParamIndex(fid, declared) != null)
         {
-            if (arg.ty) |ty| return self.staticGenericArgCompatibility(
-                fid,
-                ty,
-                param,
-                0,
-            );
+            if (arg.ty) |ty| {
+                sac_route = "fn-tp-generic";
+                return self.staticGenericArgCompatibility(
+                    fid,
+                    ty,
+                    param,
+                    0,
+                );
+            }
             const bound = self.staticFuncTypeParamBound(fid, declared).?;
+            sac_route = "fn-tp-bound";
             if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
             return .unknown;
         }
@@ -3435,6 +3454,7 @@ pub const Module = struct {
         }
         if (arg.ty) |ty| {
             if (self.staticTypeContainsFuncParam(fid, param)) {
+                sac_route = "contains-fn-tp";
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
             if (typeContainsBoundParam(ty, actual_bounds)) {
@@ -3456,6 +3476,7 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            sac_route = "recv-compat-tail";
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
@@ -4207,12 +4228,13 @@ pub const Module = struct {
                         ctx.actual_type_param_bounds,
                     );
                     if (rex_trace) {
-                        std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s}\n", .{
+                        std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s} route={s}\n", .{
                             name,
                             fid.int(),
                             param.ty.name,
                             if (arg.ty) |t| t.name else "-",
                             @tagName(arg_compatibility),
+                            sac_route,
                         });
                     }
                     if (arg_compatibility == .incompatible) {
