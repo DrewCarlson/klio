@@ -1378,3 +1378,25 @@ sites is NOT the lambda producer path — probe which body-lowering
 route emits them before extending), plus random/chunked/windowed
 shapes. Session total: stdlib 1,211 -> 1,070, bound 82.3% -> 83.7%;
 examples 86.1% -> 86.7%.
+
+## Session-close standing (2026-08-03, resumed session end)
+
+Census, cold, both sets, at HEAD:
+- stdlib: 8,832 sites, 84.0% bound (1,513 + 5,905), no_receiver_type
+  1,048, declined 213, no_class_id 33. Session start: 1,211 / 82.3%.
+- examples: 98,793 sites, 86.9% bound (15,463 + 70,418),
+  no_receiver_type 8,472 (from 9,362), declined 2,699, no_class_id 463.
+
+Gates all green: sweep 117/0, litmus 42/42, drift 266/266, parity pins
+(+5 this session), units, compose SnapshotState 61/65 + 56/59.
+
+The remaining stdlib `it` mass (166) is now CONFIRMED dominated by
+head-only-bound receivers (`data: T` with `T : Iterable<String>` where
+only the bound HEAD survives the prop-head channel): `count`/`any`/
+`none`/`windowed` transform lambdas all wait on the receiver-refutation
+program (Addendum 1-3) that also gates the classPropHead flip. That
+program — kotlinc's static-receiver candidate semantics under the
+KLIO_RESOLVE_AUDIT discipline — is the single biggest remaining lever
+for both counts and is the designed next leg. After it: the
+resolver_declined 213 (same argument-authority family), no_class_id
+(unsigned host-symbol route), compose throughput, the bytecode VM.
