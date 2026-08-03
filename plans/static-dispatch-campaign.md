@@ -30,6 +30,60 @@ shadowing its own initializer; a later local capturing an earlier bare
 write; the boxed-var analysis; the local-init re-entry). Any new scope
 query must carry the declaration point.
 
+## Handoff — exact state as of 2026-08-03 (session end)
+
+Everything below is committed on `main` at `730200c7`; the working tree
+is clean except the user's in-progress README.md rewrite (NEVER commit
+or revert that file).
+
+Census standing (fresh, cold-cache, both sets):
+- stdlib: 8,910 sites, 82.3% bound (1,513 static + 5,824 virtual),
+  no_receiver_type 1,211, declined 213, no_class_id 29.
+- examples: 98,878 sites, 86.1% bound (15,462 + 69,641),
+  no_receiver_type 9,362, declined 2,699, no_class_id 436.
+- Campaign start was 2.34% / 37.4%.
+
+Gates, all green at HEAD: commontest sweep 117/117, threaded litmus
+41/41 (scripts/litmus-sweep.py — in the standing battery), corpus
+drift 266/266, parity pinned 154/154 (`zig build test`), ir 236 +
+interp_ir 118 unit tests, compose SnapshotStateListTests 61/65 +
+SnapshotStateMapTests 56/59 (the 7 fails are the concurrent
+throughput set below, nothing else).
+
+Where work stopped, in priority order:
+
+1. REMAINING no_receiver mass after the iterator-family clearance:
+   `it` 1,192 (lambda-context typing design, plan item #1),
+   `captured destination` 468 + `captured iterator` 104 (captured
+   implicit receiver, plan item #2), then a small tail (element 234,
+   list 159, line 105, index 104+104) NOT yet probed — next concrete
+   action was to run the `KLIO_NORECV_WHY=<name>` recipe on `element`
+   and `list` exactly as was done for `iterator` (that recipe found
+   three root causes and cleared the whole family; see the ledger
+   entry at `730200c7`).
+2. Compose 100% baselines: the 7 failing tests are pure single-thread
+   interpreter throughput on the lock-serialized snapshot-write path
+   (verified: 1 worker == 3 workers). Benchmark
+   concurrentGlobalModification_add went 20.5s -> ~13.4s this
+   session; `_add` passes upstream's real 60s runTest default (the
+   harness caps at 10s), but the source-written 30s budgets need
+   1.3x (`addAll`, true runtime 37.3s) to 2.6x (`removeRange`,
+   ~78s). Every spot-fix family is measured and closed (drains,
+   caches, allocation, syscalls — see the throughput section):
+   what remains is the core dispatch/execution loop
+   (superinstructions or the bytecode VM). Timing methodology:
+   same-day numbers drift thermally; only back-to-back A/B pairs.
+3. Long tail (all recorded with re-derivation recipes): 213/2,699
+   resolver_declined await lambda-context arg typing; no_class_id
+   29/436; KLIO_ANON_BASE default-ON awaits runtime-lowering arena
+   discipline; the refcount backend hangs on coroutines (never
+   benchmark with it), arena OOMs at the RSS cap.
+
+Diagnostics added this session (all env-gated, all kept):
+KLIO_NORECV_WHY (per-site derivation-terminal), KLIO_ICRT
+(instantiation trace), KLIO_DRAIN_TRACE, KLIO_WALK_TRACE, the
+[valty]-enter context print, litmus-sweep.py.
+
 ## Current state
 
 Census scripts (cold cache, pinned file sets — two measurements are

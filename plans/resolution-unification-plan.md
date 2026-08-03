@@ -65,6 +65,18 @@ for every non-runtime-polymorphic call.
 
 ## Where the work stands
 
+**Session-end handoff 2026-08-03:** the authoritative, dated handoff —
+census standing (stdlib 82.3% bound / examples 86.1%), all-green gate
+list, the exact stopped-at queue (the `KLIO_NORECV_WHY` probe on the
+`element`/`list` census tail is the next concrete action; then the
+lambda-context and captured-receiver designs; then the compose
+throughput budgets), the closed spot-fix families, and every diagnostic
+added — lives at the top of `plans/static-dispatch-campaign.md`
+("Handoff — exact state as of 2026-08-03"). Read that first when
+resuming; the sections below carry this plan's own longer-running
+state.
+
+
 The stdlib commonTest canonical is at 100% per-file (~2,150 cases, zero known
 failures, dual-eager identical). The compose test fleet
 (`scripts/compose-fleet.py --per-class`, honest mode) reads **1006 passed /
