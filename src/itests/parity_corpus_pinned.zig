@@ -1593,6 +1593,14 @@ test "sequence_scope_outer_iterator" {
     );
 }
 
+test "lock_member_binding_spliced" {
+    try check("lock_member_binding_spliced",
+        \\other=false
+        \\reacquired=true
+        \\
+    );
+}
+
 test "setter_value_param_typed" {
     try check("setter_value_param_typed",
         \\6

@@ -41,21 +41,27 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 8,978 member sites
+    stdlib:   total 8,974 member sites
             1,525  16.99%  bound_static
-            5,758  64.13%  bound_virtual     (81.1% bound; 2.34% at campaign start)
-            1,333  14.85%  no_receiver_type
+            5,758  64.16%  bound_virtual     (81.2% bound; 2.34% at campaign start)
+            1,329  14.81%  no_receiver_type
               213   2.37%  resolver_declined
                29   0.32%  no_class_id
               120   1.34%  nullable_or_generic
 
-    examples: total 91,643
-           14,468  15.79%  bound_static
-           63,399  69.18%  bound_virtual     (85.0% bound; 37.4% at start)
-            9,839  10.74%  no_receiver_type
-            2,493   2.72%  resolver_declined
-              264   0.29%  no_class_id
-            1,180   1.29%  nullable_or_generic
+    examples: total 99,688
+           15,618  15.67%  bound_static
+           68,760  68.98%  bound_virtual     (84.7% bound; 37.4% at start)
+           10,897  10.93%  no_receiver_type
+            2,699   2.71%  resolver_declined
+              436   0.44%  no_class_id
+            1,278   1.28%  nullable_or_generic
+
+The examples total grew 91,595→99,688 when the intrinsic-only-import
+fix landed: programs importing `kotlin.concurrent.thread` had been
+failing pre-run (the unresolved rejection), so their site mass was
+absent. The restored threaded examples carry fresh unbound mass, which
+is why the bound share dipped 85.0→84.7 while nothing regressed.
 
 The member-site TOTAL moves in both directions: bare calls becoming
 statically bound EXTENSION calls leave the member census (denominator
@@ -71,10 +77,11 @@ the ledger below. The eager pipeline is the ONLY pipeline
 
 Standing gates, all green at HEAD: sweep 117/0
 (`python3 scripts/commontest-sweep.py zig-out/bin/klio-harness`), corpus
-drift 266/266 (out-of-process headless runner), parity pinned 151/151
+drift 266/266 (out-of-process headless runner), parity pinned 152/152
 (`backtick_this_param_not_receiver` closed: a provably-unresolved bare
-call in a package-less file is rejected pre-run), ir unit tests,
-`zig build test`.
+call in a package-less file is rejected pre-run), threaded litmus 41/41
+(`python3 scripts/litmus-sweep.py` — first fully-green run of the
+suite), ir unit tests, `zig build test`.
 
 ## Remaining work
 
@@ -611,6 +618,56 @@ unless noted. Chronological.
   at ref-lowering, which the lambda-return typing enabled.
   KLIO_LAMBDA_RET is now DEFAULT ON: stdlib no_receiver_type
   1,524→1,353, 80.6%% bound. Pin `unbound_ref_companion_receiver`.
+
+- **Extension-property declared types flow to bare reads**
+  (`KLIO_EXT_RECV_PROP`): a bare read whose name resolves to an
+  extension-property getter (`__ext_get_<Head>_<name>` on the receiver
+  tower) types the read from the getter's declared return head, so
+  `n`/`last`-style ext-prop locals stop being `no_receiver_type`
+  downstream. Pin `ext_prop_type_bare_read`.
+
+- **Splice-hint feed + setter value typing**: the inline splice hands
+  its receiver/param type hints to the spliced builder eagerly, and a
+  class-member setter's `value` parameter carries the property's
+  declared type (`lowerSetterExprTyped`/`lowerSetterBlockTyped` set
+  the local decl type + nullability). Pin `setter_value_param_typed`.
+
+- **The bare return derivation walks the outer receiver tower**: `val
+  iterator = iterator()` inside `sequence { }` receiver-lambdas
+  derived no type because `staticCallReturnTypeRef`'s bare Path arm
+  probed only the innermost head (SequenceScope); it now walks the
+  enclosing implicit-receiver tower and resolves the member or bare
+  extension against each outer head, adopting the first hit's receiver.
+  stdlib no_receiver_type 1,333→1,329, examples 9,839→9,791. Pin
+  `sequence_scope_outer_iterator`.
+
+- **Litmus restoration: two holes the static campaign opened, one
+  latent shadowing bug** (found by the new
+  `scripts/litmus-sweep.py`, 34/41→41/41 — first fully-green litmus):
+  (1) the pre-run unresolved rejection fired on intrinsic-only imports
+  — `kotlin.concurrent.thread` has a host impl but no Kotlin
+  declaration, so every provability probe answered no; a named import
+  of the leaf now defeats provability. (2) `linkResolvedForms` marked
+  only simple-name-indexed funcs native, so a member-form binding
+  (`kotlinx.atomicfu.locks.ReentrantLock.lock`) never settled onto the
+  class METHOD's FuncId — a statically resolved spliced `lock()` ran
+  the placeholder no-op body and held no lock (8×500 guarded
+  increments lost ~5%); the link now resolves the binding key's class
+  prefix and marks matching methods. (3) latent: a caller local
+  shadowing a receiver member for a bare CALL — `val lock =
+  ReentrantLock()` beside the spliced body's `lock()` lowered
+  `CallValue` on the instance (`invoke` miss); a local whose
+  initializer is a constructor of a concrete class with no `invoke`
+  operator (member or applicable extension) now defers to the
+  function/member path, matching kotlinc candidate rules. Census:
+  stdlib total 8,978→8,974 (deferred locals leaving the value-call
+  census); examples total 91,595→99,688 — programs importing
+  `kotlin.concurrent.thread` had been failing pre-run, so the import
+  fix restored their whole site mass (bound share 85.0→84.7 from the
+  fresh threaded mass, no regression). Pin
+  `lock_member_binding_spliced` + a linkResolvedForms member-form unit
+  test; litmus sweep promoted to the standing battery
+  (`scripts/litmus-sweep.py`).
 
 ## Measured dead ends and falsified theories — do not retry
 

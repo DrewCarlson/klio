@@ -557,6 +557,28 @@ pub const ProgramImage = struct {
                         try self.resolved_native.put(cand.int(), intrinsic);
                     }
                 }
+                // A member-form binding (`<pkg>.<Class>.<name>`) names a
+                // class method, which the simple-name index does not carry.
+                // A statically resolved call reaches that method's FuncId
+                // directly through `callFunc`, so its placeholder Kotlin
+                // body must be settled to the intrinsic here exactly like a
+                // top-level form (`kotlinx.atomicfu.locks.ReentrantLock.
+                // lock`'s no-op body held no lock under a spliced
+                // `withLock`).
+                if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+                    const owner_fqn = fqn[0..dot];
+                    if (module.classIdByFqn(owner_fqn)) |cid| {
+                        if (cid.int() < module.classes.items.len) {
+                            const cls = &module.classes.items[cid.int()];
+                            for (cls.methods) |mid| {
+                                const mf = module.funcById(mid) orelse continue;
+                                if (!std.mem.eql(u8, mf.name, simple)) continue;
+                                if (genericOverloadKeepsBody(module, mid, mf)) continue;
+                                try self.resolved_native.put(mid.int(), intrinsic);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1675,6 +1697,48 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     }
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
+}
+
+test "linkResolvedForms settles a member-form binding onto the class method" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer {
+        for (m.funcs.items) |f| a.free(f.blocks);
+        m.deinit(a);
+    }
+    // A body-bearing method reached only through its class: member funcs
+    // are not in the simple-name index, so the member leg must resolve the
+    // binding key's class prefix and mark the method native (the
+    // `ReentrantLock.lock` placeholder-body shape).
+    const lock_m = try pushLinkTestFunc(&m, a, "lock", "kx.locks.ReentrantLock.lock");
+    _ = m.func_index.pop();
+    try m.rebuildFuncNameIndex(a);
+    const methods = try a.alloc(FuncId, 1);
+    defer a.free(methods);
+    methods[0] = lock_m;
+    try m.classes.append(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "ReentrantLock",
+        .fqn = "kx.locks.ReentrantLock",
+        .primary_params = &.{},
+        .methods = methods,
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+    defer _ = m.classes.pop();
+
+    var prog = try ProgramImage.init(a);
+    defer prog.deinit();
+    {
+        const bg = prog.installed_bindings.borrowMut();
+        defer bg.deinit();
+        try bg.get().register("kx.locks.ReentrantLock.lock", linkTestNativeFn);
+    }
+    try prog.linkResolvedForms(&m);
+    const resolved = prog.resolvedNativeForm(lock_m);
+    try testing.expect(resolved != null);
+    try testing.expect(resolved.? == linkTestNativeFn);
 }
 
 test "linkResolvedForms keeps a structurally generic overload body" {

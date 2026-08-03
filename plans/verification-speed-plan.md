@@ -84,6 +84,12 @@ Two standing traps this re-confirmed:
   interpreter is ~4× slower per run — fine for single repros.
 - **Targeted commontest check** (one file, both eager modes):
   `python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both`
+- **Threaded-litmus sweep** (~40 s, all 41 fixtures out-of-process):
+  `python3 scripts/litmus-sweep.py [harness] [--filter substr]` — mirrors the
+  `parity_threaded_litmus` itest without an itest rebuild. Part of the
+  default battery: it caught a pre-run-rejection regression (intrinsic-only
+  `thread` import) and a member-binding link hole the commontest and corpus
+  sweeps cannot see.
 - **One suite**: `zig build itest-<name>` (builds and runs just that suite).
   Never run `zig build itest-bin` (all ~56 binaries) during iteration.
 - **Full gate before a commit**: `scripts/gate.sh` (unit + litmus set + e2e +
