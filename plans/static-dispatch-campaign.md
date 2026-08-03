@@ -234,7 +234,24 @@ Flow 68. Start with `listOf`/`mutableListOf` and the `iterator()`
 chain, and the substitution of a caller's own type arguments into a
 generic member's return type (`getOrPut` returning `V`).
 
-Concrete first step, measured 2026-08-03: the `iterator` local family
+Concrete first step, PARTIALLY INVESTIGATED 2026-08-03 (pick up here):
+the star-return channel (KLIO_STAR_RET) already serves the USER shape —
+`val iterator = iterator()` inside `fun <T> Sequence<T>.countAll()`
+lowers all three of iterator/hasNext/next as bound CallVirtual (verified
+by dump). The 516-weighted census sites are STDLIB-INTERNAL (57/example
+recv=SequenceScope inside `sequence {}` builder bodies, 25 recv=Map,
+10 recv=<none>), where the derivation misses at BAKE time.
+KLIO_VALTY_TRACE=iterator over one example run: 219 sites DO record
+head=Iterator; 1,676 reads see decl=<unset>, with `enter iterator
+annotated=false init_tag=Call` at nf ids 6003/6005/6080/6082 (two
+module variants d278/a478). The lambda tower IS propagated into
+pre-lowered bodies (lowerLambda stashes collectReceiverTowerLabeled via
+module.pending_lambda_receiver_tower -> setImplicitReceiverTower in
+lambda_body.zig), so the miss is deeper: identify nf 6005's function
+(KLIO_DUMP_FN by id fires only on execution — trace at lowering
+instead), then check whether the tower content at that site includes
+the outer Sequence entry and why staticCallReturnTypeRef's bare arm
+returns null there. The `iterator` local family
 (516 examples-weighted, recv=SequenceScope 57/example + recv=Sequence
 direct) is `val iterator = iterator()` inside stdlib extension bodies.
 The resolved `Sequence.iterator()` returns `Iterator<T>` with the
