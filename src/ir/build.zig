@@ -2141,12 +2141,25 @@ pub const FuncBuilder = struct {
         complete: bool,
         head_only: bool,
     ) Allocator.Error!void {
+        return self.addTypeParamBoundHeadArgs(name, bound, complete, head_only, &.{});
+    }
+    /// `bound_args`: the bound's concrete type-argument heads (see
+    /// `ModuleRegistry.TypeParamBound.args`) — registry-lifetime slices.
+    pub fn addTypeParamBoundHeadArgs(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: []const u8,
+        complete: bool,
+        head_only: bool,
+        bound_args: []const []const u8,
+    ) Allocator.Error!void {
         try self.type_param_names.put(name, {});
         try self.type_param_bounds.put(name, .{
             .param = name,
             .bound = bound,
             .complete = complete,
             .head_only = head_only,
+            .args = bound_args,
         });
     }
     pub fn addOwnedTypeParamBoundEvidence(

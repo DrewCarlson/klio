@@ -1788,11 +1788,12 @@ fn addScopedTypeParamBounds(
                     }
                 }
                 if (!shadowed) {
-                    try b.addTypeParamBoundHead(
+                    try b.addTypeParamBoundHeadArgs(
                         bound.param,
                         bound.bound,
                         bound.complete,
                         bound.head_only,
+                        bound.args,
                     );
                     // A bound whose record kept CONCRETE type arguments
                     // also registers the full ref, so a receiver typed by

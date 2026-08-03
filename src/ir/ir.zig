@@ -3722,12 +3722,35 @@ pub const Module = struct {
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        const scoped_receiver = self.resolveTypeAliasAt(
+        var scoped_receiver = self.resolveTypeAliasAt(
             sa,
             receiver,
             ctx.caller_file,
             ctx.caller_package,
         ) catch return .{};
+        // A receiver still HEADED by a type parameter ranks with its full
+        // bound substituted: `data - "foo"` on a `T : Iterable<String>`
+        // receiver must refute `Set.minus` exactly as kotlinc does — an
+        // unresolved `T` head leaves every receiver-shaped candidate
+        // applicable, and the wrong overload can outrank the bound's own.
+        if (scoped_receiver.args.len == 0) {
+            const rhead = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+            for (ctx.actual_type_param_bounds) |b| {
+                if (!std.mem.eql(u8, b.param, rhead)) continue;
+                if (b.args.len == 0) break;
+                if (sa.alloc(TypeRef, b.args.len)) |hop_args| {
+                    for (b.args, hop_args) |an, *dst| {
+                        dst.* = .{ .name = an, .nullable = false, .args = &.{} };
+                    }
+                    scoped_receiver = .{
+                        .name = b.bound,
+                        .nullable = false,
+                        .args = hop_args,
+                    };
+                } else |_| {}
+                break;
+            }
+        }
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
