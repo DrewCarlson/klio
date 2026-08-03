@@ -9107,6 +9107,13 @@ pub const ModuleRegistry = struct {
     /// call on the property resolves against the static type, as
     /// kotlinc does.
     class_prop_type_heads: StrPairMap([]const u8),
+    /// `(extension-receiver head, property name)` -> declared type head for
+    /// TOP-LEVEL extension properties (`val IntArray.indices: IntRange`
+    /// records `(IntArray, indices) -> IntRange`). Recorded in the decl
+    /// scan, before any body lowers, so a bare `indices` read inside an
+    /// array extension body types statically even while the stdlib itself
+    /// is still lowering.
+    ext_prop_type_heads: StrPairMap([]const u8),
     /// `FuncId` → declaring-class simple name for *member extension
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
@@ -9279,6 +9286,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
+            .ext_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
@@ -9358,6 +9366,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
+        self.ext_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
         self.iface_member_ext_recv.deinit();
@@ -9503,6 +9512,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.class_prop_type_heads.iterator();
             while (it.next()) |e| try out.class_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.ext_prop_type_heads.iterator();
+            while (it.next()) |e| try out.ext_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.member_ext_owner_class.iterator();

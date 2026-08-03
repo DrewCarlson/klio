@@ -41,21 +41,21 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 8,974 member sites
-            1,525  16.99%  bound_static
-            5,758  64.16%  bound_virtual     (81.2% bound; 2.34% at campaign start)
-            1,329  14.81%  no_receiver_type
-              213   2.37%  resolver_declined
-               29   0.32%  no_class_id
-              120   1.34%  nullable_or_generic
+    stdlib:   total 8,918 member sites
+            1,519  17.03%  bound_static
+            5,758  64.57%  bound_virtual     (81.6% bound; 2.34% at campaign start)
+            1,279  14.34%  no_receiver_type
+              213   2.39%  resolver_declined
+               29   0.33%  no_class_id
+              120   1.35%  nullable_or_generic
 
-    examples: total 99,688
-           15,618  15.67%  bound_static
-           68,760  68.98%  bound_virtual     (84.7% bound; 37.4% at start)
-           10,897  10.93%  no_receiver_type
-            2,699   2.71%  resolver_declined
+    examples: total 98,982
+           15,540  15.70%  bound_static
+           68,761  69.47%  bound_virtual     (85.2% bound; 37.4% at start)
+           10,268  10.37%  no_receiver_type
+            2,699   2.73%  resolver_declined
               436   0.44%  no_class_id
-            1,278   1.28%  nullable_or_generic
+            1,278   1.29%  nullable_or_generic
 
 The examples total grew 91,595→99,688 when the intrinsic-only-import
 fix landed: programs importing `kotlin.concurrent.thread` had been
@@ -77,7 +77,7 @@ the ledger below. The eager pipeline is the ONLY pipeline
 
 Standing gates, all green at HEAD: sweep 117/0
 (`python3 scripts/commontest-sweep.py zig-out/bin/klio-harness`), corpus
-drift 266/266 (out-of-process headless runner), parity pinned 152/152
+drift 266/266 (out-of-process headless runner), parity pinned 153/153
 (`backtick_this_param_not_receiver` closed: a provably-unresolved bare
 call in a package-less file is rejected pre-run), threaded litmus 41/41
 (`python3 scripts/litmus-sweep.py` — first fully-green run of the
@@ -668,6 +668,37 @@ unless noted. Chronological.
   `lock_member_binding_spliced` + a linkResolvedForms member-form unit
   test; litmus sweep promoted to the standing battery
   (`scripts/litmus-sweep.py`).
+
+- **Extension-property type heads recorded at declaration scan**
+  (`ext_prop_type_heads` in the registry, image format 38): the bare
+  `indices` receiver family — 629 examples-weighted sites, all inside
+  shipped array/CharSequence extension bodies — derived nothing because
+  the ext-prop channel read the GETTER FUNC's return type, and (a)
+  accessor funcs never entered `func_name_index` (`pushFunc` skipped
+  the index; the `__ext_get_*` naming contract found nothing, ever),
+  (b) even indexed, stdlib-internal sites lower during the bake BEFORE
+  the getters lower — ordering no func-lookup can beat. Both fixed:
+  `pushFunc` indexes `__ext_get_*` accessors, accessors carry the
+  declared property type as their return type, and the decl scan
+  records `(receiver head, prop) -> declared head` before any body
+  lowers, which `extPropReturnHead` consults first. stdlib
+  no_receiver_type 1,329->1,279, examples 10,897->10,268 (the whole
+  family). Pin `ext_prop_receiver_typed_read` (property declared AFTER
+  the consuming function, so only the decl channel can answer).
+  The new typed sites exposed two dispatch holes, both fixed in the
+  same slice: (a) the member-form binding link is restricted to
+  CONCRETE classes — an interface/abstract method fid marked native
+  would serve host-repr intrinsics to interpreted receivers; (b) a
+  virtual slot on an interpreted Instance that links to a BODYLESS
+  header with a host symbol now falls to the by-name ladder whenever
+  the receiver's class hierarchy declares the member — the header's
+  native form fed a `PersistentList` instance to
+  `kotlin.collections.List.isEmpty` (host-List-only), the compose
+  `validateIsEmpty` failure. This interaction class (typed receiver ->
+  newly bound slot -> repr-mismatched native header) is the expected
+  failure shape as binding coverage grows; the name ladder still
+  reaches host bindings through its own tails when no interpreted body
+  exists.
 
 ## Measured dead ends and falsified theories — do not retry
 

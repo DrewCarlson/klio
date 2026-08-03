@@ -44,6 +44,19 @@ fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     var func = func_in;
     func.id = id;
     try module.funcs.append(moduleAllocator(module), func);
+    // An extension-property getter is looked up BY NAME under the
+    // `__ext_get_<Head>_<name>` contract (`extPropGetterReturn` types a
+    // bare `indices` read from the getter's declared return); without the
+    // index entry no accessor was ever findable and the channel answered
+    // nothing. Mangled names never collide with user identifiers, so the
+    // simple-name heuristics are untouched.
+    if (std.mem.startsWith(u8, func.name, "__ext_get_")) {
+        const a = moduleAllocator(module);
+        try module.func_index.append(a, .{ .name = func.name, .id = id });
+        const gop = try module.func_name_index.getOrPut(func.name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, id);
+    }
     return id;
 }
 
@@ -400,10 +413,23 @@ fn lowerAccessorExprFull(
     const v = try lowerExpr(&b, if (widened) |*w| w else expr);
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
-    var func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
+}
+
+/// The accessor's declared property type as its IR return type, so the
+/// getter's return head is readable where the naming-contract lookup
+/// consumes it. Unit when the property declares none.
+fn accessorReturnTy(allocator: Allocator, expected: ?TypeRef) Allocator.Error!ir.TypeRef {
+    const ty = expected orelse return build.typeUnit();
+    if (ty.name.name.len == 0) return build.typeUnit();
+    return .{
+        .name = try allocator.dupe(u8, ty.name.name),
+        .nullable = ty.nullable,
+        .args = &.{},
+    };
 }
 
 /// Record the accessor's bound parameters as `Func.params` so the eval
@@ -432,6 +458,20 @@ pub fn lowerAccessorBlock(
     block: *const ast.Block,
     name: []const u8,
 ) Allocator.Error!FuncId {
+    return lowerAccessorBlockRet(module, owner_class, own_members, params, block, name, null);
+}
+
+/// `lowerAccessorBlock` carrying the property's declared type as the
+/// accessor's return type (the ext-getter naming-contract lookup reads it).
+pub fn lowerAccessorBlockRet(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    params: []const []const u8,
+    block: *const ast.Block,
+    name: []const u8,
+    expected: ?TypeRef,
+) Allocator.Error!FuncId {
     const allocator = moduleAllocator(module);
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
@@ -447,7 +487,7 @@ pub fn lowerAccessorBlock(
     try bindParams(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
-    var func = try b.finish(name, name, build.typeUnit());
+    var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }

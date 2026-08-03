@@ -1593,6 +1593,13 @@ test "sequence_scope_outer_iterator" {
     );
 }
 
+test "ext_prop_receiver_typed_read" {
+    try check("ext_prop_receiver_typed_read",
+        \\5
+        \\
+    );
+}
+
 test "lock_member_binding_spliced" {
     try check("lock_member_binding_spliced",
         \\other=false

@@ -91,6 +91,7 @@ pub const widenNumericLiteral = literals.widenNumericLiteral;
 
 // Thunk lowering surface.
 pub const lowerAccessorBlock = thunks.lowerAccessorBlock;
+pub const lowerAccessorBlockRet = thunks.lowerAccessorBlockRet;
 pub const lowerSetterBlockTyped = thunks.lowerSetterBlockTyped;
 pub const lowerSetterExprTyped = thunks.lowerSetterExprTyped;
 pub const lowerAccessorExpr = thunks.lowerAccessorExpr;

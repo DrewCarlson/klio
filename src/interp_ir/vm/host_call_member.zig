@@ -9840,6 +9840,33 @@ pub fn invokeVirtualMember(
             if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
         }
     }
+    // A bodyless header WITH a linked host symbol is executable — but only
+    // for receivers whose runtime REPR the intrinsic serves. An interpreted
+    // Instance whose class hierarchy declares the member has a MORE DERIVED
+    // interpreted override the name ladder finds; running the header's
+    // native form instead fed a `PersistentList` instance to
+    // `kotlin.collections.List.isEmpty` (host-List-only). The name ladder
+    // still reaches host bindings through its own tails when the hierarchy
+    // has no interpreted body.
+    if (!virtualTargetExecutable(module, target) and
+        host_call_func.resolvedNativeForm(self, target) != null)
+    {
+        if (slot_name) |n| {
+            const declares = blk: {
+                const class = runtime_def.borrow();
+                defer class.deinit();
+                const c = class.get();
+                if (module.registry.hierarchy_methods.get(c.name)) |s| {
+                    if (s.contains(n)) break :blk true;
+                }
+                if (module.registry.hierarchy_methods.get(c.fqn)) |s| {
+                    if (s.contains(n)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (declares) return callMemberNamed(self, allocator, receiver, n, args, arg_names);
+        }
+    }
 
     if (arg_params) |params| {
         const sig = module.decl_sigs.get(target.int());
