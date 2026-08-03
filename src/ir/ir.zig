@@ -10892,8 +10892,13 @@ test "member resolution separates class and caller function bounds" {
         },
         .actual_type_param_bounds = &actual_bounds,
     });
-    try testing.expect(resolved.target == null);
-    try testing.expect(!resolved.applicable);
+    // The caller's `T : CharSequence` proves nothing against the class's
+    // `T : Number` and refutes nothing either (one type can satisfy both
+    // bounds), so the single candidate commits only as DEFERRED — the
+    // runtime adjudicates. A `.virtual`/`.direct` result here means the
+    // two bound records were conflated into a false proof.
+    try testing.expect(resolved.target != null);
+    try testing.expect(resolved.dispatch == .deferred);
 }
 
 test "method slots link generic overrides and multiple interface roots" {
