@@ -1567,3 +1567,18 @@ expectations, and both pipelines resolve the bounded-receiver operator
 through the same engine. The duplicate-collector shape itself (two
 bound collectors, two func_type_params registrations, three compat
 provers) remains the standing P2-completion debt.
+
+## Addendum 13 — refutation-gate A/B on the declined family: zero (2026-08-04)
+
+KLIO_RECV_REFUTE=1 census is IDENTICAL on every bucket: the
+target_known_deferred 213's deferral decision lives in emitFormFor's
+member-vs-extension arbitration (knownReceiverApplicability and the
+promo gates), not in resolveExtensionCall's per-candidate compat loop
+where the gate sits. The family's actual blockers per [promo-blocked]:
+receiver_not_instance 130 (the host-symbol route design),
+ext_own_head/builtin_super/declared_super 169 (argument authority — the
+memberPromotionProven helper is due its THIRD re-derive now that six
+lambda/receiver typing channels landed; rebuild it from the Addendum-
+dated entry and measure), ext_generic_receiver 22 (the now-sound
+generic proof may serve these — include in the re-derive). The gate
+stays in-tree default-OFF for the ranker-level cases it was built for.
