@@ -1645,3 +1645,15 @@ winners). Every remaining declined site is now individually named and
 categorized; the family-level levers are exhausted — further declined
 work rides the it-tail argument-typing legs. Current standing: stdlib
 85.3% bound / declined 87; examples 87.9% / 1,075.
+
+## Addendum 19 — ctor-tail admission re-measured negative (2026-08-04)
+
+Re-admitted CONSTRUCTOR-only Call tails to the lambda-return channel
+under the now-sound compat stack (bound judgment, projection
+transparency, head relation): still net NEGATIVE — stdlib no_receiver
+1,172 -> 1,234, bound_virtual -64. The recorded dead end holds under
+new conditions; the getOrPut `V := ArrayList` narrowing genuinely
+disproves more downstream than the typed local buys, independent of
+proof soundness. The groupBy `list` family (67) therefore waits on the
+REAL substitution engine (per-instantiation evidence), not tail
+admission. Reverted.
