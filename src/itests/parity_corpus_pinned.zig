@@ -1593,6 +1593,13 @@ test "sequence_scope_outer_iterator" {
     );
 }
 
+test "interface_prop_receiver_iterator" {
+    try check("interface_prop_receiver_iterator",
+        \\3
+        \\
+    );
+}
+
 test "ext_prop_receiver_typed_read" {
     try check("ext_prop_receiver_typed_read",
         \\5

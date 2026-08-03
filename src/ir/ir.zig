@@ -4821,7 +4821,21 @@ pub const Module = struct {
                 // applicability-neutral downstream. `KLIO_STAR_RET=0`
                 // disables.
                 if (!projected_ok) {
-                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) {
+                    // The return may reference the owner's parameters by RAW
+                    // name or by the class-param IDENTITY mangle (an
+                    // inherited interface header's `Iterator<E>` carries
+                    // `$class$ N i:E` in its args) — test both, or the star
+                    // fill skips exactly the headers the completeness check
+                    // then refuses (`Set.iterator` stayed underivable).
+                    const mentions = blk_m: {
+                        if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) break :blk_m true;
+                        for (owner_class.type_params) |param| {
+                            const ident = try classTypeParamIdentity(a, owner, param);
+                            if (typeMentionsAnyParamName(&f.return_ty, &.{ident})) break :blk_m true;
+                        }
+                        break :blk_m false;
+                    };
+                    if (mentions) {
                         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
                         for (owner_class.type_params) |param| {
                             try bindings.append(a, .{
@@ -4830,6 +4844,27 @@ pub const Module = struct {
                             });
                         }
                     }
+                }
+            }
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) {
+            std.debug.print("[icrt] fn={s} ret={s} ret_args={d} decl_sig={} kind={s} owner={} owner_tps={d} fn_tps={d} bindings={d}\n", .{
+                f.fqn,
+                f.return_ty.name,
+                f.return_ty.args.len,
+                decl_sig != null,
+                if (decl_sig) |sig| @tagName(sig.kind) else "-",
+                owner_id != null,
+                if (owner_id) |o| (if (o.int() < self.classes.items.len) self.classes.items[o.int()].type_params.len else 999) else 0,
+                function_type_params.len,
+                bindings.items.len,
+            });
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) {
+            if (f.return_ty.args.len != 0) std.debug.print("[icrt2] {s} arg0={s}\n", .{ f.fqn, f.return_ty.args[0].name });
+            if (owner_id) |o| {
+                if (o.int() < self.classes.items.len) {
+                    for (self.classes.items[o.int()].type_params) |tp| std.debug.print("[icrt2] {s} owner_tp={s}\n", .{ f.fqn, tp });
                 }
             }
         }
@@ -4965,11 +5000,18 @@ pub const Module = struct {
                 });
             }
         }
-        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) return null;
+        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) {
+            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
+            return null;
+        }
         const substituted = try substituteType(a, f.return_ty, bindings.items);
         // A return erased to a bare `*` head names nothing a caller can bind
         // against; it would only pollute the local's declared-type record.
-        if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) return null;
+        if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
+            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: star head\n", .{f.fqn});
+            return null;
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: OK -> {s}\n", .{ f.fqn, substituted.name });
         return try substituted.clone(allocator);
     }
 

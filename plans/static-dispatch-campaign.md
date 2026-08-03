@@ -41,18 +41,18 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 8,918 member sites
-            1,519  17.03%  bound_static
-            5,758  64.57%  bound_virtual     (81.6% bound; 2.34% at campaign start)
-            1,279  14.34%  no_receiver_type
+    stdlib:   total 8,910 member sites
+            1,513  16.98%  bound_static
+            5,824  65.36%  bound_virtual     (82.3% bound; 2.34% at campaign start)
+            1,211  13.59%  no_receiver_type
               213   2.39%  resolver_declined
                29   0.33%  no_class_id
               120   1.35%  nullable_or_generic
 
-    examples: total 98,982
-           15,540  15.70%  bound_static
-           68,761  69.47%  bound_virtual     (85.2% bound; 37.4% at start)
-           10,268  10.37%  no_receiver_type
+    examples: total 98,878
+           15,462  15.64%  bound_static
+           69,641  70.43%  bound_virtual     (86.1% bound; 37.4% at start)
+            9,362   9.47%  no_receiver_type
             2,699   2.73%  resolver_declined
               436   0.44%  no_class_id
             1,278   1.29%  nullable_or_generic
@@ -271,14 +271,20 @@ identified TWO sub-families and one fix landed:
   body's label is its fn name) or the tower entry carrying the label.
   End-to-end verified on the user shape ([2, 4] from a
   `this@skipOdd.iterator()` sequence body).
-- REMAINING (the bulk of the 516): MEMBER-callee initializers whose
-  receiver is an interface PROPERTY — `Map.toList`'s
-  `val iterator = entries.iterator()`: the derivation must type bare
-  `entries` from the interface's declared property
-  (`class_prop_type_heads` for interface Map — verify the registry
-  records interface property heads at all), then `iterator()` on the
-  resulting `Set<...>` head via the star channel. Pick up in
-  staticCallReturnTypeRef's Member arm; `full=<null>` there today. The `iterator` local family
+- CLOSED (was the bulk of the 516): the receiver (`entries` -> Set
+  head) derived fine and `Set.iterator` resolved; the null was in
+  `instantiatedCallReturnType` — an inherited interface header's
+  return carries the owner's type parameters as IDENTITY MANGLES
+  (`Iterator<$class$ 152 1:E>`), the star-fill's mentions-check tested
+  RAW names only, so it skipped exactly the headers the completeness
+  check then refused. The mentions-check now tests both forms. This
+  cleared the ENTIRE `local_no_decl_type iterator` census family:
+  stdlib no_receiver 1,279 -> 1,211 (82.3% bound), examples
+  10,268 -> 9,362 (86.1% bound) — the largest single-slice move in
+  weeks. Diagnosed with the new `KLIO_ICRT=1` instantiation trace
+  (kept). Pin `interface_prop_receiver_iterator`. Remaining iterator
+  mass is `captured iterator` (104) — the captured-receiver design
+  gate, item #2. The `iterator` local family
 (516 examples-weighted, recv=SequenceScope 57/example + recv=Sequence
 direct) is `val iterator = iterator()` inside stdlib extension bodies.
 The resolved `Sequence.iterator()` returns `Iterator<T>` with the
