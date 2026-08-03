@@ -12402,6 +12402,29 @@ fn lowerUnresolvedBareCall(
     // `funcId == null` here means the overload tier has no candidates
     // either — the callee is a static global value.
     if (!inReceiverContext(b)) {
+        // A name with no local, no capture, no global candidate, no
+        // classifier, and no top-level property is PROVABLY unresolved
+        // here — kotlinc rejects it (`fun probe(`this`: Box) { show() }`
+        // has no receiver for `show`). Restricted to PACKAGE-LESS files
+        // (the user-script shape): pack sources lower in stages where a
+        // sibling classifier or a native binding is not yet visible
+        // (`PathBuilder`, `__skia_c_draw_text2` false-fired), and a
+        // runtime side module resolves against a wider universe.
+        const file0 = callee.Path.segments[0].span.file;
+        if (!b.module.anon_side and b.module.packageOfFile(file0) == null and
+            b.resolve(name0) == null and !b.knowsOuter(name0) and
+            !b.module.hasBareCallCandidate(name0, file0) and
+            b.module.classId(name0) == null and !isTopLevelProp(name0))
+        {
+            try b.module.resolve_diags.append(b.allocator, .{
+                .name = name0,
+                .fqn_a = "",
+                .fqn_b = "",
+                .span = callee.Path.segments[0].span,
+                .kind = .unresolved_local,
+            });
+            return try b.emitConst(.Unit);
+        }
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm = try b.module.internConst(b.allocator, .{ .String = name0 });

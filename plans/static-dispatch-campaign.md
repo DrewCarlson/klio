@@ -71,9 +71,10 @@ the ledger below. The eager pipeline is the ONLY pipeline
 
 Standing gates, all green at HEAD: sweep 117/0
 (`python3 scripts/commontest-sweep.py zig-out/bin/klio-harness`), corpus
-drift 266/266 (out-of-process headless runner), parity pinned 150/151
-(the one red is `backtick_this_param_not_receiver`, owned by
-`resolution-unification-plan.md`), ir unit tests, `zig build test`.
+drift 266/266 (out-of-process headless runner), parity pinned 151/151
+(`backtick_this_param_not_receiver` closed: a provably-unresolved bare
+call in a package-less file is rejected pre-run), ir unit tests,
+`zig build test`.
 
 ## Remaining work
 
