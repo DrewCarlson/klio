@@ -152,9 +152,22 @@ pub const Pool = struct {
         return v;
     }
 
+    /// `getCpuCount` is a sysctl SYSCALL; `maxWorkers` runs on every task
+    /// post, so resolve the count once per process.
+    fn cpuCountCached() usize {
+        const S = struct {
+            var cached: std.atomic.Value(usize) = .init(0);
+        };
+        const c = S.cached.load(.monotonic);
+        if (c != 0) return c;
+        const n = std.Thread.getCpuCount() catch 1;
+        S.cached.store(n, .monotonic);
+        return n;
+    }
+
     pub fn defaultCap(self: *Pool) usize {
         if (self.default_cap_override != 0) return self.default_cap_override;
-        const n = std.Thread.getCpuCount() catch 1;
+        const n = cpuCountCached();
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, @min(cap, n));
         return @max(2, n);
@@ -162,10 +175,9 @@ pub const Pool = struct {
 
     pub fn maxWorkers(self: *Pool) usize {
         if (self.max_workers_override != 0) return self.max_workers_override;
-        const n = std.Thread.getCpuCount() catch 1;
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, cap);
-        return @max(64, n);
+        return @max(64, cpuCountCached());
     }
 
     /// Post a task. Spawns a worker when none is idle and the pool is

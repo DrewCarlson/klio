@@ -124,6 +124,41 @@ single-thread interpreter throughput, zero retry/contention waste):
   Stale-pack trap: drift caches under .klio-local/cache bake with the
   CURRENT binary — clear after harness rebuilds when validating fixes.
 
+Leaf-profile findings (sample's own "Sort by top of stack", the ONLY
+trustworthy self-time view — a hand-rolled tree parser double-counted):
+
+- `<deduplicated_symbol>` 1,903 leaf samples = ~40% of active CPU;
+  ancestry (ensureTotalCapacityPrecise 278, dispatchWithReceiver 248,
+  callNamedOverload 180, invokeMethodFuncId 152) identifies it as
+  memcpy/memmove under PER-CALL ARG-ARRAY builds: every interpreted
+  call allocates, fills, and frees a `std.ArrayList(Value)` args
+  carrier (prependReceiver's `[receiver] ++ args`, the packed_args
+  builds). THE next big lever: an args pool mirroring `regs_pool`
+  (EvalTls), exposed as shared eval.acquireArgs/releaseArgs so the vm
+  build sites and evalWith's consumption agree. CAUTION: ownership
+  crosses vararg repacking (`packVarargArgs` may return the input or a
+  new list), `discardArgs`, and FlatCallReq transfer — every seam must
+  route through the pool helpers or a pooled buffer double-frees.
+- FIXED: `maxWorkers()` ran `getCpuCount` (a sysctl SYSCALL) on every
+  task post; eval.zig's `routeTraceOn` getenv'd per call
+  (~300 leaf samples together). Both resolved once.
+- MEASURED NEGATIVE, do not retry: a threadlocal L1 in front of the
+  field read/write memos REGRESSED 13.7s -> 17.0s (A/B'd twice each
+  way) — macOS `_tlv_get_addr` indirection per probe costs more than
+  the saved ObjRef borrow. The tl_method_cache survives because it
+  saves a full walk, not one map probe. The ObjRef(ProgramImage)
+  borrow contention under getFieldInner (362 spin-yield samples) is
+  real but the read lock guards map REHASH during cache fills —
+  lock-free reads need an RCU-style snapshot, not a raw pointer.
+- Waits dominate raw samples (19.5k of 26k across threads — parked
+  workers); always read the active-CPU slice, not totals.
+- removeRange verified NOT pathological (no drains, one 20k
+  `fastForEach on host List keyed=false` walk family): its 78s is raw
+  interpreted volume — 4 reps x 100 iters x 100 lists x (addAll(100) +
+  subList(0,100).clear() through interpreted AbstractMutableList
+  machinery). It needs the general per-call cost work, starting with
+  the args pool.
+
 ## Remaining work
 
 ### 1. The typeck generic-argument project — the mass
