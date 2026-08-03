@@ -8435,6 +8435,17 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // Refuse to re-enter a local already on the chain.
         if (init != arg and pushInitChain(p.segments[0].name)) {
             defer popInitChain();
+            // The initializer is read in its DECLARATION scope: the local's
+            // own name was free there (recorded at the decl), so the init's
+            // bare calls must not see the binding that now exists at the
+            // READ point — `iterator.hasNext()` follows `val iterator =
+            // iterator()`, whose init resolves the RECEIVER member, never
+            // the local itself.
+            const prev_self = init_self_name;
+            if (b.localInitNameFree(p.segments[0].name) and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_INIT_SELF") orelse "1", "0"))
+                init_self_name = p.segments[0].name;
+            defer init_self_name = prev_self;
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
             // A MEMBER-call or elvis initializer needs the full derivation
             // the lazy reader lacks (`val clause = findClause(x) ?:

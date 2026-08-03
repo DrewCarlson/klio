@@ -247,11 +247,24 @@ annotated=false init_tag=Call` at nf ids 6003/6005/6080/6082 (two
 module variants d278/a478). The lambda tower IS propagated into
 pre-lowered bodies (lowerLambda stashes collectReceiverTowerLabeled via
 module.pending_lambda_receiver_tower -> setImplicitReceiverTower in
-lambda_body.zig), so the miss is deeper: identify nf 6005's function
-(KLIO_DUMP_FN by id fires only on execution — trace at lowering
-instead), then check whether the tower content at that site includes
-the outer Sequence entry and why staticCallReturnTypeRef's bare arm
-returns null there. The `iterator` local family
+lambda_body.zig), so the miss is deeper. ADVANCED (same day): the failing
+sites are `min`/`max`/`minOrNull`/… Sequence ext bodies LAZILY
+relowered at run time (in_fn trace added to [valty] enter), and the
+1,396 `[bareret] iterator shadowed local=true` refusals were the
+canonical self-shadow: the derivation chains that follow a local's
+initializer from its READ site (`iterator.hasNext()` ->
+argDeclTypeRefLazy init chain) never set `init_self_name`, so the
+init's bare call saw the local's own binding. FIXED two ways, both
+landed: `setLocalInitExprAt` carries the DECL SPAN so a relower pass's
+own prior binding is recognized as self (the standing-constraint
+recipe), and the init-chain read now sets `init_self_name` under
+`localInitNameFree`. Shadow refusals 1,396 -> 0. THE CENSUS FAMILY IS
+UNCHANGED at 516 — those sites fail through yet another channel:
+next probe is to trace WHICH deriver the counted sites use
+(the [no-recv-name] classification fires where declared_ty reached
+lowerResolvedMemberCall as null — add a KLIO_NORECV_NAMES detail print
+of the failed derivation's terminal for receiver Path locals whose
+localInitExpr IS recorded). The `iterator` local family
 (516 examples-weighted, recv=SequenceScope 57/example + recv=Sequence
 direct) is `val iterator = iterator()` inside stdlib extension bodies.
 The resolved `Sequence.iterator()` returns `Iterator<T>` with the

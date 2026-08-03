@@ -580,6 +580,11 @@ pub const FuncBuilder = struct {
     /// so a bare call inside that initializer must ignore the local — but only
     /// when the name really was free there.
     local_init_name_free: std.StringHashMap(void),
+    /// Declaration span of each recorded local initializer, so a RELOWER of
+    /// the same statement recognizes the prior pass's own binding as SELF
+    /// (never an outer shadow) — `val iterator = iterator()` lowered again
+    /// in the same builder must stay name-free.
+    local_init_decl_spans: std.StringHashMap(ast.Span),
     /// Params whose declared type is a receiver-typed function
     /// (`block: T.() -> R`). A bare call `block(...)` on one of these
     /// must dispatch with the enclosing `this` as the implicit
@@ -815,6 +820,7 @@ pub const FuncBuilder = struct {
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_init_name_free = std.StringHashMap(void).init(allocator),
+            .local_init_decl_spans = std.StringHashMap(ast.Span).init(allocator),
             .local_ext_fns = StringSet.init(allocator),
             .nonfn_locals = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
@@ -924,6 +930,7 @@ pub const FuncBuilder = struct {
         self.local_decl_recv_fn.deinit();
         self.local_init_exprs.deinit();
         self.local_init_name_free.deinit();
+        self.local_init_decl_spans.deinit();
         self.local_ext_fns.deinit();
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
@@ -1784,13 +1791,28 @@ pub const FuncBuilder = struct {
         return self.local_decl_recv_fn.contains(name);
     }
     pub fn setLocalInitExpr(self: *FuncBuilder, name: []const u8, e: *const ast.Expr) Allocator.Error!void {
+        return self.setLocalInitExprAt(name, e, null);
+    }
+
+    pub fn setLocalInitExprAt(self: *FuncBuilder, name: []const u8, e: *const ast.Expr, decl_span: ?ast.Span) Allocator.Error!void {
         // Recorded BEFORE the local is bound, which is the scope its own
-        // initializer was written in.
-        if (self.resolve(name) == null and !self.isLocalFn(name) and !self.knowsOuter(name)) {
+        // initializer was written in. A binding left by a PRIOR LOWERING
+        // PASS of this exact declaration (same span) is SELF, not an outer
+        // shadow — without the span the lazy relower path saw its own
+        // pass-1 binding and refused the `val iterator = iterator()` type.
+        const self_rebind = blk: {
+            const sp = decl_span orelse break :blk false;
+            const prior = self.local_init_decl_spans.get(name) orelse break :blk false;
+            break :blk prior.file.int() == sp.file.int() and prior.start == sp.start and prior.end == sp.end;
+        };
+        if (self_rebind or
+            (self.resolve(name) == null and !self.isLocalFn(name) and !self.knowsOuter(name)))
+        {
             try self.local_init_name_free.put(name, {});
         } else {
             _ = self.local_init_name_free.remove(name);
         }
+        if (decl_span) |sp| try self.local_init_decl_spans.put(name, sp);
         try self.local_init_exprs.put(name, e);
         if (self.local_decl_types.fetchRemove(name)) |old| {
             var cleanup = old.value;

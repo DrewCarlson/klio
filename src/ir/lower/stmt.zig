@@ -170,8 +170,21 @@ fn isSafeMemberTarget(target: *const Expr) bool {
 
 fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?Reg {
     if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
-        if (std.mem.eql(u8, w, p.name.name))
-            std.debug.print("[valty] enter {s} annotated={} init_tag={s} nf={d}\n", .{ p.name.name, p.ty != null, if (p.init) |*e| @tagName(std.meta.activeTag(e.*)) else "-", b.module.funcs.items.len });
+        if (std.mem.eql(u8, w, p.name.name)) {
+            std.debug.print("[valty] enter {s} annotated={} init_tag={s} nf={d} in_fn={s} recv={s} encl={s} owner={s} tower={d}:", .{
+                p.name.name,
+                p.ty != null,
+                if (p.init) |*e| @tagName(std.meta.activeTag(e.*)) else "-",
+                b.module.funcs.items.len,
+                build.currentRealFn() orelse "-",
+                b.recvTy() orelse "-",
+                b.enclosingRecvTy() orelse "-",
+                b.ownerClass() orelse "-",
+                b.implicit_receiver_tower.items.len,
+            });
+            for (b.implicit_receiver_tower.items) |entry| std.debug.print(" {s}", .{entry.head});
+            std.debug.print("\n", .{});
+        }
     }
     // `val x = expr` / `var x = expr`. The init is lowered
     // into a fresh register and bound in the current scope;
@@ -331,11 +344,11 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // A property read is recorded too: `val node = coord.layoutNode`
             // lends the property's registered type head to the local, which
             // the declared-type channel then reads back.
-            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExpr(p.name.name, e),
+            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             // A property read and an INDEXED read both carry a static type of
             // their own: `val held = row[1]` is `Row.get`'s return type.
             .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_INIT") orelse "1", "0"))
-                try b.setLocalInitExpr(p.name.name, e),
+                try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
             else => if (runtime.getenvSlice("KLIO_INIT_KINDS") != null) {
                 std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
