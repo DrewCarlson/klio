@@ -1416,3 +1416,23 @@ minus family double-registers (expect/actual pair? the operator's
 `element: T` vs collection overload registration?), dedupe or teach the
 multi-bound arm same-param merging, and the flip should clear
 end-to-end. Flip reverted again; battery green.
+
+## Addendum 5 — seventh level + the program's A/B entry is in-tree (2026-08-03)
+
+fb851166 lands: declaredTypeParamBounds DEDUPES same-name entries (the
+header+body double registration made `Iterable<T>.minus` read
+bounds=2; note the rex bounds probe ALSO exposed that same-fid rows
+from the second module variant print under one name — fid spaces are
+per-module, read traces accordingly), the per-candidate bound-record
+rex print, and KLIO_RECV_REFUTE (default OFF) as the
+receiver-refutation A/B entry in resolveExtensionCall's loop.
+
+minusArray under the classPropHead flip resists the FULL composition
+(hop + Array-arg disproof + fn-level bound args + dedup + gate ON):
+still 4/5. Seventh-level HYPOTHESIS, next probe: the
+`minus(element: T)` overload stays applicable with T := Array<String>
+and TIES the Array overload in ext_key — the withhold would then be
+`tied`, not best_unknown, and the fix is the specificity rule (a
+concrete `Array<out T>` param outranks a bare `T` in the key), checked
+by printing the ext_keys of the two finalists in the flip run. The
+flip remains reverted; every landed piece is battery-green.
