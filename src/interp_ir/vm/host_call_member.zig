@@ -4103,9 +4103,15 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
     };
 }
 
+var route_trace_init: bool = false;
+var route_trace_val: ?[]const u8 = null;
 fn routeTraceOn(name: []const u8) bool {
-    const w = std.c.getenv("KLIO_ROUTE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(w), name);
+    if (!route_trace_init) {
+        route_trace_val = if (std.c.getenv("KLIO_ROUTE")) |w| std.mem.span(w) else null;
+        route_trace_init = true;
+    }
+    const w = route_trace_val orelse return false;
+    return std.mem.eql(u8, w, name);
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
@@ -11314,7 +11320,15 @@ fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
     _ = allocator;
     const want = argc + 1;
     const sp = ir.eval.currentCallSiteSpan();
-    const dbg = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+    const dbg = blk: {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |b| break :blk b;
+        const b = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+        S.cached = b;
+        break :blk b;
+    };
     if (dbg) std.debug.print("[shadow] probe name={s} argc={d} cands={d} span={any}\n", .{ name, argc, blk: {
         const mg2 = self.module.borrow();
         defer mg2.deinit();

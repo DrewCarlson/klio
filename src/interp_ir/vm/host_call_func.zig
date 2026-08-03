@@ -1474,6 +1474,23 @@ pub fn composePluginEnabled() bool {
     return true;
 }
 
+
+/// `KLIO_MISS_TRACE`, resolved once. `getenvSlice` takes a global mutex and
+/// the env store scans linearly — measurable per interpreted call.
+var hcf_miss_trace_state: u8 = 0;
+var hcf_miss_trace_want: []const u8 = "";
+fn hcfMissTraceEnv() ?[]const u8 {
+    if (hcf_miss_trace_state == 0) {
+        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+            hcf_miss_trace_want = w;
+            hcf_miss_trace_state = 2;
+        } else {
+            hcf_miss_trace_state = 1;
+        }
+    }
+    return if (hcf_miss_trace_state == 2) hcf_miss_trace_want else null;
+}
+
 fn composableEval(
     self: *VmHost,
     allocator: Allocator,
@@ -1481,7 +1498,7 @@ fn composableEval(
     f: *const Func,
     packed_args: std.ArrayList(Value),
 ) Allocator.Error!EvalResult {
-    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+    if (hcfMissTraceEnv()) |w| {
         if (std.mem.eql(u8, w, f.name)) {
             std.debug.print("[fn-entry] {s}#{d} caller={s}@{?any}:", .{ f.fqn, f.id.int(), if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>", ir.eval.currentCallSiteSpan() });
             for (f.params, 0..) |p, i| {
@@ -1641,7 +1658,7 @@ pub fn pickNamedOverloadIdRecv(
     // (`lightColorScheme(primary = c)`) outscores the real overload (whose
     // extra roles are defaulted) and, when it delegates to the real one by
     // name, self-recurses.
-    const pno_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, f0.name) else false;
+    const pno_trace = if (hcfMissTraceEnv()) |w| std.mem.eql(u8, w, f0.name) else false;
     var best_ord: ?FuncId = null;
     var best_ord_score: i32 = std.math.minInt(i32);
     var best_low: ?FuncId = null;
@@ -1930,7 +1947,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                         const has_default = walk_defaults != null and j < walk_defaults.?.len and walk_defaults.?[j] != null;
                         if (!has_default) required_tail += 1;
                     }
-                    if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+                    if (hcfMissTraceEnv()) |w| {
                         if (std.mem.eql(u8, w, f.name))
                             std.debug.print("[vabsorb] {s} n_pos={d} seen={d} req_tail={d} defaults={}\n", .{ f.name, n_pos_total, pos_seen, required_tail, walk_defaults != null });
                     }
