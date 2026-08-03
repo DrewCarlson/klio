@@ -1568,6 +1568,15 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "fn_type_ext_private_inline" {
+    try check("fn_type_ext_private_inline",
+        \\ran alpha -> 42
+        \\ran beta -> beta-value
+        \\member runIt(direct)
+        \\
+    );
+}
+
 test "factory_lambda_local_star" {
     try check("factory_lambda_local_star",
         \\4

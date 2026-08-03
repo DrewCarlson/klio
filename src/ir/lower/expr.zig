@@ -10282,7 +10282,7 @@ fn lowerPathCall(
             for (cands) |fid| {
                 const f = b.module.funcById(fid) orelse continue;
                 std.debug.print(
-                    "[bare-candidate] {s}#{d} pkg={s} file={?d} params={d} body={}\n",
+                    "[bare-candidate] {s}#{d} pkg={s} file={?d} params={d} body={} kind={s} sig={} vis={s} mext_owner={s}\n",
                     .{
                         f.fqn,
                         fid.int(),
@@ -10290,6 +10290,10 @@ fn lowerPathCall(
                         if (b.module.registry.private_fn_files.get(fid)) |file| file.int() else null,
                         f.params.len,
                         f.hasBody(),
+                        @tagName(f.kind),
+                        b.module.decl_sigs.get(fid.int()) != null,
+                        if (b.module.decl_sigs.get(fid.int())) |ds| @tagName(ds.visibility) else "-",
+                        b.module.registry.member_ext_owner_class.get(fid) orelse "-",
                     },
                 );
             }
@@ -10551,6 +10555,9 @@ fn resolveCtxFor(
         .in_receiver_context = inReceiverContext(b),
         .unknown_receiver = b.capturesThisSlot() or b.isParamThunk() or
             (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0)),
+        .recv_cannot_shadow = fnTypedRecvCannotShadow(b, name0) and
+            !b.capturesThisSlot() and !b.isParamThunk() and
+            b.ownerClass() == null,
         .enclosing_has_member = b.hasEnclosingMember(name0) or blk: {
             const oc = b.ownerClass() orelse break :blk false;
             break :blk (ownerChainShadowContains(b, oc, name0) orelse false);
@@ -10914,8 +10921,34 @@ fn inReceiverContext(b: *const FuncBuilder) bool {
 /// the same-file top-level `runSafely`, silently discarding the completion.
 fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
     const rt = b.recvTy() orelse return false;
-    if (!std.mem.eql(u8, rt, "<function>")) return false;
+    if (!recvHeadIsFunctionType(rt)) return false;
     return !std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call");
+}
+
+/// Whether a recorded receiver-type head denotes a function type in any of
+/// its spellings: the parser's `"<function>"` tag, a spelled-out
+/// `(P) -> R`, or the erased builtin names (`Function1`,
+/// `SuspendFunction0`, ...). Deliberately tighter than `headIsFunctionType`
+/// — the erased names must end in digits so a user class named
+/// `FunctionTable` never claims the closed no-member surface.
+fn recvHeadIsFunctionType(rt: []const u8) bool {
+    if (std.mem.eql(u8, rt, "<function>")) return true;
+    if (std.mem.indexOf(u8, rt, "->") != null) return true;
+    var head = rt;
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    for ([_][]const u8{ "Function", "SuspendFunction", "KFunction", "KSuspendFunction" }) |p| {
+        if (std.mem.startsWith(u8, head, p) and head.len > p.len) {
+            var all_digits = true;
+            for (head[p.len..]) |c| {
+                if (c < '0' or c > '9') {
+                    all_digits = false;
+                    break;
+                }
+            }
+            if (all_digits) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether a bare name in an implicit-receiver context could bind to a member

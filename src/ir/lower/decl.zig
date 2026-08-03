@@ -551,6 +551,9 @@ pub fn reserveMemberHeaders(
         try module.recordFuncDeclSpan(a, f.name.span, id);
         if (f.receiver_type != null) {
             try module.registry.member_ext_owner_class.put(id, class_fqn);
+            if (f.visibility == .Private) {
+                try module.registry.private_fn_files.put(id, f.name.span.file);
+            }
         }
         try registerFuncTypeParams(module, f, id);
 
@@ -1552,6 +1555,9 @@ pub fn lowerMethodWithMemberContext(
             break :blk owner_class;
         };
         try module.registry.member_ext_owner_class.put(id, owner_identity);
+        if (f.visibility == .Private) {
+            try module.registry.private_fn_files.put(id, f.name.span.file);
+        }
         // Extension member: no enclosing-class own-members in scope (the
         // receiver is `this`, not the declaring class), so the thunk
         // runs with no owner_class context.

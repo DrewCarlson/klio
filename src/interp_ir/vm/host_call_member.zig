@@ -2963,8 +2963,31 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // A callable argument definitely does not satisfy a primitive/String
     // parameter: `logger.trace { … }` must drop the member `trace(String)`
     // so the inline `Logger.trace(message: () -> String)` extension binds
-    // (kotlinc resolves the extension; the member is inapplicable).
-    if (isCallable(arg) and isDefinitelyNonFunctionTypeName(pn)) return true;
+    // (kotlinc resolves the extension; the member is inapplicable). The same
+    // holds for any REGISTERED class that is not a `fun interface`: no SAM
+    // conversion exists, so a lambda never satisfies `FlowCollector` — the
+    // member `collect(FlowCollector)` stands aside for the extension
+    // `collect(action)` exactly as kotlinc binds it. A head naming no
+    // registered class (a typealias of a function type) stays non-definite.
+    if (isCallable(arg)) {
+        if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+            const cg2 = self.classes.borrow();
+            defer cg2.deinit();
+            std.debug.print("[adm] callable-vs pn={s} orig={s} reg={}\n", .{ pn, orig, cg2.get().get(pn) != null });
+        }
+        if (isDefinitelyNonFunctionTypeName(pn)) return true;
+        if (!std.mem.startsWith(u8, pn, "Function") and
+            !std.mem.eql(u8, pn, "Any") and !std.mem.eql(u8, pn, "Unit"))
+        {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(pn) orelse cg.get().get(orig)) |d| {
+                const dg = d.borrow();
+                defer dg.deinit();
+                if (!dg.get().is_fun_interface) return true;
+            }
+        }
+    }
     if (std.mem.startsWith(u8, pn, "Function")) {
         // Callables and Null stay non-definite; a value kind that PLAINLY
         // carries no invoke surface is definite — a `List` is not a

@@ -6344,6 +6344,7 @@ pub const Module = struct {
     const BareCallCandidateIterator = struct {
         module: *const Module,
         name: []const u8,
+        caller_file: FileId,
         simple: []const FuncId,
         simple_index: usize = 0,
         aliases: []const ModuleRegistry.ImportPath,
@@ -6352,17 +6353,29 @@ pub const Module = struct {
         alias_candidate_index: usize = 0,
         alias_fqn: []const u8 = "",
 
+        /// A `private` declaration is visible only inside its declaring file
+        /// (a private member extension's whole lexical family lives there
+        /// too), so a cross-file private candidate is never resolvable —
+        /// admitting one let a test class's private
+        /// `CoroutineScope.block(context)` shadow-defer every bare `block`
+        /// in the program.
+        fn visibleFrom(it: *const BareCallCandidateIterator, id: FuncId) bool {
+            const decl_file = it.module.registry.private_fn_files.get(id) orelse return true;
+            return decl_file.int() == it.caller_file.int();
+        }
+
         fn next(it: *BareCallCandidateIterator) ?FuncId {
-            if (it.simple_index < it.simple.len) {
+            while (it.simple_index < it.simple.len) {
                 defer it.simple_index += 1;
-                return it.simple[it.simple_index];
+                const id = it.simple[it.simple_index];
+                if (it.visibleFrom(id)) return id;
             }
             while (true) {
                 while (it.alias_candidate_index < it.alias_candidates.len) {
                     const id = it.alias_candidates[it.alias_candidate_index];
                     it.alias_candidate_index += 1;
                     const f = it.module.funcById(id) orelse continue;
-                    if (std.mem.eql(u8, f.fqn, it.alias_fqn)) return id;
+                    if (std.mem.eql(u8, f.fqn, it.alias_fqn) and it.visibleFrom(id)) return id;
                 }
                 if (it.alias_index >= it.aliases.len) return null;
 
@@ -6397,6 +6410,7 @@ pub const Module = struct {
         return .{
             .module = self,
             .name = name,
+            .caller_file = caller_file,
             .simple = self.funcsBySimpleName(name),
             .aliases = self.importAliasPathsIn(caller_file, name),
         };
@@ -7113,6 +7127,15 @@ pub const Module = struct {
     pub const ResolveCtx = struct {
         in_receiver_context: bool = false,
         unknown_receiver: bool = false,
+        /// The body's only implicit receiver is a FUNCTION-typed extension
+        /// receiver (no owner class, no captured `this`), whose member
+        /// surface is closed to `invoke`/`call`: no member can shadow the
+        /// resolved name, so the member-shadowable gates stand down.
+        /// `runSafely(completion) { … }` inside
+        /// `(suspend () -> T).startCoroutineCancellable` is the canonical
+        /// site — deferring it hands a private INLINE callee to the runtime
+        /// walk, which cannot splice it.
+        recv_cannot_shadow: bool = false,
         enclosing_has_member: bool = false,
         /// The body's receiver type is statically known (a plain method
         /// body): the member-shadow question was answered precisely by its
@@ -7193,7 +7216,12 @@ pub const Module = struct {
     /// here, lowering commits to a target the runtime would have rejected.
     fn memberExtOutOfScope(self: *const Module, id: FuncId, ctx_owner: ?[]const u8) bool {
         const f = self.funcById(id) orelse return false;
-        if (f.kind != .member_extension) return false;
+        // The declaration kind, not `f.kind`: a phase-1 header stub still
+        // carries `.plain` on the Func while the DeclSig knows it is a member
+        // extension — reading the stub admitted a test class's private
+        // `CoroutineScope.block(context)` as a tier-0 candidate for every
+        // bare `block` in the program.
+        if (self.declarationKind(id, f) != .member_extension) return false;
         const owner = self.registry.member_ext_owner_class.get(id) orelse return false;
         for (self.registry.object_names.items) |o| {
             if (std.mem.eql(u8, o, owner)) return false;
@@ -8182,9 +8210,10 @@ pub const Module = struct {
             ctx,
         );
         const receiver_shadowable = known_receiver_applicable orelse
-            (ctx.in_receiver_context or ctx.unknown_receiver);
+            ((ctx.in_receiver_context or ctx.unknown_receiver) and !ctx.recv_cannot_shadow);
         const member_shadowable = receiver_shadowable or ctx.enclosing_has_member or
             (known_receiver_applicable == null and !ctx.receiver_known and
+                !ctx.recv_cannot_shadow and
                 self.registry.class_member_names.contains(name));
         const cast_static = if (ctx.cast_pick) |cp| (if (target) |t| cp.int() == t.int() else false) else false;
         if (target) |t| {
@@ -8201,9 +8230,11 @@ pub const Module = struct {
                         ctx,
                     );
                     break :blk (known_member_applicable orelse
-                        (ctx.in_receiver_context or ctx.unknown_receiver)) or
+                        ((ctx.in_receiver_context or ctx.unknown_receiver) and
+                            !ctx.recv_cannot_shadow)) or
                         ctx.enclosing_has_member or
                         (known_member_applicable == null and !ctx.receiver_known and
+                            !ctx.recv_cannot_shadow and
                             self.registry.class_member_names.contains(name));
                 } else member_shadowable;
                 // Extension member-first defer: in a receiver context a member of
@@ -14205,6 +14236,26 @@ test "bare-ref index defers ambiguity, extensions, and unknown names" {
     try testing.expect(m.resolveBareRefIndexed("ext", "app", FileId.from(0)) == null);
     try testing.expect(m.resolveBareRefIndexed("missing", "app", FileId.from(0)) == null);
     try testing.expect(m.resolveBareRefIndexed("compareValues", "app", FileId.from(0)) == null);
+}
+
+test "a cross-file private declaration is not a bare-call candidate" {
+    const a = testing.allocator;
+    var m = Module.default(a);
+    defer freeTestModule(&m, a);
+    // A private member extension declared in file 7 (a test class's
+    // `CoroutineScope.block(context)`) must not enter another file's
+    // candidate set; the same-file query still sees it.
+    const priv = try pushTestFuncOpts(&m, a, "block", "lib.T.block", "lib", 1, .{ .extension = true });
+    m.funcs.items[priv.int()].kind = .member_extension;
+    try m.registry.member_ext_owner_class.put(priv, "T");
+    try m.registry.private_fn_files.put(priv, FileId.from(7));
+    try m.rebuildFuncNameIndex(a);
+    const cross = try m.bareCallCandidates(a, "block", FileId.from(3));
+    defer a.free(cross);
+    try testing.expectEqual(@as(usize, 0), cross.len);
+    const same = try m.bareCallCandidates(a, "block", FileId.from(7));
+    defer a.free(same);
+    try testing.expectEqual(@as(usize, 1), same.len);
 }
 
 test "classIdIndexed ranks a named import above the own package" {
