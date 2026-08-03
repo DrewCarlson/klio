@@ -1586,6 +1586,14 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "ext_prop_type_bare_read" {
+    try check("ext_prop_type_bare_read",
+        \\n=3 last=2 total=12
+        \\r=0..1
+        \\
+    );
+}
+
 test "unbound_ref_companion_receiver" {
     try check("unbound_ref_companion_receiver",
         \\[0, 1, 2, 3, 4]

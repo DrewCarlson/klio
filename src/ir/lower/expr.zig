@@ -2424,7 +2424,44 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
         const head = b.recvTy() orelse return null;
         break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
     };
-    return propTypeHeadOn(b, owner, recv_name);
+    if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
+    return extPropReturnHead(b, owner, recv_name);
+}
+
+/// The declared return head of an EXTENSION PROPERTY named `name` on
+/// `head` (or its builtin/declared supertypes): the lowered getter follows
+/// the stable `__ext_get_<Head>_<name>` naming contract, and its return
+/// type is the bare read's static type — `indices` inside a `ShortArray`
+/// extension body is an `IntRange`, so the desugared `for (i in indices)`
+/// iterator call binds.
+fn extPropReturnHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    if (extPropGetterReturn(b, head, name)) |h| return h;
+    for (applicability.builtinSupersOf(head)) |sup| {
+        if (extPropGetterReturn(b, sup, name)) |h| return h;
+    }
+    if (b.module.registry.class_super_names.get(head)) |chain| {
+        for (chain) |sup| {
+            if (extPropGetterReturn(b, applicability.simpleName(sup), name)) |h| return h;
+        }
+    }
+    return null;
+}
+
+fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    var buf: [160]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return null;
+    const fids = b.module.funcsBySimpleName(gname);
+    if (fids.len == 0) return null;
+    const f = b.module.funcById(fids[0]) orelse return null;
+    var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
+    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+        b.module.classIdByFqn(h)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(h)));
+    if (cid == null) return null;
+    return h;
 }
 
 fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {

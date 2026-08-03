@@ -43,19 +43,19 @@ and not the other and still be right.
 
     stdlib:   total 8,998 member sites
             1,525  16.95%  bound_static
-            5,730  63.68%  bound_virtual     (80.6% bound; 2.34% at campaign start)
+            5,758  63.99%  bound_virtual     (80.9% bound; 2.34% at campaign start)
             1,353  15.04%  no_receiver_type
               241   2.68%  resolver_declined
                29   0.32%  no_class_id
               120   1.33%  nullable_or_generic
 
-    examples: total 100,085
-           15,632  15.62%  bound_static
-           68,509  68.45%  bound_virtual     (84.1% bound; 37.4% at start)
-           11,277  11.27%  no_receiver_type
-            2,953   2.95%  resolver_declined
-              436   0.44%  no_class_id
-            1,278   1.28%  nullable_or_generic
+    examples: total 91,884 (thousands of sites left as bound extensions)
+           14,468  15.75%  bound_static
+           63,399  69.00%  bound_virtual     (84.7% bound; 37.4% at start)
+           10,080  10.97%  no_receiver_type
+            2,493   2.71%  resolver_declined
+              264   0.29%  no_class_id
+            1,180   1.28%  nullable_or_generic
 
 The member-site TOTAL moves in both directions: bare calls becoming
 statically bound EXTENSION calls leave the member census (denominator
