@@ -1552,3 +1552,18 @@ first; this is the RC-A run-vs-test divergence family). The test-mode
 battery is fully green WITH the flip. Register the fixture in
 parity_corpus_pinned with the List-true expectations once run mode
 resolves through the same engine.
+
+## Addendum 12 — run-mode sibling CLOSED (2026-08-04)
+
+One cold probe run named it (once the greps were run in a clean shell —
+the ugrep -c silent-empty quirk cost a false "no rows" reading, twice;
+prefer `grep pattern file | wc -l` in this repo): the run pipeline's
+class-bound twin collector (interp_ir/build.zig
+collectClassTypeParamBounds) never populated bound args, so run-mode
+hops carried no substitution and the proof stack stood down. The twin
+now calls the shared concreteBoundArgs (9294e594);
+bounded_prop_minus_list is REGISTERED with kotlinc-correct
+expectations, and both pipelines resolve the bounded-receiver operator
+through the same engine. The duplicate-collector shape itself (two
+bound collectors, two func_type_params registrations, three compat
+provers) remains the standing P2-completion debt.
