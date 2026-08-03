@@ -3601,6 +3601,49 @@ pub const Module = struct {
                     }
                 }
                 if (required != null and arg.ty != null) {
+                    // A bare type-parameter ARGUMENT is never definite: the
+                    // caller's own `T` offered to the owner's `T` slot
+                    // (EnumEntriesList.indexOf(element: T) from a generic
+                    // body) can bind anything its bound admits.
+                    {
+                        var ah = staticTypeHead(std.mem.trimEnd(u8, arg.ty.?.name, "?"));
+                        if (parseClassTypeParamIdentity(ah)) |ident2| ah = ident2.param;
+                        var tp_bound: ?ModuleRegistry.TypeParamBound = null;
+                        for (actual_bounds) |ab| {
+                            if (std.mem.eql(u8, ab.param, ah)) {
+                                tp_bound = ab;
+                                break;
+                            }
+                        }
+                        if (tp_bound) |ab| {
+                            // Judge the parameter THROUGH its bound: every
+                            // instantiation of T satisfies the bound, so
+                            // bound <: required proves the argument, and a
+                            // provably disjoint bound/required pair refutes
+                            // it. Anything else is unknown.
+                            var barg_buf: [8]TypeRef = undefined;
+                            var bref = TypeRef{ .name = ab.bound, .nullable = false, .args = &.{} };
+                            if (ab.args.len != 0 and ab.args.len <= barg_buf.len) {
+                                for (ab.args, 0..) |an, i| {
+                                    barg_buf[i] = .{ .name = an, .nullable = false, .args = &.{} };
+                                }
+                                bref.args = barg_buf[0..ab.args.len];
+                            }
+                            if (self.staticTypeIsSubtypeWithBounds(
+                                self.registry.allocator,
+                                bref,
+                                required.?,
+                                actual_bounds,
+                            ) catch false) return .compatible;
+                            if (self.staticReceiverCompatibility(null, bref, required.?) == .incompatible and
+                                self.staticReceiverCompatibility(null, required.?, bref) == .incompatible)
+                            {
+                                return .incompatible;
+                            }
+                            return .unknown;
+                        }
+                        if (ah.len > 0 and ah.len <= 2 and std.ascii.isUpper(ah[0])) return .unknown;
+                    }
                     if (self.staticTypeIsSubtypeWithBounds(
                         self.registry.allocator,
                         arg.ty.?,
