@@ -149,6 +149,7 @@ const RUNNABLE = [_][]const u8{
     "tl_atomicfu_long_workers",
     "tl_atomicfu_cas_once",
     "tl_atomicfu_ref_cas",
+    "tl_atomic_update_contended",
     "tl_atomicfu_lock_mutex",
     "tl_lazy_once",
     "tl_default_parallel_wall",
@@ -222,6 +223,10 @@ test "tl_atomicfu_long_workers" {
 test "tl_atomicfu_cas_once" {
     try check("tl_atomicfu_cas_once");
 }
+test "tl_atomic_update_contended" {
+    try check("tl_atomic_update_contended");
+}
+
 test "tl_atomicfu_ref_cas" {
     try check("tl_atomicfu_ref_cas");
 }

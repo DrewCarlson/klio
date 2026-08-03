@@ -10,8 +10,10 @@
 //! already atomic under the cell lock.
 //!
 //! The class shapes (the `value` cell and the `array` backing) come from the
-//! wasm `actual` declarations; these bindings shadow the non-atomic method
-//! bodies at dispatch time.
+//! klio-authored `actual` declarations (kotlin-klio/kotlin-concurrent/); these
+//! bindings shadow the source method bodies at dispatch time. The inline
+//! `update` extension family splices into callers and cannot be shadowed here,
+//! so those actuals are compare-and-set loops built on the bound CAS.
 
 const std = @import("std");
 const runtime = @import("runtime");
