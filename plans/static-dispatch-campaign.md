@@ -1347,12 +1347,15 @@ With the flip applied and the operator lowering's lhs extended through
 staticBareReceiverType (prop-head channel answers `data -> T`), the
 `[binop]` probe (kept, KLIO_HOP_TRACE) printed ZERO rows during the
 minus test run — including for the PASSING minusElement — while the
-bake-time Duration sites do print. The lazily-relowered @Test method
-bodies never reach lowerResolvedBinaryOperator: the relower path lowers
-Binary through some other arm. Next probe: find the relower's Binary
-routing (start at lowerBinary's callers and the deferred_func_section
-body lowering; confirm with [binop] rows appearing for minusElement),
-then route it through lowerResolvedBinaryOperator; the lhs prop-head
-extension (staticBareReceiverType blk in lowerResolvedBinaryOperator)
-re-applies from this entry once the routing is fixed. All experiments
+bake-time Duration sites do print. CORRECTION on re-read: the
+[binop] print sits AFTER the member-call attempt, so zero rows cannot
+distinguish "fn not called" from "both lhs typing channels nulled and
+the fn returned early" — and the latter is consistent with
+staticBareReceiverType returning null in the relower context (suspect:
+propTypeHeadOn keys on the class SIMPLE name while the relower's
+ownerClass() may answer a lifted/fqn form). Next probe: move the
+[binop] print to the fn ENTRY printing the lhs tag and both channel
+answers, rerun minusElement, and adjudicate; then fix the owner-key
+mismatch or the routing, whichever the rows show. The lhs prop-head
+extension (staticBareReceiverType blk) re-applies from this entry. All experiments
 reverted; battery green.
