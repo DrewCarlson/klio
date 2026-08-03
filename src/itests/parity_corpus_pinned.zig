@@ -1568,6 +1568,15 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "factory_lambda_local_star" {
+    try check("factory_lambda_local_star",
+        \\4
+        \\A
+        \\7
+        \\
+    );
+}
+
 test "ext_body_bare_iterator_star" {
     try check("ext_body_bare_iterator_star",
         \\3
