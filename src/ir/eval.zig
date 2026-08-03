@@ -926,6 +926,12 @@ pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
 
 /// Ungated frame-chain dump for name-filtered diagnostics that gate at
 /// their own call site (e.g. `KLIO_MISS_TRACE`).
+/// Install the runtime-layer frame-dump hook (idempotent; see
+/// `runtime.debug_frame_dump`).
+pub fn installDebugFrameDump() void {
+    runtime.debug_frame_dump = &dumpFrameChainForDiagAlways;
+}
+
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
     var cur = evtls.frame_chain;
@@ -8773,9 +8779,15 @@ var or_audit_enabled: bool = false;
 /// `global_id` (the lowering-resolved identity), `global` (name lookup),
 /// or the store/global-fallback variants — so a corpus sweep proves which
 /// runtime arms are live before an emit site is statically classified.
+var route_trace_init: bool = false;
+var route_trace_val: ?[]const u8 = null;
 fn routeTraceOn(name: []const u8) bool {
-    const w = std.c.getenv("KLIO_ROUTE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(w), name);
+    if (!route_trace_init) {
+        route_trace_val = if (std.c.getenv("KLIO_ROUTE")) |w| std.mem.span(w) else null;
+        route_trace_init = true;
+    }
+    const w = route_trace_val orelse return false;
+    return std.mem.eql(u8, w, name);
 }
 
 fn orAuditOn() bool {

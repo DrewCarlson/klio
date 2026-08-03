@@ -48,6 +48,11 @@ pub const leaktrack = @import("leaktrack.zig");
 pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");
 pub const prof = @import("prof.zig");
+
+/// Debug-only frame-chain dump hook, installed by the evaluator at startup
+/// so a stdlib intrinsic (which cannot import the ir layer) can name its
+/// calling frames in a diagnostic. Null until the evaluator installs it.
+pub var debug_frame_dump: ?*const fn () void = null;
 // Host-op temporary keepalive (a GC root for accumulators/snapshots held across
 // a re-entrant user callable). No-ops unless the GC is active.
 pub const keepaliveMark = value_mod.keepaliveMark;

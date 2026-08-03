@@ -3851,6 +3851,9 @@ fn buildModuleWithOverrides(
     // complete. Runtime member dispatch can then use only class + slot ids.
     try module.linkMethodSlots(a);
 
+    // Debug-only frame-dump hook for intrinsics below the ir layer.
+    ir.eval.installDebugFrameDump();
+
     return .{
         .module = module_ref,
         .classes = classes,

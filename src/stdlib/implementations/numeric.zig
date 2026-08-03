@@ -563,6 +563,7 @@ pub fn ctor_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
             std.debug.print("[uctor] nargs={d} tags=", .{ctx.args.len});
             for (ctx.args) |a| std.debug.print("{s},", .{@tagName(std.meta.activeTag(a))});
             std.debug.print("\n", .{});
+            if (runtime.debug_frame_dump) |dump| dump();
         }
         return .{ .err = .{ .Type = "UInt constructor requires an integer" } };
     };

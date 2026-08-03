@@ -540,7 +540,20 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (boundReferenceFunc(callee)) |func| {
                 var exact_args: std.ArrayList(Value) = .empty;
                 defer exact_args.deinit(allocator);
-                if (rv == .Class) {
+                // A TYPE-form reference is unbound — the first call argument
+                // is the receiver. The type value is a `.Class`, but for a
+                // companion-carrying class (`Int` declares one) the name in
+                // value position is the COMPANION INSTANCE; prepending it
+                // shifted every argument (`map(Int::toUInt)` ran `toUInt`
+                // with the companion as `this`). Same predicate as the
+                // by-name path below.
+                const fid_fn_type_like = rv == .Function and
+                    rv.Function.decl.name.name.len > 0 and
+                    std.ascii.isUpper(rv.Function.decl.name.name[0]);
+                const fid_type_like = (rv == .Class) or fid_fn_type_like or
+                    (rv == .Instance and isCompanionInstance(rv) and
+                        !companionServesName(self, &rv, name));
+                if (fid_type_like) {
                     try exact_args.appendSlice(allocator, args);
                 } else {
                     try exact_args.append(allocator, rv);

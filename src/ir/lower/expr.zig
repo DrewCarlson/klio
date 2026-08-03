@@ -2421,10 +2421,50 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // extension has no enclosing class at all, so the search stopped there.
     const owner = b.ownerClass() orelse blk: {
         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
-        const head = b.recvTy() orelse return null;
+        // The splice-receiver hint serves the same role inside an inline
+        // extension splice, where the body's builder has no recvTy of its
+        // own.
+        const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
         break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
     };
-    return propTypeHeadOn(b, owner, recv_name);
+    if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
+    return extPropReturnHead(b, owner, recv_name);
+}
+
+/// The declared return head of an EXTENSION PROPERTY named `name` on
+/// `head` (or its builtin/declared supertypes): the lowered getter follows
+/// the stable `__ext_get_<Head>_<name>` naming contract, and its return
+/// type is the bare read's static type — `indices` inside a `ShortArray`
+/// extension body is an `IntRange`, so the desugared `for (i in indices)`
+/// iterator call binds.
+fn extPropReturnHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    if (extPropGetterReturn(b, head, name)) |h| return h;
+    for (applicability.builtinSupersOf(head)) |sup| {
+        if (extPropGetterReturn(b, sup, name)) |h| return h;
+    }
+    if (b.module.registry.class_super_names.get(head)) |chain| {
+        for (chain) |sup| {
+            if (extPropGetterReturn(b, applicability.simpleName(sup), name)) |h| return h;
+        }
+    }
+    return null;
+}
+
+fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    var buf: [160]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return null;
+    const fids = b.module.funcsBySimpleName(gname);
+    if (fids.len == 0) return null;
+    const f = b.module.funcById(fids[0]) orelse return null;
+    var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
+    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+        b.module.classIdByFqn(h)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(h)));
+    if (cid == null) return null;
+    return h;
 }
 
 fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
@@ -9434,12 +9474,7 @@ fn enrichLambdaArgShapes(
     shape_set: *StaticReturnArgShapes,
 ) Allocator.Error!void {
     if (od_depth >= 3) return;
-    // Default OFF: with the channel on, XorWowRandom's on-demand
-    // lowering emitted its bare `require(...)` as a FIELD READ and a UInt
-    // constructor call surfaced in checkInvariants — a side effect of the
-    // scratch derivation not yet isolated. Opt in with =1; the toy chain
-    // (`List(3) { it * 2 }` typing `List<Int>`) works end to end.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "0", "1")) return;
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "1", "0")) return;
     const tf = b.module.funcById(target) orelse return;
     const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
     const first = @intFromBool(has_this);
@@ -9466,10 +9501,13 @@ fn enrichLambdaArgShapes(
         const stmts = lam.body.stmts;
         if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) continue;
         const tail = &stmts[stmts.len - 1].Expr;
-        // Only self-contained tail kinds derive: a Call tail re-enters the
-        // resolution machinery, and doing that from a scratch builder while
-        // a class's methods are mid-lowering corrupted the enclosing
-        // context (XorWowRandom's `require` emission).
+        // Only self-contained tail kinds derive. Call/Member tails were
+        // re-tried once the mis-attributed XorWow corruption resolved (the
+        // real cause was the unbound-ref companion arg-shift) and measured
+        // NET NEGATIVE: stdlib no_receiver_type 1,353 -> 1,403 and
+        // bound_virtual 5,730 -> 5,666 — a derived call-tail binding (the
+        // getOrPut `V := ArrayList` shape) narrows generic instantiations
+        // in ways that disprove more downstream than the typed local buys.
         switch (tail.*) {
             .Path, .Binary, .StringTemplate, .IntLit, .FloatLit, .BoolLit, .CharLit => {},
             else => continue,
@@ -12404,6 +12442,29 @@ fn lowerUnresolvedBareCall(
     // `funcId == null` here means the overload tier has no candidates
     // either — the callee is a static global value.
     if (!inReceiverContext(b)) {
+        // A name with no local, no capture, no global candidate, no
+        // classifier, and no top-level property is PROVABLY unresolved
+        // here — kotlinc rejects it (`fun probe(`this`: Box) { show() }`
+        // has no receiver for `show`). Restricted to PACKAGE-LESS files
+        // (the user-script shape): pack sources lower in stages where a
+        // sibling classifier or a native binding is not yet visible
+        // (`PathBuilder`, `__skia_c_draw_text2` false-fired), and a
+        // runtime side module resolves against a wider universe.
+        const file0 = callee.Path.segments[0].span.file;
+        if (!b.module.anon_side and b.module.packageOfFile(file0) == null and
+            b.resolve(name0) == null and !b.knowsOuter(name0) and
+            !b.module.hasBareCallCandidate(name0, file0) and
+            b.module.classId(name0) == null and !isTopLevelProp(name0))
+        {
+            try b.module.resolve_diags.append(b.allocator, .{
+                .name = name0,
+                .fqn_a = "",
+                .fqn_b = "",
+                .span = callee.Path.segments[0].span,
+                .kind = .unresolved_local,
+            });
+            return try b.emitConst(.Unit);
+        }
         orEmitAudit(b, "unresolved_bare_call", "LoadGlobal", name0);
         const callee_r = b.allocReg();
         const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -13648,6 +13709,9 @@ fn lowerResolvedMemberCall(
         }
         if (promo_blocked_by_class) {
             lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-class] {s}.{s} nargs={d} why={s}\n", .{ head, name.name, args.len, @tagName(promo_ext_why) });
+            }
         } else switch (promo_ext_why) {
             .none => {},
             .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
@@ -13667,8 +13731,14 @@ fn lowerResolvedMemberCall(
         // all) still takes a DIRECT answer — a final method on a closed
         // host-backed class binds by fid; only a virtual answer stays
         // deferred for it.
+        // A VIRTUAL answer is accepted for stub/value receivers too: the
+        // runtime resolves the slot against an interpreted receiver's class
+        // and prefers the FQN-keyed intrinsic for host values (the VOWN
+        // model) — holding the deferral for blocked classes predates that
+        // and left every bodyless expect member (`Long.shl`,
+        // `MutableList.add`) and unsigned-array member dynamic.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
-            if (!promo_blocked_by_class or d == .direct) resolved.dispatch = d;
+            resolved.dispatch = d;
         }
     }
     if (resolved.dispatch == .deferred) {
