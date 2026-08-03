@@ -1895,6 +1895,9 @@ pub const FuncBuilder = struct {
     pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }
+    pub fn localInitExprIterator(self: *const FuncBuilder) std.StringHashMap(*const ast.Expr).Iterator {
+        return self.local_init_exprs.iterator();
+    }
     pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
         return self.local_init_exprs.get(name);
     }

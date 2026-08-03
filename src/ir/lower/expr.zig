@@ -2976,6 +2976,21 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lowered_ty = try decl_mod.loweredTypeRef(b.allocator, e.value_ptr, true);
             try locals.types.put(e.key_ptr.*, lowered_ty);
         }
+        // Pre-derive the lazily-typed outer locals INTO the snapshot: a
+        // closure capturing `val iterator = listIterator(size)` sees only
+        // an on-demand derivation that cannot run in the closure's scope.
+        // Deriving here runs in the OUTER builder — the only scope the
+        // initializer was written in — and the closure inherits a plain
+        // declared type.
+        var init_it = b.localInitExprIterator();
+        while (init_it.next()) |e| {
+            if (locals.types.contains(e.key_ptr.*)) continue;
+            const prev_self = init_self_name;
+            if (b.localInitNameFree(e.key_ptr.*)) init_self_name = e.key_ptr.*;
+            const derived = staticCallReturnTypeRef(b, e.value_ptr.*) catch null;
+            init_self_name = prev_self;
+            if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
+        }
     }
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
