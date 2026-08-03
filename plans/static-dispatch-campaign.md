@@ -41,21 +41,21 @@ comparable ONLY at the same cache state; the scripts clear it):
 Report BOTH for anything aimed at element types; a change can move one
 and not the other and still be right.
 
-    stdlib:   total 9,105 member sites (unsigned source bodies now count)
-            1,521  16.71%  bound_static
-            5,672  62.30%  bound_virtual     (79.0% bound; 2.34% at campaign start)
-            1,524  16.74%  no_receiver_type
-              239   2.62%  resolver_declined
+    stdlib:   total 8,998 member sites
+            1,525  16.95%  bound_static
+            5,730  63.68%  bound_virtual     (80.6% bound; 2.34% at campaign start)
+            1,353  15.04%  no_receiver_type
+              241   2.68%  resolver_declined
                29   0.32%  no_class_id
-              120   1.32%  nullable_or_generic
+              120   1.33%  nullable_or_generic
 
-    examples: total 101,263
-           15,602  15.41%  bound_static
-           68,025  67.18%  bound_virtual     (82.6% bound; 37.4% at start)
-           12,973  12.81%  no_receiver_type
-            2,949   2.91%  resolver_declined
-              436   0.43%  no_class_id
-            1,278   1.26%  nullable_or_generic
+    examples: total 100,085
+           15,632  15.62%  bound_static
+           68,509  68.45%  bound_virtual     (84.1% bound; 37.4% at start)
+           11,277  11.27%  no_receiver_type
+            2,953   2.95%  resolver_declined
+              436   0.44%  no_class_id
+            1,278   1.28%  nullable_or_generic
 
 The member-site TOTAL moves in both directions: bare calls becoming
 statically bound EXTENSION calls leave the member census (denominator
