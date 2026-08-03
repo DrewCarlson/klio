@@ -2364,6 +2364,144 @@ pub const Module = struct {
         return result;
     }
 
+    /// The promotion proof, third derivation (the first two measured zero
+    /// for lack of argument authority — the typing channels now supply it):
+    /// a deferred member commits when every supplied argument is
+    /// AUTHORITATIVE and member-compatible, and every same-name extension
+    /// reachable from the receiver's chain is refuted by arity or by an
+    /// argument. Conservative everywhere: an unjudgeable candidate keeps
+    /// the deferral.
+    pub threadlocal var mpp_why: []const u8 = "-";
+
+    pub fn memberPromotionProven(
+        self: *const Module,
+        member_fid: FuncId,
+        head: []const u8,
+        name: []const u8,
+        recv_ty: TypeRef,
+        shapes: []const applicability.ArgShape,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
+    ) bool {
+        mpp_why = "-";
+        const mf = self.funcById(member_fid) orelse {
+            mpp_why = "no-member-fn";
+            return false;
+        };
+        const m_off: usize = @intFromBool(funcHasImplicitThis(mf));
+        if (mf.params.len < m_off + shapes.len) {
+            mpp_why = "member-arity";
+            return false;
+        }
+        var member_fully_proven = true;
+        // The receiver's instantiation substitutes the owner's own type
+        // parameters positionally: `contains(element: E)` on an
+        // `Iterable<String>` receiver proves against String. Only the
+        // direct-instantiation case (receiver head IS the owner) is
+        // taken; projections keep the raw param and the conservative
+        // unknown below.
+        const owner_tps: []const []const u8 = blk: {
+            const ds = self.decl_sigs.get(member_fid.int()) orelse break :blk &.{};
+            const oid = ds.enclosing_class orelse break :blk &.{};
+            if (oid.int() >= self.classes.items.len) break :blk &.{};
+            const ocls = &self.classes.items[oid.int()];
+            if (!std.mem.eql(u8, applicability.simpleName(ocls.name), applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, recv_ty.name, "?")))))
+                break :blk &.{};
+            break :blk ocls.type_params;
+        };
+        for (shapes, mf.params[m_off .. m_off + shapes.len]) |sh, p| {
+            if (sh.ty == null and sh.literal_kind == null and !sh.is_lambda) {
+                mpp_why = "arg-unauthoritative";
+                return false;
+            }
+            if (sh.named != null or sh.is_spread) {
+                mpp_why = "named-or-spread";
+                return false;
+            }
+            var param_ty = p.ty;
+            var ph = staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?"));
+            if (parseClassTypeParamIdentity(ph)) |ident| ph = ident.param;
+            for (owner_tps, 0..) |tp, i| {
+                if (std.mem.eql(u8, tp, ph) and i < recv_ty.args.len and
+                    recv_ty.args[i].name.len != 0 and
+                    !std.mem.eql(u8, recv_ty.args[i].name, "*"))
+                {
+                    param_ty = recv_ty.args[i];
+                    break;
+                }
+            }
+            // Two tiers. A member PROVEN applicable on every argument
+            // commits by Kotlin's scope order alone — members outrank
+            // extensions, no refutation needed. A member merely
+            // NON-refuted (the removeAll/addAll/putAll family, whose
+            // `Collection<E>` params stay unknown without a receiver
+            // instantiation) still commits, but only when every reachable
+            // extension is refuted below.
+            switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
+                .incompatible => {
+                    mpp_why = "member-arg-refuted";
+                    return false;
+                },
+                .unknown => member_fully_proven = false,
+                .compatible => {},
+            }
+        }
+        if (member_fully_proven) return true;
+        const chain: []const []const u8 = self.registry.class_super_names.get(head) orelse &.{};
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (fid.int() == member_fid.int()) continue;
+            const f = self.funcById(fid) orelse continue;
+            const kind = self.declarationKind(fid, f);
+            if (kind != .top_level_extension and kind != .member_extension) continue;
+            const ds = self.decl_sigs.get(fid.int()) orelse {
+                mpp_why = "ext-no-sig";
+                return false;
+            };
+            const recv_ref = ds.receiver_ty orelse
+                (if (f.params.len != 0) f.params[0].ty else continue);
+            var r_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, recv_ref.name, "?")));
+            if (std.mem.startsWith(u8, r_head, "out#")) r_head = r_head["out#".len..];
+            if (std.mem.startsWith(u8, r_head, "in#")) r_head = r_head["in#".len..];
+            const generic_recv = self.funcTypeParamIndex(fid, r_head) != null or
+                (r_head.len <= 2 and r_head.len > 0 and std.ascii.isUpper(r_head[0]));
+            var reachable = generic_recv or std.mem.eql(u8, r_head, head);
+            if (!reachable) {
+                for (applicability.builtinSupersOf(head)) |sup| {
+                    if (std.mem.eql(u8, r_head, sup)) {
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+            if (!reachable) {
+                for (chain) |sup| {
+                    if (std.mem.eql(u8, r_head, applicability.simpleName(staticTypeHead(sup)))) {
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+            if (!reachable) continue;
+            // Arity refutation first: the DeclSig arity counts user args.
+            const required: usize = ds.arity.required;
+            const total: usize = if (ds.arity.has_vararg) std.math.maxInt(u32) else ds.arity.total;
+            if (shapes.len < required or shapes.len > total) continue;
+            if (f.params.len < 1 + shapes.len and !ds.arity.has_vararg) continue;
+            var refuted = false;
+            const n = @min(shapes.len, f.params.len -| 1);
+            for (shapes[0..n], f.params[1 .. 1 + n]) |sh, p| {
+                if (self.staticArgCompatibility(fid, sh, p.ty, actual_bounds) == .incompatible) {
+                    refuted = true;
+                    break;
+                }
+            }
+            if (!refuted) {
+                mpp_why = "ext-unrefuted";
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn recvRefuteOn() bool {
         const S = struct {
             var cached: ?bool = null;

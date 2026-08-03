@@ -14276,8 +14276,12 @@ fn lowerResolvedMemberCall(
             .none;
     if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
         if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
-            std.debug.print("[promo-ext] {s}.{s} nargs={d} why={s}\n", .{
-                head, name.name, args.len, @tagName(promo_ext_why),
+            var typed_args: usize = 0;
+            for (shapes) |sh| {
+                if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) typed_args += 1;
+            }
+            std.debug.print("[promo-ext] {s}.{s} nargs={d} typed={d} why={s}\n", .{
+                head, name.name, args.len, typed_args, @tagName(promo_ext_why),
             });
         }
         if (promo_blocked_by_class) {
@@ -14292,6 +14296,34 @@ fn lowerResolvedMemberCall(
             .own_head => lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
             .builtin_super => lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
             .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
+        }
+    }
+    // Third-derivation promotion: the extension-shadow question answers by
+    // PROOF when every argument is authoritative — the member compatible,
+    // every reachable same-name extension refuted (`KLIO_MEMBER_PROMO=0`
+    // disables for A/B).
+    if (promo_ext_why != .none and !promo_blocked_by_class and
+        resolved.dispatch == .deferred and resolved.target != null and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_PROMO") orelse "1", "0"))
+    {
+        const owned_bounds_promo = try b.typeParamBoundsSlice();
+        defer if (owned_bounds_promo) |bnd| b.allocator.free(bnd);
+        if (b.module.memberPromotionProven(
+            resolved.target.?,
+            head,
+            name.name,
+            recv_ty,
+            shapes,
+            owned_bounds_promo orelse &.{},
+        )) {
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-proof] {s}.{s} nargs={d} PROMOTED\n", .{ head, name.name, args.len });
+            }
+            if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
+                resolved.dispatch = d;
+            }
+        } else if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+            std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
         }
     }
     if (promo_ext_why == .none and
