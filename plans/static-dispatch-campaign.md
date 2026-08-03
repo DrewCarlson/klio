@@ -1324,3 +1324,19 @@ KLIO_RESOLVE_AUDIT zero-disagreement discipline, not as a spot fix.
 Diagnostics for re-entry: KLIO_HOP_TRACE ([hop] rows), [rex] enter
 rows now print the ranked receiver; the flip re-applies by returning
 `tp.name.name` from classPropHead when an upper bound exists.
+
+## Addendum 2 — the gated receiver-refutation slice measured short (2026-08-03)
+
+A default-OFF `KLIO_RECV_REFUTE` slice was built in
+resolveExtensionCall's loop (unknown-compat candidates whose declared
+receiver classifier is provably unrelated to a PROVEN args-carrying
+receiver head become incompatible) and tested with the classPropHead
+flip + gate ON: minusArray STILL fails. Conclusion: the extension
+RANKER is not the deciding call for the operator EMISSION — the `[rex]`
+rows observed during the run come from the derivation channel, and the
+`data - arrayOf(...)` emission resolves elsewhere (probe next with
+KLIO_OR_AUDIT on the operator lowering path, then find its resolver and
+apply the refutation THERE). The slice was reverted rather than kept
+unproven; re-derive it from this entry once the emission site is
+identified — the refutation logic itself (head inequality + both
+builtin identities + evidenceSubtypeCb negative) behaved as designed.
