@@ -63,6 +63,7 @@ fn collectClassTypeParamBounds(
                 .param = param.name.name,
                 .bound = upper.name.name,
                 .complete = boundTypeRecordComplete(upper),
+                .args = try ir.lower.decl.concreteBoundArgs(allocator, class.type_params, upper),
             });
             any_bound = true;
         }

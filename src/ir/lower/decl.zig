@@ -1662,7 +1662,7 @@ fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
 /// not a function type, and not naming any of the class's own type
 /// parameters. `T : Iterable<String>` keeps ["String"];
 /// `C : MutableCollection<in T>` keeps nothing.
-fn concreteBoundArgs(
+pub fn concreteBoundArgs(
     allocator: Allocator,
     own_params: []const ast.TypeParam,
     upper: *const ast.TypeRef,

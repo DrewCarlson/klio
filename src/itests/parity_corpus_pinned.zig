@@ -1568,6 +1568,17 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "bounded_prop_minus_list" {
+    try check("bounded_prop_minus_list",
+        \\[bar]
+        \\true
+        \\[bar]
+        \\true
+        \\1
+        \\
+    );
+}
+
 test "fn_bound_receiver_ext_commit" {
     try check("fn_bound_receiver_ext_commit",
         \\2
