@@ -4103,9 +4103,15 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
     };
 }
 
+var route_trace_init: bool = false;
+var route_trace_val: ?[]const u8 = null;
 fn routeTraceOn(name: []const u8) bool {
-    const w = std.c.getenv("KLIO_ROUTE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(w), name);
+    if (!route_trace_init) {
+        route_trace_val = if (std.c.getenv("KLIO_ROUTE")) |w| std.mem.span(w) else null;
+        route_trace_init = true;
+    }
+    const w = route_trace_val orelse return false;
+    return std.mem.eql(u8, w, name);
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
@@ -5209,6 +5215,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 // its intrinsic handles Instance receivers itself.
                 if (std.mem.eql(u8, name, "toTypedArray")) {
                     return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
+                }
+                if (std.c.getenv("KLIO_DRAIN_TRACE") != null) {
+                    std.debug.print("[drain] {s} on {s} caller={s} span={?any}\n", .{
+                        name,
+                        receiver.typeFqn(),
+                        if (ir.eval.currentFrameFunc()) |cfn| cfn.fqn else "<none>",
+                        ir.eval.currentCallSiteSpan(),
+                    });
                 }
                 const drained = blk: {
                     iterable_fallback_active = true;
@@ -8301,8 +8315,8 @@ fn funcAt(module: *const Module, fid: FuncId) ?Func {
 }
 
 fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error!std.ArrayList(Value) {
-    var l: std.ArrayList(Value) = .empty;
-    try l.appendSlice(allocator, slice);
+    var l = try ir.eval.acquireArgsCap(allocator, slice.len);
+    l.appendSliceAssumeCapacity(slice);
     return l;
 }
 
@@ -8617,15 +8631,25 @@ fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) All
 fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8, name: []const u8) ?AnonMethodEntry {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
-    // The lookup keys are scratch — the map copies what it needs, so free them
-    // on exit. The GC does not manage these raw allocations; leaving them (the
-    // old arena-only assumption) leaks per dispatch under the freeing backends.
-    const ak = anonKey(allocator, class_name, arity_name) catch return null;
-    defer allocator.free(ak);
-    if (tbl.get().get(ak)) |e| return e;
-    const pk = anonKey(allocator, class_name, name) catch return null;
-    defer allocator.free(pk);
-    if (tbl.get().get(pk)) |e| return e;
+    if (tbl.get().count() == 0) return null;
+    // Probe keys live in a stack buffer — this runs per dynamic dispatch, and
+    // the old per-probe allocPrint pair was measurable in the profile. The
+    // heap fallback covers pathological name lengths.
+    var kb: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |ak| {
+        if (tbl.get().get(ak)) |e| return e;
+    } else |_| {
+        const ak = anonKey(allocator, class_name, arity_name) catch return null;
+        defer allocator.free(ak);
+        if (tbl.get().get(ak)) |e| return e;
+    }
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, name })) |pk| {
+        if (tbl.get().get(pk)) |e| return e;
+    } else |_| {
+        const pk = anonKey(allocator, class_name, name) catch return null;
+        defer allocator.free(pk);
+        if (tbl.get().get(pk)) |e| return e;
+    }
     return null;
 }
 
@@ -8635,6 +8659,11 @@ fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const u8,
 fn lookupAnonMethodExact(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8) ?AnonMethodEntry {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
+    if (tbl.get().count() == 0) return null;
+    var kb: [256]u8 = undefined;
+    if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |key| {
+        return tbl.get().get(key);
+    } else |_| {}
     const key = anonKey(allocator, class_name, arity_name) catch return null;
     defer allocator.free(key);
     return tbl.get().get(key);
@@ -10050,8 +10079,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // hot member-dispatch path).
     const has_vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
     if (!has_vararg and args.len + 1 >= f.params.len) {
-        var list: std.ArrayList(Value) = .empty;
-        try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+        var list = try ir.eval.acquireArgsCap(allocator, args.len + 1);
         list.appendAssumeCapacity(receiver.*);
         list.appendSliceAssumeCapacity(args);
         if (trace.invariantsEnabled()) {
@@ -10300,6 +10328,11 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
             break :blk h.final() | 1;
         },
         .Result => 0x5261 | 1,
+        // A CLASS value (`Snapshot`'s companion-forwarding class receiver, a
+        // `::class`): member/extension resolution is a pure function of the
+        // referenced class cell — `currentSnapshot` on the snapshot companion
+        // class re-ran the full extension walk 90k times per benchmark.
+        .Class => |c| c.identity(),
         // Runtime shapes whose extension resolution is fully fixed by the
         // value's type tag, at exactly `typeFqn` granularity (prim kind for
         // arrays, kind + step-refinement for ranges). Identities are forced
@@ -10478,6 +10511,9 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+        std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
+    }
     runtime.prof.opRoute(9);
     // Inline cache: memoize the (class, method-name, arg-type-signature) →
     // FuncId resolution. The signature captures the argument primitive types the
@@ -11283,7 +11319,15 @@ fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
     _ = allocator;
     const want = argc + 1;
     const sp = ir.eval.currentCallSiteSpan();
-    const dbg = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+    const dbg = blk: {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |b| break :blk b;
+        const b = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+        S.cached = b;
+        break :blk b;
+    };
     if (dbg) std.debug.print("[shadow] probe name={s} argc={d} cands={d} span={any}\n", .{ name, argc, blk: {
         const mg2 = self.module.borrow();
         defer mg2.deinit();
@@ -11756,6 +11800,7 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
 /// every single call (half of a recompose workload's runtime), and a walk
 /// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+
     runtime.prof.opRoute(3);
     var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
         instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv);
@@ -11788,6 +11833,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
     var saw_member_ext = false;
+    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+        std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} keyed={}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", cache_key != null });
+    }
     const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
     if (r == null) {
         if (!saw_member_ext) {

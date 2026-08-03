@@ -275,6 +275,13 @@ pub const ProgramImage = struct {
     /// Both facts derive from the static class graph, so one probe here
     /// replaces the per-read getter BFS + linear slot scan.
     field_read_cache: std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
+    /// Field-WRITE resolution memo, keyed (receiver class fqn, field name):
+    /// whether the write runs a custom setter (`setter` FuncId) or lands in
+    /// a stored slot under `store_name`. Recorded only when every consulted
+    /// fact is class-static (main-module class, no delegate, no dynamic
+    /// forwarding), so one probe replaces the per-write ext-setter /
+    /// delegated / custom-setter / override-cell ladder.
+    field_write_cache: std.HashMap(StrPair, FieldWriteHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
     /// Declaring-class memo for an instance method's implicit-`this` static
     /// receiver resolution: `(module, FuncId)` → the simple name of the class
     /// whose `methods` list owns the FuncId (`null` = no owning class found).
@@ -306,6 +313,15 @@ pub const ProgramImage = struct {
         getter: u32,
         /// Stored-slot index, `NONE` when a getter serves the read.
         stored_idx: u32,
+        pub const NONE: u32 = std.math.maxInt(u32);
+    };
+
+    pub const FieldWriteHit = struct {
+        /// Custom setter to run, `NONE` when the write is a plain store.
+        setter: u32,
+        /// Resolved store key for the plain write (the override-cell key or
+        /// the plain name); borrowed from registry/IR memory.
+        store_name: []const u8,
         pub const NONE: u32 = std.math.maxInt(u32);
     };
 
@@ -386,6 +402,7 @@ pub const ProgramImage = struct {
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
             .field_read_cache = std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .field_write_cache = std.HashMap(StrPair, FieldWriteHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
             .func_owner_class_cache = std.AutoHashMap(FuncOwnerKey, ?[]const u8).init(allocator),
             .allocator = allocator,
         };
@@ -449,6 +466,7 @@ pub const ProgramImage = struct {
         self.cmg_global_cache.deinit();
         self.overload_cache.deinit();
         self.field_read_cache.deinit();
+        self.field_write_cache.deinit();
         self.func_owner_class_cache.deinit();
     }
 

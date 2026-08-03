@@ -6899,6 +6899,96 @@ fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
     }
 }
 
+/// Whether any of `f`'s value parameters is a RECEIVER-formed function type
+/// (`block: R.() -> T`).
+fn anyReceiverFormedFnParam(f: *const ast.Function) bool {
+    for (f.params) |*p| {
+        if (p.ty.function) |ft| {
+            if (ft.receiver != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `f`'s body contains a `this` reference INSIDE a nested lambda /
+/// anon-fun. Such a `this` may belong to a receiver-formed block invoked
+/// dynamically (`withCurrent { this }`), which a member-body splice would
+/// statically capture to the wrong receiver.
+fn bodyLambdaBindsThis(f: *const ast.Function) bool {
+    const body = &(f.body orelse return false);
+    return switch (body.*) {
+        .Block => |*blk| thisScanStmts(blk.stmts, false),
+        .Expr => |*e| thisScan(e, false),
+    };
+}
+
+fn thisScanStmts(stmts: []const ast.Stmt, in_lambda: bool) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| thisScan(e, in_lambda),
+            .Assign => |asg| thisScan(&asg.target, in_lambda) or thisScan(&asg.value, in_lambda),
+            .DestructuringDecl => |d| thisScan(&d.init, in_lambda),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| if (pr.init) |*init| thisScan(init, in_lambda) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+fn thisScanArgs(args: []const Expr, in_lambda: bool) bool {
+    for (args) |*a| {
+        if (thisScan(a, in_lambda)) return true;
+    }
+    return false;
+}
+
+fn thisScan(e: *const Expr, in_lambda: bool) bool {
+    return switch (e.*) {
+        .This => in_lambda,
+        .Lambda => |l| thisScanStmts(l.body.stmts, true),
+        .AnonFun => true,
+        .ObjectExpr => true,
+        .Member => |m| thisScan(m.receiver, in_lambda),
+        .Unary => |u| thisScan(u.expr, in_lambda),
+        .Postfix => |po| thisScan(po.expr, in_lambda),
+        .Spread => |sp| thisScan(sp.expr, in_lambda),
+        .Throw => |t| thisScan(t.value, in_lambda),
+        .Labeled => |l| thisScan(l.expr, in_lambda),
+        .As => |a| thisScan(a.expr, in_lambda),
+        .IsCheck => |c| thisScan(c.expr, in_lambda),
+        .MemberRef => |r| thisScan(r.receiver, in_lambda),
+        .Return => |r| if (r.value) |v| thisScan(v, in_lambda) else false,
+        .Call => |c| thisScan(c.callee, in_lambda) or thisScanArgs(c.args, in_lambda),
+        .Index => |i| thisScan(i.receiver, in_lambda) or thisScanArgs(i.args, in_lambda),
+        .Binary => |bin| thisScan(bin.lhs, in_lambda) or thisScan(bin.rhs, in_lambda),
+        .If => |i| thisScan(i.cond, in_lambda) or thisScan(i.then_branch, in_lambda) or
+            (if (i.else_branch) |eb| thisScan(eb, in_lambda) else false),
+        .While => |w| thisScan(w.cond, in_lambda) or thisScan(w.body, in_lambda),
+        .DoWhile => |dw| (if (dw.body) |db| thisScan(db, in_lambda) else false) or thisScan(dw.cond, in_lambda),
+        .For => |fl| thisScan(fl.iter, in_lambda) or thisScan(fl.body, in_lambda),
+        .Block => |blk| thisScanStmts(blk.stmts, in_lambda),
+        .When => |w| (if (w.subject) |sub| thisScan(sub, in_lambda) else false) or blk: {
+            for (w.branches) |*br| {
+                if (thisScan(&br.body, in_lambda)) break :blk true;
+            }
+            break :blk false;
+        },
+        .StringTemplate => |t| blk: {
+            for (t.parts) |*p| {
+                if (p.* == .Interp) {
+                    if (thisScan(p.Interp, in_lambda)) break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .Try => true,
+        else => false,
+    };
+}
+
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
@@ -6935,10 +7025,27 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         break :blk companionOwnerInEnclosingHierarchy(b, owner);
     };
+    // A bare inline-EXT call inside a class MEMBER body: `this` there is
+    // always an interpreted Instance, so the no-splice route's host binding
+    // can only serve it by draining the whole receiver into a host value
+    // per call (`indexOfFirst` inside `AbstractList.indexOf` drained the
+    // list on every `contains`). The splice keeps the operation in place,
+    // exactly as kotlinc inlines it. Ext-body contexts (recvTy set) keep
+    // the host fast path — their values are host-repr. RECEIVER-formed
+    // lambda params (`block: R.() -> T`) are excluded: a nested splice of
+    // `withCurrent { this }` bound the block's `this` to the OUTER member
+    // receiver (`current.modification` read off the list instead of the
+    // record) — those keep the dynamic route until the nested receiver
+    // rebinding is fixed.
+    const member_body_ext = f.receiver_type != null and
+        b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
+        b.recvTy() == null and b.ownerClass() != null and
+        !anyReceiverFormedFnParam(f) and !bodyLambdaBindsThis(f) and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
-            companion_super_member);
+            companion_super_member or member_body_ext);
 }
 
 /// True when `owner` names a companion object (a `$Companion`-mangled
@@ -8165,6 +8272,27 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         }
         return null;
     }
+    // `this@label`: the receiver bound under that label — the builder's own
+    // receiver when its label matches (an ext body's label is its fn name),
+    // else the tower entry carrying it. `this@runningReduce.iterator()`
+    // inside the `sequence { }` body types as the OUTER Sequence receiver.
+    if (arg.* == .This) {
+        if (arg.This.qualifier) |q| {
+            if (b.own_this_label) |own| {
+                if (std.mem.eql(u8, own, q.name)) {
+                    if (b.recvTypeRef()) |receiver| return receiver;
+                    if (b.recvTy()) |head| return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+            for (b.implicit_receiver_tower.items) |entry| {
+                const label = entry.label orelse continue;
+                if (std.mem.eql(u8, label, q.name)) {
+                    return .{ .name = entry.head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
+        return null;
+    }
     switch (arg.*) {
         .IntLit => |lit| return .{
             .name = switch (lit.kind) {
@@ -8328,6 +8456,17 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // Refuse to re-enter a local already on the chain.
         if (init != arg and pushInitChain(p.segments[0].name)) {
             defer popInitChain();
+            // The initializer is read in its DECLARATION scope: the local's
+            // own name was free there (recorded at the decl), so the init's
+            // bare calls must not see the binding that now exists at the
+            // READ point — `iterator.hasNext()` follows `val iterator =
+            // iterator()`, whose init resolves the RECEIVER member, never
+            // the local itself.
+            const prev_self = init_self_name;
+            if (b.localInitNameFree(p.segments[0].name) and
+                !std.mem.eql(u8, runtime.getenvSlice("KLIO_INIT_SELF") orelse "1", "0"))
+                init_self_name = p.segments[0].name;
+            defer init_self_name = prev_self;
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
             // A MEMBER-call or elvis initializer needs the full derivation
             // the lazy reader lacks (`val clause = findClause(x) ?:
@@ -13641,11 +13780,13 @@ fn lowerResolvedMemberCall(
             lm_norecv_path[@intFromEnum(which)] += 1;
             if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
                 if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
-                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s}\n", .{
+                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s} call={s} fn={s}\n", .{
                         @tagName(which),
                         rn,
                         b.ownerClass() orelse "<none>",
                         bareStaticRecvHead(b) orelse "<none>",
+                        name.name,
+                        build.currentRealFn() orelse "-",
                     });
                 }
             }
@@ -13653,6 +13794,42 @@ fn lowerResolvedMemberCall(
                 if (b.localInitExpr(rn)) |ini| {
                     lm_norecv_init[1] += 1;
                     lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
+                    // `KLIO_NORECV_WHY=<name>`: at a counted site whose init
+                    // IS recorded, re-run the lazy deriver and print its
+                    // terminal, so the failing channel is named instead of
+                    // guessed (the self-shadow fix measured census-neutral;
+                    // this finds where these sites actually die).
+                    if (runtime.getenvSlice("KLIO_NORECV_WHY")) |want| {
+                        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
+                            const redo = argDeclTypeRefLazy(b, receiver);
+                            const prev_self = init_self_name;
+                            if (b.localInitNameFree(rn)) init_self_name = rn;
+                            const full = staticCallReturnTypeRef(b, ini) catch null;
+                            init_self_name = prev_self;
+                            const why_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse "-";
+                            std.debug.print("[norecv-why] {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
+                                rn,
+                                @tagName(std.meta.activeTag(ini.*)),
+                                b.localInitNameFree(rn),
+                                if (redo) |r| r.name else "<null>",
+                                if (full) |r| r.name else "<null>",
+                                build.currentRealFn() orelse "-",
+                                why_head,
+                                b.module.uniqueClassIdBySimpleName(typeHead(std.mem.trimEnd(u8, why_head, "?"))) != null,
+                                b.module.uniqueClassIdBySimpleName("Iterator") != null,
+                                b.module.anon_side,
+                                b.module.funcs.items.len,
+                            });
+                            if (redo) |r| {
+                                var owned = r;
+                                owned.deinit(b.allocator);
+                            }
+                            if (full) |r| {
+                                var owned = r;
+                                owned.deinit(b.allocator);
+                            }
+                        }
+                    }
                 } else lm_norecv_init[0] += 1;
             }
         }

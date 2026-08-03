@@ -1145,7 +1145,18 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     const allocator = self.allocator;
     var top_prop_buf: [256]u8 = undefined;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
-    const gtrace = if (runtime.getenvSlice("KLIO_GLOBAL_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const gtrace = blk: {
+        const S = struct {
+            var init: bool = false;
+            var val: ?[]const u8 = null;
+        };
+        if (!S.init) {
+            S.val = runtime.getenvSlice("KLIO_GLOBAL_TRACE");
+            S.init = true;
+        }
+        const w = S.val orelse break :blk false;
+        break :blk std.mem.eql(u8, w, name);
+    };
 
     const cached: ?Value = blk: {
         const g = self.globals.borrow();
