@@ -4261,7 +4261,11 @@ pub const Module = struct {
             const score = applicability.applicable(sig, proof_args, ranked_scope) orelse continue;
             const key = score.ext_key.?;
             if (std.c.getenv("KLIO_REX_TRACE") != null) {
-                std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={}\n", .{ name, fid.int(), key, score.low_priority, unknown });
+                if (applicability.trace_call_span) |sp| {
+                    std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={} at=f{d}:{d}\n", .{ name, fid.int(), key, score.low_priority, unknown, sp.file.int(), sp.start });
+                } else {
+                    std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={}\n", .{ name, fid.int(), key, score.low_priority, unknown });
+                }
             }
             if (key[0] == 0 or (any_ordinary and score.low_priority)) continue;
             if (best == null or extensionKeyGreater(key, best_key)) {
