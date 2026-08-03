@@ -486,7 +486,17 @@ pub fn spliceInlineLambda(
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
         if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi])) |ty| {
-            try b.setLocalDeclTypeOwned(pname, try ty.clone(b.allocator));
+            // A head that is still a bare TYPE PARAMETER names nothing in
+            // the receiving scope; committing it only feeds the
+            // no_class_id bucket and disproves candidates a null leaves
+            // open.
+            var h = std.mem.trimEnd(u8, ty.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare_tp = (h.len > 0 and h.len <= 2 and
+                std.ascii.isUpper(h[0])) or b.isTypeParam(h);
+            if (!bare_tp) {
+                try b.setLocalDeclTypeOwned(pname, try ty.clone(b.allocator));
+            }
         }
     }
     // Capture the owner splice's localize target *before* pushing the new
