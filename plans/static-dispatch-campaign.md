@@ -163,6 +163,20 @@ unchanged):
   stdlib-bake lambda contexts (Duration takeIf-chains, unsigned splice
   contexts, windowed/joinToString shapes) — per-family, not one
   design.
+- **Ranker bound hop landed (7db4d2db); Array arg disproof landed
+  (229a9c15); the flip is STILL blocked** — third derivation level:
+  with the hop, minus{Element,Collection,Sequence} resolve under the
+  flip, but minusArray's 4-way arity-1 overload set stays ambiguous
+  because the extension ranker's ARG scoring flows through the shared
+  applicability engine whose `ext_is_subtype_name` oracle
+  (evidenceSubtypeCb, walking class_super_names) claims
+  Array <: Iterable — deliberate for RECEIVER dispatch (arrays run
+  Iterable extensions), kotlinc-wrong for ARGUMENT positions. The fix
+  is a receiver-vs-argument split in the applicability scope (a
+  second callback or a flag the arg-scoring path sets), after which
+  classPropHead keeps the param name (re-derives at ~-11
+  no_receiver_type and correct static minus binding on Set
+  subclasses).
 
 ## Handoff — exact state as of 2026-08-03 (session end)
 
