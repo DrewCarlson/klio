@@ -1400,3 +1400,19 @@ KLIO_RESOLVE_AUDIT discipline — is the single biggest remaining lever
 for both counts and is the designed next leg. After it: the
 resolver_declined 213 (same argument-authority family), no_class_id
 (unsigned host-symbol route), compose throughput, the bytecode VM.
+
+## Addendum 4 — sixth level: the minus family carries TWO bound records (2026-08-03)
+
+Fn-level bounds now carry concrete args (ea362778), and the full proof
+chain works end-to-end for `fun <T : Iterable<String>> probe(data: T) =
+data.count { }` — hop -> Iterable<String>, generic_applies=true, KEPT
+compatible, extension COMMITS statically (pin
+fn_bound_receiver_ext_commit). Under the classPropHead flip, the
+`Iterable<T>.minus` candidates STILL fail generic_applies — the rex
+rows show `bounds=2` for every minus fid where the passing count fid
+shows `bounds=1`: declaredTypeParamBounds returns TWO records for a
+single-`<T>` declaration, and the multi-bound arm refuses. Find why the
+minus family double-registers (expect/actual pair? the operator's
+`element: T` vs collection overload registration?), dedupe or teach the
+multi-bound arm same-param merging, and the flip should clear
+end-to-end. Flip reverted again; battery green.
