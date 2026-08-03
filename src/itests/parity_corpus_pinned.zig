@@ -1568,6 +1568,13 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "fn_bound_receiver_ext_commit" {
+    try check("fn_bound_receiver_ext_commit",
+        \\2
+        \\
+    );
+}
+
 test "bound_args_lambda_param" {
     try check("bound_args_lambda_param",
         \\2
