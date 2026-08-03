@@ -2976,14 +2976,19 @@ fn buildModuleWithOverrides(
             if (p.setter) |setter| {
                 const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
                 const nm = try std.fmt.allocPrint(a, "__set_{s}_{s}", .{ c.name.name, p.name.name });
+                // The value parameter's type is the property's declared
+                // type: `set(value) { if (value <= 0) ... }` resolves
+                // `value` statically.
+                const vty_head: ?[]const u8 = if (p.ty) |*t| t.name.name else null;
+                const vty_nullable = if (p.ty) |*t| t.nullable else false;
                 const fid = switch (setter.body) {
                     .Expr => |body| blk: {
                         const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body);
-                        break :blk try ir.lower.lowerAccessorExpr(module, c.name.name, &own_members, &.{ "this", setter_param_name }, rewritten, nm);
+                        break :blk try ir.lower.lowerSetterExprTyped(module, c.name.name, &own_members, &.{ "this", setter_param_name }, setter_param_name, vty_head, vty_nullable, rewritten, nm);
                     },
                     .Block => |blk_body| blk: {
                         const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name);
-                        break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, &.{ "this", setter_param_name }, &rewritten, nm);
+                        break :blk try ir.lower.lowerSetterBlockTyped(module, c.name.name, &own_members, &.{ "this", setter_param_name }, setter_param_name, vty_head, vty_nullable, &rewritten, nm);
                     },
                 };
                 const set_cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);

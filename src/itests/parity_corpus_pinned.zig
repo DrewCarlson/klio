@@ -1586,6 +1586,30 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "sequence_scope_outer_iterator" {
+    try check("sequence_scope_outer_iterator",
+        \\[1, 3, 5]
+        \\
+    );
+}
+
+test "lock_member_binding_spliced" {
+    try check("lock_member_binding_spliced",
+        \\other=false
+        \\reacquired=true
+        \\
+    );
+}
+
+test "setter_value_param_typed" {
+    try check("setter_value_param_typed",
+        \\6
+        \\HI
+        \\bad 0
+        \\
+    );
+}
+
 test "ext_prop_type_bare_read" {
     try check("ext_prop_type_bare_read",
         \\n=3 last=2 total=12

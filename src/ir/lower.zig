@@ -69,6 +69,8 @@ pub const widenNumericLiteral = mod.widenNumericLiteral;
 
 // Thunk lowering surface.
 pub const lowerAccessorBlock = mod.lowerAccessorBlock;
+pub const lowerSetterBlockTyped = mod.lowerSetterBlockTyped;
+pub const lowerSetterExprTyped = mod.lowerSetterExprTyped;
 pub const lowerAccessorExpr = mod.lowerAccessorExpr;
 pub const lowerAccessorExprWithExpected = mod.lowerAccessorExprWithExpected;
 pub const lowerAccessorExprEnclosing = mod.lowerAccessorExprEnclosing;

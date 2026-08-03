@@ -7639,11 +7639,19 @@ fn lowerValueInvocation(
         // resolves the call `nodeIndex(slots, startingGroup)` to the
         // function (an Int is not invokable) — the composer's
         // movable-content insert is the shape.
-        if (b.module.hasBareCallCandidate(name0, callee.Path.segments[0].span.file) and
+        // A constructor initializer of a class with no `invoke` operator
+        // (member or extension) is equally non-invokable, and the member
+        // alternative counts alongside the bare-function one: inside a
+        // spliced `ReentrantLock.withLock` body the bare `lock()` is the
+        // receiver's member, never the caller's `val lock =
+        // ReentrantLock()` local.
+        if ((b.module.hasBareCallCandidate(name0, callee.Path.segments[0].span.file) or
+            (inReceiverContext(b) and anyReceiverClassDeclares(b, name0))) and
             !b.isLocalFn(name0))
         {
             if (b.localInitExpr(name0)) |init_e| {
                 if (argLitKind(init_e) != null) return null;
+                if (ctorInitNonInvocable(b, init_e, args.len)) return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
@@ -7783,6 +7791,33 @@ fn argLitKind(e: *const Expr) ?LitKind {
         .StringTemplate => .string,
         else => null,
     };
+}
+
+/// Whether a local's initializer is a constructor call of a concrete class
+/// that provably has no `invoke` operator — member (own or inherited) or
+/// applicable extension — making the local's value non-invokable, so a bare
+/// call of its name must bind a same-named function or member instead.
+/// Answers false whenever anything is unknown (qualified callee, abstract
+/// classifier, absent hierarchy entry): unknown keeps the local binding.
+fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
+    const call = switch (init_e.*) {
+        .Call => |*c| c,
+        else => return false,
+    };
+    const path = switch (call.callee.*) {
+        .Path => |*p| p,
+        else => return false,
+    };
+    if (path.segments.len != 1) return false;
+    const cls_name = path.segments[0].name;
+    const cid = b.module.classId(cls_name) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    if (cls.is_abstract) return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
 
 /// Declared parameter arity of a single lambda / anon-fun argument
@@ -9082,6 +9117,49 @@ fn staticCallReturnTypeRef(
                             if (bt) std.debug.print("[bareret] {s} on {s} ast-declared return={s}\n", .{ name.name, ident, fwd.name });
                             return fwd;
                         }
+                    }
+                    // The OUTER implicit receivers: a bare `iterator()`
+                    // inside a `sequence { }` receiver lambda resolves
+                    // against the enclosing extension's receiver when
+                    // SequenceScope misses — the same tower the emission
+                    // walk consults.
+                    for (b.implicit_receiver_tower.items) |entry| {
+                        var outer_head = std.mem.trimEnd(u8, entry.head, "?");
+                        if (std.mem.indexOfScalar(u8, outer_head, '<')) |lt| outer_head = outer_head[0..lt];
+                        if (std.mem.eql(u8, typeHead(outer_head), bare_head)) continue;
+                        const outer_cid = (if (std.mem.indexOfScalar(u8, outer_head, '.') != null)
+                            b.module.classIdByFqn(outer_head)
+                        else
+                            b.module.uniqueClassIdBySimpleName(typeHead(outer_head))) orelse continue;
+                        var outer_recv = ir.TypeRef{
+                            .name = try b.allocator.dupe(u8, entry.head),
+                            .nullable = false,
+                            .args = &.{},
+                        };
+                        const outer_resolved = b.module.resolveMemberCall(
+                            outer_cid,
+                            name.name,
+                            shape_set.shapes,
+                            .{
+                                .caller_file = name.span.file,
+                                .lexical_owner = null,
+                                .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+                                .receiver_type = outer_recv,
+                            },
+                        );
+                        if (outer_resolved.target) |t| {
+                            if (bt) std.debug.print("[bareret] {s} tower {s} target\n", .{ name.name, outer_head });
+                            if (receiver) |*old| old.deinit(b.allocator);
+                            receiver = outer_recv;
+                            break :blk t;
+                        }
+                        if (try bareExtensionTarget(b, name, outer_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
+                            if (bt) std.debug.print("[bareret] {s} tower {s} ext target\n", .{ name.name, outer_head });
+                            if (receiver) |*old| old.deinit(b.allocator);
+                            receiver = outer_recv;
+                            break :blk t;
+                        }
+                        outer_recv.deinit(b.allocator);
                     }
                 }
                 break :blk sole_global orelse return null;
@@ -12449,12 +12527,17 @@ fn lowerUnresolvedBareCall(
         // (the user-script shape): pack sources lower in stages where a
         // sibling classifier or a native binding is not yet visible
         // (`PathBuilder`, `__skia_c_draw_text2` false-fired), and a
-        // runtime side module resolves against a wider universe.
+        // runtime side module resolves against a wider universe. A named
+        // import of the leaf also defeats provability: an intrinsic-only
+        // function (`kotlin.concurrent.thread`) has a host impl but no
+        // declaration, so the candidate probe cannot see it — the
+        // runtime global universe serves the call.
         const file0 = callee.Path.segments[0].span.file;
         if (!b.module.anon_side and b.module.packageOfFile(file0) == null and
             b.resolve(name0) == null and !b.knowsOuter(name0) and
             !b.module.hasBareCallCandidate(name0, file0) and
-            b.module.classId(name0) == null and !isTopLevelProp(name0))
+            b.module.classId(name0) == null and !isTopLevelProp(name0) and
+            b.module.importAliasIn(file0, name0) == null)
         {
             try b.module.resolve_diags.append(b.allocator, .{
                 .name = name0,
