@@ -9461,10 +9461,13 @@ fn enrichLambdaArgShapes(
         const stmts = lam.body.stmts;
         if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) continue;
         const tail = &stmts[stmts.len - 1].Expr;
-        // Only self-contained tail kinds derive: a Call tail re-enters the
-        // resolution machinery, and doing that from a scratch builder while
-        // a class's methods are mid-lowering corrupted the enclosing
-        // context (XorWowRandom's `require` emission).
+        // Only self-contained tail kinds derive. Call/Member tails were
+        // re-tried once the mis-attributed XorWow corruption resolved (the
+        // real cause was the unbound-ref companion arg-shift) and measured
+        // NET NEGATIVE: stdlib no_receiver_type 1,353 -> 1,403 and
+        // bound_virtual 5,730 -> 5,666 — a derived call-tail binding (the
+        // getOrPut `V := ArrayList` shape) narrows generic instantiations
+        // in ways that disprove more downstream than the typed local buys.
         switch (tail.*) {
             .Path, .Binary, .StringTemplate, .IntLit, .FloatLit, .BoolLit, .CharLit => {},
             else => continue,
