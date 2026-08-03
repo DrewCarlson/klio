@@ -1657,6 +1657,32 @@ fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
         bound.qualified_path == null;
 }
 
+/// The bound's type-argument heads, kept only when EVERY argument is a
+/// plain concrete reference: unprojected, non-star, no nested arguments,
+/// not a function type, and not naming any of the class's own type
+/// parameters. `T : Iterable<String>` keeps ["String"];
+/// `C : MutableCollection<in T>` keeps nothing.
+fn concreteBoundArgs(
+    allocator: Allocator,
+    class: *const ast.Class,
+    upper: *const ast.TypeRef,
+) Allocator.Error![]const []const u8 {
+    if (upper.type_args.len == 0) return &.{};
+    for (upper.type_args) |*ta| {
+        if (ta.is_star or ta.variance != .Invariant) return &.{};
+        if (ta.ty.type_args.len != 0 or ta.ty.function != null or ta.ty.nullable) return &.{};
+        const n = ta.ty.name.name;
+        if (n.len == 0) return &.{};
+        if (n.len <= 2 and std.ascii.isUpper(n[0])) return &.{};
+        for (class.type_params) |*other| {
+            if (std.mem.eql(u8, other.name.name, n)) return &.{};
+        }
+    }
+    const out = try allocator.alloc([]const u8, upper.type_args.len);
+    for (upper.type_args, out) |*ta, *dst| dst.* = ta.ty.name.name;
+    return out;
+}
+
 fn loweredClassTypeParamBounds(
     allocator: Allocator,
     class: *const ast.Class,
@@ -1672,6 +1698,7 @@ fn loweredClassTypeParamBounds(
                 .bound = upper.name.name,
                 .complete = boundTypeRecordComplete(upper),
                 .head_only = boundTypeRecordHeadOnly(upper),
+                .args = try concreteBoundArgs(allocator, class, upper),
             });
         }
         for (class.where_bounds) |*where_bound| {
@@ -1767,6 +1794,32 @@ fn addScopedTypeParamBounds(
                         bound.complete,
                         bound.head_only,
                     );
+                    // A bound whose record kept CONCRETE type arguments
+                    // also registers the full ref, so a receiver typed by
+                    // this parameter can substitute a generic callee's
+                    // lambda params (`T : Iterable<String>` makes
+                    // `count { it.startsWith("f") }` type `it` String).
+                    if (bound.args.len != 0) {
+                        const arg_refs = try b.allocator.alloc(ir.TypeRef, bound.args.len);
+                        var filled: usize = 0;
+                        errdefer {
+                            for (arg_refs[0..filled]) |*t| t.deinit(b.allocator);
+                            b.allocator.free(arg_refs);
+                        }
+                        for (bound.args, arg_refs) |src, *dst| {
+                            dst.* = .{
+                                .name = try b.allocator.dupe(u8, src),
+                                .nullable = false,
+                                .args = &.{},
+                            };
+                            filled += 1;
+                        }
+                        try b.addTypeParamBoundRef(bound.param, .{
+                            .name = try b.allocator.dupe(u8, bound.bound),
+                            .nullable = false,
+                            .args = arg_refs,
+                        });
+                    }
                 }
             }
         }

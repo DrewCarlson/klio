@@ -3882,6 +3882,7 @@ fn instantiatedLambdaValueParams(
     fn_ty: ir.TypeRef,
     type_args: []const ast.TypeRef,
     include_function_receiver: bool,
+    recv: ?*const ir.TypeRef,
 ) Allocator.Error!?[]ir.TypeRef {
     const arity = fnTypeArityAlias(b, fn_ty) orelse return null;
     if (arity < 0) return null;
@@ -3895,12 +3896,26 @@ fn instantiatedLambdaValueParams(
     for (type_args, explicit) |*src, *dst| {
         dst.* = try loweredOwnedLocalTypeRef(b, src);
     }
-    var instantiated = (try b.module.instantiatedDeclarationType(
-        b.allocator,
-        func.id,
-        fn_ty,
-        explicit,
-    )) orelse try fn_ty.clone(b.allocator);
+    var instantiated = blk: {
+        // With no explicit type args, the ACTUAL receiver may bind the
+        // callee's params (`Iterable<String>.count` binds T := String).
+        if (type_args.len == 0) {
+            if (recv) |r| {
+                if (try b.module.instantiatedTypeFromReceiver(
+                    b.allocator,
+                    func.id,
+                    fn_ty,
+                    r.*,
+                )) |t| break :blk t;
+            }
+        }
+        break :blk (try b.module.instantiatedDeclarationType(
+            b.allocator,
+            func.id,
+            fn_ty,
+            explicit,
+        )) orelse try fn_ty.clone(b.allocator);
+    };
     defer instantiated.deinit(b.allocator);
 
     var hi = instantiated.args.len;
@@ -3944,6 +3959,20 @@ fn deinitArgLambdaParamTypes(
 
 /// Instantiated expected value-parameter types for each lambda argument,
 /// aligned through the same positional/named/trailing-lambda map as arity.
+/// The receiver to substitute a generic callee's params from: a declared
+/// receiver carrying ARGUMENTS is authoritative; a bare type-param head
+/// resolves through its full bound ref when one was recorded
+/// (`T : Iterable<String>` answers `Iterable<String>`); a head-only
+/// receiver substitutes nothing.
+fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const ir.TypeRef {
+    const d = declared orelse return null;
+    var head = std.mem.trimEnd(u8, d.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (b.typeParamBoundRef(typeHead(head))) |ref| return ref;
+    if (d.args.len != 0) return d;
+    return null;
+}
+
 fn argLambdaParamTypes(
     b: *FuncBuilder,
     func: *const Func,
@@ -3951,6 +3980,18 @@ fn argLambdaParamTypes(
     arg_names: []const ?[]const u8,
     type_args: []const ast.TypeRef,
     recv_offset: usize,
+) Allocator.Error!?[]?[]ir.TypeRef {
+    return argLambdaParamTypesRecv(b, func, args, arg_names, type_args, recv_offset, null);
+}
+
+fn argLambdaParamTypesRecv(
+    b: *FuncBuilder,
+    func: *const Func,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const ast.TypeRef,
+    recv_offset: usize,
+    recv: ?*const ir.TypeRef,
 ) Allocator.Error!?[]?[]ir.TypeRef {
     if (runtime.getenvSlice("KLIO_ALPT")) |want| {
         if (std.mem.eql(u8, want, func.name)) {
@@ -3989,6 +4030,7 @@ fn argLambdaParamTypes(
                 params[pi].ty,
                 type_args,
                 callable_ref,
+                recv,
             );
             any = any or slot.* != null;
         }
@@ -4012,6 +4054,7 @@ fn argLambdaParamTypes(
                     params[param_index].ty,
                     type_args,
                     callable_ref,
+                    recv,
                 );
                 any = any or slot.* != null;
             }
@@ -14242,13 +14285,14 @@ fn lowerResolvedMemberCall(
     const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
-    const lambda_param_types = try argLambdaParamTypes(
+    const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
         args,
         ast_arg_names,
         ast_type_args,
         1,
+        substitutionRecv(b, &recv_ty),
     );
     defer if (lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
@@ -14454,13 +14498,14 @@ fn lowerResolvedExtensionCall(
     const arg_generic = try argFnGenericFlags(b, target, selected_values, selected_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
-    const lambda_param_types = try argLambdaParamTypes(
+    const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
         selected_values,
         selected_names,
         ast_type_args,
         1,
+        substitutionRecv(b, &recv_ty),
     );
     defer if (lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);

@@ -5018,6 +5018,36 @@ pub const Module = struct {
         return try substituted.clone(allocator);
     }
 
+    /// Instantiate a declared type of extension `fid` from the ACTUAL
+    /// receiver: bind the declaration's receiver parameter against
+    /// `receiver`, then substitute into `ty`. Null when the declaration has
+    /// no receiver or type parameters, nothing binds, or the substitution
+    /// stays incomplete — the caller keeps its explicit-args answer.
+    /// `Iterable<T>.count(predicate: (T) -> Boolean)` on an
+    /// `Iterable<String>` receiver instantiates `(String) -> Boolean`.
+    pub fn instantiatedTypeFromReceiver(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        ty: TypeRef,
+        receiver: TypeRef,
+    ) Allocator.Error!?TypeRef {
+        const f = self.funcById(fid) orelse return null;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
+        const tp_list = self.registry.func_type_params.get(fid);
+        const tps: []const []const u8 = if (tp_list) |list| list.items else &.{};
+        if (tps.len == 0) return null;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var bindings: std.ArrayList(TypeBinding) = .empty;
+        if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
+        if (bindings.items.len == 0) return null;
+        if (!returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
+        const substituted = try substituteType(a, ty, bindings.items);
+        return try substituted.clone(allocator);
+    }
+
     /// Instantiate an arbitrary type owned by a resolved declaration from
     /// explicit call-site type arguments. Returns null while any declaration
     /// type parameter used by `ty` remains unbound.
@@ -9327,6 +9357,12 @@ pub const ModuleRegistry = struct {
         /// is enough to answer "which class owns a member call on this
         /// parameter", which is all the receiver-owner lookup asks.
         head_only: bool = true,
+        /// The bound's type-argument heads, kept ONLY when every argument is
+        /// concrete (`T : Iterable<String>` keeps ["String"];
+        /// `C : MutableCollection<in T>` keeps nothing — an argument naming
+        /// another parameter substitutes nothing). Lets a receiver typed by
+        /// the parameter instantiate a generic callee's lambda params.
+        args: []const []const u8 = &.{},
     };
 
     /// One class's transitive shadow-name set + chain completeness.

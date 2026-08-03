@@ -1568,6 +1568,14 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "bound_args_lambda_param" {
+    try check("bound_args_lambda_param",
+        \\2
+        \\[FOO, BAR, FIZZ]
+        \\
+    );
+}
+
 test "nested_it_shadow_local_ext" {
     try check("nested_it_shadow_local_ext",
         \\[, abc, sort]
