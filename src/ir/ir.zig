@@ -2274,6 +2274,15 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            // A Kotlin Array is NOT an Iterable/Collection/Sequence. The
+            // runtime models arrays against those interfaces for member
+            // dispatch convenience, but overload REFUTATION follows
+            // kotlinc: `minus(elements: Iterable<T>)` never takes an Array
+            // argument, so the Array sibling resolves statically instead
+            // of deferring the whole overload set to a runtime value pick.
+            if (arrayVsCollectionParam(actual_head, param_erased_head)) {
+                return .incompatible;
+            }
         }
         const classifier = self.staticReceiverCompatibility(
             null,
@@ -2298,6 +2307,26 @@ pub const Module = struct {
             if (nested == .unknown) result = .unknown;
         }
         return result;
+    }
+
+    fn arrayVsCollectionParam(actual_head: []const u8, param_head: []const u8) bool {
+        const is_array = std.mem.eql(u8, actual_head, "Array") or
+            for ([_][]const u8{
+                "BooleanArray", "ByteArray",  "ShortArray", "IntArray",
+                "LongArray",    "CharArray",  "FloatArray", "DoubleArray",
+                "UByteArray",   "UShortArray", "UIntArray", "ULongArray",
+            }) |n| {
+                if (std.mem.eql(u8, actual_head, n)) break true;
+            } else false;
+        if (!is_array) return false;
+        for ([_][]const u8{
+            "Iterable", "MutableIterable",   "Collection", "MutableCollection",
+            "List",     "MutableList",       "Set",        "MutableSet",
+            "Sequence",
+        }) |n| {
+            if (std.mem.eql(u8, param_head, n)) return true;
+        }
+        return false;
     }
 
     const StaticAliasHead = struct {
