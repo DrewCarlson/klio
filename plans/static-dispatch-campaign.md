@@ -115,6 +115,29 @@ unchanged):
   `nested_it_shadow_local_ext`. Battery green after the arc (sweep
   117/0, litmus 42/42, drift 266/266, compose 61/65+56/59, units).
 
+- **Splice-inherited types refuse bare type-param heads** (e5f6606a):
+  no_class_id 44 -> 33 after the R/T pollution the splice channel
+  introduced. The remaining 33 stdlib no_class heads: T 9, Builder 8,
+  R 4, Monotonic 4, NumberHexFormat/BytesHexFormat/Function0/
+  DeepRecursiveFunctionBlock 2 each. MEASURED ZERO, do not retry
+  as-is: resolving the `Builder`/`Monotonic` family via
+  `classIdNestedIn(ownerClass)` or `classIdIndexed(head, pkg, file)`
+  — the sites sit in top-level extension bodies (no owner class) and
+  the nested lifted registrations are invisible to both probes; the
+  fix needs file-scope class-alias resolution (the file's import/
+  declaration TYPE scope), not a call-site probe.
+- **Next design steps for the remaining `it` mass (169)**: the
+  IterableTests family (`data.count { it.startsWith }` where
+  `data: T`, `T : Iterable<String>`) needs (a) `TypeParamBound` to
+  carry the bound's type ARGUMENTS when they are fully concrete
+  (loweredClassTypeParamBounds drops `upper.args` — keep them when no
+  arg mentions another type param), and (b) receiver-substitution in
+  the lambda-param channel: argLambdaParamTypes ->
+  instantiatedLambdaValueParams substitutes only explicit call-site
+  type args today; it needs the receiver binding (T := String) like
+  instantiatedCallReturnType's owner-projection arm. The unsigned
+  splice family rides the storage-mapped contexts.
+
 ## Handoff — exact state as of 2026-08-03 (session end)
 
 Everything below is committed on `main` at `730200c7`; the working tree
