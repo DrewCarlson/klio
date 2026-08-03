@@ -700,6 +700,14 @@ unless noted. Chronological.
   targeting: unsigned 168, incomplete type-param bounds (`M`/`C`) 81,
   `out#T` projection-prefix artifact 26.
 
+- Proof-based promotion of the ext_* promo-blocked pairs, re-derived
+  2026-08-03 with per-site why-tracing: of the sites reaching the
+  proof, 49 carry NO argument type at all (`ty=-`) — they sit in the
+  untyped-lambda-context cascade — 4 judge member-INCOMPATIBLE
+  (correctly held), 2 unknown. The proof pipeline itself is sound;
+  the gate is still argument authority, which the lambda/captured
+  design front owns. Re-derive a THIRD time only after lambda-context
+  arguments type.
 - Proof-based promotion of the ext_* promo-blocked pairs (2026-08-02):
   a `memberPromotionProven` (member `.compatible` + every chain-related
   extension `.incompatible`, all-args-authoritative gate, mirroring the
