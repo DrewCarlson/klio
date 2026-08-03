@@ -2237,10 +2237,34 @@ pub const Module = struct {
         depth: u8,
     ) StaticCompatibility {
         if (depth >= 32) return .unknown;
+        // A use-site variance projection is transparent to compatibility:
+        // `Array<String>` against `Array<out T>` adjudicates String-vs-T,
+        // not String-vs-`out#T` (whose head names nothing and left the
+        // Array overload of `minus` unknown at the argument step).
+        if (std.mem.startsWith(u8, param.name, "out#") or
+            std.mem.startsWith(u8, param.name, "in#"))
+        {
+            var stripped = param;
+            stripped.name = if (std.mem.startsWith(u8, param.name, "out#"))
+                param.name["out#".len..]
+            else
+                param.name["in#".len..];
+            return self.staticGenericArgCompatibility(fid, actual, stripped, depth + 1);
+        }
+        if (std.mem.startsWith(u8, actual.name, "out#") or
+            std.mem.startsWith(u8, actual.name, "in#"))
+        {
+            var stripped = actual;
+            stripped.name = if (std.mem.startsWith(u8, actual.name, "out#"))
+                actual.name["out#".len..]
+            else
+                actual.name["in#".len..];
+            return self.staticGenericArgCompatibility(fid, stripped, param, depth + 1);
+        }
         const param_head = staticTypeHead(param.name);
         if (overrideQualifiedPath(param) == null) {
             if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
-                if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
+                if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
                 return self.staticReceiverCompatibility(
                     null,
                     actual,
@@ -2294,6 +2318,27 @@ pub const Module = struct {
         const param_args = overrideArgs(param);
         if (param_args.len == 0) return .compatible;
         const actual_args = overrideArgs(actual);
+        // A head-matching actual whose ARGS are absent (a derivation that
+        // kept only the head — `arrayOf("foo","g")` shapes as bare `Array`)
+        // still satisfies a parameter whose every argument is one of the
+        // callee's OWN inferable type parameters: kotlinc binds them by
+        // inference, and applicability is not instantiation proof.
+        if (actual_args.len == 0 and param_args.len != 0) {
+            var all_own_tp = true;
+            for (param_args) |pa| {
+                var n = pa.name;
+                if (std.mem.startsWith(u8, n, "out#")) {
+                    n = n["out#".len..];
+                } else if (std.mem.startsWith(u8, n, "in#")) {
+                    n = n["in#".len..];
+                }
+                if (self.funcTypeParamIndex(fid, staticTypeHead(n)) == null) {
+                    all_own_tp = false;
+                    break;
+                }
+            }
+            if (all_own_tp) return .compatible;
+        }
         if (actual_args.len != param_args.len) return .unknown;
         var result: StaticCompatibility = .compatible;
         for (actual_args, param_args) |actual_arg, param_arg| {
@@ -3307,7 +3352,7 @@ pub const Module = struct {
                 0,
             );
             const bound = self.staticFuncTypeParamBound(fid, declared).?;
-            if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
+            if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
             return .unknown;
         }
         // A class-owned type parameter needs the receiver's class
@@ -3840,6 +3885,15 @@ pub const Module = struct {
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
+        // The per-call window delimiter for the rex trace: every candidate
+        // row until the next rex-call row belongs to this resolution.
+        if (std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (applicability.trace_call_span) |sp| {
+                std.debug.print("[rex-call] {s} recv={s} rargs={d} at=f{d}:{d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len, sp.file.int(), sp.start });
+            } else {
+                std.debug.print("[rex-call] {s} recv={s} rargs={d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len });
+            }
+        }
         var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
         var receiver_pruned: usize = 0;
         candidate_loop: while (candidate_it.next()) |fid| {
@@ -4152,6 +4206,15 @@ pub const Module = struct {
                         param.ty,
                         ctx.actual_type_param_bounds,
                     );
+                    if (rex_trace) {
+                        std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s}\n", .{
+                            name,
+                            fid.int(),
+                            param.ty.name,
+                            if (arg.ty) |t| t.name else "-",
+                            @tagName(arg_compatibility),
+                        });
+                    }
                     if (arg_compatibility == .incompatible) {
                         compatibility = .incompatible;
                         break;
