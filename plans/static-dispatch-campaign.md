@@ -1657,3 +1657,57 @@ disproves more downstream than the typed local buys, independent of
 proof soundness. The groupBy `list` family (67) therefore waits on the
 REAL substitution engine (per-instantiation evidence), not tail
 admission. Reverted.
+
+## Handoff — exact state as of 2026-08-04 (session end)
+
+Everything committed on main at feea5a2d..9f4e114c lineage; working
+tree clean except the user's README.md (NEVER commit or revert it).
+
+Census standing (cold, both sets):
+- stdlib: 9,597 sites, 85.3% bound (1,521 static + 6,664 virtual),
+  no_receiver_type 1,172, declined 87, no_class_id 33.
+- examples: 105,443 sites, 87.9% bound (15,541 + 77,106),
+  no_receiver_type 9,980, declined 1,075, no_class_id 463.
+- Session start (2026-08-03 handoff): 82.3% / 86.1%, declined 213 /
+  2,699.
+
+Gates, all green at HEAD: sweep 117/0, litmus 42/42, drift 266/266
+(scratchpad corpus-drift.py — recreate from the memory recipe if
+absent), parity pinned suite +11 this session, units, compose
+SnapshotStateListTests 61/65 + SnapshotStateMapTests 56/59 (the known
+throughput set only).
+
+The session's landed arc, chronological: star-fill generalization;
+klio-authored wasm-actuals policy (atomics CAS-loops — REAL lost-update
+fix — and coroutines test-utils); fn-typed-receiver shadow gate +
+cross-file private candidate exclusion; lambda-context typing (six
+channels incl. splice inheritance + nested-it shadowing fix);
+TypeParamBound.args + full bound refs into lambdas + receiver
+substitution (image format 39); captured-receiver inheritance (splice
+params + pre-derived outer locals); primitive-array iteration; the
+classPropHead flip (nine-level chain; head-blind proof SOUNDNESS fix
+underneath); run-mode bounds-collector unification (both pipelines one
+engine); the promotion proof (two tiers + owner-instantiation
+substitution + star-erasure); the ext-commit widening (three
+regression-derived guards); tp-args judge through bounds; signed
+literals; two re-confirmed dead ends (ctor-tail admission, gated
+receiver refutation at the ranker).
+
+Where work stops, in priority order:
+1. no_receiver 1,172: it 186 + list 67 (groupBy getOrPut — WAITS on
+   the per-instantiation substitution engine, ctor-tail admission
+   re-confirmed dead), destination 33 (spliced filterIndexedTo param —
+   next probe: whether the member-receiver typing path consults
+   spliceParamTy in the newly-countable contexts), then the recorded
+   per-family tail.
+2. declined 87 — every site named (Addendum 18); rides the arg-typing
+   legs.
+3. no_class_id 33 — the unsigned host-symbol route (design with the C
+   transpiler coupling).
+4. Compose throughput (7 concurrent tests) and the bytecode VM — the
+   end-state architecture.
+5. Standing debt the session repeatedly paid interest on: the
+   DUPLICATED implementations (two bound collectors now sharing
+   concreteBoundArgs, two func_type_params registrations, THREE static
+   compat provers) — the P2-completion unification of the static-proof
+   stack is the single highest-leverage structural change remaining.
