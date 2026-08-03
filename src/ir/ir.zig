@@ -2429,6 +2429,43 @@ pub const Module = struct {
                     break;
                 }
             }
+            // Unsubstitutable class-parameter ARGS erase to `*` for the
+            // proof: `Collection<E>` under a head-only receiver behaves as
+            // `Collection<*>` — the head adjudicates, the parameter proves
+            // and refutes nothing (the star-erasure convention). This is
+            // what lifts removeAll/addAll/putAll members to the
+            // scope-order tier.
+            var star_buf: [8]TypeRef = undefined;
+            if (param_ty.args.len != 0 and param_ty.args.len <= star_buf.len) {
+                var all_tp = true;
+                for (param_ty.args) |pa| {
+                    var ah = staticTypeHead(std.mem.trimEnd(u8, pa.name, "?"));
+                    if (std.mem.startsWith(u8, ah, "out#")) ah = ah["out#".len..];
+                    if (std.mem.startsWith(u8, ah, "in#")) ah = ah["in#".len..];
+                    var is_tp = parseClassTypeParamIdentity(ah) != null or
+                        (ah.len > 0 and ah.len <= 2 and std.ascii.isUpper(ah[0]));
+                    if (!is_tp) for (owner_tps) |tp| {
+                        if (std.mem.eql(u8, tp, ah)) {
+                            is_tp = true;
+                            break;
+                        }
+                    };
+                    if (!is_tp) {
+                        all_tp = false;
+                        break;
+                    }
+                }
+                if (all_tp) {
+                    for (0..param_ty.args.len) |i| {
+                        star_buf[i] = .{ .name = "*", .nullable = false, .args = &.{} };
+                    }
+                    param_ty = .{
+                        .name = param_ty.name,
+                        .nullable = param_ty.nullable,
+                        .args = star_buf[0..param_ty.args.len],
+                    };
+                }
+            }
             // Two tiers. A member PROVEN applicable on every argument
             // commits by Kotlin's scope order alone — members outrank
             // extensions, no refutation needed. A member merely
@@ -2439,6 +2476,16 @@ pub const Module = struct {
             switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
                 .incompatible => {
                     mpp_why = "member-arg-refuted";
+                    if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                        std.debug.print("[promo-pair] {s}.{s} param={s}<{d}> arg={s}<{d}>\n", .{
+                            head,
+                            name,
+                            param_ty.name,
+                            param_ty.args.len,
+                            if (sh.ty) |t| t.name else "?",
+                            if (sh.ty) |t| t.args.len else 0,
+                        });
+                    }
                     return false;
                 },
                 .unknown => member_fully_proven = false,
@@ -2828,7 +2875,19 @@ pub const Module = struct {
             // prove compatibility without both.
             return .unknown;
         }
-        if (param.args.len != 0) return .unknown;
+        if (param.args.len != 0) {
+            // All-star arguments prove and refute nothing (the star-erasure
+            // convention): `List<String>` against `Collection<*>`
+            // adjudicates by HEAD alone below.
+            var all_star = true;
+            for (param.args) |pa| {
+                if (!std.mem.eql(u8, pa.name, "*")) {
+                    all_star = false;
+                    break;
+                }
+            }
+            if (!all_star) return .unknown;
+        }
         if (self.staticTypeClassId(receiver)) |actual_id| {
             if (self.staticTypeClassId(param)) |declared_id| {
                 if (self.classIdIsOrExtends(actual_id, declared_id)) return .compatible;
@@ -2841,6 +2900,13 @@ pub const Module = struct {
             }
         }
         if (actual_builtin == .ambiguous) return .unknown;
+        // The registered supertype chain is evidence the hardcoded builtin
+        // table lacks: `MutableCollection` IS a `Collection` through the
+        // shipped source hierarchy, and the blind refutation below held the
+        // whole removeAll/addAll member family.
+        if (evidenceSubtypeCb(@ptrCast(@constCast(self)), actual, declared)) {
+            return .compatible;
+        }
         if (!(actual_builtin == .yes and staticBuiltinConcrete(actual)) and
             applicability.builtinSupersOf(actual).len == 0 and
             self.staticTypeClassId(receiver) == null and
