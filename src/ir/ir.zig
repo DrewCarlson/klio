@@ -4877,10 +4877,11 @@ pub const Module = struct {
 
         const first_param: usize = @intFromBool(funcHasImplicitThis(f));
         // An extension receiver written head-only (a bare implicit `this`)
-        // cannot bind the declared receiver's type parameters; erase the
-        // still-unbound ones to `*` at the end instead of refusing, exactly
-        // as the owner-projection arm above does for members.
-        var recv_bind_failed = false;
+        // cannot bind the declared receiver's type parameters; the erasure
+        // pass below substitutes `*` for the still-unbound ones instead of
+        // refusing, exactly as the owner-projection arm above does for
+        // members. A receiver WITH arguments that fails to bind is a real
+        // mismatch and still refuses here.
         if (first_param != 0 and
             (decl_sig == null or decl_sig.?.kind != .instance_method))
         {
@@ -4896,13 +4897,7 @@ pub const Module = struct {
                     if (actual_receiver.args.len != 0 or
                         std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0"))
                         return null;
-                    recv_bind_failed = true;
                 }
-            } else {
-                // A receiver-less top-level pick (a bare call resolved by
-                // name alone) binds no receiver params at all; same erasure.
-                recv_bind_failed =
-                    !std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0");
             }
         }
         const params = f.params[first_param..];
@@ -4985,7 +4980,15 @@ pub const Module = struct {
             }
         }
 
-        if (recv_bind_failed) {
+        // A function type parameter still unbound after the receiver and every
+        // argument had their chance erases to `*` rather than refusing the
+        // whole return: `MutableList(3) { ... }` (a receiver-less generic
+        // factory whose lambda carries no inferred type) yields
+        // `MutableList<*>` — the HEAD binds the local's member calls, and `*`
+        // is applicability-neutral downstream. A hard bind CONFLICT still
+        // refused above; this only covers absence. A result erased to a bare
+        // `*` head is refused below as before.
+        if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) {
             for (function_type_params) |tp| {
                 var bound = false;
                 for (bindings.items) |bd| {
