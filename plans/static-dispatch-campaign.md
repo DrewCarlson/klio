@@ -595,10 +595,21 @@ unless noted. Chronological.
   full batch-shaped child with the unsigned suite executing
   beforehand reproduces (the --only-file pair + dir siblings + the 3
   cross-dir providers, `--filter=ArraysTest`, `KLIO_LAMBDA_RET=1`,
-  cold cache — deterministic there). NEXT PROBE (decisive): dump the
-  frame chain at the `[uctor]` site (or make the ctor failure a
-  Thrown exception so errtrace prints it) — that names the mis-bound
-  call in one run.
+  cold cache — deterministic there). RESOLVED by the frame-chain
+  probe (`runtime.debug_frame_dump`, installed by the evaluator): the
+  chain read `kotlin.toUInt (UInt.kt:462) <- kotlin.collections.map`
+  — an UNBOUND method reference (`Int::toUInt`) invoked with its own
+  receiver value prepended. `Int` in value position is its COMPANION
+  INSTANCE (Primitives.kt Int declares one), and the STATIC-FID ref
+  invocation path tested only `rv == .Class` for the unbound form, so
+  the companion got prepended as `this` and every argument shifted.
+  The fix reuses the by-name path's type-like predicate (Class, or
+  uppercase ctor-function, or companion instance whose companion does
+  not serve the member) on the fid path. Order-dependence explained:
+  the fid attaches only when the extension target statically resolves
+  at ref-lowering, which the lambda-return typing enabled.
+  KLIO_LAMBDA_RET is now DEFAULT ON: stdlib no_receiver_type
+  1,524→1,353, 80.6%% bound. Pin `unbound_ref_companion_receiver`.
 
 ## Measured dead ends and falsified theories — do not retry
 

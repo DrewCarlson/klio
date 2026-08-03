@@ -9434,12 +9434,7 @@ fn enrichLambdaArgShapes(
     shape_set: *StaticReturnArgShapes,
 ) Allocator.Error!void {
     if (od_depth >= 3) return;
-    // Default OFF: with the channel on, XorWowRandom's on-demand
-    // lowering emitted its bare `require(...)` as a FIELD READ and a UInt
-    // constructor call surfaced in checkInvariants — a side effect of the
-    // scratch derivation not yet isolated. Opt in with =1; the toy chain
-    // (`List(3) { it * 2 }` typing `List<Int>`) works end to end.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "0", "1")) return;
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "1", "0")) return;
     const tf = b.module.funcById(target) orelse return;
     const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
     const first = @intFromBool(has_this);

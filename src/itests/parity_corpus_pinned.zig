@@ -1586,6 +1586,15 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "unbound_ref_companion_receiver" {
+    try check("unbound_ref_companion_receiver",
+        \\[0, 1, 2, 3, 4]
+        \\10
+        \\[1, 2]
+        \\
+    );
+}
+
 test "splice_hygiene_caller_members" {
     try check("splice_hygiene_caller_members",
         \\[6, 7]

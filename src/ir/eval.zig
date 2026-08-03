@@ -926,6 +926,12 @@ pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
 
 /// Ungated frame-chain dump for name-filtered diagnostics that gate at
 /// their own call site (e.g. `KLIO_MISS_TRACE`).
+/// Install the runtime-layer frame-dump hook (idempotent; see
+/// `runtime.debug_frame_dump`).
+pub fn installDebugFrameDump() void {
+    runtime.debug_frame_dump = &dumpFrameChainForDiagAlways;
+}
+
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
     var cur = evtls.frame_chain;
