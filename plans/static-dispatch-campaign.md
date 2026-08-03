@@ -1517,3 +1517,23 @@ unification (one proof engine with one projection/alias/absent-args
 policy), after which the classPropHead flip and the withhold rule
 re-derive trivially. All landed pieces battery-green; the flip stays
 reverted.
+
+## Addendum 10 — THE FLIP LANDS (2026-08-04)
+
+The route-tagged rex-arg row named the final branch in one run:
+`route=recv-compat-tail` — staticTypeContainsFuncParam could not see T
+through the `out#` projection prefix, so `Array<out T>` never entered
+the generic proof. With the strip (56239bc0), the ENTIRE nine-level
+chain resolves and the classPropHead provenance flip HOLDS across the
+full battery: sweep 117/0, litmus 42/42, drift 266/266, units, compose
+61/65 + 56/59. Census: stdlib bound_virtual 5,905 -> 5,989 (84.4%
+bound, member total +89 as deferrals became countable); examples
+70,418 -> 70,522 bound_virtual (86.95% bound). Five real fixes landed
+under the chain: the head-blind generic-receiver proof (soundness),
+projection transparency in the arg proof AND the containment check,
+the qualified-Any bound compare, the inference-tolerant absent-args
+arm, and the bound-record dedup. The withheld KLIO_RECV_REFUTE gate
+and the sole-commit refinements remain available for the
+resolver_declined family, which this proof stack now serves with
+correct answers. Next legs unchanged: resolver_declined 213, unsigned
+no_class_id route, compose throughput, bytecode VM.
