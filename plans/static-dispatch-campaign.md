@@ -1304,3 +1304,23 @@ Census A/B: every flipped default takes `=0`.
 - Every receiver-typing fix grows `resolver_declined` until
   argument-side inference exists — that growth is progress, not
   regression.
+
+## Addendum — the minusArray blocker, fourth derivation level (2026-08-03)
+
+With the ranker bound hop live, the hopped `Iterable<String>` receiver
+DOES reach the ranker (`[rex] ... recv=Iterable rargs=1`), yet every
+minus candidate stays `compat0=unknown`: `staticReceiverCompatibility`
+deliberately keeps a Set/List-recv candidate NON-refuted for an
+Iterable-typed receiver — lazy-mode leniency (a statically
+Iterable-typed value may be a Set at runtime). kotlinc's static
+semantics refute on the STATIC type: `Set.minus` is not a candidate
+for an Iterable-typed receiver at all. This is the plan's standing
+"ranker learns to REFUTE competing tiers" design — receiver-static-
+type refutation for PROVEN receivers — and is the real gate for both
+the classPropHead provenance flip (~-11 no_receiver_type) and the
+whole `resolver_declined` ext_* family. It is a semantic mode change
+(many deferred sites rely on the leniency), to be landed with the
+KLIO_RESOLVE_AUDIT zero-disagreement discipline, not as a spot fix.
+Diagnostics for re-entry: KLIO_HOP_TRACE ([hop] rows), [rex] enter
+rows now print the ranked receiver; the flip re-applies by returning
+`tp.name.name` from classPropHead when an upper bound exists.
