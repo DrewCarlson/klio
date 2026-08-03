@@ -2543,6 +2543,14 @@ pub const Module = struct {
             }
             if (!refuted) {
                 mpp_why = "ext-unrefuted";
+                if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                    std.debug.print("[promo-ext-alive] {s}.{s} ext={s} recv={s}\n", .{
+                        head,
+                        name,
+                        f.fqn,
+                        recv_ref.name,
+                    });
+                }
                 return false;
             }
         }
