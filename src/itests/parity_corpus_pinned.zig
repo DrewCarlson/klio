@@ -1568,6 +1568,17 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "nested_it_shadow_local_ext" {
+    try check("nested_it_shadow_local_ext",
+        \\[, abc, sort]
+        \\[sort, abc, ]
+        \\[abc, sort, ]
+        \\true
+        \\false
+        \\
+    );
+}
+
 test "fn_type_ext_private_inline" {
     try check("fn_type_ext_private_inline",
         \\ran alpha -> 42

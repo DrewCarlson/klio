@@ -1718,6 +1718,18 @@ pub const FuncBuilder = struct {
         try self.setLocalDeclTypeOwned(name, owned);
         _ = self.local_init_exprs.remove(name);
     }
+    /// A rebinding (a lambda's own parameter) shadows every inherited
+    /// enclosing-local record under this name: the nested lambda's `it`
+    /// must not read the OUTER `it`'s declared type or initializer.
+    pub fn clearLocalDeclType(self: *FuncBuilder, name: []const u8) void {
+        if (self.local_decl_types.fetchRemove(name)) |old| {
+            var cleanup = old.value;
+            cleanup.deinit(self.allocator);
+        }
+        _ = self.local_decl_nullable.remove(name);
+        _ = self.local_call_returns.remove(name);
+        _ = self.local_init_exprs.remove(name);
+    }
     /// Record a complete declared type. Takes ownership of `ty`.
     pub fn setLocalDeclTypeOwned(self: *FuncBuilder, name: []const u8, ty: TypeRef) Allocator.Error!void {
         var owned = ty;

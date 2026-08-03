@@ -452,15 +452,41 @@ pub fn spliceInlineLambda(
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg);
-    if (params.len == 0) {
-        if (arg_regs.len > 0) {
-            try b.bind("it", arg_regs[0]);
+    // The splice's parameter bindings inherit the ARGUMENT expressions'
+    // static types: `predicate(element)` inside a spliced `all` body binds
+    // the caller lambda's `it` to `element`, and the loop variable's derived
+    // type (Char over a CharSequence receiver) is exactly the type kotlinc
+    // gives the lambda parameter. The splice runs in the CALLER's builder,
+    // whose flat decl-type map may already record a SAME-NAMED outer local
+    // (`let { it.sortedBy { ... } }` records the outer `it`): the binding
+    // shadows that record for the body and restores it on exit — the derived
+    // types are argument-position facts, not enclosing-scope facts.
+    const ShadowSave = struct { name: []const u8, ty: ?ir.TypeRef, init: ?*const ast.Expr };
+    var shadow_saves: std.ArrayList(ShadowSave) = .empty;
+    defer {
+        for (shadow_saves.items) |*sv| {
+            b.clearLocalDeclType(sv.name);
+            if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
+            if (sv.init) |e| b.setLocalInitExpr(sv.name, e) catch {};
         }
-    } else {
-        const n = @min(params.len, arg_regs.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            try b.bind(params[i].name, arg_regs[i]);
+        shadow_saves.deinit(b.allocator);
+    }
+    const bind_n: usize = if (params.len == 0)
+        @min(@as(usize, 1), arg_regs.len)
+    else
+        @min(params.len, arg_regs.len);
+    var bi: usize = 0;
+    while (bi < bind_n) : (bi += 1) {
+        const pname = if (params.len == 0) "it" else params[bi].name;
+        try shadow_saves.append(b.allocator, .{
+            .name = pname,
+            .ty = if (b.localDeclTypeRef(pname)) |t| try t.clone(b.allocator) else null,
+            .init = b.localInitExpr(pname),
+        });
+        try b.bind(pname, arg_regs[bi]);
+        b.clearLocalDeclType(pname);
+        if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi])) |ty| {
+            try b.setLocalDeclTypeOwned(pname, try ty.clone(b.allocator));
         }
     }
     // Capture the owner splice's localize target *before* pushing the new

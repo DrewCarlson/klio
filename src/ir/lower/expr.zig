@@ -3952,6 +3952,19 @@ fn argLambdaParamTypes(
     type_args: []const ast.TypeRef,
     recv_offset: usize,
 ) Allocator.Error!?[]?[]ir.TypeRef {
+    if (runtime.getenvSlice("KLIO_ALPT")) |want| {
+        if (std.mem.eql(u8, want, func.name)) {
+            std.debug.print("[alpt] {s}#{d} nargs={d} nparams={d} off={d} p_last={s} p_last_args={d}\n", .{
+                func.fqn,
+                func.id.int(),
+                args.len,
+                func.params.len,
+                recv_offset,
+                if (func.params.len != 0) func.params[func.params.len - 1].ty.name else "-",
+                if (func.params.len != 0) func.params[func.params.len - 1].ty.args.len else 0,
+            });
+        }
+    }
     if (args.len == 0 or func.params.len < recv_offset) return null;
     for (args) |*arg| if (arg.* == .Spread) return null;
     const params = func.params[recv_offset..];
@@ -8651,6 +8664,23 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
             (try localInitTypeRef(b, iter)) orelse return null;
         break :blk owned.?;
     };
+    // Char sequences iterate Chars by their iterator, not by a type
+    // argument — `for (element in this)` inside `CharSequence.all`'s
+    // spliced body is the live case.
+    {
+        var h = std.mem.trimEnd(u8, ty.name, "?");
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        h = typeHead(h);
+        if (std.mem.eql(u8, h, "CharSequence") or std.mem.eql(u8, h, "String") or
+            std.mem.eql(u8, h, "StringBuilder"))
+        {
+            return try (ir.TypeRef{
+                .name = "Char",
+                .nullable = false,
+                .args = &.{},
+            }).clone(b.allocator);
+        }
+    }
     if (ty.args.len != 1) return null;
     const elem = ty.args[0].name;
     if (elem.len == 0 or ty.args[0].nullable) return null;
@@ -11909,6 +11939,36 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         }
         break :blk null;
     };
+    // The deferred form types lambda params from the committed global
+    // candidate exactly as the static Call emitter does — a bare
+    // `all { it.isWhitespace() }` whose inline callee is still a header
+    // stub defers, and without this the closure's `it` lowers untyped.
+    const lambda_param_types: ?[]?[]ir.TypeRef = blk: {
+        const f = b.module.funcById(func_id) orelse break :blk null;
+        const recv_off: usize = if (f.params.len != 0 and
+            std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaParamTypes(
+            b,
+            f,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            recv_off,
+        );
+    };
+    defer if (lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    b.pending_arg_lambda_param_types = lambda_param_types;
+    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+        const f0 = b.module.funcById(func_id);
+        std.debug.print("[cmg-lpt] {s} fid={d} lpt={} p_last={s} p_last_args={d}\n", .{
+            name0,
+            func_id.int(),
+            lambda_param_types != null,
+            if (f0) |f| (if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-") else "?",
+            if (f0) |f| (if (f.params.len != 0) f.params[f.params.len - 1].ty.args.len else 0) else 0,
+        });
+    }
     const run = try lowerArgRunWithArity(b, args, arg_arity);
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
@@ -13077,6 +13137,34 @@ fn lowerUnresolvedBareCall(
         }
         break :blk null;
     };
+    // Lambda params still type from the RESOLVED extension hint on the
+    // deferred form: `all { it.isWhitespace() }` inside `isBlank` defers
+    // (the lazy-relower scope cannot prove the member-shadow negative),
+    // but `kotlin.text.all`'s `predicate: (Char) -> Boolean` is the
+    // engine's committed candidate, so `it` is Char exactly as on the
+    // static path. Only the resolved hint is trusted — the
+    // trailing-lambda namesake pick above stays arity/receiver-only (a
+    // wrong namesake type stamp is worse than none).
+    const bare_lambda_param_types: ?[]?[]ir.TypeRef = blk: {
+        const hint = ext_hint orelse break :blk null;
+        const f = b.module.funcById(hint) orelse break :blk null;
+        const off: usize = if (f.params.len != 0 and
+            std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        break :blk try argLambdaParamTypes(b, f, args, ast_arg_names, ast_type_args, off);
+    };
+    defer if (bare_lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    b.pending_arg_lambda_param_types = bare_lambda_param_types;
+    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+        const f0 = if (ext_hint) |h| b.module.funcById(h) else null;
+        std.debug.print("[ubc-lpt] {s} hint={?d} lpt={} p_last={s} p_last_args={d}\n", .{
+            name0,
+            if (ext_hint) |h| h.int() else null,
+            bare_lambda_param_types != null,
+            if (f0) |f| (if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-") else "?",
+            if (f0) |f| (if (f.params.len != 0) f.params[f.params.len - 1].ty.args.len else 0) else 0,
+        });
+    }
     if (b.resolve("this")) |this_reg| {
         const run = try lowerArgRunWithArity(b, args, bare_arity);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -13813,13 +13901,16 @@ fn lowerResolvedMemberCall(
             lm_norecv_path[@intFromEnum(which)] += 1;
             if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
                 if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
-                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s} call={s} fn={s}\n", .{
+                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
                         @tagName(which),
                         rn,
                         b.ownerClass() orelse "<none>",
                         bareStaticRecvHead(b) orelse "<none>",
                         name.name,
                         build.currentRealFn() orelse "-",
+                        b.isParam(rn),
+                        b.spliceRecvTy() orelse "-",
+                        b.recvTy() orelse "-",
                     });
                 }
             }
@@ -14618,15 +14709,23 @@ fn localExtensionReceiverCouldApply(
     receiver_ty: ?TypeRef,
 ) Allocator.Error!bool {
     const actual = receiver_ty orelse return true;
-    const overloads = b.localFnDecls(name) orelse return true;
+    const overloads = b.localFnDecls(name) orelse {
+        if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+            std.debug.print("[lerca] {s} no-decls actual={s} -> true\n", .{ name, actual.name });
+        return true;
+    };
     var saw_extension = false;
     for (overloads) |overload| {
         if (!overload.is_ext) continue;
         saw_extension = true;
         if (try localOverloadReceiverCouldApply(b, &overload, actual)) {
+            if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+                std.debug.print("[lerca] {s} ext-applies actual={s} -> true\n", .{ name, actual.name });
             return true;
         }
     }
+    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+        std.debug.print("[lerca] {s} actual={s} saw_ext={} -> {}\n", .{ name, actual.name, saw_extension, !saw_extension });
     return !saw_extension;
 }
 
