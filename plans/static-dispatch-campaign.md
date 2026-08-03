@@ -1494,3 +1494,26 @@ name+span+outcome under the rex trace), after which the residual site
 reads off directly. Landed this cycle: exit-arm rows, DISQUALIFIED
 rows, span-carrying finalist rows (all rex-gated). Flip reverted;
 battery green.
+
+## Addendum 9 — the minusArray synthesis (2026-08-04)
+
+The bracket rows finally isolated the window: at f2:17517 the Array
+overload (fid 2309) WINS the ext_key (100105 vs the element overload's
+100010) but stays KEPT unknown, and the best_unknown withhold defers
+the call to the runtime value pick (Set.minus -> Set -> equal-printing
+List/Set mismatch). Three kotlinc-fidelity corrections landed en route
+(e02414e9: projection-transparent compat, qualified-Any bound compare,
+inference-tolerant absent-args arm) — the arg verdict STILL lands
+unknown through a branch the per-arg probe has not named (next probe if
+resumed piecemeal: tag the rex-arg row with WHICH route inside
+staticArgCompatibility answered — tp-arm / class-tp-arm / literal /
+contains-fn-param / receiver-compat tail). The RECORDED DECISION: stop
+adding arms. The compat stack is three near-identical implementations
+with projection/qualification/absent-args handling scattered
+(staticArgCompatibility, staticGenericArgCompatibility,
+staticReceiverCompatibility) — exactly the RC-B shape P2 unified at the
+SCORER level but not at the static-proof level. The fix class is that
+unification (one proof engine with one projection/alias/absent-args
+policy), after which the classPropHead flip and the withhold rule
+re-derive trivially. All landed pieces battery-green; the flip stays
+reverted.
