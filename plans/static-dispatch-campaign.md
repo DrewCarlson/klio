@@ -30,6 +30,71 @@ shadowing its own initializer; a later local capturing an earlier bare
 write; the boxed-var analysis; the local-init re-entry). Any new scope
 query must carry the declaration point.
 
+## Continuation — 2026-08-03 (resumed session)
+
+Landed on top of the handoff below, battery green after each
+(sweep 117/0, litmus 42/42 — one new fixture, drift 266/266, unit
+tests, compose SnapshotStateListTests 61/65 + MapTests 56/59
+unchanged):
+
+- **Still-unbound function type params erase to star** (60bffe8b): the
+  last-resort star fill now covers receiver-LESS generic calls
+  (`MutableList(3) { ... }`, `mutableListOf()`), not only the
+  receiver-bind arms. stdlib no_receiver_type 1,211 -> 1,174 (82.7%
+  bound), examples 9,362 -> 9,223. This also cleared the whole
+  `val it = iterator()` init-carrying family in
+  AbstractMutableCollection.remove/clear. Pin
+  `factory_lambda_local_star`.
+- **No js/wasm logic actuals** (d202d616, 25558689): user directive —
+  klio must not consume actual implementations built for js/wasm.
+  Replaced: `wasm/**/Atomics.wasm.kt` + `AtomicArrays.wasm.kt` with
+  klio-authored `kotlin-klio/kotlin-concurrent/` actuals (same shapes,
+  fields, FQNs — host RMW bindings hold; the inline update family is
+  now CAS loops, fixing a REAL lost-update bug: inline splices cannot
+  be host-shadowed and the wasm bodies were store(transform(load()))).
+  Pin `tl_atomic_update_contended` (litmus now 42). Replaced
+  `test-utils/wasmWasi` with klio-authored
+  `klio-kotlinx-coroutines/klioTestUtils/` (runBlocking runTest, no
+  platform skips; A/B behavior-neutral). Remaining native-wasm/
+  consumption (AbstractMutable*4, CharCategory) is the Kotlin/Native
+  SHARED sourceset — platform-neutral collection logic and a data
+  enum, judged within policy; replace with klio actuals if strictness
+  is wanted.
+- **Two resolver defects** (545c62a3), found via the coroutines test
+  tree (`klio test kotlin-klio/klio-kotlinx-coroutines
+  --only-file=.../SharedFlowTest.kt`): (1) fn-typed extension
+  receivers (erased `Function{N}` heads) never triggered the
+  closed-member-surface stand-down (only the `<function>` spelling was
+  recognized) — bare `runSafely(completion) { }` inside
+  `(suspend () -> T).startCoroutineCancellable` deferred a private
+  INLINE callee to a walk that cannot splice it;
+  `ResolveCtx.recv_cannot_shadow` now feeds emitFormFor directly.
+  (2) the raw bare-candidate iterator ignored visibility — a test
+  class's PRIVATE member extension `CoroutineScope.block(context)`
+  entered every file's candidate set; private decls (incl. member
+  extensions, now file-registered) are dropped cross-file at the
+  iterator. Also: memberExtOutOfScope reads DeclSig kind (stubs carry
+  .plain on Func); callable-vs-registered-non-fun-interface-class is
+  a definite mismatch. Pins `fn_type_ext_private_inline` + a
+  cross-file-private unit test.
+- **OPEN residual** (pre-existing, NOT from the test-utils swap —
+  fails identically under the old wasmWasi infra):
+  SharedFlowTest.testOnSubscription (`Vm::call_member block on
+  kotlin.Function`) + onSubscriptionThrows (stack overflow), ONLY in
+  the coroutines test-project compile context (standalone repro of the
+  full operator chain passes). State: bare `block` candidates now
+  empty (was the test-class leak); the failing instruction is
+  `collector.block()` (SafeCollector.common.kt:107, unsafeFlow's anon
+  `collect` member, span len 17) executing a MEMBER call whose
+  receiver register holds the crossinline closure. The
+  member_or_local arbitration (`member_or_local_exact_value` /
+  `CallMemberOrValue`) emitted pre-filter but no longer fires for
+  that site — next: dump the anon collect override's lowered body in
+  the test context (KLIO_DUMP_FN by fid; the fn displays as `collect`
+  under $anon$1) and find which member path lowers `collector.block()`
+  without consulting the anon capture. KLIO_ADM_TRACE (new, kept)
+  prints callable-vs-param adjudications.
+
 ## Handoff — exact state as of 2026-08-03 (session end)
 
 Everything below is committed on `main` at `730200c7`; the working tree
