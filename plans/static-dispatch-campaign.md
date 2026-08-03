@@ -1436,3 +1436,21 @@ and TIES the Array overload in ext_key — the withhold would then be
 concrete `Array<out T>` param outranks a bare `T` in the key), checked
 by printing the ext_keys of the two finalists in the flip run. The
 flip remains reverted; every landed piece is battery-green.
+
+## Addendum 6 — eighth level LANDED: the head-blind proof (2026-08-03)
+
+The real defect under the whole minusArray chain: KLIO_DUMP_FN on the
+flip run's committed winner identified `kotlin.sequences.minus` — the
+generic-receiver PROOF (staticGenericReceiverApplicable) was binding
+pattern params head-blind, proving a `Sequence<T>` receiver pattern
+against an `Iterable<String>` actual via `T := String`. Fixed
+(d7f4c2d5): the proof requires related heads (class-id chain /
+builtin identity + supertype oracle; unknown never refutes). Under the
+flip the minus family still shows one residual failure whose [rex-key]
+rows need SITE attribution (the trace conflates every minus ranking in
+the run — add the call span to the rex-key row, one cold run, read
+which site's winner remains wrong). All landed pieces battery-green at
+the default. The eight levels stand as: hop -> Array disproof ->
+argument-position split (superseded) -> emission-site hunt
+(superseded) -> relower routing (superseded) -> bound double-read ->
+element-tie hypothesis (superseded) -> HEAD-BLIND PROOF (the root).
