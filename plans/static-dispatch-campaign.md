@@ -95,6 +95,26 @@ unchanged):
   without consulting the anon capture. KLIO_ADM_TRACE (new, kept)
   prints callable-vs-param adjudications.
 
+- **Lambda-context typing, first arc** (0f242f44): four channels — the
+  deferred CMG emitters thread argLambdaParamTypes from the committed
+  candidate (emitMemberOrGlobal + lowerUnresolvedBareCall's ext hint);
+  CharSequence/String/StringBuilder loops type their element Char;
+  inline-splice param bindings inherit the argument expressions'
+  derived types with save/restore shadowing; and a lambda's param
+  names SHADOW inherited enclosing-local records (clearLocalDeclType
+  at bindParams — the nested-it defect: the inner `it` read the outer
+  `it`'s List record and refuted a local String extension,
+  sortedByNullable's exact failure; this was the one regression the
+  arc introduced and root-fixed). stdlib no_receiver_type 1,174 ->
+  1,163 (it-family 182 -> 169). Examples: no_class_id 437 -> 466 —
+  newly typed heads whose class rows are missing; that bucket is now
+  the cheap next slice. Remaining stdlib `it` (169) is dominated by
+  IterableTests-style GENERIC bounded receivers (head-only bounds
+  drop the `Iterable<String>` args — the bound-args completeness
+  design) plus unsigned-array splice contexts. Pin
+  `nested_it_shadow_local_ext`. Battery green after the arc (sweep
+  117/0, litmus 42/42, drift 266/266, compose 61/65+56/59, units).
+
 ## Handoff — exact state as of 2026-08-03 (session end)
 
 Everything below is committed on `main` at `730200c7`; the working tree
