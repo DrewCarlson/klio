@@ -1308,6 +1308,11 @@ fn varargPropArrayHead(elem: []const u8) []const u8 {
 }
 
 fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
+    // A type written qualified (`BytesHexFormat.Builder`) keeps its dotted
+    // path: `name` alone is the last segment, and recording just `Builder`
+    // made the receiver typing bind a same-named class from an enclosing
+    // scope. A qualified reference is never a type parameter.
+    if (ty.qualified_path) |qp| return qp;
     const head = ty.name.name;
     for (c.type_params) |*tp| {
         if (std.mem.eql(u8, tp.name.name, head)) {
@@ -1990,7 +1995,7 @@ fn buildModuleWithOverrides(
                 if (m.* != .Property) continue;
                 const prop = m.Property;
                 if (prop.ty) |*ty| {
-                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.name.name);
+                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.qualified_path orelse ty.name.name);
                 } else if (propCtorHeadEvidence(prop, decls)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
                 }
@@ -5307,6 +5312,7 @@ test "class type-parameter metadata includes where bounds and unbounded identiti
 
     const bounds = (try collectClassTypeParamBounds(testing.allocator, &class)).?;
     defer testing.allocator.free(bounds);
+    defer for (bounds) |tb| testing.allocator.free(tb.args);
     try testing.expectEqual(@as(usize, 4), bounds.len);
     try testing.expectEqualStrings("T", bounds[0].param);
     try testing.expectEqualStrings("Number", bounds[0].bound);

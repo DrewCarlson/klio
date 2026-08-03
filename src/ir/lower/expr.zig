@@ -14176,6 +14176,20 @@ fn lowerResolvedMemberCall(
             }
         }
     }
+    // A declared type the module-wide lookups miss can still name a class
+    // the DECLARATION SITE can see: `Outer.Inner` written without its
+    // package resolves as a `.`-aligned FQN suffix (the type-position
+    // convention), and a bare nested-class name resolves through the
+    // enclosing classifier chain — inside `HexFormat`, `BytesHexFormat`
+    // names its nested sibling even though nested classes are deliberately
+    // invisible to the module-wide simple-name index.
+    if (owner_id == null) {
+        if (std.mem.indexOfScalar(u8, identity, '.') != null) {
+            owner_id = b.module.classIdByQualifiedSuffix(identity);
+        } else if (!b.isTypeParam(head)) {
+            owner_id = nestedClassIdAtLexicalSite(b, head);
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         if (norecvCensusOn()) {
@@ -14190,7 +14204,14 @@ fn lowerResolvedMemberCall(
                 if (b.typeParamBound(head)) |tpb| {
                     std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
                 } else {
-                    std.debug.print("[no-class-head] {s} no-bound-record tp={}\n", .{ head, b.isTypeParam(head) });
+                    std.debug.print("[no-class-head] {s} id={s} no-bound-record tp={} call={s} fn={s} owner={s}\n", .{
+                        head,
+                        identity,
+                        b.isTypeParam(head),
+                        name.name,
+                        build.currentRealFn() orelse "-",
+                        b.ownerClass() orelse "-",
+                    });
                 }
             }
         }
